@@ -124,15 +124,48 @@ pub async fn run_health(
         print_sample(sample);
     }
 
-    if snapshot.endpoints.is_empty() {
-        println!("endpoints: none");
-    } else {
-        println!("endpoints: {}", snapshot.endpoints.len());
+    // #270-family split-view fix: the ADVERTISED endpoints live in the
+    // MACHINE DAEMON (the process that owns the listeners), not in this
+    // short-lived CLI scope — printing the scope's own (always-empty)
+    // table produced "endpoints: none" while the daemon was listening on
+    // two ports with live inbound connections, and that lie repeatedly
+    // misdirected transport debugging toward routes that were fine. Ask
+    // the daemon (Request::RouteEndpoints, card 4b6a0ffa); only if no
+    // daemon answers do we fall back to the scope view, LABELED as such.
+    let daemon_endpoints = {
+        let socket = crate::cli::default_socket_path_in(home);
+        match airc_ipc::DaemonClient::new(socket).route_endpoints().await {
+            Ok(response) => Some(response.endpoints),
+            Err(_) => None,
+        }
+    };
+    match daemon_endpoints {
+        Some(endpoints) if endpoints.is_empty() => {
+            println!("endpoints: none advertised by the daemon — this node is NOT dialable");
+        }
+        Some(endpoints) => {
+            println!("endpoints (daemon-advertised): {}", endpoints.len());
+            for endpoint in &endpoints {
+                println!("  {endpoint:?}");
+            }
+        }
+        None => {
+            println!(
+                "endpoints: daemon unreachable — scope-local view only ({}; NOT authoritative)",
+                snapshot.endpoints.len()
+            );
+        }
     }
     if snapshot.connected_lan_peers.is_empty() {
         println!("lan peers: none");
     } else {
         println!("lan peers: {}", snapshot.connected_lan_peers.len());
+    }
+    // #1306: half-open sessions the delivery ledger caught this refresh
+    // — a previously-silent failure class made visible. Each was dropped
+    // + re-dialed because flushed frames went unacked.
+    for peer in &snapshot.suspect_connections_dropped {
+        println!("suspect connection dropped (unacked frames, re-dialing): {peer}");
     }
     // Card 625abe6d slice 1: every failed outbound dial to a stored
     // peer endpoint is visible here — an offline peer is normal mesh
@@ -146,14 +179,26 @@ pub async fn run_health(
     // Card 7e3c9a1f: endpoints in dial-failure backoff — shown as a
     // DISTINCT state, never as "dial failed" (no dial was attempted this
     // refresh). Surfaced so the operator sees the backoff is intentional,
-    // and re-dialed once the window elapses.
+    // and re-dialed once the window elapses. Self-healing join: a DEAD
+    // endpoint (failure-counted eviction) is a third distinct state —
+    // no countdown applies; only a fresher advertisement revives it.
     for skip in &snapshot.peer_dial_skips {
-        println!(
-            "dial backoff: {} via {:?} — skipped, ~{}s remaining after a prior failed dial",
-            skip.peer_id,
-            skip.endpoint,
-            skip.remaining_ms.div_ceil(1000)
-        );
+        if skip.dead {
+            println!(
+                "endpoint dead: {} via {:?} — evicted after {} consecutive failed dials; \
+                 revived only by a fresher advertisement",
+                skip.peer_id,
+                skip.endpoint,
+                airc_lib::DEAD_AFTER_CONSECUTIVE_FAILURES
+            );
+        } else {
+            println!(
+                "dial backoff: {} via {:?} — skipped, ~{}s remaining after a prior failed dial",
+                skip.peer_id,
+                skip.endpoint,
+                skip.remaining_ms.div_ceil(1000)
+            );
+        }
     }
 
     if !verdict.is_failure() || !fail {

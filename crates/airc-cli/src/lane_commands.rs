@@ -44,9 +44,9 @@ pub async fn run_state(
     Ok(())
 }
 
-pub async fn run_status(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_status(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let board = airc.work_board(limit).await?;
+    let board = airc.work_board().await?;
     print_status(&board);
     Ok(())
 }
@@ -79,12 +79,9 @@ pub async fn run_manager_release(
     Ok(())
 }
 
-pub async fn run_manager_status(
-    home: &Path,
-    limit: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_manager_status(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let board = airc.work_board(limit).await?;
+    let board = airc.work_board().await?;
     print_manager_status(&board);
     Ok(())
 }

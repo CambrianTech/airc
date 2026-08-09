@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 pub mod account_registry;
+pub mod account_registry_fs;
 pub mod adapter;
 pub mod agent_heartbeat;
 pub mod airc;
@@ -60,11 +61,13 @@ pub mod publish;
 pub mod registry;
 pub mod registry_refresh;
 mod relay;
+pub mod rendezvous;
 pub mod room;
 pub mod route;
 pub mod route_forwarder;
 pub mod router_bridge;
 mod stream;
+pub mod stream_chunk;
 pub mod subscriptions;
 pub mod task_negotiation;
 mod time;
@@ -84,9 +87,10 @@ pub use account_registry::{
     AccountRegistryDocument, AccountRegistryError, AccountRegistryStore, RegistryMergeOutcome,
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
+pub use account_registry_fs::FsAccountRegistryStore;
 pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
-    DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
+    RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
 pub use airc::{machine_account_home, Airc};
 pub use airc_protocol::{
@@ -117,6 +121,15 @@ pub use delivery_ack::DeliverySendOutcome;
 pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
 };
+pub use rendezvous::{
+    parse_rendezvous_dir, resolve_account_registry_store, GistRendezvous, RendezvousChoice,
+    RendezvousConfigError, RENDEZVOUS_DIR_ENV,
+};
+pub use stream_chunk::{
+    StreamChunk, StreamPayload, HEADER_STREAM_FINAL, HEADER_STREAM_ID, HEADER_STREAM_KIND,
+    HEADER_STREAM_SEQ, STREAM_KIND_AUDIO_PCM, STREAM_KIND_MOTOR_CMD, STREAM_KIND_TEXT_REASONING,
+    STREAM_KIND_TEXT_TOKEN, STREAM_KIND_VIDEO_FRAME,
+};
 // Observability macros live in the substrate (airc-diagnostics) so
 // every consumer reaches for them downward: `airc_lib::probe!` /
 // `airc_lib::time_probe!`. The `probe` re-export carries both the
@@ -139,6 +152,9 @@ pub use gh::client::{
 };
 pub use gh::governor::{GhBudget, Reservation};
 pub use join_context::{JoinContext, GENERAL_CHANNEL};
+pub use lan::{
+    is_tailscale_ipv4, lan_advertise_rejection, stable_lan_port, tailscale_advertise_rejection,
+};
 pub use lane_coordination::{
     LaneAction, LaneCoordinationEvent, LaneStatus, HEADER_COORD_KIND, HEADER_COORD_LANE_ID,
     HEADER_COORD_PR,
@@ -159,11 +175,13 @@ pub use registry_refresh::{
     RegistryRefreshConfig, RegistryRefreshGate, SyncOutcome, TickReport as RegistrySyncReport,
 };
 pub use room::Room;
+pub use route::delivery_ledger::{DeliveryAggregate, DeliveryLedger, PeerDeliveryStats};
 pub use route::{
     endpoints_from_json, endpoints_to_json, ImportedInvite, InviteBeacon, PeerDialFailure,
     PeerDialSkip, RouteClass, RouteDecision, RouteDiscoverySnapshot, RouteEndpoint, RoutePolicy,
     TransportCandidate, TransportHealthSample, TransportHealthState, TransportHealthTable,
     TransportKind, TransportResolver, TransportRole, TransportRoute,
+    DEAD_AFTER_CONSECUTIVE_FAILURES,
 };
 pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};
@@ -204,6 +222,7 @@ pub use airc_core::{
     body::Body,
     channel_purpose::{ChannelPurpose, ChannelPurposeEvent, ChannelPurposePublished},
     headers::{HeaderFilter, Headers},
+    identity::{Identity, PeerIdentityCard},
     transcript::MentionTarget,
     ClientId, EventId, PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId,
     TranscriptCursor, TranscriptEvent, TranscriptKind, PERSONA_CAPABILITIES_KEY,

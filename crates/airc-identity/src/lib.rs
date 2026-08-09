@@ -194,6 +194,29 @@ impl LocalIdentity {
         home: &Path,
         agent_name: impl AsRef<str>,
     ) -> Result<Self, IdentityError> {
+        Self::load_or_generate_as_with_peer_id(home, agent_name, None).await
+    }
+
+    /// Like [`load_or_generate_as`], but lets the caller pin the `peer_id`
+    /// adopted **on a fresh mint**.
+    ///
+    /// `peer_id`:
+    /// - `Some(id)` → if (and only if) this call mints a brand-new identity
+    ///   (no key + no row on disk), adopt `id` as the `peer_id` so
+    ///   `peer_id()` coheres with a host-derived identifier. See
+    ///   [`generate_and_save_as_with_peer_id`] for the rationale.
+    /// - `None` → mint a random `peer_id`, the historical behavior.
+    ///
+    /// On EVERY resume/load path the supplied id is ignored — the stored
+    /// identity is authoritative — so an existing citizen is never rotated.
+    /// The id is likewise not consulted by the "key exists, row missing"
+    /// recovery arms (multi-agent-in-one-home); those keep minting a random
+    /// `peer_id`, since a host that pins ids gives each citizen its own home.
+    pub async fn load_or_generate_as_with_peer_id(
+        home: &Path,
+        agent_name: impl AsRef<str>,
+        peer_id: Option<PeerId>,
+    ) -> Result<Self, IdentityError> {
         let agent_name = normalise_agent_name(agent_name.as_ref())?;
         let store = open_store(home).await?;
         let key_path = Self::key_path(home);
@@ -216,7 +239,14 @@ impl LocalIdentity {
                     state_exists: false,
                 }),
             },
-            (false, None) => Self::generate_and_save_as(home, &store, &agent_name).await,
+            // The ONLY fresh-mint arm: adopt the supplied peer_id if any.
+            (false, None) => match peer_id {
+                Some(peer_id) => {
+                    Self::generate_and_save_as_with_peer_id(home, &store, &agent_name, peer_id)
+                        .await
+                }
+                None => Self::generate_and_save_as(home, &store, &agent_name).await,
+            },
             (key, state) => Err(IdentityError::PartialState {
                 key_exists: key,
                 state_exists: state.is_some(),
@@ -292,13 +322,26 @@ impl LocalIdentity {
         let client_id = ClientId::new();
         let created_at_ms = now_ms()?;
 
+        // Seed the published card's nick from a NAMED citizen's
+        // agent_name (e.g. `attach_as("Claude")` / `init --as Claude`),
+        // so the very first card it publishes carries "Claude" rather
+        // than an empty name that resolves to a raw uuid for peers. The
+        // DEFAULT scope keeps an empty name — that identity is the
+        // user's, filled in later via `airc identity set`, and "default"
+        // is a discriminator, not a display name.
+        let identity = if agent_name == airc_store::DEFAULT_AGENT_NAME {
+            Identity::default()
+        } else {
+            Identity::new(agent_name)
+        };
+
         store
             .insert_local_identity(StoredLocalIdentity {
                 peer_id,
                 client_id,
                 version: IDENTITY_STATE_VERSION,
                 created_at_ms,
-                identity: Identity::default(),
+                identity,
                 agent_name: agent_name.to_string(),
             })
             .await?;
@@ -328,10 +371,42 @@ impl LocalIdentity {
         store: &SqliteEventStore,
         agent_name: impl AsRef<str>,
     ) -> Result<Self, IdentityError> {
+        // The peer_id is airc's to assign, so the default mint stamps a
+        // fresh random one. Hosts that derive an actor's identifier BEFORE
+        // attach (e.g. Continuum personas, whose name + home are projected
+        // from a `persona_id`) use `generate_and_save_as_with_peer_id` to make
+        // the two cohere.
+        Self::generate_and_save_as_with_peer_id(home, store, agent_name, PeerId::new()).await
+    }
+
+    /// Like [`generate_and_save_as`], but ADOPTS a caller-supplied `peer_id`
+    /// instead of minting a random one.
+    ///
+    /// The `peer_id` is a stable uuid airc assigns and persists — it is NOT a
+    /// hash of the keypair (the keypair is separate signing material, still
+    /// freshly generated here). So there is no cryptographic reason it must be
+    /// minted inside airc: an embedding host that has already derived an
+    /// identifier can hand it in, and `peer_id()` will equal it.
+    ///
+    /// The motivating consumer is Continuum's per-persona runtime: a persona's
+    /// `agent_name` (and thus her home directory) is projected from a
+    /// `persona_id` chosen before `attach_as` runs. Passing that `persona_id`
+    /// here as the `peer_id` makes `airc.peer_id() == persona_id == the seed her
+    /// name was derived from` — coherent identity from birth, with no
+    /// throwaway-uuid divergence to collapse after the fact.
+    ///
+    /// This is the FRESH-mint path only. A resumed identity (key + row already
+    /// on disk) loads its stored `peer_id`; a supplied one is never consulted,
+    /// so an existing citizen's identity is never rotated.
+    pub async fn generate_and_save_as_with_peer_id(
+        home: &Path,
+        store: &SqliteEventStore,
+        agent_name: impl AsRef<str>,
+        peer_id: PeerId,
+    ) -> Result<Self, IdentityError> {
         let agent_name = normalise_agent_name(agent_name.as_ref())?;
         ensure_home_dir(home)?;
         let keypair = PeerKeypair::generate();
-        let peer_id = PeerId::new();
         let client_id = ClientId::new();
         let created_at_ms = now_ms()?;
 
@@ -537,6 +612,49 @@ mod tests {
             .unwrap();
         assert_eq!(default_row.peer_id, default.peer_id);
         assert_eq!(codex_row.peer_id, codex.peer_id);
+    }
+
+    #[tokio::test]
+    async fn fresh_mint_adopts_a_supplied_peer_id_but_resume_ignores_it() {
+        // what this catches: the coherence contract Continuum relies on — a
+        // fresh mint stamps the caller's peer_id (so name/home/peer_id cohere
+        // from birth), while a resume keeps the STORED identity even if a
+        // different peer_id is supplied (an existing citizen is never rotated).
+        let home = TempDir::new().unwrap();
+        let chosen = PeerId::new();
+
+        let first =
+            LocalIdentity::load_or_generate_as_with_peer_id(home.path(), "helper", Some(chosen))
+                .await
+                .unwrap();
+        assert_eq!(
+            first.peer_id, chosen,
+            "fresh mint must adopt the supplied peer_id"
+        );
+
+        // Resume with a DIFFERENT supplied id — the stored one wins.
+        let other = PeerId::new();
+        assert_ne!(other, chosen);
+        let second =
+            LocalIdentity::load_or_generate_as_with_peer_id(home.path(), "helper", Some(other))
+                .await
+                .unwrap();
+        assert_eq!(
+            second.peer_id, chosen,
+            "resume must ignore a supplied peer_id"
+        );
+        assert_eq!(
+            first.keypair.secret_bytes(),
+            second.keypair.secret_bytes(),
+            "resume keeps the same keypair"
+        );
+
+        // And the None path still mints a random id (historical behavior).
+        let home2 = TempDir::new().unwrap();
+        let random = LocalIdentity::load_or_generate_as_with_peer_id(home2.path(), "helper", None)
+            .await
+            .unwrap();
+        assert_ne!(random.peer_id, chosen);
     }
 
     #[test]

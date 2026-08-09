@@ -47,10 +47,12 @@
 //! [`resolve`] which uses the gh+git fallback resolver. Tests pass
 //! a fixed-string closure.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use airc_store::{EventStore, StoredMeshIdentity};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::subscriptions::MeshIdentity;
 
@@ -355,16 +357,95 @@ fn run_command(argv: &[&str]) -> Option<String> {
 /// Last-resort identity: `local:<host>:<user>`. Deterministic per
 /// machine+user but does NOT converge across machines or with the
 /// operator's `gh` identity — the operator should know about this.
+///
+/// Cross-platform: on Windows the POSIX probes ALL fail (`HOSTNAME`
+/// and `USER`/`LOGNAME` env vars don't exist; `hostname -s` is
+/// rejected by Windows hostname.exe), which used to collapse every
+/// Windows machine onto the SAME degenerate
+/// `local:unknown-host:unknown-user` identity — the exact fingerprint
+/// of the M5↔bigmama blind-room bug (bigmama's `#general` derived to
+/// `eef18336-…` under that identity while M5 derived `5eedf7b1-…`
+/// under the gh login, so every room frame between them died as
+/// `unknown_channel`). `COMPUTERNAME`/`USERNAME` are the Windows
+/// equivalents; bare `hostname` (no flag) works on every platform.
 fn local_fallback_identity() -> String {
-    let host = std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| run_command(&["hostname", "-s"]))
-        .unwrap_or_else(|| "unknown-host".to_string());
-    let user = std::env::var("USER")
-        .ok()
-        .or_else(|| std::env::var("LOGNAME").ok())
-        .unwrap_or_else(|| "unknown-user".to_string());
-    format!("local:{host}:{user}")
+    local_fallback_identity_with(&|name| std::env::var(name).ok(), &run_command, &machine_id)
+}
+
+/// The machine-account airc home (`~/.airc`) — shared by EVERY scope on
+/// this machine, so [`machine_id`] resolves to one value per machine
+/// rather than per project scope (which would re-fragment the mesh). Not
+/// `$AIRC_HOME`: that points at the current project scope, not the machine.
+fn machine_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE")) // Windows
+        .map(|h| PathBuf::from(h).join(".airc"))
+}
+
+/// Stable, machine-wide unique id — persisted once at `~/.airc/machine-id`
+/// and reused by every scope. The canonical machine key: it keeps the
+/// last-resort local identity DISTINCT across machines (never the
+/// colliding `unknown-host`) and is the single key for the account-registry
+/// gist name (one gist per machine, regardless of how `hostname` resolves —
+/// see `gh::account_registry::writer_key`). If the home is unwritable it
+/// degrades to a per-process id — still distinct across machines, just not
+/// persisted.
+pub(crate) fn machine_id() -> String {
+    if let Some(home) = machine_home() {
+        let path = home.join("machine-id");
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let fresh = Uuid::new_v4().simple().to_string();
+        let _ = std::fs::create_dir_all(&home);
+        let _ = std::fs::write(&path, &fresh);
+        return fresh;
+    }
+    Uuid::new_v4().simple().to_string()
+}
+
+/// Injectable core of [`local_fallback_identity`] — env, command, and
+/// machine-id lookups passed in so tests can pin the per-platform
+/// fallback chain without mutating process globals or the real home.
+fn local_fallback_identity_with(
+    env: &dyn Fn(&str) -> Option<String>,
+    run: &dyn Fn(&[&str]) -> Option<String>,
+    machine_id: &dyn Fn() -> String,
+) -> String {
+    let non_empty = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    let host = non_empty(env("HOSTNAME"))
+        .or_else(|| non_empty(env("COMPUTERNAME"))) // Windows
+        .or_else(|| non_empty(run(&["hostname", "-s"])))
+        .or_else(|| non_empty(run(&["hostname"]))); // Windows hostname.exe rejects -s
+    let user = non_empty(env("USER"))
+        .or_else(|| non_empty(env("LOGNAME")))
+        .or_else(|| non_empty(env("USERNAME"))); // Windows
+
+    match (host, user) {
+        (Some(host), Some(user)) => format!("local:{host}:{user}"),
+        (host, user) => {
+            // Total/partial probe failure: NEVER emit the colliding
+            // `local:unknown-host:unknown-user` fingerprint that collapses
+            // every such machine onto ONE identity (the M5<->bigmama
+            // blind-room root cause — divergent `#general` UUIDs, so every
+            // frame between them died as `unknown_channel`). Anchor the
+            // degraded identity to the stable machine-id so it stays
+            // DISTINCT across machines, and shout so it is never silent.
+            let mid = machine_id();
+            let short = &mid[..mid.len().min(12)];
+            let host = host.unwrap_or_else(|| format!("machine-{short}"));
+            let user = user.unwrap_or_else(|| format!("machine-{short}"));
+            eprintln!(
+                "airc: WARN mesh identity: host/user probe failed; using stable machine-id \
+                 fallback `local:{host}:{user}` (distinct per machine, self-heals to your gh \
+                 login once reachable). Fix gh auth / hostname resolution to converge rooms."
+            );
+            format!("local:{host}:{user}")
+        }
+    }
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {
@@ -578,6 +659,78 @@ mod tests {
         save(&store, &entry).await.unwrap();
         let loaded = load_cached(&store).await.unwrap().unwrap();
         assert_eq!(loaded, entry);
+    }
+
+    /// what this catches (M5↔bigmama blind room, root cause): on
+    /// Windows the POSIX env probes all miss, and the old chain
+    /// collapsed to `local:unknown-host:unknown-user` — the SAME
+    /// degenerate identity on every Windows box, silently forking room
+    /// UUID derivation from the account identity. The fallback must
+    /// consult the Windows equivalents before giving up.
+    #[test]
+    fn local_fallback_uses_windows_env_names() {
+        let windows_env = |name: &str| match name {
+            "COMPUTERNAME" => Some("BigMama".to_string()),
+            "USERNAME" => Some("joelt".to_string()),
+            _ => None,
+        };
+        // Windows hostname.exe: `-s` fails (non-zero exit → None),
+        // bare `hostname` would answer — but env wins first.
+        let no_command = |_argv: &[&str]| None;
+        let mid = || "test-machine-id".to_string();
+        assert_eq!(
+            local_fallback_identity_with(&windows_env, &no_command, &mid),
+            "local:BigMama:joelt"
+        );
+    }
+
+    /// what this catches: `hostname -s` failing (Windows) must fall
+    /// through to bare `hostname`, and empty/whitespace probe output
+    /// must not be accepted as a host or user component.
+    #[test]
+    fn local_fallback_hostname_flag_fallthrough_and_empty_rejection() {
+        let empty_env = |name: &str| match name {
+            // Empty values are as bad as missing — never accept them.
+            "HOSTNAME" => Some("   ".to_string()),
+            "USERNAME" => Some("joelt".to_string()),
+            _ => None,
+        };
+        let windows_hostname = |argv: &[&str]| match argv {
+            ["hostname"] => Some("BigMama".to_string()),
+            _ => None, // `hostname -s` → non-zero exit on Windows
+        };
+        let mid = || "test-machine-id".to_string();
+        assert_eq!(
+            local_fallback_identity_with(&empty_env, &windows_hostname, &mid),
+            "local:BigMama:joelt"
+        );
+    }
+
+    /// what this catches (regression for the M5↔bigmama blind-room bug):
+    /// when EVERY host/user probe fails (bare daemon process — no env, no
+    /// hostname), the fallback must NOT emit the colliding
+    /// `local:unknown-host:unknown-user` fingerprint that collapses every
+    /// such machine onto one identity. It must anchor to the stable
+    /// machine-id so two probe-blind machines get DISTINCT identities.
+    #[test]
+    fn local_fallback_uses_machine_id_when_all_probes_fail() {
+        let no_env = |_name: &str| None;
+        let no_command = |_argv: &[&str]| None;
+        let id_a = || "aaaaaaaabbbbccccdddd".to_string();
+        let id_b = || "1111111122223333eeee".to_string();
+
+        let a = local_fallback_identity_with(&no_env, &no_command, &id_a);
+        let b = local_fallback_identity_with(&no_env, &no_command, &id_b);
+
+        assert!(
+            !a.contains("unknown-host") && !a.contains("unknown-user"),
+            "must never emit the colliding sentinel identity, got {a}"
+        );
+        assert_ne!(
+            a, b,
+            "two machines with distinct machine-ids must NOT collide"
+        );
+        assert_eq!(a, "local:machine-aaaaaaaabbbb:machine-aaaaaaaabbbb");
     }
 
     #[test]

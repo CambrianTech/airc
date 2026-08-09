@@ -282,12 +282,20 @@ pub async fn sync_once(
 /// loop). `shutdown` is awaited via a single pinned future so a
 /// `notify_waiters()` landing between ticks is never lost (the exact
 /// hazard `server::run` documents).
+/// `route_wake` is the MIRROR of `resync` (#240 event-driven heal): after
+/// every tick that actually imports (fresh beacons/endpoints just landed in
+/// the trust store), this notifies the route-refresh loop so it dials those
+/// endpoints IMMEDIATELY instead of waiting out the remainder of its own
+/// interval. Only fires on a real import (not a gate-skip or failed tick), so
+/// steady-state adds at most one nudge per cadence, and the woken refresh is a
+/// cheap no-op when every peer is already connected.
 pub async fn run_loop<S>(
     airc: Airc,
     store: S,
     gate: RegistryRefreshGate,
     config: RegistryRefreshConfig,
     resync: &tokio::sync::Notify,
+    route_wake: &tokio::sync::Notify,
     shutdown: impl Future<Output = ()>,
 ) where
     S: AccountRegistryStore,
@@ -312,11 +320,29 @@ pub async fn run_loop<S>(
             // spam). `Notify` stores one permit if the nudge lands during
             // a tick, so the wakeup is never lost.
             _ = resync.notified() => {
-                gated_tick(&gate, &airc, &store, &sink).await;
+                honor(gated_tick(&gate, &airc, &store, &sink).await, route_wake).await;
             }
             _ = ticker.tick() => {
-                gated_tick(&gate, &airc, &store, &sink).await;
+                honor(gated_tick(&gate, &airc, &store, &sink).await, route_wake).await;
             }
+        }
+    }
+}
+
+/// Act on a tick's outcome: nudge route-refresh when something landed,
+/// and — the part that was missing — actually SLEEP OUT a governor denial.
+///
+/// The governor already computed "retry in N seconds" and the loop used to
+/// throw it away, coming back on its own cadence to be refused again. The
+/// account registry is how peers discover each other, so a permanently
+/// refused registry is a permanently blind node. Sleeping here is what
+/// turns the governor's advice into backpressure.
+async fn honor(outcome: TickOutcome, route_wake: &tokio::sync::Notify) {
+    match outcome {
+        TickOutcome::Imported => route_wake.notify_one(),
+        TickOutcome::NoChange => {}
+        TickOutcome::RateLimited { retry_after_secs } => {
+            tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
         }
     }
 }
@@ -326,12 +352,34 @@ pub async fn run_loop<S>(
 /// on failure; callers deliberately swallow the `Err` and keep ticking
 /// (self-heal: a transient gh failure must not kill discovery for the
 /// daemon's lifetime).
+///
+/// Returns `true` iff a publish+refresh actually RAN AND SUCCEEDED — i.e.
+/// fresh beacons/endpoints were imported into the trust store this tick.
+/// The loop uses that to nudge the route-refresh loop (#240 event-driven
+/// heal): a gate-skip or a failed import imported nothing, so there is
+/// nothing newly-dialable to wake for.
+/// What one gated tick did, for a caller that must react differently to
+/// "nothing changed" and "the door is shut for N seconds".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// Publish+refresh ran and succeeded — fresh beacons/endpoints landed
+    /// in the trust store, so there is something newly dialable.
+    Imported,
+    /// Skipped or failed without a governor denial. Next tick on cadence.
+    NoChange,
+    /// The gh governor refused: its window is full. The caller MUST wait
+    /// this long before the next attempt — retrying sooner is what kept
+    /// the budget permanently exhausted and discovery permanently starved.
+    RateLimited { retry_after_secs: u64 },
+}
+
 async fn gated_tick<S>(
     gate: &RegistryRefreshGate,
     airc: &Airc,
     store: &S,
     sink: &StderrJsonDiagnosticSink,
-) where
+) -> TickOutcome
+where
     S: AccountRegistryStore,
 {
     if let Some(block) = gate.block().await {
@@ -344,9 +392,15 @@ async fn gated_tick<S>(
             code,
             format!("account registry tick skipped: {block}"),
         ));
-        return;
+        return TickOutcome::NoChange;
     }
-    let _ = run_tick(airc, store, sink).await;
+    match run_tick(airc, store, sink).await {
+        Ok(_) => TickOutcome::Imported,
+        Err(crate::AircError::AccountRegistry(
+            crate::account_registry::AccountRegistryError::RateLimited { retry_after_secs },
+        )) => TickOutcome::RateLimited { retry_after_secs },
+        Err(_) => TickOutcome::NoChange,
+    }
 }
 
 #[cfg(test)]
@@ -641,6 +695,87 @@ exit 1
         }
     }
 
+    // Self-healing join — publish-on-bind. The daemon nudges
+    // `endpoint_resync` the moment it binds a listen socket (restart on
+    // a possibly-NEW port); `Notify` stores that permit, so the loop
+    // must publish IMMEDIATELY on start instead of sitting out the
+    // first_tick/cadence while every peer keeps dialing the dead port.
+    //
+    // what this catches: a restart's fresh advertisement waiting a full
+    // first-tick (or worse, a cadence) before reaching the rendezvous.
+    // Both first_tick and cadence are set far beyond the test budget,
+    // so the ONLY way the document can appear on the store in time is
+    // the pre-loop resync permit. Mutation check: dropping the
+    // `resync.notified()` arm from `run_loop`'s select (or notifying
+    // after the permit is lost) times the wait out.
+    #[tokio::test]
+    async fn pre_loop_resync_permit_publishes_immediately_not_at_first_tick() {
+        let dir = tempdir().unwrap();
+        let machine = dir.path().join("machine/.airc");
+        let wire = dir.path().join("wire");
+        write_identity(&wire).await;
+        let store = sqlite_registry_store_at(&dir.path().join("rendezvous")).await;
+        let airc = Airc::open_with_wire_root_for_test(&machine, &wire)
+            .await
+            .unwrap();
+        airc.join("general").await.unwrap();
+
+        let resync = Arc::new(tokio::sync::Notify::new());
+        // The bind site nudges BEFORE the loop starts — the permit must
+        // not be lost.
+        resync.notify_one();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let config = RegistryRefreshConfig {
+            // Far beyond the bounded wait below: only the resync permit
+            // can publish in time.
+            first_tick: Duration::from_secs(3600),
+            cadence: Duration::from_secs(3600),
+        };
+        let loop_airc = airc.clone();
+        let loop_store = store.clone();
+        let loop_resync = resync.clone();
+        let handle = tokio::spawn(async move {
+            let loop_wake = tokio::sync::Notify::new();
+            run_loop(
+                loop_airc,
+                loop_store,
+                RegistryRefreshGate::Always,
+                config,
+                &loop_resync,
+                &loop_wake,
+                async move {
+                    let _ = rx.await;
+                },
+            )
+            .await;
+        });
+
+        // Bounded poll: the published document must land well before the
+        // 3600s first tick could ever fire.
+        let mesh = crate::subscriptions::MeshIdentity::new("joelteply");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut published = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(doc) = store.refresh(&mesh).await.unwrap() {
+                published = Some(doc);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let doc = published.expect(
+            "a pre-loop resync permit (publish-on-bind) must publish immediately, \
+             not at the first cadence tick",
+        );
+        assert!(
+            doc.peers.iter().any(|p| p.peer_id() == airc.peer_id()),
+            "the immediate publish must carry this node's own beacon"
+        );
+
+        tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
     // The loop honors shutdown promptly even with a long cadence —
     // proves the pinned-shutdown wiring (bounded by the 1s test budget).
     #[tokio::test]
@@ -662,12 +797,14 @@ exit 1
         };
         let handle = tokio::spawn(async move {
             let resync = tokio::sync::Notify::new();
+            let route_wake = tokio::sync::Notify::new();
             run_loop(
                 airc,
                 store,
                 RegistryRefreshGate::Always,
                 config,
                 &resync,
+                &route_wake,
                 async move {
                     let _ = rx.await;
                 },
@@ -682,5 +819,41 @@ exit 1
             .await
             .expect("loop must exit promptly on shutdown")
             .unwrap();
+    }
+
+    /// what this catches: the starvation half of the 2026-08-04 M5 ghost —
+    /// 4,951 governor denials in one daemon log while the account registry
+    /// (how peers FIND each other) stayed permanently refused. The governor
+    /// had already computed "retry in N seconds"; the loop threw it away and
+    /// came back on its own cadence to be refused again. Advisory backoff is
+    /// not backoff. `honor` must actually SLEEP the requested window.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_tick_actually_waits_out_the_governors_window() {
+        let wake = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        honor(
+            TickOutcome::RateLimited {
+                retry_after_secs: 60,
+            },
+            &wake,
+        )
+        .await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(60),
+            "a governor denial must be waited out, not logged and retried"
+        );
+    }
+
+    /// what this catches: the backoff must not become a stall. A tick that
+    /// imported (or simply changed nothing) returns immediately — only a
+    /// denial costs wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_normal_tick_costs_no_wall_clock() {
+        let wake = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        honor(TickOutcome::Imported, &wake).await;
+        honor(TickOutcome::NoChange, &wake).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(0));
     }
 }

@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use airc_bus::{BusError, Clock, EventRouter, RouterConfig, SeqSource, SystemClock};
 use airc_core::PeerId;
-use airc_ipc::IpcRouteEndpoint;
+use airc_ipc::{IpcPeerDeliveryStats, IpcRouteEndpoint};
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, SqliteDurableSink};
 
@@ -75,6 +75,13 @@ pub struct DaemonState {
     /// counter each tick — exactly the wiring split used for
     /// `route_endpoints`. `0` until the first refresh completes.
     pub connected_lan_peers: Arc<AtomicUsize>,
+    /// #1306 slice 2: per-peer delivery-ledger snapshot, served via
+    /// `Request::DeliveryStats`. Same wiring split as
+    /// `connected_lan_peers`: the concrete ledger lives on an
+    /// `airc-lib` handle this crate must not depend on, so the host's
+    /// route-refresh loop writes this snapshot each tick. Empty until
+    /// the first refresh after any cross-machine forward.
+    pub delivery_stats: Arc<RwLock<Vec<IpcPeerDeliveryStats>>>,
     /// Edge-triggered resync nudge for the account-registry loop. The
     /// route-refresh loop detects this node's own LAN/Tailscale IP
     /// changing (router swap, DHCP renew, Tailscale toggle) and, ONLY when
@@ -85,6 +92,18 @@ pub struct DaemonState {
     /// airc-lib-owning host loops hold the `Airc` handle, this crate does
     /// not depend on airc-lib.
     pub endpoint_resync: Arc<Notify>,
+    /// Edge-triggered wake nudge for the route-refresh loop — the MIRROR of
+    /// [`Self::endpoint_resync`]. The account-registry loop notifies this the
+    /// moment it completes an import (fresh beacons / endpoints just landed in
+    /// the trust store), so freshly-advertised endpoints for a currently-
+    /// disconnected peer are DIALED immediately instead of waiting up to a full
+    /// route-refresh interval (#240 event-driven heal). In steady state (every
+    /// peer already connected) the nudged refresh is a cheap no-op — connected
+    /// peers are skipped and the quarantine/ghost gates still apply — so it does
+    /// real work only when a reconnect is actually pending. Shared like
+    /// `endpoint_resync`: both loops live in the airc-lib-owning host, and this
+    /// crate does not depend on airc-lib.
+    pub route_wake: Arc<Notify>,
 }
 
 impl DaemonState {
@@ -129,7 +148,9 @@ impl DaemonState {
             runtime,
             route_endpoints: RwLock::new(Vec::new()),
             connected_lan_peers: Arc::new(AtomicUsize::new(0)),
+            delivery_stats: Arc::new(RwLock::new(Vec::new())),
             endpoint_resync: Arc::new(Notify::new()),
+            route_wake: Arc::new(Notify::new()),
         })
     }
 

@@ -22,7 +22,7 @@ use airc_core::PeerId;
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
 use airc_lib::{Airc, PeerSpec};
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
-use airc_store::{EventStore, InMemoryEventStore};
+use airc_store::{EventStore, SqliteEventStore};
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
@@ -40,7 +40,12 @@ pub struct DaemonFixture {
     pub socket: PathBuf,
     state: Arc<DaemonState>,
     handle: JoinHandle<()>,
-    _home: TempDir,
+    home: PathBuf,
+    /// Present only when this fixture owns its home (standalone
+    /// [`start`]); `None` when a [`Machine`] owns the shared root and
+    /// lends it via [`start_in`], so the daemon and every scope resolve
+    /// ONE machine-account home.
+    _owned_home: Option<TempDir>,
 }
 
 impl DaemonFixture {
@@ -52,7 +57,27 @@ impl DaemonFixture {
             socket,
             state,
             handle,
-            _home: home,
+            home: home.path().to_path_buf(),
+            _owned_home: Some(home),
+        }
+    }
+
+    /// Like [`start`], but roots the daemon at a caller-owned `home` so
+    /// the daemon's coordinator store (`home/events.sqlite`) is the SAME
+    /// on-disk machine-account sqlite attached scopes write their durable
+    /// identity index to (`wire_root/events.sqlite`). Faithful to
+    /// production `run_daemon`, where the daemon and every scope resolve
+    /// one `machine_account_home/events.sqlite` — so a scope's identity
+    /// write is visible to the daemon's `peer_identity_card` IPC read.
+    pub async fn start_in(home: PathBuf) -> Self {
+        let socket = unique_socket();
+        let (state, handle) = Self::spawn_on(&home, socket.clone()).await;
+        Self {
+            socket,
+            state,
+            handle,
+            home,
+            _owned_home: None,
         }
     }
 
@@ -71,7 +96,20 @@ impl DaemonFixture {
         registry
             .enrol(peer_id, 0, keypair.public_bytes())
             .expect("enrol self");
-        let coordinator: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
+        // Production faithfulness (`run_daemon`, commands.rs): the
+        // daemon's coordinator store is a Sqlite over the SAME
+        // `home/events.sqlite` the router transcript uses AND that
+        // attached scopes resolve as their coordinator
+        // (`wire_root/events.sqlite`). A scope writes its identity index
+        // there (`record_peer_identity_card`); the daemon reads it back
+        // in `handle_peer_identity_card`. An `InMemoryEventStore` here is
+        // disjoint from that on-disk file, so every daemon-side identity /
+        // alias lookup returned `None` — the durable-index bug this fixes.
+        let coordinator: Arc<dyn EventStore> = Arc::new(
+            SqliteEventStore::open_path(&db_path)
+                .await
+                .expect("coordinator store"),
+        );
         let state = Arc::new(
             DaemonState::build(
                 peer_id,
@@ -118,7 +156,7 @@ impl DaemonFixture {
         let _ = tokio::time::timeout(Duration::from_secs(3), &mut self.handle).await;
         let _ = std::fs::remove_file(&self.socket);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let (state, handle) = Self::spawn_on(self._home.path(), self.socket.clone()).await;
+        let (state, handle) = Self::spawn_on(&self.home, self.socket.clone()).await;
         self.state = state;
         self.handle = handle;
     }
@@ -144,10 +182,14 @@ pub struct Machine {
 
 impl Machine {
     pub async fn boot() -> Self {
-        Self {
-            daemon: DaemonFixture::start().await,
-            root: TempDir::new().expect("machine root"),
-        }
+        // ONE machine-account home: the daemon roots at the SAME `root`
+        // every scope attaches against, so `root/events.sqlite` is the
+        // single coordinator store the daemon writes/reads AND scopes
+        // resolve as their `wire_root` — mirroring production, where the
+        // daemon and every scope share `machine_account_home/events.sqlite`.
+        let root = TempDir::new().expect("machine root");
+        let daemon = DaemonFixture::start_in(root.path().to_path_buf()).await;
+        Self { daemon, root }
     }
 
     /// Hard-restart this machine's daemon (same socket + durable db).
@@ -160,6 +202,18 @@ impl Machine {
     /// (`<root>/events.sqlite`), i.e. the machine coordinator store.
     pub fn wire_root(&self) -> &std::path::Path {
         self.root.path()
+    }
+
+    /// Pin this machine's mesh identity (Operator-source, never
+    /// re-resolved) into the shared coordinator store every attached
+    /// scope resolves against. Call BEFORE the first `attach`/`join`
+    /// so no scope ever falls through to the live gh/git resolver.
+    /// See [`pin_identity`] for the shared-state class this kills.
+    pub async fn pin_identity(&self, identity: &str) {
+        let store = SqliteEventStore::open_path(&self.root.path().join("events.sqlite"))
+            .await
+            .expect("open machine coordinator store for identity pin");
+        pin_identity(&store, identity).await;
     }
 
     /// Attach a new scope ("tab"/agent) to this machine's daemon.
@@ -191,6 +245,32 @@ impl Machine {
         bob.join(room).await.expect("bob joins room");
         (alice, bob)
     }
+}
+
+/// Pin a mesh identity into `store` with an `Operator`-source cache
+/// entry — trusted as-is, never expired, never re-resolved — so
+/// identity-sensitive tests are hermetic. Shared-state class this
+/// kills: the default mesh-identity resolver reads LIVE HOST STATE
+/// shared by every parallel test — `gh api user` (network + gh auth,
+/// 3s kill-deadline), `git config user.email`, and on total probe
+/// failure the REAL `~/.airc/machine-id` — so its outcome varies with
+/// suite load and box configuration, and a provisional (non-gh) result
+/// re-probes `gh` on every later resolve. An Operator pin short-circuits
+/// all of it: no shell-outs, no real-home writes, deterministic RoomId
+/// derivation on any box.
+pub async fn pin_identity(store: &dyn EventStore, identity: &str) {
+    airc_lib::mesh_identity::save(
+        store,
+        &airc_lib::CachedIdentity {
+            version: 1,
+            identity: identity.to_string(),
+            source: airc_lib::mesh_identity::Source::Operator,
+            resolved_at_ms: 1,
+            ttl_ms: airc_lib::mesh_identity::DEFAULT_TTL_MS,
+        },
+    )
+    .await
+    .expect("pin mesh identity");
 }
 
 /// Mutually trust two scopes (each enrols the other's pinned key) so

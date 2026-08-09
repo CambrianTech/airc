@@ -9,7 +9,6 @@ use fs2::FileExt;
 use serde_json::Value;
 
 const DEFAULT_MAX_REQUESTS_PER_MIN: usize = 30;
-const LOCAL_THROTTLE_BACKOFF_SEC: f64 = 60.0;
 
 pub(crate) fn reserve_guarded_request(
     args: &[String],
@@ -25,11 +24,24 @@ pub(crate) fn reserve_guarded_request(
     }
     let count = recent_request_count(now)?;
     let limit = max_requests_per_min();
-    if count >= limit {
-        write_backoff(now + LOCAL_THROTTLE_BACKOFF_SEC)?;
+    // Starvation fix (task #288, 2026-08-01), mirroring
+    // airc-lib::gh::governor::reserve_class — this CLI path hosts the
+    // BEACON/channel polling traffic, so it is capped below the shared
+    // limit to leave airc-lib's REGISTRY_FLOOR untouchable: registry
+    // convergence must always find budget no matter how hot polling
+    // runs (the 33k-error empty-registry incident). And a LOCAL exceed
+    // no longer arms the SHARED backoff — that let one noisy poller
+    // lock out every caller (registry included) for 60s repeatedly;
+    // the sliding window is already self-limiting, and the shared
+    // backoff stays exclusively GitHub's own voice (note_rate_limit).
+    // Eventual single owner: delegate this whole fn to the lib
+    // governor (two implementations over one budget file is the
+    // registry_bridge smell).
+    let cap = limit.saturating_sub(airc_lib::gh::governor::REGISTRY_FLOOR);
+    if count >= cap {
         return Ok((
             false,
-            format!("local request budget exceeded ({count}/{limit} in 60s)"),
+            format!("local request budget exceeded ({count}/{cap} of {limit} in 60s)"),
         ));
     }
     if guarded_command(args) {

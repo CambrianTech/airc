@@ -74,9 +74,9 @@ pub async fn run_release(
     Ok(())
 }
 
-pub async fn run_list(home: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_list(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let board = airc.work_board(limit).await?;
+    let board = airc.work_board().await?;
     print_workspaces(&board);
     Ok(())
 }

@@ -157,13 +157,25 @@ pub enum WorkAction {
         #[arg(long)]
         force: bool,
     },
-    /// Print the current room's projected work board.
+    /// Print a room's projected work board (the current room by default).
     ///
     /// `--available`, `--mine`, `--others` are mutually exclusive filters
     /// over the projection so peers can see their slice fast (kink
     /// b408698c). When none are passed, the full board is shown.
+    ///
+    /// The output always names the room it read, with or without `--room`
+    /// (continuum #345) — a board for the wrong room looks exactly like a
+    /// board for the right one, so the reader needs the scope in the answer,
+    /// not only in the question.
     Board {
-        /// Recent transcript events to replay into the projection.
+        /// Read this room's board instead of the current room. Accepts a
+        /// channel name or a channel id, and must already be subscribed
+        /// (this never auto-joins).
+        #[arg(long)]
+        room: Option<String>,
+        /// Maximum card rows to display (newest kept). The projection
+        /// itself is always complete — continuum #154: the old
+        /// recent-window read lost durable cards to chat traffic.
         #[arg(long, default_value_t = 128)]
         limit: usize,
         /// Show only cards available to claim now: no active claim, or

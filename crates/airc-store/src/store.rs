@@ -13,6 +13,7 @@ use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::refresh_lock::StoredRefreshLockOutcome;
+use crate::scoped_state::StoredScopedState;
 use crate::subscriptions::StoredSubscription;
 
 /// Durable transcript event store.
@@ -141,6 +142,31 @@ pub trait EventStore: Send + Sync {
 
     /// Upsert the cached mesh identity row for its `scope`.
     async fn save_mesh_identity(&self, entry: StoredMeshIdentity) -> Result<(), StoreError>;
+
+    /// Load one generic scoped-state row by its `(scope_key, key)`, if
+    /// present. See [`crate::scoped_state`] for the scope encoding.
+    async fn get_scoped_state(
+        &self,
+        scope_key: &str,
+        key: &str,
+    ) -> Result<Option<StoredScopedState>, StoreError>;
+
+    /// Upsert one generic scoped-state row. Last write wins: the store
+    /// records `value_json` / `version` / `updated_at_ms` verbatim and
+    /// never parses the value or arbitrates the version — consumers own
+    /// those semantics.
+    async fn set_scoped_state(&self, entry: StoredScopedState) -> Result<(), StoreError>;
+
+    /// List every scoped-state row under `scope_key`, `key` ascending.
+    /// Backs dashboard / RAG enumeration of a scope's walls.
+    async fn list_scoped_state(
+        &self,
+        scope_key: &str,
+    ) -> Result<Vec<StoredScopedState>, StoreError>;
+
+    /// Delete one scoped-state row by `(scope_key, key)`. Deleting a
+    /// missing row is not an error (idempotent).
+    async fn delete_scoped_state(&self, scope_key: &str, key: &str) -> Result<(), StoreError>;
 
     /// Load the caller's own account-mesh beacon for `mesh_identity`,
     /// if present.

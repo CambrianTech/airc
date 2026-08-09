@@ -15,14 +15,17 @@ use std::sync::Arc;
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
 use airc_bus::{Clock, Seq, SystemClock};
+use airc_core::scoped_state::{ScopeRef, PEER_IDENTITY_STATE_KEY};
 use airc_core::{Body, ClientId, PeerId, RoomId};
 use airc_ipc::request::{
-    AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
-    RemovePeerRequest, Request, RoomTipRequest, SendRequest,
+    AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
+    PeerIdentityCardRequest, PublishRequest, RemovePeerRequest, Request, RoomTipRequest,
+    SendRequest,
 };
 use airc_ipc::response::{
-    InboxResponse, PeerEntry, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    RouteEndpointsResponse, StatusResponse,
+    DeliveryStatsResponse, InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry,
+    PeerIdentityCardResponse, PeersResponse, PublishResponse, Response, RoomTipResponse,
+    RoomsResponse, RouteEndpointsResponse, StatusResponse,
 };
 use bytes::Bytes;
 
@@ -53,12 +56,20 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::RoomTip(tip) => handle_room_tip(state, tip).await,
+        Request::PeerIdentityCard(req) => handle_peer_identity_card(state, req).await,
         Request::Attach(_) => Response::Error {
             message: "attach is a streaming request handled by the server".to_string(),
         },
         Request::AddPeer(add) => handle_add_peer(state, add).await,
         Request::RemovePeer(remove) => handle_remove_peer(state, remove).await,
         Request::ListPeers => handle_list_peers(state).await,
+        Request::ListRooms => handle_list_rooms(state).await,
+        // #1306 slice 2: serve the host-written delivery-ledger snapshot
+        // — the delivery-truth read behind doctor's "last confirmed
+        // delivery to X: N ago".
+        Request::DeliveryStats => Response::DeliveryStats(DeliveryStatsResponse {
+            peers: state.delivery_stats.read().await.clone(),
+        }),
         // Card 4b6a0ffa (#33): serve the endpoints the registry glue
         // recorded after binding its listener. Empty means "up but not
         // dialable" — the client decides what that implies.
@@ -210,19 +221,46 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
         }
     };
     let limit = request.limit.unwrap_or(INBOX_DEFAULT_LIMIT);
+    // Continuum #297: the kinds filter is applied BEFORE `limit`, so
+    // the page is "the newest N events OF THESE KINDS" — never the
+    // survivors of a raw newest-N (three personas streaming ~4
+    // StreamChunk frames/sec evict every Message from a 50-event page,
+    // deafening working personas to direction; post-filtering
+    // client-side yields crumbs). `None` AND the empty vec both mean
+    // unfiltered: filtering to nothing is never what a caller means,
+    // so an empty list is treated as absent rather than answered with
+    // a vacuously empty page.
+    let kinds: Option<Vec<Kind>> = request
+        .kinds
+        .as_ref()
+        .filter(|kinds| !kinds.is_empty())
+        .map(|kinds| kinds.iter().map(|k| map_kind(*k)).collect());
     let events = match request.since {
         // "Most recent N" when no cursor (card 8428ae8c): reverse-paged
         // at the store layer — work bounded by N (ring tail + at most
         // one indexed `page_tail`), NEVER a full-room replay truncated
-        // in memory. `durable_tail` is durable-only by contract.
-        None => match state.router.durable_tail(channel, limit).await {
-            Ok(events) => events,
-            Err(error) => {
-                return Response::Error {
-                    message: format!("inbox: {error}"),
+        // in memory. `durable_tail` is durable-only by contract; the
+        // kinds-filtered leg rides the same merge with the kind
+        // predicate pushed into both the ring scan and the sink query.
+        None => {
+            let tail = match &kinds {
+                None => state.router.durable_tail(channel, limit).await,
+                Some(kinds) => {
+                    state
+                        .router
+                        .durable_tail_of_kinds(channel, kinds, limit)
+                        .await
+                }
+            };
+            match tail {
+                Ok(events) => events,
+                Err(error) => {
+                    return Response::Error {
+                        message: format!("inbox: {error}"),
+                    }
                 }
             }
-        },
+        }
         // "First N after the cursor" when resuming.
         Some(c) => {
             let from = Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
@@ -238,8 +276,14 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
             // merges the hot ring (which transiently holds every class,
             // incl. StreamChunk / EphemeralLatest for live attach-replay)
             // with the sink, so filter to durable here — non-durable
-            // classes never belong in a replay (§3.4).
-            events.retain(|env| env.delivery.is_durable());
+            // classes never belong in a replay (§3.4). The kinds filter
+            // composes the same way, and BOTH run before `truncate`, so
+            // `since` + `kinds` still means "the first N matching events
+            // after the cursor."
+            events.retain(|env| {
+                env.delivery.is_durable()
+                    && kinds.as_ref().is_none_or(|kinds| kinds.contains(&env.kind))
+            });
             events.truncate(limit);
             events
         }
@@ -274,6 +318,37 @@ async fn handle_room_tip(state: Arc<DaemonState>, request: RoomTipRequest) -> Re
         }),
         Err(error) => Response::Error {
             message: format!("room_tip: {error}"),
+        },
+    }
+}
+
+/// Resolve one peer's durable identity card from the daemon's owner-core
+/// identity index (`scoped_state`, `user:<peer>` / `identity.card`). The
+/// identity analog of [`handle_room_tip`]: an attached client's local
+/// store never observes foreign peers' cards (they are indexed here, off
+/// the broadcast `IdentityPublished` event), so name resolution
+/// (`peer_alias` / `peer_identity_card` / `room_roster`) reads the
+/// daemon's index over IPC instead of replaying the room. A store error
+/// is surfaced loudly; an absent row is an honest `card: None`, not an
+/// error.
+async fn handle_peer_identity_card(
+    state: Arc<DaemonState>,
+    request: PeerIdentityCardRequest,
+) -> Response {
+    let scope_key = ScopeRef::User(request.peer_id).scope_key();
+    match state
+        .coordinator_store
+        .get_scoped_state(&scope_key, PEER_IDENTITY_STATE_KEY)
+        .await
+    {
+        Ok(stored) => Response::PeerIdentityCard(PeerIdentityCardResponse {
+            card: stored.map(|row| IpcIdentityCard {
+                value_json: row.value_json,
+                version: row.version,
+            }),
+        }),
+        Err(error) => Response::Error {
+            message: format!("peer_identity_card: {error}"),
         },
     }
 }
@@ -326,4 +401,31 @@ async fn handle_list_peers(state: Arc<DaemonState>) -> Response {
         })
         .collect();
     Response::Peers(PeersResponse { peers: entries })
+}
+
+/// #270/#241: serve the durable subscribed-room registry from the
+/// coordinator store. Parted rooms are excluded — the store keeps them
+/// only so auto-restore doesn't resurrect an explicit leave. This is
+/// THE membership read: nav/room-list clients seed from it instead of
+/// inferring rooms from observed traffic (the seam that left a rebooted
+/// interface showing one room until each of the others happened to
+/// speak).
+async fn handle_list_rooms(state: Arc<DaemonState>) -> Response {
+    match state.coordinator_store.load_subscriptions().await {
+        Ok(rows) => Response::Rooms(RoomsResponse {
+            rooms: rows
+                .into_iter()
+                .filter(|row| !row.parted)
+                .map(|row| IpcRoomInfo {
+                    room_id: row.room_id,
+                    name: row.channel_name,
+                    joined_at_ms: row.joined_at_ms,
+                    is_default: row.is_default,
+                })
+                .collect(),
+        }),
+        Err(error) => Response::Error {
+            message: format!("list_rooms: {error}"),
+        },
+    }
 }

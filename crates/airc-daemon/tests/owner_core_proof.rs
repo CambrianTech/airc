@@ -300,6 +300,7 @@ async fn streamchunk_raw_bytes_route_live_byte_identical_and_never_persist() {
             since: None,
             channel: Some(channel),
             limit: Some(100),
+            kinds: None,
         })
         .await
         .expect("inbox");
@@ -328,6 +329,7 @@ async fn durable_publishes_replay_via_inbox_in_order_and_page_by_cursor() {
             since: None,
             channel: Some(channel),
             limit: Some(100),
+            kinds: None,
         })
         .await
         .expect("inbox");
@@ -343,6 +345,7 @@ async fn durable_publishes_replay_via_inbox_in_order_and_page_by_cursor() {
             since: inbox.newest,
             channel: Some(channel),
             limit: Some(100),
+            kinds: None,
         })
         .await
         .expect("inbox after cursor");
@@ -518,6 +521,7 @@ async fn continuum_webrtc_room_mixed_traffic_only_chat_persists() {
             since: None,
             channel: Some(channel),
             limit: Some(1000),
+            kinds: None,
         })
         .await
         .expect("inbox");
@@ -553,6 +557,7 @@ async fn chat_send_is_durable_and_text_round_trips() {
             since: None,
             channel: Some(channel),
             limit: Some(10),
+            kinds: None,
         })
         .await
         .expect("inbox");

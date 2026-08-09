@@ -49,6 +49,13 @@ pub enum AircError {
     #[error("system clock before UNIX_EPOCH: {0}")]
     Clock(#[from] std::time::SystemTimeError),
 
+    /// JSON (de)serialization of a value the consumer API owns — e.g. the
+    /// `Identity` card serialized into the durable per-peer identity index
+    /// (scoped_state). A programmer error in practice for fixed-shape
+    /// structs, surfaced rather than swallowed.
+    #[error("serde: {0}")]
+    Serde(#[from] serde_json::Error),
+
     #[error("peer spec: {0}")]
     PeerSpec(#[from] crate::registry::PeerSpecError),
 
@@ -120,6 +127,20 @@ pub enum AircError {
         card_id: airc_work::WorkCardId,
         claim_id: Option<airc_work::ClaimId>,
         owner: Option<airc_core::PeerId>,
+    },
+
+    /// Caller attempted to claim a card whose lifecycle state is past
+    /// claiming (Review/Merged/Closed). Live evidence (2026-07-24):
+    /// personas kept re-claiming ALREADY-COMPLETED cards because the
+    /// claim guard only checked lease expiry, not state — settled work
+    /// looked open to every board reader. Settled cards are history,
+    /// not backlog.
+    #[error(
+        "work card {card_id} is {state:?} — settled work is not claimable; pick an Open card (or reopen this one explicitly with `airc work state`)"
+    )]
+    WorkCardNotClaimable {
+        card_id: airc_work::WorkCardId,
+        state: airc_work::CardState,
     },
 
     /// Card 09fddedd: `relink` supersedes an EXISTING link — a card

@@ -288,6 +288,19 @@ impl Subscription {
     }
 }
 
+/// One healed subscription binding (self-healing join — receive-binding
+/// re-derive on identity heal): the stored room UUID no longer matched
+/// the current derivation of the stored channel NAME, so the
+/// subscription was re-bound to the converged UUID. Carried out of
+/// [`SubscriptionSet::rebind_diverged`] so callers can be LOUD about
+/// exactly which room moved where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRebind {
+    pub name: ChannelName,
+    pub old_room_id: RoomId,
+    pub new_room_id: RoomId,
+}
+
 /// All channels this scope is subscribed to, plus the default-channel
 /// pointer for short-shape commands and the parted set so re-running
 /// [`Airc::join_default_context`](crate::Airc::join_default_context)
@@ -407,6 +420,42 @@ impl SubscriptionSet {
     /// consumer-surface PR reads to know which RoomIds to drain.
     pub fn channel_names(&self) -> impl Iterator<Item = &ChannelName> {
         self.subscribed.keys()
+    }
+
+    /// Self-healing join — receive-binding re-derive on identity heal
+    /// (M5↔bigmama decay mode: after the Windows mesh identity healed,
+    /// SENDS derived converged channel UUIDs, but this scope's stored
+    /// subscriptions kept the OLD diverged UUIDs — so inbound frames
+    /// addressed to the converged room found no binding and the scope
+    /// read a dead room until a manual `airc stop && airc join`).
+    ///
+    /// A subscription's channel NAME is its durable identity; the room
+    /// UUID is a derivation of `(mesh_identity, name)` frozen at join
+    /// time. When the identity changes (heals), re-derive each
+    /// subscription's room UUID and re-bind any that diverged, keeping
+    /// name, wire, and `joined_at_ms`. Read cursors are unaffected:
+    /// runtime cursors are keyed per consumer id over the owner-core's
+    /// GLOBAL `(epoch, counter)` order, not per room UUID.
+    ///
+    /// Returns the rebinds performed (empty when the set is already
+    /// converged — the idempotent steady state) so callers can be loud
+    /// about each old→new move. Delivery to the OLD UUID keeps working
+    /// via the router bridge's per-frame name reconvergence; this heals
+    /// the READ side, which that per-frame remap cannot reach.
+    pub fn rebind_diverged(&mut self, identity: &MeshIdentity) -> Vec<SubscriptionRebind> {
+        let mut rebinds = Vec::new();
+        for (name, subscription) in self.subscribed.iter_mut() {
+            let derived = derive_room_id(identity, name);
+            if subscription.room_id != derived {
+                rebinds.push(SubscriptionRebind {
+                    name: name.clone(),
+                    old_room_id: subscription.room_id,
+                    new_room_id: derived,
+                });
+                subscription.room_id = derived;
+            }
+        }
+        rebinds
     }
 }
 
@@ -812,6 +861,59 @@ mod tests {
         // Setting a non-subscribed channel as default must error.
         let result = set.set_default(ChannelName::new("nowhere").unwrap());
         assert!(result.is_err());
+    }
+
+    // what this catches (self-healing join — receive-binding re-derive
+    // on identity heal): a subscription stored under a DIVERGED mesh
+    // identity keeps its stale room UUID forever (subscribe() is
+    // idempotent by NAME and never re-derives), so a healed identity
+    // leaves the scope reading a dead room. `rebind_diverged` must move
+    // every stale room UUID to the current derivation, preserve name /
+    // wire / joined_at_ms, report each old→new move, and be idempotent
+    // once converged.
+    #[test]
+    fn rebind_diverged_moves_room_ids_to_the_current_identity_derivation() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let diverged = MeshIdentity::new("local-fallback-boot-identity");
+        let healed = MeshIdentity::new("joelteply");
+        let general = ChannelName::new("general").unwrap();
+        let project = ChannelName::new("cambriantech").unwrap();
+
+        let mut set = SubscriptionSet::empty();
+        set.subscribe(home, &diverged, general.clone()).unwrap();
+        set.subscribe(home, &diverged, project.clone()).unwrap();
+        let old_general = set.subscribed.get(&general).unwrap().clone();
+
+        let rebinds = set.rebind_diverged(&healed);
+        assert_eq!(rebinds.len(), 2, "both diverged rooms must be re-bound");
+        let general_rebind = rebinds
+            .iter()
+            .find(|rebind| rebind.name == general)
+            .expect("general rebind reported");
+        assert_eq!(general_rebind.old_room_id, old_general.room_id);
+        assert_eq!(
+            general_rebind.new_room_id,
+            derive_room_id(&healed, &general),
+            "the new binding must be the healed identity's derivation"
+        );
+
+        let rebound = set.subscribed.get(&general).unwrap();
+        assert_eq!(rebound.room_id, derive_room_id(&healed, &general));
+        assert_eq!(
+            rebound.wire, old_general.wire,
+            "the wire path is name-derived and must not move"
+        );
+        assert_eq!(
+            rebound.joined_at_ms, old_general.joined_at_ms,
+            "rebind is a heal, not a re-join"
+        );
+
+        // Idempotent once converged — a steady-state join must not spam.
+        assert!(
+            set.rebind_diverged(&healed).is_empty(),
+            "converged set must report no rebinds"
+        );
     }
 
     #[tokio::test]

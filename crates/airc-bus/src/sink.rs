@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use airc_core::RoomId;
 
-use crate::envelope::{Cursor, Envelope};
+use crate::envelope::{Cursor, Envelope, Kind};
 use crate::error::Result;
 
 /// The durable event tier. `append` persists one `Durable` envelope; `page`
@@ -97,6 +97,31 @@ pub trait DurableSink: Send + Sync {
         &self,
         channel: RoomId,
         before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Envelope>>;
+
+    /// **Continuum #297.** [`DurableSink::page_tail`] restricted to
+    /// envelopes whose [`crate::envelope::Kind`] is in `kinds` — the
+    /// sink leg of "newest N events OF THESE KINDS". The kind predicate
+    /// is applied by the STORE, before `limit`, so a chunk-flooded room
+    /// still answers with the newest N matching events; a client-side
+    /// newest-N-raw-then-filter yields crumbs (three personas streaming
+    /// ~4 chunks/sec evict every `Message` from a 50-event page).
+    ///
+    /// Same order/bound contract as `page_tail`: ascending total order,
+    /// work bounded by the matching rows (SQLite: the composite
+    /// `(room_id, epoch, counter, event_id)` index scanned DESC with the
+    /// kind predicate; in-memory: a reverse filtered scan). There is
+    /// deliberately NO default impl (same posture as `page_tail`, card
+    /// 8428ae8c): a sink that cannot kind-filter its reverse page is a
+    /// compile error, never a silent fetch-everything-then-filter.
+    /// `kinds` is never empty — callers normalize empty to the
+    /// unfiltered [`DurableSink::page_tail`].
+    async fn page_tail_of_kinds(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        kinds: &[Kind],
         limit: usize,
     ) -> Result<Vec<Envelope>>;
 
@@ -239,6 +264,34 @@ impl DurableSink for InMemoryDurableSink {
         };
         let start = end.saturating_sub(limit);
         Ok(bucket[start..end].to_vec())
+    }
+
+    async fn page_tail_of_kinds(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        kinds: &[Kind],
+        limit: usize,
+    ) -> Result<Vec<Envelope>> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(bucket) = guard.events.get(&channel.0.as_u128()) else {
+            return Ok(Vec::new());
+        };
+        let end = match &before {
+            None => bucket.len(),
+            Some(b) => bucket.partition_point(|e| e.cursor().is_before(b)),
+        };
+        // Newest-first over the pre-cursor slice, kind predicate BEFORE
+        // `take(limit)` — then back to ascending for the caller.
+        let mut out: Vec<Envelope> = bucket[..end]
+            .iter()
+            .rev()
+            .filter(|e| kinds.contains(&e.kind))
+            .take(limit)
+            .cloned()
+            .collect();
+        out.reverse();
+        Ok(out)
     }
 
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool> {

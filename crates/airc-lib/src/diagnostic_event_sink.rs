@@ -201,9 +201,12 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::RouteRefreshFailed => "route_refresh_failed",
         DiagnosticCode::PeerDialFailed => "peer_dial_failed",
         DiagnosticCode::FrameUndeliverable => "frame_undeliverable",
+        DiagnosticCode::UnknownChannelRebound => "unknown_channel_rebound",
+        DiagnosticCode::ChannelNameReconverged => "channel_name_reconverged",
         DiagnosticCode::DeliveryAckSendFailed => "delivery_ack_send_failed",
         DiagnosticCode::RoutedForwardQueueSaturated => "routed_forward_queue_saturated",
         DiagnosticCode::RoutedForwardFailed => "routed_forward_failed",
+        DiagnosticCode::SuspectConnectionDropped => "suspect_connection_dropped",
     }
 }
 

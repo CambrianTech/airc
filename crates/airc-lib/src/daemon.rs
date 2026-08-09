@@ -16,11 +16,13 @@
 use std::sync::Arc;
 
 use airc_bus::envelope::{Envelope, Kind, Target};
-use airc_core::{Body, MentionTarget, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind};
+use airc_core::{
+    Body, MentionTarget, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
+};
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
-    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcTarget, PublishRequest,
-    Response, RoomTipRequest, SendRequest,
+    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
+    PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -73,6 +75,34 @@ fn kind_to_transcript(kind: Kind) -> TranscriptKind {
         | Kind::StreamChunk
         | Kind::Control => TranscriptKind::System,
     }
+}
+
+/// Continuum #297 — the inverse of [`kind_to_transcript`], for pushing
+/// a consumer's `EventFilter::kinds` down into the daemon's inbox read
+/// ("newest N events OF THESE KINDS", filtered before the limit).
+///
+/// The push-down must be a SUPERSET of the client-side `filter.matches`
+/// — never narrower, or the daemon would drop events the consumer asked
+/// for. `kind_to_transcript` is lossy (every non-chat bus kind projects
+/// to the coarse `System`), so `Message` maps exactly and ANY other
+/// transcript kind admits every non-`Message` bus kind; `filter.matches`
+/// still refines the decoded page afterwards.
+fn transcript_kinds_to_ipc(kinds: &std::collections::BTreeSet<TranscriptKind>) -> Vec<IpcKind> {
+    let mut out = Vec::new();
+    if kinds.contains(&TranscriptKind::Message) {
+        out.push(IpcKind::Message);
+    }
+    if kinds.iter().any(|kind| *kind != TranscriptKind::Message) {
+        out.extend([
+            IpcKind::Event,
+            IpcKind::Command,
+            IpcKind::CommandResult,
+            IpcKind::Signal,
+            IpcKind::StreamChunk,
+            IpcKind::Control,
+        ]);
+    }
+    out
 }
 
 fn target_to_mention(target: &Target) -> MentionTarget {
@@ -134,8 +164,11 @@ impl Airc {
         &self,
         room: &Room,
         text: &str,
-        headers: airc_core::Headers,
+        mut headers: airc_core::Headers,
     ) -> Result<airc_core::EventId, AircError> {
+        // Cross-machine name reconvergence (blind-room heal): every
+        // room send carries the human channel name.
+        room.stamp_name_header(&mut headers);
         let receipt = self
             .require_daemon_client()?
             .send(SendRequest {
@@ -160,8 +193,9 @@ impl Airc {
         kind: FrameKind,
         target: MentionTarget,
         body: Body,
-        headers: airc_core::Headers,
+        mut headers: airc_core::Headers,
     ) -> Result<crate::messaging::SendFrameResult, AircError> {
+        room.stamp_name_header(&mut headers);
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
@@ -189,8 +223,9 @@ impl Airc {
         room: &Room,
         kind: FrameKind,
         body: Body,
-        headers: airc_core::Headers,
+        mut headers: airc_core::Headers,
     ) -> Result<PublishReceipt, AircError> {
+        room.stamp_name_header(&mut headers);
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
@@ -231,6 +266,34 @@ impl Airc {
                 since: None,
                 channel: Some(room.channel),
                 limit: Some(limit),
+                kinds: None,
+            })
+            .await?;
+        response
+            .envelopes
+            .into_iter()
+            .map(decode_wire_event)
+            .collect()
+    }
+
+    /// Continuum #297: [`Airc::daemon_page_recent`] with the consumer's
+    /// kind filter pushed down into the daemon's inbox read (mapped via
+    /// [`transcript_kinds_to_ipc`]), so the daemon pages the newest
+    /// `limit` events OF THOSE KINDS instead of a raw newest-`limit`
+    /// that a StreamChunk flood fills with events the caller discards.
+    pub(crate) async fn daemon_page_recent_of_kinds(
+        &self,
+        channel: RoomId,
+        kinds: &std::collections::BTreeSet<TranscriptKind>,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .inbox(InboxRequest {
+                since: None,
+                channel: Some(channel),
+                limit: Some(limit),
+                kinds: Some(transcript_kinds_to_ipc(kinds)),
             })
             .await?;
         response
@@ -257,6 +320,7 @@ impl Airc {
                 }),
                 channel: Some(room.channel),
                 limit: Some(limit),
+                kinds: None,
             })
             .await?;
         response
@@ -338,6 +402,7 @@ impl Airc {
                     since,
                     channel: Some(channel),
                     limit: Some(page_size),
+                    kinds: None,
                 })
                 .await?;
             let count = response.envelopes.len();
@@ -379,6 +444,36 @@ impl Airc {
         Ok(response.tip.map(|tip| TranscriptCursor {
             lamport: pack_seq(tip.epoch, tip.counter),
             event_id: tip.event_id,
+        }))
+    }
+
+    /// One peer's durable identity card from the DAEMON's owner-core
+    /// identity index, or `None` if the peer has never published a card.
+    ///
+    /// The identity analog of [`Self::daemon_latest_transcript_cursor`]:
+    /// when a scope is daemon-attached, its LOCAL store only ever holds
+    /// its own card — foreign peers' cards are observed off the wire into
+    /// the DAEMON's index, never streamed into an attached client's store
+    /// (the daemon's subscribe reader forwards events without running the
+    /// identity-observe chokepoint). So `peer_alias` / `peer_identity_card`
+    /// resolve names via this typed IPC op instead of a local read that
+    /// would answer `None` for every peer but self.
+    pub(crate) async fn daemon_peer_identity_card(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<Option<airc_core::identity::PeerIdentityCard>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .peer_identity_card(PeerIdentityCardRequest { peer_id })
+            .await?;
+        let Some(card) = response.card else {
+            return Ok(None);
+        };
+        let identity: airc_core::identity::Identity = serde_json::from_str(&card.value_json)?;
+        Ok(Some(airc_core::identity::PeerIdentityCard {
+            peer_id,
+            identity,
+            emitted_at_ms: card.version as u64,
         }))
     }
 

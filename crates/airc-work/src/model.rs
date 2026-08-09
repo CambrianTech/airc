@@ -28,6 +28,30 @@ pub enum CardState {
     Closed,
 }
 
+impl CardState {
+    /// Is this card SETTLED — past claiming regardless of lease status?
+    ///
+    /// The single authority for "can this state be claimed at all". The claim
+    /// guard (`airc-lib::work`) and every surface that ADVERTISES claimability
+    /// must ask this one function, or they drift — and when they drift, the
+    /// board offers work that the claim path then refuses, which reads to the
+    /// person picking a card as a broken substrate.
+    ///
+    /// That drift was live, measured on 2026-08-07: the claim guard was taught
+    /// on 2026-07-24 that `Review` is history, not backlog (personas kept
+    /// re-claiming completed cards), but the board's `--available` filter was
+    /// never told. It excluded only `Merged | Closed`, so on one real board it
+    /// advertised 12 of 12 cards as available while 4 of them bounced with
+    /// "settled work is not claimable". The operator reading that board — me —
+    /// reported the inflated number as fact.
+    ///
+    /// `Blocked` is deliberately NOT settled: a blocked card is live work
+    /// waiting on something, and someone taking it over is exactly the move.
+    pub fn is_settled(self) -> bool {
+        matches!(self, Self::Review | Self::Merged | Self::Closed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaneState {

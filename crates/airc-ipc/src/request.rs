@@ -130,6 +130,30 @@ pub enum Request {
     /// op, not a `limit: 1` flag on the `Inbox` scan. Returns
     /// `Response::RoomTip`.
     RoomTip(RoomTipRequest),
+    /// Resolve one peer's durable identity card from the daemon's
+    /// owner-core identity index (`scoped_state`, `user:<peer>`, key
+    /// `identity.card`). The attached-client read path for peer names:
+    /// a client's LOCAL store never holds foreign peers' cards (they are
+    /// observed off the wire into the DAEMON's index), so `peer_alias` /
+    /// `peer_identity_card` / `room_roster` resolve names by asking the
+    /// daemon — the identity analog of `RoomTip` for the transcript. Returns
+    /// `Response::PeerIdentityCard`.
+    PeerIdentityCard(PeerIdentityCardRequest),
+    /// **#270/#241.** The scope's durable subscribed-room registry
+    /// (name + room id + joined-at + default flag, parted rooms
+    /// excluded). The membership read that lets an attached client
+    /// (continuum's nav, a TUI room list) show EVERY room the account
+    /// is in — not just the rooms that happened to emit traffic since
+    /// boot. Returned via `Response::Rooms`.
+    ListRooms,
+    /// **#1306 slice 2.** Per-peer end-to-end delivery accounting from
+    /// the daemon's delivery ledger — attempts, acks, last confirmed
+    /// delivery, measured RTT, suspect verdict. THE delivery-truth read:
+    /// doctor reports "last confirmed delivery to X: N ago" from this
+    /// instead of inferring health from TCP connection state. Returned
+    /// via `Response::DeliveryStats`. Empty until the routed forwarder
+    /// has attempted at least one cross-machine delivery.
+    DeliveryStats,
     /// Attach to the daemon's live event stream. Long-lived: after an
     /// initial `Response::Ok`, the daemon streams `Response::Event`
     /// frames (airc-wire bytes) until the client disconnects. Optionally
@@ -155,6 +179,19 @@ pub struct InboxRequest {
     /// reasonable cap (32) so a slow client doesn't pull megabytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// **Continuum #297.** When set, the daemon filters to these kinds
+    /// BEFORE applying `limit` — the page is the newest N events *of
+    /// these kinds*, not the survivors of a raw newest-N. Post-filtering
+    /// client-side cannot express that: three personas streaming ~4
+    /// `StreamChunk` frames/sec evict every durable `Message` from a
+    /// 50-event page, deafening working personas to direction.
+    ///
+    /// `None` (and, on the daemon side, an empty vec — filtering to
+    /// nothing is never what a caller means) is exactly today's
+    /// unfiltered behavior. Wire-compat both directions: old daemons
+    /// ignore the field; old clients omit it (`skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<IpcKind>>,
 }
 
 /// Parameters for `RoomTip` (card a1562dbc). The channel is mandatory:
@@ -164,6 +201,14 @@ pub struct InboxRequest {
 pub struct RoomTipRequest {
     /// The channel (room) whose durable tip is being probed.
     pub channel: airc_core::RoomId,
+}
+
+/// Parameters for `PeerIdentityCard`. The peer whose durable
+/// identity-index row (`user:<peer>` / `identity.card`) is resolved.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerIdentityCardRequest {
+    /// The peer whose published identity card is being resolved.
+    pub peer_id: PeerId,
 }
 
 /// Where an attach stream starts. One intentional choice — not a
@@ -225,6 +270,17 @@ pub struct AttachRequest {
     /// (`Live`, or a cursor already at head).
     #[serde(default, skip_serializing_if = "is_false")]
     coalesce_backlog: bool,
+    /// Pairs with [`Self::with_coalesced_backlog`] (card 7d5b6a65
+    /// extension): the N most-recent backlog events are streamed as
+    /// normal `Event` frames at the catch-up seam, and only the OLDER
+    /// history is collapsed into the summary frame — the Discord "one
+    /// page back" shape instead of all-or-nothing. `coalesce_backlog`
+    /// remains the gate: without it this field is a no-op (legacy
+    /// replay already delivers everything). Wire-compat: omitted when
+    /// unset, so old daemons ignore the unknown field and old clients
+    /// simply never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backlog_tail: Option<u32>,
     /// If set, only these kinds are delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kinds: Option<Vec<IpcKind>>,
@@ -254,6 +310,7 @@ impl AttachRequest {
             from,
             from_now,
             coalesce_backlog: false,
+            backlog_tail: None,
             kinds: None,
             delivery: None,
             headers: HeaderFilter::default(),
@@ -289,6 +346,12 @@ impl AttachRequest {
         self.coalesce_backlog
     }
 
+    /// How many most-recent backlog events are streamed at the seam
+    /// (the rest are coalesced). `None` = coalesce everything.
+    pub fn backlog_tail(&self) -> Option<u32> {
+        self.backlog_tail
+    }
+
     /// Deliver only these event kinds.
     pub fn with_kinds(mut self, kinds: Vec<IpcKind>) -> Self {
         self.kinds = Some(kinds);
@@ -313,6 +376,15 @@ impl AttachRequest {
         self
     }
 
+    /// Pairs with [`Self::with_coalesced_backlog`]: stream the `n`
+    /// most-recent backlog events at the catch-up seam and summarize
+    /// only the older history ("one page back"). A no-op unless
+    /// coalescing is enabled.
+    pub fn with_backlog_tail(mut self, n: u32) -> Self {
+        self.backlog_tail = Some(n);
+        self
+    }
+
     /// Destructure for the daemon's attach handler: moves the filter
     /// vectors out (no clone) with the start already decoded. One-way —
     /// there is no path from parts back to a request, so the typed
@@ -323,6 +395,7 @@ impl AttachRequest {
             channel: self.channel,
             start,
             coalesce_backlog: self.coalesce_backlog,
+            backlog_tail: self.backlog_tail,
             kinds: self.kinds,
             delivery: self.delivery,
             headers: self.headers,
@@ -336,6 +409,7 @@ pub struct AttachParts {
     pub channel: Option<airc_core::RoomId>,
     pub start: AttachStart,
     pub coalesce_backlog: bool,
+    pub backlog_tail: Option<u32>,
     pub kinds: Option<Vec<IpcKind>>,
     pub delivery: Option<Vec<IpcDelivery>>,
     pub headers: HeaderFilter,
@@ -528,10 +602,36 @@ mod tests {
         )
         .with_kinds(vec![IpcKind::Command])
         .with_coalesced_backlog()
+        .with_backlog_tail(2)
         .into_parts();
         assert_eq!(parts.start, AttachStart::After(cursor(9)));
         assert!(parts.coalesce_backlog);
+        assert_eq!(parts.backlog_tail, Some(2));
         assert_eq!(parts.kinds.as_deref(), Some(&[IpcKind::Command][..]));
+    }
+
+    /// Card 7d5b6a65 extension wire-compat: `backlog_tail` never rides
+    /// the wire when unset (old daemons see the exact pre-extension
+    /// bytes — pinned above), and roundtrips intact when set.
+    // what this catches: a serde attribute regression that would leak
+    // `backlog_tail: null` into every attach and break old daemons'
+    // strict decoders, or drop the value on the daemon side.
+    #[test]
+    fn backlog_tail_is_omitted_when_unset_and_roundtrips_when_set() {
+        let channel = airc_core::RoomId(Uuid::nil());
+        let unset = serde_json::to_string(&AttachRequest::new(channel, AttachStart::Live)).unwrap();
+        assert!(
+            !unset.contains("backlog_tail"),
+            "unset backlog_tail must be absent from the wire: {unset}"
+        );
+
+        let set = AttachRequest::new(channel, AttachStart::FromTranscriptStart)
+            .with_coalesced_backlog()
+            .with_backlog_tail(25);
+        let decoded: AttachRequest =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(decoded.backlog_tail(), Some(25));
+        assert!(decoded.coalesces_backlog());
     }
 
     #[test]
@@ -611,10 +711,41 @@ mod tests {
             }),
             channel: Some(airc_core::RoomId::from_u128(0x42)),
             limit: Some(64),
+            kinds: None,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Continuum #297: `kinds` wire contract, both halves.
+    // what this catches: a serde attribute regression that would leak
+    // `kinds: null` into every unfiltered inbox (breaking old daemons'
+    // strict decoders) or drop the kinds list on the daemon side —
+    // silently reverting the filter-before-limit fix to raw newest-N.
+    #[test]
+    fn inbox_kinds_omitted_when_none_and_roundtrips_when_set() {
+        let unfiltered = Request::Inbox(InboxRequest {
+            since: None,
+            channel: Some(airc_core::RoomId::from_u128(0x42)),
+            limit: Some(50),
+            kinds: None,
+        });
+        let encoded = serde_json::to_string(&unfiltered).unwrap();
+        assert!(
+            !encoded.contains("kinds"),
+            "unset kinds must be absent from the wire: {encoded}"
+        );
+
+        let filtered = Request::Inbox(InboxRequest {
+            since: None,
+            channel: Some(airc_core::RoomId::from_u128(0x42)),
+            limit: Some(50),
+            kinds: Some(vec![IpcKind::Message, IpcKind::Event]),
+        });
+        let decoded: Request =
+            serde_json::from_str(&serde_json::to_string(&filtered).unwrap()).unwrap();
+        assert_eq!(decoded, filtered);
     }
 
     /// Card a1562dbc: the EXACT wire bytes of `RoomTip` are the
@@ -666,8 +797,31 @@ mod tests {
                 since: None,
                 channel: Some(airc_core::RoomId::from_u128(0x42)),
                 limit: Some(1),
+                kinds: None,
             })
         );
+    }
+
+    // what this catches: the `peer_identity_card` op tag + `peer_id`
+    // field are the cross-version wire contract — a symmetric serde
+    // rename (which a round-trip test would miss) breaks an attached
+    // client talking to an older/newer daemon. Pinned as a literal on
+    // BOTH sides, independently.
+    #[test]
+    fn peer_identity_card_wire_bytes_are_pinned() {
+        let request = Request::PeerIdentityCard(PeerIdentityCardRequest {
+            peer_id: airc_core::PeerId::from_u128(0x7),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"op":"peer_identity_card","peer_id":"00000000-0000-0000-0000-000000000007"}"#
+        );
+        let decoded: Request = serde_json::from_str(
+            r#"{"op":"peer_identity_card","peer_id":"00000000-0000-0000-0000-000000000007"}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded, request);
     }
 
     /// Card 4b6a0ffa (#33): the EXACT wire bytes of `RouteEndpoints`

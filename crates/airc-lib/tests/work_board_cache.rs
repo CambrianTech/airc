@@ -188,6 +188,36 @@ async fn snapshot_with_rewound_log_is_rebuilt_never_served_stale() {
     );
 }
 
+// what this catches: continuum #154 — `airc work board` projected EMPTY
+// in a live persona room while 9 cards durably existed and claims flowed.
+// The interactive board verb read a recent-window projection
+// (`limit × WORK_BOARD_FETCH_MULTIPLIER` transcript events); four personas
+// chatting push every work event outside that window within the hour, so
+// the instrument lies ("no work cards") about a board that is full. The
+// board verb must project from the complete (cached) projection: a card
+// followed by any amount of chat traffic is still on the board.
+#[tokio::test]
+async fn board_survives_chat_flood() {
+    let machine = Machine::boot().await;
+    let airc = machine.solo("board-chat-flood").await;
+
+    create_card(&airc, "buried by chatter").await;
+
+    // Flood well past the old recent-window (default limit 128 × 4).
+    for i in 0..600 {
+        airc.say(&format!("persona chatter {i}"))
+            .await
+            .expect("chat send");
+    }
+
+    let board = airc.work_board().await.expect("board");
+    assert_eq!(
+        card_titles(&board),
+        vec!["buried by chatter".to_string()],
+        "interactive board lost a durable card to chat traffic"
+    );
+}
+
 #[tokio::test]
 async fn corrupt_snapshot_is_discarded_and_rebuilt() {
     let machine = Machine::boot().await;
