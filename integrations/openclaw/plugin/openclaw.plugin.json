@@ -8,5 +8,102 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {}
+  },
+  "channelConfigs": {
+    "airc": {
+      "label": "airc",
+      "description": "Bridge an airc mesh room into OpenClaw. Unlike every other channel here, there is no bot token to create: airc authenticates from the local scope (its home directory and identity keypair), so the only required setting is which room to join.",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Display name for this account in channel listings."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this account is active. Disabled accounts stay configured but do not connect."
+          },
+          "home": {
+            "type": "string",
+            "description": "airc scope directory (AIRC_HOME). One machine can run many scopes — a repo-local .airc and a personal ~/.airc are different identities with different rooms. Leave unset to use airc's own auto-detection (a git repo's .airc, else the current directory's)."
+          },
+          "room": {
+            "type": "string",
+            "description": "Room to join, without the leading '#'. Defaults to airc's current room for the scope."
+          },
+          "agentId": {
+            "type": "string",
+            "description": "OpenClaw agent that answers messages from this room."
+          },
+          "replyMode": {
+            "type": "string",
+            "enum": ["agent", "model"],
+            "description": "'agent' routes an incoming message through the full OpenClaw agent (tools, memory); 'model' answers with a single model call. Use 'model' for a cheap responder, 'agent' when it should be able to act."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model id used when replyMode is 'model'."
+          },
+          "systemPrompt": {
+            "type": "string",
+            "description": "System prompt applied to replies from this room."
+          },
+          "timeoutSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600,
+            "description": "How long to wait for a reply before giving up on a message."
+          },
+          "toolsAllow": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Allow-list of tool names this room's agent may use. Omit for the agent's default tool set."
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Peer ids permitted to trigger a reply. Omit to accept any peer in the room. Note that airc broadcasts carry no structural addressing, so without this every room message is a candidate."
+          },
+          "pollMs": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000,
+            "description": "How often to poll the airc scope for new messages, in milliseconds."
+          },
+          "accounts": {
+            "type": "object",
+            "description": "Named accounts, each overriding the fields above. Use this to bridge several rooms or scopes at once.",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "enabled": { "type": "boolean" },
+                "home": { "type": "string" },
+                "room": { "type": "string" },
+                "agentId": { "type": "string" },
+                "replyMode": { "type": "string", "enum": ["agent", "model"] },
+                "model": { "type": "string" },
+                "systemPrompt": { "type": "string" },
+                "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+                "toolsAllow": { "type": "array", "items": { "type": "string" } },
+                "allowFrom": { "type": "array", "items": { "type": "string" } },
+                "pollMs": { "type": "integer", "minimum": 500, "maximum": 60000 }
+              }
+            }
+          },
+          "defaultAccount": {
+            "type": "string",
+            "description": "Which named account to use when none is specified."
+          }
+        }
+      },
+      "uiHints": {
+        "setupOrder": ["room", "home", "agentId", "replyMode", "model"]
+      }
+    }
   }
 }
