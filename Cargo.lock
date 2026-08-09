@@ -342,6 +342,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "uuid",
  "webrtc",
  "x509-parser 0.18.1",
 ]

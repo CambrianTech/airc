@@ -91,6 +91,21 @@ impl Room {
     pub fn default_for(home: &Path) -> Result<Self, RoomError> {
         Self::from_name(home, DEFAULT_ROOM_NAME)
     }
+
+    /// Stamp this room's human NAME onto outbound headers
+    /// ([`airc_protocol::HEADER_AIRC_CHANNEL_NAME`]) — the convergence
+    /// key that lets a receiving machine whose identity-scoped channel
+    /// derivation diverged from ours (the M5↔bigmama blind-room bug)
+    /// re-derive the room under its own identity and still deliver.
+    /// Never overwrites a caller-supplied value; skips unnamed rooms.
+    pub fn stamp_name_header(&self, headers: &mut airc_core::Headers) {
+        if self.name.is_empty() {
+            return;
+        }
+        headers
+            .entry(airc_protocol::HEADER_AIRC_CHANNEL_NAME.to_string())
+            .or_insert_with(|| self.name.clone());
+    }
 }
 
 /// Sanitise a room name into a path-safe directory component. ASCII

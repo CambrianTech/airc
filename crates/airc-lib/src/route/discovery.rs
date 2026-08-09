@@ -10,7 +10,7 @@ use futures::stream::StreamExt;
 use crate::error::AircError;
 use crate::route::health::{TransportHealthSample, TransportHealthState};
 use crate::route::invite::RouteEndpoint;
-use crate::route::policy::TransportKind;
+use crate::route::policy::{TransportKind, TransportRole};
 use crate::Airc;
 
 /// Card 625abe6d slice 1 — per-dial deadline. LAN/tailnet targets
@@ -35,6 +35,29 @@ const DIAL_CONCURRENCY: usize = 16;
 /// the endpoints skipped for being in backoff. Named so the concurrent
 /// collection below doesn't trip clippy's `type_complexity` gate.
 type PeerDialOutcome = (Vec<PeerDialFailure>, Vec<PeerDialSkip>);
+
+/// Self-healing join (machine-vs-scope cert identity) — the PURE pin
+/// decision: which identity a dial to `record_peer`'s stored endpoints
+/// must expect in the TLS handshake.
+///
+/// A trust record can declare that its endpoints are HOSTED by a
+/// different transport identity (`endpoints_peer_id` — the daemon whose
+/// cert answers at the shared listener). Honor that mapping ONLY when
+/// the declared host is itself enrolled: cert pinning stays strict — an
+/// unknown identity is never dialed-for, so a poisoned mapping can at
+/// worst redirect the pin to another already-trusted peer, never open a
+/// door to a stranger. A self- or absent mapping pins the record's own
+/// peer, exactly the pre-mapping behavior.
+fn resolve_dial_pin(
+    record_peer: PeerId,
+    declared_host: Option<PeerId>,
+    host_is_enrolled: bool,
+) -> PeerId {
+    match declared_host {
+        Some(host) if host != record_peer && host_is_enrolled => host,
+        Some(_) | None => record_peer,
+    }
+}
 
 /// #10: is this enrolled peer a GHOST — no fresh contact within the freshness
 /// TTL? A live peer's registry beacon refreshes `last_seen_ms` every cycle, so
@@ -99,8 +122,15 @@ pub struct PeerDialSkip {
     pub peer_id: PeerId,
     pub endpoint: RouteEndpoint,
     /// Milliseconds of backoff remaining before this endpoint is dialed
-    /// again.
+    /// again. `0` when [`Self::dead`] (no timer applies — only a fresher
+    /// advertisement revives a dead endpoint).
     pub remaining_ms: u64,
+    /// Self-healing join — failure-counted eviction: `true` when the
+    /// endpoint is DEAD (`DEAD_AFTER_CONSECUTIVE_FAILURES` consecutive
+    /// failures, no fresher advertisement since) rather than in a timed
+    /// backoff window. Surfaced distinctly so `transport health` never
+    /// mislabels an eviction as a countdown.
+    pub dead: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +156,41 @@ pub struct RouteDiscoverySnapshot {
     /// burn a `PEER_DIAL_TIMEOUT` and bury live peers in failure noise), and a
     /// single count is surfaced rather than one skip per ghost (anti-spam).
     pub ghost_peers_skipped: usize,
+    /// #1306: peers whose live connection was force-dropped this refresh
+    /// because their flushed frames went unacked (the half-open purge —
+    /// see [`crate::route::delivery_ledger::DeliveryLedger`]). Each is
+    /// immediately eligible for re-dial in the SAME refresh pass.
+    pub suspect_connections_dropped: Vec<PeerId>,
+}
+
+/// #1306: the lan-tcp health sample, derived from delivery accounting
+/// when any exists. Pure — the decision is unit-tested independent of
+/// forwarder/adapter machinery.
+///
+/// - `None` aggregate (no ledger, or no forward ever attempted): the
+///   honest pre-traffic fallback — `Healthy`, rtt/success unmeasured.
+/// - Some acks coming back: `Healthy`, with MEASURED rtt + success_ppm
+///   (this is what retires `state=healthy (not measured)`).
+/// - Every attempted peer currently suspect: `Degraded` — frames are
+///   being flushed and nothing acks; the transport must stop being
+///   advertised as usable-now even though sockets "exist".
+pub(crate) fn lan_health_sample(
+    aggregate: Option<super::delivery_ledger::DeliveryAggregate>,
+) -> TransportHealthSample {
+    let Some(aggregate) = aggregate else {
+        return TransportHealthSample::healthy_direct(TransportKind::LanTcp);
+    };
+    TransportHealthSample {
+        kind: TransportKind::LanTcp,
+        role: TransportRole::Direct,
+        state: if aggregate.all_suspect {
+            TransportHealthState::Degraded
+        } else {
+            TransportHealthState::Healthy
+        },
+        rtt_ms: aggregate.best_rtt_ms,
+        success_ppm: Some(aggregate.success_ppm),
+    }
 }
 
 impl RouteDiscoverySnapshot {
@@ -185,6 +250,13 @@ impl Airc {
         // verifier sees the newly-enrolled pubkeys.
         self.sync_account_peer_registry().await?;
 
+        // #1306: BEFORE trusting the connection map, drop sessions the
+        // delivery ledger has proven half-open (flushed frames, no acks).
+        // The dropped peers vanish from `connected`, so the dial pass
+        // below re-dials them THIS refresh instead of skipping them as
+        // "connected" forever — the half-open immortality bug.
+        let suspect_connections_dropped = self.purge_suspect_connections().await;
+
         let (peer_dial_failures, peer_dial_skips, ghost_peers_skipped) =
             self.dial_stored_peer_endpoints().await?;
 
@@ -194,8 +266,14 @@ impl Airc {
             .any(|endpoint| matches!(endpoint, RouteEndpoint::LanTcp { .. }));
         let connected_lan_peers = self.connected_lan_peers().await;
         if lan_has_endpoint || !connected_lan_peers.is_empty() {
-            self.upsert_transport_health(TransportHealthSample::healthy_direct(
-                TransportKind::LanTcp,
+            // #1306: MEASURED health when delivery accounting exists —
+            // real rtt/success_ppm and Degraded when every attempted
+            // peer is suspect. `healthy (not measured)` only as the
+            // honest no-traffic fallback.
+            self.upsert_transport_health(lan_health_sample(
+                self.delivery_ledger()
+                    .as_deref()
+                    .and_then(super::delivery_ledger::DeliveryLedger::aggregate),
             ))?;
         }
 
@@ -206,7 +284,44 @@ impl Airc {
             peer_dial_failures,
             peer_dial_skips,
             ghost_peers_skipped,
+            suspect_connections_dropped,
         })
+    }
+
+    /// #1306: force-drop every connected peer the delivery ledger marks
+    /// SUSPECT (≥ [`super::delivery_ledger::SUSPECT_UNACKED_ATTEMPTS`]
+    /// flushed-but-unacked frames). Emits one warn diagnostic per drop —
+    /// this is the moment a silent half-open socket becomes a visible,
+    /// self-healing event. No-op on handles without a ledger (non-daemon).
+    async fn purge_suspect_connections(&self) -> Vec<PeerId> {
+        let Some(ledger) = self.delivery_ledger() else {
+            return Vec::new();
+        };
+        let adapter = self.inner.lan_tcp.lock().await.clone();
+        let Some(adapter) = adapter else {
+            return Vec::new();
+        };
+        let mut dropped = Vec::new();
+        for peer in adapter.connected_peers().await {
+            if !ledger.is_suspect(peer) {
+                continue;
+            }
+            if adapter.drop_connection(peer).await {
+                ledger.note_purged(peer);
+                self.diag_sink().emit(
+                    airc_diagnostics::DiagnosticEvent::warn(
+                        airc_diagnostics::DiagnosticComponent::Transport,
+                        airc_diagnostics::DiagnosticCode::SuspectConnectionDropped,
+                        "live connection dropped: flushed frames went unacked — the \
+                         session was presumed half-open and the peer will be re-dialed \
+                         this refresh",
+                    )
+                    .with_field("peer", peer),
+                );
+                dropped.push(peer);
+            }
+        }
+        dropped
     }
 
     /// Card 625abe6d slice 1 — outbound-dial every enrolled peer with
@@ -267,6 +382,25 @@ impl Airc {
         let mut order: Vec<PeerId> = Vec::new();
         let mut merged: std::collections::HashMap<PeerId, Vec<RouteEndpoint>> =
             std::collections::HashMap::new();
+        // Self-healing join: the freshest endpoint-set stamp seen for
+        // each peer across both stores — the failure-counted eviction's
+        // revival signal (a fresher advertisement lifts a dead verdict).
+        let mut advert_stamps: std::collections::HashMap<PeerId, u64> =
+            std::collections::HashMap::new();
+        // Self-healing join (#240): the freshest presence stamp seen for
+        // each peer across both stores — proof-of-life that revives a DEAD
+        // endpoint for a probe even when its endpoint set (and thus its
+        // advert stamp) is unchanged. Same monotonic-max discipline as
+        // `advert_stamps` (a stale store copy must never rewind it).
+        let mut proof_of_life: std::collections::HashMap<PeerId, u64> =
+            std::collections::HashMap::new();
+        // Self-healing join (machine-vs-scope): each peer's declared
+        // transport host — the identity whose TLS cert answers at its
+        // stored endpoints. First-seen (wire-root) order wins, matching
+        // the endpoint merge above; normalized on write, so any Some
+        // here names a DIFFERENT peer than the record's own.
+        let mut declared_hosts: std::collections::HashMap<PeerId, PeerId> =
+            std::collections::HashMap::new();
         let mut ghost_peers_skipped = 0usize;
         for peer in stored {
             if peer.peer_id == self.inner.identity.peer_id || connected.contains(&peer.peer_id) {
@@ -313,6 +447,13 @@ impl Airc {
                     slot.push(endpoint);
                 }
             }
+            let stamp = advert_stamps.entry(peer.peer_id).or_insert(0);
+            *stamp = (*stamp).max(peer.endpoints_advertised_at_ms);
+            let alive = proof_of_life.entry(peer.peer_id).or_insert(0);
+            *alive = (*alive).max(peer.last_seen_ms);
+            if let Some(host) = peer.endpoints_peer_id.filter(|host| *host != peer.peer_id) {
+                declared_hosts.entry(peer.peer_id).or_insert(host);
+            }
         }
 
         // #9: prepend each peer's LEARNED real IP (harvested from an
@@ -346,9 +487,37 @@ impl Airc {
         // tests pin). What is now CONCURRENT is ACROSS peers: dialing
         // peer B must not wait on peer A's 3s timeout (see
         // DIAL_CONCURRENCY — the serial-sum hang this fixes).
-        let dial_list: Vec<(PeerId, Vec<RouteEndpoint>)> = order
+        let dial_list: Vec<(PeerId, PeerId, Vec<RouteEndpoint>, u64, u64)> = order
             .into_iter()
-            .filter_map(|peer_id| merged.remove(&peer_id).map(|eps| (peer_id, eps)))
+            .filter_map(|peer_id| {
+                merged.remove(&peer_id).map(|eps| {
+                    let stamp = advert_stamps.get(&peer_id).copied().unwrap_or(0);
+                    let alive = proof_of_life.get(&peer_id).copied().unwrap_or(0);
+                    // Machine-vs-scope: cert-pin the record's declared
+                    // transport host when it is enrolled (strict —
+                    // resolve_dial_pin); an unenrolled declared host is
+                    // LOUD and falls back to pinning the record's own
+                    // peer, which will fail the handshake honestly
+                    // rather than ever accepting an unknown identity.
+                    let declared = declared_hosts.get(&peer_id).copied();
+                    let host_enrolled = declared
+                        .map(|host| self.inner.registry.has_peer(host))
+                        .unwrap_or(false);
+                    let pin = resolve_dial_pin(peer_id, declared, host_enrolled);
+                    if let Some(host) = declared {
+                        if !host_enrolled {
+                            tracing::warn!(
+                                record_peer = %peer_id,
+                                declared_host = %host,
+                                "trust record declares an UNENROLLED transport host for its \
+                                 endpoints — pinning the record's own peer (strict); enrol \
+                                 the host or refresh the registry"
+                            );
+                        }
+                    }
+                    (peer_id, pin, eps, stamp, alive)
+                })
+            })
             .collect();
 
         // Dial peers concurrently (bounded), then merge results in the
@@ -357,14 +526,28 @@ impl Airc {
         // Arc adapter and every mutation (quarantine map, transport
         // health) sits behind its own brief lock, so concurrent dials to
         // distinct peers do not race.
-        let mut dialed: Vec<(usize, PeerDialOutcome)> =
-            futures::stream::iter(dial_list.into_iter().enumerate())
-                .map(|(idx, (peer_id, endpoints))| async move {
-                    (idx, self.dial_one_peer(peer_id, endpoints, now_ms).await)
-                })
-                .buffer_unordered(DIAL_CONCURRENCY)
-                .collect()
-                .await;
+        let mut dialed: Vec<(usize, PeerDialOutcome)> = futures::stream::iter(
+            dial_list.into_iter().enumerate(),
+        )
+        .map(
+            |(idx, (peer_id, pin, endpoints, advert_stamp_ms, proof_of_life_ms))| async move {
+                (
+                    idx,
+                    self.dial_one_peer(
+                        peer_id,
+                        pin,
+                        endpoints,
+                        now_ms,
+                        advert_stamp_ms,
+                        proof_of_life_ms,
+                    )
+                    .await,
+                )
+            },
+        )
+        .buffer_unordered(DIAL_CONCURRENCY)
+        .collect()
+        .await;
         dialed.sort_by_key(|(idx, _)| *idx);
         for (_, (peer_failures, peer_skips)) in dialed {
             failures.extend(peer_failures);
@@ -379,14 +562,35 @@ impl Airc {
     /// per-peer dials run concurrently; the inner endpoint walk here
     /// stays serial because cost-order + stop-on-first-success is the
     /// pinned contract.
+    ///
+    /// `pin` is the identity the TLS handshake must present
+    /// ([`resolve_dial_pin`]): the record's own peer, or its enrolled
+    /// declared transport host (machine-vs-scope). Quarantine stays
+    /// keyed by the RECORD's `(peer_id, addr)` — the record owns the
+    /// endpoint entry regardless of which identity answers it.
     async fn dial_one_peer(
         &self,
         peer_id: PeerId,
+        pin: PeerId,
         endpoints: Vec<RouteEndpoint>,
         now_ms: u64,
+        advert_stamp_ms: u64,
+        // Self-healing join (#240): the peer's presence freshness
+        // (`StoredPeer::last_seen_ms`) — a DEAD endpoint is revived for one
+        // probe when this proves the peer is alive since its last failure,
+        // even with no fresher endpoint advertisement.
+        proof_of_life_ms: u64,
     ) -> PeerDialOutcome {
         let mut failures = Vec::new();
         let mut skips = Vec::new();
+        // Machine-vs-scope: when the record's endpoints are hosted by a
+        // different (enrolled) identity that is ALREADY connected, the
+        // route is up — dialing again would only trip the adapter's
+        // already-connected guard. Same silent-skip semantics as the
+        // connected-record check in the collection loop.
+        if pin != peer_id && self.connected_lan_peers().await.contains(&pin) {
+            return (failures, skips);
+        }
         for endpoint in &endpoints {
             match endpoint {
                 RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } => {
@@ -408,23 +612,45 @@ impl Airc {
                     // `airc transport health`'s failure count. The operator still
                     // sees "in backoff" via the skips channel — honest, not a
                     // clean-list lie and not an over-report.
-                    if let Some(remaining_ms) =
-                        self.dial_quarantine_remaining_ms(peer_id, addr, now_ms)
-                    {
-                        skips.push(PeerDialSkip {
-                            peer_id,
-                            endpoint: endpoint.clone(),
-                            remaining_ms,
-                        });
-                        continue;
+                    match self.dial_quarantine_gate(
+                        peer_id,
+                        addr,
+                        now_ms,
+                        advert_stamp_ms,
+                        proof_of_life_ms,
+                    ) {
+                        super::dial_quarantine::DialGate::Dial => {}
+                        super::dial_quarantine::DialGate::Backoff { remaining_ms } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms,
+                                dead: false,
+                            });
+                            continue;
+                        }
+                        // Self-healing join — failure-counted eviction:
+                        // the endpoint is DEAD (kept on the record,
+                        // never dialed) until a fresher advertisement
+                        // arrives. This is what stops the 172.x ghost
+                        // swarm from burning a 3s timeout per corpse
+                        // per refresh, forever.
+                        super::dial_quarantine::DialGate::Dead { .. } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms: 0,
+                                dead: true,
+                            });
+                            continue;
+                        }
                     }
                     // #1120 sentinel blocking-2: connect_lan has no inner
                     // timeout, and a SYN-dropping firewall (the default posture
                     // of the NATs this card exists to cross) hangs the OS connect
                     // for ~21-130s per endpoint. Bound every dial; a timeout is a
                     // recorded failure like any other.
-                    match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, peer_id))
-                        .await
+                    match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, pin)).await
                     {
                         Ok(Ok(())) => {
                             // Card 7e3c9a1f: a live connect lifts any prior
@@ -434,15 +660,74 @@ impl Airc {
                             break;
                         }
                         Ok(Err(error)) => {
-                            self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                            let error_text = error.to_string();
+                            // A concurrent dial (another record hosted by the
+                            // same machine) may have connected the pinned
+                            // identity while ours failed the adapter's
+                            // already-connected guard — a live route is a
+                            // success, not a failure.
+                            if pin != peer_id && self.connected_lan_peers().await.contains(&pin) {
+                                self.dial_quarantine_record_success(peer_id, addr);
+                                break;
+                            }
+                            // Self-healing join — machine-vs-scope retry: the
+                            // endpoint answered TLS with a DIFFERENT enrolled
+                            // identity than the record pinned (live evidence:
+                            // scopes send as scope peers while the daemon's
+                            // listener presents the MACHINE identity, and a
+                            // human fixed it every time by redialing with the
+                            // machine id). Do what the human does, once, and
+                            // only for an identity we already trust. (With a
+                            // stored host mapping the pin was already correct;
+                            // this is the fallback for records that predate
+                            // the mapping.)
+                            if self
+                                .retry_dial_pinning_presented_identity(addr, pin, &error_text)
+                                .await
+                            {
+                                // Healed: the endpoint is live and its real
+                                // identity is connected. Clear this record's
+                                // quarantine so the mapped endpoint is not
+                                // failure-counted toward eviction.
+                                self.dial_quarantine_record_success(peer_id, addr);
+                                break;
+                            }
+                            // An identity-mismatch we could NOT heal (presented
+                            // peer not enrolled/trusted) is TERMINAL — this stored
+                            // endpoint now hosts a different peer and will fail
+                            // identically forever. Evict on the first strike so the
+                            // orphan isn't hammered for five cycles; a transient
+                            // failure still counts normally.
+                            if airc_transport::presented_peer_from_mismatch_error(&error_text)
+                                .is_some()
+                            {
+                                self.dial_quarantine_record_terminal_failure(
+                                    peer_id,
+                                    addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            } else {
+                                self.dial_quarantine_record_failure(
+                                    peer_id,
+                                    addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            }
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
-                                error: error.to_string(),
+                                error: error_text,
                             });
                         }
                         Err(_elapsed) => {
-                            self.dial_quarantine_record_failure(peer_id, addr, now_ms);
+                            self.dial_quarantine_record_failure(
+                                peer_id,
+                                addr,
+                                now_ms,
+                                advert_stamp_ms,
+                            );
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
@@ -472,15 +757,54 @@ impl Airc {
                     let Some((relay_peer, relay_addr)) = endpoint.connectable_relay() else {
                         continue;
                     };
-                    if let Some(remaining_ms) =
-                        self.dial_quarantine_remaining_ms(relay_peer, relay_addr, now_ms)
-                    {
-                        skips.push(PeerDialSkip {
-                            peer_id,
-                            endpoint: endpoint.clone(),
-                            remaining_ms,
-                        });
-                        continue;
+                    // #267: when the advertised relay IS this node, the
+                    // recorded port may belong to a PREVIOUS daemon
+                    // incarnation — the OS-assigned relay bind drifts across
+                    // restarts, and peers' imported cards republish on their
+                    // own cadence, so the stale port survives in route
+                    // records indefinitely (glass-boxed live: dialing our own
+                    // dead :65280 while the live relay sat on :57958,
+                    // "Connection refused" and 0 healthy routes). This node
+                    // is the AUTHORITY on its own relay listener: substitute
+                    // the live bound port instead of dialing — and then
+                    // quarantining — a dead self-port.
+                    let live_self_port = if relay_peer == self.inner.identity.peer_id {
+                        self.inner
+                            .relay_server
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|server| server.local_addr().port())
+                    } else {
+                        None
+                    };
+                    let relay_addr = substitute_self_relay_port(relay_addr, live_self_port);
+                    match self.dial_quarantine_gate(
+                        relay_peer,
+                        relay_addr,
+                        now_ms,
+                        advert_stamp_ms,
+                        proof_of_life_ms,
+                    ) {
+                        super::dial_quarantine::DialGate::Dial => {}
+                        super::dial_quarantine::DialGate::Backoff { remaining_ms } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms,
+                                dead: false,
+                            });
+                            continue;
+                        }
+                        super::dial_quarantine::DialGate::Dead { .. } => {
+                            skips.push(PeerDialSkip {
+                                peer_id,
+                                endpoint: endpoint.clone(),
+                                remaining_ms: 0,
+                                dead: true,
+                            });
+                            continue;
+                        }
                     }
                     match tokio::time::timeout(
                         PEER_DIAL_TIMEOUT,
@@ -496,15 +820,44 @@ impl Airc {
                             break;
                         }
                         Ok(Err(error)) => {
-                            self.dial_quarantine_record_failure(relay_peer, relay_addr, now_ms);
+                            // A relay host that re-installed comes back under a NEW
+                            // identity, so its stored endpoint now presents a cert
+                            // for a different peer — a TERMINAL mismatch that fails
+                            // identically forever (glass-boxed: the M5↔bigmama
+                            // "cert is for 71dcc50f, expected 2f0aed7f" orphan).
+                            // Evict on the first strike; revival on a fresher advert
+                            // still brings the relay's new endpoint in on its own.
+                            let error_text = error.to_string();
+                            if airc_transport::presented_peer_from_mismatch_error(&error_text)
+                                .is_some()
+                            {
+                                self.dial_quarantine_record_terminal_failure(
+                                    relay_peer,
+                                    relay_addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            } else {
+                                self.dial_quarantine_record_failure(
+                                    relay_peer,
+                                    relay_addr,
+                                    now_ms,
+                                    advert_stamp_ms,
+                                );
+                            }
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
-                                error: format!("relay connect: {error}"),
+                                error: format!("relay connect: {error_text}"),
                             });
                         }
                         Err(_elapsed) => {
-                            self.dial_quarantine_record_failure(relay_peer, relay_addr, now_ms);
+                            self.dial_quarantine_record_failure(
+                                relay_peer,
+                                relay_addr,
+                                now_ms,
+                                advert_stamp_ms,
+                            );
                             failures.push(PeerDialFailure {
                                 peer_id,
                                 endpoint: endpoint.clone(),
@@ -531,6 +884,88 @@ impl Airc {
         (failures, skips)
     }
 
+    /// Self-healing join — refresh-on-failure (M5↔bigmama decay mode
+    /// #1: a peer kept dialing a restarted daemon's DEAD port forever,
+    /// never re-reading the rendezvous).
+    ///
+    /// When a route refresh recorded dial failures, re-read the
+    /// rendezvous for FRESHER endpoints for the failed peers BEFORE the
+    /// next blind retry of the dead ones:
+    ///
+    /// 1. record the failed peers' stored endpoint sets;
+    /// 2. `refresh_account_registry(store)` — one rendezvous re-read;
+    ///    the import replaces endpoints atomically + monotonically (a
+    ///    staler advertisement is refused, so this can never make
+    ///    things worse);
+    /// 3. if any failed peer's stored endpoints CHANGED, run one more
+    ///    route-discovery pass so the fresh endpoints are dialed NOW —
+    ///    the just-failed endpoints sit in dial-failure backoff
+    ///    ([`crate::route::dial_quarantine`]), so the extra pass dials
+    ///    the fresh candidates, not the corpses.
+    ///
+    /// Bounded by construction: at most ONE rendezvous re-read and ONE
+    /// extra dial pass per refresh cycle, and the extra pass fires only
+    /// when the rendezvous actually produced a different endpoint set
+    /// for a peer that just failed. Retry of the dead endpoints
+    /// themselves stays governed by the quarantine backoff — this is
+    /// "re-read instead of blind retry", not a retry loop.
+    ///
+    /// Returns `Ok(None)` when there was nothing to heal (no failures,
+    /// no rendezvous document, or no fresher endpoint for any failed
+    /// peer); `Ok(Some(snapshot))` with the post-heal discovery
+    /// snapshot otherwise. Rendezvous errors propagate — the caller
+    /// (daemon loop) logs and continues per the self-heal doctrine.
+    pub async fn heal_failed_dials(
+        &self,
+        store: &dyn crate::account_registry::AccountRegistryStore,
+        failures: &[PeerDialFailure],
+    ) -> Result<Option<RouteDiscoverySnapshot>, AircError> {
+        if failures.is_empty() {
+            return Ok(None);
+        }
+        let failed_peers: std::collections::HashSet<PeerId> =
+            failures.iter().map(|failure| failure.peer_id).collect();
+
+        // Stored endpoint sets BEFORE the re-read — the registry import
+        // writes to the wire root, so that's the record we watch.
+        let endpoints_of = |peers: Vec<airc_trust::StoredPeer>| {
+            peers
+                .into_iter()
+                .filter(|peer| failed_peers.contains(&peer.peer_id))
+                .map(|peer| (peer.peer_id, peer.endpoints_json))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let before = endpoints_of(
+            airc_trust::load(&self.inner.wire_root)
+                .await
+                .map_err(|error| AircError::Transport(error.to_string()))?,
+        );
+
+        // ONE rendezvous re-read + import (atomic, monotonic — item 1).
+        if self.refresh_account_registry(store).await?.is_none() {
+            return Ok(None);
+        }
+
+        let after = endpoints_of(
+            airc_trust::load(&self.inner.wire_root)
+                .await
+                .map_err(|error| AircError::Transport(error.to_string()))?,
+        );
+        let fresher_arrived = failed_peers
+            .iter()
+            .any(|peer_id| before.get(peer_id) != after.get(peer_id));
+        if !fresher_arrived {
+            // Nothing fresher on the rendezvous — do NOT blind-retry
+            // the dead endpoints here; the quarantine backoff owns
+            // their retry cadence.
+            return Ok(None);
+        }
+        // Fresh endpoints exist for at least one failed peer: dial them
+        // now through the one pinned dial path (cost order, quarantine
+        // skips, stop-on-first-success), not a parallel dialer.
+        Ok(Some(self.refresh_route_discovery().await?))
+    }
+
     /// Snapshot the last known discovery state without mutating
     /// route health.
     pub async fn route_discovery_snapshot(&self) -> Result<RouteDiscoverySnapshot, AircError> {
@@ -541,41 +976,164 @@ impl Airc {
             peer_dial_failures: Vec::new(),
             peer_dial_skips: Vec::new(),
             ghost_peers_skipped: 0,
+            suspect_connections_dropped: Vec::new(),
         })
     }
 
-    /// Card 7e3c9a1f: backoff remaining for `(peer_id, addr)`, or `None`
-    /// when not quarantined. Keyed per-peer so a recycled container IP
-    /// under a new peer is not shadow-banned by a dead peer's failure.
-    /// Brief lock, never held across an await.
-    fn dial_quarantine_remaining_ms(
+    /// Self-healing join — the machine-vs-scope identity retry (item 1
+    /// of the restart-reconnect heal).
+    ///
+    /// A stored record can pin a SCOPE peer while the endpoint's TLS
+    /// listener presents the MACHINE (daemon) identity — the dial then
+    /// fails with the loud verifier mismatch naming the identity the
+    /// cert actually resolved to. When that presented identity is
+    /// ALREADY ENROLLED (strictness: an unknown identity is never
+    /// accepted, never dialed-for), retry the dial exactly once pinned
+    /// to it — the same recovery a human performs with the mismatch
+    /// error in hand. Returns `true` iff the endpoint's real identity
+    /// is connected after the retry.
+    ///
+    /// The durable scope→machine mapping (so first dials pin correctly
+    /// without a failed handshake) is the account-registry
+    /// `endpoints_peer_id` model; this retry is the fallback for
+    /// records that predate the mapping or whose mapping is missing.
+    async fn retry_dial_pinning_presented_identity(
+        &self,
+        addr: std::net::SocketAddr,
+        pinned: PeerId,
+        error_text: &str,
+    ) -> bool {
+        let Some(presented) = airc_transport::presented_peer_from_mismatch_error(error_text) else {
+            return false;
+        };
+        if presented == pinned {
+            return false;
+        }
+        if !self.inner.registry.has_peer(presented) {
+            // Strict cert pinning: the mismatch names an identity this
+            // scope does not trust — say so and stop. (The verifier can
+            // only name enrolled peers, so this arm means the verifier
+            // registry changed under us — still: never re-pin blind.)
+            tracing::warn!(
+                %addr,
+                pinned = %pinned,
+                presented = %presented,
+                "dial identity mismatch names an UNENROLLED identity — not retrying \
+                 (strict pinning; enrol the peer or fix the record)"
+            );
+            return false;
+        }
+        // Already connected to the presented identity (an earlier record
+        // in this refresh healed the same endpoint): nothing to dial.
+        if self.connected_lan_peers().await.contains(&presented) {
+            tracing::warn!(
+                %addr,
+                pinned = %pinned,
+                presented = %presented,
+                "dial identity mismatch: endpoint is the already-connected machine \
+                 identity — record pins a scope peer hosted there (machine-vs-scope)"
+            );
+            return true;
+        }
+        match tokio::time::timeout(PEER_DIAL_TIMEOUT, self.connect_lan(addr, presented)).await {
+            Ok(Ok(())) => {
+                self.dial_quarantine_record_success(presented, addr);
+                tracing::warn!(
+                    %addr,
+                    pinned = %pinned,
+                    presented = %presented,
+                    "dial identity mismatch HEALED: retried once pinning the enrolled \
+                     identity the cert presented (machine-vs-scope) — connected"
+                );
+                true
+            }
+            Ok(Err(retry_error)) => {
+                tracing::warn!(
+                    %addr,
+                    pinned = %pinned,
+                    presented = %presented,
+                    error = %retry_error,
+                    "dial identity mismatch retry failed"
+                );
+                false
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %addr,
+                    pinned = %pinned,
+                    presented = %presented,
+                    "dial identity mismatch retry timed out"
+                );
+                false
+            }
+        }
+    }
+
+    /// Card 7e3c9a1f + self-healing join: the dial verdict for
+    /// `(peer_id, addr)` — timed backoff, failure-counted DEAD (until a
+    /// fresher advertisement, per `current_advert_stamp_ms`), or dial.
+    /// Keyed per-peer so a recycled container IP under a new peer is
+    /// not shadow-banned by a dead peer's failure. Brief lock, never
+    /// held across an await.
+    fn dial_quarantine_gate(
         &self,
         peer_id: PeerId,
         addr: std::net::SocketAddr,
         now_ms: u64,
-    ) -> Option<u64> {
+        current_advert_stamp_ms: u64,
+        proof_of_life_ms: u64,
+    ) -> super::dial_quarantine::DialGate {
         let guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.remaining_ms(&(peer_id, addr), now_ms)
+        guard.gate(
+            &(peer_id, addr),
+            now_ms,
+            current_advert_stamp_ms,
+            proof_of_life_ms,
+        )
     }
 
     /// Card 7e3c9a1f: stamp a failed dial to `(peer_id, addr)` (starts /
-    /// doubles the backoff).
+    /// doubles the backoff, grows the eviction streak, and remembers the
+    /// advertisement stamp the failure occurred under).
     fn dial_quarantine_record_failure(
         &self,
         peer_id: PeerId,
         addr: std::net::SocketAddr,
         now_ms: u64,
+        advert_stamp_ms: u64,
     ) {
         let mut guard = self
             .inner
             .dial_quarantine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.record_failure((peer_id, addr), now_ms);
+        guard.record_failure((peer_id, addr), now_ms, advert_stamp_ms);
+    }
+
+    /// Terminal-failure eviction: a dial whose failure is DETERMINISTIC (an
+    /// identity-mismatch verdict — the endpoint now hosts a different peer, so
+    /// every dial will fail identically) evicts on the FIRST strike instead of
+    /// counting five. Stops the "survivor stuck on the orphan" wedge where a
+    /// re-installed peer's stale endpoint is hammered for ~5 refresh cycles.
+    /// Revival (fresher advert / proof-of-life) is unchanged — the returning
+    /// peer's new endpoint replaces the orphan on its own.
+    fn dial_quarantine_record_terminal_failure(
+        &self,
+        peer_id: PeerId,
+        addr: std::net::SocketAddr,
+        now_ms: u64,
+        advert_stamp_ms: u64,
+    ) {
+        let mut guard = self
+            .inner
+            .dial_quarantine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.record_terminal_failure((peer_id, addr), now_ms, advert_stamp_ms);
     }
 
     /// Card 7e3c9a1f: clear any quarantine on `(peer_id, addr)` after a
@@ -598,9 +1156,46 @@ impl Airc {
     }
 }
 
+/// #267: rewrite a self-relay dial target onto the LIVE listener port.
+/// `live_self_port` is `Some` only when the relay endpoint pins THIS node's
+/// peer id AND a relay server is currently bound — the one case where the
+/// route record's port can be authoritatively overridden without any
+/// network read. The IP is kept as recorded (it is this node's routable
+/// address, which the live listener serves via its wildcard bind).
+fn substitute_self_relay_port(
+    recorded: std::net::SocketAddr,
+    live_self_port: Option<u16>,
+) -> std::net::SocketAddr {
+    match live_self_port {
+        Some(port) => std::net::SocketAddr::from((recorded.ip(), port)),
+        None => recorded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (#267): a stale self-relay port in a route record must
+    // be rewritten to the LIVE listener port before dialing — the exact bug
+    // where every dial refused on a previous incarnation's OS-assigned port
+    // and the node quarantined ITSELF. A foreign relay (live_self_port=None)
+    // must dial exactly as recorded.
+    #[test]
+    fn self_relay_dials_the_live_port_never_a_dead_incarnation() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let recorded = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 249), 65280));
+        assert_eq!(
+            substitute_self_relay_port(recorded, Some(57958)),
+            SocketAddr::from((Ipv4Addr::new(192, 168, 1, 249), 57958)),
+            "self-relay: live port wins over the recorded one"
+        );
+        assert_eq!(
+            substitute_self_relay_port(recorded, None),
+            recorded,
+            "foreign relay (or no live server): dial as recorded"
+        );
+    }
 
     // what this catches (#9): the learn-live-address candidate builder. A peer
     // that connected to us teaches its real IP; we must produce
@@ -659,6 +1254,26 @@ mod tests {
         );
     }
 
+    // what this catches (machine-vs-scope cert identity — the pin
+    // decision): a record's declared transport host is honored ONLY
+    // when it names a different peer AND that host is enrolled. Every
+    // other shape — absent, self-mapping, unenrolled host — pins the
+    // record's own peer, so strict pinning can never be redirected to
+    // an identity this scope does not already trust.
+    #[test]
+    fn dial_pin_honors_only_an_enrolled_foreign_host_mapping() {
+        let scope = PeerId::from_u128(0xce8b);
+        let machine = PeerId::from_u128(0xe85a);
+        // The mapping case: enrolled foreign host → pin the host.
+        assert_eq!(resolve_dial_pin(scope, Some(machine), true), machine);
+        // Strictness: an unenrolled declared host is never pinned.
+        assert_eq!(resolve_dial_pin(scope, Some(machine), false), scope);
+        // A self-mapping adds nothing.
+        assert_eq!(resolve_dial_pin(scope, Some(scope), true), scope);
+        // No mapping — the pre-mapping behavior.
+        assert_eq!(resolve_dial_pin(scope, None, false), scope);
+    }
+
     fn snapshot(
         health: Vec<TransportHealthSample>,
         connected_lan_peers: Vec<PeerId>,
@@ -670,6 +1285,7 @@ mod tests {
             peer_dial_failures: Vec::new(),
             peer_dial_skips: Vec::new(),
             ghost_peers_skipped: 0,
+            suspect_connections_dropped: Vec::new(),
         }
     }
 
@@ -702,5 +1318,42 @@ mod tests {
     #[test]
     fn grid_of_one_never_elects() {
         assert!(!snapshot(Vec::new(), Vec::new()).should_self_elect_as_relay(0));
+    }
+
+    /// what this catches (#1306): the health-sample decision. No
+    /// delivery accounting keeps today's honest unmeasured fallback;
+    /// any accounting yields MEASURED rtt/success (retiring
+    /// `state=healthy (not measured)`); an all-suspect ledger — frames
+    /// flushing, nothing acking — must degrade the transport even
+    /// though sockets "exist".
+    #[test]
+    fn lan_health_sample_measures_and_degrades_from_delivery_truth() {
+        use crate::route::delivery_ledger::DeliveryAggregate;
+
+        let unmeasured = lan_health_sample(None);
+        assert_eq!(unmeasured.state, TransportHealthState::Healthy);
+        assert_eq!(unmeasured.rtt_ms, None);
+        assert_eq!(unmeasured.success_ppm, None);
+
+        let measured = lan_health_sample(Some(DeliveryAggregate {
+            attempts: 4,
+            acked: 3,
+            success_ppm: 750_000,
+            best_rtt_ms: Some(12),
+            all_suspect: false,
+        }));
+        assert_eq!(measured.state, TransportHealthState::Healthy);
+        assert_eq!(measured.rtt_ms, Some(12));
+        assert_eq!(measured.success_ppm, Some(750_000));
+
+        let half_open = lan_health_sample(Some(DeliveryAggregate {
+            attempts: 3,
+            acked: 0,
+            success_ppm: 0,
+            best_rtt_ms: None,
+            all_suspect: true,
+        }));
+        assert_eq!(half_open.state, TransportHealthState::Degraded);
+        assert_eq!(half_open.success_ppm, Some(0));
     }
 }

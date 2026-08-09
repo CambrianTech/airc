@@ -103,6 +103,24 @@ pub(crate) fn resolve_publish_endpoints(
     ))
 }
 
+/// Probe the daemon for its own peer id — the TLS cert identity its
+/// listener answers with. Paired with [`daemon_route_endpoints`]: when
+/// a scope publishes the daemon's endpoints, it must also publish WHO
+/// answers there (machine-vs-scope cert identity).
+async fn daemon_status_peer_id(home: &Path) -> Result<airc_core::PeerId, String> {
+    let socket = crate::cli::default_socket_path_in(home);
+    let client = DaemonClient::new(socket.clone());
+    let status = client
+        .status()
+        .await
+        .map_err(|error| format!("{error} (socket: {})", socket.display()))?;
+    status
+        .peer_id
+        .parse::<uuid::Uuid>()
+        .map(airc_core::PeerId::from_uuid)
+        .map_err(|error| format!("daemon status peer_id unparseable: {error}"))
+}
+
 /// Probe the daemon that owns this home's socket for its advertised
 /// endpoints. `Err(reason)` covers every can't-answer shape: no
 /// daemon, stale pre-verb daemon, RPC failure.
@@ -152,11 +170,32 @@ pub async fn run_sync(
     // Card 4b6a0ffa / #33: a manual sync must publish a DIALABLE
     // endpoint — the daemon's live one, read back over typed IPC —
     // or refuse. Never silently endpoint-less.
+    let handle_endpoints = airc.route_endpoints()?;
+    let endpoints_are_daemon_hosted = handle_endpoints.is_empty();
     let publish_endpoints = resolve_publish_endpoints(
-        airc.route_endpoints()?,
+        handle_endpoints,
         daemon_route_endpoints(home).await,
         allow_endpointless,
     )?;
+    // Self-healing join (machine-vs-scope cert identity): endpoints
+    // read back from the DAEMON answer TLS with the DAEMON's identity,
+    // not this scope's — record that host on the handle so the
+    // published beacon carries the identity a dialer must cert-pin
+    // (the live failure: remote dials pinned this scope's peer id and
+    // died in a loud mismatch until a human redialed by machine id).
+    // Loud when the host can't be resolved: publishing daemon-hosted
+    // endpoints WITHOUT the mapping re-creates the mismatch.
+    if endpoints_are_daemon_hosted && !publish_endpoints.is_empty() {
+        match daemon_status_peer_id(home).await {
+            Ok(daemon_peer) => airc.set_advertised_endpoints_host(daemon_peer),
+            Err(reason) => eprintln!(
+                "registry sync: could not resolve the daemon's peer id for the \
+                 endpoint-host mapping ({reason}) — publishing WITHOUT it; remote \
+                 dialers may hit a machine-vs-scope identity mismatch (self-healed \
+                 by their one-shot retry, but slower than pinning right first)"
+            ),
+        }
+    }
     if publish_endpoints.is_empty() {
         println!(
             "registry sync: publishing WITHOUT endpoints (--allow-endpointless): \

@@ -79,10 +79,16 @@ pub fn merge_registry_documents(
     let mut channels: Vec<ChannelName> = Vec::new();
     // peer_id -> (heartbeat_at_ms, doc generated_at_ms, beacon)
     let mut freshest: HashMap<airc_core::PeerId, (u64, u64, AccountPeerBeacon)> = HashMap::new();
-    // peer_id -> (heartbeat_at_ms, doc generated_at_ms, endpoints) of
-    // the freshest beacon that actually CARRIES endpoints — the
-    // backfill source when the overall-freshest beacon is endpoint-less.
-    type EndpointKey = (u64, u64, Vec<RouteEndpoint>);
+    // peer_id -> (heartbeat_at_ms, doc generated_at_ms, endpoints,
+    // endpoint-freshness stamp, transport-host mapping) of the freshest
+    // beacon that actually CARRIES endpoints — the backfill source when
+    // the overall-freshest beacon is endpoint-less. The stamp AND the
+    // host mapping travel WITH the endpoints so a backfilled set keeps
+    // the carrier's freshness and its cert-pin identity, never the
+    // winner's (self-healing join: stale endpoints must not masquerade
+    // as fresh, and endpoints must never be paired with another
+    // carrier's host).
+    type EndpointKey = (u64, u64, Vec<RouteEndpoint>, u64, Option<airc_core::PeerId>);
     let mut endpoint_carriers: HashMap<airc_core::PeerId, EndpointKey> = HashMap::new();
     let mut matched_any = false;
 
@@ -105,10 +111,18 @@ pub fn merge_registry_documents(
             let key = (beacon.presence.heartbeat_at_ms, document.generated_at_ms);
             if !beacon.endpoints.is_empty() {
                 match endpoint_carriers.get(&beacon.peer_id()) {
-                    Some((heartbeat, doc_ms, _)) if (*heartbeat, *doc_ms) >= key => {}
+                    Some((heartbeat, doc_ms, _, _, _)) if (*heartbeat, *doc_ms) >= key => {}
                     _ => {
-                        endpoint_carriers
-                            .insert(beacon.peer_id(), (key.0, key.1, beacon.endpoints.clone()));
+                        endpoint_carriers.insert(
+                            beacon.peer_id(),
+                            (
+                                key.0,
+                                key.1,
+                                beacon.endpoints.clone(),
+                                beacon.endpoints_freshness_ms(),
+                                beacon.endpoints_peer_id,
+                            ),
+                        );
                     }
                 }
             }
@@ -134,11 +148,19 @@ pub fn merge_registry_documents(
         .collect();
     // Endpoint retention (card 4b6a0ffa / #33): an endpoint-less winner
     // (e.g. a fresher manual-sync doc) must not erase a peer's known
-    // dialable endpoints from the merged view.
+    // dialable endpoints from the merged view. Self-healing join: the
+    // backfilled endpoints keep the CARRIER's freshness stamp — the
+    // winner's fresh presence says "the peer is alive", not "these
+    // endpoints are current" — so a fresher genuine advertisement
+    // still outranks them at import time.
     for peer in &mut peers {
         if peer.endpoints.is_empty() {
-            if let Some((_, _, endpoints)) = endpoint_carriers.remove(&peer.peer_id()) {
+            if let Some((_, _, endpoints, stamp, endpoints_peer)) =
+                endpoint_carriers.remove(&peer.peer_id())
+            {
                 peer.endpoints = endpoints;
+                peer.endpoints_advertised_at_ms = Some(stamp);
+                peer.endpoints_peer_id = endpoints_peer;
             }
         }
     }
@@ -230,13 +252,27 @@ impl AccountRegistryDocument {
             .iter()
             .filter_map(|presence| {
                 let peer_spec = specs.get(&presence.peer_id)?.clone();
+                let peer_endpoints = endpoints
+                    .get(&presence.peer_id)
+                    .cloned()
+                    .unwrap_or_default();
+                // Self-healing join: endpoints carried in a freshly
+                // generated document are current AS OF generation —
+                // stamp them so importers can order them against what
+                // they already hold. Endpoint-less beacons carry no
+                // stamp (nothing to date).
+                let endpoints_advertised_at_ms =
+                    (!peer_endpoints.is_empty()).then_some(generated_at_ms);
                 Some(AccountPeerBeacon {
                     presence: presence.clone(),
                     peer_spec,
-                    endpoints: endpoints
-                        .get(&presence.peer_id)
-                        .cloned()
-                        .unwrap_or_default(),
+                    endpoints: peer_endpoints,
+                    endpoints_advertised_at_ms,
+                    // The snapshot carries no host mapping; the
+                    // publisher stamps its own beacon's mapping in
+                    // `account_registry_document` when the endpoints
+                    // belong to a different transport identity.
+                    endpoints_peer_id: None,
                 })
             })
             .collect();
@@ -274,11 +310,61 @@ pub struct AccountPeerBeacon {
     pub presence: PresenceBeacon,
     pub peer_spec: PeerSpec,
     pub endpoints: Vec<RouteEndpoint>,
+    /// Self-healing join: epoch-ms instant the `endpoints` set was
+    /// ADVERTISED by its publisher. Distinct from
+    /// `presence.heartbeat_at_ms` because the reader-side merge can
+    /// backfill an older carrier's endpoints onto a fresher presence
+    /// (card 4b6a0ffa / #33) — the endpoints must then keep the
+    /// CARRIER's freshness, or a stale `(ip, port)` masquerades as
+    /// fresh and clobbers a good stored set on import (the M5↔bigmama
+    /// stale-port repro). `None` = written by a pre-stamp binary; the
+    /// import falls back to `presence.heartbeat_at_ms`. Serde-default
+    /// so old documents keep decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoints_advertised_at_ms: Option<u64>,
+    /// Self-healing join (machine-vs-scope cert identity): the peer id
+    /// of the TRANSPORT HOST whose TLS certificate answers at
+    /// `endpoints` — the daemon (machine keypair) identity when this
+    /// beacon is a SCOPE peer advertising a shared daemon listener
+    /// (live evidence: dial pinning the scope peer failed the TLS
+    /// handshake with a loud mismatch naming the machine identity).
+    /// Importers persist it on the trust record so dialers cert-pin
+    /// correctly the FIRST time; the dial layer only honors it when
+    /// the host is itself enrolled (strict pinning). `None` = the
+    /// endpoints answer as this beacon's own peer.
+    ///
+    /// NOTE: distinct from the mesh-identity machine-id (the registry
+    /// rendezvous key string) — this is a cert identity, joinable with
+    /// it in `airc whois` for the one-card machine↔scope view.
+    /// Serde-default so old documents keep decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoints_peer_id: Option<airc_core::PeerId>,
 }
 
 impl AccountPeerBeacon {
     pub fn peer_id(&self) -> airc_core::PeerId {
         self.peer_spec.peer_id
+    }
+
+    /// The transport-host mapping worth persisting for this beacon:
+    /// the declared `endpoints_peer_id` when it names a DIFFERENT peer
+    /// than the beacon's own (the machine-vs-scope case), else `None`
+    /// (the endpoints answer as the peer itself — a self-mapping adds
+    /// no information and is normalized away).
+    pub fn normalized_endpoints_peer(&self) -> Option<airc_core::PeerId> {
+        self.endpoints_peer_id
+            .filter(|host| *host != self.peer_id())
+    }
+
+    /// The freshness instant of this beacon's endpoint set: the
+    /// explicit stamp when present, else the presence heartbeat (the
+    /// pre-stamp binaries' best available signal — a beacon publishes
+    /// its endpoints at heartbeat time). NOT clamped: importers clamp
+    /// to their own clock (`.min(now_ms)`) before persisting, exactly
+    /// like the `last_seen` security clamp.
+    pub fn endpoints_freshness_ms(&self) -> u64 {
+        self.endpoints_advertised_at_ms
+            .unwrap_or(self.presence.heartbeat_at_ms)
     }
 
     pub fn invite_beacon(&self) -> InviteBeacon {
@@ -301,6 +387,20 @@ pub enum AccountRegistryError {
         spec_peer_id: airc_core::PeerId,
     },
     Adapter(String),
+    /// The gh request governor refused this call: the 60s window is full
+    /// (or GitHub's own backoff is active). Carries the governor's own
+    /// answer to "when may I try again?" as DATA rather than prose, so
+    /// the refresh loop can actually WAIT it out.
+    ///
+    /// Before this existed the denial was formatted into `Adapter`'s
+    /// string, logged, and the loop came back on its normal cadence —
+    /// re-attempting inside a window it had just been told was closed.
+    /// Measured on the M5 2026-08-04: 4,951 denials in a single daemon
+    /// log while the account registry (how peers FIND each other) stayed
+    /// starved. Advisory backoff is not backoff.
+    RateLimited {
+        retry_after_secs: u64,
+    },
 }
 
 impl std::fmt::Display for AccountRegistryError {
@@ -320,6 +420,11 @@ impl std::fmt::Display for AccountRegistryError {
                 "account registry peer mismatch: presence {presence_peer_id} vs spec {spec_peer_id}"
             ),
             Self::Adapter(error) => write!(f, "account registry adapter: {error}"),
+            Self::RateLimited { retry_after_secs } => write!(
+                f,
+                "gh request budget exhausted; the governor asks for {retry_after_secs}s \
+                 before the next Registry call"
+            ),
         }
     }
 }
@@ -335,6 +440,50 @@ pub trait AccountRegistryStore: Send + Sync {
         &self,
         mesh_identity: &MeshIdentity,
     ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError>;
+}
+
+/// Delegating impl so a `Box<dyn AccountRegistryStore>` — what the
+/// rendezvous resolver returns after picking gist vs shared-folder —
+/// itself satisfies `AccountRegistryStore`. That lets one boxed store
+/// flow through `run_loop`'s generic `S: AccountRegistryStore` bound
+/// unchanged, so provider SELECTION happens once at the seam and the
+/// refresh loop never learns which door the mesh converged through.
+#[async_trait]
+impl AccountRegistryStore for Box<dyn AccountRegistryStore> {
+    async fn publish(
+        &self,
+        document: &AccountRegistryDocument,
+    ) -> Result<(), AccountRegistryError> {
+        (**self).publish(document).await
+    }
+
+    async fn refresh(
+        &self,
+        mesh_identity: &MeshIdentity,
+    ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+        (**self).refresh(mesh_identity).await
+    }
+}
+
+/// Same delegation for `Arc<dyn AccountRegistryStore>` — the shape the
+/// daemon SHARES between the registry-refresh loop and the
+/// route-refresh loop's refresh-on-failure heal (self-healing join):
+/// one resolved rendezvous, two consumers, no second resolution.
+#[async_trait]
+impl AccountRegistryStore for Arc<dyn AccountRegistryStore> {
+    async fn publish(
+        &self,
+        document: &AccountRegistryDocument,
+    ) -> Result<(), AccountRegistryError> {
+        (**self).publish(document).await
+    }
+
+    async fn refresh(
+        &self,
+        mesh_identity: &MeshIdentity,
+    ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+        (**self).refresh(mesh_identity).await
+    }
 }
 
 /// Store-backed local cache of account-registry documents.
@@ -477,11 +626,39 @@ impl Airc {
             document.peers.push(AccountPeerBeacon {
                 presence,
                 peer_spec: self_spec,
+                // Self-healing join: we are advertising these endpoints
+                // RIGHT NOW — stamp with the publish instant so a
+                // restarted daemon's new port outranks every reader's
+                // stored copy of the old one.
+                endpoints_advertised_at_ms: (!self_endpoints.is_empty())
+                    .then(crate::time::now_ms)
+                    .transpose()?,
                 endpoints: self_endpoints,
+                // Stamped below, with the live path, in ONE place.
+                endpoints_peer_id: None,
             });
             document
                 .peers
                 .sort_by_key(|peer| peer.peer_id().to_string());
+        }
+
+        // Self-healing join (machine-vs-scope cert identity): when this
+        // handle's advertised endpoints are HOSTED by a different
+        // transport identity — a scope publishing the daemon's listener,
+        // read back over IPC — stamp that host on the self beacon so an
+        // importing dialer cert-pins the machine identity the first
+        // time instead of failing a scope-pinned handshake. A handle
+        // that owns its own listener leaves the mapping absent (the
+        // endpoints answer as this peer itself). One stamping site for
+        // both the live-presence and stale-self document paths.
+        if let Some(host) = self.advertised_endpoints_host() {
+            if host != self_id {
+                for peer in &mut document.peers {
+                    if peer.peer_id() == self_id && !peer.endpoints.is_empty() {
+                        peer.endpoints_peer_id = Some(host);
+                    }
+                }
+            }
         }
         Ok(document)
     }
@@ -535,6 +712,13 @@ impl Airc {
         // at — the upper bound for any peer's `last_seen`. See the clamp
         // at the touch below.
         let now_ms = crate::time::now_ms()?;
+        // #18 auto-trust: our REAL mesh identity, resolved from our own
+        // credential — never the document's self-asserted `mesh_identity`.
+        // The elevation below only fires when the document's identity
+        // actually MATCHES ours, so a foreign document (or a direct import
+        // of one) leaves its peers `Untrusted`. Using `document.mesh_identity`
+        // for both sides would be circular — a document vouching for itself.
+        let self_mesh = self.mesh_identity().await?;
         for peer in document.peers {
             if peer.peer_id() == self.inner.identity.peer_id {
                 continue;
@@ -545,6 +729,49 @@ impl Airc {
                 peer.peer_spec.pubkey,
             )
             .await?;
+            // #18 auto-trust (import-time elevation, staged model). This
+            // document is OUR OWN account registry — `refresh` loads it by
+            // our mesh identity and `import` re-asserts
+            // `document.mesh_identity == self mesh` via `validate()` above —
+            // so every non-self beacon in it was placed by a machine with
+            // write-access to our account's rendezvous (our `gh` token for
+            // the gist door, our device-scoped ACL for the folder door).
+            // That write-authority is same-account evidence, so the policy
+            // in `detect_tier` resolves these peers to `OwnAccount` rather
+            // than leaving them `Untrusted` (which would surface as an
+            // unusable "unknown" peer needing a manual `set-tier`). We route
+            // through `detect_tier` rather than hardcoding the tier so the
+            // signals→tier policy lives in exactly one place. Locality is
+            // `false` — a registry beacon proves nothing about local
+            // reachability; the `OwnMachine` upgrade is the local-UDS path's
+            // job, not the import's.
+            //
+            // STAGED (Joel's call): this couples trust to rendezvous
+            // write-authority. The planned hardening keeps the enrol here at
+            // `Untrusted` and elevates to `OwnAccount` only once the peer
+            // ALSO proves possession of this pinned key in a live session —
+            // defense-in-depth so a compromised rendezvous alone can't mint
+            // account trust. Tracked as the #18 handshake-gate follow-up.
+            let tier = airc_trust::detect_tier(
+                self.inner.identity.peer_id,
+                Some(self_mesh.as_str()),
+                peer.peer_spec.peer_id,
+                Some(document.mesh_identity.as_str()),
+                false,
+            );
+            airc_trust::set_tier(&self.inner.wire_root, peer.peer_spec.peer_id, tier)
+                .await?
+                // The peer was added to this exact store a few lines up; a
+                // vanished row here is the same structural bug the endpoint
+                // store below guards against, so fail loud rather than
+                // silently leaving the peer at the default tier.
+                .ok_or_else(|| {
+                    AircError::Transport(format!(
+                        "peer {} vanished between trust add and tier elevation \
+                         during registry import — report as a substrate bug",
+                        peer.peer_spec.peer_id
+                    ))
+                })?;
             // Seam #3.2 (liveness): a peer present in a freshly
             // refreshed, stale-pruned registry document just published a
             // beacon — that IS fresh contact. Record it so the age-based
@@ -577,13 +804,32 @@ impl Airc {
             // does not survive one). Empty beacons leave the column
             // alone — a registry refresh without endpoints must not
             // wipe endpoints learned elsewhere.
+            //
+            // Self-healing join: the write carries the advertisement's
+            // freshness stamp, clamped to our clock (same doctrine as
+            // the last_seen clamp above — the stamp is peer-asserted,
+            // and an un-clamped future stamp would block every later
+            // legitimate advertisement). The store replaces
+            // monotonically: a staler advertisement than what we hold
+            // is refused whole, so an out-of-order import can never
+            // resurrect a dead (ip, port) — the M5↔bigmama stale-port
+            // repro this card exists to kill.
             if !peer.endpoints.is_empty() {
                 let endpoints_json = crate::route::endpoints_to_json(&peer.endpoints)
                     .map_err(|error| AircError::Transport(error.to_string()))?;
+                // Self-healing join (machine-vs-scope): persist the
+                // beacon's transport-host mapping WITH the endpoints —
+                // normalized (a self-mapping carries no information) —
+                // so the dialer can cert-pin the machine identity that
+                // actually answers at these endpoints on the FIRST
+                // dial. Strictness lives at the dial layer: the mapping
+                // is only honored when the host is itself enrolled.
                 airc_trust::set_endpoints_json(
                     &self.inner.wire_root,
                     peer.peer_spec.peer_id,
                     Some(endpoints_json),
+                    peer.endpoints_freshness_ms().min(now_ms),
+                    peer.normalized_endpoints_peer(),
                 )
                 .await?
                 // The peer was added to this exact store two lines up;
@@ -670,6 +916,8 @@ mod tests {
             2_000,
             vec![channel("general")],
             vec![AccountPeerBeacon {
+                endpoints_advertised_at_ms: None,
+                endpoints_peer_id: None,
                 presence,
                 peer_spec: peer_spec(peer_id),
                 endpoints: vec![RouteEndpoint::LanTcp {
@@ -736,6 +984,8 @@ mod tests {
             2_000,
             vec![channel("general")],
             vec![AccountPeerBeacon {
+                endpoints_advertised_at_ms: None,
+                endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     presence_peer,
                     "/machine/a/.airc".into(),
@@ -772,6 +1022,8 @@ mod tests {
             2_000,
             vec![channel("general")],
             vec![AccountPeerBeacon {
+                endpoints_advertised_at_ms: None,
+                endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     peer_id,
                     "/machine/a/.airc".into(),
@@ -805,6 +1057,8 @@ mod tests {
             2_000,
             vec![channel("general")],
             vec![AccountPeerBeacon {
+                endpoints_advertised_at_ms: None,
+                endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     peer_id,
                     machine_a.clone(),
@@ -846,6 +1100,104 @@ mod tests {
         );
     }
 
+    // what this catches: #18 auto-trust (import-time elevation). A peer
+    // beacon carried in OUR OWN account registry (document mesh == our real
+    // mesh) must enrol at `OwnAccount`, not the default `Untrusted` — that
+    // is the difference between "join just works" and an unusable peer that
+    // needs a manual `set-tier`. The SECURITY half: a document whose
+    // mesh_identity is FOREIGN must leave its peers `Untrusted`, proving the
+    // elevation checks our real resolved mesh (never the document's
+    // self-asserted identity — that would be circular and let any document
+    // mint account trust for its own peers).
+    #[tokio::test]
+    async fn import_elevates_same_account_peer_but_not_a_foreign_document() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("machine-b/.airc");
+        std::fs::create_dir_all(&home).unwrap();
+        let airc = Airc::open(&home).await.unwrap();
+
+        // The document's identity IS our own resolved mesh — the same-account
+        // case the auto-trust exists for.
+        let my_mesh = airc.mesh_identity().await.unwrap();
+        let same_account_peer = PeerId::new();
+        let same_spec = peer_spec(same_account_peer);
+        let same_doc = AccountRegistryDocument::new(
+            my_mesh.clone(),
+            2_000,
+            vec![channel("general")],
+            vec![AccountPeerBeacon {
+                endpoints_advertised_at_ms: None,
+                endpoints_peer_id: None,
+                presence: crate::coordinator::beacon_now(
+                    same_account_peer,
+                    home.clone(),
+                    vec![channel("general")],
+                    123,
+                    1_000,
+                ),
+                peer_spec: same_spec.clone(),
+                endpoints: Vec::new(),
+            }],
+        );
+        airc.import_account_registry_document(same_doc)
+            .await
+            .unwrap();
+
+        let tier = airc_trust::load(&airc.inner.wire_root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.peer_id == same_spec.peer_id)
+            .expect("same-account peer enrolled on import")
+            .tier;
+        assert_eq!(
+            tier,
+            airc_store::TrustTier::OwnAccount,
+            "a peer in our OWN account registry must auto-elevate to OwnAccount"
+        );
+
+        // A document claiming a DIFFERENT mesh identity — its peers must NOT
+        // be elevated (the elevation must consult our real mesh, not the
+        // document's self-asserted one).
+        let foreign_peer = PeerId::new();
+        let foreign_spec = peer_spec(foreign_peer);
+        let foreign_doc = AccountRegistryDocument::new(
+            MeshIdentity::new("someone-else@github"),
+            2_000,
+            vec![channel("general")],
+            vec![AccountPeerBeacon {
+                endpoints_advertised_at_ms: None,
+                endpoints_peer_id: None,
+                presence: crate::coordinator::beacon_now(
+                    foreign_peer,
+                    home.clone(),
+                    vec![channel("general")],
+                    123,
+                    1_000,
+                ),
+                peer_spec: foreign_spec.clone(),
+                endpoints: Vec::new(),
+            }],
+        );
+        airc.import_account_registry_document(foreign_doc)
+            .await
+            .unwrap();
+
+        let foreign_tier = airc_trust::load(&airc.inner.wire_root)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.peer_id == foreign_spec.peer_id)
+            .expect("foreign peer still enrolled (key pinned) on import")
+            .tier;
+        assert_eq!(
+            foreign_tier,
+            airc_store::TrustTier::Untrusted,
+            "a peer from a foreign-mesh document must NOT auto-elevate — \
+             enrolment pins the key, but trust stays Untrusted"
+        );
+    }
+
     /// what this catches: seam #3.2 touch wiring + the SECURITY CLAMP
     /// (sentinel BLOCK on #1195). `import_account_registry_document`
     /// stamps `last_seen` from the beacon — but `heartbeat_at_ms` is the
@@ -877,6 +1229,8 @@ mod tests {
                 2_000,
                 vec![channel("general")],
                 vec![AccountPeerBeacon {
+                    endpoints_advertised_at_ms: None,
+                    endpoints_peer_id: None,
                     presence: crate::coordinator::beacon_now(
                         peer_id,
                         machine_b.clone(),
@@ -957,6 +1311,8 @@ mod tests {
 
     fn beacon_at(peer_id: PeerId, scope_home: &str, heartbeat_ms: u64) -> AccountPeerBeacon {
         AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
             presence: crate::coordinator::beacon_now(
                 peer_id,
                 scope_home.into(),
@@ -1045,6 +1401,8 @@ mod tests {
         let shared_spec = peer_spec(shared);
 
         let stale = AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
             presence: crate::coordinator::beacon_now(
                 shared,
                 "/machine/a/.airc".into(),
@@ -1058,6 +1416,8 @@ mod tests {
             }],
         };
         let fresh = AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
             presence: crate::coordinator::beacon_now(
                 shared,
                 "/machine/a/.airc".into(),
@@ -1112,6 +1472,8 @@ mod tests {
         let peer = PeerId::new();
         let spec = peer_spec(peer);
         let daemon_beacon = AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
             presence: crate::coordinator::beacon_now(
                 peer,
                 "/machine/a/.airc".into(),
@@ -1125,6 +1487,8 @@ mod tests {
             }],
         };
         let manual_sync_beacon = AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
             presence: crate::coordinator::beacon_now(
                 peer,
                 "/machine/a/.airc".into(),
@@ -1162,6 +1526,256 @@ mod tests {
                 addr: SocketAddr::from(([10, 0, 0, 2], 7717)),
             }],
             "endpoint-less fresh beacon must not erase known dialable endpoints"
+        );
+        // Self-healing join: the retained endpoints must carry the
+        // CARRIER's freshness (heartbeat 1_000), not inherit the
+        // winner's fresh presence — otherwise a later import would
+        // treat the stale set as current and clobber a newer stored
+        // endpoint. Mutation check: stamping the winner's heartbeat
+        // (or nothing) here fails this assert.
+        assert_eq!(
+            merged.peers[0].endpoints_advertised_at_ms,
+            Some(1_000),
+            "backfilled endpoints keep the carrier's freshness stamp"
+        );
+    }
+
+    // what this catches (machine-vs-scope cert identity): the
+    // endpoint-carrier backfill must carry the CARRIER's transport-host
+    // mapping with its endpoints — endpoints paired with another
+    // beacon's (absent) host would send dialers back into the identity
+    // mismatch this field exists to prevent. Also pins the serde
+    // contract: the field is skip-serialized when absent (old readers
+    // see unchanged documents) and defaults when missing (old
+    // documents keep decoding).
+    #[test]
+    fn merge_backfill_carries_the_carriers_endpoints_host_mapping() {
+        let peer = PeerId::new();
+        let machine = PeerId::new();
+        let spec = peer_spec(peer);
+        let carrier = AccountPeerBeacon {
+            endpoints_advertised_at_ms: Some(1_000),
+            endpoints_peer_id: Some(machine),
+            presence: crate::coordinator::beacon_now(
+                peer,
+                "/machine/a/.airc".into(),
+                vec![channel("general")],
+                123,
+                1_000,
+            ),
+            peer_spec: spec.clone(),
+            endpoints: vec![RouteEndpoint::LanTcp {
+                addr: SocketAddr::from(([10, 0, 0, 2], 7717)),
+            }],
+        };
+        let endpointless_winner = AccountPeerBeacon {
+            endpoints_advertised_at_ms: None,
+            endpoints_peer_id: None,
+            presence: crate::coordinator::beacon_now(
+                peer,
+                "/machine/a/.airc".into(),
+                vec![channel("general")],
+                456,
+                5_000,
+            ),
+            peer_spec: spec,
+            endpoints: Vec::new(),
+        };
+        let outcome = merge_registry_documents(
+            vec![
+                AccountRegistryDocument::new(mesh(), 2_000, Vec::new(), vec![carrier]),
+                AccountRegistryDocument::new(mesh(), 6_000, Vec::new(), vec![endpointless_winner]),
+            ],
+            &mesh(),
+        );
+        let merged = outcome.document.expect("document must merge");
+        assert_eq!(
+            merged.peers[0].endpoints_peer_id,
+            Some(machine),
+            "backfilled endpoints must keep the carrier's transport-host mapping"
+        );
+
+        // Serde contract: absent mapping serializes to NOTHING (old
+        // readers see the pre-field document)…
+        let no_mapping = AccountRegistryDocument::new(
+            mesh(),
+            2_000,
+            Vec::new(),
+            vec![AccountPeerBeacon {
+                endpoints_peer_id: None,
+                ..merged.peers[0].clone()
+            }],
+        );
+        let json = serde_json::to_string(&no_mapping).unwrap();
+        assert!(
+            !json.contains("endpoints_peer_id"),
+            "an absent mapping must not appear on the wire: {json}"
+        );
+        // …and a pre-field document (no key at all) still decodes.
+        let decoded: AccountRegistryDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.peers[0].endpoints_peer_id, None);
+    }
+
+    // what this catches (machine-vs-scope import): the beacon's
+    // transport-host mapping must land on the trust record WITH the
+    // endpoints — that is what lets the dialer cert-pin the machine
+    // identity the FIRST time — and a degenerate self-mapping must be
+    // normalized away (it adds no information and would only clutter
+    // every pin decision).
+    #[tokio::test]
+    async fn import_stores_the_endpoints_host_mapping_normalized() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("machine-b/.airc");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let scope_peer = PeerId::new();
+        let machine_peer = PeerId::new();
+        let self_hosted_peer = PeerId::new();
+        let beacon = |peer_id: PeerId, host: Option<PeerId>| AccountPeerBeacon {
+            endpoints_advertised_at_ms: Some(1_000),
+            endpoints_peer_id: host,
+            presence: crate::coordinator::beacon_now(
+                peer_id,
+                "/machine/a/.airc".into(),
+                vec![channel("general")],
+                123,
+                1_000,
+            ),
+            peer_spec: peer_spec(peer_id),
+            endpoints: vec![RouteEndpoint::LanTcp {
+                addr: SocketAddr::from(([10, 0, 0, 2], 7717)),
+            }],
+        };
+        let document = AccountRegistryDocument::new(
+            mesh(),
+            2_000,
+            vec![channel("general")],
+            vec![
+                beacon(scope_peer, Some(machine_peer)),
+                beacon(self_hosted_peer, Some(self_hosted_peer)),
+            ],
+        );
+
+        let airc = Airc::open(&home).await.unwrap();
+        airc.import_account_registry_document(document)
+            .await
+            .unwrap();
+
+        let peers = airc_trust::load(&airc.inner.wire_root).await.unwrap();
+        let stored = |id: PeerId| {
+            peers
+                .iter()
+                .find(|peer| peer.peer_id == id)
+                .expect("imported peer enrolled")
+                .clone()
+        };
+        assert_eq!(
+            stored(scope_peer).endpoints_peer_id,
+            Some(machine_peer),
+            "the machine↔scope mapping must persist on the trust record"
+        );
+        assert_eq!(
+            stored(self_hosted_peer).endpoints_peer_id,
+            None,
+            "a self-mapping must be normalized away at import"
+        );
+    }
+
+    /// what this catches (self-healing join, M5↔bigmama repro #2 —
+    /// "merge loses the port"): after a peer's daemon restarts on a
+    /// new port, importing the fresh advertisement must leave the
+    /// stored record EXACTLY (ip2, port2) — a whole-value replace,
+    /// never a field-merge keeping the stale port. And re-importing
+    /// the STALE advertisement afterwards (out-of-order rendezvous
+    /// read, or a fresh presence carrying merge-backfilled old
+    /// endpoints) must be refused — the dead (ip1, port1) never
+    /// resurrects. Mutation check: dropping the stamp guard in
+    /// `set_peer_trust_endpoints` fails the second half; stamping
+    /// backfilled endpoints with the winner's heartbeat fails the
+    /// third.
+    #[tokio::test]
+    async fn import_fresher_advertisement_fully_replaces_endpoint_and_stale_is_refused() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("machine-b/.airc");
+        std::fs::create_dir_all(&home).unwrap();
+        let airc = Airc::open(&home).await.unwrap();
+
+        let peer_id = PeerId::new();
+        let spec = peer_spec(peer_id);
+        let old_endpoint = RouteEndpoint::LanTcp {
+            // The literal live-evidence shape: daemon restarted, old
+            // port dead.
+            addr: SocketAddr::from(([192, 168, 1, 249], 58842)),
+        };
+        let new_endpoint = RouteEndpoint::LanTcp {
+            addr: SocketAddr::from(([192, 168, 1, 250], 57958)),
+        };
+        let doc = |hb: u64, endpoint: &RouteEndpoint, stamp: Option<u64>| {
+            AccountRegistryDocument::new(
+                mesh(),
+                hb,
+                vec![channel("general")],
+                vec![AccountPeerBeacon {
+                    presence: crate::coordinator::beacon_now(
+                        peer_id,
+                        home.clone(),
+                        vec![channel("general")],
+                        123,
+                        hb,
+                    ),
+                    peer_spec: spec.clone(),
+                    endpoints: vec![endpoint.clone()],
+                    endpoints_advertised_at_ms: stamp,
+                    endpoints_peer_id: None,
+                }],
+            )
+        };
+        let stored_endpoints = |peers: Vec<airc_trust::StoredPeer>| {
+            let json = peers
+                .into_iter()
+                .find(|p| p.peer_id == peer_id)
+                .expect("peer enrolled")
+                .endpoints_json
+                .expect("endpoints stored");
+            crate::route::endpoints_from_json(&json).expect("decode stored endpoints")
+        };
+
+        // Old advertisement lands first.
+        airc.import_account_registry_document(doc(1_000, &old_endpoint, None))
+            .await
+            .unwrap();
+        // Fresh advertisement (daemon restarted, new ip+port): the
+        // record must become EXACTLY the new endpoint — addr and port
+        // as one atomically-replaced value.
+        airc.import_account_registry_document(doc(2_000, &new_endpoint, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_endpoints(airc_trust::load(&airc.inner.wire_root).await.unwrap()),
+            vec![new_endpoint.clone()],
+            "a fresher advertisement fully replaces the endpoint"
+        );
+
+        // Out-of-order stale advertisement replayed: refused whole.
+        airc.import_account_registry_document(doc(1_000, &old_endpoint, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_endpoints(airc_trust::load(&airc.inner.wire_root).await.unwrap()),
+            vec![new_endpoint.clone()],
+            "a stale advertisement must never resurrect the dead endpoint"
+        );
+
+        // The live-bug composite: a FRESH presence (heartbeat 5_000)
+        // carrying merge-BACKFILLED old endpoints (carrier stamp
+        // 1_500) — fresh liveness must not launder stale endpoints.
+        airc.import_account_registry_document(doc(5_000, &old_endpoint, Some(1_500)))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_endpoints(airc_trust::load(&airc.inner.wire_root).await.unwrap()),
+            vec![new_endpoint],
+            "backfilled stale endpoints on a fresh presence must not clobber a newer stored set"
         );
     }
 

@@ -78,6 +78,8 @@ mod route_proof_commands;
 mod runtime_context;
 mod runtime_dir;
 mod staleness;
+mod state_cli;
+mod state_commands;
 mod transport_cli;
 mod transport_commands;
 mod update_commands;
@@ -117,6 +119,7 @@ use monitor::MonitorAction;
 use pending_cli::PendingAction;
 use queue_card_cli::QueueCardAction;
 use route_cli::RouteAction;
+use state_cli::StateAction;
 use transport_cli::TransportAction;
 use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
@@ -320,11 +323,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => identity_commands::run_write_work_session(&session_file, &name, &transport_name),
             IdentityAction::Show => identity_commands::run_show(&home).await,
             IdentityAction::Set {
+                name,
                 pronouns,
                 role,
                 bio,
                 status,
-            } => identity_commands::run_set(&home, pronouns, role, bio, status).await,
+            } => identity_commands::run_set(&home, name, pronouns, role, bio, status).await,
             IdentityAction::Link { platform, handle } => {
                 identity_commands::run_link(&home, &platform, &handle).await
             }
@@ -335,6 +339,22 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             IdentityAction::ContinuumHandle => identity_commands::run_continuum_handle(&home).await,
             IdentityAction::PushContinuum { handle } => {
                 identity_commands::run_push_continuum(&home, &handle).await
+            }
+        },
+
+        Command::State(args) => match args.action {
+            StateAction::Get { key, in_room } => {
+                state_commands::run_get(&home, &key, in_room).await
+            }
+            StateAction::Set {
+                key,
+                value,
+                version,
+                in_room,
+            } => state_commands::run_set(&home, &key, &value, version, in_room).await,
+            StateAction::List { in_room } => state_commands::run_list(&home, in_room).await,
+            StateAction::Delete { key, in_room } => {
+                state_commands::run_delete(&home, &key, in_room).await
             }
         },
 
@@ -354,6 +374,18 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Listen { replay } => commands::run_listen(&home, parsed.peers, replay).await,
+
+        Command::Dial {
+            to,
+            peer,
+            timeout_ms,
+        } => {
+            let expected = match peer {
+                Some(raw) => Some(parse_peer_id(&raw)?),
+                None => None,
+            };
+            commands::run_dial(&home, parsed.peers, to, expected, timeout_ms).await
+        }
 
         Command::LanSend {
             to,
@@ -718,13 +750,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 work_commands::run_cleanup(&home, dry_run, force).await
             }
             WorkAction::Board {
+                room,
                 limit,
                 available,
                 mine,
                 others,
             } => {
                 let filter = work_commands::BoardFilter::from_flags(available, mine, others);
-                work_commands::run_board(&home, limit, filter).await
+                work_commands::run_board(&home, room, limit, filter).await
             }
             WorkAction::Next {
                 repo,
@@ -812,7 +845,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             LaneAction::State { lane_id, state } => {
                 lane_commands::run_state(&home, lane_id, state).await
             }
-            LaneAction::Status { limit } => lane_commands::run_status(&home, limit).await,
+            LaneAction::Status { limit: _ } => lane_commands::run_status(&home).await,
             LaneAction::Manager { action } => match action {
                 LaneManagerAction::Claim { repo, ttl_ms } => {
                     lane_commands::run_manager_claim(&home, repo, ttl_ms).await
@@ -820,8 +853,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 LaneManagerAction::Release { repo } => {
                     lane_commands::run_manager_release(&home, repo).await
                 }
-                LaneManagerAction::Status { limit } => {
-                    lane_commands::run_manager_status(&home, limit).await
+                LaneManagerAction::Status { limit: _ } => {
+                    lane_commands::run_manager_status(&home).await
                 }
             },
         },
@@ -902,7 +935,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             WorkspaceAction::Release { workspace_id } => {
                 workspace_commands::run_release(&home, workspace_id).await
             }
-            WorkspaceAction::List { limit } => workspace_commands::run_list(&home, limit).await,
+            WorkspaceAction::List { limit: _ } => workspace_commands::run_list(&home).await,
         },
 
         Command::QueueCard(args) => match args.action {

@@ -33,9 +33,11 @@ pub(crate) fn detect_lan_ip() -> Option<Ipv4Addr> {
     //
     // Targeted fix: if we're running INSIDE a container, the OS's
     // "primary LAN" is the Docker bridge — not a real LAN — so we
-    // SHOULD NOT publish it as a dialable endpoint. Real hosts with
-    // 172.16/12 corporate LANs continue to work; only containers
-    // change behavior.
+    // SHOULD NOT publish it as a dialable endpoint. Self-healing join
+    // hardened this further: the shared hygiene predicate below now
+    // refuses the whole 172.16/12 band even on hosts (the live 172.x
+    // ghost swarm had container escapes this probe missed) — such a
+    // host still advertises its Tailscale rung.
     if in_container() {
         return None;
     }
@@ -47,8 +49,12 @@ pub(crate) fn detect_lan_ip() -> Option<Ipv4Addr> {
     }
 }
 
+/// Self-healing join — detection reuses the ONE advertise-hygiene rule
+/// (`airc_lib::lan_advertise_rejection`): loopback, unspecified,
+/// link-local, the 172.16/12 docker/bridge band, and CGNAT are never a
+/// LAN address worth advertising. One predicate, detection + advertise.
 fn is_routable_lan_ipv4(ip: Ipv4Addr) -> bool {
-    !ip.is_loopback() && !ip.is_unspecified()
+    airc_lib::lan_advertise_rejection(ip).is_none()
 }
 
 /// The IPv4 the daemon should ADVERTISE as its dialable LAN endpoint.
@@ -141,10 +147,10 @@ pub(crate) fn detect_tailscale_ip() -> Option<Ipv4Addr> {
     }
 }
 
-/// Tailscale's CGNAT range is `100.64.0.0/10` (100.64.0.0 – 100.127.255.255).
+/// Tailscale's CGNAT range check — delegates to the ONE definition in
+/// `airc_lib` (shared with the advertise hygiene).
 fn is_tailscale_ipv4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    o[0] == 100 && (64..=127).contains(&o[1])
+    airc_lib::is_tailscale_ipv4(ip)
 }
 
 // ===========================================================================

@@ -49,7 +49,8 @@ pub enum WorkspaceAction {
     },
     /// Print the current room's projected workspace leases.
     List {
-        /// Recent transcript events to replay into the projection.
+        /// Deprecated no-op (kept so existing invocations still parse):
+        /// the projection is always complete now — continuum #154.
         #[arg(long, default_value_t = 128)]
         limit: usize,
     },

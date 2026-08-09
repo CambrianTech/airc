@@ -32,7 +32,9 @@ pub enum LaneAction {
     },
     /// Print the current room's lane projection.
     Status {
-        /// Recent transcript events to replay into the projection.
+        /// Deprecated no-op (kept so existing invocations still parse):
+        /// the projection is always complete now — continuum #154, the
+        /// recent-window read lost durable state to chat traffic.
         #[arg(long, default_value_t = 128)]
         limit: usize,
     },
@@ -62,7 +64,8 @@ pub enum LaneManagerAction {
     },
     /// Print current manager hats from the board projection.
     Status {
-        /// Recent transcript events to replay into the projection.
+        /// Deprecated no-op (kept so existing invocations still parse):
+        /// the projection is always complete now — continuum #154.
         #[arg(long, default_value_t = 128)]
         limit: usize,
     },

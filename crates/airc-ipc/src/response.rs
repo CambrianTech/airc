@@ -32,6 +32,20 @@ pub enum Response {
     /// store's index. No envelope bytes ride along: the probe returns
     /// the cursor value only, never a copy of an event body.
     RoomTip(RoomTipResponse),
+    /// Response to `PeerIdentityCard` — the peer's durable identity-index
+    /// row (opaque `Identity` JSON + LWW `version`), or `None` when the peer
+    /// has never published a card. The identity analog of `RoomTip`: the
+    /// daemon answers from its owner-core `scoped_state` index, never by
+    /// replaying the room.
+    PeerIdentityCard(PeerIdentityCardResponse),
+    /// **#270/#241.** Response to `ListRooms` — the scope's durable
+    /// subscribed-room registry (parted rooms excluded). Answered from
+    /// the coordinator store's subscriptions table, never inferred from
+    /// transcript traffic.
+    Rooms(RoomsResponse),
+    /// **#1306 slice 2.** Response to `DeliveryStats` — per-peer
+    /// delivery-ledger rows from the daemon's routed forwarder.
+    DeliveryStats(DeliveryStatsResponse),
     /// One live event emitted by an `Attach` stream — the airc-wire
     /// encoding of the bus `Envelope`. The client decodes via
     /// `airc_wire::decode`.
@@ -124,6 +138,59 @@ pub struct PeersResponse {
     pub peers: Vec<PeerEntry>,
 }
 
+/// The scope's durable subscribed rooms (#270/#241).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomsResponse {
+    pub rooms: Vec<IpcRoomInfo>,
+}
+
+/// One subscribed room, straight from the coordinator store's
+/// subscriptions table. `name` is the human channel name (`general`,
+/// `project-x`); `room_id` is the converged UUID clients address
+/// events with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcRoomInfo {
+    pub room_id: RoomId,
+    pub name: String,
+    pub joined_at_ms: u64,
+    /// The scope's default channel (`airc msg` with no `--room`).
+    pub is_default: bool,
+}
+
+/// **#1306 slice 2.** Per-peer delivery-ledger rows. The wiring split is
+/// the same as `route_endpoints` / `connected_lan_peers`: the concrete
+/// ledger lives on an `airc-lib` handle this crate must not depend on,
+/// so the host's route-refresh loop snapshots it into `DaemonState`
+/// each tick and the daemon serves that snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryStatsResponse {
+    pub peers: Vec<IpcPeerDeliveryStats>,
+}
+
+/// One peer's end-to-end delivery accounting — mirrors
+/// `airc-lib`'s `PeerDeliveryStats` the way `IpcRouteEndpoint` mirrors
+/// `RouteEndpoint`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcPeerDeliveryStats {
+    pub peer_id: PeerId,
+    /// Frames flushed to this peer's connection (kernel buffer, not
+    /// enqueue).
+    pub attempts: u64,
+    /// Typed delivery acks received back (any outcome — each proves the
+    /// pipe and the remote daemon end-to-end).
+    pub acked: u64,
+    /// Flushed frames since the last ack — the suspect trigger.
+    pub attempts_since_ack: u32,
+    pub last_attempt_ms: Option<u64>,
+    /// Wall stamp of the last ack — "last confirmed delivery: N ago".
+    pub last_ack_ms: Option<u64>,
+    /// Measured send→ack round trip (EMA).
+    pub rtt_ema_ms: Option<u32>,
+    /// The connection is presumed half-open; route refresh will drop +
+    /// re-dial it.
+    pub suspect: bool,
+}
+
 /// Result of an `Inbox` pull: durable envelopes (airc-wire bytes) + the
 /// cursor to feed back as `since` on the next call. Envelopes are in
 /// total order `(epoch, counter, event_id)`, oldest → newest.
@@ -148,6 +215,33 @@ pub struct RoomTipResponse {
     /// absent on the wire) when the room has no durable events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<IpcCursor>,
+}
+
+/// Result of a `PeerIdentityCard` resolve: the peer's durable
+/// identity-index row, or `None` (absent on the wire) when the peer has
+/// never published a card. The identity analog of [`RoomTipResponse`] —
+/// answered from the daemon's owner-core `scoped_state` index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerIdentityCardResponse {
+    /// The stored identity-index row, or `None` when no card exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<IpcIdentityCard>,
+}
+
+/// One peer's durable identity-index row as it crosses IPC: the opaque
+/// serialized `Identity` JSON plus its LWW `version` (the card's
+/// `emitted_at_ms`). Mirrors `airc_store::StoredScopedState`'s
+/// `(value_json, version)` without leaking the store type across the
+/// boundary — this crate sits below airc-lib/airc-store's consumers,
+/// exactly like `IpcRouteEndpoint` mirrors `RouteEndpoint`. The client
+/// (`airc-lib`) reconstructs the typed `PeerIdentityCard` from these two
+/// fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcIdentityCard {
+    /// Serialized `airc_core::identity::Identity` JSON. Opaque here.
+    pub value_json: String,
+    /// LWW version — the card's `emitted_at_ms`, recorded verbatim.
+    pub version: i64,
 }
 
 /// One dialable endpoint advertised by the daemon (card 4b6a0ffa /
@@ -357,6 +451,37 @@ mod tests {
             (
                 Response::RoomTip(RoomTipResponse { tip: None }),
                 r#"{"kind":"room_tip"}"#,
+            ),
+        ] {
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert_eq!(encoded, expected, "wire bytes of {response:?}");
+            let decoded: Response = serde_json::from_str(expected).unwrap();
+            assert_eq!(decoded, response, "decode of pinned literal");
+        }
+    }
+
+    // what this catches: the EXACT wire bytes of `PeerIdentityCard` per
+    // shape — `kind` tag, `card` field, nested `value_json`/`version`
+    // field names all literal. Both shapes covered: a populated card,
+    // and the never-published shape where `card` is ABSENT (not `null`),
+    // mirroring `RoomTipResponse.tip`. A symmetric rename a round-trip
+    // test would miss breaks an attached client ↔ daemon of another
+    // version.
+    #[test]
+    fn peer_identity_card_response_wire_bytes_are_pinned_per_shape() {
+        for (response, expected) in [
+            (
+                Response::PeerIdentityCard(PeerIdentityCardResponse {
+                    card: Some(IpcIdentityCard {
+                        value_json: r#"{"name":"Claude"}"#.to_string(),
+                        version: 1_700_000_000_000,
+                    }),
+                }),
+                r#"{"kind":"peer_identity_card","card":{"value_json":"{\"name\":\"Claude\"}","version":1700000000000}}"#,
+            ),
+            (
+                Response::PeerIdentityCard(PeerIdentityCardResponse { card: None }),
+                r#"{"kind":"peer_identity_card"}"#,
             ),
         ] {
             let encoded = serde_json::to_string(&response).unwrap();

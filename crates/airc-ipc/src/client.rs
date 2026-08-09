@@ -17,12 +17,12 @@ use crate::codec::{read_frame, write_frame};
 use crate::transport::IpcStream;
 
 use crate::request::{
-    AddPeerRequest, AttachRequest, InboxRequest, PublishRequest, RemovePeerRequest, Request,
-    RoomTipRequest, SendRequest,
+    AddPeerRequest, AttachRequest, InboxRequest, PeerIdentityCardRequest, PublishRequest,
+    RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 use crate::response::{
-    InboxResponse, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    RouteEndpointsResponse, StatusResponse,
+    DeliveryStatsResponse, InboxResponse, PeerIdentityCardResponse, PeersResponse, PublishResponse,
+    Response, RoomTipResponse, RoomsResponse, RouteEndpointsResponse, StatusResponse,
 };
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -193,6 +193,22 @@ impl DaemonClient {
         }
     }
 
+    /// Resolve one peer's durable identity card from the daemon's
+    /// owner-core identity index (`scoped_state`, `user:<peer>`, key
+    /// `identity.card`). The attached-client read path for peer names: a
+    /// client's local store never holds foreign peers' cards, so
+    /// `peer_alias` / `peer_identity_card` ask the daemon — the identity
+    /// analog of `room_tip` for the transcript.
+    pub async fn peer_identity_card(
+        &self,
+        request: PeerIdentityCardRequest,
+    ) -> Result<PeerIdentityCardResponse, ClientError> {
+        match self.call(Request::PeerIdentityCard(request)).await? {
+            Response::PeerIdentityCard(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
     pub async fn stop(&self) -> Result<(), ClientError> {
         match self.call(Request::Stop).await? {
             Response::Ok => Ok(()),
@@ -222,6 +238,26 @@ impl DaemonClient {
     pub async fn route_endpoints(&self) -> Result<RouteEndpointsResponse, ClientError> {
         match self.call(Request::RouteEndpoints).await? {
             Response::RouteEndpoints(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// #1306 slice 2: per-peer end-to-end delivery accounting. The
+    /// delivery-truth read — doctor prints "last confirmed delivery to
+    /// X: N ago" from this instead of inferring health from TCP state.
+    pub async fn delivery_stats(&self) -> Result<DeliveryStatsResponse, ClientError> {
+        match self.call(Request::DeliveryStats).await? {
+            Response::DeliveryStats(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(other)),
+        }
+    }
+
+    /// #270/#241: the scope's durable subscribed-room registry. The
+    /// membership read continuum's nav seeds from — a member's rooms
+    /// exist in the interface before their first event, not after.
+    pub async fn list_rooms(&self) -> Result<RoomsResponse, ClientError> {
+        match self.call(Request::ListRooms).await? {
+            Response::Rooms(response) => Ok(response),
             other => Err(ClientError::UnexpectedResponse(other)),
         }
     }

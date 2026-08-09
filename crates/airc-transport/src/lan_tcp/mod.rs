@@ -30,4 +30,7 @@ pub mod verifier;
 pub use adapter::{LanTcpAdapter, LanTcpError};
 pub use cert::{extract_ed25519_pubkey, generate_self_signed_cert, CertGenError, CertParseError};
 pub use tls_config::{build_client_config, build_server_config, TlsConfigError};
-pub use verifier::{PinnedClientVerifier, PinnedServerVerifier};
+pub use verifier::{
+    peer_identity_mismatch_error, presented_peer_from_mismatch_error, PinnedClientVerifier,
+    PinnedServerVerifier,
+};

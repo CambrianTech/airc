@@ -1,5 +1,11 @@
 //! Consumer request structs for the work coordination API.
 
+use crate::time::now_ms;
+use crate::work_board_cache::{
+    cursor_strictly_before, zero_transcript_cursor, WorkBoardCache, WorkBoardCacheSource,
+    WORK_BOARD_CACHE_FORMAT_VERSION,
+};
+use crate::{Airc, AircError, Room};
 use airc_core::EventId;
 use airc_protocol::FrameKind;
 use airc_work::{
@@ -12,39 +18,18 @@ use airc_work::{
     WorkCardClaimed, WorkCardId, WorkEvent, WorkspaceAllocated, WorkspaceHeartbeat, WorkspaceId,
     WorkspaceReleased, WorkspaceRequested,
 };
-use airc_work_store::WorkEventStore;
-
-use crate::time::now_ms;
-use crate::work_board_cache::{
-    cursor_strictly_before, zero_transcript_cursor, WorkBoardCache, WorkBoardCacheSource,
-    WORK_BOARD_CACHE_FORMAT_VERSION,
-};
-use crate::{Airc, AircError};
 
 const WORK_MUTATION_PAGE_SIZE: usize = 512;
 
-/// Card 79953b4d: how many raw transcript events to fetch from the
-/// daemon per requested work board page entry. Heartbeats with their
-/// d4e3e350 coordination payload share the recent-event window with
-/// work events; with N active peers heart-beating every 60s a flat
-/// `limit`-event scan can be ~90% heartbeats. 4x over-fetch trades a
-/// bit of IPC bandwidth for the property "user's requested `limit`
-/// number of work events actually lands in the projection." Server-
-/// side filtering at the daemon's page rpc would be cleaner; this is
-/// the minimum-viable fix until that follow-up.
-const WORK_BOARD_FETCH_MULTIPLIER: usize = 4;
-
 /// Canonical pagination size for complete work-board projections.
 ///
-/// Card acd72c81: every prior caller that needed the complete board
-/// was passing `usize::MAX` to `work_board(limit)`. That issues ONE
-/// Inbox RPC asking for `usize::MAX * WORK_BOARD_FETCH_MULTIPLIER`
-/// events; the daemon serializes every transcript event in the room
-/// into a single CBOR frame, which trips
-/// `airc_ipc::codec::MAX_FRAME_BYTES` (16 MiB) once the room
-/// accumulates ~9000+ events. Empirically caught on Joel's box
-/// 2026-06-01: `airc work state X closed` failed with
-/// `daemon I/O: ipc frame too large: 16973574 bytes exceeds 16777216`.
+/// Card acd72c81: a complete projection read as ONE Inbox RPC asks the
+/// daemon to serialize every transcript event in the room into a
+/// single CBOR frame, which trips `airc_ipc::codec::MAX_FRAME_BYTES`
+/// (16 MiB) once the room accumulates ~9000+ events. Empirically
+/// caught on Joel's box 2026-06-01: `airc work state X closed` failed
+/// with `daemon I/O: ipc frame too large: 16973574 bytes exceeds
+/// 16777216`.
 ///
 /// `work_board_complete(page_size)` paginates: each IPC frame stays
 /// well under the cap while the projection is still complete.
@@ -53,18 +38,6 @@ const WORK_BOARD_FETCH_MULTIPLIER: usize = 4;
 /// and the round-trip count stays low for the 9000+ event case
 /// (~9 RPCs instead of one giant one).
 pub const WORK_BOARD_PROJECTION_PAGE_SIZE: usize = 1024;
-
-/// Card 79953b4d (pure helper for unit-testability): true when a
-/// transcript event is a work-domain event. Distinguishes work events
-/// from heartbeats / chat / other lifecycle by header presence rather
-/// than body shape — every work event carries
-/// `HEADER_FORGE_WORK_EVENT_KIND`; heartbeats and chat do not.
-fn is_work_event_transcript(event: &airc_core::TranscriptEvent) -> bool {
-    event
-        .headers
-        .iter()
-        .any(|(key, _)| key == airc_work::HEADER_FORGE_WORK_EVENT_KIND)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkCard {
@@ -843,45 +816,33 @@ impl Airc {
         })
     }
 
-    /// Rebuild the current room's work board from persisted work
-    /// events. `limit` is the transcript page size for interactive
-    /// board views; scheduling code should use
-    /// [`Airc::work_board_complete`] instead.
+    /// The current room's complete work board — the interactive board
+    /// view. Continuum #154: this used to be a recent-window projection
+    /// (`limit × WORK_BOARD_FETCH_MULTIPLIER` transcript events, work-
+    /// event-filtered); in any chat-heavy room every work event ages out
+    /// of that window and the board projects EMPTY while cards durably
+    /// exist — the instrument lies. Cards are event-sourced state, not
+    /// recent traffic, so the board verb reads the same complete cached
+    /// projection the scheduling/mutation paths use (cheap since card
+    /// 1291173d: snapshot + incremental resume).
+    pub async fn work_board(&self) -> Result<WorkBoardProjection, AircError> {
+        self.work_board_in(&self.current_room().await?).await
+    }
+
+    /// The complete work board of a room the caller RESOLVED for itself.
     ///
-    /// **DO NOT pass `usize::MAX`** — it issues a single Inbox RPC
-    /// asking for every event in the room, which trips
-    /// `airc_ipc::codec::MAX_FRAME_BYTES` (16 MiB) once the room
-    /// has accumulated ~9000+ events. If you need the complete
-    /// board, call [`Airc::work_board_complete`] with
-    /// [`WORK_BOARD_PROJECTION_PAGE_SIZE`] (paginated, never hits
-    /// the cap). Card acd72c81.
-    pub async fn work_board(&self, limit: usize) -> Result<WorkBoardProjection, AircError> {
-        let room = self.current_room().await?;
-        // Recent-window view (not the complete board): daemon reads the
-        // most-recent `limit`; direct reads the recent store page.
-        if self.is_daemon_attached() {
-            // Card 79953b4d: heartbeats with the d4e3e350 coordination
-            // payload (active_claims + doctrine_version) dominate the
-            // recent-event window at scale. With three+ peers heart-
-            // beating every 60s, a flat `limit`-event page fills with
-            // heartbeats and squeezes card lifecycle events out — the
-            // projection then misses recent cards even when they're
-            // durably in the transcript. Filter to events carrying
-            // HEADER_FORGE_WORK_EVENT_KIND (work-domain events only)
-            // and over-fetch by WORK_BOARD_FETCH_MULTIPLIER so the
-            // projection sees `limit` work events worth of history.
-            let fetch_limit = limit.saturating_mul(WORK_BOARD_FETCH_MULTIPLIER);
-            let transcripts: Vec<_> = self
-                .daemon_page_recent(&room, fetch_limit)
-                .await?
-                .into_iter()
-                .filter(is_work_event_transcript)
-                .take(limit)
-                .collect();
-            return Ok(airc_work_store::project_transcripts(transcripts)?);
-        }
-        let store = WorkEventStore::new(self.event_store());
-        Ok(store.project_recent(Some(room.channel), limit).await?)
+    /// [`Self::work_board`] answers "the board of whatever room I happen to
+    /// point at"; this answers "the board of THIS room". Continuum #345: a
+    /// caller that means a specific room must be able to say so, because the
+    /// silent default produces a plausible board for the wrong room and nothing
+    /// in the result says which one it read.
+    ///
+    /// Same page size as `work_board` — the default lives in exactly one place,
+    /// so the two can never disagree about how much history a "complete" board
+    /// folds in.
+    pub async fn work_board_in(&self, room: &Room) -> Result<WorkBoardProjection, AircError> {
+        self.project_room_work_board(room, WORK_BOARD_PROJECTION_PAGE_SIZE)
+            .await
     }
 
     /// Rebuild the current room's complete work board. Scheduling and
@@ -911,7 +872,19 @@ impl Airc {
     /// source mismatch, a cursor the log no longer agrees with) is
     /// logged loudly and recovered by a full from-scratch replay —
     /// the cache is an accelerator, never an authority.
-    async fn project_room_work_board(
+    ///
+    /// **Public because a caller that is already room-scoped must be able to say
+    /// WHICH room it means.** [`Self::work_board_complete`] resolves
+    /// `current_room()` — "whatever my default subscription happens to be" — which
+    /// is right for the CLI (the operator's current room IS the intent) and wrong
+    /// for any consumer that carries its own room. Continuum's persona gate binds
+    /// a room id and then checks it against a board this read never consulted; the
+    /// two agree only because both were seeded from the same `current_room()` at
+    /// bootstrap. Nothing prevented a gate that passed for room A while the read
+    /// returned room B, and no probe would have fired. Diagnosed 2026-08-07 while
+    /// tracing why a citizen's board and the operator's disagreed (they were two
+    /// different rooms, and neither surface named the one it read).
+    pub async fn project_room_work_board(
         &self,
         room: &crate::Room,
         page_size: usize,
@@ -1022,7 +995,7 @@ impl Airc {
     /// `cursor`, in transcript order — via the daemon when attached,
     /// the local store otherwise. Pass the zero cursor for the
     /// complete history.
-    async fn room_transcripts_since(
+    pub(crate) async fn room_transcripts_since(
         &self,
         room: &crate::Room,
         cursor: &airc_core::TranscriptCursor,
@@ -1209,6 +1182,19 @@ impl Airc {
                 room_id: room.channel,
             });
         };
+        // Settled work is history, not backlog: a Review/Merged/Closed card is
+        // past claiming regardless of lease status. Live evidence (2026-07-24):
+        // personas kept re-claiming already-completed cards because this guard
+        // only checked lease expiry — the board read as open work forever.
+        // Reopening is an explicit `airc work state` transition, never a claim.
+        // The predicate lives on CardState so the surfaces that ADVERTISE
+        // claimability answer with the same rule this gate enforces.
+        if card.state.is_settled() {
+            return Err(AircError::WorkCardNotClaimable {
+                card_id,
+                state: card.state,
+            });
+        }
         let now_ms = now_ms()?;
         if card.claim_id.is_none()
             || card
@@ -1277,66 +1263,6 @@ fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use airc_core::headers::Headers;
-    use airc_core::{ClientId, EventId, MentionTarget, RoomId, TranscriptKind};
-
-    fn event_with_headers(headers: Headers) -> airc_core::TranscriptEvent {
-        airc_core::TranscriptEvent {
-            event_id: EventId::new(),
-            room_id: RoomId::new(),
-            peer_id: airc_core::PeerId::new(),
-            client_id: ClientId::new(),
-            kind: TranscriptKind::System,
-            occurred_at_ms: 0,
-            lamport: 0,
-            target: MentionTarget::All,
-            headers,
-            body: None,
-            attachment: None,
-            receipt: None,
-            metadata: serde_json::Value::Null,
-        }
-    }
-
-    #[test]
-    fn work_event_transcript_filter_pins_header_presence_not_body_shape() {
-        // Card 79953b4d: at scale, heartbeats with the d4e3e350
-        // coordination payload share the recent-event window. The
-        // distinguishing signal is HEADER_FORGE_WORK_EVENT_KIND —
-        // every work event carries it, heartbeats / chat / generic
-        // lifecycle do not.
-
-        // Work event: header present → keep.
-        let mut work_headers = Headers::new();
-        work_headers.insert(
-            airc_work::HEADER_FORGE_WORK_EVENT_KIND.to_owned(),
-            "card_created".to_owned(),
-        );
-        assert!(is_work_event_transcript(&event_with_headers(work_headers)));
-
-        // Empty headers (e.g. raw heartbeat alive) → drop.
-        assert!(!is_work_event_transcript(&event_with_headers(
-            Headers::new()
-        )));
-
-        // Unrelated header only (e.g. a chat msg with bridge headers) → drop.
-        let mut other_headers = Headers::new();
-        other_headers.insert("airc.bridge.source".to_owned(), "slack".to_owned());
-        assert!(!is_work_event_transcript(&event_with_headers(
-            other_headers
-        )));
-
-        // Mixed headers including the work-kind header → keep
-        // (work events often carry several headers like
-        // forge.work.card_id alongside forge.work.kind).
-        let mut mixed_headers = Headers::new();
-        mixed_headers.insert(
-            airc_work::HEADER_FORGE_WORK_EVENT_KIND.to_owned(),
-            "card_claimed".to_owned(),
-        );
-        mixed_headers.insert("forge.work.card_id".to_owned(), "abc".to_owned());
-        assert!(is_work_event_transcript(&event_with_headers(mixed_headers)));
-    }
 
     #[test]
     fn build_operator_card_created_never_emits_origin_none() {

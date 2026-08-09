@@ -8,6 +8,16 @@ use crate::stream::{EventFilter, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
 
+/// Continuum #297: how many raw events the LOCAL-store filtered page
+/// reads per requested match. The local store has no kind-pushdown
+/// query (the daemon does — see [`Airc::daemon_page_recent_of_kinds`]),
+/// so [`Airc::page_recent_filtered`] pages `limit * 8` raw, filters,
+/// and keeps the newest `limit` matches — a bounded overscan instead of
+/// the old newest-`limit`-raw-then-filter, whose page a StreamChunk
+/// flood fills with events the filter discards. Exhausting the window
+/// before `limit` matches is logged (no silent caps).
+const STORE_FILTER_OVERSCAN: usize = 8;
+
 /// Event metadata returned by [`Airc::send_frame_to_room`]. Carries
 /// enough to build a typed receipt for the public publish API.
 #[derive(Debug, Clone, Copy)]
@@ -96,9 +106,14 @@ impl Airc {
         kind: FrameKind,
         target: MentionTarget,
         body: Body,
-        headers: Headers,
+        mut headers: Headers,
         room: &crate::Room,
     ) -> Result<SendFrameResult, AircError> {
+        // Cross-machine name reconvergence (blind-room heal): every
+        // room send carries the human channel name so a receiver whose
+        // identity-scoped channel derivation diverged from ours can
+        // re-derive the room under its own identity and still deliver.
+        room.stamp_name_header(&mut headers);
         // Daemon-attached: ALL structured sends (publish, work events,
         // lifecycle) route through the daemon's router — not just `say`.
         // Keeps the write path consistent with the daemon read path.
@@ -111,7 +126,6 @@ impl Airc {
         // rarely changes between sends; loading it from disk per outbound
         // message was ~95% of send latency (profiled). Sync at most once/sec.
         self.sync_account_peer_registry_debounced().await?;
-        let route = self.resolve_send_route(kind)?;
         let event_id = EventId::new();
         let occurred_at_ms = now_ms()?;
         let lamport = self.next_lamport(occurred_at_ms);
@@ -158,8 +172,59 @@ impl Airc {
         let __append = airc_diagnostics::timing::start();
         self.append_sent_frame(frame.clone()).await?;
         __append.stop("airc.append_sent");
+
+        // TRANSPORT IS NOT A PRECONDITION FOR MEMORY.
+        //
+        // Route resolution used to happen ABOVE, before the frame was even
+        // built, so `?` on a refusal returned early and the append never ran.
+        // Persist-then-transport was already the design (see the comment
+        // above); an accidental ordering made durability conditional on the
+        // network anyway.
+        //
+        // What that cost, measured on the M5 2026-08-04: a fresh scope could
+        // not say anything into its own room — `say` failed outright with
+        // "DataInteractive has no admissible live route" — and the live store
+        // held 504,013 events of which ZERO were messages (503,656 were
+        // `subscription_advanced` cursor rows). A room that only remembers
+        // what it successfully broadcast is not a transcript, and every
+        // read-side feature (persona wake-hydration, recall, repetition
+        // detection, the transcript UI) was compensating for a room with no
+        // history.
+        //
+        // Now: the event is durable and locally visible FIRST. A transport
+        // failure is reported loudly and does not erase what was said. It is
+        // deliberately not an `Err` — the send genuinely succeeded as an act
+        // of record, and whether a peer RECEIVED it is a different question
+        // with its own answer (the delivery-ack ledger, #280). Conflating
+        // "wrote it down" with "you heard it" is what made an offline node
+        // mute.
         let __route = airc_diagnostics::timing::start();
-        self.execute_send_route(route.kind, room, frame).await?;
+        match self.resolve_send_route(kind) {
+            Ok(route) => {
+                if let Err(error) = self.execute_send_route(route.kind, room, frame).await {
+                    tracing::warn!(
+                        target: "airc::messaging",
+                        %event_id,
+                        room = %room.name,
+                        %error,
+                        "message is durable and locally delivered, but the wire write \
+                         failed — remote peers have NOT received it; delivery receipts \
+                         are the authority on who actually got it"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "airc::messaging",
+                    %event_id,
+                    room = %room.name,
+                    %error,
+                    "message is durable and locally delivered, but NO transport route \
+                     is admissible right now — nothing was sent to remote peers. The \
+                     record stands; delivery is deferred to route recovery"
+                );
+            }
+        }
         __route.stop("airc.exec_route");
         Ok(SendFrameResult {
             event_id,
@@ -273,20 +338,98 @@ impl Airc {
 
     /// Fetch recent events matching `filter`. If the filter does not
     /// specify a channel, it is scoped to the current room.
+    ///
+    /// Continuum #297: the kind filter is applied BEFORE the limit, so
+    /// the page is the newest `limit` events OF THOSE KINDS — never the
+    /// survivors of a raw newest-`limit` (a persona-turn StreamChunk
+    /// flood fills a raw page and evicts every durable Message,
+    /// deafening working personas to direction). Daemon-attached, the
+    /// kinds are pushed down into the daemon's inbox read; the local
+    /// store path uses a bounded overscan. Either way `filter.matches`
+    /// still runs on the result (headers / self-echo are client-side).
     pub async fn page_recent_filtered(
         &self,
         filter: EventFilter,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
-        Ok(self
+        // Route to the DAEMON whenever one is attached — the kinds filter
+        // selects WHICH daemon read, it does not decide whether to use one.
+        //
+        // It used to: the daemon branch required `!filter.kinds.is_empty()`, so
+        // an attached caller passing a filter with no kind restriction fell
+        // through to `self.inner.store` — the CLIENT's local store, which for an
+        // attached client holds nothing, because the daemon owns the events.
+        // The call returned an empty page and looked like it had worked.
+        //
+        // Caught 2026-08-08 by `tests/room_roster.rs`, which went red the moment
+        // `active_agents` started paging through this function with a
+        // channel-only filter: "self must be present in its own room roster" —
+        // the roster was empty because the read had quietly consulted the wrong
+        // store. Nothing about the signature suggests that a kind-less filter is
+        // the unsupported case.
+        if self.is_daemon_attached() {
+            if let Some(channel) = filter.channel {
+                if !filter.kinds.is_empty() {
+                    return Ok(self
+                        .daemon_page_recent_of_kinds(channel, &filter.kinds, limit)
+                        .await?
+                        .into_iter()
+                        .filter(|event| filter.matches(event))
+                        .collect());
+                }
+                // No kind restriction: page the whole room from the daemon,
+                // exactly what `page_recent` fetches.
+                //
+                // Only when the channel is one this scope actually subscribes
+                // to. An UNSUBSCRIBED channel deliberately falls through to the
+                // local-store path below rather than returning empty — that is
+                // the pre-existing behaviour and two integration tests depend on
+                // it (`unknown_channel_auto_rebinds_from_account_registry_cache`,
+                // `delivered_ack_means_visible_to_subscribed_scopes_not_just_durable`),
+                // because a frame can land in the local transcript for a channel
+                // the subscription set has not converged on yet. Returning empty
+                // there would break the rebind path this crate heals with.
+                if let Some(room) = self.room_by_channel(channel).await? {
+                    return Ok(self
+                        .daemon_page_recent(&room, limit)
+                        .await?
+                        .into_iter()
+                        .filter(|event| filter.matches(event))
+                        .collect());
+                }
+            }
+        }
+        // Local store path: bounded overscan — page a wider raw window,
+        // filter, keep the newest `limit` matches. With a pass-all
+        // filter this is exactly the newest `limit` (today's behavior).
+        let overscan = limit.saturating_mul(STORE_FILTER_OVERSCAN);
+        let raw = self
             .inner
             .store
-            .page_recent(filter.channel, limit)
-            .await?
+            .page_recent(filter.channel, overscan)
+            .await?;
+        let scanned = raw.len();
+        let mut matches: Vec<TranscriptEvent> = raw
             .into_iter()
             .filter(|event| filter.matches(event))
-            .collect())
+            .collect();
+        if matches.len() < limit && scanned == overscan {
+            // No silent caps: the overscan window filled before finding
+            // `limit` matches — older matching events may exist beyond it.
+            tracing::debug!(
+                target: "airc::messaging",
+                limit,
+                overscan,
+                found = matches.len(),
+                "page_recent_filtered: overscan window exhausted before \
+                 finding `limit` matching events"
+            );
+        }
+        if matches.len() > limit {
+            matches.drain(..matches.len() - limit);
+        }
+        Ok(matches)
     }
 
     /// Fetch recent events from the subscribed room set.

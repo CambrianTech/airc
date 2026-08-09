@@ -71,10 +71,32 @@ pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn s
             println!("  channel: {}", next.channel);
         }
         None => {
+            // #270: bare `airc room` lists EVERY subscription, not just the
+            // current one. The old current-only display read as "my rooms",
+            // which is exactly how a whole afternoon of seam messages sat
+            // unread in a subscribed-but-not-current channel while both
+            // agents concluded the transport was broken. Membership must be
+            // visible to be trusted.
             let current = airc.current_room().await?;
+            let set = airc.subscription_set().await?;
             println!("room:    {}", current.name);
             println!("wire:    {}", current.wire.display());
             println!("channel: {}", current.channel);
+            let others: Vec<_> = set
+                .all()
+                .filter(|s| s.name.as_str() != current.name)
+                .collect();
+            if others.is_empty() {
+                println!("subscribed: (only the current room)");
+            } else {
+                println!(
+                    "subscribed ({} more — `airc room <name>` to switch):",
+                    others.len()
+                );
+                for sub in others {
+                    println!("  {}  channel {}", sub.name.as_str(), sub.room_id);
+                }
+            }
         }
     }
     Ok(())
@@ -897,11 +919,39 @@ fn format_send_receipt(
              Any scope tailing this channel on this machine still has it."
         )
     } else {
+        // Report REACH, not the address book. `enrolled_peers` is every peer this
+        // scope has ever enrolled — across every room, for all time — so printing
+        // it beside a live count invites the reader to divide, and that ratio is
+        // meaningless: the enrolled set is not this room's audience, and
+        // `connected_lan_peers` counts LAN links only.
+        //
+        // Live 2026-08-07 that arithmetic manufactured a false alarm. "addressed 52
+        // enrolled remote peer(s), 1 currently connected" reads as 2% reach; the
+        // ack ledger for the same period showed 767 of 771 delivered — 99.5%. A
+        // card was filed on the strength of the receipt (#340) and the receipt was
+        // the only thing wrong. An instrument that reads as a catastrophe during
+        // healthy operation is worse than no instrument: it burns the operator's
+        // trust in every future alarm.
+        //
+        // So: state the live count as a plain fact with no denominator to divide
+        // by, and point at `airc doctor --health`, which reads the ACK ledger
+        // (#280 — delivery is a returned ack, never a connection's existence).
+        let peers = if connected_lan_peers == 1 {
+            "1 peer"
+        } else {
+            "peers"
+        };
+        let count = if connected_lan_peers == 1 {
+            String::new()
+        } else {
+            format!("{connected_lan_peers} ")
+        };
         format!(
-            "queued to {channel_name} ({channel_id}) — addressed {enrolled_peers} enrolled \
-             remote peer(s), {connected_lan_peers} currently connected; delivery is \
-             asynchronous and not yet confirmed \
-             (run `airc doctor --health` to check route delivery). \
+            "queued to {channel_name} ({channel_id}) — live to {count}{peers} now; \
+             delivery is asynchronous and confirmed by ACK, not by this line \
+             (run `airc doctor --health` for the delivery ledger). \
+             {enrolled_peers} peer(s) are enrolled in this scope's address book, \
+             which is not this room's audience — do not read it as a reach ratio. \
              Any scope tailing this channel on this machine also receives it."
         )
     }
@@ -1104,6 +1154,143 @@ pub async fn run_lan_send(
     }
 }
 
+/// Self-healing join — `airc dial HOST:PORT`: manual recovery dial with
+/// the full authenticated handshake, LOUD either way.
+///
+/// Why it exists (M5↔bigmama live repro): when the automatic paths are
+/// wedged — a peer dialing our dead port, a poisoned record — ONE
+/// hands-on authenticated dial both proves reachability AND teaches the
+/// REMOTE side our real source address (learn-live-address, #9), which
+/// un-wedges its next outbound dial. This is the manual override that
+/// used to require hand-driven `lan-send` gymnastics.
+///
+/// The expected peer (for mTLS cert pinning) is inferred when `--peer`
+/// is omitted: first a stored-endpoint exact match, then the
+/// identity-derived stable port (#8). Ambiguity or no match is a loud
+/// error naming the candidates — never a guess.
+pub async fn run_dial(
+    home: &Path,
+    peers: Vec<PeerSpec>,
+    to: std::net::SocketAddr,
+    expected_peer: Option<PeerId>,
+    timeout_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    for peer in &peers {
+        airc.enrol_volatile_peer(peer)?;
+    }
+
+    let expected = match expected_peer {
+        Some(peer) => peer,
+        None => infer_peer_for_endpoint(&airc, home, to).await?,
+    };
+    preflight_expected_peer(&airc, home, &peers, expected).await?;
+
+    println!("dialing {to} expecting peer {expected} …");
+    let deadline = std::time::Duration::from_millis(timeout_ms);
+    match tokio::time::timeout(deadline, airc.connect_lan(to, expected)).await {
+        Ok(Ok(())) => {
+            // A successful authenticated dial IS fresh contact — stamp
+            // recency so the liveness/ghost classifiers see it (same
+            // contract as the registry import's touch). Best-effort on
+            // both stores; `Ok(None)` just means the peer lives in the
+            // other one.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let _ = airc_trust::touch_last_seen(airc.wire_root(), expected, now_ms).await;
+            let _ = airc_trust::touch_last_seen(home, expected, now_ms).await;
+            println!(
+                "CONNECTED: authenticated handshake with {expected} at {to} succeeded.\n\
+                 The remote has now learned THIS machine's real source address \
+                 (learn-live-address) — its next outbound dial can use it even if its \
+                 stored endpoint for us is stale."
+            );
+            Ok(())
+        }
+        Ok(Err(error)) => Err(format!(
+            "DIAL FAILED: {to} (expecting {expected}) — {error}\n\
+             The endpoint answered nothing acceptable. Check `airc network` for the \
+             peer's freshest advertisement, or `airc registry sync` to re-read the \
+             rendezvous."
+        )
+        .into()),
+        Err(_elapsed) => Err(format!(
+            "DIAL FAILED: {to} (expecting {expected}) — no TCP+TLS handshake within \
+             {timeout_ms}ms (endpoint unreachable, or a firewall drops SYN)."
+        )
+        .into()),
+    }
+}
+
+/// Infer which enrolled peer owns `to` for cert pinning: an exact match
+/// against stored endpoints first, else the identity-derived stable
+/// port (#8 — `stable_lan_port(peer_id) == to.port()`). Exactly one
+/// candidate wins; zero or several is a loud error asking for `--peer`.
+async fn infer_peer_for_endpoint(
+    airc: &Airc,
+    home: &Path,
+    to: std::net::SocketAddr,
+) -> Result<PeerId, Box<dyn std::error::Error>> {
+    let mut stored = airc_trust::load(airc.wire_root()).await.unwrap_or_default();
+    if airc.wire_root() != home {
+        stored.extend(airc_trust::load(home).await.unwrap_or_default());
+    }
+    let mut endpoint_matches: Vec<PeerId> = Vec::new();
+    let mut port_matches: Vec<PeerId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for peer in stored {
+        if peer.peer_id == airc.peer_id() || !seen.insert(peer.peer_id) {
+            continue;
+        }
+        if let Some(json) = peer.endpoints_json.as_deref() {
+            if let Ok(endpoints) = airc_lib::endpoints_from_json(json) {
+                let hit = endpoints.iter().any(|endpoint| {
+                    matches!(
+                        endpoint,
+                        airc_lib::RouteEndpoint::LanTcp { addr }
+                        | airc_lib::RouteEndpoint::TailscaleTcp { addr } if *addr == to
+                    )
+                });
+                if hit {
+                    endpoint_matches.push(peer.peer_id);
+                    continue;
+                }
+            }
+        }
+        if airc_lib::stable_lan_port(peer.peer_id) == to.port() {
+            port_matches.push(peer.peer_id);
+        }
+    }
+    let candidates = if endpoint_matches.is_empty() {
+        port_matches
+    } else {
+        endpoint_matches
+    };
+    match candidates.as_slice() {
+        [one] => {
+            println!("inferred expected peer {one} for {to} (trust-store match)");
+            Ok(*one)
+        }
+        [] => Err(format!(
+            "cannot infer which peer to expect at {to}: no enrolled peer's stored \
+             endpoint or stable port matches. Pass --expected-peer <uuid> (see `airc peers`)."
+        )
+        .into()),
+        several => Err(format!(
+            "ambiguous: {} enrolled peers match {to} ({}). Pass --expected-peer <uuid>.",
+            several.len(),
+            several
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into()),
+    }
+}
+
 /// Card bf7c30e2: verify `expected_peer` is known to the SAME trust
 /// material the TLS verifier will pin against — the opened handle's
 /// `peers()` union (scope store + machine-account store + wire-root
@@ -1213,8 +1400,11 @@ pub async fn run_daemon(
     let machine_home = airc_lib::machine_account_home(home);
     std::fs::create_dir_all(&machine_home)?;
     let db_path = machine_home.join("events.sqlite");
-    let coordinator_store: Arc<dyn EventStore> =
-        Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    // Concrete handle kept alongside the trait object: the inbound
+    // bridge's unknown-channel heal reads the account-registry CACHE
+    // (a concrete SqliteAccountRegistryStore over this same file).
+    let machine_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let coordinator_store: Arc<dyn EventStore> = machine_store.clone();
     let state = Arc::new(
         DaemonState::build(
             identity.peer_id,
@@ -1257,36 +1447,97 @@ pub async fn run_daemon(
     // installed ONCE here; the listener bind stays in the registry task
     // (gated), the dial happens in route refresh — all on this one handle.
     let daemon_airc = Airc::open(&state.home).await?;
-    daemon_airc.set_inbound_frame_sink(Arc::new(airc_lib::RouterInboundBridge::new(
-        state.router.clone(),
-        state.coordinator_store.clone(),
-    )));
+    daemon_airc.set_inbound_frame_sink(Arc::new(
+        airc_lib::RouterInboundBridge::new(state.router.clone(), state.coordinator_store.clone())
+            // Self-healing join (the "blind room" heal): an inbound
+            // frame for a channel no scope binds consults the local
+            // account-registry cache and re-binds from its beacons
+            // instead of silently store-and-dropping.
+            .with_account_registry(Arc::new(airc_lib::SqliteAccountRegistryStore::new(
+                machine_store.clone(),
+            ))),
+    ));
     routed_forwarder.add_link(daemon_airc.clone()).await;
+
+    // #1306: end-to-end delivery truth. The forwarder's per-peer ack
+    // ledger feeds the shared daemon handle so route refresh can (a)
+    // force-drop + re-dial "connected" peers whose flushed frames go
+    // unacked (the half-open purge) and (b) stamp MEASURED lan-tcp
+    // health (rtt/success_ppm) instead of `healthy (not measured)`.
+    daemon_airc.set_delivery_ledger(routed_forwarder.delivery_ledger());
+
+    // Self-healing join (refresh-on-failure): the ONE resolved rendezvous
+    // store + gate, shared between the registry-refresh loop (its owner,
+    // which fills this slot once resolution succeeds) and the
+    // route-refresh loop (which re-reads the rendezvous when dials fail,
+    // instead of blindly retrying dead endpoints). Empty until the
+    // registry task resolves — and stays empty when the rendezvous is
+    // disabled (hermetic gate / no store), in which case there is
+    // nothing to re-read and the heal path correctly stays off.
+    let rendezvous_for_heal: Arc<SharedRendezvousSlot> = Arc::new(std::sync::OnceLock::new());
 
     // Card 625abe6d slice 2: the daemon, not the operator, keeps
     // routes alive. Spawn the periodic route-discovery refresh before
     // the accept loop blocks; it exits on the same shutdown notifier.
-    let route_refresh_task = spawn_route_refresh(state.clone(), daemon_airc.clone());
+    let route_refresh_task = spawn_route_refresh(
+        state.clone(),
+        daemon_airc.clone(),
+        rendezvous_for_heal.clone(),
+    );
+
+    // #240 event-driven heal (peer-DROPPED mirror of the registry-import
+    // nudge): when a live LAN session terminates, nudge the route-refresh loop
+    // to attempt reconnection AT ONCE — quarantine-gated, so a genuinely-offline
+    // peer costs at most one dial, while a transient blip reconnects in seconds
+    // instead of waiting out a full refresh interval. Registered on the shared
+    // daemon handle; the wake permit coalesces a burst of drops into one refresh.
+    {
+        let route_wake = state.route_wake.clone();
+        daemon_airc.set_disconnect_observer(std::sync::Arc::new(move |_peer_id| {
+            route_wake.notify_one();
+        }));
+    }
 
     // #1268: autonomous self-update — keep the node on current canary with no
     // human in the loop (the version-drift pain we just lived: stale binaries,
     // peers that can't speak the current protocol). The dangerous half (fetch +
     // smoke-test + rollback-safe `airc update --auto`, spawned detached) lives
     // in `airc_daemon::auto_update`; the daemon supplies only the MESH-IDLE
-    // predicate so an update never restarts mid-work. Idle = zero live LAN peer
-    // connections: with no connection there is definitionally no in-flight mesh
-    // work to drop, and control-plane reconnect after a restart is cheap +
-    // self-healing. (Refinement TODO: once stream-plane sessions are tracked in
-    // daemon connection-state, gate on "no active TRANSFER" so a connected-but-
-    // quiet node can still update.) Exits on the shared shutdown notifier.
+    // predicate so an update never restarts mid-work.
+    //
+    // Idle = NO HEALTHY PEER HAS FRAMES OUTSTANDING (`mesh_is_quiet` over the
+    // delivery-truth stats, #280). This replaced `connected_lan_peers == 0`,
+    // which was inverted: a node connected to the mesh — i.e. one doing its job
+    // — was never "idle", so it could never self-update, and only an already-
+    // isolated node ever did. That is why two healthy nodes sat on a stale build
+    // for a day (2026-08-05) with a merged transport fix available, until a human
+    // ran the update by hand on both. Connection COUNT is not work.
+    //
+    // Note the resolved TODO this carries: a connected-but-quiet node CAN now
+    // update, which is the whole point. Exits on the shared shutdown notifier.
     let auto_update_task = {
         let daemon_state = state.clone();
         tokio::spawn(async move {
             airc_daemon::auto_update::run(&daemon_state.shutdown, || {
-                daemon_state
-                    .connected_lan_peers
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == 0
+                // try_read, NOT blocking_read: this predicate is called from
+                // inside the async tick, and tokio's RwLock::blocking_read
+                // panics in an async context — it would have taken the daemon
+                // down on the first tick.
+                match daemon_state.delivery_stats.try_read() {
+                    Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
+                        stats.iter().map(|s| (s.attempts_since_ack, s.suspect)),
+                    ),
+                    Err(_) => {
+                        // Contended write (stats being refreshed). Skip THIS
+                        // tick and retry next interval — never guess "quiet"
+                        // from a lock we couldn't read. Loud, because a
+                        // permanently-contended lock would silently become a
+                        // node that never self-updates again, which is the
+                        // exact failure class this whole path exists to kill.
+                        eprintln!("airc auto-update: delivery stats busy — skipping this check");
+                        false
+                    }
+                }
             })
             .await;
         })
@@ -1312,6 +1563,9 @@ pub async fn run_daemon(
     // daemon handle (one adapter for accept + dial + forward) rather than
     // opening its own — that split was the reverse-broadcast bug.
     let registry_airc = daemon_airc.clone();
+    // Self-healing join: the registry task fills this once the
+    // rendezvous store is resolved (see `rendezvous_for_heal` above).
+    let heal_slot = rendezvous_for_heal.clone();
     let registry_handle = tokio::spawn(async move {
         // HERMETIC GATE (card d793c242): test/temp daemons inherit the
         // operator's working gh auth, so without this gate they publish
@@ -1403,6 +1657,14 @@ pub async fn run_daemon(
                          (LAN dialed first; off-LAN peers fall through to Tailscale \
                          after a ~3s LAN-rung timeout, once per session)"
                     );
+                    // Self-healing join — publish-on-bind: a freshly bound
+                    // listener (daemon restart, possibly on a NEW port when
+                    // the stable port was taken) must propagate to the
+                    // rendezvous NOW, not at the refresh loop's first
+                    // cadence tick. `Notify` stores the permit, so the loop
+                    // below publishes immediately on start. Idempotent: an
+                    // unchanged advertisement republishes the same document.
+                    registry_state.endpoint_resync.notify_one();
                 }
                 Err(error) => {
                     eprintln!(
@@ -1458,29 +1720,57 @@ pub async fn run_daemon(
                 bin.display()
             );
         }
-        // Stale-token recovery slot (card 1f2cbffa): the SAME slot
-        // goes to the gate (which re-resolves on auth failure) and the
-        // store (whose gh spawns then carry the recovered token), so a
-        // mid-session token rotation no longer bricks the rendezvous
-        // until daemon restart.
-        let gh_token_override = airc_lib::GhTokenOverride::new();
-        let store = match &gh_bin {
-            Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home)
-                .with_bin(bin.clone()),
-            None => airc_lib::GhAccountRegistryStore::new(event_store, &registry_home),
-        }
-        .with_token_override(gh_token_override.clone());
-        let gate = airc_lib::RegistryRefreshGate::GhAuth {
-            gh_bin: gh_bin.clone(),
-            scope_home: registry_home.clone(),
-            token_override: Some(gh_token_override),
+        // Rendezvous SELECTION (#113): which door the mesh converges
+        // through is a data choice, not a hardcode. `AIRC_RENDEZVOUS_DIR`
+        // set → the no-GitHub shared-folder door (on-prem / behind
+        // firewall); unset → the default gist door. The resolver pairs the
+        // chosen store with the gate that matches it (gist → gh-auth,
+        // folder → Always), so this loop never learns which door won.
+        //
+        // Stale-token recovery slot (card 1f2cbffa) rides the gist door:
+        // the SAME slot goes to the gate (which re-resolves on auth
+        // failure) and the store (whose gh spawns then carry the recovered
+        // token), so a mid-session token rotation no longer bricks the
+        // rendezvous until daemon restart. The folder door ignores it.
+        let choice = match airc_lib::RendezvousChoice::from_env() {
+            Ok(choice) => choice,
+            Err(error) => {
+                eprintln!("airc daemon: account-registry loop disabled — {error}");
+                return;
+            }
         };
+        if let airc_lib::RendezvousChoice::Folder { dir } = &choice {
+            eprintln!(
+                "airc daemon: account-registry using shared-folder rendezvous at {} (no gh)",
+                dir.display()
+            );
+        }
+        let (store, gate) = airc_lib::resolve_account_registry_store(
+            choice,
+            airc_lib::GistRendezvous {
+                event_store,
+                scope_home: registry_home.clone(),
+                gh_bin: gh_bin.clone(),
+                token_override: airc_lib::GhTokenOverride::new(),
+            },
+        );
+        // Self-healing join: share the resolved store + gate with the
+        // route-refresh loop so a failed dial can re-read the rendezvous
+        // (refresh-on-failure) instead of blindly retrying a dead
+        // endpoint. `Arc<dyn>` because both loops consume the SAME
+        // resolved door — resolving twice would race gh token recovery.
+        let store: Arc<dyn airc_lib::AccountRegistryStore> = Arc::from(store);
+        let _ = heal_slot.set((store.clone(), gate.clone()));
         airc_lib::run_registry_refresh_loop(
             airc,
             store,
             gate,
             airc_lib::RegistryRefreshConfig::default(),
             &registry_state.endpoint_resync,
+            // #240 event-driven heal: nudge the route-refresh loop the
+            // instant an import lands fresh endpoints so they are dialed
+            // NOW, not up to a full route-refresh interval later.
+            &registry_state.route_wake,
             registry_state.shutdown.notified(),
         )
         .await;
@@ -1524,13 +1814,38 @@ pub async fn run_daemon(
 /// connections live on its adapter, so re-opening per tick would sever
 /// them. Inbound sink + forwarder link are installed once in
 /// `run_daemon` before this spawns.
-fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::JoinHandle<()> {
+/// Self-healing join: the daemon's ONE resolved rendezvous (store +
+/// gate), filled by the registry task, read by the route-refresh loop's
+/// refresh-on-failure heal. `OnceLock` because resolution happens
+/// exactly once and the readers only ever need "the resolved door or
+/// nothing yet".
+type SharedRendezvousSlot = std::sync::OnceLock<(
+    Arc<dyn airc_lib::AccountRegistryStore>,
+    airc_lib::RegistryRefreshGate,
+)>;
+
+fn spawn_route_refresh(
+    state: Arc<DaemonState>,
+    airc: Airc,
+    rendezvous: Arc<SharedRendezvousSlot>,
+) -> tokio::task::JoinHandle<()> {
     let connected = state.connected_lan_peers.clone();
+    let delivery_stats = state.delivery_stats.clone();
     let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
-        airc_daemon::route_refresh::run_periodic_refresh(&state.shutdown, || {
-            refresh_routes_once(&airc, &connected, &endpoint_resync)
-        })
+        airc_daemon::route_refresh::run_periodic_refresh(
+            &state.shutdown,
+            &state.route_wake,
+            || {
+                refresh_routes_once(
+                    &airc,
+                    &connected,
+                    &delivery_stats,
+                    &endpoint_resync,
+                    &rendezvous,
+                )
+            },
+        )
         .await;
     })
 }
@@ -1543,7 +1858,9 @@ fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::Join
 async fn refresh_routes_once(
     airc: &Airc,
     connected_lan_peers: &std::sync::atomic::AtomicUsize,
+    delivery_stats: &tokio::sync::RwLock<Vec<airc_ipc::IpcPeerDeliveryStats>>,
     endpoint_resync: &tokio::sync::Notify,
+    rendezvous: &SharedRendezvousSlot,
 ) {
     // Adaptable-router reflex: re-detect this node's own routable LAN +
     // Tailscale IPv4 every tick (cheap, local — no network) and re-advertise
@@ -1586,16 +1903,7 @@ async fn refresh_routes_once(
         }
     }
     match airc.refresh_route_discovery().await {
-        Ok(snapshot) => {
-            // Publish the live LAN-peer count for `Status` to report —
-            // the set room broadcast actually fans out to. This is the
-            // ONLY writer (the daemon crate can't reach the airc-lib
-            // handle that owns the connections), refreshed every tick so
-            // `airc send` can warn loudly when a broadcast reaches no one.
-            connected_lan_peers.store(
-                snapshot.connected_lan_peers.len(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        Ok(mut snapshot) => {
             for failure in &snapshot.peer_dial_failures {
                 StderrJsonDiagnosticSink.emit(
                     DiagnosticEvent::warn(
@@ -1607,6 +1915,81 @@ async fn refresh_routes_once(
                     .with_field("endpoint", format!("{:?}", failure.endpoint))
                     .with_field("error", &failure.error),
                 );
+            }
+
+            // Self-healing join — refresh-on-failure: dials failed, so
+            // re-read the rendezvous for FRESHER endpoints for those
+            // peers before their next blind retry (the M5↔bigmama
+            // stale-port decay: the old port stays dead forever unless
+            // someone re-reads the advertisement). Gated exactly like
+            // the registry loop's own ticks; when a fresher endpoint
+            // arrived, the heal already re-dialed it and the healed
+            // snapshot replaces this tick's (so the connected count and
+            // relay self-election below see the post-heal truth).
+            if !snapshot.peer_dial_failures.is_empty() {
+                if let Some((store, gate)) = rendezvous.get() {
+                    if gate.block().await.is_none() {
+                        match airc
+                            .heal_failed_dials(store.as_ref(), &snapshot.peer_dial_failures)
+                            .await
+                        {
+                            Ok(Some(healed)) => {
+                                eprintln!(
+                                    "airc daemon: dial failure(s) triggered a rendezvous re-read; \
+                                     fresher endpoint(s) found and re-dialed — connected LAN \
+                                     peers now: {}",
+                                    healed.connected_lan_peers.len()
+                                );
+                                snapshot = healed;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                StderrJsonDiagnosticSink.emit(
+                                    DiagnosticEvent::warn(
+                                        DiagnosticComponent::Daemon,
+                                        DiagnosticCode::RouteRefreshFailed,
+                                        "refresh-on-failure rendezvous re-read failed; dead \
+                                         endpoints stay in backoff until the next cycle",
+                                    )
+                                    .with_field("error", error),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Publish the live LAN-peer count for `Status` to report —
+            // the set room broadcast actually fans out to. This is the
+            // ONLY writer (the daemon crate can't reach the airc-lib
+            // handle that owns the connections), refreshed every tick so
+            // `airc send` can warn loudly when a broadcast reaches no one.
+            connected_lan_peers.store(
+                snapshot.connected_lan_peers.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            // #1306 slice 2: publish the delivery-ledger snapshot for
+            // `Request::DeliveryStats` — the delivery-truth read behind
+            // doctor's "last confirmed delivery to X: N ago". Same
+            // single-writer wiring split as the counter above (the
+            // daemon crate can't reach the airc-lib ledger).
+            if let Some(ledger) = airc.delivery_ledger() {
+                let rows = ledger
+                    .snapshot()
+                    .into_iter()
+                    .map(|(peer_id, stats)| airc_ipc::IpcPeerDeliveryStats {
+                        peer_id,
+                        attempts: stats.attempts,
+                        acked: stats.acked,
+                        attempts_since_ack: stats.attempts_since_ack,
+                        last_attempt_ms: stats.last_attempt_ms,
+                        last_ack_ms: stats.last_ack_ms,
+                        rtt_ema_ms: stats.rtt_ema_ms,
+                        suspect: stats.suspect(),
+                    })
+                    .collect::<Vec<_>>();
+                *delivery_stats.write().await = rows;
             }
 
             // #1247 slice 4b — relay self-election. When this node can
@@ -1623,7 +2006,19 @@ async fn refresh_routes_once(
             // the gist advertises whatever port the OS gave, so the
             // durable pointer stays valid across restarts.
             let enrolled = airc.peers().await.map(|peers| peers.len()).unwrap_or(0);
-            if snapshot.should_self_elect_as_relay(enrolled) {
+            // #267 follow-up (2026-07-31 regression): relay-hood is a
+            // DURABLE ROLE, not an emergency fallback. Once this node has
+            // ever been a relay, peers hold `airc-relay://me@ip:port`
+            // cards — if a daemon restart only re-elects when NO peer is
+            // reachable, every card-holder gets Connection refused while
+            // this node chats happily over its one direct LAN link
+            // (glass-boxed live: overnight restart dropped :65280 while
+            // .232 stayed connected). A persisted relay-port file IS the
+            // role record: re-assume it on every tick unconditionally
+            // (become_relay is idempotent — already-relaying is a cheap
+            // re-advertise).
+            let has_relay_role = read_persisted_relay_port().is_some();
+            if snapshot.should_self_elect_as_relay(enrolled) || has_relay_role {
                 // Slice 4c: advertise the relay under our ROUTABLE IP(s)
                 // (LAN + Tailscale), never the 0.0.0.0 bind — peers can't
                 // dial a wildcard. Reuses the IPs detected once at the top
@@ -1637,19 +2032,29 @@ async fn refresh_routes_once(
                          — staying a client (open a routable interface to host a relay)"
                     );
                 } else {
-                    match airc
-                        .become_relay(
-                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-                            lan_ip,
-                            tailscale_ip,
-                        )
-                        .await
-                    {
-                        Ok(addr) => eprintln!(
-                            "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
-                             self-elected as a relay (listening {addr}) and advertised it on \
-                             this node's routable IP(s) (#1247)"
-                        ),
+                    // #267: prefer the port the LAST relay incarnation bound
+                    // (persisted in the runtime dir). An OS-assigned port
+                    // drifts on every daemon restart, and remote peers'
+                    // imported `airc-relay://me@ip:port` cards republish on
+                    // THEIR cadence — so every restart stranded the mesh on
+                    // a dead port (glass-boxed live: peers dialing :65280
+                    // while the new relay sat on :57958, 0 healthy routes).
+                    // Re-binding the persisted port keeps every stale card
+                    // valid; OS-assigned is only the first-election / port-
+                    // stolen fallback, and whatever binds gets persisted.
+                    match become_relay_with_stable_port(airc, lan_ip, tailscale_ip).await {
+                        Ok(addr) => {
+                            eprintln!(
+                                "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
+                                 self-elected as a relay (listening {addr}) and advertised it on \
+                                 this node's routable IP(s) (#1247)"
+                            );
+                            // Self-healing join — publish-on-bind: the relay
+                            // listener just bound; propagate the new relay
+                            // endpoint to the rendezvous now instead of
+                            // waiting up to a full registry cadence.
+                            endpoint_resync.notify_one();
+                        }
                         Err(error) => eprintln!(
                             "airc daemon: relay self-election failed ({error}); \
                              retrying next interval"
@@ -1669,6 +2074,79 @@ async fn refresh_routes_once(
             );
         }
     }
+}
+
+/// #267: where this machine's relay listener port persists across daemon
+/// restarts — machine-scope (one relay per node), beside the daemon socket.
+fn relay_port_file() -> Option<std::path::PathBuf> {
+    crate::runtime_dir::runtime_dir()
+        .ok()
+        .map(|dir| dir.join("relay-port"))
+}
+
+fn read_persisted_relay_port() -> Option<u16> {
+    std::fs::read_to_string(relay_port_file()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn persist_relay_port(port: u16) {
+    if let Some(path) = relay_port_file() {
+        // Best-effort: a failed persist only costs port stability on the
+        // NEXT restart, never this election.
+        let _ = std::fs::write(path, port.to_string());
+    }
+}
+
+/// Bind order for relay self-election: the persisted previous port first
+/// (keeps every peer's imported `airc-relay://me@ip:port` card valid across
+/// restarts), OS-assigned as the first-election / port-stolen fallback.
+fn relay_bind_candidates(persisted: Option<u16>) -> Vec<u16> {
+    match persisted {
+        Some(port) if port != 0 => vec![port, 0],
+        _ => vec![0],
+    }
+}
+
+/// Self-elect as a relay on a RESTART-STABLE port (#267). Tries the
+/// persisted previous port, falls back to OS-assigned, and persists
+/// whatever actually bound so the next incarnation lands on it again.
+async fn become_relay_with_stable_port(
+    airc: &Airc,
+    lan_ip: Option<std::net::Ipv4Addr>,
+    tailscale_ip: Option<std::net::Ipv4Addr>,
+) -> Result<std::net::SocketAddr, airc_lib::AircError> {
+    // Sticky candidates first; the OS-assigned bind (port 0, always the
+    // final candidate — pinned by the relay_bind_candidates tests) is the
+    // TERMINAL attempt whose error propagates directly, so no empty-list
+    // panic path exists (CI denies clippy::expect_used).
+    for port in relay_bind_candidates(read_persisted_relay_port()) {
+        if port == 0 {
+            continue;
+        }
+        if let Ok(addr) = airc
+            .become_relay(
+                std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+                lan_ip,
+                tailscale_ip,
+            )
+            .await
+        {
+            persist_relay_port(addr.port());
+            return Ok(addr);
+        }
+    }
+    let addr = airc
+        .become_relay(
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            lan_ip,
+            tailscale_ip,
+        )
+        .await?;
+    persist_relay_port(addr.port());
+    Ok(addr)
 }
 
 fn current_daemon_runtime_info() -> DaemonRuntimeInfo {
@@ -1702,9 +2180,41 @@ pub async fn run_ping(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>>
 /// `ensure_daemon_running` before the probe gives every recipe that
 /// says "run `airc status` first" a working contract again.
 pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    // `ensure_daemon_running` may SPAWN a daemon (see card 2bdae532 above), which
+    // makes this command unable to report "down" — asking creates the answer.
+    // That is fine as convenience and fatal as a measurement, so establish
+    // whether one was already answering BEFORE we ensure, and say so.
+    //
+    // Incident 2026-08-08: a grid blackout drill measured a 0.0s outage across
+    // an `airc update` because its probe was `airc status`. The positive control
+    // failed — status reported UP one second after `airc stop` — and the number
+    // was retracted. An instrument that changes what it measures reads as
+    // healthy precisely when the thing it watches is broken.
+    //
+    // Worse than a bad number: anything polling `status` DURING an update
+    // respawns a daemon from the OLD binary mid-swap, which is a candidate cause
+    // of the stale-process class `update_commands.rs` already guards against
+    // ("a stale process that survived `stop_daemon` answers IPC perfectly").
+    //
+    // The spawn is NOT removed — 2bdae532 added it so a fresh onboard has a
+    // working contract, and breaking onboarding to fix an honesty bug trades one
+    // defect for another. It is now DISCLOSED instead, and `airc ping` remains
+    // the non-spawning probe for anyone who needs to observe rather than ensure.
+    let was_already_up = DaemonClient::new(socket.clone())
+        .status_with_timeout(Duration::from_millis(250))
+        .await
+        .is_ok();
+
     ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
     let client = DaemonClient::new(socket);
     let status = client.status().await?;
+    if !was_already_up {
+        println!(
+            "note: no daemon was answering — this command STARTED one. \
+             It was not running until you asked. Use `airc ping` to observe \
+             liveness without starting anything."
+        );
+    }
     println!("peer_id:        {}", status.peer_id);
     println!("uptime_seconds: {}", status.uptime_seconds);
     if let Some(version) = status.ipc_protocol_version {
@@ -1720,6 +2230,16 @@ pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std:
     if let Some(executable) = status.executable.as_deref() {
         println!("executable:     {executable}");
     }
+    // Joel's ruling 2026-08-08: the version must be visible on every
+    // health/query surface, in every repo, because stale binaries have
+    // repeatedly poisoned testing. `build:` above reports what the DAEMON says
+    // it is; this reports what the CLI asking the question is. Printing both is
+    // the point — when they disagree, the operator is talking to a daemon built
+    // from different source than the tool they are holding, which is precisely
+    // the confusion the #354 incident produced ("Already at 1e2f424" one line
+    // above `airc --version` saying three commits behind, both true, describing
+    // different objects).
+    println!("cli_version:    {}", crate::build_info::version_line());
     Ok(())
 }
 
@@ -1814,6 +2334,32 @@ pub async fn run_inbox(
         Some(cursor) => airc.resume_from(&cursor, effective_limit).await?,
         None => airc.page_recent(effective_limit).await?,
     };
+    // #270: `inbox` reads ONE room (the current one) — say so, loudly,
+    // and name what it is NOT showing. The unlabeled view is how "your
+    // message isn't in my inbox" became a false transport diagnosis
+    // twice in one day: the message was in the store the whole time,
+    // in a subscribed room that wasn't current.
+    if !as_json {
+        if let (Ok(current), Ok(set)) = (airc.current_room().await, airc.subscription_set().await) {
+            let others: Vec<String> = set
+                .all()
+                .filter(|s| s.name.as_str() != current.name)
+                .map(|s| s.name.as_str().to_string())
+                .collect();
+            if others.is_empty() {
+                println!("inbox: room '{}' (your only subscribed room)", current.name);
+            } else {
+                println!(
+                    "inbox: room '{}' ONLY — {} other subscribed room(s) NOT shown: {} \
+                     (switch with `airc room <name>`)",
+                    current.name,
+                    others.len(),
+                    others.join(", ")
+                );
+            }
+            println!();
+        }
+    }
     if as_json {
         print_inbox_json(&events)?;
         return Ok(());
@@ -1989,7 +2535,16 @@ pub async fn run_peer_add(
     if !endpoints.is_empty() {
         let endpoints_json = airc_lib::endpoints_to_json(&endpoints)
             .map_err(|error| format!("encoding --endpoint values: {error}"))?;
-        airc_trust::set_endpoints_json(home, peer_id, Some(endpoints_json))
+        // Self-healing join: an operator-supplied endpoint is fresh AS
+        // OF NOW — stamp it so it outranks any stale stored set, and so
+        // a later fresher advertisement can in turn replace it.
+        let advertised_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .map_err(|error| format!("system clock before epoch: {error}"))?;
+        // Operator `peer add --endpoint` names the peer it dials — the
+        // endpoints answer as that peer itself (no host mapping).
+        airc_trust::set_endpoints_json(home, peer_id, Some(endpoints_json), advertised_at_ms, None)
             .await?
             .ok_or_else(|| {
                 format!(
@@ -2266,6 +2821,10 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
                     // a serde document; nesting it re-parsed keeps the
                     // machine surface honest about decode failures).
                     "endpoints_json": p.endpoints_json,
+                    // Machine-vs-scope: the transport host whose TLS
+                    // cert answers at the endpoints (dials pin THIS
+                    // identity). Null = the peer answers itself.
+                    "endpoints_peer_id": p.endpoints_peer_id.map(|host| host.to_string()),
                 })
             })
             .collect();
@@ -2302,8 +2861,14 @@ fn render_peer_list_lines(peers: &[airc_trust::StoredPeer], home: &Path) -> Vec<
                 Err(error) => format!("  endpoints=<undecodable: {error}>"),
             },
         };
+        // Machine-vs-scope: show which identity actually answers at the
+        // stored endpoints, so the mapping the dialer pins is visible.
+        let host = match peer.endpoints_peer_id {
+            Some(host) => format!("  host={host}"),
+            None => String::new(),
+        };
         lines.push(format!(
-            "{}  {}  tier={}{endpoints}",
+            "{}  {}  tier={}{endpoints}{host}",
             peer.peer_id,
             peer.pubkey_b64,
             peer.tier.as_wire_str()
@@ -2348,6 +2913,49 @@ pub async fn run_whois_peer(home: &Path, target: &str) -> Result<(), Box<dyn std
         [peer] => {
             println!("  peer_id:   {}", peer.peer_id);
             println!("  pubkey:    {}", peer.pubkey_b64);
+            // Machine↔scope, one card (self-healing join): show the
+            // transport HOST whose TLS cert answers at this peer's
+            // endpoints, and — when this peer IS a host — the scope
+            // peers reachable through it. Cert identity, joinable with
+            // the registry machine-id in the identity card below. Read
+            // from the same trust stores the dialer consults (wire root
+            // first, then the scope store — `peers()` is the identity
+            // union and doesn't carry endpoint metadata).
+            let mut trust_records = airc_trust::load(airc.wire_root()).await.unwrap_or_default();
+            if airc.wire_root() != home {
+                trust_records.extend(airc_trust::load(home).await.unwrap_or_default());
+            }
+            let host_of = |target: airc_core::PeerId| {
+                trust_records
+                    .iter()
+                    .find(|record| record.peer_id == target)
+                    .and_then(|record| record.endpoints_peer_id)
+                    .filter(|host| *host != target)
+            };
+            if let Some(host) = host_of(peer.peer_id) {
+                println!(
+                    "  machine:   {host} (transport host — TLS at this peer's \
+                     endpoints answers as this identity; dials pin it)"
+                );
+            }
+            let mut hosted: Vec<airc_core::PeerId> = trust_records
+                .iter()
+                .filter(|record| {
+                    record.endpoints_peer_id == Some(peer.peer_id) && record.peer_id != peer.peer_id
+                })
+                .map(|record| record.peer_id)
+                .collect();
+            hosted.sort_by_key(|scope| scope.to_string());
+            hosted.dedup();
+            if !hosted.is_empty() {
+                println!(
+                    "  hosts:     {} scope peer(s) behind this machine:",
+                    hosted.len()
+                );
+                for scope in hosted {
+                    println!("             {scope}");
+                }
+            }
             // Card 20066c49: read the identity card the peer published
             // via the substrate (IdentityPublished events emitted on
             // join — cards 088af06 / cd638b8) when known. Falls back
@@ -2436,6 +3044,18 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    /// what this catches (#267): relay self-election must try the PERSISTED
+    /// previous port before an OS-assigned one — port drift across daemon
+    /// restarts is what stranded every peer's imported relay card on a dead
+    /// port. A persisted 0 (or nothing persisted) must not produce a
+    /// degenerate double-\[0\] list.
+    #[test]
+    fn relay_bind_prefers_the_persisted_port_with_os_fallback() {
+        assert_eq!(relay_bind_candidates(Some(65280)), vec![65280, 0]);
+        assert_eq!(relay_bind_candidates(None), vec![0]);
+        assert_eq!(relay_bind_candidates(Some(0)), vec![0]);
+    }
+
     /// what this catches: the send receipt must NOT report the enrolled
     /// peer count as confirmed delivery. The old line was
     /// "sent to X — N paired peer(s) + any local scope tailing …",
@@ -2466,16 +3086,58 @@ mod tests {
         // It IS honest about what happened and what is unconfirmed.
         assert!(line.contains("queued to general"), "honest verb: {line}");
         assert!(
-            line.contains("41 enrolled"),
-            "addressed-peer count framed as enrolled, not delivered: {line}"
+            line.contains("enrolled"),
+            "the address-book count is still disclosed, just not as reach: {line}"
         );
         assert!(
-            line.contains("asynchronous") && line.contains("not yet confirmed"),
+            line.contains("asynchronous"),
             "must state delivery is unconfirmed: {line}"
         );
         assert!(
             line.contains("airc doctor --health"),
             "must tell operator how to confirm delivery: {line}"
+        );
+    }
+
+    /// what this catches (#351): the receipt inviting the reader to compute a
+    /// REACH RATIO out of two incommensurable numbers.
+    ///
+    /// It used to print "addressed 52 enrolled remote peer(s), 1 currently
+    /// connected". Enrolled is every peer this scope ever met, across every room,
+    /// for all time — not this room's audience — and the live count is LAN links
+    /// only. Read as a fraction it says 2%. The ack ledger for the same period
+    /// said 767 of 771 delivered: 99.5%. A card (#340) was filed on the strength
+    /// of that line, and the line was the only thing wrong.
+    ///
+    /// An instrument that reads as catastrophe during healthy operation is worse
+    /// than no instrument — it spends the trust that a REAL alarm will need.
+    #[test]
+    fn the_receipt_never_reads_as_a_reach_ratio() {
+        // The shape that caused the false alarm: a big address book, one live link.
+        let line = format_send_receipt("cambriantech", "cb2e21a1", 52, 1);
+
+        // The adjacency itself was the bug — "N enrolled …, M currently connected"
+        // sitting together is what the eye divides. Neither the old phrasing nor
+        // the old ordering may come back.
+        assert!(
+            !line.contains("currently connected"),
+            "a live-link count must not sit where it reads as the numerator: {line}"
+        );
+        assert!(
+            !line.contains("addressed 52"),
+            "the address book is not an audience and must not be 'addressed': {line}"
+        );
+        // It must say so outright, because a reader who has been burned once will
+        // keep dividing unless told the denominator is not a denominator.
+        assert!(
+            line.contains("not this room's audience"),
+            "must disclaim the address book explicitly: {line}"
+        );
+        // And it must point at the ACK ledger, which is what delivery actually
+        // means (#280: delivery is a returned ack, never a connection's existence).
+        assert!(
+            line.contains("ACK") || line.contains("ack"),
+            "delivery truth is the ack ledger, not this line: {line}"
         );
     }
 
@@ -2540,12 +3202,18 @@ mod tests {
     #[test]
     fn send_receipt_reports_connected_subset_when_routes_are_up() {
         let line = format_send_receipt("general", "cb2e21a1", 42, 3);
+        // Both facts are still disclosed — the fix was never about hiding a
+        // number, it was about not pairing them as numerator and denominator.
         assert!(
-            line.contains("42 enrolled") && line.contains("3 currently connected"),
-            "must report enrolled total and live-connected subset: {line}"
+            line.contains("3 peers"),
+            "the live-link count is still reported: {line}"
         );
         assert!(
-            line.contains("asynchronous") && line.contains("not yet confirmed"),
+            line.contains("42 peer(s) are enrolled"),
+            "the address-book size is still reported, as its own fact: {line}"
+        );
+        assert!(
+            line.contains("asynchronous"),
             "still does not claim confirmed delivery: {line}"
         );
     }

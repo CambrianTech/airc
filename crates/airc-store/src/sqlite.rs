@@ -33,13 +33,14 @@ use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSe
 use crate::beacon::StoredBeacon;
 use crate::entities::{
     account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
-    peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, subscription,
+    peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, scoped_state, subscription,
 };
 use crate::error::StoreError;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::peer_trust::{RotationAuditEntry, StoredPeer, TrustTier};
 use crate::refresh_lock::StoredRefreshLockOutcome;
+use crate::scoped_state::StoredScopedState;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
 
@@ -210,6 +211,10 @@ impl SqliteEventStore {
                     tier,
                     endpoints_json: row.endpoints_json,
                     last_seen_ms: stored_last_seen_ms(row.last_seen_ms, added_at_ms)?,
+                    endpoints_peer_id: row.endpoints_peer_id.map(PeerId::from_uuid),
+                    endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
+                        row.endpoints_advertised_at_ms,
+                    )?,
                 })
             })
             .collect()
@@ -259,6 +264,10 @@ impl SqliteEventStore {
             // leaving it NULL, so a never-touched-again peer ages from
             // enrolment forward without relying on the read-time floor.
             last_seen_ms: Set(Some(u64_to_i64("peer_trust.last_seen_ms", added_at_ms)?)),
+            // No endpoints yet, so no endpoint freshness either.
+            endpoints_advertised_at_ms: Set(None),
+            // …and no host mapping (mapping travels with endpoints).
+            endpoints_peer_id: Set(None),
         };
         let insert = peer_trust::Entity::insert(active)
             .on_conflict(
@@ -302,6 +311,10 @@ impl SqliteEventStore {
             tier: stored_tier,
             endpoints_json: stored.endpoints_json,
             last_seen_ms: stored_last_seen_ms(stored.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id: stored.endpoints_peer_id.map(PeerId::from_uuid),
+            endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
+                stored.endpoints_advertised_at_ms,
+            )?,
         })
     }
 
@@ -332,6 +345,14 @@ impl SqliteEventStore {
         // stored value survives). For a fresh insert there is no prior
         // contact, so seed it to the enrolment instant.
         let existing_last_seen = existing.as_ref().and_then(|row| row.last_seen_ms);
+        // Endpoint freshness travels WITH the endpoint set — preserved
+        // across rotation exactly like the endpoints themselves.
+        let existing_endpoints_stamp = existing
+            .as_ref()
+            .and_then(|row| row.endpoints_advertised_at_ms);
+        // The host mapping travels with the endpoint set — preserved
+        // across rotation exactly like the endpoints and their stamp.
+        let existing_endpoints_peer = existing.as_ref().and_then(|row| row.endpoints_peer_id);
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
@@ -342,6 +363,8 @@ impl SqliteEventStore {
                 Some(value) => value,
                 None => u64_to_i64("peer_trust.last_seen_ms", added_at_ms)?,
             })),
+            endpoints_advertised_at_ms: Set(existing_endpoints_stamp),
+            endpoints_peer_id: Set(existing_endpoints_peer),
         };
         peer_trust::Entity::insert(active)
             .on_conflict(
@@ -358,6 +381,8 @@ impl SqliteEventStore {
             tier: existing_tier,
             endpoints_json: existing_endpoints,
             last_seen_ms: stored_last_seen_ms(existing_last_seen, added_at_ms)?,
+            endpoints_peer_id: existing_endpoints_peer.map(PeerId::from_uuid),
+            endpoints_advertised_at_ms: stored_endpoints_stamp_ms(existing_endpoints_stamp)?,
         })
     }
 
@@ -391,6 +416,10 @@ impl SqliteEventStore {
             tier: removed_tier,
             endpoints_json: stored.endpoints_json,
             last_seen_ms: stored_last_seen_ms(stored.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id: stored.endpoints_peer_id.map(PeerId::from_uuid),
+            endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
+                stored.endpoints_advertised_at_ms,
+            )?,
         }))
     }
 
@@ -432,23 +461,40 @@ impl SqliteEventStore {
             tier,
             endpoints_json: existing.endpoints_json,
             last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id: existing.endpoints_peer_id.map(PeerId::from_uuid),
+            endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
+                existing.endpoints_advertised_at_ms,
+            )?,
         }))
     }
 
-    /// Card 625abe6d slice 1 — replace the advertised endpoints on an
-    /// existing peer row. The payload is the serde JSON of
+    /// Card 625abe6d slice 1 + self-healing join — replace the
+    /// advertised endpoints on an existing peer row, ATOMICALLY with
+    /// their freshness stamp. The payload is the serde JSON of
     /// `Vec<RouteEndpoint>` (typed at the airc-lib layer). `None`
     /// clears the record back to identity-only.
+    ///
+    /// `advertised_at_ms` is the epoch-ms instant of the advertisement
+    /// the set came from. **Monotonic replace**: a write whose stamp is
+    /// STALER than the stored stamp is refused (no-op, row returned
+    /// unchanged) — endpoint addr+port+transport move as one value with
+    /// their stamp, so an out-of-order merge/import can never mix a new
+    /// IP with a dead port or resurrect an evicted set (the M5↔bigmama
+    /// stale-port repro). An equal-or-fresher stamp fully replaces both
+    /// the set and the stamp.
     ///
     /// Returns `Ok(None)` if the peer isn't enrolled — endpoints
     /// without a trust anchor are meaningless (nothing to cert-pin
     /// the dial against), so no row is inserted.
     ///
-    /// Idempotent: writing the same JSON returns the row unchanged.
+    /// Idempotent: re-writing the same JSON at the same stamp returns
+    /// the row unchanged.
     pub async fn set_peer_trust_endpoints(
         &self,
         peer_id: PeerId,
         endpoints_json: Option<String>,
+        advertised_at_ms: u64,
+        endpoints_peer_id: Option<PeerId>,
     ) -> Result<Option<StoredPeer>, StoreError> {
         let txn = self.db.begin().await?;
         let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
@@ -464,11 +510,40 @@ impl SqliteEventStore {
                 value: existing.tier.clone(),
             }
         })?;
+        let added_at_ms = i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?;
+        let stored_stamp = stored_endpoints_stamp_ms(existing.endpoints_advertised_at_ms)?;
+        if advertised_at_ms < stored_stamp {
+            // Staler advertisement than what we hold — refuse the whole
+            // write (endpoints AND their host mapping move as one value
+            // with the stamp). Returning the UNCHANGED row (not an
+            // error) keeps import loops total: one stale beacon must
+            // not abort the rest of a registry sync.
+            txn.commit().await?;
+            return Ok(Some(StoredPeer {
+                peer_id,
+                pubkey_b64: existing.pubkey_b64,
+                added_at_ms,
+                tier: stored_tier,
+                endpoints_json: existing.endpoints_json,
+                last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
+                endpoints_peer_id: existing.endpoints_peer_id.map(PeerId::from_uuid),
+                endpoints_advertised_at_ms: stored_stamp,
+            }));
+        }
         let mut active: peer_trust::ActiveModel = existing.clone().into();
         active.endpoints_json = Set(endpoints_json.clone());
+        active.endpoints_advertised_at_ms = Set(Some(u64_to_i64(
+            "peer_trust.endpoints_advertised_at_ms",
+            advertised_at_ms,
+        )?));
+        // Self-healing join (machine-vs-scope): the transport-host
+        // mapping travels WITH the endpoint set, under the same stamp —
+        // a fresher advertisement replaces both, a staler one was
+        // refused above, and a mapping can never outlive the endpoints
+        // it describes.
+        active.endpoints_peer_id = Set(endpoints_peer_id.map(|peer| peer.as_uuid()));
         peer_trust::Entity::update(active).exec(&txn).await?;
         txn.commit().await?;
-        let added_at_ms = i64_to_u64("peer_trust.added_at_ms", existing.added_at_ms)?;
         Ok(Some(StoredPeer {
             peer_id,
             pubkey_b64: existing.pubkey_b64,
@@ -476,6 +551,8 @@ impl SqliteEventStore {
             tier: stored_tier,
             endpoints_json,
             last_seen_ms: stored_last_seen_ms(existing.last_seen_ms, added_at_ms)?,
+            endpoints_peer_id,
+            endpoints_advertised_at_ms: advertised_at_ms,
         }))
     }
 
@@ -527,6 +604,10 @@ impl SqliteEventStore {
             tier: stored_tier,
             endpoints_json: existing.endpoints_json,
             last_seen_ms: next,
+            endpoints_peer_id: existing.endpoints_peer_id.map(PeerId::from_uuid),
+            endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
+                existing.endpoints_advertised_at_ms,
+            )?,
         }))
     }
 
@@ -833,6 +914,20 @@ fn identity_from_row(row: &local_identity::Model) -> Identity {
     }
 }
 
+/// Map a `scoped_state` row into its DTO. No numeric coercion — the
+/// DTO mirrors the columns' i64 storage so the u64/i64 dance the
+/// time-based tables need does not apply here.
+fn scoped_state_row_to_stored(row: scoped_state::Model) -> StoredScopedState {
+    StoredScopedState {
+        scope_key: row.scope_key,
+        key: row.key,
+        value_json: row.value_json,
+        version: row.version,
+        updated_at_ms: row.updated_at_ms,
+        updated_by: row.updated_by,
+    }
+}
+
 fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::InvalidStoredValue {
         field,
@@ -856,6 +951,19 @@ fn stored_last_seen_ms(column: Option<i64>, added_at_ms: u64) -> Result<u64, Sto
     match column {
         Some(value) => i64_to_u64("peer_trust.last_seen_ms", value),
         None => Ok(added_at_ms),
+    }
+}
+
+/// Self-healing join — resolve a stored `endpoints_advertised_at_ms`
+/// column into the concrete freshness stamp
+/// [`StoredPeer::endpoints_advertised_at_ms`] exposes. A NULL column
+/// (pre-migration row / endpoints written before stamping existed)
+/// floors to 0: "freshness unknown", so ANY stamped advertisement
+/// outranks the legacy set.
+fn stored_endpoints_stamp_ms(column: Option<i64>) -> Result<u64, StoreError> {
+    match column {
+        Some(value) => i64_to_u64("peer_trust.endpoints_advertised_at_ms", value),
+        None => Ok(0),
     }
 }
 
@@ -1121,6 +1229,61 @@ impl EventStore for SqliteEventStore {
                     ])
                     .to_owned(),
             )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_scoped_state(
+        &self,
+        scope_key: &str,
+        key: &str,
+    ) -> Result<Option<StoredScopedState>, StoreError> {
+        let row = scoped_state::Entity::find_by_id((scope_key.to_string(), key.to_string()))
+            .one(&self.db)
+            .await?;
+        Ok(row.map(scoped_state_row_to_stored))
+    }
+
+    async fn set_scoped_state(&self, entry: StoredScopedState) -> Result<(), StoreError> {
+        let active = scoped_state::ActiveModel {
+            scope_key: ActiveValue::Set(entry.scope_key),
+            key: ActiveValue::Set(entry.key),
+            value_json: ActiveValue::Set(entry.value_json),
+            version: ActiveValue::Set(entry.version),
+            updated_at_ms: ActiveValue::Set(entry.updated_at_ms),
+            updated_by: ActiveValue::Set(entry.updated_by),
+        };
+        scoped_state::Entity::insert(active)
+            .on_conflict(
+                OnConflict::columns([scoped_state::Column::ScopeKey, scoped_state::Column::Key])
+                    .update_columns([
+                        scoped_state::Column::ValueJson,
+                        scoped_state::Column::Version,
+                        scoped_state::Column::UpdatedAtMs,
+                        scoped_state::Column::UpdatedBy,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_scoped_state(
+        &self,
+        scope_key: &str,
+    ) -> Result<Vec<StoredScopedState>, StoreError> {
+        let rows = scoped_state::Entity::find()
+            .filter(scoped_state::Column::ScopeKey.eq(scope_key))
+            .order_by_asc(scoped_state::Column::Key)
+            .all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(scoped_state_row_to_stored).collect())
+    }
+
+    async fn delete_scoped_state(&self, scope_key: &str, key: &str) -> Result<(), StoreError> {
+        scoped_state::Entity::delete_by_id((scope_key.to_string(), key.to_string()))
             .exec(&self.db)
             .await?;
         Ok(())
@@ -1961,6 +2124,97 @@ mod tests {
         );
     }
 
+    // what this catches: the generic scoped-state store's full
+    // round-trip on real SQLite — set upserts on the (scope_key, key)
+    // composite PK (second write wins), get reads it back, list filters
+    // to one scope and returns rows key-ascending, and delete is
+    // idempotent. Regresses the wiring of migration #18 + the
+    // OnConflict::columns([ScopeKey, Key]) upsert.
+    #[tokio::test]
+    async fn scoped_state_upserts_lists_and_deletes() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let room = "room:general";
+
+        // Missing key reads as None.
+        assert!(store
+            .get_scoped_state(room, "plan")
+            .await
+            .unwrap()
+            .is_none());
+
+        // First write, then an upsert of the SAME (scope_key, key).
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: room.to_string(),
+                key: "plan".to_string(),
+                value_json: r#"{"v":1}"#.to_string(),
+                version: 1,
+                updated_at_ms: 100,
+                updated_by: Some("peer:a".to_string()),
+            })
+            .await
+            .unwrap();
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: room.to_string(),
+                key: "plan".to_string(),
+                value_json: r#"{"v":2}"#.to_string(),
+                version: 2,
+                updated_at_ms: 200,
+                updated_by: Some("peer:b".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let got = store.get_scoped_state(room, "plan").await.unwrap().unwrap();
+        assert_eq!(got.value_json, r#"{"v":2}"#, "upsert: second write wins");
+        assert_eq!(got.version, 2);
+        assert_eq!(got.updated_by.as_deref(), Some("peer:b"));
+
+        // A second key in the same scope, plus a key in a DIFFERENT
+        // scope that list must NOT return.
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: room.to_string(),
+                key: "instructions".to_string(),
+                value_json: "\"be terse\"".to_string(),
+                version: 1,
+                updated_at_ms: 150,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_scoped_state(StoredScopedState {
+                scope_key: "user:peer-a".to_string(),
+                key: "prefs".to_string(),
+                value_json: "{}".to_string(),
+                version: 1,
+                updated_at_ms: 50,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+
+        let listed = store.list_scoped_state(room).await.unwrap();
+        let keys: Vec<&str> = listed.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["instructions", "plan"],
+            "list is scope-isolated and key-ascending"
+        );
+
+        // Delete is idempotent — deleting twice is not an error.
+        store.delete_scoped_state(room, "plan").await.unwrap();
+        store.delete_scoped_state(room, "plan").await.unwrap();
+        assert!(store
+            .get_scoped_state(room, "plan")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.list_scoped_state(room).await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn beacons_replace_channels_and_drain_by_peer() {
         let store = SqliteEventStore::in_memory().await.unwrap();
@@ -2134,7 +2388,12 @@ mod tests {
             .unwrap();
         let json = r#"[{"kind":"lan_tcp","addr":"192.168.1.232:7474"}]"#;
         store
-            .set_peer_trust_endpoints(peer_id, Some(json.to_string()))
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(json.to_string()),
+                150,
+                Some(PeerId::from_u128(0xda_e0)),
+            )
             .await
             .unwrap()
             .expect("peer enrolled");
@@ -2147,6 +2406,15 @@ mod tests {
             rotated.endpoints_json.as_deref(),
             Some(json),
             "rotation must carry endpoints forward"
+        );
+        assert_eq!(
+            rotated.endpoints_advertised_at_ms, 150,
+            "rotation must carry the endpoint freshness stamp with the endpoints"
+        );
+        assert_eq!(
+            rotated.endpoints_peer_id,
+            Some(PeerId::from_u128(0xda_e0)),
+            "rotation must carry the transport-host mapping with the endpoints"
         );
         let loaded = store.load_peers().await.unwrap();
         assert_eq!(loaded[0].endpoints_json.as_deref(), Some(json));
@@ -2161,11 +2429,91 @@ mod tests {
         let store = SqliteEventStore::in_memory().await.unwrap();
         let peer_id = PeerId::from_u128(0xdead_beef);
         let result = store
-            .set_peer_trust_endpoints(peer_id, Some("[]".to_string()))
+            .set_peer_trust_endpoints(peer_id, Some("[]".to_string()), 100, None)
             .await
             .unwrap();
         assert!(result.is_none());
         assert!(store.load_peers().await.unwrap().is_empty());
+    }
+
+    /// what this catches (self-healing join, M5↔bigmama stale-port
+    /// repro): endpoint replacement must be ATOMIC + stamped. A record
+    /// holding old (ip1, port1) that receives a FRESHER advertisement
+    /// (ip2, port2) must end up holding EXACTLY (ip2, port2) — never a
+    /// field-merged (ip2, port1) — and a STALER advertisement must be
+    /// refused whole, never resurrecting a dead endpoint.
+    /// Mutation check: dropping the `advertised_at_ms < stored_stamp`
+    /// guard fails the stale-refusal half; writing endpoints without
+    /// the stamp fails the stamp assertions.
+    #[tokio::test]
+    async fn fresher_advertisement_atomically_replaces_endpoints_and_staler_is_refused() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let peer_id = PeerId::from_u128(0x0a0a_1b1b);
+        store
+            .add_peer_trust(peer_id, "AAAA".repeat(11), 100)
+            .await
+            .unwrap();
+
+        let old = r#"[{"kind":"lan_tcp","addr":"192.168.1.249:58842"}]"#;
+        let fresh = r#"[{"kind":"lan_tcp","addr":"192.168.1.250:57958"}]"#;
+
+        store
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(old.to_string()),
+                1_000,
+                Some(PeerId::from_u128(0xaa)),
+            )
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+
+        // Fresher advertisement: full replace — addr AND port together.
+        let replaced = store
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(fresh.to_string()),
+                2_000,
+                Some(PeerId::from_u128(0xbb)),
+            )
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+        assert_eq!(replaced.endpoints_json.as_deref(), Some(fresh));
+        assert_eq!(replaced.endpoints_advertised_at_ms, 2_000);
+        assert_eq!(
+            replaced.endpoints_peer_id,
+            Some(PeerId::from_u128(0xbb)),
+            "a fresher advertisement replaces the host mapping WITH the endpoints"
+        );
+
+        // Staler advertisement (an out-of-order re-sync carrying the
+        // dead port): refused whole, row unchanged.
+        let refused = store
+            .set_peer_trust_endpoints(
+                peer_id,
+                Some(old.to_string()),
+                1_500,
+                Some(PeerId::from_u128(0xaa)),
+            )
+            .await
+            .unwrap()
+            .expect("peer enrolled");
+        assert_eq!(
+            refused.endpoints_json.as_deref(),
+            Some(fresh),
+            "a staler advertisement must never resurrect a dead endpoint"
+        );
+        assert_eq!(refused.endpoints_advertised_at_ms, 2_000);
+        assert_eq!(
+            refused.endpoints_peer_id,
+            Some(PeerId::from_u128(0xbb)),
+            "a refused staler advertisement must not touch the host mapping either"
+        );
+
+        let loaded = store.load_peers().await.unwrap();
+        assert_eq!(loaded[0].endpoints_json.as_deref(), Some(fresh));
+        assert_eq!(loaded[0].endpoints_advertised_at_ms, 2_000);
     }
 
     #[tokio::test]

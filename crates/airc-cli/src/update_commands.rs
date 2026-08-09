@@ -9,53 +9,255 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     let airc_exe = env::current_exe()?;
     let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
 
-    let branch = git_text(&source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if branch == "HEAD" || branch.is_empty() {
+    let channel = update_channel();
+
+    // ── The blackout window is the product, not a side effect ──────────────
+    //
+    // Incident 2026-08-08: a peer's daemon was down ~4 minutes during an
+    // `airc update`, and every message sent to that node in the window was
+    // LOST — not queued, not replayed. Replay resumes from the RECEIVER's
+    // cursor against the RECEIVER's store, so a frame that never reached that
+    // store cannot be recovered; the receiver cannot even know it missed one.
+    // Generalized: every update costs the grid a coordination blackout on each
+    // node as it rolls, and the traffic most likely to be in flight during an
+    // update is the traffic coordinating it.
+    //
+    // Durable store-and-forward (#47) is the other half and is not this fix.
+    // This one shrinks the window that makes #47 fire on a SCHEDULE rather
+    // than by accident, by taking the daemon down only for what actually
+    // requires it — replacing the binary — instead of for the git fetch and
+    // the multi-minute rebuild that preceded it.
+    //
+    // Ordering below, in the order the reasons apply:
+    //   1. fetch/checkout — a git op on a separate worktree, no daemon involved
+    //   2. nothing-to-do  — return WITHOUT ever stopping the daemon
+    //   3. pre-warm build — compile while the node is still on the air
+    //   4. stop → install → restart — the genuinely exclusive part
+    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
+
+    // NOTHING TO DO → NO BLACKOUT.
+    //
+    // This condition already existed and decided only a println: the updater
+    // learned the source had not moved, then stopped the daemon, ran the full
+    // installer, and restarted anyway — so a node that was already current
+    // paid the entire outage for a no-op, on every check. Auto-update runs on
+    // a cadence, so those were recurring outages bought with nothing.
+    //
+    // Both halves are required. `before == after` says the SOURCE did not move
+    // this run; it does NOT say the installed binary matches it (#354: a prior
+    // install can have failed while the checkout stayed current). The smoke
+    // test is what makes skipping safe — unchanged source AND a binary that
+    // already reports it means there is genuinely nothing to do.
+    if before == after && smoke_test_new_binary(&airc_exe, &after) {
+        println!("Already at {after} on channel {channel} — daemon left running.");
+        return Ok(());
+    }
+
+    // Compile BEFORE the node goes off the air. `install.sh` runs
+    // `cargo build --release -p airc-cli` in this same directory, so this warms
+    // exactly the cache it will use and its rebuild becomes near-incremental —
+    // the outage shrinks from "fetch + full rebuild + install" to roughly
+    // "install + restart".
+    //
+    // Best-effort ON PURPOSE, and not a masking fallback: `run_installer` below
+    // performs the authoritative build moments later and fails loud if the code
+    // does not compile. Nothing is hidden by ignoring a failure here — a broken
+    // build still stops the update, it just stops it a few seconds later.
+    prewarm_build(&build_dir);
+
+    if daemon_was_running {
+        stop_daemon(&airc_exe, home, &socket)?;
+    }
+
+    run_installer(&build_dir)?;
+
+    // Prove the BINARY became `after` before claiming anything about it (#354).
+    //
+    // Everything above this line is a statement about a git checkout; the
+    // operator reads the lines below as statements about the tool they are
+    // holding. Those were allowed to disagree silently — and did, on a live
+    // peer node on 2026-08-07: `airc update` printed "Already at 1e2f424 …
+    // daemon: restarted." and `airc --version` on the very next line said
+    // *3 commits behind*. Both true, neither lying, describing different
+    // objects.
+    //
+    // The check itself was never missing. `run_auto_update` has smoke-tested
+    // since it was written (`smoke_test_new_binary`, with rollback). It was
+    // simply never wired into the MANUAL path — the one the staleness banner
+    // tells you to run, and therefore the one a human or an agent actually
+    // reaches for. Built, correct, and not called where it mattered.
+    //
+    // Deliberately NOT mirroring the auto path's rollback here: this path is
+    // entered on purpose by someone who can re-run it, and a rollback needs
+    // its own backup anchor + failure modes. Verification is what was missing;
+    // silently rolling back an operator's explicit action is a separate call.
+    //
+    // Nor does this SELF-HEAL, unlike the daemon check below — and the
+    // asymmetry is the point, not an oversight. Heal what has a known-safe
+    // idempotent remedy; report what needs a human decision. A stale daemon is
+    // the former: stop it, start it, done. A binary that did not land is
+    // usually the installer writing somewhere other than what the shell
+    // resolves, and re-running an installer that already did its job cannot fix
+    // a PATH. Retrying there would be theatre — it would burn minutes, change
+    // nothing, and teach the operator that the check is noise.
+    if !smoke_test_new_binary(&airc_exe, &after) {
         return Err(format!(
-            "install source is detached at {}; check out a branch before updating",
-            source.display()
+            "update did NOT take: the source reached {after}, but the binary at \
+             {} does not report it. Nothing verified this before, so this printed \
+             a success line instead. Check `which -a airc` — the installer may be \
+             writing somewhere other than the path your shell resolves.",
+            airc_exe.display()
         )
         .into());
     }
 
-    let before = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
-    if daemon_was_running {
-        stop_daemon(&airc_exe, home, &socket)?;
-    }
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .arg("fetch")
-            .arg("--quiet")
-            .arg("origin")
-            .arg(&branch),
-        "git fetch",
-    )?;
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .arg("pull")
-            .arg("--ff-only")
-            .arg("--quiet"),
-        "git pull --ff-only",
-    )?;
-    let after = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
-
-    run_installer(&source)?;
-
     if before == after {
-        println!("Already at {after}.");
+        println!("Already at {after} on channel {channel}.");
     } else {
-        println!("Updated: {before} -> {after}");
+        println!("Updated ({channel}): {before} -> {after}");
     }
     if daemon_was_running {
         restart_daemon(&airc_exe, home, &socket)?;
         wait_daemon_ready(&airc_exe, home, &socket)?;
-        println!("daemon: restarted.");
+        // The NEXT link in the chain. `wait_daemon_ready` proves a daemon
+        // answers; it does not prove it is the daemon we just built. A stale
+        // process that survived `stop_daemon` answers IPC perfectly, so
+        // "daemon: restarted." was true and useless — the exact shape
+        // `check_daemon_build` in doctor.rs was written for after it went
+        // undetected on a live node for hours. That check only runs under
+        // `doctor --health`; update restarts the daemon and never asked.
+        verify_daemon_build(&airc_exe, home, &socket, &after)?;
+        println!("daemon: restarted (build verified).");
     }
     Ok(())
+}
+
+/// The release channel this node's updates track — DURABLE per-machine config,
+/// never the install checkout's whim. Resolution: `AIRC_UPDATE_CHANNEL` env →
+/// `~/.airc/update-channel` file → `"canary"` (the rust-rewrite release branch).
+///
+/// Why this exists (task #288, incident 2026-08-01): the updater used to build
+/// whatever branch the install-source checkout happened to have checked out.
+/// On a dev checkout that branch can be a feature branch or a DELETED PR branch
+/// — updates then either brick ("couldn't find remote ref …") or silently
+/// strand the node off-channel, which is exactly how a peer's daemon misses a
+/// committed transport fix for a day. The channel is the node's contract; the
+/// checkout is just where the objects live.
+pub(crate) const DEFAULT_UPDATE_CHANNEL: &str = "canary";
+
+fn update_channel() -> String {
+    if let Some(ch) = env::var("AIRC_UPDATE_CHANNEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return ch;
+    }
+    machine_airc_home()
+        .and_then(|d| channel_from_file(&d.join("update-channel")))
+        .unwrap_or_else(|| DEFAULT_UPDATE_CHANNEL.to_string())
+}
+
+/// Read a channel name from the durable file; `None` on missing/empty/unreadable
+/// so the caller falls through to the default. Pure over the path — unit-tested.
+fn channel_from_file(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The per-user `~/.airc` dir (same resolution as the gh guard state) — home for
+/// the update channel file and the channel build worktree.
+fn machine_airc_home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(|h| PathBuf::from(h).join(".airc"))
+}
+
+/// Prepare the directory the update BUILDS from, pinned to the release channel,
+/// WITHOUT ever mutating a dev checkout's working tree. Returns
+/// `(build_dir, before_short_sha, after_short_sha)`; `before == after` is the
+/// caller's no-op signal.
+///
+/// - Checkout already ON the channel branch → fetch + ff-pull in place (the
+///   pre-existing fast path, unchanged behavior for `~/.airc/src` installs).
+/// - Checkout on ANY other branch, or detached (including a deleted PR branch —
+///   the state that bricked `airc update` on 2026-08-01) → build from an
+///   airc-owned worktree at `~/.airc/update-worktree` hard-reset to
+///   `origin/<channel>`. The dev checkout is only ever `git fetch`ed; its
+///   branch, index, and working tree are never touched. The worktree shares the
+///   source repo's objects, so no re-clone.
+fn prepare_build_source(
+    source: &Path,
+    channel: &str,
+) -> Result<(PathBuf, String, String), Box<dyn std::error::Error>> {
+    run_checked(
+        Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["fetch", "--quiet", "origin", channel]),
+        "git fetch (channel)",
+    )?;
+    let branch = git_text(source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == channel {
+        let before = git_text(source, ["rev-parse", "--short", "HEAD"])?;
+        run_checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(source)
+                .args(["pull", "--ff-only", "--quiet"]),
+            "git pull --ff-only",
+        )?;
+        let after = git_text(source, ["rev-parse", "--short", "HEAD"])?;
+        return Ok((source.to_path_buf(), before, after));
+    }
+
+    let wt = machine_airc_home()
+        .ok_or("HOME is not set; cannot place the update worktree")?
+        .join("update-worktree");
+    let origin_ref = format!("origin/{channel}");
+    if wt.join(".git").exists() {
+        // Reuse: `before` is what this node last built from the channel, so the
+        // auto path's no-op compare stays meaningful across runs.
+        let before = git_text(&wt, ["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+        run_checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(["reset", "--hard", &origin_ref]),
+            "git reset --hard (update worktree)",
+        )?;
+        let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
+        Ok((wt, before, after))
+    } else {
+        if wt.exists() {
+            // Half-created leftover (no .git link) — clear it and drop any stale
+            // registration so `worktree add` can't refuse.
+            std::fs::remove_dir_all(&wt)?;
+        }
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["worktree", "prune"])
+            .output();
+        let wt_str = wt
+            .to_str()
+            .ok_or("update worktree path is not valid UTF-8")?
+            .to_string();
+        run_checked(
+            Command::new("git").arg("-C").arg(source).args([
+                "worktree",
+                "add",
+                "--detach",
+                &wt_str,
+                &origin_ref,
+            ]),
+            "git worktree add (update worktree)",
+        )?;
+        let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
+        // Empty `before` ≠ `after` → first channel build always proceeds.
+        Ok((wt, String::new(), after))
+    }
 }
 
 /// `airc update --auto` — self-update with a smoke-test and rollback.
@@ -66,9 +268,18 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
 /// leave a peer with a binary that compiles-but-doesn't-run.
 ///
 /// Flow: fetch + ff-pull the channel → if HEAD unchanged, nothing to do
-/// → else back up the installed binary to `airc.prev`, rebuild in place,
-/// smoke-test (the new binary's `version` reports the pulled SHA), and on
-/// failure restore `airc.prev`.
+/// (the daemon is NEVER touched — see below) → else stop the daemon, back
+/// up the installed binary to `airc.prev`, rebuild in place, smoke-test
+/// (the new binary's `version` reports the pulled SHA), and on failure
+/// restore `airc.prev`.
+///
+/// The no-op path must not restart the daemon: `git fetch`/`pull` only
+/// touch the source checkout, never the running binary, so only the
+/// rebuild+swap needs the daemon down. The pre-fix shape stopped the
+/// daemon BEFORE the SHA compare, which killed the transport owner every
+/// hourly "nothing to auto-update" tick — wiping in-process room state
+/// and blinding every subscribed client for the restart window
+/// (continuum blind-room incidents #2/#3, 2026-07-11/12).
 ///
 /// Platform note: on Windows the live `airc.exe` is locked while this
 /// process runs, so the in-place reinstall (and thus the swap) inherits
@@ -81,42 +292,24 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     let airc_exe = env::current_exe()?;
     let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
 
-    let branch = git_text(&source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if branch == "HEAD" || branch.is_empty() {
-        return Err(format!(
-            "install source is detached at {}; check out a branch before auto-updating",
-            source.display()
-        )
-        .into());
-    }
-    let before = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
-
-    if daemon_was_running {
-        stop_daemon(&airc_exe, home, &socket)?;
-    }
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["fetch", "--quiet", "origin", &branch]),
-        "git fetch",
-    )?;
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["pull", "--ff-only", "--quiet"]),
-        "git pull --ff-only",
-    )?;
-    let after = git_text(&source, ["rev-parse", "--short", "HEAD"])?;
+    let channel = update_channel();
+    // Channel-pinned build source: fetch/reset only ever touch the channel
+    // worktree (or ff-pull a checkout that IS the channel) — never the running
+    // binary and never a dev checkout's working tree.
+    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
 
     if before == after {
-        println!("Already at {after} — nothing to auto-update.");
-        if daemon_was_running {
-            restart_daemon(&airc_exe, home, &socket)?;
-            wait_daemon_ready(&airc_exe, home, &socket)?;
-        }
+        // Nothing pulled → nothing to rebuild → the daemon was never
+        // stopped and MUST NOT be restarted. Restart-on-no-op is the bug
+        // this ordering exists to prevent (hourly transport-owner death).
+        println!("Already at {after} on channel {channel} — nothing to auto-update.");
         return Ok(());
+    }
+
+    // A real update is pending — only NOW does the binary swap need the
+    // transport owner down.
+    if daemon_was_running {
+        stop_daemon(&airc_exe, home, &socket)?;
     }
 
     // Back up the live binary BEFORE the rebuild — this is the rollback
@@ -129,7 +322,7 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         )
     })?;
 
-    let installed = run_installer(&source);
+    let installed = run_installer(&build_dir);
 
     // Smoke-test: the new binary must RUN and report the SHA we pulled —
     // a build that compiled but is broken (or didn't actually replace the
@@ -362,6 +555,104 @@ fn validate_source_checkout(source: &Path) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Confirm the running daemon is the build we just installed — and if it is
+/// not, HEAL it rather than reporting a problem to a human.
+///
+/// `wait_daemon_ready` proves *a* daemon answers. It does not prove it is the
+/// daemon we just built. A process that survived `stop_daemon` answers IPC
+/// perfectly, so "daemon: restarted." was true and useless. That is the exact
+/// drift `doctor.rs::check_daemon_build` was written for — after it went
+/// undetected on a live node for hours — and it only runs under
+/// `doctor --health`, which update never invokes.
+///
+/// Fail-loud is not the goal here. Per the self-healing mandate (#288, "heal
+/// through flux and updates autonomously — no human ever runs the fix"), a
+/// deploy path that *detects* staleness and hands it back to an operator has
+/// only moved the work. The remedy for a stale daemon is known, safe, and
+/// idempotent — stop it and start it again — so we do that ourselves, once.
+///
+/// Only when the second attempt ALSO comes back stale do we stop and say so,
+/// naming both shas and what was already tried. One retry, not a loop: a
+/// daemon that ignores two clean restarts has something wrong that another
+/// restart will not fix, and hiding that behind retries is how a brittle
+/// system looks healthy right up until it doesn't.
+fn verify_daemon_build(
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if daemon_build_matches(airc_exe, home, socket, expected) {
+        return Ok(());
+    }
+
+    eprintln!(
+        "⚠ the daemon came back on a build that is not {expected} — restarting it \
+         once more before reporting anything (a process that survived the stop \
+         answers IPC just fine)."
+    );
+    restart_daemon(airc_exe, home, socket)?;
+    wait_daemon_ready(airc_exe, home, socket)?;
+
+    if daemon_build_matches(airc_exe, home, socket, expected) {
+        eprintln!("✓ self-healed: the daemon is now running {expected}.");
+        return Ok(());
+    }
+
+    Err(format!(
+        "the running daemon is NOT the build that was just installed ({expected}), \
+         and a second clean restart did not change that. The binary on disk is \
+         correct — something is holding an old daemon process alive. Check for a \
+         stray `airc` process that did not exit, then `airc stop` and `airc join` \
+         to re-establish the transport owner. Reporting rather than retrying \
+         further: two restarts that both fail is not a timing problem."
+    )
+    .into())
+}
+
+/// Whether the daemon reachable on `socket` reports `expected` as its build.
+///
+/// `false` when it cannot be asked or reports nothing — an unverifiable daemon
+/// is not a verified one, and this is the predicate a heal decision hangs off,
+/// so "I don't know" must never read as "fine".
+fn daemon_build_matches(airc_exe: &Path, home: &Path, socket: &Path, expected: &str) -> bool {
+    let Ok(output) = daemon_command(airc_exe, home, "status", socket).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_build_sha(&stdout) {
+        Some(sha) => smoke_sha_matches(&sha, expected),
+        None => false,
+    }
+}
+
+/// Compile the new build while the daemon is still serving, so the outage
+/// covers only the binary swap.
+///
+/// Mirrors `install.sh`'s own `cargo build --release -p airc-cli` in the same
+/// directory, so this populates precisely the cache the installer will hit.
+/// Silent on success, one line on failure — and deliberately infallible to the
+/// caller: `run_installer` does the authoritative build immediately after and
+/// surfaces any real compile error there. Treating a pre-warm failure as fatal
+/// would turn an optimization into a new way for `airc update` to refuse.
+fn prewarm_build(source: &Path) {
+    println!("Pre-building while the daemon stays up (keeps the node reachable)…");
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "airc-cli"])
+        .current_dir(source)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => println!("pre-build exited {s} — the installer will build it properly."),
+        Err(e) => println!("pre-build could not run ({e}) — the installer will build it."),
+    }
+}
+
 fn run_installer(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Stream the installer's output live instead of buffering it with
     // `Command::output()` (what run_checked does). install.sh does the
@@ -465,6 +756,47 @@ fn command_error(label: &str, output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (#354): the exact live shape that motivated wiring
+    /// the smoke-test into the MANUAL update path. On 2026-08-07 a peer's
+    /// source resolved to one commit while the binary on PATH still reported
+    /// an older one, and `airc update` printed a success line anyway.
+    ///
+    /// The existing `smoke_sha_matches` tests cover the tolerant-prefix
+    /// direction (a successful update must not read as a failure). This covers
+    /// the other one: a genuinely stale binary must NOT slip through on a
+    /// prefix coincidence, and an unparsed/empty value must never vacuously
+    /// satisfy the check — a verification that passes on missing evidence is
+    /// worse than none.
+    #[test]
+    fn a_stale_binary_does_not_satisfy_the_commit_the_source_reached() {
+        assert!(!smoke_sha_matches("1e2f424aaaaa", "35d40b1"));
+        assert!(!smoke_sha_matches("", "35d40b1"));
+        assert!(!smoke_sha_matches("35d40b1468ee", ""));
+    }
+
+    // what this catches (#288 pin-to-channel): the durable channel file wins over
+    // the default, and missing/empty files fall through to "canary" — the update
+    // must NEVER derive its ref from the checkout's current branch again (the
+    // deleted-PR-branch brick + off-channel-strand incident, 2026-08-01).
+    #[test]
+    fn channel_file_wins_missing_or_empty_falls_to_default() {
+        let dir = std::env::temp_dir().join(format!("airc-chan-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("update-channel");
+
+        std::fs::write(&file, "release-2\n").unwrap();
+        assert_eq!(channel_from_file(&file).as_deref(), Some("release-2"));
+
+        std::fs::write(&file, "   \n").unwrap();
+        assert_eq!(channel_from_file(&file), None, "blank file falls through");
+
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(channel_from_file(&file), None, "missing file falls through");
+        assert_eq!(DEFAULT_UPDATE_CHANNEL, "canary");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn install_source_prefers_airc_dir() {
