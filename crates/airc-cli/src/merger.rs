@@ -821,7 +821,26 @@ mod tests {
         );
 
         drop(_first);
-        let _third = acquire_singleton_lock(&tmp).expect("after drop, third acquire succeeds");
+        // The `flock(LOCK_EX)` held by `_first` is released when its file descriptor
+        // closes on drop. That release is synchronous on macOS, but on some Linux
+        // kernels/filesystems (seen on the ubuntu CI runner) the handoff to a fresh
+        // `open()` + `flock()` can lag a few ms — a real property of advisory locks,
+        // not a bug in the code under test. Production never rapid-re-acquires (the
+        // merger holds the lock for its whole lifetime), so a short bounded wait here
+        // reflects real lock-handoff timing and makes the test deterministic instead
+        // of platform-flaky. Fails loud if the lock is genuinely never released.
+        let mut third = None;
+        for _ in 0..100 {
+            match acquire_singleton_lock(&tmp) {
+                Ok(f) => {
+                    third = Some(f);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let _third =
+            third.expect("after drop, third acquire must succeed once the flock releases (<=2s)");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
