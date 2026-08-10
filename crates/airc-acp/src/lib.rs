@@ -19,10 +19,13 @@
 //! spawns it and serves as the transport.
 
 pub mod policy;
+pub mod transport;
 
-pub use policy::{PeerPolicy, PermissionDecision, ToolPolicy};
+pub use policy::{PeerPolicy, PermissionDecision, ToolIdentity, ToolPolicy};
+pub use transport::AcpBridge;
 
 use std::fmt;
+use std::path::PathBuf;
 
 /// How to launch one ACP agent, and what it is allowed to do once running.
 ///
@@ -39,6 +42,13 @@ pub struct AgentSpec {
     pub tools: ToolPolicy,
     /// Which peers may prompt it. Defaults to anyone in the room.
     pub peers: PeerPolicy,
+    /// The directory the agent treats as its workspace.
+    ///
+    /// `None` means the bridge process's current directory. Named explicitly
+    /// rather than always-implicit because the bridge may run as a daemon whose
+    /// cwd is unrelated to any project — an agent silently rooted at `/` is a
+    /// confusing way to find out.
+    pub workspace: Option<PathBuf>,
 }
 
 impl AgentSpec {
@@ -53,6 +63,7 @@ impl AgentSpec {
             command: command.into(),
             tools: ToolPolicy::deny_all(),
             peers: PeerPolicy::any(),
+            workspace: None,
         }
     }
 
@@ -63,6 +74,11 @@ impl AgentSpec {
 
     pub fn with_peers(mut self, peers: PeerPolicy) -> Self {
         self.peers = peers;
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.workspace = Some(workspace.into());
         self
     }
 }
@@ -164,7 +180,11 @@ mod tests {
             spec.peers.may_prompt("peer-anyone"),
             "chat must work by default"
         );
-        assert!(!spec.tools.decide("shell").is_allowed(), "tools must not");
+        let execute = ToolIdentity {
+            kind: Some("execute".into()),
+            title: Some("run a shell command".into()),
+        };
+        assert!(!spec.tools.decide(&execute).is_allowed(), "tools must not");
     }
 
     /// what this catches: spawning a subprocess for a peer we were going to
@@ -188,10 +208,11 @@ mod tests {
             text: "I could not write that file.".into(),
             decisions: vec![
                 PermissionDecision::Allow {
-                    tool: "read_file".into(),
+                    label: "read src/main.rs (read)".into(),
+                    caveat: None,
                 },
                 PermissionDecision::Deny {
-                    tool: "write_file".into(),
+                    label: "write src/main.rs (edit)".into(),
                     reason: "not allow-listed".into(),
                 },
             ],
@@ -199,7 +220,7 @@ mod tests {
         assert!(turn.had_refusal());
         let lines = turn.refusal_lines();
         assert_eq!(lines.len(), 1, "only refusals surface: {lines:?}");
-        assert!(lines[0].contains("write_file"));
+        assert!(lines[0].contains("write src/main.rs"));
     }
 
     /// what this catches: an error type that collapses "cannot start" into

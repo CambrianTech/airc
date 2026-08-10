@@ -67,15 +67,47 @@ appropriate `TrustTier`. The bridge is the agent's grounded presence on the grid
 
 ## Build slices
 
-- **Slice 1 — airc-citizen half (known-cold):** the bin scaffold + join /
-  subscribe / publish loop over `airc-lib`, ACP side stubbed (echo). Proves the
-  airc seam end-to-end; compiles + a smoke test (joins a room, round-trips a
-  message through the stub).
-- **Slice 2 — ACP client half:** spawn the agent subprocess, JSON-RPC framing,
-  `initialize`/`session/new`/`session/prompt`/`session/update`. Replace the stub
-  with the real agent turn.
-- **Slice 3 — judgment + permissions:** the respond decision (not a gate) and
-  `requestPermission` policy wired to the grid ACL.
+- **Slice 1 — airc-citizen half — DONE:** the bin scaffold + join / subscribe /
+  publish loop over `airc-lib`, ACP side stubbed.
+- **Slice 2 — ACP client half — DONE:** the ACP work lives in the
+  **`airc-acp` crate** (`crates/airc-acp`), which this binary consumes. Spawn +
+  `initialize` / `session/new` / `session/prompt` / `session/update` + the
+  permission policy.
+
+  **Superseded plan:** this slice originally said "hand-write JSON-RPC framing".
+  It uses the published `agent-client-protocol` SDK instead. Framing, batching,
+  cancellation, and version negotiation are things the SDK already gets right and
+  a hand-rolled framer would get subtly wrong — and subtly-wrong framing presents
+  as an agent that mysteriously goes quiet, which is the most expensive bug shape
+  we have. See `docs/architecture/ACP-CLIENT-BRIDGE.md`.
+- **Slice 3 — judgment:** replace the `/acp` trigger with the registered
+  `ai/should-respond` handler described below. The trigger is a scaffold, not the
+  design: it exists so the bridge isn't an echo bot in a shared room while
+  cognition's decision path is still being wired.
+
+## Running it
+
+```sh
+ACP_BRIDGE_COMMAND='uvx hermes-agent[acp] hermes-acp' \
+ACP_BRIDGE_ROOM=general \
+  cargo run -p airc-acp-bridge
+```
+
+Then in the room: `/acp what changed in this repo today?`
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `ACP_BRIDGE_COMMAND` | Command that starts the ACP agent | **required** — no silent no-op |
+| `ACP_BRIDGE_AGENT` | Name the bridge is grounded under | `acp-agent` |
+| `ACP_BRIDGE_ROOM` | Room to join | `general` |
+| `ACP_BRIDGE_TOOLS` | Comma-separated tool **kinds** the agent may run (`read,search,…`) | none — every tool refused |
+| `ACP_BRIDGE_ALLOW_FROM` | Comma-separated peers allowed to prompt | anyone in the room |
+| `ACP_BRIDGE_WORKSPACE` | Directory the agent treats as its workspace | the bridge's cwd |
+
+`ACP_BRIDGE_TOOLS` lists **kinds**, not tool names — the stable ACP permission
+request identifies a tool by kind, and its human-readable title changes per call.
+Unset means the agent can chat and can run nothing, which is the useful-but-safe
+default when the prompter is an arbitrary peer.
 
 ## The respond decision: ONE command, N handlers (resolved, Intel Mac 2026-06-17)
 

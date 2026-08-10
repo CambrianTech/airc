@@ -15,7 +15,27 @@ publish = false
 # way means the security-relevant rule is unit-tested before a subprocess exists,
 # rather than being an `if` buried in an async callback.
 
+[features]
+# Test fixtures. Per CLAUDE.md's test discipline, fixtures live behind a cargo
+# feature so a production build physically cannot link them.
+test-fixtures = []
+
+# A real ACP agent over real stdio, so the SUBPROCESS path (spawn + JSON-RPC
+# framing) is covered by a deterministic test rather than only by a live run.
+# That path is where Windows historically fails silently — a child that never
+# starts looks exactly like an agent with nothing to say.
+[[bin]]
+name = "acp-echo-agent"
+path = "src/bin/acp_echo_agent.rs"
+required-features = ["test-fixtures"]
+
 [lints]
 workspace = true
 
 [dependencies]
+agent-client-protocol = "2"
+agent-client-protocol-tokio = "0.11"
+tokio = { version = "1.53.1", features = ["process", "rt", "macros", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "macros", "rt-multi-thread"] }
