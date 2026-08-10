@@ -1,0 +1,21 @@
+[package]
+name = "airc-acp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# airc as an ACP CLIENT — one bridge, every agent that speaks the Agent Client
+# Protocol. See docs/architecture/ACP-CLIENT-BRIDGE.md.
+#
+# This slice owns the DECISIONS (who may prompt, which tools may run, how a
+# refusal reaches the room) as pure, testable logic with no I/O. The transport —
+# spawning the agent and driving Initialize/NewSession/Prompt over
+# `agent-client-protocol` — lands next, against this contract. Splitting it this
+# way means the security-relevant rule is unit-tested before a subprocess exists,
+# rather than being an `if` buried in an async callback.
+
+[lints]
+workspace = true
+
+[dependencies]
