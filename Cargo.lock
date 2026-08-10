@@ -167,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol 2.0.0",
  "agent-client-protocol-tokio",
+ "serde_json",
  "tokio",
 ]
 

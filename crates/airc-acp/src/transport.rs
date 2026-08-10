@@ -32,24 +32,22 @@ use crate::{admit_prompt, AgentSpec, AgentTurn, BridgeError};
 /// This is the ONE place the enum becomes config, so the vocabulary can't drift
 /// between the gate and the documentation.
 ///
-/// The catch-all matters: `ToolKind` is `#[non_exhaustive]`, so a kind added by
-/// a future SDK release lands here. It maps to `"other"` — the same bucket as
-/// ACP's own `Other` default — which is denied unless an operator has explicitly
-/// allow-listed unclassified tools. A new protocol capability therefore arrives
-/// closed, not open.
-fn kind_key(kind: &ToolKind) -> &'static str {
-    match kind {
-        ToolKind::Read => "read",
-        ToolKind::Edit => "edit",
-        ToolKind::Delete => "delete",
-        ToolKind::Move => "move",
-        ToolKind::Search => "search",
-        ToolKind::Execute => "execute",
-        ToolKind::Think => "think",
-        ToolKind::Fetch => "fetch",
-        ToolKind::SwitchMode => "switch_mode",
-        _ => "other",
-    }
+/// Derived from the `ToolKind` serde repr (`#[serde(rename_all = "snake_case")]`)
+/// rather than a `match`: `ToolKind` is `#[non_exhaustive]`, so any match needs a
+/// `_` arm — which the compiler FORCES and the production no-silent-fallback
+/// clippy gate (`-D clippy::wildcard_enum_match_arm`) forbids. No match can win.
+///
+/// The serde repr sidesteps the match: a future fieldless SDK variant yields its
+/// OWN snake_case name, stays absent from `toolsAllow`, and is still denied — a new
+/// protocol capability arrives CLOSED, not open, and the denial names the real
+/// kind instead of a blanket `"other"`. A future *data-carrying* variant can't
+/// render to a plain string and falls to `"other"` (still ACP's own default deny
+/// bucket) — fail-closed either way, with no wildcard.
+fn kind_key(kind: &ToolKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "other".to_owned())
 }
 
 /// Read the tool's identity off the wire request.
@@ -61,7 +59,7 @@ fn kind_key(kind: &ToolKind) -> &'static str {
 fn identity_of(request: &RequestPermissionRequest) -> ToolIdentity {
     let fields = &request.tool_call.fields;
     ToolIdentity {
-        kind: fields.kind.as_ref().map(|k| kind_key(k).to_string()),
+        kind: fields.kind.as_ref().map(kind_key),
         title: fields.title.clone(),
     }
 }

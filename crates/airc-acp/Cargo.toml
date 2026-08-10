@@ -35,6 +35,10 @@ workspace = true
 [dependencies]
 agent-client-protocol = "2"
 agent-client-protocol-tokio = "0.11"
+# The ToolKind → toolsAllow key is derived from the type's serde repr (see
+# `kind_key` in transport.rs) rather than a `_`-wildcard match the non-exhaustive
+# enum forces and the no-silent-fallback clippy gate forbids. Already in the lock.
+serde_json = "1"
 tokio = { version = "1.53.1", features = ["process", "rt", "macros", "io-util"] }
 
 [dev-dependencies]
