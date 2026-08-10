@@ -255,15 +255,32 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows runs on the self-hosted bigmama runner (5090 grid
-        # node) — GitHub-hosted windows-latest has been queue-starved
-        # for days and was blocking merges (#1114). The install-smoke
-        # jobs in ci.yml deliberately STAY on windows-latest: they do
-        # real machine-wide winget installs and need a virgin box,
-        # which a persistent self-hosted runner is not.
-        # Security: repo fork-PR approval policy is set to
-        # all_external_contributors, so no fork code reaches the
-        # self-hosted runner without a maintainer's explicit approval.
+        # Windows runs on GitHub-hosted windows-latest.
+        #
+        # It was moved to a self-hosted "bigmama" runner in #1114 because
+        # windows-latest was queue-starved for days. That runner DOES NOT
+        # EXIST. Measured 2026-08-09:
+        #   gh api repos/CambrianTech/airc/actions/runners -> total_count 0
+        # and bigmama itself has no runner service, no Runner.Listener
+        # process, and no actions-runner directory. So this leg was not
+        # slow or offline — nothing could ever claim it. On PR #1336 it sat
+        # `pending` at 0s, and it has been emitting a permanently-pending
+        # `cargo test (windows-self-hosted)` check on every PR since,
+        # faking coverage that never ran a single test. It came within one
+        # check of blocking the canary->main release.
+        #
+        # The #1114 starvation is also stale: ci.yml's clean-install-windows
+        # and clean-install-windows-ps5 run on windows-latest and passed in
+        # 9m10s / 8m42s the same day. So the hosted queue is healthy, and a
+        # leg that actually RUNS beats one that reports a green-looking
+        # pending forever.
+        #
+        # If a self-hosted bigmama runner is genuinely registered later,
+        # this can move back — but only once `actions/runners` shows it,
+        # and the fork-PR guard below is kept for exactly that case.
+        # The install-smoke jobs in ci.yml stay on windows-latest for their
+        # own reason: they do real machine-wide winget installs and need a
+        # virgin box, which a persistent self-hosted runner is not.
         # ubuntu-latest is NOT here — it's the dedicated `test-ubuntu` job
         # below. A SKIPPED matrix job reports ONE check named with the
         # unexpanded template `cargo test (${{ matrix.display }})`, so the
@@ -272,7 +289,7 @@ jobs:
         # their template-named skip is harmless.
         include:
           - { os: macos-latest, display: macos-latest }
-          - { os: [self-hosted, windows], display: windows-self-hosted }
+          - { os: windows-latest, display: windows-latest }
     steps:
       # Self-defending guard (sentinel ask on #1116): the self-hosted leg
       # refuses fork-PR code before checkout. Lives at STEP level because

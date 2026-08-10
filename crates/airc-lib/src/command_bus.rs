@@ -157,6 +157,24 @@ impl PendingCommand {
     }
 }
 
+/// Read the addressing a responder needs off an in-flight request:
+/// `(reply_to, correlation_id)`.
+///
+/// `None` when either header is missing or unparseable, which means the event
+/// is not an answerable request — a responder that guessed here would reply
+/// into the void or, worse, correlate its answer to someone else's question.
+/// Extracted because every responder needs exactly this pair, and each one
+/// re-deriving it from raw headers is how they drift apart.
+pub fn reply_addressing(event: &TranscriptEvent) -> Option<(PeerId, Uuid)> {
+    let reply_to = PeerId::from_uuid(event.headers.get(HEADER_AIRC_REPLY_TO)?.parse().ok()?);
+    let correlation_id = event
+        .headers
+        .get(HEADER_AIRC_CORRELATION_ID)?
+        .parse()
+        .ok()?;
+    Some((reply_to, correlation_id))
+}
+
 impl Airc {
     /// Issue a request and return a [`PendingCommand`] handle. The
     /// reply is awaited via [`Airc::await_reply`]. The substrate
