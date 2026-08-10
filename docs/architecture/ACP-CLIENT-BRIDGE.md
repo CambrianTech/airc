@@ -1,7 +1,7 @@
 # airc as an ACP client — one bridge, N agents
 
-**Status:** transport implemented and covered by in-process round-trip tests
-(2026-08-09). Live subprocess round-trip still outstanding — see
+**Status:** transport implemented; in-process AND subprocess round-trips green on Windows
+(2026-08-09). A live two-peer room round-trip is still outstanding — see
 [Verification bar](#verification-bar).
 
 ## Where the code lives (read this before adding a second ACP path)
@@ -186,9 +186,22 @@ merely demonstrated once.
 
 Rows 6 and 7 are the honest gaps, and they are different in kind:
 
-- **Row 6** is the airc half — the library returns the right thing, and
-  `integrations/acp` publishes it, but nobody has watched a second peer receive
-  it. "It returned a string" is not "the room saw it".
+- **Row 6** is the airc half. A live attempt on Windows found two real defects
+  before it found a result, both of the same family — *something behaves
+  perfectly and is simply not connected to anything*:
+
+  1. **The trigger was `/acp`.** Git Bash's MSYS path conversion rewrote it to
+     `C:/Program Files/Git/acp hello …` before airc ever saw the message. The
+     bridge worked; the token it was watching for never arrived. Now `@acp`,
+     which is not path-like on any platform, with a regression test.
+  2. **The bridge joined a room of its own.** With `AIRC_SOCKET` unset,
+     `Airc::open_as` opens an ISOLATED in-process scope. It logged a successful
+     join to `#general` and returned a peer id, while `airc peers` on the real
+     grid had never heard of it. Both paths look identical from the outside, so
+     the bridge now says which one it took, loudly, at startup.
+
+  Row 6 stays open: the fixes are in, but nobody has yet watched a second live
+  peer receive a reply. "It returned a string" is not "the room saw it".
 - **Row 7** is the third-party half. Our fixture agent is, unavoidably, an agent
   written against the same reading of the SDK as the client. A real agent is the
   only thing that can falsify that reading. Hermes additionally needs an LLM

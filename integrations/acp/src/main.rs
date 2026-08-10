@@ -30,7 +30,21 @@ use futures::StreamExt;
 /// not to an `if` in the loop. Until that lands, an explicit trigger is the
 /// honest placeholder: it is obviously a stand-in rather than a gate pretending
 /// to be judgment, and it makes the live round-trip deterministic to test.
-const TRIGGER: &str = "/acp";
+///
+/// ## Why `@acp` and not `/acp`
+///
+/// It WAS `/acp`, until a live test on Windows showed the message arriving as
+/// `C:/Program Files/Git/acp hello …`. Git Bash's MSYS path conversion rewrites
+/// a leading `/token` into a Windows path, silently, before airc ever sees it.
+/// Every agent driving airc from a shell — which is most of them — would have
+/// hit that, and the symptom is the worst kind: the bridge behaves perfectly and
+/// simply never answers, because the trigger it was watching for never arrived.
+///
+/// `@` is not path-like on any platform, and it reads as addressing, which is
+/// what this actually is. (airc has no structural addressing — every broadcast
+/// is `MentionTarget::All` — so a textual convention is what we have to work
+/// with either way.)
+const TRIGGER: &str = "@acp";
 
 /// A turn handler: given who spoke and what they said, produce the lines to
 /// publish, in order. Empty = PASS (stay quiet) — the decision lives HERE, never
@@ -78,9 +92,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bridge = Arc::new(AcpBridge::new(spec));
 
+    // Attached vs isolated is the difference between "in the room" and "in a
+    // room of its own", and it is invisible from the outside: both paths log a
+    // successful join and hand back a peer id.
+    //
+    // A live test on Windows lost twenty minutes to exactly that — the bridge
+    // reported joining #general, and `airc peers` on the real grid had never
+    // heard of it, because `open_as` opens an isolated in-process scope. So say
+    // which one this is, out loud, at startup.
     let airc = match std::env::var("AIRC_SOCKET").ok() {
-        Some(socket) => Airc::attach_as(home, &agent_name, socket).await?,
-        None => Airc::open_as(home, &agent_name).await?,
+        Some(socket) => {
+            eprintln!("airc-acp-bridge: attaching to the running daemon at {socket}");
+            Airc::attach_as(home, &agent_name, socket).await?
+        }
+        None => {
+            eprintln!(
+                "airc-acp-bridge: AIRC_SOCKET is unset — opening an ISOLATED in-process scope. \
+                 This bridge will NOT see traffic from a running airc daemon, and peers on the \
+                 live grid will not see it. Set AIRC_SOCKET to join the real grid."
+            );
+            Airc::open_as(home, &agent_name).await?
+        }
     };
     airc.publish_identity().await?; // ground by name (room_roster + whois see it)
     airc.join(&room).await?;
@@ -263,30 +295,45 @@ mod tests {
             triggered_prompt("what do you all think about the merge?"),
             None
         );
-        assert_eq!(triggered_prompt("the /acp thing is neat"), None);
+        assert_eq!(triggered_prompt("the @acp thing is neat"), None);
     }
 
     #[test]
     fn a_triggered_message_yields_just_the_prompt() {
         assert_eq!(
-            triggered_prompt("/acp summarize the diff"),
+            triggered_prompt("@acp summarize the diff"),
             Some("summarize the diff")
         );
-        assert_eq!(triggered_prompt("/acp   padded  "), Some("padded"));
+        assert_eq!(triggered_prompt("@acp   padded  "), Some("padded"));
     }
 
-    /// what this catches: a prefix match swallowing an unrelated word. `/acpfoo`
+    /// what this catches: a prefix match swallowing an unrelated word. `@acpfoo`
     /// is not the trigger, and treating it as one would make a typo silently
     /// spend an agent turn.
     #[test]
     fn the_trigger_requires_a_separator() {
-        assert_eq!(triggered_prompt("/acpfoo bar"), None);
+        assert_eq!(triggered_prompt("@acpfoo bar"), None);
+    }
+
+    /// regression: the trigger used to be `/acp`, and a live Windows test showed
+    /// Git Bash rewriting it to `C:/Program Files/Git/acp ...` via MSYS path
+    /// conversion before airc ever saw it. The bridge then behaved perfectly and
+    /// never answered, which is the most expensive way for this to fail.
+    /// what this catches: anyone reintroducing a path-like trigger.
+    #[test]
+    fn the_trigger_is_not_path_like() {
+        assert!(
+            !TRIGGER.starts_with('/'),
+            "a leading-slash trigger is rewritten by MSYS path conversion on Windows"
+        );
+        // And the mangled form must not accidentally still fire.
+        assert_eq!(triggered_prompt("C:/Program Files/Git/acp hello"), None);
     }
 
     /// what this catches: a bare trigger spawning an agent with an empty prompt.
     #[test]
     fn a_bare_trigger_is_not_a_prompt() {
-        assert_eq!(triggered_prompt("/acp"), None);
-        assert_eq!(triggered_prompt("/acp    "), None);
+        assert_eq!(triggered_prompt("@acp"), None);
+        assert_eq!(triggered_prompt("@acp    "), None);
     }
 }

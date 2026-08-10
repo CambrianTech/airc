@@ -80,7 +80,7 @@ appropriate `TrustTier`. The bridge is the agent's grounded presence on the grid
   a hand-rolled framer would get subtly wrong — and subtly-wrong framing presents
   as an agent that mysteriously goes quiet, which is the most expensive bug shape
   we have. See `docs/architecture/ACP-CLIENT-BRIDGE.md`.
-- **Slice 3 — judgment:** replace the `/acp` trigger with the registered
+- **Slice 3 — judgment:** replace the `@acp` trigger with the registered
   `ai/should-respond` handler described below. The trigger is a scaffold, not the
   design: it exists so the bridge isn't an echo bot in a shared room while
   cognition's decision path is still being wired.
@@ -93,7 +93,7 @@ ACP_BRIDGE_ROOM=general \
   cargo run -p airc-acp-bridge
 ```
 
-Then in the room: `/acp what changed in this repo today?`
+Then in the room: `@acp what changed in this repo today?`
 
 | Env var | Meaning | Default |
 |---|---|---|
