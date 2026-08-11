@@ -131,18 +131,77 @@ impl Airc {
     /// `DiagnosticEvent`s in transcript order (oldest → newest).
     /// Useful for `airc doctor` surfacing recent errors without
     /// holding a live subscription.
+    ///
+    /// Returns only the events. An EMPTY result from this method does
+    /// not establish that no diagnostics were emitted — see
+    /// [`Airc::recent_diagnostics`], which reports whether the scan
+    /// window was saturated. Prefer that method for any caller whose
+    /// output distinguishes "clean" from "nothing found".
     pub async fn recent_diagnostic_events(
         &self,
         window: usize,
     ) -> Result<Vec<DiagnosticEvent>, AircError> {
+        Ok(self.recent_diagnostics(window).await?.events)
+    }
+
+    /// Recent diagnostics PLUS the evidence needed to interpret an
+    /// empty result.
+    ///
+    /// Diagnostics are published as `FrameKind::Event`, which maps to
+    /// `TranscriptKind::System` — the SAME transcript kind as agent
+    /// heartbeats, stream chunks and lane-coordination frames. So a
+    /// kind filter cannot isolate them, and the scan is a raw newest-
+    /// `window` page: on a node carrying real traffic, higher-volume
+    /// System frames evict every diagnostic from the window.
+    ///
+    /// That makes a bare empty `Vec` ambiguous in the worst possible
+    /// direction — it means "clean" on a quiet node and "I couldn't
+    /// see" on a busy one, and the busy node is the one you are
+    /// diagnosing. `window_saturated` disambiguates: when the page came
+    /// back full, absence is NOT established and the caller must not
+    /// report a clean bill of health.
+    ///
+    /// Measured 2026-08-05 on BIGMAMA: `airc events list --limit 80`
+    /// returned 79 heartbeats and 1 message. Any diagnostic emitted in
+    /// that span was already gone.
+    pub async fn recent_diagnostics(&self, window: usize) -> Result<RecentDiagnostics, AircError> {
         let recent = self.page_recent(window).await?;
-        let mut out = Vec::with_capacity(recent.len().min(window));
+        let scanned = recent.len();
+        let mut events = Vec::new();
         for transcript_event in recent {
             if let Some(diag) = parse_diagnostic_event(&transcript_event) {
-                out.push(diag);
+                events.push(diag);
             }
         }
-        Ok(out)
+        Ok(RecentDiagnostics {
+            events,
+            scanned,
+            window_saturated: scanned >= window,
+        })
+    }
+}
+
+/// Result of [`Airc::recent_diagnostics`] — the decoded diagnostics plus
+/// whether the scan could see far enough back to justify calling an empty
+/// result "clean".
+#[derive(Debug, Clone)]
+pub struct RecentDiagnostics {
+    /// Decoded diagnostics in transcript order (oldest → newest).
+    pub events: Vec<DiagnosticEvent>,
+    /// How many raw transcript events were scanned.
+    pub scanned: usize,
+    /// The scan window filled completely, so older events — including any
+    /// older diagnostics — lie beyond it. When true, an empty `events` means
+    /// "not visible from here", NOT "none were emitted".
+    pub window_saturated: bool,
+}
+
+impl RecentDiagnostics {
+    /// True only when the scan both found nothing AND saw far enough back to
+    /// mean it. This is the ONLY condition under which a caller may report a
+    /// clean diagnostic surface.
+    pub fn establishes_clean(&self) -> bool {
+        self.events.is_empty() && !self.window_saturated
     }
 }
 

@@ -120,7 +120,8 @@ pub use coordinator::{
 pub use daemon::decode_wire_event;
 pub use delivery_ack::DeliverySendOutcome;
 pub use diagnostic_event_sink::{
-    AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
+    AircEventDiagnosticSink, RecentDiagnostics, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT,
+    HEADER_DIAG_SEVERITY,
 };
 pub use rendezvous::{
     parse_rendezvous_dir, resolve_account_registry_store, GistRendezvous, RendezvousChoice,

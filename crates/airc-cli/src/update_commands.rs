@@ -171,7 +171,11 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
 /// checkout is just where the objects live.
 pub(crate) const DEFAULT_UPDATE_CHANNEL: &str = "canary";
 
-fn update_channel() -> String {
+/// The channel this node contracts to track. `pub(crate)` so `doctor` asks THIS
+/// function rather than re-deriving the answer — a second definition of "which
+/// channel am I on" is how a node ends up diagnosing itself against a different
+/// channel than the one it updates from.
+pub(crate) fn update_channel() -> String {
     if let Some(ch) = env::var("AIRC_UPDATE_CHANNEL")
         .ok()
         .map(|s| s.trim().to_string())
