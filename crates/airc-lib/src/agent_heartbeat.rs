@@ -15,10 +15,25 @@
 //! - `airc.heartbeat.client` = optional runtime client id
 //!   (`"codex:..."`, `"claude:..."`) when known.
 //!
-//! Frame kind is `Event` (durable — same trade-off the audit's flaw
-//! #4 flags). 60s default emit interval keeps noise bounded. The
-//! ephemeral-vs-durable substrate split is the right long-term fix
-//! and is its own follow-up.
+//! Frame kind is `Event` — DURABLE, and that is a defect, not a
+//! trade-off. See airc#1341.
+//!
+//! This header used to claim "60s default emit interval keeps noise
+//! bounded". That is false and the word "bounded" made an unbounded
+//! design read as considered. Bounded per-peer-per-minute is not
+//! bounded: the log grows O(peers x time) forever. MEASURED on a live
+//! two-peer room — 339 events = 296 beats + 4 messages. 87% of the
+//! conversation plane was presence telemetry, and it degrades as the
+//! grid grows, which is the one direction it must not fail in.
+//!
+//! It also used to defer the fix as "its own follow-up". The follow-up
+//! is airc#1341, and the fix is not a substrate split: the presence
+//! store ALREADY EXISTS. `airc_store::StoredBeacon` is keyed by
+//! (mesh_identity, peer_id) with `heartbeat_at_ms`, and `save_beacon`
+//! is documented as an UPSERT. Presence is a row, and
+//! `active_agents` below pages the event log, parses each frame and
+//! folds to latest-per-peer — a hand-rolled SELECT ... GROUP BY over
+//! a log we polluted to make the fold possible.
 //!
 //! Scope cut: this module ships the typed event + emit task + query.
 //! It does **not** ship:
@@ -37,12 +52,21 @@
 //!   roster and looked confident doing it. It composes the moment emission
 //!   becomes per-room.
 //!
-//!   Per-room emission is a real design call, not an oversight: beating into
-//!   N rooms multiplies presence traffic by N, against a cadence chosen
-//!   specifically to keep that traffic bounded. There is likely a better
-//!   shape available — the coordinator beacon already carries this scope's
-//!   FULL channel list (`publish_presence`), so cross-room presence may be
-//!   derivable without multiplying beats at all.
+//!   Per-room emission was called "a real design call, not an oversight:
+//!   beating into N rooms multiplies presence traffic by N". That premise
+//!   is an ARTIFACT of the log-as-store defect above. Beats are expensive
+//!   only because they are durable log rows; as an upserted beacon row the
+//!   multiplication cost is zero and the trade-off does not exist.
+//!
+//!   The doc even named its own answer — `StoredBeacon.subscribed_channels`
+//!   already carries this scope.s FULL channel list. Cross-room presence is
+//!   derivable from the row TODAY, with no extra beats.
+//!
+//!   This is what the defect actually costs: `room_roster_in` returns empty
+//!   for every room a peer did not beat into, so a room cannot say who is
+//!   convened in it — and rooms-as-activities (continuum #2235 / #54) needs
+//!   exactly that roster. The log-as-store choice is upstream of the comms
+//!   architecture being unusable.
 //! - A `"leaving"` event on graceful shutdown (caller can emit one
 //!   manually via [`Airc::emit_agent_heartbeat`] with a custom kind
 //!   if needed; the typed shape is reserved for it).
