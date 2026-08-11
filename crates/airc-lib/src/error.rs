@@ -106,6 +106,31 @@ pub enum AircError {
     )]
     JoinUuidString { string: String },
 
+    /// Card c409eaf5, octave 2: the join token is id-shaped (8..=32
+    /// hex chars) but matches no subscribed channel. Refusing here is
+    /// what keeps `ChannelName::new` from hashing the id into a NEW
+    /// channel — the ghost-room mint that split a room's readers from
+    /// its writers on 2026-08-11 ("3be59578" → ghost 7d1a76de while
+    /// academy's traffic lived on 3be59578…).
+    #[error(
+        "join refused: {token:?} is id-shaped (hex) but matches no subscribed channel. \
+         If you meant an existing room, run `airc room` and pass its NAME. \
+         If you truly want a room NAMED this, pick a name with a non-hex character — \
+         an id-shaped name would mint a NEW channel and split the room."
+    )]
+    JoinIdUnknown { token: String },
+
+    /// Card c409eaf5, octave 2: the id-shaped join token is a prefix
+    /// of more than one subscribed channel UUID.
+    #[error(
+        "join refused: {token:?} matches multiple subscribed channels: {candidates:?}. \
+         Pass the room NAME or a longer id prefix."
+    )]
+    JoinIdAmbiguous {
+        token: String,
+        candidates: Vec<String>,
+    },
+
     /// Caller attempted to mutate a work card from a room whose work
     /// projection does not contain that card. Work cards are
     /// room-scoped coordination state; transitions from another room

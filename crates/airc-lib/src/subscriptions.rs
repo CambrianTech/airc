@@ -228,6 +228,23 @@ pub fn derive_room_id(identity: &MeshIdentity, channel: &ChannelName) -> RoomId 
     RoomId::from_uuid(Uuid::new_v5(&SUBSCRIPTIONS_NAMESPACE, &bytes))
 }
 
+/// Outcome of [`SubscriptionSet::resolve_id_token`] — how a join
+/// token that might be a channel ID resolves against this scope's
+/// subscriptions.
+#[derive(Debug)]
+pub enum IdTokenResolution<'a> {
+    /// Not id-shaped — treat the token as a channel NAME.
+    NotAnId,
+    /// Id-shaped and identifies exactly this subscribed channel.
+    Match(&'a Subscription),
+    /// Id-shaped but no subscribed channel matches — almost certainly
+    /// a mis-pasted id; minting a room named after it would split the
+    /// real room (the ghost-room trap).
+    Unknown,
+    /// Id-shaped and a prefix of MORE than one subscribed channel.
+    Ambiguous(Vec<&'a Subscription>),
+}
+
 /// One channel this scope is subscribed to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
@@ -414,6 +431,50 @@ impl SubscriptionSet {
     /// monitor/hook iteration so the user's experience is stable).
     pub fn all(&self) -> impl Iterator<Item = &Subscription> {
         self.subscribed.values()
+    }
+
+    /// Resolve a join TOKEN that may be a channel ID rather than a
+    /// name (card c409eaf5, octave 2 — glass-boxed 2026-08-11).
+    ///
+    /// `ChannelName::new` hashes whatever it is given, so an id-shaped
+    /// token that reaches it mints a brand-new channel: passing
+    /// `"3be59578"` (the hex prefix of academy's channel UUID) created
+    /// ghost room `7d1a76de…`, and from then on this scope wrote and
+    /// read a channel nobody else was in — every store read looked
+    /// like a monologue and the transport took the blame. The original
+    /// c409eaf5 guard refused FULL uuid strings; the 8-hex short id —
+    /// the form every other id surface in the system accepts — walked
+    /// straight past it into the mint.
+    ///
+    /// An id-shaped token is an ID in the caller's head, so treat it
+    /// as one: a run of 8..=32 hex chars (dashes ignored) resolves as
+    /// a prefix of a subscribed channel's UUID. Exactly one match
+    /// binds to that existing room; zero or several is the caller's
+    /// answer, never a mint. Anything else is a plain name.
+    pub fn resolve_id_token(&self, token: &str) -> IdTokenResolution<'_> {
+        let compact: String = token.trim().chars().filter(|c| *c != '-').collect();
+        let id_shaped =
+            (8..=32).contains(&compact.len()) && compact.chars().all(|c| c.is_ascii_hexdigit());
+        if !id_shaped {
+            return IdTokenResolution::NotAnId;
+        }
+        let needle = compact.to_ascii_lowercase();
+        let matches: Vec<&Subscription> = self
+            .subscribed
+            .values()
+            .filter(|s| {
+                s.room_id
+                    .as_uuid()
+                    .as_simple()
+                    .to_string()
+                    .starts_with(&needle)
+            })
+            .collect();
+        match matches.len() {
+            0 => IdTokenResolution::Unknown,
+            1 => IdTokenResolution::Match(matches[0]),
+            _ => IdTokenResolution::Ambiguous(matches),
+        }
     }
 
     /// Just the names of subscribed channels — what Codex's
@@ -717,6 +778,53 @@ mod tests {
             &ChannelName::new("c").unwrap(),
         );
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn resolve_id_token_binds_id_shaped_tokens_to_existing_channels() {
+        // what this catches: the ghost-room mint (card c409eaf5 octave 2,
+        // 2026-08-11) — an 8-hex short id of a SUBSCRIBED channel passed as a
+        // join token must resolve to that channel, and an id-shaped token
+        // matching nothing must be Unknown (refused upstream), never a fresh
+        // v5 mint that splits the room's readers from its writers.
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let id = MeshIdentity::new("joelteply");
+        let mut set = SubscriptionSet::empty();
+        let academy = set
+            .subscribe(home, &id, ChannelName::new("academy").unwrap())
+            .unwrap();
+
+        let simple = academy.room_id.as_uuid().as_simple().to_string();
+
+        // 8-hex short id → binds to academy.
+        match set.resolve_id_token(&simple[..8]) {
+            IdTokenResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
+            other => panic!("short id must Match, got {other:?}"),
+        }
+        // Full dashed uuid → binds too (resolution wins over the old refusal).
+        match set.resolve_id_token(&academy.room_id.to_string()) {
+            IdTokenResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
+            other => panic!("full uuid must Match, got {other:?}"),
+        }
+        // Id-shaped, no such channel → Unknown (join refuses; no mint).
+        assert!(matches!(
+            set.resolve_id_token("deadbeef"),
+            IdTokenResolution::Unknown
+        ));
+        // Plain names — including hexy-but-short and dashed ones — stay names.
+        assert!(matches!(
+            set.resolve_id_token("academy"),
+            IdTokenResolution::NotAnId
+        ));
+        assert!(matches!(
+            set.resolve_id_token("k3-serving"),
+            IdTokenResolution::NotAnId
+        ));
+        assert!(matches!(
+            set.resolve_id_token("cafe"),
+            IdTokenResolution::NotAnId
+        ));
     }
 
     #[test]
