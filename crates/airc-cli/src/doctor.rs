@@ -695,12 +695,47 @@ async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
                     )),
                 }
             }
-            (false, None) => findings.push(Finding::ok(
+            // NEVER-CONFIRMED. `last_ack_ms == None` means this peer has not
+            // acked ONCE — not "the last ack is old", but "there has never been
+            // one". The old arm called that `ok … (within tolerance)` at ANY
+            // attempt count, so 63 attempts with zero confirmations printed as
+            // healthy. Measured on BigMama 2026-08-11, on a peer that was in a
+            // different SCOPE and could not possibly have received anything.
+            //
+            // Tolerance is a concept for a route that has proven it works and
+            // may have one confirmation in flight. A route that has never
+            // confirmed anything has proven nothing, and the count is the whole
+            // signal: 1-2 attempts is a new route mid-handshake; dozens is a
+            // peer that is not there. The suspect-detector owns the sophisticated
+            // half-open case — this is the blunt one it does not cover, because
+            // `suspect` is false when frames were never successfully flushed at
+            // all.
+            // NEVER CONFIRMED — a different TYPE of fact, not a worse degree of
+            // one. `last_ack_ms == None` is not "the last ack is old", it is
+            // "there has never been an ack", so there is nothing to be within
+            // tolerance OF: tolerance is derived from the peer's measured rtt,
+            // and a peer with no ack has no rtt. The old arm applied a tolerance
+            // that could not exist and stamped `ok` at any attempt count — 63
+            // attempts, zero confirmations, printed healthy, on a peer that was
+            // in a different SCOPE and could not physically receive anything.
+            //
+            // No attempt threshold here, deliberately. The file's own rule is
+            // that the ledger already holds the evidence and no arbitrary
+            // constant is needed, and picking "N attempts is fine, N+1 is not"
+            // would invent exactly that. The honest report is the type itself:
+            // this route is UNPROVEN. One attempt unproven and fifty attempts
+            // unproven differ in how much was lost, not in whether anything was
+            // confirmed — and the count is printed so the reader can weigh it.
+            (false, None) => findings.push(Finding::warn(
                 "delivery truth",
                 format!(
-                    "{}: {} attempt(s), none confirmed yet (within tolerance)",
+                    "{}: UNPROVEN — {} attempt(s), never once confirmed. \
+                     Nothing sent to this peer can be shown to have arrived.",
                     peer.peer_id, peer.attempts
                 ),
+                "if this is a new route it clears on the first ack; if it does not, \
+                 check you are in the scope the peer is enrolled in (`airc peers` — \
+                 a peer absent there can never receive), then `airc transport health`",
             )),
         }
     }
