@@ -1743,19 +1743,6 @@ impl Airc {
     }
 
     async fn join_channel(&self, name: &str, focus: Focus) -> Result<Room, AircError> {
-        // Card c409eaf5: refuse uuid-shaped names. `ChannelName::new`
-        // hashes the name into a derived UUID; a uuid-shaped string
-        // re-hashes into a DIFFERENT channel UUID, silently. The
-        // resulting subscription registers on the wrong channel and
-        // the fan-out misses every publish. Better to fail loudly at
-        // the API boundary than to let the trap close on the next
-        // consumer like it closed on the continuum demo 2026-06-01.
-        if uuid::Uuid::parse_str(name.trim()).is_ok() {
-            return Err(AircError::JoinUuidString {
-                string: name.to_string(),
-            });
-        }
-        let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         // Self-healing join: `mesh_identity()` above may have HEALED
@@ -1765,6 +1752,43 @@ impl Airc {
         // room while inbound frames land in the converged one. Saved +
         // re-beaconed by the save/publish_presence below.
         warn_subscription_rebinds(&set.rebind_diverged(&identity));
+        // Card c409eaf5, both octaves: an id-shaped token must RESOLVE
+        // against the channels this scope already knows, never reach
+        // `ChannelName::new` (which would hash it into a brand-new
+        // channel). Octave 1 (2026-06-01, continuum demo): a FULL uuid
+        // string minted a diverged channel — refused since. Octave 2
+        // (2026-08-11): the 8-hex SHORT id walked past that guard and
+        // minted ghost room 7d1a76de from academy's prefix "3be59578" —
+        // this scope then wrote and read a room nobody else was in, and
+        // every store read looked like a monologue. Resolution wins
+        // over refusal: a token matching exactly one subscribed channel
+        // binds to THAT room; no match or several is a loud error.
+        let channel = match set.resolve_id_token(name) {
+            subscriptions::IdTokenResolution::Match(sub) => sub.name.clone(),
+            subscriptions::IdTokenResolution::NotAnId => ChannelName::new(name)?,
+            subscriptions::IdTokenResolution::Unknown => {
+                // Preserve the documented c409eaf5 error for full-uuid
+                // tokens; the short-id form gets its own guidance.
+                return Err(if uuid::Uuid::parse_str(name.trim()).is_ok() {
+                    AircError::JoinUuidString {
+                        string: name.to_string(),
+                    }
+                } else {
+                    AircError::JoinIdUnknown {
+                        token: name.trim().to_string(),
+                    }
+                });
+            }
+            subscriptions::IdTokenResolution::Ambiguous(subs) => {
+                return Err(AircError::JoinIdAmbiguous {
+                    token: name.trim().to_string(),
+                    candidates: subs
+                        .iter()
+                        .map(|s| format!("{} ({})", s.name.as_str(), s.room_id))
+                        .collect(),
+                });
+            }
+        };
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         if focus == Focus::MakeDefault {
