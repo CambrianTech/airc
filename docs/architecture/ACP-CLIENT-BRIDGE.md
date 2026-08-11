@@ -1,7 +1,8 @@
 # airc as an ACP client — one bridge, N agents
 
-**Status:** transport implemented; in-process AND subprocess round-trips green on Windows
-(2026-08-09). A live two-peer room round-trip is still outstanding — see
+**Status:** transport implemented; in-process + subprocess round-trips green on Windows,
+and a LIVE room round-trip confirmed by a second peer (row 6)
+(2026-08-10). Remaining gap: a real third-party agent (row 7) — see
 [Verification bar](#verification-bar).
 
 ## Where the code lives (read this before adding a second ACP path)
@@ -125,9 +126,14 @@ read  edit  delete  move  search  execute  think  fetch  switch_mode  other
 
 Two consequences worth stating because both are load-bearing:
 
-- **`other` is ACP's default** for an unclassified tool, and it is also where any
-  *future* `ToolKind` variant lands (the enum is `#[non_exhaustive]`). So a new
-  protocol capability arrives **closed**, not open.
+- **`other` is ACP's default** for an unclassified tool. A *future* `ToolKind`
+  variant does NOT get lumped in with it: the key is derived from the type's
+  serde repr rather than a `match`, so a new fieldless variant yields its own
+  `snake_case` name, stays absent from `toolsAllow`, and is denied anyway — a new
+  protocol capability arrives **closed**, not open, and the refusal names the
+  real kind. (The serde repr is also what lets this avoid a `_` wildcard arm,
+  which `#[non_exhaustive]` forces and the production no-silent-fallback clippy
+  gate forbids — no `match` can satisfy both.)
 - **Both `kind` and `title` are `Option`.** An agent may request permission
   without declaring what for. That is refused, explicitly: "did not declare" and
   "declared something harmless" are different facts, and the request carrying the
@@ -176,7 +182,7 @@ Not "it compiles". A real receipt:
 | 3 | A tool request with no `toolsAllow` entry is denied, the denial crosses the process boundary, and it is room-visible | ✅ subprocess test asserts both halves |
 | 4 | An agent that dies mid-turn produces an error, not an empty success | ✅ `an_agent_that_dies_mid_turn_is_an_error_not_silence` |
 | 5 | A missing agent binary is reported as *unavailable*, distinctly from a protocol failure | ✅ |
-| 6 | The reply is published into a real room and visible to a **second peer** | ❌ **not yet** — needs two live airc peers |
+| 6 | The reply is published into a real room and visible to a **second peer** | ✅ **confirmed live** 2026-08-10 — see below |
 | 7 | A real third-party agent (`uvx hermes-agent[acp]`) works, not just our fixture | ❌ **not yet** |
 
 Rows 1–5 are covered by tests that run on every platform in CI, using an in-repo
@@ -184,10 +190,18 @@ fixture agent (`acp-echo-agent`, gated behind the `test-fixtures` feature) rathe
 than a network download — so the subprocess path is *regression-protected*, not
 merely demonstrated once.
 
-Rows 6 and 7 are the honest gaps, and they are different in kind:
+Row 7 is the remaining gap. Row 6 is now closed, and how it closed is worth
+recording because the two defects it surfaced were both invisible to CI.
 
-- **Row 6** is the airc half. A live attempt on Windows found two real defects
-  before it found a result, both of the same family — *something behaves
+- **Row 6 — CONFIRMED LIVE (2026-08-10).** `@acp <prompt>` posted in `#general`
+  spawned the `acp-echo-agent` subprocess, and its reply was published back into
+  the room and **witnessed from a second machine** (M5, tailing the same
+  channel). The evidence that it is a real agent turn and not an echo of the
+  sender: the room shows **two distinct peer ids** — the prompt from the sender,
+  and the reply from the bridge's own peer id. Different ids, so the reply
+  originated at the bridge, not reflected from the prompter.
+
+  Getting there took two defects, both of the same family — *something behaves
   perfectly and is simply not connected to anything*:
 
   1. **The trigger was `/acp`.** Git Bash's MSYS path conversion rewrote it to
@@ -200,8 +214,14 @@ Rows 6 and 7 are the honest gaps, and they are different in kind:
      grid had never heard of it. Both paths look identical from the outside, so
      the bridge now says which one it took, loudly, at startup.
 
-  Row 6 stays open: the fixes are in, but nobody has yet watched a second live
-  peer receive a reply. "It returned a string" is not "the room saw it".
+  Neither was reachable by a unit test: the first lives in the shell *before*
+  the process starts, the second in the difference between two constructors that
+  both succeed. That is the argument for keeping a live row on this bar at all —
+  CI proves the code, only the live run proves the wiring.
+
+  **To reproduce:** set `AIRC_SOCKET` to the running daemon's socket (from
+  `airc doctor --health`) before starting the bridge. Without it the bridge is
+  correct and invisible.
 - **Row 7** is the third-party half. Our fixture agent is, unavoidably, an agent
   written against the same reading of the SDK as the client. A real agent is the
   only thing that can falsify that reading. Hermes additionally needs an LLM

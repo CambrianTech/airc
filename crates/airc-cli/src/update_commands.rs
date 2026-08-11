@@ -322,7 +322,50 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         )
     })?;
 
+    // Get the live exe OUT OF THE WAY before the installer writes.
+    //
+    // Windows refuses to overwrite a running executable (`Device or resource
+    // busy` / ERROR_SHARING_VIOLATION) — and `stop_daemon` above does not clear
+    // it, because other processes share this binary: other scopes' daemons, a
+    // `join` stream, the ACP bridge. Measured on BigMama: two `airc.exe` plus
+    // `airc-acp-bridge.exe` still holding it after a clean stop.
+    //
+    // So the installer's copy silently failed, the smoke-test then failed
+    // (correctly — the exe still reported the OLD sha), and the whole thing
+    // reported a ROLLBACK. `airc update` has never once updated a Windows box,
+    // and it never said so: the rollback branch's own comment concedes the
+    // reinstall "couldn't replace the locked live exe in the first place" and
+    // treats that as fine.
+    //
+    // Windows DOES allow renaming a running exe — the handle follows the inode,
+    // the process keeps running from the renamed file. That is the standard
+    // self-update idiom on this platform. Move it aside and the installer writes
+    // to a free path.
+    //
+    // Unix does not need this (write-over-running is legal there), but it is
+    // harmless and one code path beats two.
+    let displaced = airc_exe.with_file_name(format!("airc.old-{before}"));
+    let _ = std::fs::remove_file(&displaced); // a previous update's leftover
+    if let Err(e) = std::fs::rename(&airc_exe, &displaced) {
+        return Err(format!(
+            "could not move the live binary aside before installing ({e}). \
+             {} is still the running executable and nothing was changed. \
+             Something holds it that a rename cannot displace — check for \
+             other airc processes ({}).",
+            airc_exe.display(),
+            "airc.exe, airc-acp-bridge.exe"
+        )
+        .into());
+    }
+
     let installed = run_installer(&build_dir);
+
+    // If the installer did not produce a binary, put the original back NOW —
+    // otherwise the rename above has left the box with no `airc` on PATH at
+    // all, which is strictly worse than a stale one.
+    if installed.is_err() || !airc_exe.exists() {
+        let _ = std::fs::rename(&displaced, &airc_exe);
+    }
 
     // Smoke-test: the new binary must RUN and report the SHA we pulled —
     // a build that compiled but is broken (or didn't actually replace the
