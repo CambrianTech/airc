@@ -566,6 +566,28 @@ EOF
     exit 1
   fi
   info "Channel = current branch '$CURRENT_BRANCH'"
+  # A LOCAL-ONLY branch is not an error — it is the most common thing a
+  # contributor does. "Fast-forward whatever branch is checked out" has nothing
+  # to fast-forward when the branch exists only here, so build the tree as-is
+  # rather than failing.
+  #
+  # Measured 2026-08-07: `./install.sh` from a dev checkout on an unpushed
+  # feature branch died with "fatal: couldn't find remote ref <branch>" +
+  # "Network? gh auth?" — a message that sends you to check your token when
+  # your token is fine. The one action this script exists for, installing the
+  # build you just made, was the action it refused. The documented recovery
+  # ("git checkout canary && ./install.sh") works only because it throws your
+  # branch away, which is the opposite of what you asked for.
+  #
+  # This preserves the design intent above — git stays the state manager and we
+  # still never silently switch branches — while removing the footgun for the
+  # case that intent implies should work: testing your own commits. Same shape
+  # as the Rust updater's #288 fix (a channel must not be whatever branch the
+  # checkout happens to sit on); that one was fixed in update_commands.rs and
+  # this path kept the original behaviour.
+  if ! git -C "$CLONE_DIR" ls-remote --exit-code --heads origin "$CURRENT_BRANCH" >/dev/null 2>&1; then
+    info "Branch '$CURRENT_BRANCH' has no remote counterpart — installing this tree as-is (nothing to pull)"
+  else
   git -C "$CLONE_DIR" fetch --quiet origin "$CURRENT_BRANCH" || {
     echo "ERROR: Couldn't fetch origin/$CURRENT_BRANCH. Network? gh auth?" >&2
     exit 1
@@ -584,6 +606,7 @@ Recover with:
 EOF
     exit 1
   fi
+  fi  # local-only-branch guard
   fi  # AIRC_INSTALL_NO_PULL guard
 else
   # First install. The channel is just a git branch — git is the state
