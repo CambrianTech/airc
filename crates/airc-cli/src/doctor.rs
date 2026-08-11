@@ -581,17 +581,40 @@ async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
     let socket = crate::cli::default_socket_path_in(home);
     let stats = match airc_ipc::DaemonClient::new(socket).delivery_stats().await {
         Ok(response) => response.peers,
-        Err(_) => {
-            // No daemon (or an older build without the verb): delivery
-            // truth is unknown, not fine. Quietly informational — the
-            // daemon-liveness check above already reports the daemon.
-            return Vec::new();
+        Err(error) => {
+            // The old comment said "delivery truth is unknown, not fine" and
+            // then returned an EMPTY vec — which prints NOTHING. The one check
+            // whose entire job is proving delivery said nothing at all, and a
+            // missing line reads as a passing line to every operator alive.
+            //
+            // Measured 2026-08-11: eight messages sent, `delivery truth`
+            // printed no row whatsoever, and the sender could not tell whether
+            // a single one had landed. Unknown must be SPOKEN.
+            return vec![Finding::warn(
+                "delivery truth",
+                format!("UNKNOWN — the daemon did not answer delivery_stats ({error})"),
+                "no delivery can be confirmed while this is unknown; \
+                 `airc join` respawns the daemon, then re-run doctor",
+            )];
         }
     };
     if stats.is_empty() {
-        return vec![Finding::ok(
+        // NOT `ok`, and NOT "no deliveries attempted yet" — the ledger being
+        // empty is not evidence that nothing was sent. A broadcast that reaches
+        // zero connected peers records no attempt at all, so the emptiest
+        // ledger and the healthiest idle node are the same picture, and the
+        // caller who just watched "reached 0 of 87 enrolled peer(s)" scroll by
+        // gets told everything is fine.
+        //
+        // An empty ledger means NO EVIDENCE EITHER WAY. Report the absence as
+        // the finding rather than dressing it as a clean bill.
+        return vec![Finding::warn(
             "delivery truth",
-            "no cross-machine deliveries attempted yet (nothing to confirm)",
+            "ledger EMPTY — no cross-machine delivery has been confirmed, and \
+             an empty ledger is NOT proof that none was attempted (a send to \
+             zero connected peers records nothing)",
+            "send one message and re-run; if the ledger stays empty while peers \
+             are enrolled, outbound is not reaching anyone",
         )];
     }
     let now_ms = std::time::SystemTime::now()
