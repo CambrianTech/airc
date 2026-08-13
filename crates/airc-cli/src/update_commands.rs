@@ -595,10 +595,33 @@ fn wait_daemon_ready(
 }
 
 fn daemon_command(airc_exe: &Path, home: &Path, subcommand: &str, socket: &Path) -> Command {
+    // THE SECOND SPAWN SITE. `commands.rs::ensure_daemon_running` was fixed to
+    // start the daemon under the home that OWNS the socket; this one was not,
+    // and it is the path `airc update` uses to bring the daemon back after
+    // replacing the binary.
+    //
+    // Measured immediately after the ownership guard landed on canary, running
+    // `airc update` from a git-project scope:
+    //
+    //   Updated (canary): binary f5976b4 -> 6294c35
+    //   airc: daemon did not become ready after update:
+    //     \\?\C:\Users\joelt\development\continuum\.airc
+    //
+    // The guard did its job — that IS a foreign scope for the machine-account
+    // socket — and the node went dark, because the updater had spawned the
+    // daemon with the caller's project home. So updating from a project
+    // directory took the node OFF the mesh, which is the failure the guard
+    // exists to prevent, arriving through the door the guard could not watch.
+    //
+    // One rule, now applied at every spawn: the daemon serving a socket is the
+    // scope that owns it. Fixing it at both sites rather than relaxing the
+    // guard — a guard that has to be weakened to accommodate a caller is a
+    // guard that will be weakened again.
+    let owning_home = airc_lib::machine_account_home(home);
     let mut command = Command::new(airc_exe);
     command
         .arg("--home")
-        .arg(home)
+        .arg(&owning_home)
         .arg(subcommand)
         .arg("--socket")
         .arg(socket);
