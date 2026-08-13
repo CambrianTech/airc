@@ -291,6 +291,36 @@ fn parse_comments(raw: &str) -> Result<Vec<SosComment>, Box<dyn Error>> {
 /// One poll: fetch comments, print any past the cursor that are NOT our
 /// own, advance the cursor to the highest id seen. Returns the number of
 /// peer comments printed.
+/// One SOS poll for the ALWAYS-ON fallback that rides along with `airc join`.
+///
+/// Same cursor and same self-filter as `airc sos watch`, on purpose: the
+/// automatic path and the manual one must not disagree about what has already
+/// been seen, or an operator who runs `watch` after a join would be shown
+/// nothing and conclude the channel is empty.
+///
+/// Prints peer posts under a marker, because a message arriving here means the
+/// LIVE WIRE did not carry it — the reader needs to know which channel they are
+/// looking at before they act on the content.
+pub(crate) async fn poll_fallback_once(home: &Path) -> Result<usize, Box<dyn Error>> {
+    let label = node_label(home).await?;
+    // Resolve, never CREATE, from the automatic path: an unattended join must
+    // not mint an SOS gist on the operator's account as a side effect of
+    // starting up. `airc sos send` creates it deliberately, when a human or an
+    // agent has something to say.
+    let Some(gist_id) = find_sos_gist()? else {
+        return Ok(0);
+    };
+    let cursor_path = watch_cursor_path(home);
+    let printed = poll_once(&gist_id, &label, &cursor_path)?;
+    if printed > 0 {
+        eprintln!(
+            "airc: {printed} message(s) above arrived over the SOS fallback, NOT the live wire \
+             — the mesh did not carry them. `airc doctor --health` for why."
+        );
+    }
+    Ok(printed)
+}
+
 fn poll_once(gist_id: &str, my_label: &str, cursor_path: &Path) -> Result<usize, Box<dyn Error>> {
     let comments = fetch_comments(gist_id)?;
     let cursor = read_cursor(cursor_path);

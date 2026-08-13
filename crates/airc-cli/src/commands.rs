@@ -245,11 +245,58 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
         None
     };
 
+    // SOS rides ALONG with the live feed instead of waiting to be remembered.
+    //
+    // The out-of-band channel exists for the case where the wire is down — and
+    // that is precisely the case where nobody thinks to run `airc sos watch`,
+    // because the wire being down is not announced, it is INFERRED from silence.
+    // On 2026-08-12 two operators sat in that silence for hours; the human
+    // relayed between them by hand, and `airc sos` had been merged only that
+    // night after sitting unmerged through the exact outage it was built for.
+    //
+    // So: whenever this node streams a join, it also surfaces peer SOS posts.
+    // No flag, no verb to recall, no decision to make while blind. `poll_once`
+    // is cursor-gated and self-filtering, so a healthy node sees nothing and
+    // pays one `gh` call per interval; a blind one sees its peers.
+    //
+    // Best-effort and detached ON PURPOSE: SOS is the recovery channel, so it
+    // must never be able to take down the feed it backs up. A missing `gh`, an
+    // unauthenticated shell, or no SOS gist yet all degrade to "no fallback",
+    // which is exactly where we were before this existed.
+    let _sos_fallback = runtime_context
+        .should_stream_join()
+        .then(|| start_sos_fallback(home));
+
     if runtime_context.should_stream_join() {
         crate::join_feed::run(&airc).await?;
     }
     Ok(())
 }
+
+/// Poll the SOS gist alongside the live feed, printing any NEW peer posts.
+///
+/// Returns a task handle whose drop cancels the poll — it lives exactly as long
+/// as the join it accompanies.
+fn start_sos_fallback(home: &Path) -> tokio::task::JoinHandle<()> {
+    let home = home.to_path_buf();
+    tokio::spawn(async move {
+        // First poll is delayed: a node that just joined is the LEAST likely to
+        // need the fallback, and an immediate `gh` call on every join would tax
+        // the healthy path to serve the broken one.
+        loop {
+            tokio::time::sleep(SOS_FALLBACK_POLL_INTERVAL).await;
+            // Errors are swallowed rather than reported every tick: `gh` absent
+            // or unauthenticated is a STANDING condition, not an event, and a
+            // recurring complaint in a live feed is its own kind of noise. The
+            // explicit `airc sos status` says so plainly when asked.
+            let _ = crate::sos_commands::poll_fallback_once(&home).await;
+        }
+    })
+}
+
+/// How often a joined node checks the out-of-band channel. Deliberately slow:
+/// this is a rendezvous, not a bus, and the healthy case must stay cheap.
+const SOS_FALLBACK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 async fn start_join_heartbeat(
     airc: &Airc,
