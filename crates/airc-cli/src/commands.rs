@@ -1558,8 +1558,27 @@ pub async fn run_daemon(
     // else's scope". The socket path can NOT be re-derived for comparison —
     // `resolve_socket_path` takes the scope home AND the machine home, so
     // the same socket is minted from many scopes by design.
+    //
+    // EXEMPT a simulated account. `machine_account_home` documents a carve-out:
+    // when HOME/USERPROFILE is ITSELF temp-rooted, a harness is simulating a
+    // machine account with a TempDir and scopes deliberately SHARE it. Under
+    // that simulation `machine_account_home(home) != home` is the NORMAL,
+    // correct state, so the check above reads a legitimate pairing as theft.
+    //
+    // Measured: ~10 `codex_hook_*` tests plus `drain_stdin_timeout` failing with
+    // "daemon did not become ready" — a 22s hang each, because the daemon
+    // refused to start and the CLI waited out its readiness window. Caught by M5
+    // with a positive control (same test passes on canary's parent, fails with
+    // the guard) rather than from reading the diff, which is what made it a
+    // five-minute fix instead of a hunt.
+    //
+    // A guard that fires on correct configurations is worse than no guard: it
+    // does not merely fail tests, it teaches everyone to route around the check.
+    // Enforce only where a foreign socket is genuinely reachable — a real
+    // machine account, which is also the only place the original bug can bite.
     let owning_home = airc_lib::machine_account_home(home);
-    if owning_home != home {
+    let simulated_account = airc_core::temp_home::scope_home_is_temp_rooted(home);
+    if !simulated_account && owning_home != home {
         return Err(format!(
             "refusing to serve a socket this scope does not own.\n  \
              --home  {}\n  \
