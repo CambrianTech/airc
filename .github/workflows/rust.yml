@@ -211,7 +211,30 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
+      # #404 — THE GATE ITSELF WAS UNRELIABLE. Measured 2026-08-12:
+      # three consecutive runs on two PRs (whose diffs were roster string
+      # logic and one pool constant) failed FOUR DIFFERENT daemon tests
+      # with zero overlap — peer_add_with_tier_flag ("pool timed out"),
+      # daemon_survives_shutdown_and_restart, healed_identity_rebinds_
+      # stale_subscription, cursors_stay_monotonic. Not one defect: a
+      # suite that is nondeterministic under this runner.
+      #
+      # Cause is capacity, not logic. These are INTEGRATION tests that
+      # spawn REAL daemon processes, bind sockets and open SQLite; the
+      # default harness runs every test binary concurrently with one
+      # thread per core on top of that. A 2-core hosted runner — with
+      # Windows' slower process spawn and file locking — cannot carry
+      # that many live daemons at once, so waits that are comfortable on
+      # a dev box expire in CI. Capping concurrency matches the harness
+      # to the machine; it is not a timeout band-aid.
+      #
+      # A red gate is worse than a slow one: when green carries no
+      # information, real regressions pass and every PR needs a re-run
+      # war. Acceptance for this change is N CONSECUTIVE green runs,
+      # never a single lucky pass.
       - name: cargo test --workspace --all-features
+        env:
+          RUST_TEST_THREADS: "2"
         run: cargo test --workspace --all-features
       # Card f122b5b5 ZERO-LEAK GUARD (see matrix job for rationale).
       - name: zero leaked temp-home daemons
@@ -316,7 +339,30 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
+      # #404 — THE GATE ITSELF WAS UNRELIABLE. Measured 2026-08-12:
+      # three consecutive runs on two PRs (whose diffs were roster string
+      # logic and one pool constant) failed FOUR DIFFERENT daemon tests
+      # with zero overlap — peer_add_with_tier_flag ("pool timed out"),
+      # daemon_survives_shutdown_and_restart, healed_identity_rebinds_
+      # stale_subscription, cursors_stay_monotonic. Not one defect: a
+      # suite that is nondeterministic under this runner.
+      #
+      # Cause is capacity, not logic. These are INTEGRATION tests that
+      # spawn REAL daemon processes, bind sockets and open SQLite; the
+      # default harness runs every test binary concurrently with one
+      # thread per core on top of that. A 2-core hosted runner — with
+      # Windows' slower process spawn and file locking — cannot carry
+      # that many live daemons at once, so waits that are comfortable on
+      # a dev box expire in CI. Capping concurrency matches the harness
+      # to the machine; it is not a timeout band-aid.
+      #
+      # A red gate is worse than a slow one: when green carries no
+      # information, real regressions pass and every PR needs a re-run
+      # war. Acceptance for this change is N CONSECUTIVE green runs,
+      # never a single lucky pass.
       - name: cargo test --workspace --all-features
+        env:
+          RUST_TEST_THREADS: "2"
         run: cargo test --workspace --all-features
       # Card f122b5b5 ZERO-LEAK GUARD: the acceptance is that a full
       # `cargo test --workspace` leaves ZERO airc daemon processes whose
