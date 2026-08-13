@@ -1535,21 +1535,27 @@ pub async fn run_daemon(
     // The spawn is now correct, so this can only fire on a hand-rolled
     // invocation — which is exactly when a human needs to be told, by name,
     // which two scopes disagree.
+    // The invariant that is actually derivable HERE: a daemon's home must
+    // BE a machine-account root, not a project scope that merely resolves
+    // to one. `machine_account_home` is idempotent on a real machine home,
+    // so `machine_account_home(home) != home` is exactly "this is somebody
+    // else's scope". The socket path can NOT be re-derived for comparison —
+    // `resolve_socket_path` takes the scope home AND the machine home, so
+    // the same socket is minted from many scopes by design.
     let owning_home = airc_lib::machine_account_home(home);
-    let expected_socket = crate::cli::default_socket_path_in(&owning_home);
-    if socket != expected_socket {
+    if owning_home != home {
         return Err(format!(
             "refusing to serve a socket this scope does not own.\n  \
              --home  {}\n  \
              --socket {}\n  \
-             this home's socket is {}\n\
+             this home's machine account is {}\n\
              A daemon serves ITS home's identity to every client on that socket, so \
              serving a foreign one silently gives every caller the wrong peer_id, the \
              wrong rooms, and the wrong advertised endpoint. Start the daemon with the \
              home that owns the socket, or let `airc join` spawn it.",
             home.display(),
             socket.display(),
-            expected_socket.display(),
+            owning_home.display(),
         )
         .into());
     }
