@@ -493,6 +493,38 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// The `--room <NAME>` selector, declared ONCE for every room-scoped
+/// verb (`send`, `msg`, `publish`, `inbox`).
+///
+/// It used to be hand-copied per subcommand — three near-identical
+/// `room: Option<String>` fields with three near-identical doc
+/// comments, and `inbox` never got one at all. That asymmetry is not a
+/// missing flag, it is what a per-command declaration DOES: the writes
+/// could each name a room while the READ could only see whichever room
+/// the scope happened to be sitting in, so reading a subscribed room
+/// required `airc room <name>` — mutating shared scope state to perform
+/// a read (#270). One struct, flattened everywhere, means a new
+/// room-scoped verb inherits the flag instead of re-deriving it.
+///
+/// Resolution is likewise single-source: `Airc::room_by_name_or_channel`
+/// accepts a name OR a channel id, refuses loudly for a room this scope
+/// is not subscribed to, and NEVER auto-joins.
+#[derive(Debug, Args)]
+pub struct RoomSelector {
+    /// Channel name (or channel id) to act on. Must already be
+    /// subscribed — this never auto-joins. Defaults to the current
+    /// room. Using it does NOT move this scope's default-room pointer.
+    #[arg(long)]
+    pub room: Option<String>,
+}
+
+impl RoomSelector {
+    /// The room the caller named, if any. `None` means "the current room".
+    pub fn named(&self) -> Option<&str> {
+        self.room.as_deref()
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create or load the persisted identity (`<home>/identity.key`
@@ -531,11 +563,8 @@ pub enum Command {
     /// as `airc publish --room`). Without `--room`, the default
     /// channel lives in the ORM store.
     Send {
-        /// Channel name to route to. Must already be subscribed
-        /// (send does not auto-join). Defaults to the current room
-        /// when omitted.
-        #[arg(long)]
-        room: Option<String>,
+        #[command(flatten)]
+        room: RoomSelector,
         /// Message body.
         text: String,
     },
@@ -637,11 +666,8 @@ pub enum Command {
     Msg {
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// Channel name to route to. Must already be subscribed
-        /// (msg does not auto-join). Defaults to the current room
-        /// when omitted.
-        #[arg(long)]
-        room: Option<String>,
+        #[command(flatten)]
+        room: RoomSelector,
         /// Message body.
         text: String,
     },
@@ -653,11 +679,8 @@ pub enum Command {
     /// non-default room without mutating this scope's default
     /// pointer.
     Publish {
-        /// Channel name to route to. Must already be subscribed
-        /// (publish does not auto-join). Defaults to the current
-        /// room when omitted.
-        #[arg(long)]
-        room: Option<String>,
+        #[command(flatten)]
+        room: RoomSelector,
         /// Inline UTF-8 body. Mutually exclusive with
         /// `--body-json`.
         #[arg(long, conflicts_with = "body_json", group = "body")]
@@ -674,11 +697,15 @@ pub enum Command {
         kind: PublishFrameKind,
     },
 
-    /// Pull buffered frames from the daemon's inbox for the current
-    /// room's wire.
+    /// Pull buffered frames from a subscribed room's wire. With
+    /// `--room`, reads that room without mutating this scope's
+    /// default-room pointer — the read sibling of `airc msg --room`.
+    /// Without `--room`, reads the current room.
     Inbox {
         #[arg(long)]
         socket: Option<PathBuf>,
+        #[command(flatten)]
+        room: RoomSelector,
         /// Cursor lamport — pair with `--since-event-id`. The cursor
         /// is `(lamport, event_id)`; both halves required when paging
         /// from a specific point.

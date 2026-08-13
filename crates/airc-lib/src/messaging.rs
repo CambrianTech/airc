@@ -324,10 +324,31 @@ impl Airc {
     }
 
     /// Fetch the most recent `limit` events from the current room.
+    ///
+    /// The current room is the DEFAULT scope for this read, not the only
+    /// one it can express: this is `page_recent_in` against
+    /// `current_room()`. Callers that already know which room they want
+    /// (`airc inbox --room`, a consumer paging a room it is subscribed to
+    /// but not sitting in) call `page_recent_in` directly and never have
+    /// to move the scope's default-room pointer to perform a READ.
     pub async fn page_recent(&self, limit: usize) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
+        self.page_recent_in(&room, limit).await
+    }
+
+    /// Fetch the most recent `limit` events from `room`.
+    ///
+    /// The room-explicit half of `page_recent` — same daemon-attached
+    /// routing, no implicit scope. Resolve `room` with
+    /// `room_by_name_or_channel`, which refuses loudly for a room this
+    /// scope is not subscribed to (reading must not auto-join).
+    pub async fn page_recent_in(
+        &self,
+        room: &crate::Room,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
         if self.is_daemon_attached() {
-            return self.daemon_page_recent(&room, limit).await;
+            return self.daemon_page_recent(room, limit).await;
         }
         Ok(self
             .inner
@@ -457,15 +478,29 @@ impl Airc {
             .collect())
     }
 
-    /// Fetch up to `limit` events strictly after `cursor`.
+    /// Fetch up to `limit` events strictly after `cursor` in the current room.
+    ///
+    /// `resume_from_in` against `current_room()` — see `page_recent` for why
+    /// the current room is a default here rather than the only expressible
+    /// scope.
     pub async fn resume_from(
         &self,
         cursor: &TranscriptCursor,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
+        self.resume_from_in(&room, cursor, limit).await
+    }
+
+    /// Fetch up to `limit` events strictly after `cursor` in `room`.
+    pub async fn resume_from_in(
+        &self,
+        room: &crate::Room,
+        cursor: &TranscriptCursor,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
         if self.is_daemon_attached() {
-            return self.daemon_resume_from(&room, cursor, limit).await;
+            return self.daemon_resume_from(room, cursor, limit).await;
         }
         Ok(self
             .inner
