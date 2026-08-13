@@ -82,7 +82,21 @@ impl From<std::io::Error> for DaemonError {
 /// a Stop request handler), the temp-home idle watchdog trips (card
 /// f122b5b5), or the listener errors.
 pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), DaemonError> {
-    let _guard = DaemonBindGuard::acquire(&socket_path)?;
+    // #355: a contended lock is not automatically "already running" — the
+    // holder must PROVE it serves (request-response ping). A wedged holder
+    // is reclaimed via the pidfile kill-handle and the acquire retried
+    // once; a responsive holder keeps the lock and we bow out as before.
+    let _guard = match DaemonBindGuard::acquire(&socket_path) {
+        Ok(guard) => guard,
+        Err(DaemonError::AlreadyRunning(path)) => {
+            match crate::reclaim::reclaim_wedged_holder(&state.home, &socket_path).await {
+                Some(()) => DaemonBindGuard::acquire(&socket_path)
+                    .map_err(|_| DaemonError::AlreadyRunning(path))?,
+                None => return Err(DaemonError::AlreadyRunning(path)),
+            }
+        }
+        Err(error) => return Err(error),
+    };
     cleanup_stale_socket(&socket_path).map_err(DaemonError::StaleSocket)?;
     let listener = IpcListener::bind(&socket_path).await?;
 
