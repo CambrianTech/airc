@@ -231,12 +231,35 @@ fn prepare_build_source(
     let branch = git_text(source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch == channel {
         let before = git_text(source, ["rev-parse", "--short", "HEAD"])?;
+        // Advance to the ref the fetch above ALREADY resolved, rather than
+        // letting a bare `git pull` re-fetch and re-derive what to merge.
+        //
+        // `git pull --ff-only` with no argument runs its own fetch and then
+        // merges whatever `FETCH_HEAD` marks for-merge. When more than one
+        // entry carries that mark it aborts with
+        //
+        //     fatal: Cannot fast-forward to multiple branches.
+        //
+        // and the node silently stays on its old binary. Observed on the
+        // Windows node 2026-08-13: `airc update` printed that line while
+        // `git pull --ff-only` run by hand in the same directory succeeded,
+        // so the condition depends on the state the preceding explicit fetch
+        // leaves behind — which is exactly the kind of dependency a
+        // self-update path must not have.
+        //
+        // `git merge --ff-only origin/<channel>` names its target, so it has
+        // no branch to be ambiguous about. It is also strictly less work: the
+        // fetch two statements up already did the network round trip, and the
+        // bare pull was repeating it.
+        let origin_ref = format!("origin/{channel}");
         run_checked(
-            Command::new("git")
-                .arg("-C")
-                .arg(source)
-                .args(["pull", "--ff-only", "--quiet"]),
-            "git pull --ff-only",
+            Command::new("git").arg("-C").arg(source).args([
+                "merge",
+                "--ff-only",
+                "--quiet",
+                &origin_ref,
+            ]),
+            "git merge --ff-only (channel)",
         )?;
         let after = git_text(source, ["rev-parse", "--short", "HEAD"])?;
         return Ok((source.to_path_buf(), before, after));
