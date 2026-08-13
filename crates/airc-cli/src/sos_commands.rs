@@ -45,10 +45,30 @@ const SOS_MARKER: &str = "airc-account-sos";
 /// channel so a peer who stumbles on the gist understands it.
 const SOS_SEED_FILENAME: &str = "airc-account-sos.md";
 
-/// Poll cadence for `watch --follow` (human streaming mode). Deliberately
-/// gentle: the whole point of SOS is that it works when the wire is down,
-/// so it must not itself hammer `gh` into a rate-limit backoff.
-const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(45);
+/// Floor on the derived `watch --follow` cadence, and in practice THE
+/// cadence: the primary quota is 5000/hr, so pacing it across the window
+/// yields single-digit seconds and always clamps here. The binding
+/// constraint is the SECONDARY (abuse) limiter, which throttles BURST RATE
+/// and publishes no number to derive from — so the floor is where that
+/// judgement lives, and it must be set from evidence rather than taste.
+///
+/// Evidence: 45s got this account flagged for polling (2026-08-13). The
+/// floor is therefore ABOVE the cadence that was observed to trip it. An
+/// earlier draft of this fix set 20s by deriving from the primary quota
+/// alone — i.e. it "removed a hardcode" and made the actual problem twice
+/// as bad, because it paced against the threshold that was never binding.
+const WATCH_POLL_FLOOR: Duration = Duration::from_secs(60);
+
+/// Ceiling on the derived cadence. Without it, a nearly-exhausted quota
+/// would stretch the poll to the full reset window and the channel would
+/// look dead exactly when it is needed.
+const WATCH_POLL_CEILING: Duration = Duration::from_secs(300);
+
+/// Cadence used only when the budget could NOT be read. Deliberately at the
+/// ceiling and always announced — a missing signal must degrade loudly, not
+/// silently become a default (this is the defect this whole path had: a
+/// governor that reads two thresholds it was never handed).
+const WATCH_POLL_BLIND: Duration = WATCH_POLL_CEILING;
 
 /// Max readable length of a derived machine label. Long enough for a
 /// hostname, short enough to keep comment prefixes scannable.
@@ -121,8 +141,8 @@ pub async fn run_watch(home: &Path, follow: bool) -> Result<(), Box<dyn Error>> 
     }
 
     eprintln!(
-        "airc sos: watching gist {gist_id} as [{label}] (polling every {}s; Ctrl-C to stop)",
-        WATCH_POLL_INTERVAL.as_secs()
+        "airc sos: watching gist {gist_id} as [{label}] (cadence derived from GitHub's own \
+         rate-limit budget each round; Ctrl-C to stop)"
     );
     loop {
         // A transient gh hiccup must not kill a long-lived human watch:
@@ -132,7 +152,12 @@ pub async fn run_watch(home: &Path, follow: bool) -> Result<(), Box<dyn Error>> 
         if let Err(error) = poll_once(&gist_id, &label, &cursor_path) {
             eprintln!("airc sos: poll failed (will retry): {error}");
         }
-        tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+        // Ask GitHub what we may spend, every round. Never a constant:
+        // the server reports both thresholds and hardcoding a cadence
+        // against them is what got this channel flagged.
+        let (interval, basis) = next_poll_interval();
+        eprintln!("airc sos: next poll in {}s ({basis})", interval.as_secs());
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -254,6 +279,70 @@ fn post_comment(gist_id: &str, body: &str) -> Result<(), Box<dyn Error>> {
         None,
     )?;
     Ok(())
+}
+
+/// Derive the next poll cadence from GitHub's OWN reported budget, plus
+/// any active governor backoff. Returns `(interval, human_basis)`.
+///
+/// Two thresholds, both read, neither guessed:
+///   - PRIMARY quota — `GET /rate_limit` reports `remaining` and `reset`
+///     for the core resource. Pace the remaining calls evenly across the
+///     time left in the window: `(reset - now) / max(remaining, 1)`.
+///     `/rate_limit` is itself free (it does not consume quota), which is
+///     exactly why it is the right probe for a recovery channel.
+///   - SECONDARY / abuse limit — surfaced as `retry-after`, already
+///     recorded into the shared governor by `record_backoff`. It is
+///     authoritative and outranks any pacing we compute.
+///
+/// A budget we could not read is announced, never silently defaulted: the
+/// original defect here was a governor that knew how to read both
+/// thresholds and was never handed either, so "no signal" was
+/// indistinguishable from "healthy".
+fn next_poll_interval() -> (Duration, String) {
+    let now = now_seconds();
+    let backoff = wait_seconds(now);
+    if backoff > 0 {
+        // Secondary limit / explicit retry-after wins outright.
+        let secs = (backoff as u64).max(WATCH_POLL_FLOOR.as_secs());
+        return (
+            Duration::from_secs(secs),
+            format!("governor backoff active: {backoff}s remaining"),
+        );
+    }
+    match read_core_budget() {
+        Some((remaining, reset)) => {
+            let window = (reset - now).max(0.0);
+            let paced = window / (remaining.max(1) as f64);
+            let secs = (paced.ceil() as u64)
+                .max(WATCH_POLL_FLOOR.as_secs())
+                .min(WATCH_POLL_CEILING.as_secs());
+            (
+                Duration::from_secs(secs),
+                format!(
+                    "budget: {remaining} core calls left, window resets in {}s",
+                    window as u64
+                ),
+            )
+        }
+        None => (
+            WATCH_POLL_BLIND,
+            "BUDGET UNREADABLE — backing off to the ceiling rather than guessing a cadence"
+                .to_string(),
+        ),
+    }
+}
+
+/// Read `(remaining, reset_epoch_seconds)` for the core resource from
+/// GitHub's free `/rate_limit` endpoint. `None` when the probe fails or
+/// the shape is not what we expect — callers must treat that as "no
+/// signal", never as "plenty of budget".
+fn read_core_budget() -> Option<(u64, f64)> {
+    let raw = gh_capture(&["api", "rate_limit"], None).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let core = value.get("resources")?.get("core")?;
+    let remaining = core.get("remaining")?.as_u64()?;
+    let reset = core.get("reset")?.as_f64()?;
+    Some((remaining, reset))
 }
 
 /// Fetch the gist's comments in chronological (API) order.
@@ -425,11 +514,13 @@ fn gh_capture(args: &[&str], stdin: Option<&str>) -> Result<String, Box<dyn Erro
     let now = now_seconds();
     let (allowed, reason) = reserve_guarded_request(&owned, now)?;
     if !allowed {
-        return Err(format!(
-            "airc sos: gh governor blocked this request ({reason}); retry in {}s",
-            wait_seconds(now)
-        )
-        .into());
+        // `reason` already carries WHEN this clears — the local sliding
+        // window's own next-free, or GitHub's backoff. Appending
+        // `wait_seconds` here re-derived it from the SHARED backoff only,
+        // which is 0 for a purely local denial: the refusal literally
+        // read "blocked … ; retry in 0s", and a retry loop obeying it
+        // would spin at full rate against the limiter that just said no.
+        return Err(format!("airc sos: gh governor blocked this request ({reason})").into());
     }
 
     let gh = std::env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
