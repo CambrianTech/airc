@@ -41,7 +41,9 @@ async fn reading_another_subscribed_room_does_not_move_the_default_room_pointer(
     // this the scope is already sitting in 'elsewhere' and the whole test
     // is vacuous — a `page_recent_in` that ignored its argument and read
     // `current_room` would pass. (It did: caught by positive control.)
-    airc.join(&here.name).await.expect("return to the first room");
+    airc.join(&here.name)
+        .await
+        .expect("return to the first room");
     assert_eq!(
         airc.current_room().await.expect("current room").channel,
         here.channel,
@@ -68,7 +70,10 @@ async fn reading_another_subscribed_room_does_not_move_the_default_room_pointer(
         .room_by_name_or_channel("elsewhere", "read")
         .await
         .expect("resolve the other room");
-    let events = airc.page_recent_in(&there, 32).await.expect("page the other room");
+    let events = airc
+        .page_recent_in(&there, 32)
+        .await
+        .expect("page the other room");
 
     assert!(
         events.iter().any(|event| {
