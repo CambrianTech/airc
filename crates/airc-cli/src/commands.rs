@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
+use airc_core::{ClientId, EventId, PeerId, RoomId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
@@ -957,6 +957,75 @@ fn format_send_receipt(
     }
 }
 
+/// Presence horizon for the @mention audience check. Generous on
+/// purpose: a peer who reads this room but is between heartbeats must
+/// still count as audience — this warning exists to catch a peer who
+/// has NEVER been seen here, not to police liveness.
+const MENTION_AUDIENCE_WITHIN: Duration = Duration::from_secs(48 * 60 * 60);
+/// Presence-scan window for the @mention audience check (events).
+const MENTION_AUDIENCE_WINDOW: usize = 4096;
+
+/// The leading `@name` of a message body — the human addressing
+/// convention (`airc msg @peer …`). The `@` is a label, not routing:
+/// delivery is still room broadcast, which is exactly why the audience
+/// check below exists. Returns the bare name without `@`.
+fn leading_mention(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('@')?;
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// #270 family, live-proven 2026-08-12: a message addressed `@peer` was
+/// sent — twice, with green receipts — into a room whose channel id was
+/// the sender's own operator uuid, a room the addressed peer cannot
+/// hear. The receipt never said so, and the miss was diagnosed as a
+/// transport failure for an hour. This check resolves the leading
+/// @mention against the room's roster (durable presence + identity
+/// join) and returns a LOUD warning line when nobody matching the
+/// mention has ever been seen in the room. Advisory only: the send has
+/// already happened, the roster is presence-derived (an offline-but-
+/// subscribed peer beyond the horizon is a possible false alarm — the
+/// wording says "not seen", never "not subscribed"), and any roster
+/// error yields `None` so the check can never break a send.
+async fn mention_audience_warning(
+    airc: &Airc,
+    text: &str,
+    channel: RoomId,
+    channel_name: &str,
+) -> Option<String> {
+    let mention = leading_mention(text)?;
+    let roster = airc
+        .room_roster_in(
+            Some(channel),
+            MENTION_AUDIENCE_WITHIN,
+            MENTION_AUDIENCE_WINDOW,
+        )
+        .await
+        .ok()?;
+    let needle = mention.to_ascii_lowercase();
+    let heard = roster.iter().any(|member| {
+        member
+            .display_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(mention))
+            || member
+                .peer_id
+                .to_string()
+                .to_ascii_lowercase()
+                .starts_with(&needle)
+    });
+    (!heard).then(|| {
+        format!(
+            "⚠ '@{mention}' has not been seen in '{channel_name}' (48h presence window) — \
+             if they are not subscribed to this room they will NEVER receive this. \
+             Check where they speak (`airc events list --limit 5000 --kind message`) \
+             and send in a room they read, e.g. `airc msg --room general ...`."
+        )
+    })
+}
+
 /// `send` — local-fs single-shot send to the current room. Routes
 /// through `Airc::say`; ad-hoc `--peer` flags are enrolled in the
 /// in-process registry for the duration of the invocation.
@@ -991,7 +1060,7 @@ pub async fn run_send(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room + runtime
     // headers" path runs unchanged.
-    let (channel_name, channel_id) = match room {
+    let (channel_name, channel) = match room {
         Some(name) => {
             let receipt = airc
                 .publish(
@@ -1001,14 +1070,15 @@ pub async fn run_send(
                     runtime_headers()?,
                 )
                 .await?;
-            (receipt.channel_name, receipt.channel_id.to_string())
+            (receipt.channel_name, receipt.channel_id)
         }
         None => {
             let current = airc.current_room().await?;
             airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel.to_string())
+            (current.name, current.channel)
         }
     };
+    let channel_id = channel.to_string();
     // `peers()` is the enrolled-remote-peer address book, NOT a
     // delivery count — see `format_send_receipt` for why the receipt
     // says "queued/addressed" rather than "sent to N peers".
@@ -1027,6 +1097,9 @@ pub async fn run_send(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
+    if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
+        println!("{warning}");
+    }
     Ok(())
 }
 
@@ -2264,7 +2337,7 @@ pub async fn run_msg(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room" path runs
     // unchanged.
-    let (channel_name, channel_id) = match room {
+    let (channel_name, channel) = match room {
         Some(name) => {
             let receipt = airc
                 .publish(
@@ -2274,14 +2347,15 @@ pub async fn run_msg(
                     runtime_headers()?,
                 )
                 .await?;
-            (receipt.channel_name, receipt.channel_id.to_string())
+            (receipt.channel_name, receipt.channel_id)
         }
         None => {
             let current = airc.current_room().await?;
             airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel.to_string())
+            (current.name, current.channel)
         }
     };
+    let channel_id = channel.to_string();
     // Same enrolled-vs-delivered honesty fix as run_send, for the
     // daemon-attached send path. `peers()` is the address book, not a
     // delivery receipt; the daemon's live-connection count (Status) is
@@ -2296,6 +2370,9 @@ pub async fn run_msg(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
+    if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
+        println!("{warning}");
+    }
     Ok(())
 }
 
@@ -3043,6 +3120,29 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (live 2026-08-12): the @mention parse feeding the
+    /// deaf-room warning. `@name` at the start of a body is an addressing
+    /// intent and must lift the bare name (stopping at the first
+    /// non-name char); a mid-text `@`, a bare `@`, or plain prose must
+    /// not — a false mention would fire the audience warning on
+    /// messages that never addressed anyone.
+    #[test]
+    fn leading_mention_lifts_addressing_intent_only() {
+        assert_eq!(
+            leading_mention("@BigMama LANE SPLIT per Joel"),
+            Some("BigMama")
+        );
+        assert_eq!(
+            leading_mention("@peer-7711fe60: ping"),
+            Some("peer-7711fe60")
+        );
+        assert_eq!(leading_mention("@M5,ack"), Some("M5"));
+        assert_eq!(leading_mention("hello @BigMama"), None);
+        assert_eq!(leading_mention("@ stray at"), None);
+        assert_eq!(leading_mention("plain prose"), None);
+        assert_eq!(leading_mention(""), None);
+    }
 
     /// what this catches (#267): relay self-election must try the PERSISTED
     /// previous port before an OS-assigned one — port drift across daemon
