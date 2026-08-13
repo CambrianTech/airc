@@ -9,7 +9,14 @@
 //! the partition-tolerance contract forbids.
 //!
 //! The discriminator is REQUEST-RESPONSE, never connection existence
-//! (#280): on contention we ping the socket with a deadline —
+//! (#280), and it must be SUSTAINED: `DaemonBindGuard::acquire` runs
+//! BEFORE `IpcListener::bind`, so a daemon that just took the lock has
+//! a window where it legitimately cannot answer. A single failed probe
+//! would convict a healthy STARTING daemon and kill it — caught by
+//! windows CI on the first cut of this fix. So the holder is judged
+//! wedged only after it fails TWO probes separated by a settle, which
+//! is orders of magnitude longer than a real bind takes. On contention
+//! we ping the socket with a deadline —
 //! - a RESPONSIVE holder is a genuinely running daemon: we bow out and
 //!   `AlreadyRunning` stands, exactly as before;
 //! - an UNRESPONSIVE holder is wedged: reclaim via the pidfile
@@ -31,6 +38,15 @@ use airc_ipc::DaemonClient;
 /// busy one in well under a second. Only a wedge sits past this.
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How many consecutive failed probes convict the holder. TWO, because
+/// the lock is held from `acquire` until `bind` completes: one failure
+/// can mean "still starting", two across the settle cannot.
+const PROBES_BEFORE_RECLAIM: usize = 2;
+
+/// Gap between probes — dead time in which a starting daemon finishes
+/// binding and starts answering.
+const PROBE_SETTLE: Duration = Duration::from_secs(3);
+
 /// Grace between SIGTERM and SIGKILL — long enough for the daemon's
 /// graceful path (socket + pidfile removal), short enough that start
 /// doesn't hang on a process that stopped listening to signals.
@@ -41,19 +57,36 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 /// acquire. `None` = a responsive daemon holds it (or we could not
 /// safely reclaim) — the caller's `AlreadyRunning` stands.
 pub(crate) async fn reclaim_wedged_holder(home: &Path, socket_path: &Path) -> Option<()> {
-    if DaemonClient::new(socket_path.to_path_buf())
-        .ping_with_timeout(PROBE_DEADLINE)
-        .await
-        .is_ok()
-    {
-        // Alive AND serving — the one case where bowing out is correct.
-        return None;
+    for probe in 0..PROBES_BEFORE_RECLAIM {
+        if DaemonClient::new(socket_path.to_path_buf())
+            .ping_with_timeout(PROBE_DEADLINE)
+            .await
+            .is_ok()
+        {
+            // Alive AND serving — the one case where bowing out is
+            // correct. Reached on probe 0 by a healthy daemon, and on a
+            // later probe by one that was still binding when we arrived.
+            return None;
+        }
+        if probe + 1 < PROBES_BEFORE_RECLAIM {
+            eprintln!(
+                "airc daemon: lock holder on {} did not answer probe {}/{} — \
+                 settling {}s in case it is still binding",
+                socket_path.display(),
+                probe + 1,
+                PROBES_BEFORE_RECLAIM,
+                PROBE_SETTLE.as_secs()
+            );
+            tokio::time::sleep(PROBE_SETTLE).await;
+        }
     }
     eprintln!(
-        "airc daemon: bind lock is held but {} did not answer a ping within {}s — \
+        "airc daemon: bind lock is held but {} failed {} probes over {}s — \
          the holder is wedged, reclaiming via the pidfile kill-handle (#355)",
         socket_path.display(),
-        PROBE_DEADLINE.as_secs()
+        PROBES_BEFORE_RECLAIM,
+        PROBES_BEFORE_RECLAIM as u64 * PROBE_DEADLINE.as_secs()
+            + (PROBES_BEFORE_RECLAIM as u64 - 1) * PROBE_SETTLE.as_secs()
     );
     let Some(pid) = read_pidfile(home) else {
         eprintln!(
