@@ -1004,6 +1004,14 @@ async fn mention_audience_warning(
         )
         .await
         .ok()?;
+    // A roster whose members have published NO names cannot answer "is this
+    // peer here" — every match must fail, so asserting absence would be a
+    // fabricated negative. Live 2026-08-12: this warning fired against a peer
+    // who demonstrably speaks in the room, because her identity card was
+    // unpublished (#262). Absence of evidence, reported as evidence, is the
+    // exact class this whole receipt family exists to kill — so when nobody
+    // is named, say what is actually known.
+    let anybody_named = roster.iter().any(|m| m.display_name.is_some());
     let needle = mention.to_ascii_lowercase();
     let heard = roster.iter().any(|member| {
         member
@@ -1016,14 +1024,22 @@ async fn mention_audience_warning(
                 .to_ascii_lowercase()
                 .starts_with(&needle)
     });
-    (!heard).then(|| {
-        format!(
-            "⚠ '@{mention}' has not been seen in '{channel_name}' (48h presence window) — \
-             if they are not subscribed to this room they will NEVER receive this. \
-             Check where they speak (`airc events list --limit 5000 --kind message`) \
-             and send in a room they read, e.g. `airc msg --room general ...`."
-        )
-    })
+    if heard {
+        return None;
+    }
+    if !anybody_named {
+        return Some(format!(
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no member of this room \
+             has published an identity card, so a name match cannot succeed either way \
+             (#262). Confirm with `airc events list --limit 5000 --kind message`."
+        ));
+    }
+    Some(format!(
+        "⚠ '@{mention}' has not been seen in '{channel_name}' (48h presence window) — \
+         if they are not subscribed to this room they will NEVER receive this. \
+         Check where they speak (`airc events list --limit 5000 --kind message`) \
+         and send in a room they read, e.g. `airc msg --room general ...`."
+    ))
 }
 
 /// `send` — local-fs single-shot send to the current room. Routes
