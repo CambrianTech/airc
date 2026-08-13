@@ -392,10 +392,39 @@ pub async fn ensure_daemon_running(
         .open(&log)?;
     let stderr = stdout.try_clone()?;
     let exe = std::env::current_exe()?;
+    // The daemon's HOME must be the home that OWNS the socket, not the
+    // caller's scope.
+    //
+    // `default_socket_path_in` resolves through `machine_account_home`, so a
+    // caller in a git-project scope (`<repo>/.airc`) legitimately shares the
+    // MACHINE-account socket — one daemon per machine is the design. But this
+    // spawn passed the CALLER's `home` through, so whichever scope happened to
+    // start the daemon first imposed ITS identity on every scope that later
+    // attached to that socket. Nothing detected it: both paths are real, the
+    // daemon is healthy, and `doctor` reports a clean bill.
+    //
+    // Measured on BIGMAMA 2026-08-12, the whole night's blackout in one line:
+    //
+    //   airc.exe --home \\?\C:\...\development\continuum\.airc \
+    //            daemon --socket C:\Users\joelt\.airc\runtime\airc-machine-...sock
+    //
+    // Downstream, all diagnosed separately as unrelated bugs before the cause
+    // was found: messages sent through the machine socket were served by the
+    // PROJECT identity, so they landed in a scope the intended peer was not
+    // enrolled in (a one-way mirror — our sends left, their replies could not
+    // arrive); the wrong scope means a different `peer_id`, hence a different
+    // `stable_lan_port`, so the advertised endpoint moved and peers' stored
+    // endpoints went stale (read from the far side as "SYN dropped / stale
+    // ports / firewall"); and the event store read as a monologue because it
+    // was the other scope's store.
+    //
+    // Deriving it here rather than at the call sites keeps ONE rule: the
+    // daemon serving a socket is always the scope that owns it.
+    let daemon_home = airc_lib::machine_account_home(home);
     let mut command = Command::new(exe);
     command
         .arg("--home")
-        .arg(home)
+        .arg(&daemon_home)
         .arg("daemon")
         .arg("--socket")
         .arg(&socket)
@@ -1440,6 +1469,43 @@ pub async fn run_daemon(
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // REFUSE a socket this home does not own.
+    //
+    // A daemon serves ONE scope's identity to every client that attaches. If
+    // its `--home` is not the home the socket resolves from, it serves the
+    // wrong identity to everyone — silently, while looking completely healthy.
+    // That is not a degraded mode worth limping in; it is a wrong answer to
+    // every question, so it fails at startup instead of running.
+    //
+    // This is the guard that was missing on 2026-08-12. The spawn passed the
+    // caller's project home through to a machine-account socket, and NOTHING
+    // objected: daemon up, routes healthy, doctor 10/10 clean, while sends
+    // went into a scope the intended peer was not enrolled in. Two operators
+    // spent a night diagnosing the symptoms (stale ports, dropped SYNs, a
+    // monologue event store, a phantom "inbound not persisting" bug) because
+    // the one condition that explained all of them was never checked.
+    //
+    // The spawn is now correct, so this can only fire on a hand-rolled
+    // invocation — which is exactly when a human needs to be told, by name,
+    // which two scopes disagree.
+    let owning_home = airc_lib::machine_account_home(home);
+    let expected_socket = crate::cli::default_socket_path_in(&owning_home);
+    if socket != expected_socket {
+        return Err(format!(
+            "refusing to serve a socket this scope does not own.\n  \
+             --home  {}\n  \
+             --socket {}\n  \
+             this home's socket is {}\n\
+             A daemon serves ITS home's identity to every client on that socket, so \
+             serving a foreign one silently gives every caller the wrong peer_id, the \
+             wrong rooms, and the wrong advertised endpoint. Start the daemon with the \
+             home that owns the socket, or let `airc join` spawn it.",
+            home.display(),
+            socket.display(),
+            expected_socket.display(),
+        )
+        .into());
+    }
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call
