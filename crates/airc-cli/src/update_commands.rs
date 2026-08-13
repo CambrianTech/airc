@@ -612,20 +612,15 @@ fn daemon_command(airc_exe: &Path, home: &Path, subcommand: &str, socket: &Path)
     // daemon with the caller's project home. So updating from a project
     // directory took the node OFF the mesh, which is the failure the guard
     // exists to prevent, arriving through the door the guard could not watch.
+    // Reproduced independently on the M5 twice within the hour, and it took
+    // the SOS fallback down with it — the fallback rides this daemon.
     //
-    // One rule, now applied at every spawn: the daemon serving a socket is the
-    // scope that owns it. Fixing it at both sites rather than relaxing the
-    // guard — a guard that has to be weakened to accommodate a caller is a
-    // guard that will be weakened again.
-    let owning_home = airc_lib::machine_account_home(home);
-    let mut command = Command::new(airc_exe);
-    command
-        .arg("--home")
-        .arg(&owning_home)
-        .arg(subcommand)
-        .arg("--socket")
-        .arg(socket);
-    command
+    // One rule, and now ONE IMPLEMENTATION of it: both spawn sites delegate to
+    // `airc_lib::daemon_command`. Fixing it at both sites rather than relaxing
+    // the guard — a guard that has to be weakened to accommodate a caller is a
+    // guard that will be weakened again — and then removing the duplication
+    // that let one site drift from the other in the first place.
+    airc_lib::daemon_command(airc_exe, home, subcommand, socket)
 }
 
 #[cfg(unix)]
@@ -1077,6 +1072,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("No git checkout"));
+    }
+
+    /// what this catches (2026-08-12, live): `airc update` spawned the
+    /// daemon with the CALLER's project scope while #1347's guard —
+    /// correctly — refuses a foreign socket, so every update killed the
+    /// daemon and with it the SOS fallback it hosts. The daemon home
+    /// must be the scope that OWNS the socket, and `machine_account_home`
+    /// is idempotent, so a project scope must be lifted to its machine
+    /// account here exactly as `ensure_daemon_running` does.
+    #[test]
+    fn daemon_command_spawns_the_owning_scope_never_the_caller_scope() {
+        let project_scope = Path::new("/tmp/home/some-project/.airc");
+        let command = daemon_command(
+            Path::new("/usr/local/bin/airc"),
+            project_scope,
+            "daemon",
+            Path::new("/tmp/airc.sock"),
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let home_arg = PathBuf::from(&args[1]);
+        assert_eq!(
+            home_arg,
+            airc_lib::machine_account_home(project_scope).into_path_buf(),
+            "update must spawn the socket's OWNING scope, not the caller's"
+        );
     }
 
     #[test]

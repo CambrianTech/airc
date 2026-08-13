@@ -93,7 +93,7 @@ pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
     RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
-pub use airc::{machine_account_home, Airc};
+pub use airc::{daemon_command, machine_account_home, Airc, MachineAccountHome};
 pub use airc_protocol::{
     AssertionError, IdentityAssertion, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE,
     HEADER_AIRC_REPLY_TO,

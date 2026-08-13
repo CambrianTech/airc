@@ -465,16 +465,13 @@ pub async fn ensure_daemon_running(
     // ports / firewall"); and the event store read as a monologue because it
     // was the other scope's store.
     //
-    // Deriving it here rather than at the call sites keeps ONE rule: the
-    // daemon serving a socket is always the scope that owns it.
-    let daemon_home = airc_lib::machine_account_home(home);
-    let mut command = Command::new(exe);
+    // ONE rule, and now ONE implementation of it: `airc_lib::daemon_command`
+    // is the only place a daemon's `--home` is chosen. It was previously
+    // derived here and, separately, at `update_commands::daemon_command` —
+    // where it was missed, which is how `airc update` started taking nodes
+    // dark (#1352). A rule with two implementations has one that is wrong.
+    let mut command = airc_lib::daemon_command(&exe, home, "daemon", &socket);
     command
-        .arg("--home")
-        .arg(&daemon_home)
-        .arg("daemon")
-        .arg("--socket")
-        .arg(&socket)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -1578,7 +1575,7 @@ pub async fn run_daemon(
     // machine account, which is also the only place the original bug can bite.
     let owning_home = airc_lib::machine_account_home(home);
     let simulated_account = airc_core::temp_home::scope_home_is_temp_rooted(home);
-    if !simulated_account && owning_home != home {
+    if !simulated_account && owning_home.as_path() != home {
         return Err(format!(
             "refusing to serve a socket this scope does not own.\n  \
              --home  {}\n  \
@@ -1638,7 +1635,7 @@ pub async fn run_daemon(
             identity.keypair,
             registry,
             VerificationPolicy::Strict,
-            machine_home,
+            machine_home.into_path_buf(),
             &db_path,
             coordinator_store,
             current_daemon_runtime_info(),

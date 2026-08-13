@@ -63,11 +63,108 @@ use airc_core::PEER_IDENTITY_STATE_KEY;
 /// that need durable replay use `Airc::resume_from` against the store.
 const LIVE_BROADCAST_CAPACITY: usize = 1024;
 
+/// The home that OWNS the machine's daemon socket, as distinct from the
+/// caller's scope home. Constructible ONLY by [`machine_account_home`].
+///
+/// Why this is a type and not a `PathBuf`: a scope home and an owning
+/// home are both "a directory", so for the substrate's whole life the
+/// compiler could not tell them apart and every call site had to
+/// REMEMBER to derive. Two forgot — `ensure_daemon_running` (#1347) and
+/// `daemon_command` (#1352) — and each time the spawned daemon served
+/// the machine socket under the CALLER's identity. That single confusion
+/// wore five costumes before it was named: one-way delivery (replies
+/// arrived in a scope the peer was not enrolled in), stale advertised
+/// endpoints (a different scope means a different `peer_id`, hence a
+/// different `stable_lan_port`), an event store that read as a monologue,
+/// a `doctor` that reported a clean bill throughout, and finally — once
+/// #1347 added a guard that refuses a foreign scope — `airc update`
+/// taking the node dark on every run, SOS included.
+///
+/// The rule was documented at both spawn sites and honoured at neither
+/// by anything stronger than prose. Now the daemon-spawn API takes this
+/// type, so a raw scope home is a COMPILE error rather than a night.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MachineAccountHome(PathBuf);
+
+impl MachineAccountHome {
+    /// Borrow as a plain path — for comparisons against a scope home
+    /// (`owning.as_path() != scope`), which is the ownership guard.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Consume into the underlying path.
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+impl std::ops::Deref for MachineAccountHome {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for MachineAccountHome {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for MachineAccountHome {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl std::fmt::Display for MachineAccountHome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
 /// The machine-account home (`$HOME/.airc`) that owns the singular
 /// daemon + the one ORM for every scope under this user's home. Scopes
 /// outside `$HOME` (CI temp dirs, isolated test roots) get their own
 /// `scope_home` back — they are their own account boundary.
-pub fn machine_account_home(scope_home: &Path) -> PathBuf {
+///
+/// Idempotent on a home it already owns, which is what makes
+/// `machine_account_home(h).as_path() != h` a sound ownership test.
+pub fn machine_account_home(scope_home: &Path) -> MachineAccountHome {
+    MachineAccountHome(machine_account_home_inner(scope_home))
+}
+
+/// THE one place a daemon process's `--home` is chosen.
+///
+/// Builds `<exe> --home <owning> <subcommand> --socket <socket>` with the
+/// home derived from `scope_home`, never `scope_home` itself. Callers add
+/// their own stdio/detach and spawn it.
+///
+/// This exists because the rule "the daemon serving a socket is the scope
+/// that owns it" was previously enforced by each spawn site remembering to
+/// call [`machine_account_home`] — documented in a comment at one site,
+/// and silently absent at the other. See [`MachineAccountHome`] for the
+/// five symptoms that one omission produced. A third spawn site now
+/// inherits the rule instead of re-deriving it.
+pub fn daemon_command(
+    airc_exe: &Path,
+    scope_home: &Path,
+    subcommand: &str,
+    socket: &Path,
+) -> std::process::Command {
+    let daemon_home = machine_account_home(scope_home);
+    let mut command = std::process::Command::new(airc_exe);
+    command
+        .arg("--home")
+        .arg(&daemon_home)
+        .arg(subcommand)
+        .arg("--socket")
+        .arg(socket);
+    command
+}
+
+fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
     // Temp-rooted scopes are their own account boundary on EVERY
     // platform. On Linux/macOS that falls out of `/tmp` living outside
     // `$HOME`, but on Windows `%TEMP%` is
@@ -472,7 +569,7 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let wire_root = machine_account_home(&home);
+        let wire_root = machine_account_home(&home).into_path_buf();
         Self::open_inner(home, wire_root, policy, None, None).await
     }
 
@@ -485,7 +582,7 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let wire_root = machine_account_home(&home);
+        let wire_root = machine_account_home(&home).into_path_buf();
         Self::open_inner(home, wire_root, policy, Some(agent_name.into()), None).await
     }
 
@@ -503,7 +600,7 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let wire_root = machine_account_home(&home);
+        let wire_root = machine_account_home(&home).into_path_buf();
         Self::open_inner(
             home,
             wire_root,
@@ -2698,6 +2795,42 @@ mod room_trust_policy_tests {
         assert_eq!(super::Airc::WALL_CATEGORY_TRUST_POLICY, "trust-policy");
     }
 
+    /// what this catches (#1347 + #1352, the same bug at two spawn
+    /// sites): a daemon must be spawned with the home that OWNS its
+    /// socket, never the caller's scope. Both sites used to derive that
+    /// themselves; one forgot, and the daemon served the machine socket
+    /// under a project identity — one-way delivery, moving LAN ports, a
+    /// monologue event store, and eventually `airc update` taking the
+    /// node dark. Asserts the relationship rather than an absolute path
+    /// so it holds under any HOME (CI, tempdir, real box).
+    #[test]
+    fn daemon_command_always_spawns_the_owning_home_never_the_caller_scope() {
+        use std::path::Path;
+        let dir = tempfile::tempdir().unwrap();
+        let project_scope = dir.path().join("repo").join(".airc");
+        std::fs::create_dir_all(&project_scope).unwrap();
+        let socket = dir.path().join("airc-machine.sock");
+
+        let command = super::daemon_command(
+            Path::new("/usr/local/bin/airc"),
+            &project_scope,
+            "daemon",
+            &socket,
+        );
+        let args: Vec<_> = command.get_args().map(|a| a.to_os_string()).collect();
+        let home_pos = args
+            .iter()
+            .position(|a| a == "--home")
+            .expect("spawn must pass --home");
+        let passed = Path::new(&args[home_pos + 1]);
+
+        assert_eq!(
+            passed,
+            super::machine_account_home(&project_scope).as_path(),
+            "daemon --home must be the socket's OWNING scope, not the caller's"
+        );
+    }
+
     /// Card b0a81c31: a temp-rooted scope must stay its own account
     /// boundary on every platform. On Windows `%TEMP%` lives inside
     /// `%USERPROFILE%`, so before the temp_dir guard this resolved to
@@ -2709,7 +2842,7 @@ mod room_trust_policy_tests {
         let dir = tempfile::tempdir().unwrap();
         let scope = dir.path().join("scope-home");
         std::fs::create_dir(&scope).unwrap();
-        assert_eq!(super::machine_account_home(&scope), scope);
+        assert_eq!(super::machine_account_home(&scope).as_path(), scope);
     }
 }
 
