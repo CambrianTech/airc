@@ -77,6 +77,7 @@ mod route_commands;
 mod route_proof_commands;
 mod runtime_context;
 mod runtime_dir;
+mod sos_commands;
 mod staleness;
 mod state_cli;
 mod state_commands;
@@ -104,7 +105,7 @@ use airc_core::PeerId;
 
 use airc_identity::LocalIdentity;
 use channel_gist_cli::ChannelGistAction;
-use cli::{Cli, Command, PeerAction};
+use cli::{Cli, Command, PeerAction, SosAction};
 use collaboration_cli::CollaborationAction;
 use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
@@ -534,6 +535,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Join { room } => commands::run_join(&home, room).await,
+
+        Command::Sos { action } => match action {
+            SosAction::Send { message } => sos_commands::run_send(&home, &message).await,
+            SosAction::Watch { follow } => sos_commands::run_watch(&home, follow).await,
+            SosAction::Status => sos_commands::run_status(&home).await,
+        },
 
         Command::Version => commands::run_version(),
 
