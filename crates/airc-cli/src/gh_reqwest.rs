@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 
 use airc_lib::gh::client::{
-    BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
-    PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+    parse_issue_view, BranchCheckRollupArgs, GhCheck, GhClient, GhError, IssueView, IssueViewArgs,
+    MergeReceipt, PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
 };
 use tokio::process::Command;
 
@@ -472,6 +472,28 @@ impl GhClient for ReqwestGhClient {
         } else {
             Err(map_http_error_status(resp.status(), resp).await)
         }
+    }
+
+    /// Card #356. `GET /repos/{owner}/{repo}/issues/{number}` — the
+    /// REST issue object already carries every field [`IssueView`]
+    /// needs, so unlike `pr_view` this is a SINGLE call with no
+    /// second rollup fetch.
+    ///
+    /// Deserialized through the shared [`parse_issue_view`] rather
+    /// than hand-built from a `Value`, so the null-body and
+    /// state-casing normalization live in ONE place and both
+    /// implementations are genuinely interchangeable — which is the
+    /// property the trait exists to provide.
+    async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError> {
+        let url = format!(
+            "{}/repos/{}/issues/{}",
+            self.api_base, args.repo, args.number
+        );
+        let response = self
+            .send_authed(reqwest::Method::GET, &url, NO_BODY)
+            .await?;
+        let json: serde_json::Value = handle_response(response).await?;
+        parse_issue_view(&serde_json::to_vec(&json)?)
     }
 
     async fn branch_check_rollup(

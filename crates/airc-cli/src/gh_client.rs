@@ -29,8 +29,9 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 pub use airc_lib::gh::client::{
-    parse_pr_url, parse_pr_view, BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt,
-    PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+    parse_issue_view, parse_pr_url, parse_pr_view, BranchCheckRollupArgs, GhCheck, GhClient,
+    GhError, IssueView, IssueViewArgs, MergeReceipt, PrCreateArgs, PrCreated, PrEditBaseArgs,
+    PrMergeArgs, PrView, PrViewArgs,
 };
 // parse_check_runs is only used inside merger's #[cfg(test)] block — accessed
 // via the airc_lib path there to avoid a "unused re-export" lint in non-test
@@ -151,6 +152,31 @@ impl GhClient for ShellGhClient {
             return Err(classify_gh_failure(&output));
         }
         airc_lib::gh::client::parse_check_runs(&output.stdout)
+    }
+
+    /// Card #356. Same addressing and the same failure classification
+    /// as the PR verbs — `--json` field list mirrors what
+    /// [`IssueView`] deserializes, so a gh schema drift surfaces as a
+    /// loud `JsonParse` rather than a silently empty body (which the
+    /// closer would read as "no envelope, skip this card").
+    async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError> {
+        let output = Command::new("gh")
+            .args([
+                "issue",
+                "view",
+                &args.number.to_string(),
+                "--repo",
+                args.repo.as_str(),
+                "--json",
+                "number,title,body,state",
+            ])
+            .output()
+            .await
+            .map_err(map_spawn_error)?;
+        if !output.status.success() {
+            return Err(classify_gh_failure(&output));
+        }
+        parse_issue_view(&output.stdout)
     }
 }
 
