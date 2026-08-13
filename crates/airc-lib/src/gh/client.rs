@@ -138,6 +138,24 @@ pub trait GhClient: Send + Sync {
         &self,
         args: BranchCheckRollupArgs,
     ) -> Result<Vec<GhCheck>, GhError>;
+
+    /// `gh issue view <number> --repo <owner/name> --json number,title,body,state`.
+    ///
+    /// Card #356 — the queue-card closer needs the issue BODY to verify
+    /// the `airc-queue-card-v1` envelope and to apply the status-log
+    /// mutation before closing. Every verb above operates on pull
+    /// requests and none of them reads a body, so this is the first
+    /// ISSUE verb on the trait and the first that treats free-form
+    /// content as the payload.
+    ///
+    /// That makes it the deliberate outlier-B check on this trait's
+    /// shape (CLAUDE.md's methodical process): if `GhClient` only fit
+    /// PR-shaped operations, this is where it would have to be forced.
+    /// It is not forced — issues reuse `repo` + `number` addressing and
+    /// the same `GhError` classification — so the remaining closer
+    /// verbs (`issue_edit_body`, `issue_close`) are the same pattern
+    /// and are deliberately NOT built until a caller needs them.
+    async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError>;
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +188,61 @@ pub struct PrEditBaseArgs {
     pub repo: String,
     pub number: u64,
     pub base: String,
+}
+
+/// Address an issue the same way the PR verbs address a PR: `repo` +
+/// `number`. No `cwd` field — unlike `pr_create`, nothing here resolves
+/// a remote from a worktree, so offering one would be a lie.
+#[derive(Debug, Clone)]
+pub struct IssueViewArgs {
+    pub repo: String,
+    pub number: u64,
+}
+
+/// An issue as the queue-card closer needs it. `body` is the payload:
+/// the `airc-queue-card-v1` envelope lives there, and the closer both
+/// VERIFIES it (skip anything that isn't a queue card) and MUTATES it
+/// (status=merged + a status-log line) before closing.
+///
+/// `state` is the idempotence guard — a card already `CLOSED` is a
+/// silent skip, which is what makes the workflow safe to re-run.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueView {
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    /// An issue with no body serializes as JSON `null` on the REST API
+    /// (and as `""` from the gh CLI). Both mean "no envelope here,
+    /// skip this card", so both must deserialize — a bare
+    /// `#[serde(default)]` covers the MISSING key but still errors on
+    /// an explicit null, which would abort the workflow on the most
+    /// ordinary input there is.
+    #[serde(default, deserialize_with = "null_to_empty_string")]
+    pub body: String,
+    /// NORMALIZED UPPERCASE by every implementation. The gh CLI reports
+    /// `OPEN`/`CLOSED` (GraphQL-backed) while REST reports
+    /// `open`/`closed`; leaving that divergence in place would make the
+    /// closer's idempotence check silently implementation-dependent.
+    /// The trait's contract is the uppercase form.
+    #[serde(default, deserialize_with = "upper_state")]
+    pub state: String,
+}
+
+fn null_to_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn upper_state<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .to_uppercase())
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +308,18 @@ pub struct MergeReceipt {
 /// close-guard both depend on this shape, so this is where the
 /// schema round-trip is pinned in tests.
 pub fn parse_pr_view(json: &[u8]) -> Result<PrView, GhError> {
+    Ok(serde_json::from_slice(json)?)
+}
+
+/// Decode `gh issue view --json number,title,body,state`. Pure — JSON
+/// in, typed value out — so the closer's envelope/idempotence logic is
+/// unit-testable without a network or a `gh` binary. Card #356.
+///
+/// Every field is `#[serde(default)]` on [`IssueView`]: gh omits keys
+/// it has no value for, and an issue with an empty body is ordinary
+/// (a card whose envelope was stripped), not a parse failure. Failing
+/// there would turn a skippable non-card into a workflow abort.
+pub fn parse_issue_view(json: &[u8]) -> Result<IssueView, GhError> {
     Ok(serde_json::from_slice(json)?)
 }
 
@@ -368,6 +453,40 @@ pub fn parse_pr_url(stdout: &str) -> Result<PrCreated, GhError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches (#356): the two `GhClient` impls read the SAME
+    /// issue from DIFFERENT APIs — gh's CLI is GraphQL-backed and
+    /// reports `OPEN`/`CLOSED`, REST reports `open`/`closed`. The
+    /// closer's idempotence check ("already closed? skip") would then
+    /// silently depend on which backend was configured. The trait's
+    /// contract is the uppercase form; this pins it for both shapes.
+    #[test]
+    fn issue_view_state_is_normalized_uppercase_across_backends() {
+        let rest = parse_issue_view(br#"{"number":7,"title":"t","body":"b","state":"closed"}"#)
+            .expect("rest shape parses");
+        let cli = parse_issue_view(br#"{"number":7,"title":"t","body":"b","state":"CLOSED"}"#)
+            .expect("cli shape parses");
+        assert_eq!(rest.state, "CLOSED");
+        assert_eq!(cli.state, "CLOSED");
+        assert_eq!(rest, cli, "both backends must yield an identical IssueView");
+    }
+
+    /// what this catches (#356): REST sends `"body": null` for an issue
+    /// with no description, and a bare `#[serde(default)]` covers a
+    /// MISSING key but still errors on an explicit null. That would
+    /// abort the whole close-merged run on the most ordinary input
+    /// there is — an issue that simply has no body (hence no
+    /// queue-card envelope, hence a card the closer should SKIP).
+    #[test]
+    fn issue_view_tolerates_null_and_missing_body() {
+        let null_body = parse_issue_view(br#"{"number":1,"title":"t","body":null,"state":"open"}"#)
+            .expect("null body must parse, not abort the run");
+        assert_eq!(null_body.body, "");
+
+        let missing_body = parse_issue_view(br#"{"number":1,"title":"t","state":"open"}"#)
+            .expect("missing body parses");
+        assert_eq!(missing_body.body, "");
+    }
 
     #[test]
     fn parse_pr_view_decodes_all_fields() {
@@ -554,8 +673,8 @@ pub mod mock {
     use async_trait::async_trait;
 
     use super::{
-        BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
-        PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+        BranchCheckRollupArgs, GhCheck, GhClient, GhError, IssueView, IssueViewArgs, MergeReceipt,
+        PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
     };
 
     /// Per-method response queue + per-method call record. All state
@@ -568,12 +687,14 @@ pub mod mock {
         pr_merge_queue: Mutex<VecDeque<Result<MergeReceipt, GhError>>>,
         pr_edit_base_queue: Mutex<VecDeque<Result<(), GhError>>>,
         branch_check_rollup_queue: Mutex<VecDeque<Result<Vec<GhCheck>, GhError>>>,
+        issue_view_queue: Mutex<VecDeque<Result<IssueView, GhError>>>,
 
         pr_view_calls: Mutex<Vec<PrViewArgs>>,
         pr_create_calls: Mutex<Vec<PrCreateArgs>>,
         pr_merge_calls: Mutex<Vec<PrMergeArgs>>,
         pr_edit_base_calls: Mutex<Vec<PrEditBaseArgs>>,
         branch_check_rollup_calls: Mutex<Vec<BranchCheckRollupArgs>>,
+        issue_view_calls: Mutex<Vec<IssueViewArgs>>,
     }
 
     impl MockGhClient {
@@ -605,6 +726,11 @@ pub mod mock {
                 .lock()
                 .unwrap()
                 .push_back(result);
+        }
+
+        /// Queue the next [`GhClient::issue_view`] outcome. FIFO. Card #356.
+        pub fn queue_issue_view(&self, result: Result<IssueView, GhError>) {
+            self.issue_view_queue.lock().unwrap().push_back(result);
         }
 
         // --- call records ---
@@ -642,6 +768,9 @@ pub mod mock {
         }
         pub fn received_branch_check_rollup_calls(&self) -> Vec<BranchCheckRollupArgs> {
             self.branch_check_rollup_calls.lock().unwrap().clone()
+        }
+        pub fn received_issue_view_calls(&self) -> Vec<IssueViewArgs> {
+            self.issue_view_calls.lock().unwrap().clone()
         }
     }
 
@@ -703,6 +832,15 @@ pub mod mock {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Err(unqueued("branch_check_rollup")))
+        }
+
+        async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError> {
+            self.issue_view_calls.lock().unwrap().push(args);
+            self.issue_view_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(unqueued("issue_view")))
         }
     }
 
