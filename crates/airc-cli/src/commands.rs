@@ -245,11 +245,58 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
         None
     };
 
+    // SOS rides ALONG with the live feed instead of waiting to be remembered.
+    //
+    // The out-of-band channel exists for the case where the wire is down — and
+    // that is precisely the case where nobody thinks to run `airc sos watch`,
+    // because the wire being down is not announced, it is INFERRED from silence.
+    // On 2026-08-12 two operators sat in that silence for hours; the human
+    // relayed between them by hand, and `airc sos` had been merged only that
+    // night after sitting unmerged through the exact outage it was built for.
+    //
+    // So: whenever this node streams a join, it also surfaces peer SOS posts.
+    // No flag, no verb to recall, no decision to make while blind. `poll_once`
+    // is cursor-gated and self-filtering, so a healthy node sees nothing and
+    // pays one `gh` call per interval; a blind one sees its peers.
+    //
+    // Best-effort and detached ON PURPOSE: SOS is the recovery channel, so it
+    // must never be able to take down the feed it backs up. A missing `gh`, an
+    // unauthenticated shell, or no SOS gist yet all degrade to "no fallback",
+    // which is exactly where we were before this existed.
+    let _sos_fallback = runtime_context
+        .should_stream_join()
+        .then(|| start_sos_fallback(home));
+
     if runtime_context.should_stream_join() {
         crate::join_feed::run(&airc).await?;
     }
     Ok(())
 }
+
+/// Poll the SOS gist alongside the live feed, printing any NEW peer posts.
+///
+/// Returns a task handle whose drop cancels the poll — it lives exactly as long
+/// as the join it accompanies.
+fn start_sos_fallback(home: &Path) -> tokio::task::JoinHandle<()> {
+    let home = home.to_path_buf();
+    tokio::spawn(async move {
+        // First poll is delayed: a node that just joined is the LEAST likely to
+        // need the fallback, and an immediate `gh` call on every join would tax
+        // the healthy path to serve the broken one.
+        loop {
+            tokio::time::sleep(SOS_FALLBACK_POLL_INTERVAL).await;
+            // Errors are swallowed rather than reported every tick: `gh` absent
+            // or unauthenticated is a STANDING condition, not an event, and a
+            // recurring complaint in a live feed is its own kind of noise. The
+            // explicit `airc sos status` says so plainly when asked.
+            let _ = crate::sos_commands::poll_fallback_once(&home).await;
+        }
+    })
+}
+
+/// How often a joined node checks the out-of-band channel. Deliberately slow:
+/// this is a rendezvous, not a bus, and the healthy case must stay cheap.
+const SOS_FALLBACK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 async fn start_join_heartbeat(
     airc: &Airc,
@@ -392,10 +439,39 @@ pub async fn ensure_daemon_running(
         .open(&log)?;
     let stderr = stdout.try_clone()?;
     let exe = std::env::current_exe()?;
+    // The daemon's HOME must be the home that OWNS the socket, not the
+    // caller's scope.
+    //
+    // `default_socket_path_in` resolves through `machine_account_home`, so a
+    // caller in a git-project scope (`<repo>/.airc`) legitimately shares the
+    // MACHINE-account socket — one daemon per machine is the design. But this
+    // spawn passed the CALLER's `home` through, so whichever scope happened to
+    // start the daemon first imposed ITS identity on every scope that later
+    // attached to that socket. Nothing detected it: both paths are real, the
+    // daemon is healthy, and `doctor` reports a clean bill.
+    //
+    // Measured on BIGMAMA 2026-08-12, the whole night's blackout in one line:
+    //
+    //   airc.exe --home \\?\C:\...\development\continuum\.airc \
+    //            daemon --socket C:\Users\joelt\.airc\runtime\airc-machine-...sock
+    //
+    // Downstream, all diagnosed separately as unrelated bugs before the cause
+    // was found: messages sent through the machine socket were served by the
+    // PROJECT identity, so they landed in a scope the intended peer was not
+    // enrolled in (a one-way mirror — our sends left, their replies could not
+    // arrive); the wrong scope means a different `peer_id`, hence a different
+    // `stable_lan_port`, so the advertised endpoint moved and peers' stored
+    // endpoints went stale (read from the far side as "SYN dropped / stale
+    // ports / firewall"); and the event store read as a monologue because it
+    // was the other scope's store.
+    //
+    // Deriving it here rather than at the call sites keeps ONE rule: the
+    // daemon serving a socket is always the scope that owns it.
+    let daemon_home = airc_lib::machine_account_home(home);
     let mut command = Command::new(exe);
     command
         .arg("--home")
-        .arg(home)
+        .arg(&daemon_home)
         .arg("daemon")
         .arg("--socket")
         .arg(&socket)
@@ -1440,6 +1516,49 @@ pub async fn run_daemon(
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // REFUSE a socket this home does not own.
+    //
+    // A daemon serves ONE scope's identity to every client that attaches. If
+    // its `--home` is not the home the socket resolves from, it serves the
+    // wrong identity to everyone — silently, while looking completely healthy.
+    // That is not a degraded mode worth limping in; it is a wrong answer to
+    // every question, so it fails at startup instead of running.
+    //
+    // This is the guard that was missing on 2026-08-12. The spawn passed the
+    // caller's project home through to a machine-account socket, and NOTHING
+    // objected: daemon up, routes healthy, doctor 10/10 clean, while sends
+    // went into a scope the intended peer was not enrolled in. Two operators
+    // spent a night diagnosing the symptoms (stale ports, dropped SYNs, a
+    // monologue event store, a phantom "inbound not persisting" bug) because
+    // the one condition that explained all of them was never checked.
+    //
+    // The spawn is now correct, so this can only fire on a hand-rolled
+    // invocation — which is exactly when a human needs to be told, by name,
+    // which two scopes disagree.
+    // The invariant that is actually derivable HERE: a daemon's home must
+    // BE a machine-account root, not a project scope that merely resolves
+    // to one. `machine_account_home` is idempotent on a real machine home,
+    // so `machine_account_home(home) != home` is exactly "this is somebody
+    // else's scope". The socket path can NOT be re-derived for comparison —
+    // `resolve_socket_path` takes the scope home AND the machine home, so
+    // the same socket is minted from many scopes by design.
+    let owning_home = airc_lib::machine_account_home(home);
+    if owning_home != home {
+        return Err(format!(
+            "refusing to serve a socket this scope does not own.\n  \
+             --home  {}\n  \
+             --socket {}\n  \
+             this home's machine account is {}\n\
+             A daemon serves ITS home's identity to every client on that socket, so \
+             serving a foreign one silently gives every caller the wrong peer_id, the \
+             wrong rooms, and the wrong advertised endpoint. Start the daemon with the \
+             home that owns the socket, or let `airc join` spawn it.",
+            home.display(),
+            socket.display(),
+            owning_home.display(),
+        )
+        .into());
+    }
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call

@@ -53,8 +53,34 @@ const NO_RTT_GRACE_MS: u64 = 2_000 * RTT_GRACE_MULTIPLE;
 const _: () = assert!(NO_RTT_GRACE_MS >= 50 * RTT_GRACE_MULTIPLE);
 const _: () = assert!(NO_RTT_GRACE_MS <= 2_000 * RTT_GRACE_MULTIPLE);
 
+/// Which peers are THIS operator's own machines.
+///
+/// A `TrustTier::OwnAccount` ack proves the loopback: our own node received our
+/// own broadcast. It says nothing about whether any OTHER operator's node did.
+/// Returning a set (rather than filtering here) keeps the caller free to report
+/// per tier instead of hiding self-traffic — self-acks are real, they are just
+/// not evidence of a grid.
+async fn own_account_peers(home: &Path) -> std::collections::HashSet<airc_core::PeerId> {
+    airc_trust::load(home)
+        .await
+        .map(|peers| {
+            peers
+                .into_iter()
+                .filter(|peer| peer.tier == airc_store::TrustTier::OwnAccount)
+                .map(|peer| peer.peer_id)
+                .collect()
+        })
+        // A trust-store read failure must not silently reclassify every peer as
+        // cross-machine — that is the direction that INVENTS proof. An empty set
+        // means nothing is marked self, so every ack reports as cross-operator
+        // and the operator sees an over-claim rather than a hidden one... which
+        // is still wrong, so the caller states the tier it used.
+        .unwrap_or_default()
+}
+
 async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
     let socket = crate::cli::default_socket_path_in(home);
+    let own = own_account_peers(home).await;
     let stats = match airc_ipc::DaemonClient::new(socket).delivery_stats().await {
         Ok(response) => response.peers,
         Err(error) => {
@@ -178,15 +204,87 @@ async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
                     )),
                 }
             }
-            (false, None) => findings.push(Finding::ok(
+            // NEVER CONFIRMED is a different TYPE of fact, not a milder degree
+            // of one. `last_ack_ms == None` is not "the last ack is old", it is
+            // "there has never been an ack" — so there is nothing to be within
+            // tolerance OF: tolerance derives from the peer's measured rtt, and
+            // a peer that never acked has no rtt. The old arm applied a
+            // tolerance that cannot exist and stamped `ok` at ANY attempt count.
+            //
+            // Measured on BIGMAMA 2026-08-12: 63 attempts, zero confirmations,
+            // printed `[ok] within tolerance` — for a peer whose daemon was
+            // serving a different scope entirely and could not have received
+            // any of them.
+            //
+            // No attempt threshold, deliberately. This file's own rule is that
+            // the ledger holds the evidence and no arbitrary constant is needed;
+            // picking "N is fine, N+1 is not" would be exactly that constant.
+            // The honest report is the type: UNPROVEN. The count is printed so
+            // the reader can weigh how much was lost.
+            (false, None) => findings.push(Finding::warn(
                 "delivery truth",
                 format!(
-                    "{}: {} attempt(s), none confirmed yet (within tolerance)",
+                    "{}: UNPROVEN - {} attempt(s), never once confirmed. \
+                     Nothing sent to this peer can be shown to have arrived.",
                     peer.peer_id, peer.attempts
                 ),
+                "a new route clears this on its first ack; if it does not, check you are in \
+                 the scope the peer is enrolled in (`airc peers`) and that the daemon serves \
+                 THAT scope, then `airc transport health` for the dial errors",
             )),
         }
     }
+    // SELF IS NOT OTHER. A confirmed delivery to one of THIS operator's own
+    // machines proves the loopback — our node received our own broadcast — and
+    // says nothing about whether any other operator's node did.
+    //
+    // Measured on BIGMAMA 2026-08-12, and it cost a night: doctor reported
+    // `[ok] delivery truth: 2f0aed7f … rtt ~93ms (4 of 4 acked)` and it was
+    // read, by me, as "airc delivery is proven". `2f0aed7f` is tier=OwnAccount.
+    // There were FORTY own-account peers on that scope. Every ack was this node
+    // acking itself, while zero frames had ever reached the intended peer —
+    // whose daemon, it turned out, was serving a different scope entirely.
+    //
+    // Per-tier partition rather than filtering self out (M5's shape, and it is
+    // the better one): self-acks are REAL and worth printing — they prove the
+    // local pipe — they are just not grid evidence. Hiding them would trade one
+    // wrong impression for another.
+    let (self_acked, grid_acked): (Vec<_>, Vec<_>) = stats
+        .iter()
+        .filter(|peer| peer.acked > 0)
+        .partition(|peer| own.contains(&peer.peer_id));
+    if grid_acked.is_empty() {
+        if self_acked.is_empty() {
+            findings.push(Finding::warn(
+                "cross-operator delivery",
+                "NO delivery confirmed to any peer, own-account or otherwise".to_string(),
+                "nothing here proves the wire works; send one message and re-run",
+            ));
+        } else {
+            findings.push(Finding::warn(
+                "cross-operator delivery",
+                format!(
+                    "NONE CONFIRMED. {} own-account peer(s) acked (that is the LOOPBACK - this \
+                     node receiving its own broadcasts), and {} non-self peer(s) never did. \
+                     Self-acks are not grid delivery.",
+                    self_acked.len(),
+                    stats.len().saturating_sub(self_acked.len()),
+                ),
+                "check `airc peers` for the peer's tier, and that the daemon's --home is the \
+                 scope that peer is enrolled in",
+            ));
+        }
+    } else {
+        findings.push(Finding::ok(
+            "cross-operator delivery",
+            format!(
+                "{} non-self peer(s) confirmed ({} own-account ack(s) excluded as loopback)",
+                grid_acked.len(),
+                self_acked.len()
+            ),
+        ));
+    }
+
     findings
 }
 
