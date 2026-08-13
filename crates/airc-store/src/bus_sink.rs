@@ -41,6 +41,20 @@ use airc_core::{ClientId, EventId, Headers, PeerId, RoomId};
 
 use crate::entities::bus_event;
 
+/// Deadlock backstop for the single-connection pool — NOT a load limit.
+///
+/// These pools are `max_connections(1)`: concurrent callers queue by
+/// design, so a caller waiting is normal operation, not a fault. At the
+/// previous 5s this timeout behaved as a load limiter and turned routine
+/// queuing into a hard error — it took down `peer_add_with_tier_flag_
+/// persists_explicit_tier` on windows CI (2026-08-12) with "pool timed
+/// out while waiting for an open connection" during `airc init`, a
+/// failure that has nothing to do with the code under test. A backstop
+/// should only fire when something is genuinely stuck, so it is sized
+/// for the slowest legitimate wait (loaded CI, cold Windows I/O),
+/// leaving real deadlocks still bounded.
+const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// SQLite-backed durable tier for the owner-core (§3.3).
 ///
 /// Single-writer (the daemon owns it) + WAL — exactly the SQLite shape
@@ -61,7 +75,7 @@ impl SqliteDurableSink {
         // Single writer (the daemon). One connection avoids SQLite
         // write-lock contention entirely (§3.3).
         opts.connect_timeout(std::time::Duration::from_secs(5))
-            .acquire_timeout(std::time::Duration::from_secs(5))
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .max_connections(1);
         let db = Database::connect(opts)
             .await
