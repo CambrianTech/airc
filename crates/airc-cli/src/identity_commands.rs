@@ -5,6 +5,7 @@ use std::process::Command;
 
 use airc_core::identity::Identity;
 use airc_identity::LocalIdentity;
+use airc_lib::MachineAccountHome;
 use airc_store::{EventStore, SqliteEventStore};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
@@ -260,7 +261,34 @@ pub async fn run_push_continuum(home: &Path, handle: &str) -> Result<(), Box<dyn
     Ok(())
 }
 
+/// THE one place the identity card's home is chosen.
+///
+/// The card is the object PEERS see: `@mention` resolution, the roster, and
+/// `whois` all read what was published on the wires. The wires belong to the
+/// machine account, so the card does too — a project scope's own `peer_id`
+/// and enrolled-peer list are transport facts, not display facts.
+///
+/// Before this existed, `identity set` and `identity show` both addressed the
+/// CALLER's scope. They agreed with each other and disagreed with the mesh:
+/// running `airc identity set --name X` inside a git project wrote
+/// `<repo>/.airc`, `identity show` read the same row back and printed
+/// `name: X`, and the machine scope that publishes the roster kept its blank
+/// name. Measured on this node 2026-08-13 — a `--status` probe set from the
+/// project scope read back there and was absent from `~/.airc`.
+///
+/// That is the worst shape a defect can take: the verification and the bug
+/// are BOTH TRUE. Nothing lies; the success just describes a different object
+/// than the one that matters, so the operator runs the documented fix,
+/// confirms it, and stays unaddressable. Same family as the daemon serving a
+/// foreign socket (#1347) and `airc update` reporting a checkout while the
+/// operator reads it as the binary.
+fn identity_card_home(scope_home: &Path) -> MachineAccountHome {
+    airc_lib::machine_account_home(scope_home)
+}
+
 async fn load_identity_card(home: &Path) -> Result<Identity, Box<dyn Error>> {
+    let home = identity_card_home(home);
+    let home = home.as_path();
     let _ = LocalIdentity::load_or_generate(home).await?;
     let store = identity_store(home).await?;
     let stored = store
@@ -277,6 +305,11 @@ async fn save_identity_card(home: &Path, identity: Identity) -> Result<(), Box<d
     // slice). The previous direct-store save persisted locally but
     // never published, so attached peers had no way to learn about
     // nick/profile updates without the author rejoining.
+    //
+    // Home resolves through `identity_card_home` for the same reason the
+    // read does: the write must land on the scope whose roster peers read.
+    let home = identity_card_home(home);
+    let home = home.as_path();
     let _ = LocalIdentity::load_or_generate(home).await?;
     let airc = crate::commands::attached_airc(home).await?;
     airc.set_local_identity_card(identity).await?;
@@ -600,5 +633,92 @@ mod tests {
     #[test]
     fn truncated_preserves_utf8_boundary() {
         assert_eq!(truncate_str("ééééé", 4), "é...");
+    }
+}
+
+#[cfg(test)]
+mod scope_boundary_tests {
+    use super::*;
+    use std::fs;
+
+    /// Build a machine home containing a nested git-project scope, mimicking
+    /// the real shape: `<machine>/.airc` owns the wires, `<repo>/.airc` is a
+    /// per-project scope that resolves to it.
+    fn machine_and_project_homes(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let machine = root.join(".airc");
+        let project = root.join("Development").join("airc").join(".airc");
+        fs::create_dir_all(&machine).expect("machine home");
+        fs::create_dir_all(&project).expect("project home");
+        (machine, project)
+    }
+
+    /// what this catches: THE CROSS-SCOPE IDENTITY WRITE (#262 tail).
+    ///
+    /// Measured on the Windows node 2026-08-13, before the fix:
+    ///
+    /// ```text
+    /// $ airc identity set --status probe-a9e3e85      # from <repo>/.airc
+    ///   identity updated.
+    /// $ airc identity show                            # project scope
+    ///   status:  probe-a9e3e85                        # <- confirms
+    /// $ AIRC_HOME=~/.airc airc identity show          # scope that owns the wires
+    ///   status:  (unset)                              # <- peers see THIS
+    /// ```
+    ///
+    /// `set` and `show` agreed with each other and disagreed with the mesh,
+    /// so the operator ran the documented fix, verified it, and stayed
+    /// unaddressable — `@mention` resolution matches the roster the
+    /// wire-owning scope publishes. Both agents ran blank-named for a night
+    /// on exactly this.
+    ///
+    /// This asserts the ROUTING DECISION rather than an end-to-end write:
+    /// `save_identity_card` needs an attached daemon, which a hermetic
+    /// tempdir cannot supply, and a test that dies in setup proves nothing
+    /// about the invariant it names.
+    #[test]
+    fn the_identity_card_belongs_to_the_scope_that_owns_the_wires() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (machine, project) = machine_and_project_homes(root.path());
+
+        // Simulate a machine account the way `daemon_lifecycle` does: point
+        // HOME at the tempdir root so the temp-rooted carve-out treats these
+        // scopes as sharing one simulated account. Without this, BOTH homes
+        // are their own account boundary and the routing under test is
+        // trivially the identity function.
+        let restore = std::env::var_os("HOME");
+        // SAFETY: `set_var`/`remove_var` are unsound only when another thread
+        // reads the environment concurrently. Both mutations and the two
+        // resolutions between them run on this `#[test]`'s own thread with no
+        // other thread spawned, and HOME is restored before any assertion can
+        // unwind past this block.
+        let (resolved_from_project, resolved_from_machine) = unsafe {
+            std::env::set_var("HOME", root.path());
+            let resolved = (identity_card_home(&project), identity_card_home(&machine));
+            match restore {
+                Some(previous) => std::env::set_var("HOME", previous),
+                None => std::env::remove_var("HOME"),
+            }
+            resolved
+        };
+
+        // Compare canonical forms: `machine_account_home` resolves through
+        // `canonicalize`, which on Windows returns the extended-length `\\?\`
+        // form. A raw `==` against the constructed path fails on a match.
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let expected = canonical(&machine);
+
+        assert_eq!(
+            canonical(resolved_from_project.as_path()),
+            expected,
+            "an identity write from a project scope resolved to the project's own \
+             store — the operator sets a name, `identity show` reads the same row \
+             back and confirms it, and the scope that publishes the roster keeps a \
+             blank name, so nothing lies and nobody can address them"
+        );
+        assert_eq!(
+            canonical(resolved_from_machine.as_path()),
+            expected,
+            "resolution must be idempotent: the wire-owning scope resolves to itself"
+        );
     }
 }
