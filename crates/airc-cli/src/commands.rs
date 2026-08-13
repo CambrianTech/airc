@@ -2530,6 +2530,7 @@ pub async fn run_msg(
 pub async fn run_inbox(
     home: &Path,
     socket: Option<PathBuf>,
+    room: Option<&str>,
     since_lamport: Option<u64>,
     since_event_id: Option<String>,
     limit: Option<usize>,
@@ -2541,6 +2542,15 @@ pub async fn run_inbox(
             Airc::attach(home, socket).await?
         }
         None => attached_airc(home).await?,
+    };
+    // `--room` reads a room this scope is subscribed to WITHOUT moving
+    // the default-room pointer — the read sibling of `airc msg --room`.
+    // Same resolver the writes use (name or channel id, loud refusal for
+    // an unsubscribed room, never auto-joins), so a room `msg --room` can
+    // reach is exactly a room `inbox --room` can read.
+    let room = match room {
+        Some(name) => airc.room_by_name_or_channel(name, "read").await?,
+        None => airc.current_room().await?,
     };
     // Both --since-lamport and --since-event-id must be supplied
     // together; the cursor is a tuple per grievance §7.
@@ -2559,28 +2569,33 @@ pub async fn run_inbox(
     };
     let effective_limit = limit.unwrap_or(32);
     let events = match since {
-        Some(cursor) => airc.resume_from(&cursor, effective_limit).await?,
-        None => airc.page_recent(effective_limit).await?,
+        Some(cursor) => airc.resume_from_in(&room, &cursor, effective_limit).await?,
+        None => airc.page_recent_in(&room, effective_limit).await?,
     };
-    // #270: `inbox` reads ONE room (the current one) — say so, loudly,
-    // and name what it is NOT showing. The unlabeled view is how "your
-    // message isn't in my inbox" became a false transport diagnosis
-    // twice in one day: the message was in the store the whole time,
-    // in a subscribed room that wasn't current.
+    // #270: `inbox` reads ONE room — say so, loudly, and name what it is
+    // NOT showing. The unlabeled view is how "your message isn't in my
+    // inbox" became a false transport diagnosis twice in one day: the
+    // message was in the store the whole time, in a subscribed room that
+    // wasn't current.
+    //
+    // The remedy this prints is now `--room <name>`, not `airc room
+    // <name>`: reading another room must not require MOVING this scope's
+    // default-room pointer. Telling the operator to switch rooms in order
+    // to read one was the bug wearing a label.
     if !as_json {
-        if let (Ok(current), Ok(set)) = (airc.current_room().await, airc.subscription_set().await) {
+        if let Ok(set) = airc.subscription_set().await {
             let others: Vec<String> = set
                 .all()
-                .filter(|s| s.name.as_str() != current.name)
+                .filter(|s| s.name.as_str() != room.name)
                 .map(|s| s.name.as_str().to_string())
                 .collect();
             if others.is_empty() {
-                println!("inbox: room '{}' (your only subscribed room)", current.name);
+                println!("inbox: room '{}' (your only subscribed room)", room.name);
             } else {
                 println!(
                     "inbox: room '{}' ONLY — {} other subscribed room(s) NOT shown: {} \
-                     (switch with `airc room <name>`)",
-                    current.name,
+                     (read one with `airc inbox --room <name>`)",
+                    room.name,
                     others.len(),
                     others.join(", ")
                 );

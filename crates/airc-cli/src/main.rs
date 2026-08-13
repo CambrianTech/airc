@@ -371,7 +371,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Send { room, text } => {
-            commands::run_send(&home, parsed.peers, room.as_deref(), &text).await
+            commands::run_send(&home, parsed.peers, room.named(), &text).await
         }
 
         Command::Listen { replay } => commands::run_listen(&home, parsed.peers, replay).await,
@@ -413,7 +413,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
 
         Command::Msg { socket, room, text } => {
-            commands::run_msg(&home, default_or(socket, &home), room.as_deref(), &text).await
+            commands::run_msg(&home, default_or(socket, &home), room.named(), &text).await
         }
         Command::Publish {
             room,
@@ -421,15 +421,30 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             body_json,
             headers,
             kind,
-        } => publish_commands::run_publish(&home, room, body_text, body_json, headers, kind).await,
+        } => {
+            publish_commands::run_publish(&home, room.room, body_text, body_json, headers, kind)
+                .await
+        }
 
         Command::Inbox {
             socket,
+            room,
             since_lamport,
             since_event_id,
             limit,
             json,
-        } => commands::run_inbox(&home, socket, since_lamport, since_event_id, limit, json).await,
+        } => {
+            commands::run_inbox(
+                &home,
+                socket,
+                room.named(),
+                since_lamport,
+                since_event_id,
+                limit,
+                json,
+            )
+            .await
+        }
 
         Command::Room { name } => commands::run_room(&home, name).await,
 
