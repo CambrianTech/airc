@@ -818,7 +818,7 @@ mod tests {
             IdTokenResolution::NotAnId
         ));
         assert!(matches!(
-            set.resolve_id_token("k3-serving"),
+            set.resolve_id_token("bench-swe-run-1"),
             IdTokenResolution::NotAnId
         ));
         assert!(matches!(

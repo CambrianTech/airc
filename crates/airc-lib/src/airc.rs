@@ -2921,10 +2921,10 @@ mod publish_identity_tests {
         );
 
         // And the operator verb still means join-and-focus, unchanged.
-        airc.join("k3-serving").await.expect("operator join");
+        airc.join("bench-swe-run-1").await.expect("operator join");
         assert_eq!(
             airc.current_room().await.expect("current room").name,
-            "k3-serving",
+            "bench-swe-run-1",
             "join still moves the focus — this split must not change the operator's verb"
         );
     }
