@@ -439,6 +439,13 @@ impl SubscriptionSet {
         self.subscribed.values()
     }
 
+    /// Consume the set and yield every subscription by VALUE — for the
+    /// caller that owns the set and is about to drop it. Pairs with
+    /// [`Self::all`], which borrows for everyone else.
+    pub fn into_all(self) -> impl Iterator<Item = Subscription> {
+        self.subscribed.into_values()
+    }
+
     /// The subscription for a room id — one comparison against the key
     /// this map is already keyed by.
     ///
@@ -568,11 +575,19 @@ impl Airc {
     /// Return all active channel subscriptions for this scope.
     ///
     /// Consumer integrations use this instead of parsing `airc status`
-    /// or reading the store directly. Ordering is deterministic by
-    /// channel name.
+    /// or reading the store directly. Ordering is deterministic by ROOM
+    /// ID — the map's key. It was by channel name until membership was
+    /// re-keyed onto the id; a caller that wants name order sorts by the
+    /// field it means, because a label carries no ordering any more than
+    /// it carries an address.
+    ///
+    /// MOVES out of the set rather than cloning: `set` is loaded fresh
+    /// here and dropped on the next line, so cloning every subscription
+    /// out of it copied a `String` + a `PathBuf` per room for values
+    /// nobody else could observe.
     pub async fn subscriptions(&self) -> Result<Vec<Subscription>, AircError> {
         let set = self.subscription_set().await?;
-        Ok(set.all().cloned().collect())
+        Ok(set.into_all().collect())
     }
 
     /// True when this scope is subscribed to `room_id`.
