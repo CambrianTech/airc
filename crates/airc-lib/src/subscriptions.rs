@@ -716,101 +716,105 @@ mod tests {
         let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
         let academy = set
-            .subscribe(home, &id, ChannelName::new("academy").unwrap())
+            .create(home, ChannelName::new("academy").unwrap())
             .unwrap();
 
         let simple = academy.room_id.as_uuid().as_simple().to_string();
 
         // 8-hex short id → binds to academy.
-        match set.resolve_id_token(&simple[..8]) {
+        match set.resolve_room_id(&simple[..8]) {
             RoomIdResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
             other => panic!("short id must Match, got {other:?}"),
         }
         // Full dashed uuid → binds too (resolution wins over the old refusal).
-        match set.resolve_id_token(&academy.room_id.to_string()) {
+        match set.resolve_room_id(&academy.room_id.to_string()) {
             RoomIdResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
             other => panic!("full uuid must Match, got {other:?}"),
         }
         // Id-shaped, no such channel → Unknown (join refuses; no mint).
         assert!(matches!(
-            set.resolve_id_token("deadbeef"),
+            set.resolve_room_id("deadbeef"),
             RoomIdResolution::Unknown
         ));
         // Plain names — including hexy-but-short and dashed ones — stay names.
         assert!(matches!(
-            set.resolve_id_token("academy"),
+            set.resolve_room_id("academy"),
             RoomIdResolution::NotAnId
         ));
         assert!(matches!(
-            set.resolve_id_token("bench-swe-run-1"),
+            set.resolve_room_id("bench-swe-run-1"),
             RoomIdResolution::NotAnId
         ));
         assert!(matches!(
-            set.resolve_id_token("cafe"),
+            set.resolve_room_id("cafe"),
             RoomIdResolution::NotAnId
         ));
     }
 
     #[test]
-    fn subscribe_is_idempotent_and_seeds_default() {
+    fn create_mints_a_distinct_room_each_time_and_seeds_default() {
+        // what this catches: create keyed by NAME. Two rooms with the same
+        // label are two rooms; collapsing them was the v5(name) collision.
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
         assert!(set.default.is_none());
 
-        let sub1 = set
-            .subscribe(home, &id, ChannelName::new("general").unwrap())
+        let first = set
+            .create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        assert_eq!(set.default.as_ref().unwrap().as_str(), "general");
-        assert_eq!(set.subscribed.len(), 1);
+        assert_eq!(set.default, Some(first.room_id), "first room seeds default");
 
-        // Idempotent: second subscribe returns the same entry.
-        let sub2 = set
-            .subscribe(home, &id, ChannelName::new("general").unwrap())
+        let second = set
+            .create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        assert_eq!(sub1, sub2);
-        assert_eq!(set.subscribed.len(), 1);
-        assert_eq!(set.default.as_ref().unwrap().as_str(), "general");
+        assert_ne!(first.room_id, second.room_id);
+        assert_eq!(set.subscribed.len(), 2);
+        assert_eq!(set.default, Some(first.room_id), "default is not stolen");
     }
 
     #[test]
-    fn subscribe_adds_without_changing_default() {
+    fn join_is_idempotent_on_the_id_and_keeps_the_stored_label() {
+        // what this catches: re-joining a room you are already in must be a
+        // no-op for observers (joined_at_ms preserved), and a caller's label
+        // must never overwrite the one already stored.
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        set.subscribe(home, &id, ChannelName::new("general").unwrap())
+        let room = set
+            .create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        set.subscribe(home, &id, ChannelName::new("cambriantech").unwrap())
+
+        let again = set
+            .join(home, room.room_id, ChannelName::new("renamed").unwrap())
             .unwrap();
-        // First subscription stays as default.
-        assert_eq!(set.default.as_ref().unwrap().as_str(), "general");
-        assert_eq!(set.subscribed.len(), 2);
+        assert_eq!(again, room);
+        assert_eq!(set.subscribed.len(), 1);
     }
 
     #[test]
-    fn subscribe_with_wire_root_uses_machine_account_wire() {
+    fn join_with_wire_root_uses_the_machine_account_wire_keyed_by_id() {
+        // what this catches: a per-scope wire root (which split one machine's
+        // data plane per project dir) and a name-keyed wire dir.
         let scope_a = tempdir().unwrap();
         let scope_b = tempdir().unwrap();
         let machine_home = tempdir().unwrap();
-        let id = MeshIdentity::new("joelteply");
-        let channel = ChannelName::new("general").unwrap();
+        let room_id = RoomId::new();
         let mut a = SubscriptionSet::empty();
         let mut b = SubscriptionSet::empty();
 
         let a_sub = a
-            .subscribe_with_wire_root(machine_home.path(), &id, channel.clone())
+            .join_with_wire_root(machine_home.path(), room_id, ChannelName::new("general").unwrap())
             .unwrap();
         let b_sub = b
-            .subscribe_with_wire_root(machine_home.path(), &id, channel)
+            .join_with_wire_root(machine_home.path(), room_id, ChannelName::new("general").unwrap())
             .unwrap();
 
         assert_eq!(a_sub.room_id, b_sub.room_id);
         assert_eq!(a_sub.wire, b_sub.wire);
         assert_eq!(
             a_sub.wire,
-            machine_home.path().join("wires").join("general")
+            machine_home.path().join("wires").join(room_id.to_string())
         );
         assert!(
             !a_sub.wire.starts_with(scope_a.path()) && !b_sub.wire.starts_with(scope_b.path()),
@@ -819,82 +823,66 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_accepts_arbitrary_user_and_domain_channels() {
+    fn a_room_with_no_label_is_still_a_membership() {
+        // what this catches: dropping a room because its label is absent or
+        // unparseable. The id identifies it; the label is decoration.
         let dir = tempdir().unwrap();
-        let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-
-        for name in [
-            "continuum-activity-7",
-            "openclaw-workspace_alpha",
-            "useideem",
-            "friend-general",
-            "forge-lora-slots",
-        ] {
-            set.subscribe(home, &id, ChannelName::new(name).unwrap())
-                .unwrap();
-        }
-
-        let names = set
-            .channel_names()
-            .map(ChannelName::as_str)
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"continuum-activity-7"));
-        assert!(names.contains(&"openclaw-workspace_alpha"));
-        assert!(names.contains(&"useideem"));
-        assert!(names.contains(&"friend-general"));
-        assert!(names.contains(&"forge-lora-slots"));
+        let room = set.create(dir.path(), ChannelName::unnamed()).unwrap();
+        assert!(set.subscribed.contains_key(&room.room_id));
+        assert_eq!(set.default, Some(room.room_id));
     }
 
     #[test]
-    fn unsubscribe_marks_parted_and_falls_back_default() {
+    fn unsubscribe_marks_parted_by_id_and_falls_back_default() {
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        let general = ChannelName::new("general").unwrap();
-        let cambriantech = ChannelName::new("cambriantech").unwrap();
-        set.subscribe(home, &id, general.clone()).unwrap();
-        set.subscribe(home, &id, cambriantech.clone()).unwrap();
+        let general = set
+            .create(home, ChannelName::new("general").unwrap())
+            .unwrap();
+        let cambriantech = set
+            .create(home, ChannelName::new("cambriantech").unwrap())
+            .unwrap();
 
-        let removed = set.unsubscribe(&general).expect("general was subscribed");
-        assert_eq!(removed.name, general);
-        assert!(set.parted.contains(&general));
-        // Default falls back to remaining (cambriantech).
-        assert_eq!(set.default, Some(cambriantech.clone()));
+        let removed = set
+            .unsubscribe(&general.room_id)
+            .expect("general was subscribed");
+        assert_eq!(removed.room_id, general.room_id);
+        assert!(set.parted.contains(&general.room_id));
+        assert_eq!(set.default, Some(cambriantech.room_id));
         assert_eq!(set.subscribed.len(), 1);
     }
 
     #[test]
-    fn unsubscribe_then_resubscribe_clears_parted() {
+    fn rejoining_a_parted_room_clears_the_tombstone() {
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        let general = ChannelName::new("general").unwrap();
-        set.subscribe(home, &id, general.clone()).unwrap();
-        set.unsubscribe(&general);
-        assert!(set.parted.contains(&general));
+        let general = set
+            .create(home, ChannelName::new("general").unwrap())
+            .unwrap();
+        set.unsubscribe(&general.room_id);
+        assert!(set.parted.contains(&general.room_id));
 
-        set.subscribe(home, &id, general.clone()).unwrap();
-        assert!(!set.parted.contains(&general));
-        assert_eq!(set.default, Some(general));
+        set.join(home, general.room_id, general.name.clone()).unwrap();
+        assert!(!set.parted.contains(&general.room_id));
+        assert_eq!(set.default, Some(general.room_id));
     }
 
     #[test]
-    fn set_default_requires_subscription() {
+    fn set_default_requires_membership_and_names_the_id_it_refused() {
         let dir = tempdir().unwrap();
-        let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        set.subscribe(home, &id, ChannelName::new("general").unwrap())
+        set.create(dir.path(), ChannelName::new("general").unwrap())
             .unwrap();
-        // Setting a non-subscribed channel as default must error.
-        let result = set.set_default(ChannelName::new("nowhere").unwrap());
-        assert!(result.is_err());
-    }
 
+        let stranger = RoomId::new();
+        match set.set_default(stranger) {
+            Err(SubscriptionError::UnknownRoom(id)) => assert_eq!(id, stranger),
+            other => panic!("must refuse a non-subscribed room by id, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn save_load_round_trip_preserves_set() {
@@ -903,9 +891,9 @@ mod tests {
         let store = InMemoryEventStore::new();
         let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        set.subscribe(home, &id, ChannelName::new("general").unwrap())
+        set.create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        set.subscribe(home, &id, ChannelName::new("cambriantech").unwrap())
+        set.create(home, ChannelName::new("cambriantech").unwrap())
             .unwrap();
         save(&store, &set).await.unwrap();
 
