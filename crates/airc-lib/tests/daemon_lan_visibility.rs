@@ -64,6 +64,22 @@ async fn machine_coordinator_store(machine: &Machine) -> Arc<dyn EventStore> {
     )
 }
 
+/// The id this machine's ACCOUNT gives `label`, claiming it if this
+/// is the first ask.
+///
+/// This is what any scope's `join(label)` resolves through, so a room
+/// claimed here is the same room a later `operator.join(label)` lands
+/// in — which is exactly what the late-joiner test needs: the room
+/// must have an ADDRESS before anyone on this machine SUBSCRIBES to
+/// it, and those are different things.
+async fn account_room_id(machine: &Machine, label: &str) -> RoomId {
+    machine_coordinator_store(machine)
+        .await
+        .claim_room_label(label, RoomId::new(), 1)
+        .await
+        .expect("claim the account's room label")
+}
+
 /// Build the production bridge against this machine's daemon router +
 /// coordinator store and install it on a LAN-gateway handle — the
 /// in-process equivalent of what `run_daemon` does for its listener
@@ -83,13 +99,25 @@ async fn lan_gateway_with_bridge(machine: &Machine) -> (Airc, Arc<RouterInboundB
     (gateway, bridge)
 }
 
-/// A remote peer on its own "machine" (isolated temp home), joined to
-/// `room`, mutually trusted and dialed into the gateway's listener.
-async fn dialed_remote(gateway: &Airc, remote_home: &TempDir, room: &str) -> Airc {
+/// A remote peer on its own "machine" (isolated temp home), in the
+/// SAME room as the gateway, mutually trusted and dialed into the
+/// gateway's listener.
+///
+/// `room_id` is the gateway's own room id, and the remote joins THAT
+/// — the rendezvous shape, and the only one that works across two
+/// machines. Joining by the label instead (`remote.join("name")`)
+/// mints a second room on the remote's own machine that merely SHARES
+/// a name, so every frame the remote sent came back `Undeliverable {
+/// UnknownChannel }`: two rooms, one label, no membership in common.
+/// A label keys nothing; the id is the address.
+async fn dialed_remote(gateway: &Airc, remote_home: &TempDir, room_id: RoomId) -> Airc {
     let remote = Airc::open(remote_home.path().join(".airc"))
         .await
         .expect("open remote");
-    remote.join(room).await.expect("remote joins room");
+    remote
+        .join_room_id(room_id, "gateway-room")
+        .await
+        .expect("remote joins the gateway's room BY ID");
     let remote_spec: PeerSpec = remote.peer_spec().parse().expect("remote spec");
     let gateway_spec: PeerSpec = gateway.peer_spec().parse().expect("gateway spec");
     gateway
@@ -178,7 +206,8 @@ async fn inbound_lan_frame_is_visible_in_subscribed_scope_transcript() {
 
     let (gateway, _bridge) = lan_gateway_with_bridge(&machine).await;
     let remote_home = TempDir::new().expect("remote home");
-    let remote = dialed_remote(&gateway, &remote_home, "store-split-room").await;
+    let room_id = account_room_id(&machine, "store-split-room").await;
+    let remote = dialed_remote(&gateway, &remote_home, room_id).await;
 
     let outcome = remote
         .send_with_delivery_ack(
@@ -234,7 +263,8 @@ async fn unsubscribed_scope_does_not_see_inbound_frame() {
 
     let (gateway, _bridge) = lan_gateway_with_bridge(&machine).await;
     let remote_home = TempDir::new().expect("remote home");
-    let remote = dialed_remote(&gateway, &remote_home, "store-split-room").await;
+    let room_id = account_room_id(&machine, "store-split-room").await;
+    let remote = dialed_remote(&gateway, &remote_home, room_id).await;
 
     let outcome = remote
         .send_with_delivery_ack(
@@ -372,7 +402,10 @@ async fn delivered_ack_means_visible_to_subscribed_scopes_not_just_durable() {
     gateway.set_diagnostic_sink(Arc::new(diag.clone()));
 
     let remote_home = TempDir::new().expect("remote home");
-    let remote = dialed_remote(&gateway, &remote_home, "store-split-room").await;
+    // The room gets an ADDRESS now; nobody on this machine SUBSCRIBES
+    // to it until the operator attaches below. That gap is the test.
+    let room_id = account_room_id(&machine, "store-split-room").await;
+    let remote = dialed_remote(&gateway, &remote_home, room_id).await;
 
     // Nobody on the receiving machine subscribes yet.
     let outcome = remote

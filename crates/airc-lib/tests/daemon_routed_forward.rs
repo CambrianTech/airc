@@ -49,7 +49,7 @@ use airc_relay::{RelayServer, RelayServerConfig};
 use airc_store::{EventStore, SqliteEventStore};
 use airc_transport::LanTcpAdapter;
 use async_trait::async_trait;
-use common::Machine;
+use common::{same_room, Machine};
 
 const ROOM: &str = "routed-forward-room";
 
@@ -172,9 +172,8 @@ async fn routed_room_send_traverses_lan_both_directions() {
     link(&a.gateway, &b.gateway).await;
 
     let op_a = a.machine.attach("op-a").await;
-    op_a.join(ROOM).await.expect("op-a joins");
     let op_b = b.machine.attach("op-b").await;
-    op_b.join(ROOM).await.expect("op-b joins");
+    same_room(ROOM, &[&op_a, &op_b]).await;
 
     // A → B: the leg that was dead (daemon-originated ROUTED sends).
     let id_ab = op_a
@@ -233,9 +232,8 @@ async fn frame_received_from_a_peer_is_not_forwarded_back_to_it() {
     link(&a.gateway, &b.gateway).await;
 
     let op_a = a.machine.attach("op-a").await;
-    op_a.join(ROOM).await.expect("op-a joins");
     let op_b = b.machine.attach("op-b").await;
-    op_b.join(ROOM).await.expect("op-b joins");
+    same_room(ROOM, &[&op_a, &op_b]).await;
 
     // Quiesce, then snapshot B's wire-flush counter.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -274,11 +272,9 @@ async fn transitive_forward_reaches_third_machine_exactly_once() {
     link(&b.gateway, &c.gateway).await;
 
     let op_a = a.machine.attach("op-a").await;
-    op_a.join(ROOM).await.expect("op-a joins");
     let op_b = b.machine.attach("op-b").await;
-    op_b.join(ROOM).await.expect("op-b joins");
     let op_c = c.machine.attach("op-c").await;
-    op_c.join(ROOM).await.expect("op-c joins");
+    same_room(ROOM, &[&op_a, &op_b, &op_c]).await;
 
     let event_id = op_a
         .say("one hop, two hops — exactly once everywhere")
@@ -374,9 +370,8 @@ async fn remote_persist_failure_then_retry_is_exactly_once_visible() {
     link(&a.gateway, &b_gateway).await;
 
     let op_a = a.machine.attach("op-a").await;
-    op_a.join(ROOM).await.expect("op-a joins");
     let op_b = b_machine.attach("op-b").await;
-    op_b.join(ROOM).await.expect("op-b joins");
+    same_room(ROOM, &[&op_a, &op_b]).await;
 
     let event_id = op_a.say(MARKER).await.expect("op-a says");
 
@@ -527,9 +522,8 @@ async fn delivery_ledger_records_measured_acks_for_a_live_peer() {
     link(&a.gateway, &b.gateway).await;
 
     let op_a = a.machine.attach("op-a").await;
-    op_a.join(ROOM).await.expect("op-a joins");
     let op_b = b.machine.attach("op-b").await;
-    op_b.join(ROOM).await.expect("op-b joins");
+    same_room(ROOM, &[&op_a, &op_b]).await;
 
     let id = op_a.say("ledger proof").await.expect("op-a says");
     assert_eq!(wait_for_copies(&op_b, id).await, 1);
@@ -658,9 +652,8 @@ async fn routed_room_send_traverses_relay() {
     }
 
     let op_a = a.machine.attach("op-a").await;
-    op_a.join(ROOM).await.expect("op-a joins");
     let op_b = b.machine.attach("op-b").await;
-    op_b.join(ROOM).await.expect("op-b joins");
+    same_room(ROOM, &[&op_a, &op_b]).await;
 
     let id = op_a
         .say("room message A→B over the relay")

@@ -51,11 +51,15 @@ async fn lan_send_yields_delivered_ack_only_after_receiver_persistence() {
     let tmp_b = TempDir::new().expect("bob tempdir");
     let (alice, bob) = paired_handles(&tmp_a, &tmp_b).await;
 
-    // Both scopes bind the same channel name; same-machine mesh
-    // identity resolution makes the derived RoomId identical, which
-    // is the cross-machine production shape for a shared room.
+    // Alice's account resolves the label; bob joins THAT id. Two
+    // homes are two accounts, and a label keys a room only within
+    // one — so binding the same name on each would give them two
+    // different rooms wearing the same word, which is precisely the
+    // cross-machine shape this test must NOT accidentally exercise.
     let alice_room = alice.join("delivery-ack-room").await.expect("alice joins");
-    bob.join("delivery-ack-room").await.expect("bob joins");
+    bob.join_room_id(alice_room.channel, "delivery-ack-room")
+        .await
+        .expect("bob joins alice's room BY ID");
 
     let alice_addr: SocketAddr = alice
         .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))

@@ -383,23 +383,6 @@ impl SubscriptionSet {
         }
     }
 
-    /// [`Self::join`] against an account-wide local wire root. See
-    /// [`Subscription::with_wire_root`].
-    pub fn join_with_wire_root(
-        &mut self,
-        wire_root: &Path,
-        room_id: RoomId,
-        name: ChannelName,
-    ) -> Result<Subscription, SubscriptionError> {
-        self.parted.remove(&room_id);
-        if let Some(existing) = self.subscribed.get(&room_id) {
-            return Ok(existing.clone());
-        }
-        let sub = Subscription::joining(wire_root, room_id, name)?;
-        self.insert(sub.clone());
-        Ok(sub)
-    }
-
     /// Remove a subscription and mark it parted so it's not
     /// auto-restored. If the removed room was the default, the
     /// default falls back to any remaining subscription
@@ -814,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn join_with_wire_root_uses_the_machine_account_wire_keyed_by_id() {
+    fn join_uses_the_machine_account_wire_keyed_by_id() {
         // what this catches: a per-scope wire root (which split one machine's
         // data plane per project dir) and a name-keyed wire dir.
         let scope_a = tempdir().unwrap();
@@ -825,14 +808,14 @@ mod tests {
         let mut b = SubscriptionSet::empty();
 
         let a_sub = a
-            .join_with_wire_root(
+            .join(
                 machine_home.path(),
                 room_id,
                 ChannelName::new("general").unwrap(),
             )
             .unwrap();
         let b_sub = b
-            .join_with_wire_root(
+            .join(
                 machine_home.path(),
                 room_id,
                 ChannelName::new("general").unwrap(),

@@ -1922,11 +1922,57 @@ impl Airc {
     }
 
     async fn join_channel(&self, name: &str, focus: Focus) -> Result<Room, AircError> {
-        let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let subscription = self.resolve_or_mint(&mut set, name).await?;
+        self.commit_join(set, subscription, focus).await
+    }
+
+    /// Join the room `room_id` NAMES, labelling it `label` locally.
+    ///
+    /// This is the rendezvous verb, and the only honest way for two
+    /// scopes that have never met to end up in the SAME room. `join`
+    /// takes a token a human typed, so across two machines it mints
+    /// two rooms that merely share a label — the label keys nothing.
+    /// Here the caller already holds the id (from an
+    /// [`InviteBeacon`](crate::InviteBeacon), a peer's presence, a
+    /// link someone pasted), so there is nothing to resolve and
+    /// nothing to mint: the id IS the room.
+    ///
+    /// The label is local display only. Two scopes in one room may
+    /// call it different things and still be in one room, because
+    /// membership is keyed by the id and never by what either of them
+    /// wrote on the door.
+    ///
+    /// Focus moves, exactly as in [`Self::join`] — this is that same
+    /// verb with the room named by id instead of by token, so it
+    /// carries the same meaning for the caller. The membership-without
+    /// -focus half of the pair ([`Self::subscribe_room`]) has no by-id
+    /// twin yet because nothing needs one; `commit_join` already takes
+    /// the focus, so adding `subscribe_room_id` is a three-line
+    /// wrapper on the day a citizen wants it.
+    pub async fn join_room_id(&self, room_id: RoomId, label: &str) -> Result<Room, AircError> {
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        let subscription = set.join(&self.inner.wire_root, room_id, ChannelName::new(label)?)?;
+        self.commit_join(set, subscription, Focus::MakeDefault)
+            .await
+    }
+
+    /// Make a resolved subscription durable and announce it: save,
+    /// re-beacon presence, emit `RoomJoined`, publish the identity
+    /// card. Every join lands here regardless of how the room was
+    /// named, so a by-id join is observable on exactly the same terms
+    /// as a by-label one — no second lifecycle to drift.
+    async fn commit_join(
+        &self,
+        mut set: subscriptions::SubscriptionSet,
+        subscription: Subscription,
+        focus: Focus,
+    ) -> Result<Room, AircError> {
+        let identity = self.mesh_identity().await?;
         let room_id = subscription.room_id;
         let channel = subscription.name.clone();
+        // Idempotent by contract (an existing subscription is returned
+        // as-is), so the by-id path re-stating its own join is free.
         set.join(&self.inner.wire_root, room_id, channel.clone())?;
         if focus == Focus::MakeDefault {
             set.set_default(room_id)?;

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use airc_core::PeerId;
+use airc_core::{PeerId, RoomId};
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
 use airc_lib::{Airc, PeerSpec};
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
@@ -280,4 +280,33 @@ pub async fn trust(a: &Airc, b: &Airc) {
     let b_spec: PeerSpec = b.peer_spec().parse().expect("b peer spec");
     a.add_peer(b_spec).await.expect("a trusts b");
     b.add_peer(a_spec).await.expect("b trusts a");
+}
+
+/// Put every scope in ONE room and return its id.
+///
+/// The first scope resolves `label` on its own account — minting the
+/// room if this account has never used the name — and every other
+/// scope joins THAT id.
+///
+/// Why this is a helper and not `scope.join(label)` per scope: a label
+/// keys a room only WITHIN one account. Two scopes on two simulated
+/// machines each joining `"room"` get two different rooms that merely
+/// share a name, and every frame between them comes back
+/// `Undeliverable { UnknownChannel }`. The id is the address, so a
+/// test that means "these scopes are together" has to say so by id —
+/// once, here, rather than correctly in each of a dozen call sites.
+pub async fn same_room(label: &str, scopes: &[&Airc]) -> RoomId {
+    let (first, rest) = scopes.split_first().expect("at least one scope");
+    let room_id = first
+        .join(label)
+        .await
+        .expect("first scope resolves the label on its own account")
+        .channel;
+    for scope in rest {
+        scope
+            .join_room_id(room_id, label)
+            .await
+            .expect("scope joins the SAME room by id");
+    }
+    room_id
 }

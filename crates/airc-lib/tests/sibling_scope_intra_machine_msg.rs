@@ -39,7 +39,7 @@ mod common;
 use std::time::Duration;
 
 use airc_lib::Airc;
-use common::{trust, DaemonFixture, Machine};
+use common::{same_room, trust, DaemonFixture, Machine};
 use tempfile::TempDir;
 
 /// Baseline: with the shared-mesh-root convergence path (the test fixture's
@@ -102,9 +102,13 @@ async fn independent_wire_roots_two_scopes_share_one_daemon() {
 
     trust(&alice, &bob).await;
 
+    // Independent wire roots are independent ACCOUNTS, so the label
+    // keys nothing across them: joining it on each side would mint two
+    // rooms sharing a word. The room is the id alice's side resolves,
+    // and bob joins THAT — which is the shape the card describes and
+    // the only one that can route.
     let room = "sibling-scope-routing-independent";
-    alice.join(room).await.expect("alice joins");
-    bob.join(room).await.expect("bob joins");
+    same_room(room, &[&alice, &bob]).await;
 
     let body = "sibling-scope-routing-326000a5-independent";
     alice.say(body).await.expect("alice sends");
