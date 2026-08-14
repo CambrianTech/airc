@@ -477,7 +477,7 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
     let document = airc_lib::AccountRegistryDocument::new(
         identity.clone(),
         now_ms,
-        vec![known_room],
+        vec![airc_lib::AccountRoom::new(known_room, Some("general".to_string()))],
         vec![airc_lib::AccountPeerBeacon {
             presence: airc_lib::beacon_now(
                 remote_peer,

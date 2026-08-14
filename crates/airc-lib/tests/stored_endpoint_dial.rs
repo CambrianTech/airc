@@ -654,7 +654,7 @@ async fn split_store_import_still_dials_no_silent_shadow() {
     let document = AccountRegistryDocument::new(
         MeshIdentity::new("test-account"),
         2_000,
-        vec![room.channel],
+        vec![airc_lib::AccountRoom::new(room.channel, Some(room.name.clone()))],
         vec![AccountPeerBeacon {
             endpoints_advertised_at_ms: None,
             endpoints_peer_id: None,

@@ -85,7 +85,7 @@ pub mod work_subscription;
 
 pub use account_registry::{
     merge_registry_documents, prune_stale_peers, scope_home_is_temp_rooted, AccountPeerBeacon,
-    AccountRegistryDocument, AccountRegistryError, AccountRegistryStore, RegistryMergeOutcome,
+    AccountRegistryDocument, AccountRegistryError, AccountRoom, AccountRegistryStore, RegistryMergeOutcome,
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 pub use account_registry_fs::FsAccountRegistryStore;

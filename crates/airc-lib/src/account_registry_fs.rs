@@ -206,6 +206,7 @@ mod tests {
     // zero GitHub. A regression that made publish clobber (single shared
     // file) or that skipped the merge would drop one machine's peer here.
     use super::*;
+    use crate::account_registry::AccountRoom;
     use airc_core::RoomId;
     use crate::account_registry::AccountPeerBeacon;
     use crate::route::RouteEndpoint;
@@ -259,7 +260,7 @@ mod tests {
         AccountRegistryDocument::new(
             mesh(),
             generated_at_ms,
-            vec![RoomId::from_u128(1)],
+            vec![AccountRoom::new(RoomId::from_u128(1), Some("general".to_string()))],
             vec![peer.clone()],
         )
     }
