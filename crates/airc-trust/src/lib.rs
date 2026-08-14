@@ -162,7 +162,8 @@ impl From<StoreError> for PeersStoreError {
             },
             StoreError::WrongPubkeyLength(got) => PeersStoreError::WrongPubkeyLength(got),
             StoreError::Base64(error) => PeersStoreError::Base64(error),
-            StoreError::Io(_)
+            StoreError::InvariantBroken(_)
+            | StoreError::Io(_)
             | StoreError::Database(_)
             | StoreError::LockPoisoned
             | StoreError::Migration(_)

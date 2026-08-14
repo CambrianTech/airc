@@ -1847,7 +1847,7 @@ impl Airc {
     /// loud error, never a new room. A label matches at most one room
     /// (labels key nothing, so several sharing one is the caller's
     /// answer to give by id).
-    fn resolve_or_mint(
+    async fn resolve_or_mint(
         &self,
         set: &mut subscriptions::SubscriptionSet,
         token: &str,
@@ -1891,13 +1891,29 @@ impl Airc {
         if let Some(found) = labelled.into_iter().next() {
             return Ok(found);
         }
-        Ok(set.create(&self.inner.wire_root, name)?)
+        // Not in THIS scope — ask the ACCOUNT. Every scope on this
+        // machine shares one room directory, so the label resolves to
+        // whatever id the first scope to use it minted, and this scope
+        // JOINS that room instead of minting a second one. Without this
+        // hop, `~/.airc` and `repo/.airc` would each hold their own
+        // private `#general` and never see each other.
+        let candidate = Subscription::minting(&self.inner.wire_root, name.clone())?;
+        let room_id = self
+            .coordinator_store()
+            .claim_room_label(name.as_str(), candidate.room_id, time::now_ms()?)
+            .await
+            .map_err(subscriptions::SubscriptionError::from)?;
+        if room_id == candidate.room_id {
+            set.insert_subscription(candidate.clone());
+            return Ok(candidate);
+        }
+        Ok(set.join(&self.inner.wire_root, room_id, name)?)
     }
 
     async fn join_channel(&self, name: &str, focus: Focus) -> Result<Room, AircError> {
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
-        let subscription = self.resolve_or_mint(&mut set, name)?;
+        let subscription = self.resolve_or_mint(&mut set, name).await?;
         let room_id = subscription.room_id;
         let channel = subscription.name.clone();
         set.join(&self.inner.wire_root, room_id, channel.clone())?;
@@ -2090,8 +2106,13 @@ impl Airc {
                 .map(|s| (s.room_id, true));
             let (room_id, was_subscribed) = match existing {
                 Some(found) => found,
+                // Same account hop as `resolve_or_mint`: the context's
+                // rooms must be the ones the account already has, or
+                // every scope infers its own private `#general`.
                 None => (
-                    set.create(&self.inner.wire_root, channel.clone())?.room_id,
+                    self.resolve_or_mint(&mut set, channel.as_str())
+                        .await?
+                        .room_id,
                     false,
                 ),
             };
@@ -2155,7 +2176,7 @@ impl Airc {
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         let room_id = match name {
-            Some(name) => self.resolve_or_mint(&mut set, name)?.room_id,
+            Some(name) => self.resolve_or_mint(&mut set, name).await?.room_id,
             None => set.default.ok_or(AircError::NoCurrentRoom)?,
         };
         let removed = set
@@ -2207,7 +2228,7 @@ impl Airc {
         }
 
         let identity = self.mesh_identity().await?;
-        let subscription = self.resolve_or_mint(&mut set, landing)?;
+        let subscription = self.resolve_or_mint(&mut set, landing).await?;
         let subscription =
             set.join(&self.inner.wire_root, subscription.room_id, subscription.name)?;
         set.set_default(subscription.room_id)?;

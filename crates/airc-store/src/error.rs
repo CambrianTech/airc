@@ -33,6 +33,12 @@ pub enum StoreError {
     #[error("unknown transcript kind: {0}")]
     UnknownTranscriptKind(String),
 
+    /// A row this store just wrote inside a transaction was not there
+    /// when the same transaction read it back. Never expected; refuse
+    /// rather than guess a value the caller would treat as durable.
+    #[error("store invariant broken: {0}")]
+    InvariantBroken(String),
+
     /// Stored numeric value is outside the domain accepted by the
     /// Rust contract. Refuse silent wraparound at the DB boundary.
     #[error("invalid stored value for {field}: {value}")]

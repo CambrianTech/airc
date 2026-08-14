@@ -30,6 +30,7 @@ mod m20260614_000017_add_peer_trust_last_seen;
 mod m20260629_000018_create_scoped_state;
 mod m20260723_000019_add_peer_trust_endpoints_stamp;
 mod m20260723_000020_add_peer_trust_endpoints_peer;
+mod m20260814_000021_create_room_directory;
 
 pub struct Migrator;
 
@@ -57,6 +58,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260629_000018_create_scoped_state::Migration),
             Box::new(m20260723_000019_add_peer_trust_endpoints_stamp::Migration),
             Box::new(m20260723_000020_add_peer_trust_endpoints_peer::Migration),
+            Box::new(m20260814_000021_create_room_directory::Migration),
         ]
     }
 }

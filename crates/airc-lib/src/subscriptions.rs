@@ -370,6 +370,11 @@ impl SubscriptionSet {
         Ok(sub)
     }
 
+    /// Record a subscription this scope already constructed.
+    pub(crate) fn insert_subscription(&mut self, sub: Subscription) {
+        self.insert(sub);
+    }
+
     fn insert(&mut self, sub: Subscription) {
         self.parted.remove(&sub.room_id);
         let room_id = sub.room_id;

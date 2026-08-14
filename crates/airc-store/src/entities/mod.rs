@@ -41,6 +41,7 @@ pub mod mesh_identity;
 pub mod peer_rotation_audit;
 pub mod peer_trust;
 pub mod refresh_lock;
+pub mod room_directory;
 pub mod runtime_cursor;
 pub mod scoped_state;
 pub mod subscription;
