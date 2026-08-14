@@ -22,7 +22,7 @@ use crate::coordinator::{CoordinatorSnapshot, PresenceBeacon};
 use crate::error::AircError;
 use crate::registry::PeerSpec;
 use crate::route::{InviteBeacon, RouteEndpoint};
-use crate::subscriptions::{ChannelName, MeshIdentity};
+use crate::subscriptions::{MeshIdentity};
 use crate::time;
 use crate::Airc;
 
@@ -33,6 +33,7 @@ pub const ACCOUNT_REGISTRY_SCHEMA_VERSION: u16 = 1;
 /// self-exit watchdog consults the SAME check without depending on
 /// this crate; re-exported here so existing callers keep their
 /// import path.
+pub use airc_core::RoomId;
 pub use airc_core::scope_home_is_temp_rooted;
 
 /// Outcome of [`merge_registry_documents`]: the merged view plus the
@@ -76,7 +77,7 @@ pub fn merge_registry_documents(
 ) -> RegistryMergeOutcome {
     let mut ignored_temp_beacons = 0usize;
     let mut generated_at_ms = 0u64;
-    let mut channels: Vec<ChannelName> = Vec::new();
+    let mut rooms: Vec<RoomId> = Vec::new();
     // peer_id -> (heartbeat_at_ms, doc generated_at_ms, beacon)
     let mut freshest: HashMap<airc_core::PeerId, (u64, u64, AccountPeerBeacon)> = HashMap::new();
     // peer_id -> (heartbeat_at_ms, doc generated_at_ms, endpoints,
@@ -98,9 +99,9 @@ pub fn merge_registry_documents(
         }
         matched_any = true;
         generated_at_ms = generated_at_ms.max(document.generated_at_ms);
-        for channel in &document.channels {
-            if !channels.contains(channel) {
-                channels.push(channel.clone());
+        for room_id in &document.rooms {
+            if !rooms.contains(room_id) {
+                rooms.push(*room_id);
             }
         }
         for beacon in document.peers {
@@ -165,13 +166,13 @@ pub fn merge_registry_documents(
         }
     }
     peers.sort_by_key(|peer| peer.peer_id().to_string());
-    channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    rooms.sort();
 
     RegistryMergeOutcome {
         document: Some(AccountRegistryDocument::new(
             mesh_identity.clone(),
             generated_at_ms,
-            channels,
+            rooms,
             peers,
         )),
         ignored_temp_beacons,
@@ -216,7 +217,8 @@ pub struct AccountRegistryDocument {
     pub schema_version: u16,
     pub mesh_identity: MeshIdentity,
     pub generated_at_ms: u64,
-    pub channels: Vec<ChannelName>,
+    /// Every room the account knows, BY ID.
+    pub rooms: Vec<RoomId>,
     pub peers: Vec<AccountPeerBeacon>,
 }
 
@@ -224,14 +226,14 @@ impl AccountRegistryDocument {
     pub fn new(
         mesh_identity: MeshIdentity,
         generated_at_ms: u64,
-        channels: Vec<ChannelName>,
+        rooms: Vec<RoomId>,
         peers: Vec<AccountPeerBeacon>,
     ) -> Self {
         Self {
             schema_version: ACCOUNT_REGISTRY_SCHEMA_VERSION,
             mesh_identity,
             generated_at_ms,
-            channels,
+            rooms,
             peers,
         }
     }
@@ -281,7 +283,7 @@ impl AccountRegistryDocument {
         Self::new(
             snapshot.mesh_identity.clone(),
             generated_at_ms,
-            snapshot.live_channels.clone(),
+            snapshot.live_rooms.clone(),
             peers,
         )
     }
@@ -597,29 +599,29 @@ impl Airc {
         // are publishing right now) carrying our dialable endpoints.
         if !document.peers.iter().any(|peer| peer.peer_id() == self_id) {
             // Card cbbcf18d (post-#1146 audit): the stamped self-beacon's
-            // channel list comes from `self.subscriptions()` — the LOCAL
+            // room list comes from `self.subscriptions()` — the LOCAL
             // single source of truth — not from presence-derived
-            // `snapshot.live_channels`. In the exact stale-self scenario
-            // this branch exists for, `live` is empty, so live_channels
+            // `snapshot.live_rooms`. In the exact stale-self scenario
+            // this branch exists for, `live` is empty, so live_rooms
             // is [] even while this scope is subscribed; identity, key,
             // and endpoints already follow the publisher-is-alive
-            // doctrine and the channel list must too.
-            let subscribed_channels: Vec<ChannelName> = self
+            // doctrine and the room list must too.
+            let subscribed_rooms: Vec<RoomId> = self
                 .subscriptions()
                 .await?
                 .into_iter()
-                .map(|subscription| subscription.name)
+                .map(|subscription| subscription.room_id)
                 .collect();
-            for channel in &subscribed_channels {
-                if !document.channels.contains(channel) {
-                    document.channels.push(channel.clone());
+            for room_id in &subscribed_rooms {
+                if !document.rooms.contains(room_id) {
+                    document.rooms.push(*room_id);
                 }
             }
-            document.channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            document.rooms.sort();
             let presence = crate::coordinator::beacon_now(
                 self_id,
                 self.inner.home.clone(),
-                subscribed_channels,
+                subscribed_rooms,
                 std::process::id(),
                 crate::time::now_ms()?,
             );

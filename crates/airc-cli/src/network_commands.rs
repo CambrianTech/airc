@@ -239,13 +239,13 @@ fn humanize_age_ms(age_ms: u64) -> String {
     }
 }
 
-/// Channel names a beacon subscribes to, as plain strings for display
-/// and convergence comparison (apples-to-apples with `Room::name`).
+/// Room ids a beacon subscribes to, as strings for display and
+/// comparison (apples-to-apples with `Room::channel`).
 fn beacon_channels(beacon: &PresenceBeacon) -> Vec<String> {
     beacon
-        .subscribed_channels
+        .subscribed_rooms
         .iter()
-        .map(|channel| channel.as_str().to_string())
+        .map(|room_id| room_id.to_string())
         .collect()
 }
 

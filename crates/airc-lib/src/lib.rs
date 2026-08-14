@@ -189,8 +189,8 @@ pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use subscriptions::{
-    derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
-    SubscriptionSet,
+    ChannelName, ChannelNameError, MeshIdentity, RoomIdResolution, Subscription,
+    SubscriptionError, SubscriptionSet,
 };
 pub use task_negotiation::{
     HEADER_AIRC_TASK_ACCEPTED, HEADER_AIRC_TASK_OFFER, HEADER_AIRC_TASK_REQUEST,

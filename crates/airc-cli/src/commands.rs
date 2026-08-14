@@ -209,12 +209,11 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
                 println!("  #{} ({})", room.name, room.channel);
             }
             if let Some(before) = default_before {
-                if before.as_str() != current.name {
+                if before != current.channel {
                     eprintln!(
-                        "WARNING: default room CHANGED: {} -> #{} — `airc msg` now targets #{}",
-                        before.display_with_hash(),
-                        current.name,
-                        current.name
+                        "WARNING: default room CHANGED: {} -> #{} ({}) — `airc msg` now \
+                         targets that room",
+                        before, current.name, current.channel
                     );
                 }
             }

@@ -64,7 +64,6 @@ use airc_store::EventStore;
 use async_trait::async_trait;
 
 use crate::coordinator::{self, CoordinatorConfig};
-use crate::subscriptions::derive_room_id;
 use crate::time;
 
 /// Verdict of an [`InboundFrameSink::deliver`] call. This is the
@@ -179,8 +178,8 @@ impl RouterInboundBridge {
             .live
             .iter()
             .chain(snapshot.stale.iter())
-            .flat_map(|beacon| beacon.subscribed_channels.iter())
-            .any(|name| derive_room_id(&identity, name) == channel))
+            .flat_map(|beacon| beacon.subscribed_rooms.iter())
+            .any(|room_id| *room_id == channel))
     }
 
     /// Self-healing join — the "blind room" heal (M5↔bigmama decay
@@ -227,29 +226,22 @@ impl RouterInboundBridge {
                 return false;
             }
         };
-        // Does the account know this channel? Check the document's
-        // channel union AND every beacon's subscription list (belt and
-        // braces — older documents may carry one but not the other).
-        let Some(name) = document
-            .channels
+        // Does the account know this room? The beacons carry room
+        // IDS, so this is an equality check on the key — nothing is
+        // re-derived and nothing can be merely id-SHAPED.
+        if !document
+            .peers
             .iter()
-            .chain(
-                document
-                    .peers
-                    .iter()
-                    .flat_map(|peer| peer.presence.subscribed_channels.iter()),
-            )
-            .find(|name| derive_room_id(&identity, name) == channel)
-            .cloned()
-        else {
+            .any(|peer| peer.presence.subscribed_rooms.contains(&channel))
+        {
             return false;
-        };
+        }
         // Re-bind: republish every registry beacon that subscribes the
         // channel into the coordinator store (idempotent upsert — the
         // exact write `join`'s publish_presence does).
         let mut rebound = 0usize;
         for peer in &document.peers {
-            if !peer.presence.subscribed_channels.contains(&name) {
+            if !peer.presence.subscribed_rooms.contains(&channel) {
                 continue;
             }
             match coordinator::publish_store(
@@ -287,7 +279,6 @@ impl RouterInboundBridge {
                  longer blind",
             )
             .with_field("channel", channel)
-            .with_field("channel_name", name.as_str())
             .with_field("rebound_beacons", rebound),
         );
         // The verdict must stay honest: only claim Delivered if the
@@ -295,63 +286,6 @@ impl RouterInboundBridge {
         matches!(self.channel_has_subscribed_scope(channel).await, Ok(true))
     }
 
-    /// Self-healing join — cross-machine NAME reconvergence (the
-    /// M5↔bigmama blind-room root cause). Channel UUIDs derive from
-    /// `(mesh_identity, name)`; when the sender's identity resolution
-    /// forked (gh unreachable → `local:<host>:<user>` fallback), its
-    /// room UUID diverges from ours and every frame it sends dies here
-    /// as unknown_channel — while the SAME room, by name, is bound by
-    /// local scopes. When the addressed channel binds no local scope
-    /// but the frame carries [`airc_protocol::HEADER_AIRC_CHANNEL_NAME`],
-    /// re-derive the room under THIS machine's identity; if that local
-    /// channel is bound (directly, or after the registry rebind heal),
-    /// deliver there — LOUDLY ([`DiagnosticCode::ChannelNameReconverged`]).
-    ///
-    /// Trust posture: the name is a heal HINT from an already
-    /// authenticated, enrolled-account peer, consulted ONLY when the
-    /// addressed UUID binds nothing — a bound channel is never
-    /// re-routed.
-    ///
-    /// Returns the local `RoomId` to deliver under, or `None` when no
-    /// honest reconvergence exists.
-    async fn reconverge_by_name(&self, frame: &Frame, addressed: RoomId) -> Option<RoomId> {
-        let raw = frame
-            .envelope
-            .headers
-            .get(airc_protocol::HEADER_AIRC_CHANNEL_NAME)?;
-        let name = crate::subscriptions::ChannelName::new(raw.clone()).ok()?;
-        let cached = crate::mesh_identity::resolve(self.coordinator_store.as_ref())
-            .await
-            .ok()?;
-        let identity = cached.as_mesh_identity();
-        let local = derive_room_id(&identity, &name);
-        if local == addressed {
-            // Same derivation — the channel is genuinely unbound here,
-            // not diverged; the registry rebind path owns that case.
-            return None;
-        }
-        let bound = matches!(self.channel_has_subscribed_scope(local).await, Ok(true))
-            || self.try_rebind_known_channel(local).await;
-        if !bound {
-            return None;
-        }
-        self.diag_sink.emit(
-            DiagnosticEvent::warn(
-                DiagnosticComponent::Subscriber,
-                DiagnosticCode::ChannelNameReconverged,
-                "inbound frame's channel UUID binds NO local scope, but its channel \
-                 NAME derives — under this machine's identity — to a bound room; \
-                 delivered there. The SENDING machine's mesh identity has diverged \
-                 from the account identity (likely gh unreachable there) and should \
-                 be fixed",
-            )
-            .with_field("addressed_channel", addressed)
-            .with_field("local_channel", local)
-            .with_field("channel_name", name.as_str())
-            .with_field("sender", frame.envelope.sender),
-        );
-        Some(local)
-    }
 }
 
 /// Local binding state of an inbound frame's channel, resolved BEFORE
@@ -368,30 +302,17 @@ enum ChannelBinding {
 impl InboundFrameSink for RouterInboundBridge {
     async fn deliver(&self, frame: &Frame) -> InboundDeliveryVerdict {
         let event_id = frame.envelope.event_id;
+        // The frame's room id IS where it goes. There is no remap:
+        // an id is not derived from anything, so there is nothing for
+        // a sender-supplied label to disagree with, and a peer never
+        // gets to redirect a frame by sending different text.
         let addressed = frame.envelope.channel;
-        // Resolve the local binding BEFORE publish so a name-
-        // reconverged frame lands in the transcript of the room a
-        // local scope actually reads — never in a ghost channel.
         let binding = match self.channel_has_subscribed_scope(addressed).await {
             Ok(true) => ChannelBinding::Bound,
             Ok(false) => ChannelBinding::Unbound,
             Err(error) => ChannelBinding::Unknown(error),
         };
-        let remapped = match binding {
-            // A bound channel is never re-routed — the name header is
-            // a heal hint, not addressing authority.
-            ChannelBinding::Unbound => self.reconverge_by_name(frame, addressed).await,
-            ChannelBinding::Bound | ChannelBinding::Unknown(_) => None,
-        };
-        let mut env = bus_envelope_for_inbound(frame);
-        if let Some(local) = remapped {
-            env.channel = local;
-            // Keep a room mention coherent with the delivery channel
-            // (room mentions round-trip as `room:<uuid>` endpoints).
-            if frame.envelope.target == MentionTarget::Room(addressed) {
-                env.target = Target::Endpoint(format!("room:{}", local.as_uuid()));
-            }
-        }
+        let env = bus_envelope_for_inbound(frame);
         // Card 1998f6cb: attach the verified link origin so the
         // router's outbound forward sink (when installed) never
         // echoes this frame back over the link it arrived on.
@@ -403,12 +324,7 @@ impl InboundFrameSink for RouterInboundBridge {
             Ok(PublishIfNew::Published(_)) | Ok(PublishIfNew::Duplicate) => match binding {
                 ChannelBinding::Bound => InboundDeliveryVerdict::Delivered,
                 ChannelBinding::Unbound => {
-                    if let Some(local) = remapped {
-                        // Name reconvergence already proved (and, when
-                        // needed, rebound) the local binding — and the
-                        // frame was PUBLISHED under it.
-                        InboundDeliveryVerdict::DeliveredRemapped(local)
-                    } else if self.try_rebind_known_channel(addressed).await {
+                    if self.try_rebind_known_channel(addressed).await {
                         // Self-healing join: before concluding "stored
                         // but blind", try re-binding from the account
                         // registry's known channels (decay mode #5).
