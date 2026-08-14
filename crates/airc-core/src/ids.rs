@@ -73,6 +73,29 @@ macro_rules! uuid_newtype {
                 self.0.fmt(f)
             }
         }
+
+        /// The inverse of `Display`, so an id crosses a TEXT boundary
+        /// — an env var, a CLI argument, a config file — by being
+        /// PARSED into its type, once, here.
+        ///
+        /// Without this every such boundary hand-rolls
+        /// `Uuid::parse_str(..).map($name::from_uuid)`, and a boundary
+        /// that finds that tedious keeps the `String` instead. That is
+        /// how a display label becomes an identity: not by a decision,
+        /// but by the typed path being fractionally less convenient
+        /// than the untyped one. Rendering was already free; parsing
+        /// is now free too.
+        ///
+        /// Surrounding whitespace is trimmed because these values
+        /// arrive from humans and shells. Nothing else is accepted —
+        /// no prefixes, no truncation, no partial ids.
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(raw: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(raw.trim()).map(Self)
+            }
+        }
     };
 }
 

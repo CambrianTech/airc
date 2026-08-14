@@ -188,7 +188,10 @@ impl EventStore for InMemoryEventStore {
     ) -> Result<RoomId, StoreError> {
         // Held across the read AND the write: the whole point is that
         // two concurrent claims cannot both mint.
-        let mut directory = self.room_directory.lock().expect("room_directory lock");
+        let mut directory = self
+            .room_directory
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
         Ok(*directory.entry(label.to_string()).or_insert(candidate))
     }
 
@@ -196,7 +199,7 @@ impl EventStore for InMemoryEventStore {
         Ok(self
             .room_directory
             .lock()
-            .expect("room_directory lock")
+            .map_err(|_| StoreError::LockPoisoned)?
             .get(label)
             .copied())
     }

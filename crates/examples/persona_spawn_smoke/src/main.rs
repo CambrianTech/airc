@@ -29,7 +29,7 @@ const TURN_WAIT: Duration = Duration::from_secs(30);
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = PersonaAgentConfig::from_env()?;
-    let room = config.room.clone();
+    let room_id = config.room_id;
     let parent_lan_addr = config.parent_lan_addr;
 
     let mut agent = PersonaAgent::spawn(config).await?;
@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "persona-ready persona_id={} room={} parent={}",
         agent.capabilities().persona_id,
-        room,
+        room_id,
         agent.parent_peer_id(),
     );
 
