@@ -64,17 +64,69 @@ pub struct Room {
     pub name: String,
     /// Wire directory for this room.
     pub wire: PathBuf,
-    /// Channel UUID, derived deterministically from `name` so peers
-    /// joining the same name land in the same channel.
+    /// Channel UUID — the room's ADDRESS. Minted, never derived from
+    /// the name (see `mint`). The name is a label hanging off this id;
+    /// this id is what every caller passes.
     pub channel: RoomId,
     pub joined_at_ms: u64,
 }
 
 impl Room {
-    /// Derive a `Room` from a name + home dir. Deterministic — same
-    /// (home, name) always produces the same `Room`. Doesn't read
-    /// or write disk.
-    pub fn from_name(home: &Path, name: &str) -> Result<Self, RoomError> {
+    /// Mint a NEW room. The id is generated and out of the caller's
+    /// control; the name is a display label with no addressing role.
+    ///
+    /// ## Why the id is minted and not derived
+    ///
+    /// This used to be `from_name`, deriving BOTH the identity
+    /// (`new_v5(ROOM_NAMESPACE, name)`) and the storage location
+    /// (`wires/sanitise_name(name)`) from a human string. One
+    /// derivation, and text became identity — which is the root of
+    /// every room defect this crate carries:
+    ///
+    /// - a name that is *id-shaped* hashes into a brand-new channel,
+    ///   so a scope writes and reads a room nobody else is in. Twice
+    ///   in production (card c409eaf5): a full uuid, then the 8-hex
+    ///   short id minting ghost room `7d1a76de` off academy's prefix.
+    ///   `resolve_id_token` and the `JoinUuidString` / `JoinIdUnknown`
+    ///   / `JoinIdAmbiguous` errors exist ONLY to referee that.
+    /// - an id can *diverge* from its stored name, so join carries
+    ///   self-healing (`rebind_diverged`) to re-bind rooms whose uuid
+    ///   no longer derives from the name it was saved under.
+    /// - the name charset (`ChannelName`) becomes load-bearing on
+    ///   identity, so a room cannot be called anything a hash-input
+    ///   validator dislikes.
+    ///
+    /// A minted id makes all of that unrepresentable: nothing derives,
+    /// so nothing can diverge; the id IS an id, so nothing can be
+    /// merely id-SHAPED; the label is free text because no one hashes
+    /// it. Renaming a room is now a label edit, and two rooms may
+    /// share a label without colliding.
+    ///
+    /// Rendezvous — the one thing derivation genuinely bought (two
+    /// machines independently landing on `#general` with no registry)
+    /// — is a discovery concern, not an identity one: peers exchange
+    /// the id. Named lookup for humans lives at the CLI edge.
+    pub fn mint(home: &Path, name: &str) -> Result<Self, RoomError> {
+        let channel = RoomId::from_uuid(Uuid::new_v4());
+        // Wire dir keyed by the ID: always a valid path component, so
+        // `sanitise_name` has no say in where a room's bytes live.
+        let wire = home.join("wires").join(channel.to_string());
+        Ok(Self {
+            version: ROOM_VERSION,
+            name: name.to_string(),
+            wire,
+            channel,
+            joined_at_ms: now_ms()?,
+        })
+    }
+
+    /// Re-derive the legacy name-hashed room. RETAINED FOR MIGRATION
+    /// ONLY: every room created before ids were minted has an id that
+    /// IS `v5(name)` and a wire dir at `wires/<sanitised-name>`, so
+    /// existing installs (and peers still on the old build) must be
+    /// able to reconstruct it to find their bytes. Never call this for
+    /// a NEW room — `mint` is the constructor.
+    pub fn legacy_from_name(home: &Path, name: &str) -> Result<Self, RoomError> {
         let wire = home.join("wires").join(sanitise_name(name));
         let channel = RoomId::from_uuid(Uuid::new_v5(&ROOM_NAMESPACE, name.as_bytes()));
         Ok(Self {
@@ -86,10 +138,15 @@ impl Room {
         })
     }
 
-    /// Default room — auto-created on `airc init`. Name "default",
-    /// derived per `from_name`.
+    /// Default room — auto-created on `airc init`.
+    ///
+    /// LEGACY-DERIVED on purpose: every install that already ran `init`
+    /// has this room at `v5("default")` with its bytes under
+    /// `wires/default`. Minting a fresh id here would strand those
+    /// bytes and split existing scopes from their own default room, so
+    /// this one keeps the derived id until a migration moves it.
     pub fn default_for(home: &Path) -> Result<Self, RoomError> {
-        Self::from_name(home, DEFAULT_ROOM_NAME)
+        Self::legacy_from_name(home, DEFAULT_ROOM_NAME)
     }
 
     /// Stamp this room's human NAME onto outbound headers
