@@ -2451,6 +2451,14 @@ mod trust_tier_wire_str {
     }
 }
 
+/// How much room history a wall projection folds in.
+///
+/// Generous because a busy room accumulates pinned posts over time, and a
+/// wall post that scrolls out of the window silently stops being true —
+/// which is worse than a slow read. Declared once so `wall_posts` and
+/// `wall_posts_in` can never disagree about what "the wall" means.
+pub const WALL_PROJECTION_PAGE_SIZE: usize = 500;
+
 /// Pure discriminator: recover the `WallPostPublished` carried by a
 /// transcript event's self-describing body, or `None` if the event is
 /// not a wall post.
@@ -2463,15 +2471,6 @@ mod trust_tier_wire_str {
 /// deserializes to this variant for an actual wall post, so it is the
 /// authoritative identity; doctrine / identity / chat bodies fall through
 /// to `None` (heterogeneous-stream projection, not error-swallowing).
-
-/// How much room history a wall projection folds in.
-///
-/// Generous because a busy room accumulates pinned posts over time, and a
-/// wall post that scrolls out of the window silently stops being true —
-/// which is worse than a slow read. Declared once so `wall_posts` and
-/// `wall_posts_in` can never disagree about what "the wall" means.
-pub const WALL_PROJECTION_PAGE_SIZE: usize = 500;
-
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
 ) -> Option<airc_core::doctrine::WallPostPublished> {
