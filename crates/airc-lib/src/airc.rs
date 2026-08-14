@@ -1877,8 +1877,7 @@ impl Airc {
             subscriptions::RoomIdResolution::NotAnId => {}
         }
         let name = ChannelName::new(token)?;
-        let labelled: Vec<Subscription> =
-            set.all().filter(|s| s.name == name).cloned().collect();
+        let labelled: Vec<Subscription> = set.all().filter(|s| s.name == name).cloned().collect();
         if labelled.len() > 1 {
             return Err(AircError::JoinIdAmbiguous {
                 token: token.trim().to_string(),
@@ -2229,8 +2228,11 @@ impl Airc {
 
         let identity = self.mesh_identity().await?;
         let subscription = self.resolve_or_mint(&mut set, landing).await?;
-        let subscription =
-            set.join(&self.inner.wire_root, subscription.room_id, subscription.name)?;
+        let subscription = set.join(
+            &self.inner.wire_root,
+            subscription.room_id,
+            subscription.name,
+        )?;
         set.set_default(subscription.room_id)?;
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;

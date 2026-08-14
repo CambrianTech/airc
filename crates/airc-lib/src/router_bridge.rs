@@ -285,7 +285,6 @@ impl RouterInboundBridge {
         // re-published beacons actually bind the channel now.
         matches!(self.channel_has_subscribed_scope(channel).await, Ok(true))
     }
-
 }
 
 /// Local binding state of an inbound frame's channel, resolved BEFORE

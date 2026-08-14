@@ -50,8 +50,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::subscriptions::{ChannelNameError, MeshIdentity};
 use airc_core::{PeerId, RoomId};
-use uuid::Uuid;
 use airc_store::{EventStore, StoreError, StoredBeacon, StoredRefreshLockOutcome};
+use uuid::Uuid;
 
 const BEACON_VERSION: u32 = 1;
 const ACCOUNTS_DIR: &str = "accounts";
@@ -442,13 +442,7 @@ mod tests {
     }
 
     fn make_beacon(now_ms: u64, rooms: Vec<RoomId>) -> PresenceBeacon {
-        beacon_now(
-            peer(),
-            PathBuf::from("/tmp/x/.airc"),
-            rooms,
-            12345,
-            now_ms,
-        )
+        beacon_now(peer(), PathBuf::from("/tmp/x/.airc"), rooms, 12345, now_ms)
     }
 
     #[test]

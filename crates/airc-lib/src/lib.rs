@@ -85,8 +85,9 @@ pub mod work_subscription;
 
 pub use account_registry::{
     merge_registry_documents, prune_stale_peers, scope_home_is_temp_rooted, AccountPeerBeacon,
-    AccountRegistryDocument, AccountRegistryError, AccountRoom, AccountRegistryStore, RegistryMergeOutcome,
-    SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
+    AccountRegistryDocument, AccountRegistryError, AccountRegistryStore, AccountRoom,
+    RegistryMergeOutcome, SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION,
+    DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 pub use account_registry_fs::FsAccountRegistryStore;
 pub use agent_heartbeat::{
@@ -189,8 +190,8 @@ pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};
 pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
 pub use subscriptions::{
-    ChannelName, ChannelNameError, MeshIdentity, RoomIdResolution, Subscription,
-    SubscriptionError, SubscriptionSet,
+    ChannelName, ChannelNameError, MeshIdentity, RoomIdResolution, Subscription, SubscriptionError,
+    SubscriptionSet,
 };
 pub use task_negotiation::{
     HEADER_AIRC_TASK_ACCEPTED, HEADER_AIRC_TASK_OFFER, HEADER_AIRC_TASK_REQUEST,

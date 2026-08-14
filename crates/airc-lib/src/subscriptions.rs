@@ -247,7 +247,11 @@ impl Subscription {
     /// Membership in a room whose id you already hold — the normal
     /// path. A peer hands you an id, a board row carries one, a
     /// dispatch names one; you join THAT room.
-    pub fn joining(home: &Path, room_id: RoomId, name: ChannelName) -> Result<Self, SubscriptionError> {
+    pub fn joining(
+        home: &Path,
+        room_id: RoomId,
+        name: ChannelName,
+    ) -> Result<Self, SubscriptionError> {
         Self::with_wire_root(home, room_id, name)
     }
 
@@ -295,7 +299,6 @@ impl Subscription {
         }
     }
 }
-
 
 /// All channels this scope is subscribed to, plus the default-channel
 /// pointer for short-shape commands and the parted set so re-running
@@ -491,7 +494,6 @@ impl SubscriptionSet {
     pub fn room_ids(&self) -> impl Iterator<Item = &RoomId> {
         self.subscribed.keys()
     }
-
 }
 
 /// Load the subscription set from the durable store. If no rows exist
@@ -708,7 +710,6 @@ mod tests {
         assert_eq!(c.display_with_hash(), "#general");
     }
 
-
     #[test]
     fn resolve_id_token_binds_id_shaped_tokens_to_existing_channels() {
         // what this catches: the ghost-room mint (card c409eaf5 octave 2,
@@ -808,10 +809,18 @@ mod tests {
         let mut b = SubscriptionSet::empty();
 
         let a_sub = a
-            .join_with_wire_root(machine_home.path(), room_id, ChannelName::new("general").unwrap())
+            .join_with_wire_root(
+                machine_home.path(),
+                room_id,
+                ChannelName::new("general").unwrap(),
+            )
             .unwrap();
         let b_sub = b
-            .join_with_wire_root(machine_home.path(), room_id, ChannelName::new("general").unwrap())
+            .join_with_wire_root(
+                machine_home.path(),
+                room_id,
+                ChannelName::new("general").unwrap(),
+            )
             .unwrap();
 
         assert_eq!(a_sub.room_id, b_sub.room_id);
@@ -869,7 +878,8 @@ mod tests {
         set.unsubscribe(&general.room_id);
         assert!(set.parted.contains(&general.room_id));
 
-        set.join(home, general.room_id, general.name.clone()).unwrap();
+        set.join(home, general.room_id, general.name.clone())
+            .unwrap();
         assert!(!set.parted.contains(&general.room_id));
         assert_eq!(set.default, Some(general.room_id));
     }

@@ -22,19 +22,19 @@ use crate::coordinator::{CoordinatorSnapshot, PresenceBeacon};
 use crate::error::AircError;
 use crate::registry::PeerSpec;
 use crate::route::{InviteBeacon, RouteEndpoint};
-use crate::subscriptions::{MeshIdentity};
+use crate::subscriptions::MeshIdentity;
 use crate::time;
 use crate::Airc;
 
 pub const ACCOUNT_REGISTRY_SCHEMA_VERSION: u16 = 1;
 
+pub use airc_core::scope_home_is_temp_rooted;
 /// Temp-rooted scope-home detection (#1150). The definition moved to
 /// [`airc_core::temp_home`] (card f122b5b5) so `airc-daemon`'s idle
 /// self-exit watchdog consults the SAME check without depending on
 /// this crate; re-exported here so existing callers keep their
 /// import path.
 pub use airc_core::RoomId;
-pub use airc_core::scope_home_is_temp_rooted;
 
 /// Outcome of [`merge_registry_documents`]: the merged view plus the
 /// hygiene counters the caller must surface (count, not full dump).
@@ -644,8 +644,7 @@ impl Airc {
             // and endpoints already follow the publisher-is-alive
             // doctrine and the room list must too.
             let subscriptions = self.subscriptions().await?;
-            let subscribed_rooms: Vec<RoomId> =
-                subscriptions.iter().map(|s| s.room_id).collect();
+            let subscribed_rooms: Vec<RoomId> = subscriptions.iter().map(|s| s.room_id).collect();
             for subscription in &subscriptions {
                 let label = (!subscription.name.as_str().is_empty())
                     .then(|| subscription.name.as_str().to_string());

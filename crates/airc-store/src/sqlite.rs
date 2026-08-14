@@ -31,6 +31,7 @@ use airc_core::{
 
 use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 use crate::beacon::StoredBeacon;
+use crate::entities::room_directory;
 use crate::entities::{
     account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
     peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, scoped_state, subscription,
@@ -42,7 +43,6 @@ use crate::peer_trust::{RotationAuditEntry, StoredPeer, TrustTier};
 use crate::refresh_lock::StoredRefreshLockOutcome;
 use crate::scoped_state::StoredScopedState;
 use crate::store::EventStore;
-use crate::entities::room_directory;
 use crate::subscriptions::StoredSubscription;
 
 /// Deadlock backstop for the single-connection pool — NOT a load limit.

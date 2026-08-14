@@ -477,7 +477,10 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
     let document = airc_lib::AccountRegistryDocument::new(
         identity.clone(),
         now_ms,
-        vec![airc_lib::AccountRoom::new(known_room, Some("general".to_string()))],
+        vec![airc_lib::AccountRoom::new(
+            known_room,
+            Some("general".to_string()),
+        )],
         vec![airc_lib::AccountPeerBeacon {
             presence: airc_lib::beacon_now(
                 remote_peer,
@@ -524,7 +527,11 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
     // → rebound from the registry beacon and DELIVERED.
     assert_eq!(
         bridge
-            .deliver(&inbound_frame(known_room, EventId::new(), "hello blind room"))
+            .deliver(&inbound_frame(
+                known_room,
+                EventId::new(),
+                "hello blind room"
+            ))
             .await,
         InboundDeliveryVerdict::Delivered,
         "a registry-known channel must re-bind and deliver, not store-and-drop"
