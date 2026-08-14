@@ -439,6 +439,17 @@ impl SubscriptionSet {
         self.subscribed.values()
     }
 
+    /// The subscription for a room id — one comparison against the key
+    /// this map is already keyed by.
+    ///
+    /// Borrowed, deliberately. A caller that only needs to READ a field
+    /// should not be handed an owned copy of a `String` + `PathBuf`;
+    /// clone at the boundary that genuinely requires ownership, and only
+    /// there.
+    pub fn get(&self, room_id: RoomId) -> Option<&Subscription> {
+        self.subscribed.get(&room_id)
+    }
+
     /// Resolve a join TOKEN that may be a channel ID rather than a
     /// name (card c409eaf5, octave 2 — glass-boxed 2026-08-11).
     ///

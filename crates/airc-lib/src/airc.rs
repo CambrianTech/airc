@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use airc_core::{ClientId, PeerId, ScopeRef, ScopedStateEntry, TranscriptEvent};
+use airc_core::{ClientId, PeerId, RoomId, ScopeRef, ScopedStateEntry, TranscriptEvent};
 use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
 use airc_protocol::{IdentityAssertion, PeerKeyRegistry, VerificationPolicy};
@@ -1868,19 +1868,39 @@ impl Airc {
             subscriptions::RoomIdResolution::NotAnId => {}
         }
         let name = ChannelName::new(token)?;
-        let labelled: Vec<Subscription> = set.all().filter(|s| s.name == name).cloned().collect();
-        if labelled.len() > 1 {
+        // Collect the IDS, not the subscriptions. `RoomId` is `Copy`, so
+        // this ends the borrow on `set` — which is the whole reason the
+        // collect exists — without copying a `String` + `PathBuf` per
+        // match. The previous shape cloned every candidate and then read
+        // one field off each: N heap allocations to answer "how many, and
+        // which ids", both of which the ids alone already say.
+        let labelled: Vec<RoomId> = set
+            .all()
+            .filter(|s| s.name == name)
+            .map(|s| s.room_id)
+            .collect();
+        match labelled.as_slice() {
             // The candidates are IDS. Rendering them into "name (id)"
             // here would make the caller parse text back apart to get
             // the one thing it needs — and the one thing it needs is
             // the id it should have passed instead of the label.
-            return Err(AircError::JoinIdAmbiguous {
-                token: token.trim().to_string(),
-                candidates: labelled.iter().map(|s| s.room_id).collect(),
-            });
-        }
-        if let Some(found) = labelled.into_iter().next() {
-            return Ok(found);
+            [_, _, ..] => {
+                return Err(AircError::JoinIdAmbiguous {
+                    token: token.trim().to_string(),
+                    candidates: labelled,
+                })
+            }
+            // ONE clone, and only here: the return type is owned, and a
+            // borrow cannot escape a `&mut set` the caller goes on to
+            // mutate. That is the "unless absolutely necessary" case.
+            [only] => {
+                let only = *only;
+                return set
+                    .get(only)
+                    .cloned()
+                    .ok_or_else(|| subscriptions::SubscriptionError::UnknownRoom(only).into());
+            }
+            [] => {}
         }
         // Not in THIS scope — ask the ACCOUNT. Every scope on this
         // machine shares one room directory, so the label resolves to
