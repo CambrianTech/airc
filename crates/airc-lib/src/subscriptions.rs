@@ -99,6 +99,18 @@ impl From<ChannelNameError> for SubscriptionError {
 pub struct ChannelName(String);
 
 impl ChannelName {
+    /// The empty display label, for a room that has no name — one
+    /// addressed purely by id (dispatched into, handed over by a peer)
+    /// or one whose stored label no longer parses.
+    ///
+    /// This is a LABEL being absent, never an identity being absent: the
+    /// room is fully identified by its `RoomId`. Before ids keyed
+    /// membership, an unparseable name meant the whole subscription was
+    /// dropped on load — a display string could evict a real room.
+    pub(crate) fn unnamed() -> Self {
+        Self(String::new())
+    }
+
     pub(crate) fn general() -> Self {
         Self("general".to_string())
     }
@@ -325,14 +337,24 @@ pub struct SubscriptionRebind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionSet {
     pub version: u32,
-    pub subscribed: BTreeMap<ChannelName, Subscription>,
-    /// Default channel for `airc msg "..."` etc. `None` means no
+    /// Keyed by ROOM ID — the address. The name rides along inside each
+    /// `Subscription` as a display label and keys nothing.
+    ///
+    /// This was keyed by `ChannelName`, which made a display string the
+    /// lookup key for durable membership: a room could only be
+    /// remembered if it had a name, a renamed room became a different
+    /// room, and a room you were HANDED (dispatched into, told about by
+    /// a peer) had an id and no name and so could not be represented at
+    /// all. No migration is needed for the switch — `StoredSubscription`
+    /// has always persisted `room_id` alongside the name, so the id was
+    /// on disk the whole time; only the in-memory key was wrong.
+    pub subscribed: BTreeMap<RoomId, Subscription>,
+    /// Default room for `airc msg "..."` etc. `None` means no
     /// subscriptions yet (fresh-init scope).
-    pub default: Option<ChannelName>,
-    /// Channels the user explicitly parted. Never auto-rejoined by
-    /// `join_default_context`. Re-subscribing via `subscribe` clears
-    /// the entry from this set.
-    pub parted: BTreeSet<ChannelName>,
+    pub default: Option<RoomId>,
+    /// Rooms the user explicitly parted. Never auto-rejoined by
+    /// `join_default_context`. Re-subscribing clears the entry.
+    pub parted: BTreeSet<RoomId>,
 }
 
 impl SubscriptionSet {
@@ -525,28 +547,30 @@ impl SubscriptionSet {
 pub async fn load_or_init(store: &dyn EventStore) -> Result<SubscriptionSet, SubscriptionError> {
     let mut set = SubscriptionSet::empty();
     for row in store.load_subscriptions().await? {
-        let name = ChannelName::new(&row.channel_name)?;
+        // Key off the ROOM ID the row already carries. The stored name is
+        // read as a display label only, and a row whose label no longer
+        // parses (or never had one — an id-addressed room) is still a
+        // perfectly good membership: the id is what identifies it.
         if row.parted {
-            set.parted.insert(name);
+            set.parted.insert(row.room_id);
             continue;
         }
         let subscription = Subscription {
-            name: name.clone(),
+            name: ChannelName::new(&row.channel_name).unwrap_or_else(|_| ChannelName::unnamed()),
             room_id: row.room_id,
             wire: PathBuf::from(row.wire),
             joined_at_ms: row.joined_at_ms,
         };
         if row.is_default {
-            set.default = Some(name.clone());
+            set.default = Some(row.room_id);
         }
-        set.subscribed.insert(name, subscription);
+        set.subscribed.insert(row.room_id, subscription);
     }
     if set
         .default
-        .as_ref()
-        .is_some_and(|name| !set.subscribed.contains_key(name))
+        .is_some_and(|room| !set.subscribed.contains_key(&room))
     {
-        set.default = set.subscribed.keys().next().cloned();
+        set.default = set.subscribed.keys().next().copied();
     }
     Ok(set)
 }
@@ -561,15 +585,21 @@ pub async fn save(store: &dyn EventStore, set: &SubscriptionSet) -> Result<(), S
             room_id: subscription.room_id,
             wire: subscription.wire.to_string_lossy().into_owned(),
             joined_at_ms: subscription.joined_at_ms,
-            is_default: set.default.as_ref() == Some(&subscription.name),
+            is_default: set.default == Some(subscription.room_id),
             parted: false,
         });
     }
-    for channel in &set.parted {
-        if !set.subscribed.contains_key(channel) {
+    for room in &set.parted {
+        if !set.subscribed.contains_key(room) {
             rows.push(StoredSubscription {
-                channel_name: channel.as_str().to_string(),
-                room_id: derive_room_id(&MeshIdentity::unset(), channel),
+                // The parted row used to re-DERIVE its room id from the
+                // name against an `unset` identity — a fabricated id that
+                // matched the real room only by luck of the derivation.
+                // The parted set holds the actual id now, so the row
+                // carries it and the label is left empty: nothing keys on
+                // a name any more.
+                channel_name: String::new(),
+                room_id: *room,
                 wire: String::new(),
                 joined_at_ms: 0,
                 is_default: false,

@@ -26,8 +26,14 @@ use uuid::Uuid;
 macro_rules! uuid_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
+        // `Ord`/`PartialOrd` so an id can KEY an ordered collection. Ids
+        // address things — rooms, peers, events — so the maps and sets
+        // that hold them must sort by the id, not by some display string
+        // that happens to be attached. Without this the only sortable
+        // handle on a room was its name, which is exactly how a display
+        // label ended up as the key for durable membership.
         #[derive(
-            Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
         #[serde(transparent)]
         pub struct $name(pub Uuid);
