@@ -435,15 +435,17 @@ mod tests {
         PeerId::from_uuid(Uuid::new_v4())
     }
 
-    fn channel(name: &str) -> ChannelName {
-        ChannelName::new(name).unwrap()
+    /// A stable test room id. Production ids are minted; these are
+    /// hand-picked so assertions can name the room they mean.
+    fn room(n: u128) -> RoomId {
+        RoomId::from_u128(n)
     }
 
-    fn make_beacon(now_ms: u64, channels: Vec<&str>) -> PresenceBeacon {
+    fn make_beacon(now_ms: u64, rooms: Vec<RoomId>) -> PresenceBeacon {
         beacon_now(
             peer(),
             PathBuf::from("/tmp/x/.airc"),
-            channels.into_iter().map(channel).collect(),
+            rooms,
             12345,
             now_ms,
         )
@@ -476,8 +478,8 @@ mod tests {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 100,
         };
-        let fresh = make_beacon(950, vec!["general", "cambriantech"]);
-        let stale = make_beacon(0, vec!["ideem"]);
+        let fresh = make_beacon(950, vec![room(1), room(2)]);
+        let stale = make_beacon(0, vec![room(3)]);
 
         publish_store(&store, &mesh, &fresh).await.unwrap();
         publish_store(&store, &mesh, &stale).await.unwrap();
@@ -491,14 +493,7 @@ mod tests {
         let snapshot = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
         assert_eq!(snapshot.live.len(), 1);
         assert_eq!(snapshot.stale.len(), 1);
-        assert_eq!(
-            snapshot
-                .live_channels
-                .iter()
-                .map(ChannelName::as_str)
-                .collect::<Vec<_>>(),
-            vec!["cambriantech", "general"]
-        );
+        assert_eq!(snapshot.live_rooms, vec![room(1), room(2)]);
 
         assert_eq!(
             drain_stale_store(&store, &mesh, &snapshot).await.unwrap(),
@@ -525,8 +520,8 @@ mod tests {
             refresh_interval_ms: 100,
         };
 
-        let fresh = make_beacon(950, vec!["general"]);
-        let stale = make_beacon(0, vec!["cambriantech"]);
+        let fresh = make_beacon(950, vec![room(1)]);
+        let stale = make_beacon(0, vec![room(2)]);
         publish_store(&store, &mesh, &fresh).await.unwrap();
         publish_store(&store, &mesh, &stale).await.unwrap();
 
@@ -543,14 +538,17 @@ mod tests {
         let mesh = id();
         let cfg = CoordinatorConfig::default();
 
-        let a = make_beacon(1_000, vec!["general", "cambriantech"]);
-        let b = make_beacon(1_000, vec!["general", "ideem"]);
+        let a = make_beacon(1_000, vec![room(1), room(2)]);
+        let b = make_beacon(1_000, vec![room(1), room(3)]);
         publish_store(&store, &mesh, &a).await.unwrap();
         publish_store(&store, &mesh, &b).await.unwrap();
 
         let snap = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
-        let names: Vec<&str> = snap.live_channels.iter().map(ChannelName::as_str).collect();
-        assert_eq!(names, vec!["cambriantech", "general", "ideem"]);
+        assert_eq!(
+            snap.live_rooms,
+            vec![room(1), room(2), room(3)],
+            "deduplicated and sorted by id"
+        );
     }
 
     #[tokio::test]
@@ -561,15 +559,15 @@ mod tests {
             .unwrap();
         assert!(snap.live.is_empty());
         assert!(snap.stale.is_empty());
-        assert!(snap.live_channels.is_empty());
+        assert!(snap.live_rooms.is_empty());
     }
 
     #[tokio::test]
     async fn snapshot_isolates_identities() {
         let store = airc_store::InMemoryEventStore::new();
         let cfg = CoordinatorConfig::default();
-        let mine = make_beacon(1_000, vec!["general"]);
-        let theirs = make_beacon(1_000, vec!["general"]);
+        let mine = make_beacon(1_000, vec![room(1)]);
+        let theirs = make_beacon(1_000, vec![room(1)]);
         publish_store(&store, &id(), &mine).await.unwrap();
         publish_store(&store, &other_id(), &theirs).await.unwrap();
 
@@ -591,8 +589,8 @@ mod tests {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 100,
         };
-        let fresh = make_beacon(950, vec!["general"]);
-        let stale = make_beacon(0, vec!["general"]);
+        let fresh = make_beacon(950, vec![room(1)]);
+        let stale = make_beacon(0, vec![room(1)]);
         publish_store(&store, &mesh, &fresh).await.unwrap();
         publish_store(&store, &mesh, &stale).await.unwrap();
 
@@ -616,7 +614,7 @@ mod tests {
             ..beacon_now(
                 peer_id,
                 PathBuf::from("/tmp/x/.airc"),
-                vec![channel("general")],
+                vec![room(1)],
                 100,
                 1_000,
             )
@@ -804,7 +802,7 @@ mod tests {
 
     #[test]
     fn beacon_is_fresh_uses_saturating_sub_for_clock_skew() {
-        let beacon = make_beacon(2_000, vec!["general"]);
+        let beacon = make_beacon(2_000, vec![room(1)]);
         // now_ms < heartbeat_at_ms — saturating yields 0, < ttl, so fresh.
         assert!(beacon.is_fresh(1_000, 500));
     }

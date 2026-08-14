@@ -465,7 +465,9 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
     // Seed the LOCAL account-registry cache: the account knows
     // #general via a remote machine's beacon. No scope on THIS machine
     // has ever joined, so the coordinator store holds no binding.
-    let channel_name = airc_lib::subscriptions::ChannelName::new("general").expect("channel");
+    // The account knows this ROOM BY ID — that is what a beacon
+    // advertises and what a frame addresses.
+    let known_room = RoomId::new();
     let remote_peer = PeerId::new();
     let remote_keypair = airc_protocol::PeerKeypair::generate();
     let now_ms = std::time::SystemTime::now()
@@ -475,12 +477,12 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
     let document = airc_lib::AccountRegistryDocument::new(
         identity.clone(),
         now_ms,
-        vec![channel_name.clone()],
+        vec![known_room],
         vec![airc_lib::AccountPeerBeacon {
             presence: airc_lib::beacon_now(
                 remote_peer,
                 "/machine/remote/.airc".into(),
-                vec![channel_name.clone()],
+                vec![known_room],
                 123,
                 now_ms,
             ),
@@ -518,12 +520,11 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
         "an account-unknown channel must not fake a rebind"
     );
 
-    // The heal: the frame's channel derives from a registry-known name
+    // The heal: the frame addresses a room the registry KNOWS BY ID
     // → rebound from the registry beacon and DELIVERED.
-    let general = airc_lib::subscriptions::derive_room_id(&identity, &channel_name);
     assert_eq!(
         bridge
-            .deliver(&inbound_frame(general, EventId::new(), "hello blind room"))
+            .deliver(&inbound_frame(known_room, EventId::new(), "hello blind room"))
             .await,
         InboundDeliveryVerdict::Delivered,
         "a registry-known channel must re-bind and deliver, not store-and-drop"
@@ -544,7 +545,7 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
     // rebind — the heal restored durable state, not a per-frame patch.
     assert_eq!(
         bridge
-            .deliver(&inbound_frame(general, EventId::new(), "second frame"))
+            .deliver(&inbound_frame(known_room, EventId::new(), "second frame"))
             .await,
         InboundDeliveryVerdict::Delivered,
     );
@@ -555,295 +556,43 @@ async fn unknown_channel_auto_rebinds_from_account_registry_cache() {
     );
 }
 
-/// what this catches (self-healing join, the M5↔bigmama blind-room
-/// ROOT CAUSE — live log: 24 unknown_channel frames on channel
-/// `eef18336-…` = derive_room_id("local:unknown-host:unknown-user",
-/// "general")): bigmama's Windows daemon fell to the degenerate
-/// mesh-identity fallback (gh unreachable; POSIX env probes don't
-/// exist on Windows), so its `#general` UUID diverged from this
-/// machine's — and every room frame between the two machines died as
-/// unknown_channel while the room was bound and readable on both
-/// sides the whole time. The bridge must re-derive the room from the
-/// frame's channel-NAME header under THIS machine's identity and
-/// deliver into the bound room (loudly); a frame with no header, or a
-/// name nobody binds, keeps the honest unknown-channel verdict; and a
-/// BOUND channel is never re-routed by the hint. Mutation checks:
-/// dropping `reconverge_by_name` fails the DeliveredRemapped assert;
-/// remapping before the bound-check would fail the never-re-route
-/// assert; publishing under the addressed UUID instead of the local
-/// one would fail the operator-visibility assert.
+/// A sender's channel-NAME header must NEVER redirect a frame.
+///
+/// what this catches: the deleted `reconverge_by_name`. It re-routed an
+/// unbound frame to whatever local room the sender's NAME header
+/// derived to — which meant a peer could redirect a frame into a room
+/// it was not addressing by sending different text. That existed only
+/// because room ids were `v5(identity, name)` and could DIVERGE between
+/// machines. Ids are minted now: nothing derives, so nothing diverges,
+/// and the header is decoration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn diverged_channel_uuid_reconverges_by_name_header() {
+async fn a_name_header_never_redirects_a_frame() {
     let machine = Machine::boot().await;
     let store = machine_coordinator_store(&machine).await;
     pin_identity(store.as_ref(), "converged-account").await;
     let operator = machine.attach("operator").await;
-    let room = operator.join("general").await.expect("operator joins");
+    let room = operator.join("general").await.expect("join");
 
     let sink = MemoryDiagnosticSink::default();
     let bridge = RouterInboundBridge::new(machine.daemon.router(), store.clone())
         .with_diagnostic_sink(Arc::new(sink.clone()));
 
-    // The literal field fingerprint: the sender derived #general under
-    // the degenerate Windows fallback identity.
-    let diverged_identity =
-        airc_lib::subscriptions::MeshIdentity::new("local:unknown-host:unknown-user");
-    let name = airc_lib::subscriptions::ChannelName::new("general").expect("channel name");
-    let diverged = airc_lib::subscriptions::derive_room_id(&diverged_identity, &name);
-    assert_ne!(
-        diverged, room.channel,
-        "premise: the two identities must derive different room UUIDs"
-    );
-
-    // Control: no name header → honestly blind (durable + loud, as before).
-    assert_eq!(
-        bridge
-            .deliver(&inbound_frame(diverged, EventId::new(), "no hint"))
-            .await,
-        InboundDeliveryVerdict::UnknownChannel,
-        "without the name header there is no honest reconvergence"
-    );
-
-    // THE heal: the name header re-derives to the bound local room.
-    let healed_id = EventId::new();
+    // A frame addressed at a room NOBODY binds, carrying the name of a
+    // room this scope IS in. The old code delivered it into #general.
+    let stranger = RoomId::new();
     assert_eq!(
         bridge
             .deliver(&inbound_frame_with_headers(
-                diverged,
-                healed_id,
-                "hello from the diverged machine",
+                stranger,
+                EventId::new(),
+                "i claim to be #general",
                 &[(airc_protocol::HEADER_AIRC_CHANNEL_NAME, "general")],
             ))
             .await,
-        InboundDeliveryVerdict::DeliveredRemapped(room.channel),
-        "a name that derives to a bound local room must deliver there"
-    );
-    let recent = operator.page_recent(32).await.expect("page_recent");
-    assert!(
-        recent.iter().any(|event| event.event_id == healed_id),
-        "the reconverged frame must surface in the room the operator reads"
-    );
-    let reconvergences = |sink: &MemoryDiagnosticSink| {
-        sink.events()
-            .iter()
-            .filter(|event| event.code == DiagnosticCode::ChannelNameReconverged)
-            .count()
-    };
-    assert_eq!(reconvergences(&sink), 1, "the heal must be LOUD");
-
-    // A name nobody binds (and the account does not know) must not
-    // fake a delivery.
-    assert_eq!(
-        bridge
-            .deliver(&inbound_frame_with_headers(
-                diverged,
-                EventId::new(),
-                "nobody reads this",
-                &[(airc_protocol::HEADER_AIRC_CHANNEL_NAME, "nobody-binds-this")],
-            ))
-            .await,
         InboundDeliveryVerdict::UnknownChannel,
-        "an unbound name must keep the honest unknown-channel verdict"
+        "a name header must not buy delivery into a room the frame did not address"
     );
 
-    // A BOUND channel is never re-routed: the header is a heal hint,
-    // not addressing authority.
-    assert_eq!(
-        bridge
-            .deliver(&inbound_frame_with_headers(
-                room.channel,
-                EventId::new(),
-                "correctly addressed",
-                &[(airc_protocol::HEADER_AIRC_CHANNEL_NAME, "nobody-binds-this")],
-            ))
-            .await,
-        InboundDeliveryVerdict::Delivered,
-        "a bound channel must deliver as addressed, hint ignored"
-    );
-    assert_eq!(
-        reconvergences(&sink),
-        1,
-        "no reconvergence may fire for a bound or unhealable channel"
-    );
-}
-
-/// what this catches (the field scenario END-TO-END, over a real TLS
-/// LAN link): a remote machine pinned to the degenerate Windows
-/// fallback identity joins #general (deriving a diverged channel
-/// UUID), dials in, and sends with a delivery ack. Sender-side, the
-/// room name must ride `HEADER_AIRC_CHANNEL_NAME` (stamped by
-/// `send_frame_to_room`); receiver-side, the bridge must reconverge by
-/// name; the ack must say DELIVERED carrying the receiver's LOCAL
-/// channel; and the operator scope must actually see the message.
-/// This is the exact exchange that produced bigmama's unknown_channel
-/// receipts before the heal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn diverged_remote_lan_send_reconverges_and_acks_delivered() {
-    let machine = Machine::boot().await;
-    let store = machine_coordinator_store(&machine).await;
-    pin_identity(store.as_ref(), "converged-account").await;
-    let operator = machine.attach("operator").await;
-    let room = operator.join("general").await.expect("operator joins");
-
-    let (gateway, _bridge) = lan_gateway_with_bridge(&machine).await;
-    let remote_home = TempDir::new().expect("remote home");
-    let remote = Airc::open(remote_home.path().join(".airc"))
-        .await
-        .expect("open remote");
-    // Pin BEFORE join so the diverged identity shapes the remote's
-    // room derivation — the bigmama boot order.
-    pin_identity(
-        remote.coordinator_store_for_test(),
-        "local:unknown-host:unknown-user",
-    )
-    .await;
-    let remote_room = remote.join("general").await.expect("remote joins");
-    assert_ne!(
-        remote_room.channel, room.channel,
-        "premise: the remote must derive a DIVERGED channel UUID"
-    );
-    let remote_spec: PeerSpec = remote.peer_spec().parse().expect("remote spec");
-    let gateway_spec: PeerSpec = gateway.peer_spec().parse().expect("gateway spec");
-    gateway.add_peer(remote_spec).await.expect("gateway trusts");
-    remote.add_peer(gateway_spec).await.expect("remote trusts");
-    let addr: SocketAddr = gateway
-        .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .expect("gateway listens");
-    remote
-        .connect_lan(addr, gateway.peer_id())
-        .await
-        .expect("remote dials");
-
-    let outcome = remote
-        .send_with_delivery_ack(
-            "marker across the diverged channel",
-            Headers::new(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("send succeeds");
-    let event_id = match outcome {
-        DeliverySendOutcome::Delivered { event_id, ack } => {
-            match ack.outcome {
-                DeliveryOutcome::Delivered { channel, .. } => assert_eq!(
-                    channel, room.channel,
-                    "the ack must carry the receiver's LOCAL room, not the diverged UUID"
-                ),
-                DeliveryOutcome::Undeliverable { .. } => {
-                    panic!("delivered outcome must not be undeliverable")
-                }
-            }
-            event_id
-        }
-        DeliverySendOutcome::Undeliverable { .. } | DeliverySendOutcome::NoAck { .. } => {
-            panic!("expected Delivered after name reconvergence, got {outcome:?}")
-        }
-    };
-
-    let recent = operator.page_recent(32).await.expect("page_recent");
-    let seen = recent
-        .iter()
-        .find(|event| event.event_id == event_id)
-        .expect("the diverged remote's message must surface in the operator's room");
-    assert_eq!(
-        seen.headers
-            .get(airc_protocol::HEADER_AIRC_CHANNEL_NAME)
-            .map(String::as_str),
-        Some("general"),
-        "the sender must stamp the channel name on the wire — the convergence key"
-    );
-}
-
-/// what this catches (self-healing join item 2 — receive-binding
-/// re-derive on identity heal; the live sequel to the d79843c heal):
-/// a scope that joined WHILE its machine's mesh identity was diverged
-/// stores its subscription under the diverged room UUID. After the
-/// identity heals, inbound frames arrive addressed to the CONVERGED
-/// UUID — the per-frame name reconvergence heals delivery TO a bound
-/// room, but a room bound under a stale UUID must be REBOUND or the
-/// scope keeps reading the dead room (live evidence: it took a manual
-/// `airc stop && airc join`). The join-shaped touchpoint must re-derive
-/// and re-bind; after that, a frame addressed to the converged UUID is
-/// delivered AND visible to the scope, while the old diverged UUID
-/// keeps working via the existing name reconvergence remap. Mutation
-/// checks: dropping `rebind_diverged` (or not calling it from `join`)
-/// fails the room-UUID assert and the operator-visibility assert.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn healed_identity_rebinds_stale_subscription_to_the_converged_room() {
-    let machine = Machine::boot().await;
-    let store = machine_coordinator_store(&machine).await;
-    let name = airc_lib::subscriptions::ChannelName::new("general").expect("channel name");
-
-    // Boot diverged (the Windows-fallback shape), join #general.
-    pin_identity(store.as_ref(), "diverged-boot-identity").await;
-    let operator = machine.attach("operator").await;
-    let stale_room = operator.join("general").await.expect("diverged join");
-
-    let diverged_id = airc_lib::subscriptions::derive_room_id(
-        &airc_lib::subscriptions::MeshIdentity::new("diverged-boot-identity"),
-        &name,
-    );
-    let converged_id = airc_lib::subscriptions::derive_room_id(
-        &airc_lib::subscriptions::MeshIdentity::new("converged-account"),
-        &name,
-    );
-    assert_eq!(stale_room.channel, diverged_id, "premise: joined diverged");
-    assert_ne!(diverged_id, converged_id, "premise: identities diverge");
-
-    // The identity HEALS (gh reachable again / operator re-pin).
-    pin_identity(store.as_ref(), "converged-account").await;
-
-    // The join-shaped touchpoint re-binds the stored subscription.
-    let healed_room = operator.join("general").await.expect("healed join");
-    assert_eq!(
-        healed_room.channel, converged_id,
-        "join after the identity heal must re-bind the stored subscription \
-         to the converged room UUID, not keep returning the stale one"
-    );
-
-    // An inbound frame addressed to the CONVERGED UUID now delivers…
-    let sink = MemoryDiagnosticSink::default();
-    let bridge = RouterInboundBridge::new(machine.daemon.router(), store.clone())
-        .with_diagnostic_sink(Arc::new(sink.clone()));
-    let converged_event = EventId::new();
-    assert_eq!(
-        bridge
-            .deliver(&inbound_frame(
-                converged_id,
-                converged_event,
-                "addressed to the converged room"
-            ))
-            .await,
-        InboundDeliveryVerdict::Delivered,
-        "the healed binding must make the converged room deliverable"
-    );
-    // …and the SCOPE actually reads it (the read side is what the
-    // per-frame remap could never heal).
-    let recent = operator.page_recent(32).await.expect("page_recent");
-    assert!(
-        recent.iter().any(|event| event.event_id == converged_event),
-        "the rebound scope must see frames addressed to the converged room"
-    );
-
-    // The OLD diverged UUID keeps working via the existing name
-    // reconvergence remap (a not-yet-healed sender still converges).
-    let stale_addressed = EventId::new();
-    assert_eq!(
-        bridge
-            .deliver(&inbound_frame_with_headers(
-                diverged_id,
-                stale_addressed,
-                "addressed to the old diverged room",
-                &[(airc_protocol::HEADER_AIRC_CHANNEL_NAME, "general")],
-            ))
-            .await,
-        InboundDeliveryVerdict::DeliveredRemapped(converged_id),
-        "the old UUID must keep delivering via the per-frame name remap"
-    );
-    let recent = operator.page_recent(32).await.expect("page_recent");
-    assert!(
-        recent.iter().any(|event| event.event_id == stale_addressed),
-        "frames remapped from the old UUID must surface in the rebound room"
-    );
+    // And the room it named is untouched — the frame did not land there.
+    assert_ne!(stranger, room.channel);
 }

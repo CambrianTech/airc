@@ -2919,10 +2919,7 @@ mod publish_identity_tests {
         );
 
         let set = airc.subscription_set().await.expect("subscription set");
-        let names: Vec<String> = set
-            .channel_names()
-            .map(|c| c.as_str().to_string())
-            .collect();
+        let names: Vec<String> = set.all().map(|s| s.name.as_str().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "academy") && names.iter().any(|n| n == "cambriantech"),
             "she is a member of BOTH rooms, not just the focused one: {names:?}"

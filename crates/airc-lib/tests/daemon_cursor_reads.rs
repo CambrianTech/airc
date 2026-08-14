@@ -15,7 +15,6 @@
 
 mod common;
 
-use airc_lib::ChannelName;
 use common::Machine;
 
 #[tokio::test]
@@ -57,9 +56,9 @@ async fn attached_subscription_cursor_is_the_daemon_tip() {
 
     let last = alice.say("newest").await.expect("say");
 
-    let channel = ChannelName::new("sub-cursor").expect("channel name");
+    let room = bob.current_room().await.expect("current room");
     let cursor = bob
-        .subscription_cursor(&channel)
+        .subscription_cursor(&room.channel)
         .await
         .expect("subscription_cursor")
         .expect("subscribed channel with daemon history has a cursor");
@@ -70,7 +69,7 @@ async fn attached_subscription_cursor_is_the_daemon_tip() {
 
     // A channel this scope is not subscribed to still answers None —
     // the subscription gate is unchanged by the daemon routing.
-    let unsubscribed = ChannelName::new("not-joined").expect("channel name");
+    let unsubscribed = airc_lib::RoomId::new();
     assert_eq!(
         bob.subscription_cursor(&unsubscribed)
             .await

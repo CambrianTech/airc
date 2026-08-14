@@ -53,9 +53,12 @@ async fn open_scope(home: &Path, wire_root: &Path) -> Airc {
         .expect("open scope")
 }
 
+/// The default room's LABEL, read off the subscription the default id
+/// points at. The pointer is the id; this is only for readable asserts.
 async fn default_channel(airc: &Airc) -> Option<String> {
     let set = airc.subscription_set().await.expect("load subscriptions");
-    set.default.map(|name| name.as_str().to_string())
+    set.default_subscription()
+        .map(|s| s.name.as_str().to_string())
 }
 
 /// THE BUG: bare `airc join` re-run from a cwd outside any git

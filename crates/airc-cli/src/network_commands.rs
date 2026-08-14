@@ -622,13 +622,13 @@ mod tests {
     // surfaces a label-alphabetical order and fails the assert.
     #[test]
     fn stale_summary_groups_by_label_count_descending() {
-        use airc_lib::{ChannelName, PresenceBeacon};
+        use airc_lib::{PresenceBeacon, RoomId};
         use std::path::PathBuf;
         let beacon = |id: u128, home: &str| PresenceBeacon {
             version: 1,
             peer_id: airc_lib::PeerId(uuid::Uuid::from_u128(id)),
             scope_home: PathBuf::from(home),
-            subscribed_channels: vec![ChannelName::new("general").unwrap()],
+            subscribed_rooms: vec![RoomId::from_u128(1)],
             pid: 1,
             published_at_ms: 0,
             heartbeat_at_ms: 0,

@@ -713,7 +713,6 @@ mod tests {
         // v5 mint that splits the room's readers from its writers.
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
         let academy = set
             .create(home, ChannelName::new("academy").unwrap())
@@ -889,7 +888,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let store = InMemoryEventStore::new();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
         set.create(home, ChannelName::new("general").unwrap())
             .unwrap();
@@ -925,9 +923,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["cambriantech", "general"]);
 
-        let cambriantech = ChannelName::new("cambriantech").unwrap();
-        let general = ChannelName::new("general").unwrap();
-        let missing = ChannelName::new("not-joined").unwrap();
+        // Membership is asked BY ID — the labels above are only how the
+        // rooms were created; they answer no question about membership.
+        let by_label = |label: &str| {
+            subscriptions
+                .iter()
+                .find(|s| s.name.as_str() == label)
+                .expect("created above")
+                .room_id
+        };
+        let cambriantech = by_label("cambriantech");
+        let general = by_label("general");
+        let missing = RoomId::new();
 
         assert!(airc.is_subscribed(&cambriantech).await.unwrap());
         assert!(airc.is_subscribed(&general).await.unwrap());

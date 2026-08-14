@@ -206,9 +206,10 @@ mod tests {
     // zero GitHub. A regression that made publish clobber (single shared
     // file) or that skipped the merge would drop one machine's peer here.
     use super::*;
+    use airc_core::RoomId;
     use crate::account_registry::AccountPeerBeacon;
     use crate::route::RouteEndpoint;
-    use crate::subscriptions::{ChannelName, MeshIdentity};
+    use crate::subscriptions::{MeshIdentity};
     use crate::PeerSpec;
     use airc_core::PeerId;
     use airc_protocol::PeerKeypair;
@@ -226,9 +227,6 @@ mod tests {
         MeshIdentity::new("joelteply")
     }
 
-    fn channel(name: &str) -> ChannelName {
-        ChannelName::new(name).unwrap()
-    }
 
     fn peer_spec(peer_id: PeerId) -> PeerSpec {
         PeerSpec {
@@ -246,7 +244,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 peer_id,
                 scope_home.into(),
-                vec![channel("general")],
+                vec![RoomId::from_u128(1)],
                 123,
                 FRESH_MS,
             ),
@@ -261,7 +259,7 @@ mod tests {
         AccountRegistryDocument::new(
             mesh(),
             generated_at_ms,
-            vec![channel("general")],
+            vec![RoomId::from_u128(1)],
             vec![peer.clone()],
         )
     }
