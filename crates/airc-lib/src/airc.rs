@@ -1865,26 +1865,18 @@ impl Airc {
                     }
                 });
             }
-            subscriptions::RoomIdResolution::Ambiguous(subs) => {
-                return Err(AircError::JoinIdAmbiguous {
-                    token: token.trim().to_string(),
-                    candidates: subs
-                        .iter()
-                        .map(|s| format!("{} ({})", s.name.as_str(), s.room_id))
-                        .collect(),
-                });
-            }
             subscriptions::RoomIdResolution::NotAnId => {}
         }
         let name = ChannelName::new(token)?;
         let labelled: Vec<Subscription> = set.all().filter(|s| s.name == name).cloned().collect();
         if labelled.len() > 1 {
+            // The candidates are IDS. Rendering them into "name (id)"
+            // here would make the caller parse text back apart to get
+            // the one thing it needs — and the one thing it needs is
+            // the id it should have passed instead of the label.
             return Err(AircError::JoinIdAmbiguous {
                 token: token.trim().to_string(),
-                candidates: labelled
-                    .iter()
-                    .map(|s| format!("{} ({})", s.name.as_str(), s.room_id))
-                    .collect(),
+                candidates: labelled.iter().map(|s| s.room_id).collect(),
             });
         }
         if let Some(found) = labelled.into_iter().next() {

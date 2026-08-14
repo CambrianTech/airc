@@ -218,20 +218,19 @@ impl MeshIdentity {
     }
 }
 
-/// Resolution of an id-shaped token against this scope's rooms.
+/// Resolution of a caller-supplied token against this scope's rooms.
 ///
-/// Every id surface in the system accepts a short form, so a caller
-/// holding `3be59578` must land on the room whose id starts with it.
+/// A token is either a room id or it is not. There is no third thing:
+/// an id parses to 128 bits and looks up, or the token is a name and a
+/// different surface deals with it.
 #[derive(Debug)]
 pub enum RoomIdResolution<'a> {
-    /// Not id-shaped.
+    /// Does not parse as a room id.
     NotAnId,
-    /// Identifies exactly this subscribed room.
+    /// Parsed to the id of exactly this subscribed room.
     Match(&'a Subscription),
-    /// Id-shaped but no subscribed room matches.
+    /// A valid room id this scope is not subscribed to.
     Unknown,
-    /// Id-shaped and a prefix of MORE than one subscribed room.
-    Ambiguous(Vec<&'a Subscription>),
 }
 
 /// One channel this scope is subscribed to.
@@ -244,28 +243,25 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// Membership in a NEWLY MINTED room. The id is generated here and
+    /// is out of the caller's control.
+    pub fn minting(wire_root: &Path, name: ChannelName) -> Result<Self, SubscriptionError> {
+        Self::joining(wire_root, RoomId::new(), name)
+    }
+
     /// Membership in a room whose id you already hold — the normal
     /// path. A peer hands you an id, a board row carries one, a
     /// dispatch names one; you join THAT room.
+    ///
+    /// `wire_root` is the account-wide machine home, not the caller's
+    /// scope home: that is what makes `~/.airc`, `repo/.airc`, and every
+    /// other scope on one OS account share a data plane.
+    ///
+    /// (This and `minting` are the only two ways to build one. There was
+    /// a third, `with_wire_root`, that `joining` delegated to with an
+    /// identical signature — two spellings of one constructor, so the
+    /// choice between them carried no information.)
     pub fn joining(
-        home: &Path,
-        room_id: RoomId,
-        name: ChannelName,
-    ) -> Result<Self, SubscriptionError> {
-        Self::with_wire_root(home, room_id, name)
-    }
-
-    /// Membership in a NEWLY MINTED room. The id is generated here and
-    /// is out of the caller's control.
-    pub fn minting(home: &Path, name: ChannelName) -> Result<Self, SubscriptionError> {
-        Self::with_wire_root(home, RoomId::new(), name)
-    }
-
-    /// As [`Self::with_wire_root`], for the account-wide machine home
-    /// rather than the caller's scope home. This is what makes
-    /// `~/.airc`, `repo/.airc`, and other scopes on the same OS account
-    /// converge on one local data plane.
-    pub fn with_wire_root(
         wire_root: &Path,
         room_id: RoomId,
         name: ChannelName,
@@ -399,7 +395,7 @@ impl SubscriptionSet {
         if let Some(existing) = self.subscribed.get(&room_id) {
             return Ok(existing.clone());
         }
-        let sub = Subscription::with_wire_root(wire_root, room_id, name)?;
+        let sub = Subscription::joining(wire_root, room_id, name)?;
         self.insert(sub.clone());
         Ok(sub)
     }
@@ -462,28 +458,15 @@ impl SubscriptionSet {
     /// binds to that existing room; zero or several is the caller's
     /// answer, never a mint. Anything else is a plain name.
     pub fn resolve_room_id(&self, token: &str) -> RoomIdResolution<'_> {
-        let compact: String = token.trim().chars().filter(|c| *c != '-').collect();
-        let id_shaped =
-            (8..=32).contains(&compact.len()) && compact.chars().all(|c| c.is_ascii_hexdigit());
-        if !id_shaped {
+        // Parse to the id TYPE, then look up. The map is keyed by the
+        // 16-byte id, so this is one comparison against a key — never a
+        // scan, never a rendered uuid, never a substring of one.
+        let Ok(uuid) = uuid::Uuid::parse_str(token.trim()) else {
             return RoomIdResolution::NotAnId;
-        }
-        let needle = compact.to_ascii_lowercase();
-        let matches: Vec<&Subscription> = self
-            .subscribed
-            .values()
-            .filter(|s| {
-                s.room_id
-                    .as_uuid()
-                    .as_simple()
-                    .to_string()
-                    .starts_with(&needle)
-            })
-            .collect();
-        match matches.len() {
-            0 => RoomIdResolution::Unknown,
-            1 => RoomIdResolution::Match(matches[0]),
-            _ => RoomIdResolution::Ambiguous(matches),
+        };
+        match self.subscribed.get(&RoomId::from_uuid(uuid)) {
+            Some(subscription) => RoomIdResolution::Match(subscription),
+            None => RoomIdResolution::Unknown,
         }
     }
 
@@ -724,22 +707,29 @@ mod tests {
             .create(home, ChannelName::new("academy").unwrap())
             .unwrap();
 
-        let simple = academy.room_id.as_uuid().as_simple().to_string();
-
-        // 8-hex short id → binds to academy.
-        match set.resolve_room_id(&simple[..8]) {
-            RoomIdResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
-            other => panic!("short id must Match, got {other:?}"),
-        }
-        // Full dashed uuid → binds too (resolution wins over the old refusal).
+        // A room id → binds to academy.
         match set.resolve_room_id(&academy.room_id.to_string()) {
             RoomIdResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
             other => panic!("full uuid must Match, got {other:?}"),
         }
-        // Id-shaped, no such channel → Unknown (join refuses; no mint).
+        // A REAL id naming no subscribed room → Unknown (join refuses; no mint).
+        assert!(matches!(
+            set.resolve_room_id(&RoomId::new().to_string()),
+            RoomIdResolution::Unknown
+        ));
+        // A TRUNCATION of a real id is not an id. It was accepted once, by
+        // rendering every room's uuid to text and prefix-matching it — which
+        // made 32 hex characters mean 128 bits only when they happened not to
+        // collide, and needed an `Ambiguous` arm to paper over when they did.
+        // A key is passed whole or it is not passed.
+        let simple = academy.room_id.as_uuid().as_simple().to_string();
+        assert!(matches!(
+            set.resolve_room_id(&simple[..8]),
+            RoomIdResolution::NotAnId
+        ));
         assert!(matches!(
             set.resolve_room_id("deadbeef"),
-            RoomIdResolution::Unknown
+            RoomIdResolution::NotAnId
         ));
         // Plain names — including hexy-but-short and dashed ones — stay names.
         assert!(matches!(
@@ -932,10 +922,15 @@ mod tests {
         airc.join("cambriantech").await.unwrap();
 
         let subscriptions = airc.subscriptions().await.unwrap();
-        let names = subscriptions
+        // Set, not sequence. The old assertion read alphabetically only
+        // because the map was keyed by the NAME; keyed by id, iteration
+        // order follows v4 ids and carries no meaning. A caller that
+        // wants rooms in a particular order sorts by the field it means.
+        let mut names = subscriptions
             .iter()
             .map(|subscription| subscription.name.as_str())
             .collect::<Vec<_>>();
+        names.sort();
         assert_eq!(names, vec!["cambriantech", "general"]);
 
         // Membership is asked BY ID — the labels above are only how the

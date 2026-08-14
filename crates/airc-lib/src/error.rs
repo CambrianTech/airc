@@ -128,7 +128,11 @@ pub enum AircError {
     )]
     JoinIdAmbiguous {
         token: String,
-        candidates: Vec<String>,
+        /// The rooms carrying that label, BY ID — the answer the caller
+        /// re-issues its join with. Not pre-rendered text: a caller that
+        /// wants a display name reads it off the room, and one that just
+        /// wants to retry needs the id and nothing else.
+        candidates: Vec<airc_core::RoomId>,
     },
 
     /// Caller attempted to mutate a work card from a room whose work
