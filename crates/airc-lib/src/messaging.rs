@@ -278,7 +278,9 @@ impl Airc {
     pub async fn subscribe(&self) -> Result<EventStream, AircError> {
         let room = self.current_room().await?;
         if self.is_daemon_attached() {
-            return self.daemon_subscribe(vec![room.channel], None).await;
+            return self
+                .daemon_subscribe(vec![room.channel], None, airc_core::HeaderFilter::Any)
+                .await;
         }
         let rx = self.inner.live_tx.subscribe();
         Ok(EventStream::from_broadcast(rx))
@@ -309,7 +311,12 @@ impl Airc {
     /// [`Self::subscribe_subscribed_filtered`] with a ROUTER-SIDE
     /// delivery-class filter: when `delivery` is `Some`, the daemon only
     /// fans out events of those classes to this subscription — nothing
-    /// else ever crosses the socket. This is the consumer-shaped
+    /// else ever crosses the socket. The caller's
+    /// `filter.headers_filter` also rides the attach, so header
+    /// predicates (including `HeaderFilter::Not` exclusions — e.g.
+    /// dropping `airc.heartbeat.*`-stamped liveness beacons) are
+    /// enforced BEFORE fan-out too, not just client-side after a
+    /// decode the consumer paid for. This is the consumer-shaped
     /// subscription [`airc_ipc::AttachRequest`] always supported and
     /// clients never used: a mind that perceives settled room lines
     /// attaches with `[IpcDelivery::Durable]` and stops paying a decode
@@ -333,7 +340,9 @@ impl Airc {
                 .map(|sub| sub.as_room().channel)
                 .collect();
             return Ok(FilteredEventStream {
-                inner: self.daemon_subscribe(channels, delivery).await?,
+                inner: self
+                    .daemon_subscribe(channels, delivery, filter.headers_filter.clone())
+                    .await?,
                 filter,
             });
         }

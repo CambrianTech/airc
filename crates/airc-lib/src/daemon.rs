@@ -529,6 +529,7 @@ impl Airc {
         &self,
         channels: Vec<RoomId>,
         delivery: Option<Vec<IpcDelivery>>,
+        headers: airc_core::HeaderFilter,
     ) -> Result<EventStream, AircError> {
         // Own the client so each reader task can re-attach after a daemon
         // restart (the borrow from `require_daemon_client` can't outlive
@@ -552,6 +553,7 @@ impl Airc {
             if let Some(classes) = delivery.clone() {
                 request = request.with_delivery(classes);
             }
+            request = request.with_headers(headers.clone());
             let mut stream = client
                 .attach(request)
                 .await
@@ -568,10 +570,12 @@ impl Airc {
             }
             let tx = tx.clone();
             let client = client.clone();
-            // Per-task copy of the delivery filter: each channel's reader
-            // task re-applies it on every reconnect (see below), and the
-            // loop must keep its own copy for the remaining channels.
+            // Per-task copy of the delivery + header filters: each
+            // channel's reader task re-applies them on every reconnect
+            // (see below), and the loop must keep its own copy for the
+            // remaining channels.
             let delivery = delivery.clone();
+            let headers = headers.clone();
             handles.push(tokio::spawn(async move {
                 // Drain the live stream; when it drops (daemon restart /
                 // transient loss) re-attach and RESUME strictly after the
@@ -662,6 +666,7 @@ impl Airc {
                         if let Some(classes) = delivery.clone() {
                             request = request.with_delivery(classes);
                         }
+                        request = request.with_headers(headers.clone());
                         let mut s = match client.attach(request).await {
                             Ok(s) => s,
                             Err(error) => {
