@@ -512,9 +512,23 @@ impl Airc {
     /// owned by the stream (aborted on drop). Each attach is registered
     /// at the live edge before we move on (subscribe-before-ack on the
     /// daemon side), so no early event is missed.
+    ///
+    /// `delivery`: optional ROUTER-SIDE delivery-class filter, applied on
+    /// every attach (initial AND every reconnect). `None` keeps the
+    /// historical behaviour — every class is delivered. This is the seam
+    /// [`AttachRequest`] built for and nobody used: without it, a consumer
+    /// that only wants settled room lines receives every peer's
+    /// StreamChunks and ephemeral fan-out and pays a decode per event to
+    /// discard them. Measured on a continuum node 2026-08-15: 6,736
+    /// events crossed to EVERY persona subscription in 40 minutes and
+    /// 100% were discarded post-decode; an earlier solve measured 55% of
+    /// inbound as stream chunks decoded identically by four minds. Filter
+    /// at the router; the socket never carries what the consumer will
+    /// throw away.
     pub(crate) async fn daemon_subscribe(
         &self,
         channels: Vec<RoomId>,
+        delivery: Option<Vec<IpcDelivery>>,
     ) -> Result<EventStream, AircError> {
         // Own the client so each reader task can re-attach after a daemon
         // restart (the borrow from `require_daemon_client` can't outlive
@@ -534,8 +548,12 @@ impl Airc {
             // stream starts at the live edge. Catch-up is a separate,
             // bounded concern (`resume_from_subscribed_filtered` with a
             // stored cursor — see `join_feed`).
+            let mut request = AttachRequest::live(channel);
+            if let Some(classes) = delivery.clone() {
+                request = request.with_delivery(classes);
+            }
             let mut stream = client
-                .attach(AttachRequest::live(channel))
+                .attach(request)
                 .await
                 .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
             match read_frame::<_, Response>(&mut stream).await {
@@ -550,6 +568,10 @@ impl Airc {
             }
             let tx = tx.clone();
             let client = client.clone();
+            // Per-task copy of the delivery filter: each channel's reader
+            // task re-applies it on every reconnect (see below), and the
+            // loop must keep its own copy for the remaining channels.
+            let delivery = delivery.clone();
             handles.push(tokio::spawn(async move {
                 // Drain the live stream; when it drops (daemon restart /
                 // transient loss) re-attach and RESUME strictly after the
@@ -631,10 +653,16 @@ impl Airc {
                             Some(cursor) => AttachStart::After(cursor),
                             None => AttachStart::Live,
                         };
-                        let mut s = match client
-                            .attach(AttachRequest::new(channel, start))
-                            .await
-                        {
+                        // The reconnect attach carries the SAME delivery
+                        // filter as the initial one — a filter that
+                        // silently vanished on the first daemon restart
+                        // would re-open the fan-out flood and no reader
+                        // could tell why the socket got loud again.
+                        let mut request = AttachRequest::new(channel, start);
+                        if let Some(classes) = delivery.clone() {
+                            request = request.with_delivery(classes);
+                        }
+                        let mut s = match client.attach(request).await {
                             Ok(s) => s,
                             Err(error) => {
                                 // Card 807193ab: silent `continue` left

@@ -278,7 +278,7 @@ impl Airc {
     pub async fn subscribe(&self) -> Result<EventStream, AircError> {
         let room = self.current_room().await?;
         if self.is_daemon_attached() {
-            return self.daemon_subscribe(vec![room.channel]).await;
+            return self.daemon_subscribe(vec![room.channel], None).await;
         }
         let rx = self.inner.live_tx.subscribe();
         Ok(EventStream::from_broadcast(rx))
@@ -303,6 +303,27 @@ impl Airc {
         &self,
         filter: EventFilter,
     ) -> Result<FilteredEventStream, AircError> {
+        self.subscribe_subscribed_delivery(filter, None).await
+    }
+
+    /// [`Self::subscribe_subscribed_filtered`] with a ROUTER-SIDE
+    /// delivery-class filter: when `delivery` is `Some`, the daemon only
+    /// fans out events of those classes to this subscription — nothing
+    /// else ever crosses the socket. This is the consumer-shaped
+    /// subscription [`airc_ipc::AttachRequest`] always supported and
+    /// clients never used: a mind that perceives settled room lines
+    /// attaches with `[IpcDelivery::Durable]` and stops paying a decode
+    /// per peer StreamChunk / ephemeral fan-out (measured on a continuum
+    /// node 2026-08-15: 6,736 events crossed to every persona in 40
+    /// minutes, 100% discarded post-decode). The `EventFilter` still
+    /// applies client-side on top, and is the ONLY filter on the
+    /// non-daemon (in-process broadcast) fallback, which has no router
+    /// to filter at.
+    pub async fn subscribe_subscribed_delivery(
+        &self,
+        filter: EventFilter,
+        delivery: Option<Vec<airc_ipc::IpcDelivery>>,
+    ) -> Result<FilteredEventStream, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
         if self.is_daemon_attached() {
             let channels: Vec<airc_core::RoomId> = self
@@ -312,7 +333,7 @@ impl Airc {
                 .map(|sub| sub.as_room().channel)
                 .collect();
             return Ok(FilteredEventStream {
-                inner: self.daemon_subscribe(channels).await?,
+                inner: self.daemon_subscribe(channels, delivery).await?,
                 filter,
             });
         }
