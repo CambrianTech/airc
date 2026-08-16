@@ -507,20 +507,37 @@ impl Airc {
 
     /// Change a work card's lifecycle state through the work event
     /// stream. This is the queue hygiene path agents use to stop
-    /// completed work from remaining claimable.
+    /// completed work from remaining claimable. Current-room projection
+    /// of [`Airc::change_work_card_state_in`].
     pub async fn change_work_card_state(
         &self,
         request: ChangeWorkCardState,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.change_work_card_state_in(&room, request).await
+    }
+
+    /// Change a work card's lifecycle state in a SPECIFIC room, without
+    /// touching this scope's current-room pointer — the mutate sibling of
+    /// [`Airc::work_board_in`]. The reads grew room-scoped variants while
+    /// every mutate stayed pinned to `current_room()`, which made
+    /// multi-room supervisors (a grader sweeping lapsed bench cards across
+    /// per-run rooms) structurally unable to act on any board but the one
+    /// their author happened to be standing in. The guard is unchanged in
+    /// strength: the card must be on THIS room's board.
+    pub async fn change_work_card_state_in(
+        &self,
+        room: &Room,
+        request: ChangeWorkCardState,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::CardStateChanged(CardStateChanged {
             card_id: request.card_id,
             state: request.state,
             changed_by: self.peer_id(),
             changed_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -1154,10 +1171,41 @@ impl Airc {
         self.send_frame(FrameKind::Event, body, headers).await
     }
 
+    /// Room-targeted sibling of [`Airc::publish_work_event`]: the event
+    /// frame is addressed to `room`'s channel, not the current room's, so
+    /// board mutations land where the card actually lives.
+    async fn publish_work_event_in(
+        &self,
+        room: &Room,
+        event: &WorkEvent,
+    ) -> Result<EventId, AircError> {
+        let (headers, body) = encode_work_event(event)?;
+        self.send_frame_to_room(
+            FrameKind::Event,
+            crate::MentionTarget::All,
+            body,
+            headers,
+            room,
+        )
+        .await
+        .map(|receipt| receipt.event_id)
+    }
+
     async fn ensure_work_card_in_current_room(&self, card_id: WorkCardId) -> Result<(), AircError> {
         let room = self.current_room().await?;
+        self.ensure_work_card_in_room(&room, card_id).await
+    }
+
+    /// The one mutation guard, room-parameterized: a card may only be
+    /// mutated against a board it is actually on. `..._in_current_room`
+    /// is its current-room projection.
+    async fn ensure_work_card_in_room(
+        &self,
+        room: &Room,
+        card_id: WorkCardId,
+    ) -> Result<(), AircError> {
         let board = self
-            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
+            .project_room_work_board(room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         if board.card(card_id).is_some() {
             return Ok(());
@@ -1165,7 +1213,7 @@ impl Airc {
 
         Err(AircError::WorkCardNotInCurrentRoom {
             card_id,
-            room_name: room.name,
+            room_name: room.name.clone(),
             room_id: room.channel,
         })
     }
