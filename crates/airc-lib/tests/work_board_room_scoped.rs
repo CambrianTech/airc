@@ -125,3 +125,97 @@ async fn resolving_an_unsubscribed_room_refuses_loudly_instead_of_falling_back()
         "refusal must name the remedy, got: {rendered}"
     );
 }
+
+#[tokio::test]
+async fn a_state_change_for_a_named_room_lands_on_that_rooms_card() {
+    // What this catches: the WRITE half of the #345 class. Reads grew
+    // `work_board_in` while every mutate stayed pinned to `current_room()`,
+    // so a multi-room supervisor (continuum's bench-grade sweeper, first live
+    // tick 2026-08-15) had 21 auto-closes refused in one pass — every target
+    // card lived in a room its author wasn't standing in. The guard must keep
+    // its strength (card must be ON the named room's board) while the room
+    // becomes a parameter instead of ambient state.
+    let machine = Machine::boot().await;
+    let alice = machine.attach("alice").await;
+
+    let other = alice
+        .join("other-room")
+        .await
+        .expect("alice joins other-room");
+    create_card(&alice, "OTHER-ROOM CARD").await;
+    let other_card = alice
+        .work_board()
+        .await
+        .expect("other board")
+        .snapshot()
+        .cards[0]
+        .card_id;
+
+    let home = alice
+        .join("home-room")
+        .await
+        .expect("alice joins home-room");
+    create_card(&alice, "HOME-ROOM CARD").await;
+
+    // Current-room mutate of an out-of-room card still refuses — the guard
+    // keeps its strength.
+    alice
+        .change_work_card_state(airc_lib::ChangeWorkCardState {
+            card_id: other_card,
+            state: airc_lib::CardState::Closed,
+        })
+        .await
+        .expect_err("mutating a card outside the current room must refuse");
+
+    // Room-scoped mutate closes the card WHERE IT LIVES, without moving the
+    // current-room pointer.
+    alice
+        .change_work_card_state_in(
+            &other,
+            airc_lib::ChangeWorkCardState {
+                card_id: other_card,
+                state: airc_lib::CardState::Closed,
+            },
+        )
+        .await
+        .expect("room-scoped state change");
+    let closed = alice
+        .work_board_in(&other)
+        .await
+        .expect("re-read other board")
+        .snapshot()
+        .cards
+        .into_iter()
+        .find(|c| c.card_id == other_card)
+        .expect("card still on the board");
+    assert_eq!(
+        closed.state,
+        airc_lib::CardState::Closed,
+        "BUG: the room-scoped state change did not land on the named room's card"
+    );
+
+    // And the guard is room-parameterized, not gone: a card NOT in the named
+    // room refuses with the same error class.
+    let home_card = alice
+        .work_board()
+        .await
+        .expect("home board")
+        .snapshot()
+        .cards[0]
+        .card_id;
+    alice
+        .change_work_card_state_in(
+            &other,
+            airc_lib::ChangeWorkCardState {
+                card_id: home_card,
+                state: airc_lib::CardState::Closed,
+            },
+        )
+        .await
+        .expect_err("a card not on the NAMED room's board must refuse");
+    let current = alice.current_room().await.expect("current room");
+    assert_eq!(
+        current.channel, home.channel,
+        "BUG: a room-scoped mutate moved the default-room pointer"
+    );
+}
