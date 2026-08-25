@@ -41,7 +41,6 @@ fn smoke_capabilities() -> PersonaCapabilities {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_requests_turn_and_spawned_persona_replies() {
-    let room = "persona-smoke";
     let parent_tmp = TempDir::new().expect("parent tempdir");
     let persona_tmp = TempDir::new().expect("persona tempdir");
 
@@ -50,7 +49,13 @@ async fn parent_requests_turn_and_spawned_persona_replies() {
     let parent = Airc::open(parent_tmp.path().join(".airc"))
         .await
         .expect("parent open");
-    parent.join(room).await.expect("parent joins room");
+    // The parent's account mints the room; its ID is what the child
+    // is handed. A NAME here would put them in two different rooms —
+    // the persona opens its own home, so it is its own account.
+    let room = parent
+        .join("persona-smoke")
+        .await
+        .expect("parent joins room");
     let parent_addr: SocketAddr = parent
         .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -61,7 +66,7 @@ async fn parent_requests_turn_and_spawned_persona_replies() {
     let config = PersonaAgentConfig {
         home: persona_tmp.path().join(".airc"),
         parent_spec: parent.peer_spec(),
-        room: room.to_string(),
+        room_id: room.channel,
         capabilities: smoke_capabilities(),
         parent_lan_addr: Some(parent_addr),
     };

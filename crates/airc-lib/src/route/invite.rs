@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 
-use airc_core::PeerId;
+use airc_core::{PeerId, RoomId};
 use airc_transport::GhGistInviteStore;
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +122,26 @@ pub struct InviteBeacon {
     pub peer_id: PeerId,
     pub peer_spec: PeerSpec,
     pub endpoints: Vec<RouteEndpoint>,
+    /// The rooms the publisher is in. IDs, and nothing else.
+    ///
+    /// An invite used to carry a peer and no rooms at all, and rooms
+    /// converged anyway because a room id was `v5(account, name)` —
+    /// two machines typing `join general` derived the same id without
+    /// ever exchanging one. That derivation WAS the cross-machine room
+    /// rendezvous, and minting the id removed it: both sides mint their
+    /// own and address rooms the other has never heard of. So the ids
+    /// travel explicitly now.
+    ///
+    /// No labels ride along. A label is per-scope display text; putting
+    /// one on the wire next to its id would make the pair the unit of
+    /// exchange and re-import naming into the rendezvous this branch
+    /// exists to remove. A recipient that wants to show a name for one
+    /// of these rooms looks it up BY the id.
+    ///
+    /// Serde-default: a beacon from a pre-rooms binary deserializes
+    /// empty and still pairs the peer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rooms: Vec<RoomId>,
 }
 
 impl InviteBeacon {
@@ -131,7 +151,14 @@ impl InviteBeacon {
             peer_id,
             peer_spec,
             endpoints,
+            rooms: Vec::new(),
         }
+    }
+
+    /// Advertise the rooms this beacon's publisher is in.
+    pub fn with_rooms(mut self, rooms: Vec<RoomId>) -> Self {
+        self.rooms = rooms;
+        self
     }
 }
 
@@ -174,6 +201,8 @@ impl RouteEndpointTable {
 pub struct ImportedInvite {
     pub peer_id: PeerId,
     pub endpoints: Vec<RouteEndpoint>,
+    /// Rooms this peer advertised, by id.
+    pub rooms: Vec<RoomId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,6 +215,7 @@ impl ImportedInviteTable {
         let imported = ImportedInvite {
             peer_id: beacon.peer_id,
             endpoints: beacon.endpoints,
+            rooms: beacon.rooms,
         };
         self.invites.insert(imported.peer_id, imported);
     }
@@ -217,11 +247,41 @@ impl Airc {
         ))
     }
 
+    /// [`Self::invite_beacon`] plus the ids of the rooms this scope is
+    /// in, so a recipient can join one by id instead of guessing.
+    ///
+    /// Async because the subscription set is durable state; the
+    /// synchronous form stays for callers that only want reachability.
+    pub async fn invite_beacon_with_rooms(&self) -> Result<InviteBeacon, AircError> {
+        let set = crate::subscriptions::load_or_init(self.event_store()).await?;
+        let rooms = set.room_ids().copied().collect();
+        Ok(self.invite_beacon()?.with_rooms(rooms))
+    }
+
     pub async fn import_invite_beacon(&self, beacon: InviteBeacon) -> Result<(), AircError> {
         let peer_spec = beacon.peer_spec.clone();
         self.add_peer_via(peer_spec, "invite").await?;
         self.inner.imported_invites.import(beacon);
         Ok(())
+    }
+
+    /// The room ids advertised by peers this scope has imported an
+    /// invite from — what is joinable BY ID as a result of pairing.
+    ///
+    /// The caller passes one of these to `join_room_id`. Nothing here
+    /// is resolved by name, because a peer's label for a room is its
+    /// own business.
+    pub fn peer_room_ids(&self) -> Result<Vec<RoomId>, AircError> {
+        let mut ids = self
+            .inner
+            .imported_invites
+            .invites()
+            .into_iter()
+            .flat_map(|invite| invite.rooms)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     pub fn imported_invites(&self) -> Result<Vec<ImportedInvite>, AircError> {
@@ -416,7 +476,8 @@ mod tests {
                 peer_id,
                 endpoints: vec![RouteEndpoint::Relay {
                     url: "https://relay.example".to_string()
-                }]
+                }],
+                rooms: Vec::new(),
             }]
         );
     }

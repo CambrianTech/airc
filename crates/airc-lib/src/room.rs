@@ -1,14 +1,15 @@
-//! Room value type — the substrate expansion of a channel name into
-//! a wire path and channel id.
+//! Room value type — a room's concrete substrate location.
 //!
-//! A "room" is a name. The substrate primitives it expands to are
-//! deterministic:
-//!   - wire    = `<home>/wires/<name>/`
-//!   - channel = UUIDv5(namespace=oid, name)
+//! A room IS its `RoomId`. The id is minted by airc when the room is
+//! created, is read-only to every caller, and is the only thing that
+//! addresses the room:
+//!   - wire = `<home>/wires/<room-id>/`
+//!   - name = a display label hanging off the id, addressing nothing
 //!
-//! Same name → same channel UUID across machines, so two peers who
-//! both `airc join project-x` land in the same room without
-//! exchanging the channel UUID.
+//! Peers exchange the id. Named lookup for humans lives at the CLI
+//! edge, where a label is resolved against rooms this scope is already
+//! in — and refuses when the label is ambiguous, because a label is not
+//! an address.
 
 use std::path::{Path, PathBuf};
 
@@ -18,14 +19,6 @@ use uuid::Uuid;
 use airc_core::RoomId;
 
 const ROOM_VERSION: u32 = 1;
-const DEFAULT_ROOM_NAME: &str = "default";
-
-/// Namespace UUID for deriving channel UUIDs from room names.
-/// Stable across all airc installs so `airc join project-x`
-/// on different machines produces the same channel.
-const ROOM_NAMESPACE: Uuid = Uuid::from_bytes([
-    0xa1, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-]);
 
 /// What can go wrong constructing a room value.
 #[derive(Debug)]
@@ -55,28 +48,33 @@ impl From<std::time::SystemTimeError> for RoomError {
     }
 }
 
-/// A channel's concrete substrate location.
+/// A room's concrete substrate location.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Room {
     /// Schema version.
     pub version: u32,
-    /// Human-readable room name.
+    /// Display label. Carries no addressing role; two rooms may share
+    /// one, and a room may have none.
     pub name: String,
-    /// Wire directory for this room.
+    /// Wire directory for this room, keyed by its id.
     pub wire: PathBuf,
-    /// Channel UUID, derived deterministically from `name` so peers
-    /// joining the same name land in the same channel.
+    /// The room's ADDRESS. Minted by airc, read-only to callers.
     pub channel: RoomId,
     pub joined_at_ms: u64,
 }
 
 impl Room {
-    /// Derive a `Room` from a name + home dir. Deterministic — same
-    /// (home, name) always produces the same `Room`. Doesn't read
-    /// or write disk.
-    pub fn from_name(home: &Path, name: &str) -> Result<Self, RoomError> {
-        let wire = home.join("wires").join(sanitise_name(name));
-        let channel = RoomId::from_uuid(Uuid::new_v5(&ROOM_NAMESPACE, name.as_bytes()));
+    /// Mint a NEW room. The id is generated here and is out of the
+    /// caller's control; the name is a display label.
+    ///
+    /// Nothing derives the id, so nothing can diverge from it, no
+    /// id-SHAPED text can collide with it, and the label is free text
+    /// because no one hashes it. Renaming is a label edit.
+    pub fn mint(home: &Path, name: &str) -> Result<Self, RoomError> {
+        let channel = RoomId::from_uuid(Uuid::new_v4());
+        // Wire dir keyed by the ID: always a valid path component, so
+        // no name-sanitiser has a say in where a room's bytes live.
+        let wire = home.join("wires").join(channel.to_string());
         Ok(Self {
             version: ROOM_VERSION,
             name: name.to_string(),
@@ -86,18 +84,11 @@ impl Room {
         })
     }
 
-    /// Default room — auto-created on `airc init`. Name "default",
-    /// derived per `from_name`.
-    pub fn default_for(home: &Path) -> Result<Self, RoomError> {
-        Self::from_name(home, DEFAULT_ROOM_NAME)
-    }
-
-    /// Stamp this room's human NAME onto outbound headers
-    /// ([`airc_protocol::HEADER_AIRC_CHANNEL_NAME`]) — the convergence
-    /// key that lets a receiving machine whose identity-scoped channel
-    /// derivation diverged from ours (the M5↔bigmama blind-room bug)
-    /// re-derive the room under its own identity and still deliver.
-    /// Never overwrites a caller-supplied value; skips unnamed rooms.
+    /// Stamp this room's display NAME onto outbound headers
+    /// ([`airc_protocol::HEADER_AIRC_CHANNEL_NAME`]) so a receiving
+    /// surface can render a label next to the id. Never overwrites a
+    /// caller-supplied value; skips unnamed rooms. Delivery routes on
+    /// the id — this header is for humans reading the wire.
     pub fn stamp_name_header(&self, headers: &mut airc_core::Headers) {
         if self.name.is_empty() {
             return;
@@ -106,22 +97,6 @@ impl Room {
             .entry(airc_protocol::HEADER_AIRC_CHANNEL_NAME.to_string())
             .or_insert_with(|| self.name.clone());
     }
-}
-
-/// Sanitise a room name into a path-safe directory component. ASCII
-/// alphanumerics + `-` + `_` survive; everything else becomes `-`.
-/// Multiple names can collide post-sanitisation (`foo/bar` and
-/// `foo-bar` → same dir); avoid weird names.
-fn sanitise_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {

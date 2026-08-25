@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use airc_core::{ClientId, PeerId, ScopeRef, ScopedStateEntry, TranscriptEvent};
+use airc_core::{ClientId, PeerId, RoomId, ScopeRef, ScopedStateEntry, TranscriptEvent};
 use airc_identity::{IdentityError, LocalIdentity};
 use airc_ipc::DaemonClient;
 use airc_protocol::{IdentityAssertion, PeerKeyRegistry, VerificationPolicy};
@@ -43,7 +43,7 @@ use crate::room::Room;
 use crate::route::health::TransportHealthTable;
 use crate::route::invite::{ImportedInviteTable, RouteEndpointTable};
 use crate::route::TransportHealthSample;
-use crate::subscriptions::{self, ChannelName, MeshIdentity};
+use crate::subscriptions::{self, ChannelName, MeshIdentity, Subscription};
 use crate::transport::FrameSubscriber;
 use crate::webrtc_media::{IncomingTrack, IncomingTrackHandler, IncomingTrackRegistry};
 use crate::{coordinator, time};
@@ -1783,11 +1783,11 @@ impl Airc {
         identity: &MeshIdentity,
         set: &subscriptions::SubscriptionSet,
     ) -> Result<(), AircError> {
-        let channels = set.channel_names().cloned().collect();
+        let rooms = set.room_ids().copied().collect();
         let beacon = coordinator::beacon_now(
             self.inner.identity.peer_id,
             self.inner.home.clone(),
-            channels,
+            rooms,
             std::process::id(),
             time::now_ms()?,
         );
@@ -1839,62 +1839,148 @@ impl Airc {
         self.join_channel(name, Focus::Keep).await
     }
 
-    async fn join_channel(&self, name: &str, focus: Focus) -> Result<Room, AircError> {
-        let identity = self.mesh_identity().await?;
-        let mut set = subscriptions::load_or_init(self.event_store()).await?;
-        // Self-healing join: `mesh_identity()` above may have HEALED
-        // (re-resolved) since these subscriptions were stored — re-bind
-        // any room UUID that no longer derives from its stored name, or
-        // this scope keeps reading (and attaching to) a dead diverged
-        // room while inbound frames land in the converged one. Saved +
-        // re-beaconed by the save/publish_presence below.
-        warn_subscription_rebinds(&set.rebind_diverged(&identity));
-        // Card c409eaf5, both octaves: an id-shaped token must RESOLVE
-        // against the channels this scope already knows, never reach
-        // `ChannelName::new` (which would hash it into a brand-new
-        // channel). Octave 1 (2026-06-01, continuum demo): a FULL uuid
-        // string minted a diverged channel — refused since. Octave 2
-        // (2026-08-11): the 8-hex SHORT id walked past that guard and
-        // minted ghost room 7d1a76de from academy's prefix "3be59578" —
-        // this scope then wrote and read a room nobody else was in, and
-        // every store read looked like a monologue. Resolution wins
-        // over refusal: a token matching exactly one subscribed channel
-        // binds to THAT room; no match or several is a loud error.
-        let channel = match set.resolve_id_token(name) {
-            subscriptions::IdTokenResolution::Match(sub) => sub.name.clone(),
-            subscriptions::IdTokenResolution::NotAnId => ChannelName::new(name)?,
-            subscriptions::IdTokenResolution::Unknown => {
-                // Preserve the documented c409eaf5 error for full-uuid
-                // tokens; the short-id form gets its own guidance.
-                return Err(if uuid::Uuid::parse_str(name.trim()).is_ok() {
+    /// Resolve `token` to a room this scope can join, MINTING one only
+    /// when the token names no room already known here.
+    ///
+    /// An id-shaped token is an id: it resolves against the rooms this
+    /// scope holds, and a token that matches none — or several — is a
+    /// loud error, never a new room. A label matches at most one room
+    /// (labels key nothing, so several sharing one is the caller's
+    /// answer to give by id).
+    async fn resolve_or_mint(
+        &self,
+        set: &mut subscriptions::SubscriptionSet,
+        token: &str,
+    ) -> Result<Subscription, AircError> {
+        match set.resolve_room_id(token) {
+            subscriptions::RoomIdResolution::Match(sub) => return Ok(sub.clone()),
+            subscriptions::RoomIdResolution::Unknown => {
+                return Err(if uuid::Uuid::parse_str(token.trim()).is_ok() {
                     AircError::JoinUuidString {
-                        string: name.to_string(),
+                        string: token.to_string(),
                     }
                 } else {
                     AircError::JoinIdUnknown {
-                        token: name.trim().to_string(),
+                        token: token.trim().to_string(),
                     }
                 });
             }
-            subscriptions::IdTokenResolution::Ambiguous(subs) => {
+            subscriptions::RoomIdResolution::NotAnId => {}
+        }
+        let name = ChannelName::new(token)?;
+        // Collect the IDS, not the subscriptions. `RoomId` is `Copy`, so
+        // this ends the borrow on `set` — which is the whole reason the
+        // collect exists — without copying a `String` + `PathBuf` per
+        // match. The previous shape cloned every candidate and then read
+        // one field off each: N heap allocations to answer "how many, and
+        // which ids", both of which the ids alone already say.
+        let labelled: Vec<RoomId> = set
+            .all()
+            .filter(|s| s.name == name)
+            .map(|s| s.room_id)
+            .collect();
+        match labelled.as_slice() {
+            // The candidates are IDS. Rendering them into "name (id)"
+            // here would make the caller parse text back apart to get
+            // the one thing it needs — and the one thing it needs is
+            // the id it should have passed instead of the label.
+            [_, _, ..] => {
                 return Err(AircError::JoinIdAmbiguous {
-                    token: name.trim().to_string(),
-                    candidates: subs
-                        .iter()
-                        .map(|s| format!("{} ({})", s.name.as_str(), s.room_id))
-                        .collect(),
-                });
+                    token: token.trim().to_string(),
+                    candidates: labelled,
+                })
             }
-        };
-        let subscription =
-            set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
+            // ONE clone, and only here: the return type is owned, and a
+            // borrow cannot escape a `&mut set` the caller goes on to
+            // mutate. That is the "unless absolutely necessary" case.
+            [only] => {
+                let only = *only;
+                return set
+                    .get(only)
+                    .cloned()
+                    .ok_or_else(|| subscriptions::SubscriptionError::UnknownRoom(only).into());
+            }
+            [] => {}
+        }
+        // Not in THIS scope — ask the ACCOUNT. Every scope on this
+        // machine shares one room directory, so the label resolves to
+        // whatever id the first scope to use it minted, and this scope
+        // JOINS that room instead of minting a second one. Without this
+        // hop, `~/.airc` and `repo/.airc` would each hold their own
+        // private `#general` and never see each other.
+        let candidate = Subscription::minting(&self.inner.wire_root, name.clone())?;
+        let room_id = self
+            .coordinator_store()
+            .claim_room_label(name.as_str(), candidate.room_id, time::now_ms()?)
+            .await
+            .map_err(subscriptions::SubscriptionError::from)?;
+        if room_id == candidate.room_id {
+            set.insert_subscription(candidate.clone());
+            return Ok(candidate);
+        }
+        Ok(set.join(&self.inner.wire_root, room_id, name)?)
+    }
+
+    async fn join_channel(&self, name: &str, focus: Focus) -> Result<Room, AircError> {
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        let subscription = self.resolve_or_mint(&mut set, name).await?;
+        self.commit_join(set, subscription, focus).await
+    }
+
+    /// Join the room `room_id` NAMES, labelling it `label` locally.
+    ///
+    /// This is the rendezvous verb, and the only honest way for two
+    /// scopes that have never met to end up in the SAME room. `join`
+    /// takes a token a human typed, so across two machines it mints
+    /// two rooms that merely share a label — the label keys nothing.
+    /// Here the caller already holds the id (from an
+    /// [`InviteBeacon`](crate::InviteBeacon), a peer's presence, a
+    /// link someone pasted), so there is nothing to resolve and
+    /// nothing to mint: the id IS the room.
+    ///
+    /// The label is local display only. Two scopes in one room may
+    /// call it different things and still be in one room, because
+    /// membership is keyed by the id and never by what either of them
+    /// wrote on the door.
+    ///
+    /// Focus moves, exactly as in [`Self::join`] — this is that same
+    /// verb with the room named by id instead of by token, so it
+    /// carries the same meaning for the caller. The membership-without
+    /// -focus half of the pair ([`Self::subscribe_room`]) has no by-id
+    /// twin yet because nothing needs one; `commit_join` already takes
+    /// the focus, so adding `subscribe_room_id` is a three-line
+    /// wrapper on the day a citizen wants it.
+    pub async fn join_room_id(&self, room_id: RoomId, label: &str) -> Result<Room, AircError> {
+        let mut set = subscriptions::load_or_init(self.event_store()).await?;
+        let subscription = set.join(&self.inner.wire_root, room_id, ChannelName::new(label)?)?;
+        self.commit_join(set, subscription, Focus::MakeDefault)
+            .await
+    }
+
+    /// Make a resolved subscription durable and announce it: save,
+    /// re-beacon presence, emit `RoomJoined`, publish the identity
+    /// card. Every join lands here regardless of how the room was
+    /// named, so a by-id join is observable on exactly the same terms
+    /// as a by-label one — no second lifecycle to drift.
+    async fn commit_join(
+        &self,
+        mut set: subscriptions::SubscriptionSet,
+        subscription: Subscription,
+        focus: Focus,
+    ) -> Result<Room, AircError> {
+        let identity = self.mesh_identity().await?;
+        let room_id = subscription.room_id;
+        let channel = subscription.name.clone();
+        // Idempotent by contract (an existing subscription is returned
+        // as-is), so the by-id path re-stating its own join is free.
+        set.join(&self.inner.wire_root, room_id, channel.clone())?;
         if focus == Focus::MakeDefault {
-            set.set_default(channel.clone())?;
+            set.set_default(room_id)?;
         }
         // Whether this room ended up default is now a FACT to read, not a
-        // constant to assert: `subscribe_with_wire_root` seeds the default when
-        // the scope had none, so a first room is default under either focus.
-        let is_default = set.default_subscription().map(|s| &s.name) == Some(&channel);
+        // constant to assert: `join` seeds the default when the scope had
+        // none, so a first room is default under either focus.
+        let is_default = set.default == Some(room_id);
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
         let room = subscription.as_room();
@@ -2053,12 +2139,6 @@ impl Airc {
     pub async fn ensure_join_context(&self, context: JoinContext) -> Result<Vec<Room>, AircError> {
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
-        // Self-healing join: this method re-runs constantly (bare
-        // `airc join`, init re-runs, daemon-bounce recovery, monitor
-        // resume) — it is the join-shaped touchpoint where a healed
-        // mesh identity re-binds stale subscriptions to their converged
-        // room UUIDs. See `SubscriptionSet::rebind_diverged`.
-        warn_subscription_rebinds(&set.rebind_diverged(&identity));
         let mut rooms = Vec::new();
 
         // Card 1eae6f3e: the default room is DURABLE scope state. This
@@ -2071,26 +2151,49 @@ impl Airc {
         // BEFORE this run so the context default is promoted only when
         // it is genuinely new to this scope (first entry into a project
         // context) — never to overwrite an established default.
-        let previous_default = set.default.clone();
-        let context_default_was_subscribed = set.subscribed.contains_key(&context.default);
+        let previous_default = set.default;
 
+        let mut context_default_room: Option<airc_core::RoomId> = None;
+        let mut context_default_was_subscribed = false;
         for channel in context.channels {
-            if set.parted.contains(&channel) {
+            let is_context_default = channel == context.default;
+            let existing = set
+                .all()
+                .find(|s| s.name == channel)
+                .map(|s| (s.room_id, true));
+            let (room_id, was_subscribed) = match existing {
+                Some(found) => found,
+                // Same account hop as `resolve_or_mint`: the context's
+                // rooms must be the ones the account already has, or
+                // every scope infers its own private `#general`.
+                None => (
+                    self.resolve_or_mint(&mut set, channel.as_str())
+                        .await?
+                        .room_id,
+                    false,
+                ),
+            };
+            if is_context_default {
+                context_default_room = Some(room_id);
+                context_default_was_subscribed = was_subscribed;
+            }
+            if set.parted.contains(&room_id) {
                 continue;
             }
-            let subscription =
-                set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel)?;
+            let subscription = set.join(&self.inner.wire_root, room_id, channel)?;
             rooms.push(subscription.as_room());
         }
 
         let default_missing_or_dangling = match &set.default {
             None => true,
-            Some(name) => !set.subscribed.contains_key(name),
+            Some(room_id) => !set.subscribed.contains_key(room_id),
         };
-        if set.subscribed.contains_key(&context.default)
-            && (default_missing_or_dangling || !context_default_was_subscribed)
-        {
-            set.set_default(context.default)?;
+        if let Some(room_id) = context_default_room {
+            if set.subscribed.contains_key(&room_id)
+                && (default_missing_or_dangling || !context_default_was_subscribed)
+            {
+                set.set_default(room_id)?;
+            }
         }
         if let (Some(old), Some(new)) = (&previous_default, &set.default) {
             if old != new {
@@ -2099,8 +2202,8 @@ impl Airc {
                 // `airc msg` in this scope. Never let it happen
                 // silently.
                 tracing::warn!(
-                    old = %old.display_with_hash(),
-                    new = %new.display_with_hash(),
+                    old = %old,
+                    new = %new,
                     "default room CHANGED by join context — short-shape sends now target the new room"
                 );
             }
@@ -2129,13 +2232,14 @@ impl Airc {
     pub async fn part_channel(&self, name: Option<&str>) -> Result<Room, AircError> {
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
-        let channel = match name {
-            Some(name) => ChannelName::new(name)?,
-            None => set.default.clone().ok_or(AircError::NoCurrentRoom)?,
+        let room_id = match name {
+            Some(name) => self.resolve_or_mint(&mut set, name).await?.room_id,
+            None => set.default.ok_or(AircError::NoCurrentRoom)?,
         };
         let removed = set
-            .unsubscribe(&channel)
-            .ok_or_else(|| AircError::NotSubscribed(channel.display_with_hash()))?;
+            .unsubscribe(&room_id)
+            .ok_or_else(|| AircError::NotSubscribed(room_id.to_string()))?;
+        let channel = removed.name.clone();
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
 
@@ -2181,10 +2285,13 @@ impl Airc {
         }
 
         let identity = self.mesh_identity().await?;
-        let channel = ChannelName::new(landing)?;
-        let subscription =
-            set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
-        set.set_default(channel)?;
+        let subscription = self.resolve_or_mint(&mut set, landing).await?;
+        let subscription = set.join(
+            &self.inner.wire_root,
+            subscription.room_id,
+            subscription.name,
+        )?;
+        set.set_default(subscription.room_id)?;
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
         // Same publish-on-subscribe semantics as Airc::join /
@@ -2402,6 +2509,14 @@ mod trust_tier_wire_str {
     }
 }
 
+/// How much room history a wall projection folds in.
+///
+/// Generous because a busy room accumulates pinned posts over time, and a
+/// wall post that scrolls out of the window silently stops being true —
+/// which is worse than a slow read. Declared once so `wall_posts` and
+/// `wall_posts_in` can never disagree about what "the wall" means.
+pub const WALL_PROJECTION_PAGE_SIZE: usize = 500;
+
 /// Pure discriminator: recover the `WallPostPublished` carried by a
 /// transcript event's self-describing body, or `None` if the event is
 /// not a wall post.
@@ -2414,33 +2529,6 @@ mod trust_tier_wire_str {
 /// deserializes to this variant for an actual wall post, so it is the
 /// authoritative identity; doctrine / identity / chat bodies fall through
 /// to `None` (heterogeneous-stream projection, not error-swallowing).
-/// Self-healing join — receive-binding re-derive on identity heal: be
-/// LOUD about every subscription whose stored room UUID was re-bound to
-/// the current derivation of its stored name. A silent rebind would hide
-/// a mesh-identity change that re-targets what this scope reads; the
-/// old UUID stays reachable via the router bridge's per-frame name
-/// reconvergence, so naming old→new here is the operator's only signal.
-fn warn_subscription_rebinds(rebinds: &[subscriptions::SubscriptionRebind]) {
-    for rebind in rebinds {
-        tracing::warn!(
-            channel = %rebind.name.display_with_hash(),
-            old_room_id = %rebind.old_room_id,
-            new_room_id = %rebind.new_room_id,
-            "subscription REBOUND: stored room UUID no longer derives from this \
-             scope's mesh identity (identity healed since join) — re-bound to the \
-             converged room so inbound frames and reads converge again"
-        );
-    }
-}
-
-/// How much room history a wall projection folds in.
-///
-/// Generous because a busy room accumulates pinned posts over time, and a
-/// wall post that scrolls out of the window silently stops being true —
-/// which is worse than a slow read. Declared once so `wall_posts` and
-/// `wall_posts_in` can never disagree about what "the wall" means.
-pub const WALL_PROJECTION_PAGE_SIZE: usize = 500;
-
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
 ) -> Option<airc_core::doctrine::WallPostPublished> {
@@ -2911,10 +2999,7 @@ mod publish_identity_tests {
         );
 
         let set = airc.subscription_set().await.expect("subscription set");
-        let names: Vec<String> = set
-            .channel_names()
-            .map(|c| c.as_str().to_string())
-            .collect();
+        let names: Vec<String> = set.all().map(|s| s.name.as_str().to_string()).collect();
         assert!(
             names.iter().any(|n| n == "academy") && names.iter().any(|n| n == "cambriantech"),
             "she is a member of BOTH rooms, not just the focused one: {names:?}"

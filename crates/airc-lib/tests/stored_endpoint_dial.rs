@@ -622,9 +622,7 @@ async fn peer_dials_lan_rung_and_skips_tailscale() {
 /// and demands the dial happens.
 #[tokio::test]
 async fn split_store_import_still_dials_no_silent_shadow() {
-    use airc_lib::{
-        beacon_now, AccountPeerBeacon, AccountRegistryDocument, ChannelName, MeshIdentity,
-    };
+    use airc_lib::{beacon_now, AccountPeerBeacon, AccountRegistryDocument, MeshIdentity};
 
     let tmp_a = TempDir::new().expect("alice tempdir");
     let tmp_b = TempDir::new().expect("bob tempdir");
@@ -650,18 +648,21 @@ async fn split_store_import_still_dials_no_silent_shadow() {
         .await
         .expect("alice listens");
 
-    let channel = ChannelName::new("general").expect("channel");
+    let room = alice.current_room().await.expect("alice current room");
     let document = AccountRegistryDocument::new(
         MeshIdentity::new("test-account"),
         2_000,
-        vec![channel.clone()],
+        vec![airc_lib::AccountRoom::new(
+            room.channel,
+            Some(room.name.clone()),
+        )],
         vec![AccountPeerBeacon {
             endpoints_advertised_at_ms: None,
             endpoints_peer_id: None,
             presence: beacon_now(
                 alice.peer_id(),
                 tmp_a.path().join(".airc"),
-                vec![channel],
+                vec![room.channel],
                 123,
                 1_000,
             ),

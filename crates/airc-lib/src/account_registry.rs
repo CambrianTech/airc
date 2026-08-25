@@ -22,18 +22,19 @@ use crate::coordinator::{CoordinatorSnapshot, PresenceBeacon};
 use crate::error::AircError;
 use crate::registry::PeerSpec;
 use crate::route::{InviteBeacon, RouteEndpoint};
-use crate::subscriptions::{ChannelName, MeshIdentity};
+use crate::subscriptions::MeshIdentity;
 use crate::time;
 use crate::Airc;
 
 pub const ACCOUNT_REGISTRY_SCHEMA_VERSION: u16 = 1;
 
+pub use airc_core::scope_home_is_temp_rooted;
 /// Temp-rooted scope-home detection (#1150). The definition moved to
 /// [`airc_core::temp_home`] (card f122b5b5) so `airc-daemon`'s idle
 /// self-exit watchdog consults the SAME check without depending on
 /// this crate; re-exported here so existing callers keep their
 /// import path.
-pub use airc_core::scope_home_is_temp_rooted;
+pub use airc_core::RoomId;
 
 /// Outcome of [`merge_registry_documents`]: the merged view plus the
 /// hygiene counters the caller must surface (count, not full dump).
@@ -76,7 +77,7 @@ pub fn merge_registry_documents(
 ) -> RegistryMergeOutcome {
     let mut ignored_temp_beacons = 0usize;
     let mut generated_at_ms = 0u64;
-    let mut channels: Vec<ChannelName> = Vec::new();
+    let mut rooms: Vec<AccountRoom> = Vec::new();
     // peer_id -> (heartbeat_at_ms, doc generated_at_ms, beacon)
     let mut freshest: HashMap<airc_core::PeerId, (u64, u64, AccountPeerBeacon)> = HashMap::new();
     // peer_id -> (heartbeat_at_ms, doc generated_at_ms, endpoints,
@@ -98,9 +99,16 @@ pub fn merge_registry_documents(
         }
         matched_any = true;
         generated_at_ms = generated_at_ms.max(document.generated_at_ms);
-        for channel in &document.channels {
-            if !channels.contains(channel) {
-                channels.push(channel.clone());
+        for room in &document.rooms {
+            // A LABELLED entry supersedes an unlabelled one for the same
+            // id: the label is what a later peer needs to find the room
+            // by name, and dropping it would strand that room.
+            if let Some(existing) = rooms.iter_mut().find(|r| r.room_id == room.room_id) {
+                if existing.label.is_none() {
+                    existing.label = room.label.clone();
+                }
+            } else {
+                rooms.push(room.clone());
             }
         }
         for beacon in document.peers {
@@ -165,13 +173,13 @@ pub fn merge_registry_documents(
         }
     }
     peers.sort_by_key(|peer| peer.peer_id().to_string());
-    channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    rooms.sort();
 
     RegistryMergeOutcome {
         document: Some(AccountRegistryDocument::new(
             mesh_identity.clone(),
             generated_at_ms,
-            channels,
+            rooms,
             peers,
         )),
         ignored_temp_beacons,
@@ -211,12 +219,36 @@ pub fn prune_stale_peers(peers: &mut Vec<AccountPeerBeacon>, now_ms: u64, ttl_ms
     before - peers.len()
 }
 
+/// One room the account knows: its ADDRESS plus the label it was filed
+/// under. An unlabelled room (dispatched into, handed over by a peer) is
+/// still a perfectly good entry — it simply cannot be reached by name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AccountRoom {
+    pub room_id: RoomId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl AccountRoom {
+    pub fn new(room_id: RoomId, label: Option<String>) -> Self {
+        Self { room_id, label }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRegistryDocument {
     pub schema_version: u16,
     pub mesh_identity: MeshIdentity,
     pub generated_at_ms: u64,
-    pub channels: Vec<ChannelName>,
+    /// Every room the account knows, BY ID, each carrying the display
+    /// label the account filed it under.
+    ///
+    /// The label is the DIRECTORY's payload, never the room's identity:
+    /// it is what lets a peer that types `#general` learn the id the
+    /// account already minted, instead of minting a second room nobody
+    /// else is in. Delivery still routes on the id alone — a label on
+    /// the wire buys discovery, never addressing.
+    pub rooms: Vec<AccountRoom>,
     pub peers: Vec<AccountPeerBeacon>,
 }
 
@@ -224,14 +256,14 @@ impl AccountRegistryDocument {
     pub fn new(
         mesh_identity: MeshIdentity,
         generated_at_ms: u64,
-        channels: Vec<ChannelName>,
+        rooms: Vec<AccountRoom>,
         peers: Vec<AccountPeerBeacon>,
     ) -> Self {
         Self {
             schema_version: ACCOUNT_REGISTRY_SCHEMA_VERSION,
             mesh_identity,
             generated_at_ms,
-            channels,
+            rooms,
             peers,
         }
     }
@@ -281,7 +313,14 @@ impl AccountRegistryDocument {
         Self::new(
             snapshot.mesh_identity.clone(),
             generated_at_ms,
-            snapshot.live_channels.clone(),
+            // A snapshot knows ids only — beacons carry addresses, not
+            // labels. The labels are merged in by the scope's own
+            // subscriptions (below) and by peers' published documents.
+            snapshot
+                .live_rooms
+                .iter()
+                .map(|room_id| AccountRoom::new(*room_id, None))
+                .collect(),
             peers,
         )
     }
@@ -597,29 +636,37 @@ impl Airc {
         // are publishing right now) carrying our dialable endpoints.
         if !document.peers.iter().any(|peer| peer.peer_id() == self_id) {
             // Card cbbcf18d (post-#1146 audit): the stamped self-beacon's
-            // channel list comes from `self.subscriptions()` — the LOCAL
+            // room list comes from `self.subscriptions()` — the LOCAL
             // single source of truth — not from presence-derived
-            // `snapshot.live_channels`. In the exact stale-self scenario
-            // this branch exists for, `live` is empty, so live_channels
+            // `snapshot.live_rooms`. In the exact stale-self scenario
+            // this branch exists for, `live` is empty, so live_rooms
             // is [] even while this scope is subscribed; identity, key,
             // and endpoints already follow the publisher-is-alive
-            // doctrine and the channel list must too.
-            let subscribed_channels: Vec<ChannelName> = self
-                .subscriptions()
-                .await?
-                .into_iter()
-                .map(|subscription| subscription.name)
-                .collect();
-            for channel in &subscribed_channels {
-                if !document.channels.contains(channel) {
-                    document.channels.push(channel.clone());
+            // doctrine and the room list must too.
+            let subscriptions = self.subscriptions().await?;
+            let subscribed_rooms: Vec<RoomId> = subscriptions.iter().map(|s| s.room_id).collect();
+            for subscription in &subscriptions {
+                let label = (!subscription.name.as_str().is_empty())
+                    .then(|| subscription.name.as_str().to_string());
+                if let Some(existing) = document
+                    .rooms
+                    .iter_mut()
+                    .find(|r| r.room_id == subscription.room_id)
+                {
+                    if existing.label.is_none() {
+                        existing.label = label;
+                    }
+                } else {
+                    document
+                        .rooms
+                        .push(AccountRoom::new(subscription.room_id, label));
                 }
             }
-            document.channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            document.rooms.sort();
             let presence = crate::coordinator::beacon_now(
                 self_id,
                 self.inner.home.clone(),
-                subscribed_channels,
+                subscribed_rooms,
                 std::process::id(),
                 crate::time::now_ms()?,
             );
@@ -719,6 +766,22 @@ impl Airc {
         // of one) leaves its peers `Untrusted`. Using `document.mesh_identity`
         // for both sides would be circular — a document vouching for itself.
         let self_mesh = self.mesh_identity().await?;
+        // Learn the account's LABELS. This is what closes cross-machine
+        // rendezvous without letting a name address anything: a peer
+        // that types `#general` now finds the id the account already
+        // minted instead of minting a second room nobody else is in.
+        // `claim_room_label` is insert-or-ignore, so an entry this scope
+        // already holds wins and a peer can never re-point a label we
+        // are using.
+        for room in &document.rooms {
+            let Some(label) = room.label.as_deref() else {
+                continue;
+            };
+            self.coordinator_store()
+                .claim_room_label(label, room.room_id, now_ms)
+                .await
+                .map_err(crate::subscriptions::SubscriptionError::from)?;
+        }
         for peer in document.peers {
             if peer.peer_id() == self.inner.identity.peer_id {
                 continue;
@@ -871,8 +934,10 @@ mod tests {
         MeshIdentity::new("joelteply")
     }
 
-    fn channel(name: &str) -> ChannelName {
-        ChannelName::new(name).unwrap()
+    /// A stable test room id. Production ids are minted; these are
+    /// hand-picked so assertions can name the room they mean.
+    fn room(n: u128) -> RoomId {
+        RoomId::from_u128(n)
     }
 
     fn peer_spec(peer_id: PeerId) -> PeerSpec {
@@ -907,14 +972,14 @@ mod tests {
         let presence = crate::coordinator::beacon_now(
             peer_id,
             "/machine/a/.airc".into(),
-            vec![channel("general")],
+            vec![room(1)],
             123,
             1_000,
         );
         let document = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![AccountPeerBeacon {
                 endpoints_advertised_at_ms: None,
                 endpoints_peer_id: None,
@@ -943,14 +1008,14 @@ mod tests {
         let with_spec = crate::coordinator::beacon_now(
             peer_with_spec,
             "/machine/a/.airc".into(),
-            vec![channel("general")],
+            vec![room(1)],
             123,
             1_000,
         );
         let without_spec = crate::coordinator::beacon_now(
             peer_without_spec,
             "/machine/b/.airc".into(),
-            vec![channel("cambriantech")],
+            vec![room(2)],
             456,
             1_000,
         );
@@ -982,14 +1047,14 @@ mod tests {
         let document = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![AccountPeerBeacon {
                 endpoints_advertised_at_ms: None,
                 endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     presence_peer,
                     "/machine/a/.airc".into(),
-                    vec![channel("general")],
+                    vec![room(1)],
                     123,
                     1_000,
                 ),
@@ -1020,14 +1085,14 @@ mod tests {
         let document = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![AccountPeerBeacon {
                 endpoints_advertised_at_ms: None,
                 endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     peer_id,
                     "/machine/a/.airc".into(),
-                    vec![channel("general")],
+                    vec![room(1)],
                     123,
                     1_000,
                 ),
@@ -1055,14 +1120,14 @@ mod tests {
         let document = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![AccountPeerBeacon {
                 endpoints_advertised_at_ms: None,
                 endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     peer_id,
                     machine_a.clone(),
-                    vec![channel("general")],
+                    vec![room(1)],
                     123,
                     1_000,
                 ),
@@ -1124,14 +1189,14 @@ mod tests {
         let same_doc = AccountRegistryDocument::new(
             my_mesh.clone(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![AccountPeerBeacon {
                 endpoints_advertised_at_ms: None,
                 endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     same_account_peer,
                     home.clone(),
-                    vec![channel("general")],
+                    vec![room(1)],
                     123,
                     1_000,
                 ),
@@ -1164,14 +1229,14 @@ mod tests {
         let foreign_doc = AccountRegistryDocument::new(
             MeshIdentity::new("someone-else@github"),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![AccountPeerBeacon {
                 endpoints_advertised_at_ms: None,
                 endpoints_peer_id: None,
                 presence: crate::coordinator::beacon_now(
                     foreign_peer,
                     home.clone(),
-                    vec![channel("general")],
+                    vec![room(1)],
                     123,
                     1_000,
                 ),
@@ -1227,14 +1292,14 @@ mod tests {
             AccountRegistryDocument::new(
                 mesh(),
                 2_000,
-                vec![channel("general")],
+                vec![AccountRoom::new(room(1), Some("general".to_string()))],
                 vec![AccountPeerBeacon {
                     endpoints_advertised_at_ms: None,
                     endpoints_peer_id: None,
                     presence: crate::coordinator::beacon_now(
                         peer_id,
                         machine_b.clone(),
-                        vec![channel("general")],
+                        vec![room(1)],
                         123,
                         hb,
                     ),
@@ -1316,7 +1381,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 peer_id,
                 scope_home.into(),
-                vec![channel("general")],
+                vec![room(1)],
                 123,
                 heartbeat_ms,
             ),
@@ -1370,7 +1435,7 @@ mod tests {
         let document = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![
                 beacon_at(prod, "/machine/a/.airc", 1_000),
                 beacon_at(
@@ -1406,7 +1471,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 shared,
                 "/machine/a/.airc".into(),
-                vec![channel("general")],
+                vec![room(1)],
                 123,
                 1_000,
             ),
@@ -1421,7 +1486,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 shared,
                 "/machine/a/.airc".into(),
-                vec![channel("general")],
+                vec![room(1)],
                 123,
                 5_000,
             ),
@@ -1433,7 +1498,7 @@ mod tests {
         let old_doc = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![stale, beacon_at(only_in_old, "/machine/b/.airc", 900)],
         );
         let new_doc = AccountRegistryDocument::new(mesh(), 6_000, vec![], vec![fresh]);
@@ -1477,7 +1542,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 peer,
                 "/machine/a/.airc".into(),
-                vec![channel("general")],
+                vec![room(1)],
                 123,
                 1_000,
             ),
@@ -1492,7 +1557,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 peer,
                 "/machine/a/.airc".into(),
-                vec![channel("general")],
+                vec![room(1)],
                 456,
                 5_000,
             ),
@@ -1502,13 +1567,13 @@ mod tests {
         let daemon_doc = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![daemon_beacon],
         );
         let manual_doc = AccountRegistryDocument::new(
             mesh(),
             6_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![manual_sync_beacon],
         );
 
@@ -1559,7 +1624,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 peer,
                 "/machine/a/.airc".into(),
-                vec![channel("general")],
+                vec![room(1)],
                 123,
                 1_000,
             ),
@@ -1574,7 +1639,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 peer,
                 "/machine/a/.airc".into(),
-                vec![channel("general")],
+                vec![room(1)],
                 456,
                 5_000,
             ),
@@ -1637,7 +1702,7 @@ mod tests {
             presence: crate::coordinator::beacon_now(
                 peer_id,
                 "/machine/a/.airc".into(),
-                vec![channel("general")],
+                vec![room(1)],
                 123,
                 1_000,
             ),
@@ -1649,7 +1714,7 @@ mod tests {
         let document = AccountRegistryDocument::new(
             mesh(),
             2_000,
-            vec![channel("general")],
+            vec![AccountRoom::new(room(1), Some("general".to_string()))],
             vec![
                 beacon(scope_peer, Some(machine_peer)),
                 beacon(self_hosted_peer, Some(self_hosted_peer)),
@@ -1714,12 +1779,12 @@ mod tests {
             AccountRegistryDocument::new(
                 mesh(),
                 hb,
-                vec![channel("general")],
+                vec![AccountRoom::new(room(1), Some("general".to_string()))],
                 vec![AccountPeerBeacon {
                     presence: crate::coordinator::beacon_now(
                         peer_id,
                         home.clone(),
-                        vec![channel("general")],
+                        vec![room(1)],
                         123,
                         hb,
                     ),
@@ -1918,7 +1983,7 @@ mod tests {
         let stale_self = crate::coordinator::beacon_now(
             airc.peer_id(),
             machine.clone(),
-            vec![channel("general")],
+            vec![room(1)],
             std::process::id(),
             1_000,
         );
@@ -1967,17 +2032,31 @@ mod tests {
             self_beacon.endpoints, expected_endpoints,
             "self-beacon must carry route_endpoints()"
         );
-        // Card cbbcf18d item 2: channels from the LOCAL SoT
-        // (self.subscriptions()), not presence-derived live_channels
+        // Card cbbcf18d item 2: rooms from the LOCAL SoT
+        // (self.subscriptions()), not presence-derived live_rooms
         // (empty in this exact scenario).
+        let subscribed: Vec<RoomId> = airc
+            .subscriptions()
+            .await
+            .expect("subscriptions")
+            .into_iter()
+            .map(|s| s.room_id)
+            .collect();
         assert_eq!(
-            self_beacon.presence.subscribed_channels,
-            vec![channel("general")],
-            "stamped self-beacon channels must come from self.subscriptions()"
+            self_beacon.presence.subscribed_rooms, subscribed,
+            "stamped self-beacon rooms must come from self.subscriptions()"
         );
-        assert!(
-            document.channels.contains(&channel("general")),
-            "document channels must include the local subscriptions"
-        );
+        for room_id in &subscribed {
+            let entry = document
+                .rooms
+                .iter()
+                .find(|r| r.room_id == *room_id)
+                .expect("document rooms must include the local subscriptions");
+            assert!(
+                entry.label.is_some(),
+                "a subscribed room must publish its LABEL — that is what lets a peer \
+                 find this room by name instead of minting a second one"
+            );
+        }
     }
 }

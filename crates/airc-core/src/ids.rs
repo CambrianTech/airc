@@ -26,8 +26,14 @@ use uuid::Uuid;
 macro_rules! uuid_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
+        // `Ord`/`PartialOrd` so an id can KEY an ordered collection. Ids
+        // address things — rooms, peers, events — so the maps and sets
+        // that hold them must sort by the id, not by some display string
+        // that happens to be attached. Without this the only sortable
+        // handle on a room was its name, which is exactly how a display
+        // label ended up as the key for durable membership.
         #[derive(
-            Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
         #[serde(transparent)]
         pub struct $name(pub Uuid);
@@ -65,6 +71,29 @@ macro_rules! uuid_newtype {
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 self.0.fmt(f)
+            }
+        }
+
+        /// The inverse of `Display`, so an id crosses a TEXT boundary
+        /// — an env var, a CLI argument, a config file — by being
+        /// PARSED into its type, once, here.
+        ///
+        /// Without this every such boundary hand-rolls
+        /// `Uuid::parse_str(..).map($name::from_uuid)`, and a boundary
+        /// that finds that tedious keeps the `String` instead. That is
+        /// how a display label becomes an identity: not by a decision,
+        /// but by the typed path being fractionally less convenient
+        /// than the untyped one. Rendering was already free; parsing
+        /// is now free too.
+        ///
+        /// Surrounding whitespace is trimmed because these values
+        /// arrive from humans and shells. Nothing else is accepted —
+        /// no prefixes, no truncation, no partial ids.
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(raw: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(raw.trim()).map(Self)
             }
         }
     };

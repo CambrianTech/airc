@@ -8,16 +8,12 @@
 //! [`Airc::join_default_context`](crate::Airc::join_default_context)
 //! re-infers context.
 //!
-//! ## RoomId derivation
+//! ## The room id IS the key
 //!
-//! Each subscribed channel is a typed [`ChannelName`] with a
-//! deterministic [`RoomId`] — see [`derive_room_id`]. The derivation
-//! is namespaced by an opaque [`MeshIdentity`] string (intended to be
-//! the user's authenticated Git/GitHub identity) so that two scopes on
-//! the same identity converge to the same `RoomId` for a given
-//! channel, and cross-identity channels do NOT collide. For v1, the
-//! identity is supplied by the caller; a follow-up wires it to
-//! `gh api user --jq .login` via the machine-global coordinator.
+//! Membership is keyed by [`RoomId`] — a v4 uuid minted by airc when
+//! the room is created, read-only to every caller. A [`ChannelName`]
+//! rides along as a display label and addresses nothing: two rooms may
+//! share a label, a room may have none, and renaming one moves nothing.
 //!
 //! ## Storage
 //!
@@ -29,7 +25,6 @@ use std::path::{Path, PathBuf};
 
 use airc_store::{EventStore, StoredSubscription};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use airc_core::RoomId;
 
@@ -40,18 +35,16 @@ use crate::Airc;
 
 const SUBSCRIPTIONS_VERSION: u32 = 1;
 
-/// Namespace UUID for deriving channel UUIDs from
-/// `(mesh_identity, channel_name)`.
-const SUBSCRIPTIONS_NAMESPACE: Uuid = Uuid::from_bytes([
-    0xa1, 0xc2, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-]);
-
 /// What can go wrong loading or saving the subscription set.
 #[derive(Debug)]
 pub enum SubscriptionError {
     Store(airc_store::StoreError),
     Clock(std::time::SystemTimeError),
     InvalidChannelName(ChannelNameError),
+    /// A room id was passed where membership is required, and this
+    /// scope is not subscribed to it. The id is reported verbatim —
+    /// there is no name to guess at.
+    UnknownRoom(RoomId),
 }
 
 impl std::fmt::Display for SubscriptionError {
@@ -60,6 +53,7 @@ impl std::fmt::Display for SubscriptionError {
             Self::Store(error) => write!(f, "subscriptions store: {error}"),
             Self::Clock(error) => write!(f, "subscriptions clock: {error}"),
             Self::InvalidChannelName(error) => write!(f, "invalid channel name: {error}"),
+            Self::UnknownRoom(room_id) => write!(f, "not subscribed to room {room_id}"),
         }
     }
 }
@@ -70,6 +64,7 @@ impl std::error::Error for SubscriptionError {
             Self::Store(error) => Some(error),
             Self::Clock(error) => Some(error),
             Self::InvalidChannelName(error) => Some(error),
+            Self::UnknownRoom(_) => None,
         }
     }
 }
@@ -99,6 +94,18 @@ impl From<ChannelNameError> for SubscriptionError {
 pub struct ChannelName(String);
 
 impl ChannelName {
+    /// The empty display label, for a room that has no name — one
+    /// addressed purely by id (dispatched into, handed over by a peer)
+    /// or one whose stored label no longer parses.
+    ///
+    /// This is a LABEL being absent, never an identity being absent: the
+    /// room is fully identified by its `RoomId`. Before ids keyed
+    /// membership, an unparseable name meant the whole subscription was
+    /// dropped on load — a display string could evict a real room.
+    pub(crate) fn unnamed() -> Self {
+        Self(String::new())
+    }
+
     pub(crate) fn general() -> Self {
         Self("general".to_string())
     }
@@ -189,13 +196,9 @@ pub enum ChannelNameError {
     InvalidChar(char),
 }
 
-/// Opaque mesh-identity string. v1 callers may pass any stable token;
-/// future revisions wire this to `gh api user --jq .login` via the
-/// machine-global coordinator so all scopes on one GitHub account
-/// converge to the same `RoomId` for a given channel.
-///
-/// Wrapper instead of bare String so misuse like
-/// `derive_room_id(name, name)` is impossible.
+/// Opaque mesh-identity string — WHO this scope is on the mesh.
+/// Wrapper instead of a bare String so it can never be confused with
+/// any other text the mesh passes around.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MeshIdentity(String);
 
@@ -215,34 +218,19 @@ impl MeshIdentity {
     }
 }
 
-/// Derive a `RoomId` from `(mesh_identity, channel_name)`. Same inputs
-/// produce the same `RoomId` on any machine, so two scopes on the same
-/// identity that both subscribe to `#general` see the same room.
-pub fn derive_room_id(identity: &MeshIdentity, channel: &ChannelName) -> RoomId {
-    let mut bytes = Vec::with_capacity(identity.as_str().len() + 1 + channel.as_str().len());
-    bytes.extend_from_slice(identity.as_str().as_bytes());
-    // NUL separator so e.g. ("alice", "bob-room") and ("alice-bob", "room")
-    // can never collide.
-    bytes.push(0);
-    bytes.extend_from_slice(channel.as_str().as_bytes());
-    RoomId::from_uuid(Uuid::new_v5(&SUBSCRIPTIONS_NAMESPACE, &bytes))
-}
-
-/// Outcome of [`SubscriptionSet::resolve_id_token`] — how a join
-/// token that might be a channel ID resolves against this scope's
-/// subscriptions.
+/// Resolution of a caller-supplied token against this scope's rooms.
+///
+/// A token is either a room id or it is not. There is no third thing:
+/// an id parses to 128 bits and looks up, or the token is a name and a
+/// different surface deals with it.
 #[derive(Debug)]
-pub enum IdTokenResolution<'a> {
-    /// Not id-shaped — treat the token as a channel NAME.
+pub enum RoomIdResolution<'a> {
+    /// Does not parse as a room id.
     NotAnId,
-    /// Id-shaped and identifies exactly this subscribed channel.
+    /// Parsed to the id of exactly this subscribed room.
     Match(&'a Subscription),
-    /// Id-shaped but no subscribed channel matches — almost certainly
-    /// a mis-pasted id; minting a room named after it would split the
-    /// real room (the ghost-room trap).
+    /// A valid room id this scope is not subscribed to.
     Unknown,
-    /// Id-shaped and a prefix of MORE than one subscribed channel.
-    Ambiguous(Vec<&'a Subscription>),
 }
 
 /// One channel this scope is subscribed to.
@@ -255,37 +243,40 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    /// Construct a subscription. Derives the `RoomId` from
-    /// `(identity, name)` and the wire path from
-    /// `<home>/wires/<name>/`.
-    pub fn new(
-        home: &Path,
-        identity: &MeshIdentity,
-        name: ChannelName,
-    ) -> Result<Self, SubscriptionError> {
-        let wire = home.join("wires").join(name.as_str());
-        Self::with_wire(identity, name, wire)
+    /// Membership in a NEWLY MINTED room. The id is generated here and
+    /// is out of the caller's control.
+    pub fn minting(wire_root: &Path, name: ChannelName) -> Result<Self, SubscriptionError> {
+        Self::joining(wire_root, RoomId::new(), name)
     }
 
-    /// Construct a subscription whose local-fs wire is rooted at the
-    /// account-wide machine home instead of the caller's scope home.
-    /// This is what makes `~/.airc`, `repo/.airc`, and other scopes on
-    /// the same OS account converge on one local data plane.
-    pub fn new_with_wire_root(
+    /// Membership in a room whose id you already hold — the normal
+    /// path. A peer hands you an id, a board row carries one, a
+    /// dispatch names one; you join THAT room.
+    ///
+    /// `wire_root` is the account-wide machine home, not the caller's
+    /// scope home: that is what makes `~/.airc`, `repo/.airc`, and every
+    /// other scope on one OS account share a data plane.
+    ///
+    /// (This and `minting` are the only two ways to build one. There was
+    /// a third, `with_wire_root`, that `joining` delegated to with an
+    /// identical signature — two spellings of one constructor, so the
+    /// choice between them carried no information.)
+    pub fn joining(
         wire_root: &Path,
-        identity: &MeshIdentity,
+        room_id: RoomId,
         name: ChannelName,
     ) -> Result<Self, SubscriptionError> {
-        let wire = wire_root.join("wires").join(name.as_str());
-        Self::with_wire(identity, name, wire)
+        // Wire dir keyed by the ID: always a valid path component, and
+        // renaming a room never moves its bytes.
+        let wire = wire_root.join("wires").join(room_id.to_string());
+        Self::with_wire(room_id, name, wire)
     }
 
     pub fn with_wire(
-        identity: &MeshIdentity,
+        room_id: RoomId,
         name: ChannelName,
         wire: PathBuf,
     ) -> Result<Self, SubscriptionError> {
-        let room_id = derive_room_id(identity, &name);
         Ok(Self {
             name,
             room_id,
@@ -305,19 +296,6 @@ impl Subscription {
     }
 }
 
-/// One healed subscription binding (self-healing join — receive-binding
-/// re-derive on identity heal): the stored room UUID no longer matched
-/// the current derivation of the stored channel NAME, so the
-/// subscription was re-bound to the converged UUID. Carried out of
-/// [`SubscriptionSet::rebind_diverged`] so callers can be LOUD about
-/// exactly which room moved where.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubscriptionRebind {
-    pub name: ChannelName,
-    pub old_room_id: RoomId,
-    pub new_room_id: RoomId,
-}
-
 /// All channels this scope is subscribed to, plus the default-channel
 /// pointer for short-shape commands and the parted set so re-running
 /// [`Airc::join_default_context`](crate::Airc::join_default_context)
@@ -325,14 +303,24 @@ pub struct SubscriptionRebind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionSet {
     pub version: u32,
-    pub subscribed: BTreeMap<ChannelName, Subscription>,
-    /// Default channel for `airc msg "..."` etc. `None` means no
+    /// Keyed by ROOM ID — the address. The name rides along inside each
+    /// `Subscription` as a display label and keys nothing.
+    ///
+    /// This was keyed by `ChannelName`, which made a display string the
+    /// lookup key for durable membership: a room could only be
+    /// remembered if it had a name, a renamed room became a different
+    /// room, and a room you were HANDED (dispatched into, told about by
+    /// a peer) had an id and no name and so could not be represented at
+    /// all. No migration is needed for the switch — `StoredSubscription`
+    /// has always persisted `room_id` alongside the name, so the id was
+    /// on disk the whole time; only the in-memory key was wrong.
+    pub subscribed: BTreeMap<RoomId, Subscription>,
+    /// Default room for `airc msg "..."` etc. `None` means no
     /// subscriptions yet (fresh-init scope).
-    pub default: Option<ChannelName>,
-    /// Channels the user explicitly parted. Never auto-rejoined by
-    /// `join_default_context`. Re-subscribing via `subscribe` clears
-    /// the entry from this set.
-    pub parted: BTreeSet<ChannelName>,
+    pub default: Option<RoomId>,
+    /// Rooms the user explicitly parted. Never auto-rejoined by
+    /// `join_default_context`. Re-subscribing clears the entry.
+    pub parted: BTreeSet<RoomId>,
 }
 
 impl SubscriptionSet {
@@ -346,77 +334,78 @@ impl SubscriptionSet {
         }
     }
 
-    /// Add or replace a subscription for `name`. Idempotent: if the
-    /// channel is already subscribed, the existing
-    /// `joined_at_ms` is preserved (re-subscribe is a no-op for
-    /// observers). Clears the channel from `parted` if present so a
-    /// later default-context re-infer will keep it.
+    /// Join the room `room_id` identifies. Idempotent: if this scope is
+    /// already in that room the existing `joined_at_ms` is preserved
+    /// (re-joining is a no-op for observers) and its stored label wins.
+    /// Clears the room from `parted` so a later default-context
+    /// re-infer keeps it.
     ///
-    /// Sets the channel as `default` only if no default exists yet.
+    /// Sets the room as `default` only if no default exists yet.
     /// Explicit promotion is via [`Self::set_default`].
-    pub fn subscribe(
+    pub fn join(
         &mut self,
         home: &Path,
-        identity: &MeshIdentity,
+        room_id: RoomId,
         name: ChannelName,
     ) -> Result<Subscription, SubscriptionError> {
-        self.parted.remove(&name);
-        if let Some(existing) = self.subscribed.get(&name) {
+        self.parted.remove(&room_id);
+        if let Some(existing) = self.subscribed.get(&room_id) {
             return Ok(existing.clone());
         }
-        let sub = Subscription::new(home, identity, name.clone())?;
-        self.subscribed.insert(name.clone(), sub.clone());
-        if self.default.is_none() {
-            self.default = Some(name);
-        }
+        let sub = Subscription::joining(home, room_id, name)?;
+        self.insert(sub.clone());
         Ok(sub)
     }
 
-    /// Add or replace a subscription using an account-wide local wire
-    /// root. See [`Subscription::new_with_wire_root`].
-    pub fn subscribe_with_wire_root(
+    /// Mint a NEW room and join it. The id is generated by airc; the
+    /// caller supplies only a display label.
+    pub fn create(
         &mut self,
-        wire_root: &Path,
-        identity: &MeshIdentity,
+        home: &Path,
         name: ChannelName,
     ) -> Result<Subscription, SubscriptionError> {
-        self.parted.remove(&name);
-        if let Some(existing) = self.subscribed.get(&name) {
-            return Ok(existing.clone());
-        }
-        let sub = Subscription::new_with_wire_root(wire_root, identity, name.clone())?;
-        self.subscribed.insert(name.clone(), sub.clone());
-        if self.default.is_none() {
-            self.default = Some(name);
-        }
+        let sub = Subscription::minting(home, name)?;
+        self.insert(sub.clone());
         Ok(sub)
+    }
+
+    /// Record a subscription this scope already constructed.
+    pub(crate) fn insert_subscription(&mut self, sub: Subscription) {
+        self.insert(sub);
+    }
+
+    fn insert(&mut self, sub: Subscription) {
+        self.parted.remove(&sub.room_id);
+        let room_id = sub.room_id;
+        self.subscribed.insert(room_id, sub);
+        if self.default.is_none() {
+            self.default = Some(room_id);
+        }
     }
 
     /// Remove a subscription and mark it parted so it's not
-    /// auto-restored. If the removed channel was the default, the
+    /// auto-restored. If the removed room was the default, the
     /// default falls back to any remaining subscription
-    /// (deterministically the lowest-sorted name) or `None`.
-    pub fn unsubscribe(&mut self, name: &ChannelName) -> Option<Subscription> {
-        let removed = self.subscribed.remove(name);
+    /// (deterministically the lowest-sorted id) or `None`.
+    pub fn unsubscribe(&mut self, room_id: &RoomId) -> Option<Subscription> {
+        let removed = self.subscribed.remove(room_id);
         if removed.is_some() {
-            self.parted.insert(name.clone());
-            if self.default.as_ref() == Some(name) {
-                self.default = self.subscribed.keys().next().cloned();
+            self.parted.insert(*room_id);
+            if self.default.as_ref() == Some(room_id) {
+                self.default = self.subscribed.keys().next().copied();
             }
         }
         removed
     }
 
-    /// Set the default channel. Only succeeds if the channel is
-    /// already subscribed; setting a non-subscribed channel as
-    /// default would lie about what `airc msg` will hit.
-    pub fn set_default(&mut self, name: ChannelName) -> Result<(), SubscriptionError> {
-        if !self.subscribed.contains_key(&name) {
-            return Err(SubscriptionError::InvalidChannelName(
-                ChannelNameError::Empty,
-            ));
+    /// Set the default room. Only succeeds if the room is already
+    /// subscribed; setting a non-subscribed room as default would lie
+    /// about what `airc msg` will hit.
+    pub fn set_default(&mut self, room_id: RoomId) -> Result<(), SubscriptionError> {
+        if !self.subscribed.contains_key(&room_id) {
+            return Err(SubscriptionError::UnknownRoom(room_id));
         }
-        self.default = Some(name);
+        self.default = Some(room_id);
         Ok(())
     }
 
@@ -431,6 +420,24 @@ impl SubscriptionSet {
     /// monitor/hook iteration so the user's experience is stable).
     pub fn all(&self) -> impl Iterator<Item = &Subscription> {
         self.subscribed.values()
+    }
+
+    /// Consume the set and yield every subscription by VALUE — for the
+    /// caller that owns the set and is about to drop it. Pairs with
+    /// [`Self::all`], which borrows for everyone else.
+    pub fn into_all(self) -> impl Iterator<Item = Subscription> {
+        self.subscribed.into_values()
+    }
+
+    /// The subscription for a room id — one comparison against the key
+    /// this map is already keyed by.
+    ///
+    /// Borrowed, deliberately. A caller that only needs to READ a field
+    /// should not be handed an owned copy of a `String` + `PathBuf`;
+    /// clone at the boundary that genuinely requires ownership, and only
+    /// there.
+    pub fn get(&self, room_id: RoomId) -> Option<&Subscription> {
+        self.subscribed.get(&room_id)
     }
 
     /// Resolve a join TOKEN that may be a channel ID rather than a
@@ -451,72 +458,25 @@ impl SubscriptionSet {
     /// a prefix of a subscribed channel's UUID. Exactly one match
     /// binds to that existing room; zero or several is the caller's
     /// answer, never a mint. Anything else is a plain name.
-    pub fn resolve_id_token(&self, token: &str) -> IdTokenResolution<'_> {
-        let compact: String = token.trim().chars().filter(|c| *c != '-').collect();
-        let id_shaped =
-            (8..=32).contains(&compact.len()) && compact.chars().all(|c| c.is_ascii_hexdigit());
-        if !id_shaped {
-            return IdTokenResolution::NotAnId;
-        }
-        let needle = compact.to_ascii_lowercase();
-        let matches: Vec<&Subscription> = self
-            .subscribed
-            .values()
-            .filter(|s| {
-                s.room_id
-                    .as_uuid()
-                    .as_simple()
-                    .to_string()
-                    .starts_with(&needle)
-            })
-            .collect();
-        match matches.len() {
-            0 => IdTokenResolution::Unknown,
-            1 => IdTokenResolution::Match(matches[0]),
-            _ => IdTokenResolution::Ambiguous(matches),
+    pub fn resolve_room_id(&self, token: &str) -> RoomIdResolution<'_> {
+        // Parse to the id TYPE, then look up. The map is keyed by the
+        // 16-byte id, so this is one comparison against a key — never a
+        // scan, never a rendered uuid, never a substring of one.
+        let Ok(uuid) = uuid::Uuid::parse_str(token.trim()) else {
+            return RoomIdResolution::NotAnId;
+        };
+        match self.subscribed.get(&RoomId::from_uuid(uuid)) {
+            Some(subscription) => RoomIdResolution::Match(subscription),
+            None => RoomIdResolution::Unknown,
         }
     }
 
-    /// Just the names of subscribed channels — what Codex's
-    /// consumer-surface PR reads to know which RoomIds to drain.
-    pub fn channel_names(&self) -> impl Iterator<Item = &ChannelName> {
+    /// The ids of every subscribed room — what a consumer surface reads
+    /// to know which rooms to drain. The id is the address; a caller
+    /// that wants a label reads it off the `Subscription` via
+    /// [`Self::all`].
+    pub fn room_ids(&self) -> impl Iterator<Item = &RoomId> {
         self.subscribed.keys()
-    }
-
-    /// Self-healing join — receive-binding re-derive on identity heal
-    /// (M5↔bigmama decay mode: after the Windows mesh identity healed,
-    /// SENDS derived converged channel UUIDs, but this scope's stored
-    /// subscriptions kept the OLD diverged UUIDs — so inbound frames
-    /// addressed to the converged room found no binding and the scope
-    /// read a dead room until a manual `airc stop && airc join`).
-    ///
-    /// A subscription's channel NAME is its durable identity; the room
-    /// UUID is a derivation of `(mesh_identity, name)` frozen at join
-    /// time. When the identity changes (heals), re-derive each
-    /// subscription's room UUID and re-bind any that diverged, keeping
-    /// name, wire, and `joined_at_ms`. Read cursors are unaffected:
-    /// runtime cursors are keyed per consumer id over the owner-core's
-    /// GLOBAL `(epoch, counter)` order, not per room UUID.
-    ///
-    /// Returns the rebinds performed (empty when the set is already
-    /// converged — the idempotent steady state) so callers can be loud
-    /// about each old→new move. Delivery to the OLD UUID keeps working
-    /// via the router bridge's per-frame name reconvergence; this heals
-    /// the READ side, which that per-frame remap cannot reach.
-    pub fn rebind_diverged(&mut self, identity: &MeshIdentity) -> Vec<SubscriptionRebind> {
-        let mut rebinds = Vec::new();
-        for (name, subscription) in self.subscribed.iter_mut() {
-            let derived = derive_room_id(identity, name);
-            if subscription.room_id != derived {
-                rebinds.push(SubscriptionRebind {
-                    name: name.clone(),
-                    old_room_id: subscription.room_id,
-                    new_room_id: derived,
-                });
-                subscription.room_id = derived;
-            }
-        }
-        rebinds
     }
 }
 
@@ -525,28 +485,30 @@ impl SubscriptionSet {
 pub async fn load_or_init(store: &dyn EventStore) -> Result<SubscriptionSet, SubscriptionError> {
     let mut set = SubscriptionSet::empty();
     for row in store.load_subscriptions().await? {
-        let name = ChannelName::new(&row.channel_name)?;
+        // Key off the ROOM ID the row already carries. The stored name is
+        // read as a display label only, and a row whose label no longer
+        // parses (or never had one — an id-addressed room) is still a
+        // perfectly good membership: the id is what identifies it.
         if row.parted {
-            set.parted.insert(name);
+            set.parted.insert(row.room_id);
             continue;
         }
         let subscription = Subscription {
-            name: name.clone(),
+            name: ChannelName::new(&row.channel_name).unwrap_or_else(|_| ChannelName::unnamed()),
             room_id: row.room_id,
             wire: PathBuf::from(row.wire),
             joined_at_ms: row.joined_at_ms,
         };
         if row.is_default {
-            set.default = Some(name.clone());
+            set.default = Some(row.room_id);
         }
-        set.subscribed.insert(name, subscription);
+        set.subscribed.insert(row.room_id, subscription);
     }
     if set
         .default
-        .as_ref()
-        .is_some_and(|name| !set.subscribed.contains_key(name))
+        .is_some_and(|room| !set.subscribed.contains_key(&room))
     {
-        set.default = set.subscribed.keys().next().cloned();
+        set.default = set.subscribed.keys().next().copied();
     }
     Ok(set)
 }
@@ -561,15 +523,21 @@ pub async fn save(store: &dyn EventStore, set: &SubscriptionSet) -> Result<(), S
             room_id: subscription.room_id,
             wire: subscription.wire.to_string_lossy().into_owned(),
             joined_at_ms: subscription.joined_at_ms,
-            is_default: set.default.as_ref() == Some(&subscription.name),
+            is_default: set.default == Some(subscription.room_id),
             parted: false,
         });
     }
-    for channel in &set.parted {
-        if !set.subscribed.contains_key(channel) {
+    for room in &set.parted {
+        if !set.subscribed.contains_key(room) {
             rows.push(StoredSubscription {
-                channel_name: channel.as_str().to_string(),
-                room_id: derive_room_id(&MeshIdentity::unset(), channel),
+                // The parted row used to re-DERIVE its room id from the
+                // name against an `unset` identity — a fabricated id that
+                // matched the real room only by luck of the derivation.
+                // The parted set holds the actual id now, so the row
+                // carries it and the label is left empty: nothing keys on
+                // a name any more.
+                channel_name: String::new(),
+                room_id: *room,
                 wire: String::new(),
                 joined_at_ms: 0,
                 is_default: false,
@@ -590,17 +558,25 @@ impl Airc {
     /// Return all active channel subscriptions for this scope.
     ///
     /// Consumer integrations use this instead of parsing `airc status`
-    /// or reading the store directly. Ordering is deterministic by
-    /// channel name.
+    /// or reading the store directly. Ordering is deterministic by ROOM
+    /// ID — the map's key. It was by channel name until membership was
+    /// re-keyed onto the id; a caller that wants name order sorts by the
+    /// field it means, because a label carries no ordering any more than
+    /// it carries an address.
+    ///
+    /// MOVES out of the set rather than cloning: `set` is loaded fresh
+    /// here and dropped on the next line, so cloning every subscription
+    /// out of it copied a `String` + a `PathBuf` per room for values
+    /// nobody else could observe.
     pub async fn subscriptions(&self) -> Result<Vec<Subscription>, AircError> {
         let set = self.subscription_set().await?;
-        Ok(set.all().cloned().collect())
+        Ok(set.into_all().collect())
     }
 
-    /// True when this scope is subscribed to `channel`.
-    pub async fn is_subscribed(&self, channel: &ChannelName) -> Result<bool, AircError> {
+    /// True when this scope is subscribed to `room_id`.
+    pub async fn is_subscribed(&self, room_id: &RoomId) -> Result<bool, AircError> {
         let set = self.subscription_set().await?;
-        Ok(set.subscribed.contains_key(channel))
+        Ok(set.subscribed.contains_key(room_id))
     }
 
     /// Return the default room used by short-shape commands such as
@@ -614,15 +590,15 @@ impl Airc {
     /// can be empty/stale on an attached scope), the local store
     /// otherwise (card 8428ae8c).
     ///
-    /// `None` means either the channel has no events yet or this
-    /// scope is not subscribed to it. Use [`Self::is_subscribed`] when
-    /// callers need to distinguish those cases.
+    /// `None` means either the room has no events yet or this scope is
+    /// not subscribed to it. Use [`Self::is_subscribed`] when callers
+    /// need to distinguish those cases.
     pub async fn subscription_cursor(
         &self,
-        channel: &ChannelName,
+        room_id: &RoomId,
     ) -> Result<Option<airc_core::TranscriptCursor>, AircError> {
         let set = self.subscription_set().await?;
-        let Some(subscription) = set.subscribed.get(channel) else {
+        let Some(subscription) = set.subscribed.get(room_id) else {
             return Ok(None);
         };
         self.channel_latest_cursor(subscription.room_id).await
@@ -648,19 +624,10 @@ impl Airc {
                 room_ids.push(subscription.room_id);
             }
         }
-
-        if room_ids.is_empty() {
-            let identity = self.mesh_identity().await?;
-            let room_id = Subscription::new_with_wire_root(
-                &self.inner.wire_root,
-                &identity,
-                ChannelName::new("general").map_err(SubscriptionError::from)?,
-            )?
-            .room_id;
-            if seen.insert(room_id) {
-                room_ids.push(room_id);
-            }
-        }
+        // No conjured default. A scope with no subscriptions is in no
+        // rooms, and an empty filter says exactly that — inventing a
+        // room id here would have this scope draining a room nobody
+        // put it in.
         Ok(room_ids)
     }
 }
@@ -736,51 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_room_id_is_deterministic_per_identity_channel() {
-        let id = MeshIdentity::new("joelteply");
-        let c = ChannelName::new("general").unwrap();
-        let a = derive_room_id(&id, &c);
-        let b = derive_room_id(&id, &c);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn derive_room_id_differs_across_identities() {
-        let c = ChannelName::new("general").unwrap();
-        let a = derive_room_id(&MeshIdentity::new("joelteply"), &c);
-        let b = derive_room_id(&MeshIdentity::new("someone-else"), &c);
-        assert_ne!(
-            a, b,
-            "two users' #general channels MUST be different RoomIds — \
-             same-name cross-user bridging would be a privacy bug"
-        );
-    }
-
-    #[test]
-    fn derive_room_id_differs_across_channels() {
-        let id = MeshIdentity::new("joelteply");
-        let a = derive_room_id(&id, &ChannelName::new("general").unwrap());
-        let b = derive_room_id(&id, &ChannelName::new("cambriantech").unwrap());
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn derive_room_id_nul_separator_prevents_collisions() {
-        // Without the NUL separator, ("alice", "bob-c") and
-        // ("alice-bob", "c") would both produce the input "alicebob-c"
-        // (or "alicebobc") and collide.
-        let a = derive_room_id(
-            &MeshIdentity::new("alice"),
-            &ChannelName::new("bob-c").unwrap(),
-        );
-        let b = derive_room_id(
-            &MeshIdentity::new("alice-bob"),
-            &ChannelName::new("c").unwrap(),
-        );
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn resolve_id_token_binds_id_shaped_tokens_to_existing_channels() {
         // what this catches: the ghost-room mint (card c409eaf5 octave 2,
         // 2026-08-11) — an 8-hex short id of a SUBSCRIBED channel passed as a
@@ -789,104 +711,122 @@ mod tests {
         // v5 mint that splits the room's readers from its writers.
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
         let academy = set
-            .subscribe(home, &id, ChannelName::new("academy").unwrap())
+            .create(home, ChannelName::new("academy").unwrap())
             .unwrap();
 
-        let simple = academy.room_id.as_uuid().as_simple().to_string();
-
-        // 8-hex short id → binds to academy.
-        match set.resolve_id_token(&simple[..8]) {
-            IdTokenResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
-            other => panic!("short id must Match, got {other:?}"),
-        }
-        // Full dashed uuid → binds too (resolution wins over the old refusal).
-        match set.resolve_id_token(&academy.room_id.to_string()) {
-            IdTokenResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
+        // A room id → binds to academy.
+        match set.resolve_room_id(&academy.room_id.to_string()) {
+            RoomIdResolution::Match(sub) => assert_eq!(sub.name.as_str(), "academy"),
             other => panic!("full uuid must Match, got {other:?}"),
         }
-        // Id-shaped, no such channel → Unknown (join refuses; no mint).
+        // A REAL id naming no subscribed room → Unknown (join refuses; no mint).
         assert!(matches!(
-            set.resolve_id_token("deadbeef"),
-            IdTokenResolution::Unknown
+            set.resolve_room_id(&RoomId::new().to_string()),
+            RoomIdResolution::Unknown
+        ));
+        // A TRUNCATION of a real id is not an id. It was accepted once, by
+        // rendering every room's uuid to text and prefix-matching it — which
+        // made 32 hex characters mean 128 bits only when they happened not to
+        // collide, and needed an `Ambiguous` arm to paper over when they did.
+        // A key is passed whole or it is not passed.
+        let simple = academy.room_id.as_uuid().as_simple().to_string();
+        assert!(matches!(
+            set.resolve_room_id(&simple[..8]),
+            RoomIdResolution::NotAnId
+        ));
+        assert!(matches!(
+            set.resolve_room_id("deadbeef"),
+            RoomIdResolution::NotAnId
         ));
         // Plain names — including hexy-but-short and dashed ones — stay names.
         assert!(matches!(
-            set.resolve_id_token("academy"),
-            IdTokenResolution::NotAnId
+            set.resolve_room_id("academy"),
+            RoomIdResolution::NotAnId
         ));
         assert!(matches!(
-            set.resolve_id_token("bench-swe-run-1"),
-            IdTokenResolution::NotAnId
+            set.resolve_room_id("bench-swe-run-1"),
+            RoomIdResolution::NotAnId
         ));
         assert!(matches!(
-            set.resolve_id_token("cafe"),
-            IdTokenResolution::NotAnId
+            set.resolve_room_id("cafe"),
+            RoomIdResolution::NotAnId
         ));
     }
 
     #[test]
-    fn subscribe_is_idempotent_and_seeds_default() {
+    fn create_mints_a_distinct_room_each_time_and_seeds_default() {
+        // what this catches: create keyed by NAME. Two rooms with the same
+        // label are two rooms; collapsing them was the v5(name) collision.
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
         assert!(set.default.is_none());
 
-        let sub1 = set
-            .subscribe(home, &id, ChannelName::new("general").unwrap())
+        let first = set
+            .create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        assert_eq!(set.default.as_ref().unwrap().as_str(), "general");
-        assert_eq!(set.subscribed.len(), 1);
+        assert_eq!(set.default, Some(first.room_id), "first room seeds default");
 
-        // Idempotent: second subscribe returns the same entry.
-        let sub2 = set
-            .subscribe(home, &id, ChannelName::new("general").unwrap())
+        let second = set
+            .create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        assert_eq!(sub1, sub2);
-        assert_eq!(set.subscribed.len(), 1);
-        assert_eq!(set.default.as_ref().unwrap().as_str(), "general");
+        assert_ne!(first.room_id, second.room_id);
+        assert_eq!(set.subscribed.len(), 2);
+        assert_eq!(set.default, Some(first.room_id), "default is not stolen");
     }
 
     #[test]
-    fn subscribe_adds_without_changing_default() {
+    fn join_is_idempotent_on_the_id_and_keeps_the_stored_label() {
+        // what this catches: re-joining a room you are already in must be a
+        // no-op for observers (joined_at_ms preserved), and a caller's label
+        // must never overwrite the one already stored.
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        set.subscribe(home, &id, ChannelName::new("general").unwrap())
+        let room = set
+            .create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        set.subscribe(home, &id, ChannelName::new("cambriantech").unwrap())
+
+        let again = set
+            .join(home, room.room_id, ChannelName::new("renamed").unwrap())
             .unwrap();
-        // First subscription stays as default.
-        assert_eq!(set.default.as_ref().unwrap().as_str(), "general");
-        assert_eq!(set.subscribed.len(), 2);
+        assert_eq!(again, room);
+        assert_eq!(set.subscribed.len(), 1);
     }
 
     #[test]
-    fn subscribe_with_wire_root_uses_machine_account_wire() {
+    fn join_uses_the_machine_account_wire_keyed_by_id() {
+        // what this catches: a per-scope wire root (which split one machine's
+        // data plane per project dir) and a name-keyed wire dir.
         let scope_a = tempdir().unwrap();
         let scope_b = tempdir().unwrap();
         let machine_home = tempdir().unwrap();
-        let id = MeshIdentity::new("joelteply");
-        let channel = ChannelName::new("general").unwrap();
+        let room_id = RoomId::new();
         let mut a = SubscriptionSet::empty();
         let mut b = SubscriptionSet::empty();
 
         let a_sub = a
-            .subscribe_with_wire_root(machine_home.path(), &id, channel.clone())
+            .join(
+                machine_home.path(),
+                room_id,
+                ChannelName::new("general").unwrap(),
+            )
             .unwrap();
         let b_sub = b
-            .subscribe_with_wire_root(machine_home.path(), &id, channel)
+            .join(
+                machine_home.path(),
+                room_id,
+                ChannelName::new("general").unwrap(),
+            )
             .unwrap();
 
         assert_eq!(a_sub.room_id, b_sub.room_id);
         assert_eq!(a_sub.wire, b_sub.wire);
         assert_eq!(
             a_sub.wire,
-            machine_home.path().join("wires").join("general")
+            machine_home.path().join("wires").join(room_id.to_string())
         );
         assert!(
             !a_sub.wire.starts_with(scope_a.path()) && !b_sub.wire.starts_with(scope_b.path()),
@@ -895,133 +835,66 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_accepts_arbitrary_user_and_domain_channels() {
+    fn a_room_with_no_label_is_still_a_membership() {
+        // what this catches: dropping a room because its label is absent or
+        // unparseable. The id identifies it; the label is decoration.
         let dir = tempdir().unwrap();
-        let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-
-        for name in [
-            "continuum-activity-7",
-            "openclaw-workspace_alpha",
-            "useideem",
-            "friend-general",
-            "forge-lora-slots",
-        ] {
-            set.subscribe(home, &id, ChannelName::new(name).unwrap())
-                .unwrap();
-        }
-
-        let names = set
-            .channel_names()
-            .map(ChannelName::as_str)
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"continuum-activity-7"));
-        assert!(names.contains(&"openclaw-workspace_alpha"));
-        assert!(names.contains(&"useideem"));
-        assert!(names.contains(&"friend-general"));
-        assert!(names.contains(&"forge-lora-slots"));
+        let room = set.create(dir.path(), ChannelName::unnamed()).unwrap();
+        assert!(set.subscribed.contains_key(&room.room_id));
+        assert_eq!(set.default, Some(room.room_id));
     }
 
     #[test]
-    fn unsubscribe_marks_parted_and_falls_back_default() {
+    fn unsubscribe_marks_parted_by_id_and_falls_back_default() {
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        let general = ChannelName::new("general").unwrap();
-        let cambriantech = ChannelName::new("cambriantech").unwrap();
-        set.subscribe(home, &id, general.clone()).unwrap();
-        set.subscribe(home, &id, cambriantech.clone()).unwrap();
+        let general = set
+            .create(home, ChannelName::new("general").unwrap())
+            .unwrap();
+        let cambriantech = set
+            .create(home, ChannelName::new("cambriantech").unwrap())
+            .unwrap();
 
-        let removed = set.unsubscribe(&general).expect("general was subscribed");
-        assert_eq!(removed.name, general);
-        assert!(set.parted.contains(&general));
-        // Default falls back to remaining (cambriantech).
-        assert_eq!(set.default, Some(cambriantech.clone()));
+        let removed = set
+            .unsubscribe(&general.room_id)
+            .expect("general was subscribed");
+        assert_eq!(removed.room_id, general.room_id);
+        assert!(set.parted.contains(&general.room_id));
+        assert_eq!(set.default, Some(cambriantech.room_id));
         assert_eq!(set.subscribed.len(), 1);
     }
 
     #[test]
-    fn unsubscribe_then_resubscribe_clears_parted() {
+    fn rejoining_a_parted_room_clears_the_tombstone() {
         let dir = tempdir().unwrap();
         let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        let general = ChannelName::new("general").unwrap();
-        set.subscribe(home, &id, general.clone()).unwrap();
-        set.unsubscribe(&general);
-        assert!(set.parted.contains(&general));
-
-        set.subscribe(home, &id, general.clone()).unwrap();
-        assert!(!set.parted.contains(&general));
-        assert_eq!(set.default, Some(general));
-    }
-
-    #[test]
-    fn set_default_requires_subscription() {
-        let dir = tempdir().unwrap();
-        let home = dir.path();
-        let id = MeshIdentity::new("joelteply");
-        let mut set = SubscriptionSet::empty();
-        set.subscribe(home, &id, ChannelName::new("general").unwrap())
+        let general = set
+            .create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        // Setting a non-subscribed channel as default must error.
-        let result = set.set_default(ChannelName::new("nowhere").unwrap());
-        assert!(result.is_err());
+        set.unsubscribe(&general.room_id);
+        assert!(set.parted.contains(&general.room_id));
+
+        set.join(home, general.room_id, general.name.clone())
+            .unwrap();
+        assert!(!set.parted.contains(&general.room_id));
+        assert_eq!(set.default, Some(general.room_id));
     }
 
-    // what this catches (self-healing join — receive-binding re-derive
-    // on identity heal): a subscription stored under a DIVERGED mesh
-    // identity keeps its stale room UUID forever (subscribe() is
-    // idempotent by NAME and never re-derives), so a healed identity
-    // leaves the scope reading a dead room. `rebind_diverged` must move
-    // every stale room UUID to the current derivation, preserve name /
-    // wire / joined_at_ms, report each old→new move, and be idempotent
-    // once converged.
     #[test]
-    fn rebind_diverged_moves_room_ids_to_the_current_identity_derivation() {
+    fn set_default_requires_membership_and_names_the_id_it_refused() {
         let dir = tempdir().unwrap();
-        let home = dir.path();
-        let diverged = MeshIdentity::new("local-fallback-boot-identity");
-        let healed = MeshIdentity::new("joelteply");
-        let general = ChannelName::new("general").unwrap();
-        let project = ChannelName::new("cambriantech").unwrap();
-
         let mut set = SubscriptionSet::empty();
-        set.subscribe(home, &diverged, general.clone()).unwrap();
-        set.subscribe(home, &diverged, project.clone()).unwrap();
-        let old_general = set.subscribed.get(&general).unwrap().clone();
+        set.create(dir.path(), ChannelName::new("general").unwrap())
+            .unwrap();
 
-        let rebinds = set.rebind_diverged(&healed);
-        assert_eq!(rebinds.len(), 2, "both diverged rooms must be re-bound");
-        let general_rebind = rebinds
-            .iter()
-            .find(|rebind| rebind.name == general)
-            .expect("general rebind reported");
-        assert_eq!(general_rebind.old_room_id, old_general.room_id);
-        assert_eq!(
-            general_rebind.new_room_id,
-            derive_room_id(&healed, &general),
-            "the new binding must be the healed identity's derivation"
-        );
-
-        let rebound = set.subscribed.get(&general).unwrap();
-        assert_eq!(rebound.room_id, derive_room_id(&healed, &general));
-        assert_eq!(
-            rebound.wire, old_general.wire,
-            "the wire path is name-derived and must not move"
-        );
-        assert_eq!(
-            rebound.joined_at_ms, old_general.joined_at_ms,
-            "rebind is a heal, not a re-join"
-        );
-
-        // Idempotent once converged — a steady-state join must not spam.
-        assert!(
-            set.rebind_diverged(&healed).is_empty(),
-            "converged set must report no rebinds"
-        );
+        let stranger = RoomId::new();
+        match set.set_default(stranger) {
+            Err(SubscriptionError::UnknownRoom(id)) => assert_eq!(id, stranger),
+            other => panic!("must refuse a non-subscribed room by id, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1029,11 +902,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let home = dir.path();
         let store = InMemoryEventStore::new();
-        let id = MeshIdentity::new("joelteply");
         let mut set = SubscriptionSet::empty();
-        set.subscribe(home, &id, ChannelName::new("general").unwrap())
+        set.create(home, ChannelName::new("general").unwrap())
             .unwrap();
-        set.subscribe(home, &id, ChannelName::new("cambriantech").unwrap())
+        set.create(home, ChannelName::new("cambriantech").unwrap())
             .unwrap();
         save(&store, &set).await.unwrap();
 
@@ -1059,15 +931,29 @@ mod tests {
         airc.join("cambriantech").await.unwrap();
 
         let subscriptions = airc.subscriptions().await.unwrap();
-        let names = subscriptions
+        // Set, not sequence. The old assertion read alphabetically only
+        // because the map was keyed by the NAME; keyed by id, iteration
+        // order follows v4 ids and carries no meaning. A caller that
+        // wants rooms in a particular order sorts by the field it means.
+        let mut names = subscriptions
             .iter()
             .map(|subscription| subscription.name.as_str())
             .collect::<Vec<_>>();
+        names.sort();
         assert_eq!(names, vec!["cambriantech", "general"]);
 
-        let cambriantech = ChannelName::new("cambriantech").unwrap();
-        let general = ChannelName::new("general").unwrap();
-        let missing = ChannelName::new("not-joined").unwrap();
+        // Membership is asked BY ID — the labels above are only how the
+        // rooms were created; they answer no question about membership.
+        let by_label = |label: &str| {
+            subscriptions
+                .iter()
+                .find(|s| s.name.as_str() == label)
+                .expect("created above")
+                .room_id
+        };
+        let cambriantech = by_label("cambriantech");
+        let general = by_label("general");
+        let missing = RoomId::new();
 
         assert!(airc.is_subscribed(&cambriantech).await.unwrap());
         assert!(airc.is_subscribed(&general).await.unwrap());

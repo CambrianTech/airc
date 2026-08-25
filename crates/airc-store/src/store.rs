@@ -134,6 +134,29 @@ pub trait EventStore: Send + Sync {
     /// files.
     async fn replace_subscriptions(&self, rows: Vec<StoredSubscription>) -> Result<(), StoreError>;
 
+    /// Claim `label` for `candidate` in the account's room directory,
+    /// returning the id the directory HOLDS — `candidate` if this call
+    /// won the label, the incumbent otherwise.
+    ///
+    /// One atomic call rather than read-then-write on purpose: two tabs
+    /// running `airc join general` at the same instant must land in ONE
+    /// room, and a check-then-insert would let both mint.
+    ///
+    /// This is the only place a room label is a key. It buys DISCOVERY
+    /// (a human types `#general` and reaches the room the account
+    /// already has); it never becomes the room's identity — the id it
+    /// returns is the address, and a room that never passed through a
+    /// label is absent here and addressed by id like any other.
+    async fn claim_room_label(
+        &self,
+        label: &str,
+        candidate: RoomId,
+        claimed_at_ms: u64,
+    ) -> Result<RoomId, StoreError>;
+
+    /// The id `label` resolves to, if the account has ever claimed it.
+    async fn resolve_room_label(&self, label: &str) -> Result<Option<RoomId>, StoreError>;
+
     /// Load the cached mesh identity row for `scope`, if present.
     async fn load_mesh_identity(
         &self,

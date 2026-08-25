@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use airc_core::{Identity, PeerId, PersonaCapabilities, PersonaCapabilitiesError};
+use airc_core::{Identity, PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId};
 use airc_lib::{Airc, AircError, FilteredEventStream, PeerSpec};
 use airc_trust::{PeersStoreError, TrustTier};
 use consumer_shapes::continuum::{
@@ -29,8 +29,10 @@ pub const ENV_AIRC_HOME: &str = "AIRC_HOME";
 /// The parent's `peer_id:pubkey` spec (the `Airc::peer_spec` string).
 /// REQUIRED — the spawn relationship is the trust bootstrap.
 pub const ENV_PARENT_PEER_SPEC: &str = "AIRC_PARENT_PEER_SPEC";
-/// Room the persona serves turns in. Optional; defaults to
-/// [`DEFAULT_PERSONA_ROOM`].
+/// The ROOM ID (a uuid) the persona serves turns in, as the parent
+/// that spawned it knows the room. REQUIRED, and with no default —
+/// a child cannot guess which room its parent is in, and a name here
+/// would resolve inside the CHILD's own account to a different room.
 pub const ENV_PERSONA_ROOM: &str = "AIRC_PERSONA_ROOM";
 /// Optional loopback/LAN address of the parent's listener. When set,
 /// the binary dials it after spawn so turn traffic has a route
@@ -39,7 +41,13 @@ pub const ENV_PARENT_LAN_ADDR: &str = "AIRC_PARENT_LAN_ADDR";
 /// Optional persona id override for the capability advert.
 pub const ENV_PERSONA_ID: &str = "AIRC_PERSONA_ID";
 
-pub const DEFAULT_PERSONA_ROOM: &str = "persona-smoke";
+/// This scope's own display word for the room it was spawned into.
+///
+/// Purely local and purely cosmetic. It is NOT identity and NOT a
+/// default room: the room a persona serves in arrives as a `RoomId`
+/// from the parent that spawned it, and a scope may call that room
+/// whatever it likes without changing which room it is.
+pub const PERSONA_ROOM_LABEL: &str = "parent-room";
 pub const DEFAULT_PERSONA_ID: &str = "persona-smoke-echo";
 
 /// Everything the spawn loop hands a persona process.
@@ -49,8 +57,15 @@ pub struct PersonaAgentConfig {
     pub home: PathBuf,
     /// Parent's `peer_id:pubkey` spec string.
     pub parent_spec: String,
-    /// Room to join and serve turns in.
-    pub room: String,
+    /// The room to serve turns in, BY ID.
+    ///
+    /// A spawned persona opens its own home, which is its own account
+    /// — and a room label keys a room only within ONE account. So a
+    /// name here would put parent and child in two different rooms
+    /// wearing the same word, and every turn the parent requested
+    /// would be delivered to a room the child is not in. The parent
+    /// already holds the id; spawn is the rendezvous, so it passes it.
+    pub room_id: RoomId,
     /// What this persona advertises on its identity card.
     pub capabilities: PersonaCapabilities,
     /// Parent LAN listener to dial after spawn, when the route isn't
@@ -65,7 +80,19 @@ impl PersonaAgentConfig {
     pub fn from_env() -> Result<Self, PersonaAgentError> {
         let home = require_env(ENV_AIRC_HOME)?;
         let parent_spec = require_env(ENV_PARENT_PEER_SPEC)?;
-        let room = optional_env(ENV_PERSONA_ROOM).unwrap_or_else(|| DEFAULT_PERSONA_ROOM.into());
+        // REQUIRED, and with no default — deliberately. A default room
+        // name was the bug in constant form: it let a child that was
+        // told nothing invent a room, land somewhere its parent isn't,
+        // and wait forever for turns that were delivered elsewhere.
+        // A persona that was not told which room to serve cannot guess.
+        let room_raw = require_env(ENV_PERSONA_ROOM)?;
+        let room_id = room_raw
+            .parse::<RoomId>()
+            .map_err(|source| PersonaAgentError::BadEnv {
+                name: ENV_PERSONA_ROOM,
+                raw: room_raw.clone(),
+                detail: format!("expected the parent's room id (a uuid): {source}"),
+            })?;
         let persona_id = optional_env(ENV_PERSONA_ID).unwrap_or_else(|| DEFAULT_PERSONA_ID.into());
         let parent_lan_addr = match optional_env(ENV_PARENT_LAN_ADDR) {
             Some(raw) => Some(raw.parse().map_err(|source| PersonaAgentError::BadEnv {
@@ -78,7 +105,7 @@ impl PersonaAgentConfig {
         Ok(Self {
             home: PathBuf::from(home),
             parent_spec,
-            room,
+            room_id,
             capabilities: PersonaCapabilities {
                 persona_id,
                 capability_tags: vec!["echo".to_string(), "smoke".to_string()],
@@ -263,7 +290,10 @@ impl PersonaAgent {
             return Err(PersonaAgentError::ParentNotEnrolled { parent });
         }
 
-        airc.join(&config.room).await?;
+        // BY ID — the parent's room, not a room of the same name in
+        // this child's own account. The label is local decoration.
+        airc.join_room_id(config.room_id, PERSONA_ROOM_LABEL)
+            .await?;
         let inbox = airc.subscribe_filtered(any_persona_event_filter()).await?;
 
         Ok(Self {

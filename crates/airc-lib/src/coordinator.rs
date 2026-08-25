@@ -43,14 +43,15 @@
 //! were removed after the SeaORM cut so production callers cannot
 //! accidentally reintroduce split-brain JSON presence state.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::subscriptions::{ChannelName, ChannelNameError, MeshIdentity};
-use airc_core::PeerId;
+use crate::subscriptions::{ChannelNameError, MeshIdentity};
+use airc_core::{PeerId, RoomId};
 use airc_store::{EventStore, StoreError, StoredBeacon, StoredRefreshLockOutcome};
+use uuid::Uuid;
 
 const BEACON_VERSION: u32 = 1;
 const ACCOUNTS_DIR: &str = "accounts";
@@ -96,7 +97,9 @@ pub struct PresenceBeacon {
     /// different dirs (e.g., a CLI tab in `~/.airc/` vs. a project
     /// agent in `~/Development/foo/.airc/`).
     pub scope_home: PathBuf,
-    pub subscribed_channels: Vec<ChannelName>,
+    /// The rooms this scope is in, BY ID — the address a peer
+    /// routes to. A label would tell a peer nothing it can deliver on.
+    pub subscribed_rooms: Vec<RoomId>,
     /// Process id at publish time. Inspectable but never load-bearing
     /// for the freshness decision (heartbeat_at_ms is the truth).
     /// PID collisions across reboots make pid-only liveness checks
@@ -126,9 +129,9 @@ pub struct CoordinatorSnapshot {
     pub root: PathBuf,
     pub live: Vec<PresenceBeacon>,
     pub stale: Vec<PresenceBeacon>,
-    /// Channels mentioned by at least one live beacon. Useful for
+    /// Rooms mentioned by at least one live beacon. Useful for
     /// "which rooms are active on this machine right now" status.
-    pub live_channels: Vec<ChannelName>,
+    pub live_rooms: Vec<RoomId>,
     pub fetched_at_ms: u64,
 }
 
@@ -262,13 +265,13 @@ pub async fn snapshot_store(
     }
     live.sort_by_key(|b| b.peer_id.to_string());
     stale.sort_by_key(|b| b.peer_id.to_string());
-    let live_channels = unique_channels_in(&live);
+    let live_rooms = unique_rooms_in(&live);
     Ok(CoordinatorSnapshot {
         mesh_identity: identity.clone(),
         root: PathBuf::from("airc-store://beacons"),
         live,
         stale,
-        live_channels,
+        live_rooms,
         fetched_at_ms: now_ms,
     })
 }
@@ -349,18 +352,12 @@ pub async fn release_refresh_lock(
     Ok(())
 }
 
-fn unique_channels_in(beacons: &[PresenceBeacon]) -> Vec<ChannelName> {
-    let mut by_name: HashMap<String, ChannelName> = HashMap::new();
+fn unique_rooms_in(beacons: &[PresenceBeacon]) -> Vec<RoomId> {
+    let mut seen: BTreeSet<RoomId> = BTreeSet::new();
     for beacon in beacons {
-        for channel in &beacon.subscribed_channels {
-            by_name
-                .entry(channel.as_str().to_string())
-                .or_insert_with(|| channel.clone());
-        }
+        seen.extend(beacon.subscribed_rooms.iter().copied());
     }
-    let mut out: Vec<ChannelName> = by_name.into_values().collect();
-    out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    out
+    seen.into_iter().collect()
 }
 
 fn to_stored_beacon(identity: &MeshIdentity, beacon: &PresenceBeacon) -> StoredBeacon {
@@ -369,9 +366,9 @@ fn to_stored_beacon(identity: &MeshIdentity, beacon: &PresenceBeacon) -> StoredB
         peer_id: beacon.peer_id,
         scope_home: beacon.scope_home.to_string_lossy().to_string(),
         subscribed_channels: beacon
-            .subscribed_channels
+            .subscribed_rooms
             .iter()
-            .map(|channel| channel.as_str().to_string())
+            .map(RoomId::to_string)
             .collect(),
         pid: beacon.pid,
         published_at_ms: beacon.published_at_ms,
@@ -380,16 +377,19 @@ fn to_stored_beacon(identity: &MeshIdentity, beacon: &PresenceBeacon) -> StoredB
 }
 
 fn from_stored_beacon(beacon: StoredBeacon) -> Result<PresenceBeacon, CoordinatorError> {
-    let subscribed_channels = beacon
+    // Rows are room IDS. A row that doesn't parse as one predates the
+    // id key and addresses nothing routable, so it is dropped rather
+    // than guessed at.
+    let subscribed_rooms = beacon
         .subscribed_channels
         .into_iter()
-        .map(ChannelName::new)
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(|raw| raw.parse::<Uuid>().ok().map(RoomId::from_uuid))
+        .collect();
     Ok(PresenceBeacon {
         version: BEACON_VERSION,
         peer_id: beacon.peer_id,
         scope_home: PathBuf::from(beacon.scope_home),
-        subscribed_channels,
+        subscribed_rooms,
         pid: beacon.pid,
         published_at_ms: beacon.published_at_ms,
         heartbeat_at_ms: beacon.heartbeat_at_ms,
@@ -402,7 +402,7 @@ fn from_stored_beacon(beacon: StoredBeacon) -> Result<PresenceBeacon, Coordinato
 pub fn beacon_now(
     peer_id: PeerId,
     scope_home: PathBuf,
-    subscribed_channels: Vec<ChannelName>,
+    subscribed_rooms: Vec<RoomId>,
     pid: u32,
     now_ms: u64,
 ) -> PresenceBeacon {
@@ -410,7 +410,7 @@ pub fn beacon_now(
         version: BEACON_VERSION,
         peer_id,
         scope_home,
-        subscribed_channels,
+        subscribed_rooms,
         pid,
         published_at_ms: now_ms,
         heartbeat_at_ms: now_ms,
@@ -435,18 +435,14 @@ mod tests {
         PeerId::from_uuid(Uuid::new_v4())
     }
 
-    fn channel(name: &str) -> ChannelName {
-        ChannelName::new(name).unwrap()
+    /// A stable test room id. Production ids are minted; these are
+    /// hand-picked so assertions can name the room they mean.
+    fn room(n: u128) -> RoomId {
+        RoomId::from_u128(n)
     }
 
-    fn make_beacon(now_ms: u64, channels: Vec<&str>) -> PresenceBeacon {
-        beacon_now(
-            peer(),
-            PathBuf::from("/tmp/x/.airc"),
-            channels.into_iter().map(channel).collect(),
-            12345,
-            now_ms,
-        )
+    fn make_beacon(now_ms: u64, rooms: Vec<RoomId>) -> PresenceBeacon {
+        beacon_now(peer(), PathBuf::from("/tmp/x/.airc"), rooms, 12345, now_ms)
     }
 
     #[test]
@@ -476,8 +472,8 @@ mod tests {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 100,
         };
-        let fresh = make_beacon(950, vec!["general", "cambriantech"]);
-        let stale = make_beacon(0, vec!["ideem"]);
+        let fresh = make_beacon(950, vec![room(1), room(2)]);
+        let stale = make_beacon(0, vec![room(3)]);
 
         publish_store(&store, &mesh, &fresh).await.unwrap();
         publish_store(&store, &mesh, &stale).await.unwrap();
@@ -491,14 +487,7 @@ mod tests {
         let snapshot = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
         assert_eq!(snapshot.live.len(), 1);
         assert_eq!(snapshot.stale.len(), 1);
-        assert_eq!(
-            snapshot
-                .live_channels
-                .iter()
-                .map(ChannelName::as_str)
-                .collect::<Vec<_>>(),
-            vec!["cambriantech", "general"]
-        );
+        assert_eq!(snapshot.live_rooms, vec![room(1), room(2)]);
 
         assert_eq!(
             drain_stale_store(&store, &mesh, &snapshot).await.unwrap(),
@@ -525,8 +514,8 @@ mod tests {
             refresh_interval_ms: 100,
         };
 
-        let fresh = make_beacon(950, vec!["general"]);
-        let stale = make_beacon(0, vec!["cambriantech"]);
+        let fresh = make_beacon(950, vec![room(1)]);
+        let stale = make_beacon(0, vec![room(2)]);
         publish_store(&store, &mesh, &fresh).await.unwrap();
         publish_store(&store, &mesh, &stale).await.unwrap();
 
@@ -543,14 +532,17 @@ mod tests {
         let mesh = id();
         let cfg = CoordinatorConfig::default();
 
-        let a = make_beacon(1_000, vec!["general", "cambriantech"]);
-        let b = make_beacon(1_000, vec!["general", "ideem"]);
+        let a = make_beacon(1_000, vec![room(1), room(2)]);
+        let b = make_beacon(1_000, vec![room(1), room(3)]);
         publish_store(&store, &mesh, &a).await.unwrap();
         publish_store(&store, &mesh, &b).await.unwrap();
 
         let snap = snapshot_store(&store, &mesh, &cfg, 1_000).await.unwrap();
-        let names: Vec<&str> = snap.live_channels.iter().map(ChannelName::as_str).collect();
-        assert_eq!(names, vec!["cambriantech", "general", "ideem"]);
+        assert_eq!(
+            snap.live_rooms,
+            vec![room(1), room(2), room(3)],
+            "deduplicated and sorted by id"
+        );
     }
 
     #[tokio::test]
@@ -561,15 +553,15 @@ mod tests {
             .unwrap();
         assert!(snap.live.is_empty());
         assert!(snap.stale.is_empty());
-        assert!(snap.live_channels.is_empty());
+        assert!(snap.live_rooms.is_empty());
     }
 
     #[tokio::test]
     async fn snapshot_isolates_identities() {
         let store = airc_store::InMemoryEventStore::new();
         let cfg = CoordinatorConfig::default();
-        let mine = make_beacon(1_000, vec!["general"]);
-        let theirs = make_beacon(1_000, vec!["general"]);
+        let mine = make_beacon(1_000, vec![room(1)]);
+        let theirs = make_beacon(1_000, vec![room(1)]);
         publish_store(&store, &id(), &mine).await.unwrap();
         publish_store(&store, &other_id(), &theirs).await.unwrap();
 
@@ -591,8 +583,8 @@ mod tests {
             heartbeat_ttl_ms: 1_000,
             refresh_interval_ms: 100,
         };
-        let fresh = make_beacon(950, vec!["general"]);
-        let stale = make_beacon(0, vec!["general"]);
+        let fresh = make_beacon(950, vec![room(1)]);
+        let stale = make_beacon(0, vec![room(1)]);
         publish_store(&store, &mesh, &fresh).await.unwrap();
         publish_store(&store, &mesh, &stale).await.unwrap();
 
@@ -616,7 +608,7 @@ mod tests {
             ..beacon_now(
                 peer_id,
                 PathBuf::from("/tmp/x/.airc"),
-                vec![channel("general")],
+                vec![room(1)],
                 100,
                 1_000,
             )
@@ -804,7 +796,7 @@ mod tests {
 
     #[test]
     fn beacon_is_fresh_uses_saturating_sub_for_clock_skew() {
-        let beacon = make_beacon(2_000, vec!["general"]);
+        let beacon = make_beacon(2_000, vec![room(1)]);
         // now_ms < heartbeat_at_ms — saturating yields 0, < ttl, so fresh.
         assert!(beacon.is_fresh(1_000, 500));
     }

@@ -150,15 +150,26 @@ impl Airc {
         let channel_name = subscriptions::ChannelName::new(name_or_channel).map_err(|error| {
             AircError::Route(format!("channel name {name_or_channel:?}: {error}"))
         })?;
-        set.subscribed
-            .get(&channel_name)
-            .map(|subscription| subscription.as_room())
-            .ok_or_else(|| {
-                AircError::Route(format!(
-                    "refusing to {verb} {name_or_channel:?}: this scope is not subscribed to that \
-                     channel. join the room first (this does not auto-join)."
-                ))
-            })
+        // A LABEL lookup, scanning the display names of rooms this scope
+        // is in. Labels key nothing, so two rooms may legitimately carry
+        // the same one — that is the caller's answer to resolve by id,
+        // never ours to pick for them.
+        let mut matches = set.all().filter(|s| s.name == channel_name);
+        let Some(subscription) = matches.next() else {
+            return Err(AircError::Route(format!(
+                "refusing to {verb} {name_or_channel:?}: this scope is not subscribed to a room \
+                 with that name. join the room first (this does not auto-join)."
+            )));
+        };
+        if let Some(second) = matches.next() {
+            return Err(AircError::Route(format!(
+                "refusing to {verb} {name_or_channel:?}: that name is carried by more than one \
+                 room this scope is in ({} and {}). a name is a label, not an address — pass the \
+                 room id.",
+                subscription.room_id, second.room_id
+            )));
+        }
+        Ok(subscription.as_room())
     }
 }
 

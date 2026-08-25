@@ -31,6 +31,7 @@ use airc_core::{
 
 use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 use crate::beacon::StoredBeacon;
+use crate::entities::room_directory;
 use crate::entities::{
     account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
     peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, scoped_state, subscription,
@@ -1160,6 +1161,54 @@ impl EventStore for SqliteEventStore {
             .exec(&self.db)
             .await?;
         Ok(())
+    }
+
+    async fn claim_room_label(
+        &self,
+        label: &str,
+        candidate: RoomId,
+        claimed_at_ms: u64,
+    ) -> Result<RoomId, StoreError> {
+        // INSERT-then-read inside ONE transaction. A plain
+        // read-then-insert would let two tabs both see "absent" and
+        // both mint, which is exactly the split this table exists to
+        // prevent; `on_conflict … do_nothing` makes the loser's write
+        // a no-op and the SELECT hands it the winner's id.
+        let txn = self.db.begin().await?;
+        let active = room_directory::ActiveModel {
+            label: ActiveValue::Set(label.to_string()),
+            room_id: ActiveValue::Set(candidate.as_uuid()),
+            claimed_at_ms: ActiveValue::Set(u64_to_i64(
+                "room_directory.claimed_at_ms",
+                claimed_at_ms,
+            )?),
+        };
+        room_directory::Entity::insert(active)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(room_directory::Column::Label)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .do_nothing()
+            .exec(&txn)
+            .await?;
+        let row = room_directory::Entity::find_by_id(label.to_string())
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                StoreError::InvariantBroken(format!(
+                    "room_directory row for {label:?} vanished inside its own claim transaction"
+                ))
+            })?;
+        txn.commit().await?;
+        Ok(RoomId::from_uuid(row.room_id))
+    }
+
+    async fn resolve_room_label(&self, label: &str) -> Result<Option<RoomId>, StoreError> {
+        Ok(room_directory::Entity::find_by_id(label.to_string())
+            .one(&self.db)
+            .await?
+            .map(|row| RoomId::from_uuid(row.room_id)))
     }
 
     async fn load_subscriptions(&self) -> Result<Vec<StoredSubscription>, StoreError> {

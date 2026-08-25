@@ -290,7 +290,7 @@ async fn part_channel_emits_room_parted_lifecycle_event() {
     assert_eq!(parted.channel, room.channel);
     assert!(
         !airc
-            .is_subscribed(&airc_lib::ChannelName::new("part-me").unwrap())
+            .is_subscribed(&room.channel)
             .await
             .expect("subscription query"),
         "parted channel must no longer be subscribed"

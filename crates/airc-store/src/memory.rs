@@ -23,6 +23,7 @@ pub struct InMemoryEventStore {
     events: Mutex<Vec<TranscriptEvent>>,
     runtime_cursors: Mutex<BTreeMap<String, TranscriptCursor>>,
     subscriptions: Mutex<Vec<StoredSubscription>>,
+    room_directory: Mutex<std::collections::BTreeMap<String, RoomId>>,
     mesh_identities: Mutex<BTreeMap<String, StoredMeshIdentity>>,
     beacons: Mutex<BTreeMap<(String, Uuid), StoredBeacon>>,
     refresh_locks: Mutex<BTreeMap<String, StoredRefreshLock>>,
@@ -36,6 +37,7 @@ impl InMemoryEventStore {
             events: Mutex::new(Vec::new()),
             runtime_cursors: Mutex::new(BTreeMap::new()),
             subscriptions: Mutex::new(Vec::new()),
+            room_directory: Mutex::new(std::collections::BTreeMap::new()),
             mesh_identities: Mutex::new(BTreeMap::new()),
             beacons: Mutex::new(BTreeMap::new()),
             refresh_locks: Mutex::new(BTreeMap::new()),
@@ -176,6 +178,30 @@ impl EventStore for InMemoryEventStore {
             .map_err(|_| StoreError::LockPoisoned)?;
         cursors.insert(consumer_id.to_string(), cursor.clone());
         Ok(())
+    }
+
+    async fn claim_room_label(
+        &self,
+        label: &str,
+        candidate: RoomId,
+        _claimed_at_ms: u64,
+    ) -> Result<RoomId, StoreError> {
+        // Held across the read AND the write: the whole point is that
+        // two concurrent claims cannot both mint.
+        let mut directory = self
+            .room_directory
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(*directory.entry(label.to_string()).or_insert(candidate))
+    }
+
+    async fn resolve_room_label(&self, label: &str) -> Result<Option<RoomId>, StoreError> {
+        Ok(self
+            .room_directory
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?
+            .get(label)
+            .copied())
     }
 
     async fn load_subscriptions(&self) -> Result<Vec<StoredSubscription>, StoreError> {
