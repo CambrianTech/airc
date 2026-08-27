@@ -142,7 +142,7 @@ fn hex_decode(name: &str, value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         return Err(format!("{name}: hex input has odd length").into());
     }
     let mut out = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
+    for pair in value.as_bytes().as_chunks::<2>().0 {
         let high = hex_nibble(pair[0]).ok_or_else(|| format!("{name}: not valid hex"))?;
         let low = hex_nibble(pair[1]).ok_or_else(|| format!("{name}: not valid hex"))?;
         out.push((high << 4) | low);
