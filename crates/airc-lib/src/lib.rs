@@ -57,6 +57,7 @@ pub mod lane_coordination;
 pub mod lifecycle;
 pub mod mesh_identity;
 mod messaging;
+pub mod nat_ice;
 mod peers;
 pub mod publish;
 pub mod registry;
@@ -123,6 +124,7 @@ pub use diagnostic_event_sink::{
     AircEventDiagnosticSink, RecentDiagnostics, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT,
     HEADER_DIAG_SEVERITY,
 };
+pub use nat_ice::IceConfig;
 pub use rendezvous::{
     parse_rendezvous_dir, resolve_account_registry_store, GistRendezvous, RendezvousChoice,
     RendezvousConfigError, RENDEZVOUS_DIR_ENV,

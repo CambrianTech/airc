@@ -23,10 +23,12 @@
 //! ICE, STUN/TURN configuration, reconnect-on-drop, and renegotiation
 //! are explicit non-goals here.
 //!
-//! Loopback bind: PCs gather candidates on `127.0.0.1:0`, which means
-//! this PR's path only works between two endpoints on the same
-//! machine. Real-network NAT traversal needs configurable ICE servers
-//! — flagged as a follow-up.
+//! NAT traversal: PCs gather on the handle's [`crate::IceConfig`] —
+//! real-interface bind + STUN by default (`AIRC_STUN_SERVERS` /
+//! `AIRC_WEBRTC_BIND` override), so ICE hole-punches across NATs and
+//! most peer pairs connect DIRECTLY. Tests pin
+//! [`crate::IceConfig::loopback_only`] to stay hermetic. Trickle ICE,
+//! TURN, reconnect-on-drop, and renegotiation remain non-goals.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,8 +116,10 @@ impl Airc {
             .ok_or_else(|| AircError::Transport("webrtc default runtime unavailable".into()))?;
         let (gather_tx, mut gather_rx) = rtc_channel::<()>(1);
         let (connected_tx, mut connected_rx) = rtc_channel::<()>(1);
+        let ice = self.ice_config();
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
+                .with_configuration(ice.rtc_configuration())
                 .with_media_engine(default_media_engine()?)
                 .with_handler(Arc::new(OffererHandler {
                     airc: self.clone(),
@@ -124,7 +128,7 @@ impl Airc {
                     connected_tx,
                 }))
                 .with_runtime(runtime)
-                .with_udp_addrs(vec!["127.0.0.1:0"])
+                .with_udp_addrs(vec![ice.udp_bind.as_str()])
                 .build()
                 .await
                 .map_err(|error| AircError::Transport(format!("webrtc build: {error}")))?,
@@ -262,8 +266,10 @@ impl Airc {
         let (gather_tx, mut gather_rx) = rtc_channel::<()>(1);
         let (connected_tx, mut connected_rx) = rtc_channel::<()>(1);
         let (channel_tx, mut channel_rx) = mpsc::channel::<Arc<dyn DataChannel>>(1);
+        let ice = self.ice_config();
         let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
+                .with_configuration(ice.rtc_configuration())
                 .with_media_engine(default_media_engine()?)
                 .with_handler(Arc::new(AnswererHandler {
                     airc: self.clone(),
@@ -273,7 +279,7 @@ impl Airc {
                     channel_tx,
                 }))
                 .with_runtime(runtime)
-                .with_udp_addrs(vec!["127.0.0.1:0"])
+                .with_udp_addrs(vec![ice.udp_bind.as_str()])
                 .build()
                 .await
                 .map_err(|error| AircError::Transport(format!("webrtc build: {error}")))?,

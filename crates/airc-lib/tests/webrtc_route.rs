@@ -54,6 +54,11 @@ async fn paired_airc(room: &str) -> PairedAircFixture {
     let machine = Machine::boot().await;
     let alice = machine.attach("alice").await;
     let bob = machine.attach("bob").await;
+    // Hermetic ICE: loopback bind, no STUN — CI must not depend on (or
+    // wait for) public STUN round-trips. Production default is the
+    // NAT-capable IceConfig::from_env().
+    alice.set_ice_config(airc_lib::IceConfig::loopback_only());
+    bob.set_ice_config(airc_lib::IceConfig::loopback_only());
 
     let alice_spec: PeerSpec = alice.peer_spec().parse().expect("alice peer spec");
     let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob peer spec");
