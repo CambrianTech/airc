@@ -199,7 +199,7 @@ impl Airc {
         // "wrote it down" with "you heard it" is what made an offline node
         // mute.
         let __route = airc_diagnostics::timing::start();
-        match self.resolve_send_route(kind) {
+        match self.resolve_send_route(kind, &frame.envelope.target).await {
             Ok(route) => {
                 if let Err(error) = self.execute_send_route(route.kind, room, frame).await {
                     tracing::warn!(
@@ -233,11 +233,48 @@ impl Airc {
         })
     }
 
-    fn resolve_send_route(&self, kind: FrameKind) -> Result<TransportRoute, AircError> {
+    async fn resolve_send_route(
+        &self,
+        kind: FrameKind,
+        target: &airc_core::MentionTarget,
+    ) -> Result<TransportRoute, AircError> {
         let class = route_class_for_frame(kind);
-        let samples = self.inner.route_health.samples();
-        TransportResolver::from_health(samples)
-            .resolve(class)
+        // Peer-directed frames may ride the per-peer direct rung — but only
+        // on the EVIDENCE of an established DataChannel to that exact peer
+        // (see RouteTarget docs; a phantom claim would route frames into
+        // "no webrtc channel for peer" instead of a live Relay).
+        let route_target = match target {
+            airc_core::MentionTarget::Peer(peer) => crate::route::policy::RouteTarget::Peer {
+                webrtc_channel_ready: self.has_webrtc_channel(*peer).await,
+            },
+            airc_core::MentionTarget::All | airc_core::MentionTarget::Room(_) => {
+                crate::route::policy::RouteTarget::Broadcast
+            }
+        };
+        let mut candidates = self
+            .inner
+            .route_health
+            .samples()
+            .into_iter()
+            .map(crate::route::health::TransportHealthSample::candidate)
+            .collect::<Vec<_>>();
+        // The per-peer DataChannel never registers in the kind-keyed health
+        // table (one row can't speak for N peers); the registered channel to
+        // THIS peer is its own health evidence, injected per-resolution.
+        if matches!(
+            route_target,
+            crate::route::policy::RouteTarget::Peer {
+                webrtc_channel_ready: true
+            }
+        ) {
+            candidates.push(crate::route::policy::TransportCandidate {
+                kind: crate::route::policy::TransportKind::WebRtcDataChannel,
+                role: crate::route::policy::TransportRole::Direct,
+                healthy: true,
+            });
+        }
+        TransportResolver::new(candidates)
+            .resolve_for_target(class, route_target)
             .map_err(format_route_refusal)
     }
 

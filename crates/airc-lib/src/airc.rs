@@ -344,6 +344,12 @@ pub(crate) struct AircInner {
     pub(crate) relay_server: Mutex<Option<airc_relay::RelayServer>>,
     pub(crate) udp: Mutex<Option<UdpAdapter>>,
     pub(crate) udp_subscriber: Mutex<Option<FrameSubscriber>>,
+    /// ICE gathering configuration for every PeerConnection this handle
+    /// builds (STUN servers + bind address). Defaults to
+    /// [`crate::IceConfig::from_env`] — NAT-capable out of the box; tests
+    /// pin [`crate::IceConfig::loopback_only`] via
+    /// [`crate::Airc::set_ice_config`] to stay hermetic.
+    pub(crate) ice_config: std::sync::RwLock<crate::IceConfig>,
     /// Per-peer WebRTC DataChannel adapters, keyed by the remote
     /// peer id. Populated by `Airc::open_webrtc_to` /
     /// `Airc::accept_webrtc_offers` after a handshake completes.
@@ -713,6 +719,7 @@ impl Airc {
                 relay_server: Mutex::new(None),
                 udp: Mutex::new(None),
                 udp_subscriber: Mutex::new(None),
+                ice_config: std::sync::RwLock::new(crate::IceConfig::from_env()),
                 webrtc_channels: Mutex::new(HashMap::new()),
                 webrtc_subscribers: Mutex::new(HashMap::new()),
                 webrtc_peer_connections: Mutex::new(HashMap::new()),
@@ -791,6 +798,27 @@ impl Airc {
     /// Emit a diagnostic through this handle's configured sink.
     pub(crate) fn emit_diag(&self, event: airc_diagnostics::DiagnosticEvent) {
         self.diag_sink().emit(event);
+    }
+
+    /// Replace the ICE gathering config for PeerConnections this handle
+    /// builds from now on (existing connections are unaffected). Tests
+    /// pin [`crate::IceConfig::loopback_only`] to stay hermetic;
+    /// embedders may point STUN at their own infrastructure.
+    pub fn set_ice_config(&self, config: crate::IceConfig) {
+        *self
+            .inner
+            .ice_config
+            .write()
+            .expect("ice_config lock poisoned") = config;
+    }
+
+    /// The ICE gathering config PeerConnections are currently built with.
+    pub fn ice_config(&self) -> crate::IceConfig {
+        self.inner
+            .ice_config
+            .read()
+            .expect("ice_config lock poisoned")
+            .clone()
     }
 
     /// Return the home directory backing this handle.
@@ -1586,6 +1614,7 @@ impl Airc {
             relay_server: Mutex::new(None),
             udp: Mutex::new(None),
             udp_subscriber: Mutex::new(None),
+            ice_config: std::sync::RwLock::new(crate::IceConfig::from_env()),
             webrtc_channels: Mutex::new(HashMap::new()),
             webrtc_subscribers: Mutex::new(HashMap::new()),
             webrtc_peer_connections: Mutex::new(HashMap::new()),
