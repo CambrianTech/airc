@@ -805,11 +805,13 @@ impl Airc {
     /// pin [`crate::IceConfig::loopback_only`] to stay hermetic;
     /// embedders may point STUN at their own infrastructure.
     pub fn set_ice_config(&self, config: crate::IceConfig) {
+        // Poison-recover: a panicked writer can't corrupt a plain config
+        // swap — take the lock anyway rather than propagate the panic.
         *self
             .inner
             .ice_config
             .write()
-            .expect("ice_config lock poisoned") = config;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
     }
 
     /// The ICE gathering config PeerConnections are currently built with.
@@ -817,7 +819,7 @@ impl Airc {
         self.inner
             .ice_config
             .read()
-            .expect("ice_config lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
