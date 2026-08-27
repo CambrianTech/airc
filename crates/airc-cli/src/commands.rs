@@ -2337,6 +2337,10 @@ fn relay_bind_candidates(persisted: Option<u16>) -> Vec<u16> {
 /// Self-elect as a relay on a RESTART-STABLE port (#267). Tries the
 /// persisted previous port, falls back to OS-assigned, and persists
 /// whatever actually bound so the next incarnation lands on it again.
+// AircError is >=128B (clippy 1.98 result_large_err); this is a cold
+// startup path, not a hot loop — scoped allow until AircError's large
+// variants are boxed library-wide.
+#[allow(clippy::result_large_err)]
 async fn become_relay_with_stable_port(
     airc: &Airc,
     lan_ip: Option<std::net::Ipv4Addr>,

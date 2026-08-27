@@ -354,7 +354,9 @@ pub fn turn_reply_address(headers: &Headers) -> Result<TurnReplyAddress, Persona
 #[derive(Debug)]
 pub enum PersonaTurnError {
     Codec(PersonaCodecError),
-    Substrate(AircError),
+    // Boxed: AircError is 128+ bytes and rides the Err path of every turn
+    // helper (clippy::result_large_err) — the Ok path shouldn't pay for it.
+    Substrate(Box<AircError>),
 }
 
 impl std::fmt::Display for PersonaTurnError {
@@ -383,7 +385,7 @@ impl From<PersonaCodecError> for PersonaTurnError {
 
 impl From<AircError> for PersonaTurnError {
     fn from(error: AircError) -> Self {
-        Self::Substrate(error)
+        Self::Substrate(Box::new(error))
     }
 }
 

@@ -221,9 +221,53 @@ impl Airc {
         })
     }
 
+    /// Reply to an in-flight request INTO THE CHANNEL THE REQUEST ARRIVED ON.
+    ///
+    /// [`reply`](Self::reply) sends via the responder's CURRENT room — correct
+    /// only when both sides happen to share it. Two scopes on one machine can
+    /// be parked in different rooms (an operator CLI in `#general`, citizens
+    /// landed in `#academy`): the request crosses (responders subscribe every
+    /// room) but the answer leaves through the responder's room and the
+    /// requester — awaiting on the channel it asked in — never sees it. Every
+    /// dispatch then dies at the command deadline (2026-08-27 grid-smoke 0/3).
+    ///
+    /// `channel` is the request event's `room_id`, adopted verbatim;
+    /// `channel_name` is the request's stamped
+    /// [`airc_protocol::HEADER_AIRC_CHANNEL_NAME`] (for the blind-room heal
+    /// header on the reply), if present.
+    pub async fn reply_in(
+        &self,
+        channel: airc_core::RoomId,
+        channel_name: Option<&str>,
+        reply_to: PeerId,
+        correlation_id: Uuid,
+        mut headers: Headers,
+        body: Body,
+    ) -> Result<(), AircError> {
+        headers.insert(
+            HEADER_AIRC_CORRELATION_ID.into(),
+            correlation_id.to_string(),
+        );
+        headers.insert(HEADER_AIRC_REPLY_TO.into(), reply_to.to_string());
+        let room = crate::Room::at_channel(self.home(), channel_name.unwrap_or(""), channel)?;
+        self.send_frame_to_room(
+            airc_protocol::FrameKind::Message,
+            MentionTarget::Peer(reply_to),
+            body,
+            headers,
+            &room,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Reply to an in-flight request. `reply_to` is the
     /// `airc.reply_to` value read off the request event;
     /// `correlation_id` is the request's `airc.correlation_id`.
+    ///
+    /// Sends via the responder's CURRENT room — prefer
+    /// [`reply_in`](Self::reply_in) with the request's own channel when the
+    /// requester may live in a different room than this scope.
     pub async fn reply(
         &self,
         reply_to: PeerId,
