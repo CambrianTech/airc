@@ -1147,6 +1147,15 @@ fn mention_audience_verdict(
             .collect::<std::collections::HashSet<_>>()
             .len()
     };
+    // Two different facts, said separately: an empty roster means nobody was
+    // seen INCLUDING you, so "other than yourself" would imply you were.
+    if roster.is_empty() {
+        return Some(format!(
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no peer at all has been \
+             seen in this room within the presence window, so this mention cannot be \
+             resolved either way (#262). {hint}"
+        ));
+    }
     if others.is_empty() {
         return Some(format!(
             "⚠ cannot verify '@{mention}' reaches '{channel_name}': no peer other than \
@@ -3411,19 +3420,26 @@ mod tests {
     /// `display_name: None` means present-but-unnamed, so an unmatched mention
     /// may BE that peer; only an all-named roster can license the strong line.
     ///
-    /// Mutation check: restoring `any` in place of the unnamed check fails the
-    /// mixed-roster assert.
+    /// The mixed roster must hold a named OTHER peer, not just a named `me`:
+    /// once `me` is excluded from the accounting (card 74e8e6af) an all-unnamed
+    /// remainder is merely the #262 case, which was already fixed before #1378.
+    /// The invariant that needs pinning is one named peer failing to license a
+    /// negative about a DIFFERENT unnamed one.
+    ///
+    /// Mutation check: expressing the guard as `any` over either subject —
+    /// `roster` or `others` — fails the mixed-roster asserts below.
     #[test]
     fn absence_is_only_asserted_when_every_present_peer_is_named() {
         let strong = "will NEVER receive";
         let me = roster_member(Some("IntelMac"));
 
-        // Mixed roster — the live shape. One named member must NOT license a
-        // negative about the unnamed ones.
-        let mixed = vec![me.clone(), roster_member(None), roster_member(None)];
-        let warning =
-            mention_audience_verdict("M5", &mixed, me.peer_id, "academy").expect("unresolvable");
+        // Mixed roster — the live shape. A named OTHER member must NOT license
+        // a negative about the unnamed one beside it.
+        let mixed = vec![me.clone(), roster_member(Some("M5")), roster_member(None)];
+        let warning = mention_audience_verdict("BigMama", &mixed, me.peer_id, "academy")
+            .expect("unresolvable");
         assert!(!warning.contains(strong), "asserted absence: {warning}");
+        assert!(warning.contains("1 of 2 peer(s)"), "vague: {warning}");
 
         // Empty roster — nobody seen at all cannot license it either.
         let empty =
@@ -3442,11 +3458,19 @@ mod tests {
             assert!(line.contains("--room general"), "lost remediation: {line}");
         }
 
-        // A present, named match stays silent, as does a peer-id prefix.
+        // A present, named match stays silent.
         assert!(mention_audience_verdict("m5", &named, me.peer_id, "academy").is_none());
-        let by_id = vec![roster_member(None)];
-        let prefix = by_id[0].peer_id.to_string()[..8].to_uppercase();
-        assert!(mention_audience_verdict(&prefix, &by_id, by_id[0].peer_id, "academy").is_none());
+
+        // Peer-id prefixes are two DIFFERENT properties and both need pinning:
+        // an unnamed OTHER peer is still resolvable by id (so no warning), and
+        // `heard` scanning the full roster means your OWN id resolves too —
+        // otherwise self-exclusion would emit "@you has not been seen here".
+        let other = roster_member(None);
+        let other_prefix = other.peer_id.to_string()[..8].to_uppercase();
+        let by_id = vec![me.clone(), other.clone()];
+        assert!(mention_audience_verdict(&other_prefix, &by_id, me.peer_id, "academy").is_none());
+        let own_prefix = me.peer_id.to_string()[..8].to_uppercase();
+        assert!(mention_audience_verdict(&own_prefix, &by_id, me.peer_id, "academy").is_none());
     }
 
     /// what this catches (#1378 review, card 74e8e6af): two defects in the
