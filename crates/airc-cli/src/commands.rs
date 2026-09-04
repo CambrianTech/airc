@@ -1881,6 +1881,26 @@ pub async fn run_daemon(
                          (LAN dialed first; off-LAN peers fall through to Tailscale \
                          after a ~3s LAN-rung timeout, once per session)"
                     );
+                    // LAN presence beacon: same-network peers discover this
+                    // node (and it discovers them) with ZERO gh requests —
+                    // the gh rendezvous stays the CROSS-network path only.
+                    // Non-fatal on purpose: a node that cannot join the
+                    // multicast group (locked-down interface, container
+                    // without multicast) still dials out and still rides the
+                    // rendezvous; it says so once, loudly, instead of
+                    // failing the daemon.
+                    let presence_port = endpoints.iter().find_map(|endpoint| {
+                        if let airc_lib::RouteEndpoint::LanTcp { addr } = endpoint {
+                            Some(addr.port())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(port) = presence_port {
+                        if let Err(error) = airc.start_lan_presence(port) {
+                            eprintln!("airc daemon: {error}");
+                        }
+                    }
                     // Self-healing join — publish-on-bind: a freshly bound
                     // listener (daemon restart, possibly on a NEW port when
                     // the stable port was taken) must propagate to the

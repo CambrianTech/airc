@@ -266,6 +266,56 @@ impl Airc {
         Ok(addr)
     }
 
+    /// Start the LAN presence beacon — gh-free same-network discovery.
+    ///
+    /// The transport crate owns the sockets and the wire format
+    /// ([`airc_transport::lan_presence`]); this method owns what a hint
+    /// MEANS: only an ENROLLED peer's beacon teaches anything (discovery is
+    /// not authorization), and what it teaches goes into `learned_ips` — the
+    /// SAME map learn-live-address (#9) feeds — so the existing dial rungs
+    /// (learned-IP × advertised ports, identity-derived port) pick it up on
+    /// the next route refresh with no new plumbing. A node coming online on
+    /// the LAN is therefore dialable within one beacon interval plus one
+    /// refresh tick, with ZERO GitHub requests spent.
+    ///
+    /// Logging is edge-triggered: a hint logs only when it CHANGES what we
+    /// knew. At one beacon per peer per 15s, logging every packet would bury
+    /// the signal it exists to provide (the bounded-window eviction class).
+    pub fn start_lan_presence(&self, advertised_port: u16) -> Result<(), AircError> {
+        let self_peer = self.inner.identity.peer_id;
+        let learned = self.inner.learned_ips.clone();
+        let registry = self.inner.registry.clone();
+        airc_transport::lan_presence::spawn_lan_presence(
+            self_peer.as_uuid(),
+            advertised_port,
+            move |hint| {
+                let peer = PeerId(hint.peer_id);
+                if !registry.has_peer(peer) {
+                    // Unknown announcer: a public hallway is full of
+                    // strangers, and none of them are routes.
+                    return;
+                }
+                if let Ok(mut map) = learned.lock() {
+                    let changed = map.get(&peer) != Some(&hint.ip);
+                    if changed {
+                        map.insert(peer, hint.ip);
+                        tracing::info!(
+                            peer = %peer,
+                            ip = %hint.ip,
+                            claimed_port = hint.port,
+                            "LAN presence: learned peer address from multicast beacon"
+                        );
+                    }
+                }
+            },
+        )
+        .map_err(|error| {
+            AircError::Transport(format!(
+                "LAN presence bind failed — this node can still dial but cannot be                  DISCOVERED on the local network until restart: {error}"
+            ))
+        })
+    }
+
     /// Every socket address stored as ANOTHER peer's dialable endpoint
     /// (both trust stores, same merge scope as the dialer). Input to the
     /// advertise collision guard — we must never advertise an address the
