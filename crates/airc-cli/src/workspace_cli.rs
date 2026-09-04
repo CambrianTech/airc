@@ -22,9 +22,13 @@ pub enum WorkspaceAction {
         /// Workspace branch name.
         #[arg(long)]
         branch: String,
-        /// Base branch name.
-        #[arg(long, default_value = "rust-rewrite")]
-        base: String,
+        /// Base branch name. Defaults to the repo's configured
+        /// integration branch (card 5e04ab56: ONE source of truth —
+        /// `configured_base_branch`, the same resolver PR creation
+        /// uses — instead of a second hardcoded name that goes stale
+        /// when the branch is renamed).
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Mark a requested workspace as allocated at a concrete path.
     Allocate {

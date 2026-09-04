@@ -3859,25 +3859,26 @@ mod tests {
     }
 
     /// Card 28f1440c — the airc PR target branch must be the
-    /// substrate's working branch (`rust-rewrite`), NOT the repo's
-    /// GitHub default (`main`). Card 70e87d33 made the base per-repo
-    /// (so continuum can target `canary`), but the airc invariant is
-    /// unchanged and pinned here: a regression that routes airc
-    /// through the GitHub default would surface `main` and silently
-    /// bypass the substrate work the doctrine requires (AGENTS.md §8).
-    /// This is the per-repo-aware successor to the old constant test —
-    /// extended per its own instruction, not deleted.
+    /// substrate's working branch, NOT the repo's GitHub default
+    /// (`main`). Card 70e87d33 made the base per-repo (so continuum can
+    /// target `canary`); card 5e04ab56 retired `rust-rewrite` (deleted
+    /// on the remote — the stale pin broke `airc work state review` for
+    /// airc's own repo) and the working branch is now `canary`. The
+    /// INVARIANT is unchanged and is what this test pins: a regression
+    /// that routes airc through the GitHub default would surface `main`
+    /// and silently bypass the substrate work the doctrine requires
+    /// (AGENTS.md §8).
     #[test]
-    fn airc_pr_base_targets_rust_rewrite_never_main() {
+    fn airc_pr_base_targets_the_working_branch_never_main() {
         std::env::remove_var("AIRC_PR_BASE");
         let airc_repo = airc_work::RepoId::new("CambrianTech/airc").expect("valid repo key");
         let base = crate::work_commands_gh::configured_base_branch(&airc_repo);
         assert_eq!(
             base.as_deref(),
-            Some("rust-rewrite"),
-            "card 28f1440c: airc PR target must be the substrate working \
-             branch, never the repo's GitHub default ('main' on this \
-             repo today)"
+            Some("canary"),
+            "cards 28f1440c + 5e04ab56: airc PR target must be the substrate \
+             working branch (canary), never the repo's GitHub default \
+             ('main' on this repo today)"
         );
         assert_ne!(base.as_deref(), Some("main"));
     }
