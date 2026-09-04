@@ -345,47 +345,10 @@ impl GhClient for ReqwestGhClient {
         let runs_bytes = runs_resp.bytes().await.map_err(map_reqwest_error)?;
         let check_runs = airc_lib::gh::client::parse_check_runs(&runs_bytes)?;
 
-        let state = pr_json
-            .get("state")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_uppercase();
-        // GitHub's mergeable field is tri-state: null (computing), true
-        // (MERGEABLE), false (CONFLICTING). gh exposes the same as the
-        // string variants.
-        let mergeable = match pr_json.get("mergeable") {
-            Some(serde_json::Value::Bool(true)) => "MERGEABLE",
-            Some(serde_json::Value::Bool(false)) => "CONFLICTING",
-            _ => "UNKNOWN",
-        }
-        .to_string();
-
-        // `mergedAt` is populated by GitHub's REST API only when the
-        // PR has been merged. For OPEN PRs the field is absent or
-        // null; we surface it as `None`. The merger's reconcile path
-        // (card acd72c81 follow-up) reads this to emit
-        // `PullRequestMerged` with the canonical GitHub timestamp.
-        let merged_at = pr_json
-            .get("merged_at")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        // Card c03bb62f: REST says `closed` for a merged PR; GraphQL (the
-        // `gh pr view` client) says `MERGED`. One vocabulary for `state`
-        // across both clients — the gate decides on `merged_at` regardless,
-        // but a reader of `PrView.state` must not be told CLOSED when the
-        // PR merged.
-        let state = if merged_at.is_some() {
-            "MERGED".to_string()
-        } else {
-            state
-        };
-
-        Ok(PrView {
-            state,
-            mergeable,
-            status_check_rollup: Some(check_runs),
-            merged_at,
-        })
+        // Card fc483e57: the REST→canonical translation lives beside its
+        // GraphQL twin in airc-lib, not here. This client's job is the two
+        // HTTP calls; the dialect boundary owns the vocabulary.
+        Ok(PrView::from_rest(&pr_json, check_runs))
     }
 
     async fn pr_create(&self, args: PrCreateArgs) -> Result<PrCreated, GhError> {
