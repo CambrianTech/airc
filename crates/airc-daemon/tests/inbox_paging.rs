@@ -14,6 +14,8 @@
 //! The test model IS the production model: a real `DaemonState` over a
 //! real SQLite ORM on a Unix socket, driven by the real `DaemonClient`.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -132,34 +134,26 @@ fn durable_chunk(channel: RoomId, bytes: &[u8]) -> PublishRequest {
     }
 }
 
-/// Publish one request, honouring §3.8 back-pressure: the write-behind
-/// queue is bounded, and on a slow runner a tight publish loop can
-/// outpace the SQLite drain — the daemon sheds with a LOUD typed error
-/// (the designed signal, never a silent drop). Back off and retry the
-/// same event, the way a real producer would. Any other error is a real
-/// failure.
-async fn publish_with_backoff(client: &DaemonClient, request: PublishRequest) -> PublishResponse {
-    for _ in 0..500 {
-        match client.publish(request.clone()).await {
-            Ok(receipt) => return receipt,
-            Err(error) => {
-                let message = error.to_string();
-                assert!(
-                    message.contains("saturated"),
-                    "unexpected publish error: {message}"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    }
-    panic!("publish kept saturating after 500 backoff retries");
+/// Publish one request, honouring §3.8 back-pressure. Policy lives in
+/// `common::retry_while_saturated` — shared with `room_tip_probe.rs`, which had
+/// an identical inlined copy, and proven in `backoff_policy.rs`.
+async fn publish_with_backoff(
+    client: &DaemonClient,
+    request: PublishRequest,
+    deadline: std::time::Instant,
+) -> PublishResponse {
+    common::retry_while_saturated(deadline, || client.publish(request.clone())).await
 }
 
 async fn publish_n(client: &DaemonClient, channel: RoomId, n: usize) -> PublishResponse {
+    // ONE deadline for the whole run, not per call: a per-call budget lets an
+    // oscillating queue (saturate, accept one, repeat) run for n x budget,
+    // which is not what "the queue is wedged" means.
+    let deadline = common::saturation_deadline();
     let mut last = None;
     for i in 0..n {
         let request = durable_text(channel, &format!("event {i}"));
-        last = Some(publish_with_backoff(client, request).await);
+        last = Some(publish_with_backoff(client, request, deadline).await);
     }
     last.expect("n > 0")
 }
@@ -359,8 +353,12 @@ async fn inbox_kinds_filter_returns_buried_messages_under_chunk_flood() {
     // Three direction messages…
     let mut message_cursors = Vec::new();
     for i in 0..3 {
-        let receipt =
-            publish_with_backoff(&client, durable_text(channel, &format!("direction {i}"))).await;
+        let receipt = publish_with_backoff(
+            &client,
+            durable_text(channel, &format!("direction {i}")),
+            common::saturation_deadline(),
+        )
+        .await;
         message_cursors.push(airc_ipc::IpcCursor {
             epoch: receipt.epoch,
             counter: receipt.counter,
@@ -369,7 +367,12 @@ async fn inbox_kinds_filter_returns_buried_messages_under_chunk_flood() {
     }
     // …buried under 200 newer durable stream chunks.
     for _ in 0..200 {
-        publish_with_backoff(&client, durable_chunk(channel, b"\x01\x02\x03")).await;
+        publish_with_backoff(
+            &client,
+            durable_chunk(channel, b"\x01\x02\x03"),
+            common::saturation_deadline(),
+        )
+        .await;
     }
 
     // Precondition — the bug shape: the raw newest-50 page is ALL
