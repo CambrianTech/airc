@@ -132,6 +132,28 @@ fn durable_chunk(channel: RoomId, bytes: &[u8]) -> PublishRequest {
     }
 }
 
+/// How long a publish may stay saturated before we call the queue wedged.
+///
+/// A WALL-CLOCK budget, not an attempt count. The previous form was
+/// `for _ in 0..500` with a flat 10 ms sleep — five seconds of unbroken
+/// saturation — which a loaded Windows CI runner exceeds: PR #1379 failed here
+/// on a diff that touched only `airc-cli`, and the identical commit passed on
+/// re-run. Same code, opposite verdicts, ~20 minutes apart. The same job took
+/// ~13 min in one run and >20 in the next, so runner speed varies by more than
+/// the old budget's entire headroom.
+///
+/// Sixty seconds is far past any healthy drain and still fails loudly on a
+/// genuinely wedged queue — which is the behaviour this helper exists to
+/// preserve. Deliberately NOT `#[ignore]`d and NOT moved behind a feature: the
+/// invariant the caller pins (most-recent-N costs by N, not by room depth) is
+/// real and belongs in the default suite.
+const SATURATION_BUDGET: Duration = Duration::from_secs(60);
+
+/// Retry backoff: starts tight so a healthy drain is not slowed, then eases off
+/// so a struggling one is not hammered at a fixed rate while we wait it out.
+const BACKOFF_MIN: Duration = Duration::from_millis(10);
+const BACKOFF_MAX: Duration = Duration::from_millis(250);
+
 /// Publish one request, honouring §3.8 back-pressure: the write-behind
 /// queue is bounded, and on a slow runner a tight publish loop can
 /// outpace the SQLite drain — the daemon sheds with a LOUD typed error
@@ -139,7 +161,10 @@ fn durable_chunk(channel: RoomId, bytes: &[u8]) -> PublishRequest {
 /// same event, the way a real producer would. Any other error is a real
 /// failure.
 async fn publish_with_backoff(client: &DaemonClient, request: PublishRequest) -> PublishResponse {
-    for _ in 0..500 {
+    let started = std::time::Instant::now();
+    let mut backoff = BACKOFF_MIN;
+    let mut attempts = 0u32;
+    loop {
         match client.publish(request.clone()).await {
             Ok(receipt) => return receipt,
             Err(error) => {
@@ -148,11 +173,23 @@ async fn publish_with_backoff(client: &DaemonClient, request: PublishRequest) ->
                     message.contains("saturated"),
                     "unexpected publish error: {message}"
                 );
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                attempts += 1;
+                if started.elapsed() >= SATURATION_BUDGET {
+                    // Report the DURATION, not the attempt count: "500 retries"
+                    // told a reader nothing about whether that was 5 seconds or
+                    // 5 minutes, and the answer is what decides whether the queue
+                    // is wedged or the runner is merely slow.
+                    panic!(
+                        "publish stayed saturated for {:?} ({attempts} attempts) — \
+                         budget {SATURATION_BUDGET:?}; the write-behind queue never drained",
+                        started.elapsed()
+                    );
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
     }
-    panic!("publish kept saturating after 500 backoff retries");
 }
 
 async fn publish_n(client: &DaemonClient, channel: RoomId, n: usize) -> PublishResponse {
