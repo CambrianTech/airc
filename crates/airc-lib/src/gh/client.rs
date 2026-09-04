@@ -352,12 +352,20 @@ pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
         check_runs: Vec<RestRun>,
     }
     let env: Envelope = serde_json::from_slice(json)?;
+    // Card c03bb62f: REST speaks lowercase (`success`, `completed`);
+    // GraphQL — and every consumer of `GhCheck` (the merge gate's
+    // `Some("SUCCESS")` / `Some("COMPLETED")` arms, the strictly-less-red
+    // baseline's `FAILURE` filter) — speaks UPPERCASE. Passing REST through
+    // verbatim made every completed check read as in-flight, so the
+    // production ReqwestGhClient merger could only ever merge via the
+    // pending-timeout bypass and its baseline was always empty. One
+    // vocabulary at the parser: GhCheck is GraphQL-cased, whoever produced it.
     Ok(env
         .check_runs
         .into_iter()
         .map(|r| GhCheck {
-            conclusion: r.conclusion,
-            status: r.status,
+            conclusion: r.conclusion.map(|c| c.to_ascii_uppercase()),
+            status: r.status.map(|s| s.to_ascii_uppercase()),
             name: r.name,
             started_at: r.started_at,
         })
@@ -607,6 +615,25 @@ mod tests {
         let parsed: GhCheck = serde_json::from_value(json).expect("PR-shape decodes");
         assert_eq!(parsed.started_at.as_deref(), Some("2026-05-29T03:29:46Z"));
         assert_eq!(parsed.status.as_deref(), Some("IN_PROGRESS"));
+    }
+
+    // what this catches: REST check-runs are lowercase (`success`/`completed`)
+    // and the merge gate matches GraphQL's `SUCCESS`/`COMPLETED`; passed
+    // through verbatim, five green checks read as "5 check(s) still
+    // running" (card c03bb62f, 2026-09-04: continuum #3693/#3696/#3699
+    // all-green on GitHub, `airc work merge` refusing). GhCheck must be
+    // GraphQL-cased regardless of which client produced it.
+    #[test]
+    fn parse_check_runs_normalizes_rest_lowercase_to_graphql_case() {
+        let json = br#"{"total_count":2,"check_runs":[
+            {"name":"cargo test","status":"completed","conclusion":"success","started_at":"2026-09-04T17:36:00Z"},
+            {"name":"cargo check","status":"in_progress","conclusion":null}
+        ]}"#;
+        let runs = parse_check_runs(json).expect("parse");
+        assert_eq!(runs[0].status.as_deref(), Some("COMPLETED"));
+        assert_eq!(runs[0].conclusion.as_deref(), Some("SUCCESS"));
+        assert_eq!(runs[1].status.as_deref(), Some("IN_PROGRESS"));
+        assert_eq!(runs[1].conclusion, None);
     }
 
     #[test]
