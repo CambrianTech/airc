@@ -129,6 +129,29 @@ pub const HEADER_AIRC_CHANNEL_NAME: &str = "airc.channel_name";
 /// decodes + verifies. See airc-lib `grid_auth`.
 pub const HEADER_AIRC_CAPABILITY_GRANT: &str = "airc.capability_grant";
 
+/// The publisher's DELIVERY CLASS, stamped so a receiver can route on it
+/// WITHOUT decoding the body — presence vs durable is a header question,
+/// not a payload question.
+///
+/// Values are the lowercase `DeliveryClass` names: `durable`,
+/// `ephemeral_latest`, `ephemeral_window`, `request_response`,
+/// `stream_chunk`.
+///
+/// Why a header and not "read the frame and see": every hop that has to
+/// deserialize a body to learn how to treat it pays the cost of the whole
+/// payload to answer a question the envelope could have answered. A
+/// citizen's working attention filter is a hop too — it should drop a
+/// presence line by reading four bytes of header, not by parsing the
+/// glyph and thought behind it. Same rule the routing headers already
+/// follow (`airc.priority`, `airc.deadline`, body_hint).
+///
+/// Advisory, never authoritative: the DAEMON decides actual persistence
+/// from the typed IPC field. This header is what the wire tells everyone
+/// else about that decision, so a subscriber and the store can never be
+/// made to disagree by a lying publisher — worst case a mislabeled line
+/// is filtered oddly by peers while the store does the right thing.
+pub const HEADER_AIRC_DELIVERY_CLASS: &str = "airc.delivery_class";
+
 #[cfg(test)]
 mod tests {
     use super::*;

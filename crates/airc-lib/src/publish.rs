@@ -23,7 +23,9 @@
 //! The same call works for in-process [`Airc::open`] handles and
 //! daemon-attached [`Airc::attach`] handles.
 
+use airc_bus::DeliveryClass;
 use airc_core::{Body, EventId, Headers, MentionTarget, RoomId};
+use airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS;
 use airc_protocol::FrameKind;
 use serde::{Deserialize, Serialize};
 
@@ -85,9 +87,51 @@ impl Airc {
         body: Body,
         headers: Headers,
     ) -> Result<PublishReceipt, AircError> {
+        self.publish_with_delivery(target, kind, body, headers, DeliveryClass::Durable)
+            .await
+    }
+
+    /// [`publish`](Self::publish) with the DELIVERY CLASS chosen by the
+    /// caller — the presence plane's publish.
+    ///
+    /// `publish` is durable because chat is durable: it becomes an ORM row
+    /// and rides the replayable tail. But a citizen also emits lines that
+    /// are STATE, not history — a glyph, a pose, "thinking" — and those must
+    /// not accumulate in a transcript that recall, RAG, and every future
+    /// digest then has to read past. Presence is state, not an event (#1341);
+    /// this is the verb that says so at publish time.
+    ///
+    /// Two guarantees, and the second is the one that makes the first useful:
+    ///
+    /// 1. `EphemeralLatest` / `EphemeralWindow` never become ORM rows — the
+    ///    daemon's durable sink never sees them.
+    /// 2. The class is stamped into
+    ///    [`HEADER_AIRC_DELIVERY_CLASS`] so a subscriber can filter on it
+    ///    WITHOUT decoding the body. A working citizen drops the presence
+    ///    plane by reading a header, not by parsing every thought behind it.
+    ///
+    /// Callers that want the class VISIBLE but the routing unchanged can
+    /// keep using `publish`; nothing about the durable path moves here.
+    pub async fn publish_with_delivery(
+        &self,
+        target: PublishTarget,
+        kind: FrameKind,
+        body: Body,
+        mut headers: Headers,
+        delivery: DeliveryClass,
+    ) -> Result<PublishReceipt, AircError> {
+        // Stamp before the split so BOTH paths (daemon-attached and the
+        // direct send below) carry the class — a receiver must not have to
+        // know which path a publisher happened to take.
+        headers.insert(
+            HEADER_AIRC_DELIVERY_CLASS.to_string(),
+            delivery_class_header_value(delivery).to_string(),
+        );
         let room = self.resolve_publish_target(&target).await?;
         if self.is_daemon_attached() {
-            return self.daemon_publish(&room, kind, body, headers).await;
+            return self
+                .daemon_publish(&room, kind, body, headers, delivery)
+                .await;
         }
         let result = self
             .send_frame_to_room(kind, MentionTarget::All, body, headers, &room)
@@ -162,9 +206,69 @@ impl Airc {
     }
 }
 
+/// `DeliveryClass` → the wire spelling carried by
+/// [`HEADER_AIRC_DELIVERY_CLASS`]. Exhaustive on purpose: a new class must
+/// choose its wire name here rather than defaulting into a wrong one, so a
+/// future variant cannot silently masquerade as `durable` to every
+/// header-filtering subscriber on the grid.
+pub(crate) fn delivery_class_header_value(delivery: DeliveryClass) -> &'static str {
+    match delivery {
+        DeliveryClass::Durable => "durable",
+        DeliveryClass::EphemeralLatest => "ephemeral_latest",
+        DeliveryClass::EphemeralWindow => "ephemeral_window",
+        DeliveryClass::RequestResponse => "request_response",
+        DeliveryClass::StreamChunk => "stream_chunk",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: the wire spelling of a delivery class going wrong
+    // silently. Subscribers filter the presence plane by comparing this
+    // header value; if a class ever renders as an unexpected string, every
+    // header-filtering citizen on the grid mis-routes it and NOTHING errors
+    // — the line just lands in the wrong plane. Pinning the exact bytes is
+    // the only way that failure becomes loud.
+    #[test]
+    fn delivery_class_wire_names_are_exact_and_distinct() {
+        use std::collections::HashSet;
+        let all = [
+            (DeliveryClass::Durable, "durable"),
+            (DeliveryClass::EphemeralLatest, "ephemeral_latest"),
+            (DeliveryClass::EphemeralWindow, "ephemeral_window"),
+            (DeliveryClass::RequestResponse, "request_response"),
+            (DeliveryClass::StreamChunk, "stream_chunk"),
+        ];
+        for (class, expected) in all {
+            assert_eq!(
+                delivery_class_header_value(class),
+                expected,
+                "the wire spelling of {class:?} is a cross-node contract"
+            );
+        }
+        let distinct: HashSet<&str> = all.iter().map(|(_, name)| *name).collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "two classes sharing a wire name would make them indistinguishable to a              header-filtering subscriber"
+        );
+    }
+
+    // what this catches: the presence plane being unreadable without a body
+    // decode. The whole point of the class header is that a working citizen
+    // drops presence lines by reading a header — if the constant drifts out
+    // of the `airc.*` namespace or gets renamed, filters silently match
+    // nothing and every presence line reaches the attention plane again.
+    #[test]
+    fn the_delivery_class_header_is_substrate_owned_and_named() {
+        assert_eq!(HEADER_AIRC_DELIVERY_CLASS, "airc.delivery_class");
+        assert!(
+            HEADER_AIRC_DELIVERY_CLASS.starts_with("airc."),
+            "routing headers live in the substrate-owned namespace"
+        );
+    }
 
     #[test]
     fn publish_target_round_trips_through_clone_and_equality() {
