@@ -151,16 +151,9 @@ impl Airc {
         // the root of the cross-machine auto-connect churn (#8). Fall back to
         // an OS-assigned port only if the preferred one is already taken.
         let preferred = stable_lan_port(self.inner.identity.peer_id);
-        let actual = match adapter
-            .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
-            .await
-        {
-            Ok(addr) => addr,
-            Err(_preferred_taken) => adapter
-                .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-                .await
-                .map_err(|error| AircError::Transport(error.to_string()))?,
-        };
+        let actual = self
+            .bind_preferred_or_ephemeral(&adapter, preferred)
+            .await?;
         self.ensure_lan_subscriber().await?;
         self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
         let port = actual.port();
@@ -192,6 +185,85 @@ impl Airc {
             advertised.push(endpoint);
         }
         Ok(advertised)
+    }
+
+    /// Bind the identity-derived port, RETRYING across a restart handover,
+    /// and never demote to an ephemeral port in silence.
+    ///
+    /// The stable port is the whole mechanism behind peers' cached endpoints
+    /// surviving a restart (#8). It had a correct derivation, a passing unit
+    /// test asserting "same identity must derive the same port across
+    /// restarts", and a bind site that tried it first — and the node still
+    /// churned its port on every restart, because of the two lines that
+    /// handled failure:
+    ///
+    /// ```ignore
+    /// Err(_preferred_taken) => adapter.listen((UNSPECIFIED, 0)).await
+    /// ```
+    ///
+    /// Measured on the Windows node 2026-08-15, immediately after an
+    /// `airc update`: peer_id `e85a5bb3-…` derives port 61539, the daemon
+    /// was advertising 64463, and 61539 was BINDABLE at that moment — free,
+    /// not excluded, nothing listening. The new daemon had raced the
+    /// outgoing one during the update handover, lost, taken an ephemeral
+    /// port, and then kept it for the whole process lifetime even after the
+    /// stable port freed milliseconds later.
+    ///
+    /// Three defects in one expression, all of which this fixes:
+    ///
+    /// 1. NO RETRY. The contended window is the restart handover itself —
+    ///    the single most common moment this code runs. One attempt loses it.
+    /// 2. SILENT. `_preferred_taken` discards the reason, so a node that has
+    ///    just become unreachable at every address its peers have cached
+    ///    reports nothing at all. That is the masking fallback this repo
+    ///    denies at the clippy gate, written in longhand.
+    /// 3. NO RECOVERY. Once ephemeral, always ephemeral for that process.
+    ///
+    /// This retries briefly, and if it still cannot get the stable port it
+    /// takes an ephemeral one — but says so LOUDLY and names the
+    /// consequence, because "reachable at an address nobody has" is exactly
+    /// the failure that reads as a quiet room rather than a broken wire.
+    async fn bind_preferred_or_ephemeral(
+        &self,
+        adapter: &LanTcpAdapter,
+        preferred: u16,
+    ) -> Result<SocketAddr, AircError> {
+        // Short and bounded: this covers an outgoing daemon releasing its
+        // listener, which is a sub-second handover. It is deliberately not a
+        // long wait — a genuinely occupied port must surface fast rather
+        // than stall startup.
+        const ATTEMPTS: u32 = 5;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+        let mut last_error = None;
+        for attempt in 1..=ATTEMPTS {
+            match adapter
+                .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
+                .await
+            {
+                Ok(addr) => return Ok(addr),
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if attempt < ATTEMPTS {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        let addr = adapter
+            .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .map_err(|error| AircError::Transport(error.to_string()))?;
+
+        tracing::warn!(
+            preferred_port = preferred,
+            fallback_port = addr.port(),
+            attempts = ATTEMPTS,
+            last_error = last_error.as_deref().unwrap_or("unknown"),
+            "LAN bind fell back to an EPHEMERAL port — this node is now              unreachable at the identity-derived port every peer has cached              for it, and will stay on the ephemeral port until restarted.              Peers must rediscover it through the rendezvous before any              frame can cross."
+        );
+        Ok(addr)
     }
 
     /// Every socket address stored as ANOTHER peer's dialable endpoint
@@ -464,6 +536,61 @@ mod tests {
                 "port must be in the IANA dynamic/private range"
             );
         }
+    }
+
+    /// what this catches: the RESTART HANDOVER RACE that silently demoted a
+    /// node to an ephemeral port — and kept it there.
+    ///
+    /// `stable_lan_port` was correct, and the sibling test above proved it
+    /// derived the same port every time. The node churned its port anyway,
+    /// because the bind site treated "preferred port busy" as a one-shot and
+    /// fell through to `:0` while discarding the reason:
+    ///
+    /// ```ignore
+    /// Err(_preferred_taken) => adapter.listen((UNSPECIFIED, 0)).await
+    /// ```
+    ///
+    /// The contended moment is the restart handover itself — the outgoing
+    /// daemon still holds the listener for a few hundred ms — which is the
+    /// single most common moment this code runs. Measured on the Windows
+    /// node 2026-08-15 right after an `airc update`: identity `e85a5bb3-…`
+    /// derives 61539, the daemon advertised 64463, and 61539 was BINDABLE at
+    /// that moment. It lost the race, took an ephemeral port, and held it for
+    /// the process lifetime — so every endpoint peers had cached pointed at a
+    /// dead port and inbound was structurally unreachable. M5 observed the
+    /// other half independently: "your airc INBOUND is unreachable."
+    ///
+    /// This occupies the stable port, releases it mid-handover, and asserts
+    /// the bind still lands on the STABLE port. Against the old one-shot code
+    /// it fails with an ephemeral port, which is the regression.
+    #[tokio::test]
+    async fn a_busy_stable_port_is_retried_across_the_restart_handover() {
+        let (_dir, airc) = test_airc().await;
+        let preferred = stable_lan_port(airc.inner.identity.peer_id);
+
+        // Stand in for the outgoing daemon still holding the listener.
+        let outgoing =
+            std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
+                .expect("test must be able to hold the stable port to simulate the handover");
+
+        // Release it partway through the retry window, as a real handover does.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            drop(outgoing);
+        });
+
+        let advertised = airc
+            .listen_lan_advertising(Some(Ipv4Addr::new(192, 168, 1, 50)), None)
+            .await
+            .expect("bind must succeed once the outgoing listener releases");
+
+        let addr = lan_addr(&advertised).expect("a LAN endpoint must be advertised");
+        assert_eq!(
+            addr.port(),
+            preferred,
+            "bind fell back to an ephemeral port ({}) instead of retrying the identity-derived              port ({preferred}) across the handover — every endpoint peers have cached for this              node now points at a dead port, and the node cannot tell that it is unreachable",
+            addr.port()
+        );
     }
 
     async fn test_airc() -> (tempfile::TempDir, Airc) {
