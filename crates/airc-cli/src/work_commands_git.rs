@@ -5,8 +5,6 @@
 //! Card cb8d8990 (phase 3 redo, was c63a1b6e). The same extraction
 //! pattern as phases 1 (#1063) and 2 (#1064 in flight).
 
-use crate::lease;
-
 /// Best-effort: allocate `~/.airc/worktrees/<card_short>/` and a
 /// branch `<card_short>/<slug>` off the current feature branch HEAD
 /// so the agent who just claimed the card can `cd` into a clean,
@@ -47,14 +45,16 @@ pub(crate) async fn spawn_claim_worktree(
 
     let slug = slugify(&card.title, 40);
 
-    let lease_root = lease::lease_root()
+    // Card 01611f25: the path and the creation live in airc-lib now, so a
+    // CITIZEN claiming a card gets the same workspace. What stays here is the
+    // part that is genuinely CLI: resolving the clone from cwd, and refusing
+    // when cwd's repo is not the card's.
+    let worktree_path = airc_lib::work_worktree::worktree_path_for(card.card_id)
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
-    let worktree_path = lease_root.join(&short);
     if worktree_path.exists() {
         println!("worktree:  {} (existing — reused)", worktree_path.display());
         return Ok(());
     }
-    std::fs::create_dir_all(&lease_root)?;
 
     // Resolve repo root from cwd (the user's checkout). git itself
     // handles the worktree-add — we don't reimplement.
@@ -95,19 +95,17 @@ pub(crate) async fn spawn_claim_worktree(
     }
 
     let branch = format!("{short}/{slug}");
-    let add_out = std::process::Command::new("git")
-        .args(["-C", &repo_root, "worktree", "add", "-b", &branch])
-        .arg(&worktree_path)
-        .output()?;
-    if !add_out.status.success() {
-        return Err(format!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&add_out.stderr).trim()
-        )
-        .into());
-    }
+    let outcome =
+        airc_lib::work_worktree::ensure_worktree(&airc_lib::work_worktree::WorktreeSpec {
+            card_id: card.card_id,
+            clone_path: std::path::Path::new(&repo_root),
+            branch: &branch,
+            // None = the clone's current HEAD, which is what this path has always
+            // done from inside an operator's checkout.
+            start_point: None,
+        })?;
 
-    println!("worktree:  {}", worktree_path.display());
+    println!("worktree:  {}", outcome.path().display());
     println!("branch:    {branch}");
     println!("hint:      cd {}", worktree_path.display());
     Ok(())
