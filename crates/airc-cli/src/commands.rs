@@ -1077,7 +1077,7 @@ async fn mention_audience_warning(
         )
         .await
         .ok()?;
-    mention_audience_verdict(mention, &roster, channel_name)
+    mention_audience_verdict(mention, &roster, airc.peer_id(), channel_name)
 }
 
 /// The decision half of [`mention_audience_warning`], split out from the
@@ -1085,21 +1085,37 @@ async fn mention_audience_warning(
 ///
 /// The strong "has not been seen" line asserts ABSENCE. That is only
 /// honest when the roster could have answered the question at all — every
-/// member in the window is named, so a failed match really does mean "not
-/// here". `RoomMember::display_name` is documented as `None` for a peer
-/// that is PRESENT but has not published an identity card; a mention that
-/// matches nobody may simply BE one of those peers.
+/// OTHER peer in the window is named, so a failed match really does mean
+/// "not seen in this window". (Never "not subscribed": a peer quieter than
+/// [`MENTION_AUDIENCE_WITHIN`] is absent from the roster entirely, which is
+/// why the emitted string says "not seen" and hedges the rest.)
+/// `RoomMember::display_name` is documented as `None` for a peer that is
+/// PRESENT but has not published an identity card; a mention that matches
+/// nobody may simply BE one of those peers.
 ///
-/// #262 caught the all-unnamed case. This is the same defect one level
-/// up, live on IntelMac 2026-09-04: both other grid peers were reported
-/// as "will NEVER receive this" seconds after each had posted into the
-/// room, because a single OTHER named member — the sender's own published
-/// card — satisfied `any()`. One named member cannot license a negative
-/// about a different, unnamed one, and an empty roster (nobody seen at
-/// all) cannot license one either. So the guard is `all`, not `any`.
+/// #262 caught the all-unnamed case. #1378 caught the same defect one
+/// level up, live on IntelMac 2026-09-04: both other grid peers were
+/// reported as "will NEVER receive this" seconds after each had posted,
+/// because a single OTHER named member satisfied `any()`. One named member
+/// cannot license a negative about a different, unnamed one — so the guard
+/// is `all`, not `any`.
+///
+/// Two things the #1378 review then caught in that fix (card 74e8e6af):
+///
+/// - **`me` is excluded from the accounting.** A roster includes `self`, so
+///   an operator who has never run `airc identity set` is an unnamed member
+///   of EVERY room: `unnamed > 0` would be permanently true, the strong line
+///   could never fire, and the soft line would describe the operator to
+///   themselves as a third party. `heard` still scans the FULL roster, so
+///   mentioning your own name resolves rather than warning.
+/// - **Peers are counted distinctly.** `room_roster_in` yields one row per
+///   (peer, client session) — two agent tabs on one box are two rows sharing
+///   a peer id — so a row count printed as "peer(s)" is a number the data
+///   does not support.
 fn mention_audience_verdict(
     mention: &str,
     roster: &[airc_lib::RoomMember],
+    me: airc_lib::PeerId,
     channel_name: &str,
 ) -> Option<String> {
     let needle = mention.to_ascii_lowercase();
@@ -1117,28 +1133,44 @@ fn mention_audience_verdict(
     if heard {
         return None;
     }
-    let hint = "Confirm with `airc events list --limit 5000 --kind message`.";
-    if roster.is_empty() {
+    // Both clauses matter and neither depends on anyone's naming state: the
+    // "send in a room they read" half is what actually ended #270's hour of
+    // misdiagnosis, and after the `all` guard the soft path is the COMMON
+    // path in any room holding an uncarded peer.
+    let hint = "Check where they speak (`airc events list --limit 5000 --kind message`) \
+                and send in a room they read, e.g. `airc msg --room general ...`.";
+    let others: Vec<&airc_lib::RoomMember> = roster.iter().filter(|m| m.peer_id != me).collect();
+    let distinct = |members: &[&airc_lib::RoomMember]| {
+        members
+            .iter()
+            .map(|m| m.peer_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    if others.is_empty() {
         return Some(format!(
-            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no peer at all has been \
-             seen in this room within the presence window, so this mention cannot be \
-             resolved either way (#262). {hint}"
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no peer other than \
+             yourself has been seen in this room within the presence window, so this \
+             mention cannot be resolved either way (#262). {hint}"
         ));
     }
-    let unnamed = roster.iter().filter(|m| m.display_name.is_none()).count();
-    if unnamed > 0 {
+    let unnamed: Vec<&airc_lib::RoomMember> = others
+        .iter()
+        .copied()
+        .filter(|m| m.display_name.is_none())
+        .collect();
+    if !unnamed.is_empty() {
         return Some(format!(
-            "⚠ cannot verify '@{mention}' reaches '{channel_name}': {unnamed} of {} peer(s) \
-             seen here have not published an identity card, so a name match cannot succeed \
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': {} of {} peer(s) seen \
+             here have not published an identity card, so a name match cannot succeed \
              against them either way (#262). {hint}",
-            roster.len()
+            distinct(&unnamed),
+            distinct(&others)
         ));
     }
     Some(format!(
         "⚠ '@{mention}' has not been seen in '{channel_name}' (48h presence window) — \
-         if they are not subscribed to this room they will NEVER receive this. \
-         Check where they speak (`airc events list --limit 5000 --kind message`) \
-         and send in a room they read, e.g. `airc msg --room general ...`."
+         if they are not subscribed to this room they will NEVER receive this. {hint}"
     ))
 }
 
@@ -3379,38 +3411,98 @@ mod tests {
     /// `display_name: None` means present-but-unnamed, so an unmatched mention
     /// may BE that peer; only an all-named roster can license the strong line.
     ///
-    /// Mutation check: restoring `any` in place of the unnamed count fails the
+    /// Mutation check: restoring `any` in place of the unnamed check fails the
     /// mixed-roster assert.
     #[test]
     fn absence_is_only_asserted_when_every_present_peer_is_named() {
         let strong = "will NEVER receive";
+        let me = roster_member(Some("IntelMac"));
 
         // Mixed roster — the live shape. One named member must NOT license a
         // negative about the unnamed ones.
-        let mixed = vec![
-            roster_member(Some("IntelMac")),
-            roster_member(None),
-            roster_member(None),
-        ];
-        let warning = mention_audience_verdict("M5", &mixed, "academy").expect("unresolvable");
+        let mixed = vec![me.clone(), roster_member(None), roster_member(None)];
+        let warning =
+            mention_audience_verdict("M5", &mixed, me.peer_id, "academy").expect("unresolvable");
         assert!(!warning.contains(strong), "asserted absence: {warning}");
-        assert!(warning.contains("2 of 3 peer(s)"), "vague: {warning}");
 
         // Empty roster — nobody seen at all cannot license it either.
-        let empty = mention_audience_verdict("M5", &[], "academy").expect("unresolvable");
+        let empty =
+            mention_audience_verdict("M5", &[], me.peer_id, "academy").expect("unresolvable");
         assert!(!empty.contains(strong), "asserted absence: {empty}");
 
         // All named and no match — the roster CAN answer, so the loud line is
         // earned. This is the #270 case the warning exists for.
-        let named = vec![roster_member(Some("IntelMac")), roster_member(Some("M5"))];
-        let deaf = mention_audience_verdict("BigMama", &named, "academy").expect("absent");
+        let named = vec![me.clone(), roster_member(Some("M5"))];
+        let deaf =
+            mention_audience_verdict("BigMama", &named, me.peer_id, "academy").expect("absent");
         assert!(deaf.contains(strong), "lost the real warning: {deaf}");
+        // Both soft paths and the strong one carry the remediation that ended
+        // #270 — it is true regardless of anyone's naming state.
+        for line in [&warning, &empty, &deaf] {
+            assert!(line.contains("--room general"), "lost remediation: {line}");
+        }
 
         // A present, named match stays silent, as does a peer-id prefix.
-        assert!(mention_audience_verdict("m5", &named, "academy").is_none());
+        assert!(mention_audience_verdict("m5", &named, me.peer_id, "academy").is_none());
         let by_id = vec![roster_member(None)];
-        let prefix = by_id[0].peer_id.to_string()[..8].to_string();
-        assert!(mention_audience_verdict(&prefix, &by_id, "academy").is_none());
+        let prefix = by_id[0].peer_id.to_string()[..8].to_uppercase();
+        assert!(mention_audience_verdict(&prefix, &by_id, by_id[0].peer_id, "academy").is_none());
+    }
+
+    /// what this catches (#1378 review, card 74e8e6af): two defects in the
+    /// `all` guard itself, both of which put a number or a verdict in front of
+    /// the operator that the roster does not support.
+    ///
+    /// 1. A roster INCLUDES self. An operator who never ran `airc identity set`
+    ///    is an unnamed member of every room, so counting self would make
+    ///    `unnamed > 0` permanently true — the #270 warning could never fire
+    ///    again for exactly the fresh-install operator most likely to need it,
+    ///    and the soft line would describe them to themselves as a third party.
+    /// 2. `room_roster_in` yields one row per (peer, CLIENT SESSION), so two
+    ///    agent tabs on one box are two rows sharing a peer id. Counting rows
+    ///    and printing "peer(s)" is a fabricated number.
+    ///
+    /// Mutation check: counting `roster` instead of `others` fails the first
+    /// assert; counting rows instead of distinct peer ids fails the second.
+    #[test]
+    fn the_count_is_distinct_peers_and_never_includes_the_sender() {
+        let me = roster_member(None); // uncarded operator — the fresh-install shape
+
+        // Self must not suppress the real warning, even unnamed.
+        let named_other = vec![me.clone(), roster_member(Some("M5"))];
+        let deaf = mention_audience_verdict("BigMama", &named_other, me.peer_id, "academy")
+            .expect("absent");
+        assert!(
+            deaf.contains("will NEVER receive"),
+            "self suppressed the #270 warning: {deaf}"
+        );
+
+        // Two sessions of ONE unnamed peer is one peer, not two — and the
+        // named peer plus that one makes two, not three.
+        let twice = roster_member(None);
+        let mut second_session = twice.clone();
+        second_session.runtime = "codex".to_string();
+        let rows = vec![
+            me.clone(),
+            twice.clone(),
+            second_session,
+            roster_member(Some("M5")),
+        ];
+        let soft = mention_audience_verdict("BigMama", &rows, me.peer_id, "academy")
+            .expect("unresolvable");
+        assert!(
+            soft.contains("1 of 2 peer(s)"),
+            "counted rows, not peers: {soft}"
+        );
+
+        // A roster of only the sender cannot license anything.
+        let alone = vec![me.clone()];
+        let solo =
+            mention_audience_verdict("M5", &alone, me.peer_id, "academy").expect("unresolvable");
+        assert!(
+            solo.contains("no peer other than yourself"),
+            "counted self as an audience: {solo}"
+        );
     }
 
     /// what this catches (#267): relay self-election must try the PERSISTED
