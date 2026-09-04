@@ -369,6 +369,16 @@ impl GhClient for ReqwestGhClient {
             .get("merged_at")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // Card c03bb62f: REST says `closed` for a merged PR; GraphQL (the
+        // `gh pr view` client) says `MERGED`. One vocabulary for `state`
+        // across both clients — the gate decides on `merged_at` regardless,
+        // but a reader of `PrView.state` must not be told CLOSED when the
+        // PR merged.
+        let state = if merged_at.is_some() {
+            "MERGED".to_string()
+        } else {
+            state
+        };
 
         Ok(PrView {
             state,

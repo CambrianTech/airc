@@ -437,7 +437,15 @@ pub(crate) fn evaluate_gh_view(
     baseline_failures: &std::collections::HashSet<String>,
     policy: GatePolicy,
 ) -> GateResult {
-    if view.state == "MERGED" {
+    // Card c03bb62f: "merged" is a FACT (`merged_at` is set), not a state
+    // string. GraphQL (`gh pr view`) reports `state: MERGED`; REST
+    // (`/repos/../pulls/N`, the production ReqwestGhClient) reports
+    // `state: closed` + `merged_at` for the same PR — so a string-only
+    // check let every merged PR read as CLOSED and skipped the reconcile,
+    // leaving cards at Review forever (2026-09-04: three continuum cards
+    // whose PRs merged on GitHub, `airc work merge` refusing "state is
+    // CLOSED"). Decide on the fact; the state string is a hint.
+    if view.state == "MERGED" || view.merged_at.is_some() {
         // Card acd72c81 follow-up: reconcile, don't skip. The kanban
         // projection needs `PullRequestMerged` to transition; the GH
         // merge already happened, so the merger just emits the event.
@@ -1064,6 +1072,46 @@ mod tests {
                 assert_eq!(merged_at_ms, 1780297447000);
             }
             other => panic!("expected AlreadyMerged, got {other:?}"),
+        }
+    }
+
+    // what this catches: the production ReqwestGhClient reads REST, where a
+    // merged PR is `state: closed` + `merged_at: <ts>`; only GraphQL says
+    // MERGED. A string-only gate skipped every REST-viewed merged PR and the
+    // card sat at Review forever (card c03bb62f, 2026-09-04 receipts:
+    // continuum #3692/#3694/#3695). Merged is the `merged_at` FACT.
+    #[test]
+    fn evaluate_gh_view_reconciles_rest_shaped_closed_plus_merged_at() {
+        let view = crate::gh_client::PrView {
+            state: "CLOSED".to_string(),
+            mergeable: "".to_string(),
+            status_check_rollup: None,
+            merged_at: Some("2026-09-04T16:46:08Z".to_string()),
+        };
+        match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
+            GateResult::AlreadyMerged { merged_at_ms } => {
+                assert_eq!(
+                    merged_at_ms,
+                    parse_iso8601_to_ms("2026-09-04T16:46:08Z").unwrap()
+                );
+            }
+            other => panic!("expected AlreadyMerged, got {other:?}"),
+        }
+    }
+
+    // what this catches: a PR closed WITHOUT merging must never be
+    // reconciled as merged — `merged_at` absent means the fact is absent.
+    #[test]
+    fn evaluate_gh_view_does_not_reconcile_closed_unmerged() {
+        let view = crate::gh_client::PrView {
+            state: "CLOSED".to_string(),
+            mergeable: "".to_string(),
+            status_check_rollup: None,
+            merged_at: None,
+        };
+        match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
+            GateResult::NotReady(reason) => assert!(reason.contains("CLOSED"), "{reason}"),
+            other => panic!("expected NotReady, got {other:?}"),
         }
     }
 
