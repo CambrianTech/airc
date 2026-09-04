@@ -163,35 +163,35 @@ mod tests {
 
     // what this catches: an existing worktree must be REUSED, never clobbered —
     // re-claiming a card an agent is mid-work on would otherwise destroy
-    // uncommitted work. Uses a synthetic HOME so it never touches the real
-    // lease zone.
+    // uncommitted work.
+    //
+    // `temp_env::with_var` rather than a hand-rolled set_var/restore: this
+    // crate's test binary runs in parallel and siblings read `$HOME`
+    // (`airc.rs`, `mesh_identity.rs`). airc.rs:2907 already documents that
+    // exact race making another test flaky on a clean canary — reintroducing
+    // the pattern here would have been a known-bad move (#1377 review).
     #[test]
     fn an_existing_worktree_is_reused_not_clobbered() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let id = card_id();
-        let prior = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
 
-        let path = worktree_path_for(id).expect("path resolves under synthetic HOME");
-        std::fs::create_dir_all(&path).expect("pre-create the worktree dir");
-        std::fs::write(path.join("uncommitted.txt"), b"work in progress").expect("write");
+        temp_env::with_var("HOME", Some(tmp.path()), || {
+            let path = worktree_path_for(id).expect("path resolves under synthetic HOME");
+            std::fs::create_dir_all(&path).expect("pre-create the worktree dir");
+            std::fs::write(path.join("uncommitted.txt"), b"work in progress").expect("write");
 
-        let spec = WorktreeSpec {
-            card_id: id,
-            clone_path: tmp.path(),
-            branch: "irrelevant",
-            start_point: None,
-        };
-        let outcome = ensure_worktree(&spec).expect("reuse path never shells git");
-        assert_eq!(outcome, WorktreeOutcome::Reused(path.clone()));
-        assert!(
-            path.join("uncommitted.txt").exists(),
-            "reuse must not disturb work in progress"
-        );
-
-        match prior {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+            let spec = WorktreeSpec {
+                card_id: id,
+                clone_path: tmp.path(),
+                branch: "irrelevant",
+                start_point: None,
+            };
+            let outcome = ensure_worktree(&spec).expect("reuse path never shells git");
+            assert_eq!(outcome, WorktreeOutcome::Reused(path.clone()));
+            assert!(
+                path.join("uncommitted.txt").exists(),
+                "reuse must not disturb work in progress"
+            );
+        });
     }
 }
