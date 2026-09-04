@@ -414,7 +414,17 @@ pub(crate) fn baseline_failing_names(
 }
 
 /// Decide whether a PR is ready to merge, given the parsed `gh pr
-/// view` payload. Pure — no IO, no async. First-cut policy:
+/// view` payload. Pure — no IO, no async.
+///
+/// CONTRACT (card fc483e57): this function NEVER sees dialect. Its
+/// [`PrView`] comes from `PrView::from_graphql` / `PrView::from_rest`,
+/// which emit the canonical (GraphQL) vocabulary — so `MERGED`,
+/// `SUCCESS`, `COMPLETED` are matched as written, and a REST/GraphQL
+/// difference is fixed at that boundary, never here. Do not add a
+/// `to_uppercase()` or a `state == "closed"` arm below; add it to
+/// `canonicalize`.
+///
+/// First-cut policy:
 ///
 /// - state must be `OPEN` (not already MERGED/CLOSED)
 /// - mergeable must not be `CONFLICTING` (no rebase needed)

@@ -307,8 +307,97 @@ pub struct MergeReceipt {
 /// Pure — synthetic JSON in, typed value out. The merger and the
 /// close-guard both depend on this shape, so this is where the
 /// schema round-trip is pinned in tests.
+///
+/// Alias for [`PrView::from_graphql`]; the constructor is the boundary
+/// (card fc483e57) and this name is kept for existing callers.
 pub fn parse_pr_view(json: &[u8]) -> Result<PrView, GhError> {
-    Ok(serde_json::from_slice(json)?)
+    PrView::from_graphql(json)
+}
+
+/// THE DIALECT BOUNDARY (card fc483e57).
+///
+/// GitHub speaks two dialects for the same facts: GraphQL (what
+/// `gh pr view --json` emits — `MERGED`, `SUCCESS`, `COMPLETED`,
+/// `mergedAt`) and REST (what `/repos/../pulls/N` emits — `closed` +
+/// `merged_at`, `success`, `completed`, `started_at`). Consumers —
+/// above all the merger's `evaluate_gh_view` — read ONE vocabulary and
+/// must never branch on which client produced the value.
+///
+/// Both bugs behind card c03bb62f were dialect leaking past this line
+/// at two different places: a merged PR read as `CLOSED` (so the
+/// reconcile never fired and cards sat at Review forever), and green
+/// checks read as in-flight (so the production merger could only ever
+/// merge through the pending-timeout bypass). Patching each site
+/// separately would have meant a third patch for the third difference.
+///
+/// So: [`PrView`] and [`GhCheck`] are constructed HERE, through
+/// `from_graphql` / `from_rest`, and both emit the canonical
+/// (GraphQL) vocabulary. Add a new dialect difference to
+/// `canonicalize`, never to a consumer.
+impl PrView {
+    /// `gh pr view --json state,mergeable,statusCheckRollup,mergedAt`.
+    /// Already canonical on the wire; canonicalized anyway so the two
+    /// constructors are interchangeable by contract, not by luck.
+    pub fn from_graphql(json: &[u8]) -> Result<PrView, GhError> {
+        let mut view: PrView = serde_json::from_slice(json)?;
+        view.canonicalize();
+        Ok(view)
+    }
+
+    /// REST `/repos/{owner}/{repo}/pulls/{n}` plus the separately
+    /// fetched check-runs for its head SHA (REST has no rollup field).
+    pub fn from_rest(pr_json: &serde_json::Value, checks: Vec<GhCheck>) -> PrView {
+        // GitHub's REST `mergeable` is tri-state: null (still
+        // computing), true, false. GraphQL names those states.
+        let mergeable = match pr_json.get("mergeable") {
+            Some(serde_json::Value::Bool(true)) => "MERGEABLE",
+            Some(serde_json::Value::Bool(false)) => "CONFLICTING",
+            _ => "UNKNOWN",
+        }
+        .to_string();
+        let mut view = PrView {
+            state: pr_json
+                .get("state")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            mergeable,
+            status_check_rollup: Some(checks),
+            merged_at: pr_json
+                .get("merged_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+        view.canonicalize();
+        view
+    }
+
+    /// The whole dialect translation, in one place.
+    fn canonicalize(&mut self) {
+        self.state = self.state.to_ascii_uppercase();
+        self.mergeable = self.mergeable.to_ascii_uppercase();
+        // A merged PR is `closed` in REST and `MERGED` in GraphQL. The
+        // fact is `merged_at`; the state string follows it.
+        if self.merged_at.is_some() {
+            self.state = "MERGED".to_string();
+        }
+        for check in self.status_check_rollup.iter_mut().flatten() {
+            check.canonicalize();
+        }
+    }
+}
+
+impl GhCheck {
+    /// REST spells conclusions/statuses in lowercase (`success`,
+    /// `completed`); GraphQL — and every consumer — in UPPERCASE.
+    fn canonicalize(&mut self) {
+        if let Some(c) = self.conclusion.as_mut() {
+            c.make_ascii_uppercase();
+        }
+        if let Some(s) = self.status.as_mut() {
+            s.make_ascii_uppercase();
+        }
+    }
 }
 
 /// Decode `gh issue view --json number,title,body,state`. Pure — JSON
@@ -334,6 +423,10 @@ pub fn parse_issue_view(json: &[u8]) -> Result<IssueView, GhError> {
 /// differs from the GraphQL `startedAt` here); we accept both via a
 /// custom Deserialize because [`GhCheck`] is the one struct shared
 /// across both code paths.
+///
+/// Canonicalizes each run through [`GhCheck::canonicalize`] — the same
+/// dialect boundary [`PrView::from_rest`] uses (card fc483e57), so a
+/// consumer never sees REST's lowercase.
 pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
     #[derive(Deserialize)]
     struct RestRun {
@@ -352,22 +445,18 @@ pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
         check_runs: Vec<RestRun>,
     }
     let env: Envelope = serde_json::from_slice(json)?;
-    // Card c03bb62f: REST speaks lowercase (`success`, `completed`);
-    // GraphQL — and every consumer of `GhCheck` (the merge gate's
-    // `Some("SUCCESS")` / `Some("COMPLETED")` arms, the strictly-less-red
-    // baseline's `FAILURE` filter) — speaks UPPERCASE. Passing REST through
-    // verbatim made every completed check read as in-flight, so the
-    // production ReqwestGhClient merger could only ever merge via the
-    // pending-timeout bypass and its baseline was always empty. One
-    // vocabulary at the parser: GhCheck is GraphQL-cased, whoever produced it.
     Ok(env
         .check_runs
         .into_iter()
-        .map(|r| GhCheck {
-            conclusion: r.conclusion.map(|c| c.to_ascii_uppercase()),
-            status: r.status.map(|s| s.to_ascii_uppercase()),
-            name: r.name,
-            started_at: r.started_at,
+        .map(|r| {
+            let mut check = GhCheck {
+                conclusion: r.conclusion,
+                status: r.status,
+                name: r.name,
+                started_at: r.started_at,
+            };
+            check.canonicalize();
+            check
         })
         .collect())
 }
@@ -634,6 +723,52 @@ mod tests {
         assert_eq!(runs[0].conclusion.as_deref(), Some("SUCCESS"));
         assert_eq!(runs[1].status.as_deref(), Some("IN_PROGRESS"));
         assert_eq!(runs[1].conclusion, None);
+    }
+
+    // what this catches: the dialect boundary must make the two
+    // constructors interchangeable — a merged PR is `closed` + merged_at in
+    // REST and `MERGED` in GraphQL, and checks are lowercase in REST. Both
+    // must land on the canonical vocabulary the merge gate matches, or the
+    // gate silently misreads (card c03bb62f: merged PRs left cards at
+    // Review; green checks read as in-flight). Card fc483e57.
+    #[test]
+    fn from_rest_and_from_graphql_agree_on_the_canonical_vocabulary() {
+        let rest_pr = serde_json::json!({
+            "state": "closed",
+            "mergeable": true,
+            "merged_at": "2026-09-04T18:01:58Z"
+        });
+        let rest_checks = parse_check_runs(
+            br#"{"check_runs":[{"name":"cargo test","status":"completed","conclusion":"success"}]}"#,
+        )
+        .expect("rest checks parse");
+        let from_rest = PrView::from_rest(&rest_pr, rest_checks);
+
+        let from_graphql = PrView::from_graphql(
+            br#"{"state":"MERGED","mergeable":"MERGEABLE","mergedAt":"2026-09-04T18:01:58Z",
+                 "statusCheckRollup":[{"name":"cargo test","status":"COMPLETED","conclusion":"SUCCESS"}]}"#,
+        )
+        .expect("graphql parses");
+
+        assert_eq!(from_rest, from_graphql, "the dialects must converge");
+        assert_eq!(from_rest.state, "MERGED");
+        assert_eq!(from_rest.mergeable, "MERGEABLE");
+        let check = &from_rest.status_check_rollup.as_ref().unwrap()[0];
+        assert_eq!(check.status.as_deref(), Some("COMPLETED"));
+        assert_eq!(check.conclusion.as_deref(), Some("SUCCESS"));
+    }
+
+    // what this catches: a PR closed WITHOUT merging keeps its real state —
+    // the boundary normalizes vocabulary, it must not invent the merge fact.
+    #[test]
+    fn from_rest_keeps_closed_when_never_merged() {
+        let view = PrView::from_rest(
+            &serde_json::json!({"state": "closed", "mergeable": false}),
+            Vec::new(),
+        );
+        assert_eq!(view.state, "CLOSED");
+        assert_eq!(view.mergeable, "CONFLICTING");
+        assert_eq!(view.merged_at, None);
     }
 
     #[test]
