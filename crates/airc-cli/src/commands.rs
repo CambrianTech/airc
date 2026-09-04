@@ -1077,14 +1077,31 @@ async fn mention_audience_warning(
         )
         .await
         .ok()?;
-    // A roster whose members have published NO names cannot answer "is this
-    // peer here" — every match must fail, so asserting absence would be a
-    // fabricated negative. Live 2026-08-12: this warning fired against a peer
-    // who demonstrably speaks in the room, because her identity card was
-    // unpublished (#262). Absence of evidence, reported as evidence, is the
-    // exact class this whole receipt family exists to kill — so when nobody
-    // is named, say what is actually known.
-    let anybody_named = roster.iter().any(|m| m.display_name.is_some());
+    mention_audience_verdict(mention, &roster, channel_name)
+}
+
+/// The decision half of [`mention_audience_warning`], split out from the
+/// roster fetch so the wording is testable without an `Airc`.
+///
+/// The strong "has not been seen" line asserts ABSENCE. That is only
+/// honest when the roster could have answered the question at all — every
+/// member in the window is named, so a failed match really does mean "not
+/// here". `RoomMember::display_name` is documented as `None` for a peer
+/// that is PRESENT but has not published an identity card; a mention that
+/// matches nobody may simply BE one of those peers.
+///
+/// #262 caught the all-unnamed case. This is the same defect one level
+/// up, live on IntelMac 2026-09-04: both other grid peers were reported
+/// as "will NEVER receive this" seconds after each had posted into the
+/// room, because a single OTHER named member — the sender's own published
+/// card — satisfied `any()`. One named member cannot license a negative
+/// about a different, unnamed one, and an empty roster (nobody seen at
+/// all) cannot license one either. So the guard is `all`, not `any`.
+fn mention_audience_verdict(
+    mention: &str,
+    roster: &[airc_lib::RoomMember],
+    channel_name: &str,
+) -> Option<String> {
     let needle = mention.to_ascii_lowercase();
     let heard = roster.iter().any(|member| {
         member
@@ -1100,11 +1117,21 @@ async fn mention_audience_warning(
     if heard {
         return None;
     }
-    if !anybody_named {
+    let hint = "Confirm with `airc events list --limit 5000 --kind message`.";
+    if roster.is_empty() {
         return Some(format!(
-            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no member of this room \
-             has published an identity card, so a name match cannot succeed either way \
-             (#262). Confirm with `airc events list --limit 5000 --kind message`."
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no peer at all has been \
+             seen in this room within the presence window, so this mention cannot be \
+             resolved either way (#262). {hint}"
+        ));
+    }
+    let unnamed = roster.iter().filter(|m| m.display_name.is_none()).count();
+    if unnamed > 0 {
+        return Some(format!(
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': {unnamed} of {} peer(s) \
+             seen here have not published an identity card, so a name match cannot succeed \
+             against them either way (#262). {hint}",
+            roster.len()
         ));
     }
     Some(format!(
@@ -3332,6 +3359,58 @@ mod tests {
         assert_eq!(leading_mention("@ stray at"), None);
         assert_eq!(leading_mention("plain prose"), None);
         assert_eq!(leading_mention(""), None);
+    }
+
+    fn roster_member(name: Option<&str>) -> airc_lib::RoomMember {
+        airc_lib::RoomMember {
+            peer_id: airc_lib::PeerId(uuid::Uuid::new_v4()),
+            display_name: name.map(str::to_string),
+            runtime: "test".to_string(),
+            availability: None,
+            last_seen_ms: 0,
+        }
+    }
+
+    /// what this catches (live 2026-09-04, #262 follow-up): asserting ABSENCE
+    /// about a peer the roster structurally cannot resolve. Both other grid
+    /// peers were told "@them will NEVER receive this" seconds after each had
+    /// posted into the room, because ONE other member — the sender's own
+    /// published card — satisfied the old `any(display_name.is_some())` guard.
+    /// `display_name: None` means present-but-unnamed, so an unmatched mention
+    /// may BE that peer; only an all-named roster can license the strong line.
+    ///
+    /// Mutation check: restoring `any` in place of the unnamed count fails the
+    /// mixed-roster assert.
+    #[test]
+    fn absence_is_only_asserted_when_every_present_peer_is_named() {
+        let strong = "will NEVER receive";
+
+        // Mixed roster — the live shape. One named member must NOT license a
+        // negative about the unnamed ones.
+        let mixed = vec![
+            roster_member(Some("IntelMac")),
+            roster_member(None),
+            roster_member(None),
+        ];
+        let warning = mention_audience_verdict("M5", &mixed, "academy").expect("unresolvable");
+        assert!(!warning.contains(strong), "asserted absence: {warning}");
+        assert!(warning.contains("2 of 3 peer(s)"), "vague: {warning}");
+
+        // Empty roster — nobody seen at all cannot license it either.
+        let empty = mention_audience_verdict("M5", &[], "academy").expect("unresolvable");
+        assert!(!empty.contains(strong), "asserted absence: {empty}");
+
+        // All named and no match — the roster CAN answer, so the loud line is
+        // earned. This is the #270 case the warning exists for.
+        let named = vec![roster_member(Some("IntelMac")), roster_member(Some("M5"))];
+        let deaf = mention_audience_verdict("BigMama", &named, "academy").expect("absent");
+        assert!(deaf.contains(strong), "lost the real warning: {deaf}");
+
+        // A present, named match stays silent, as does a peer-id prefix.
+        assert!(mention_audience_verdict("m5", &named, "academy").is_none());
+        let by_id = vec![roster_member(None)];
+        let prefix = by_id[0].peer_id.to_string()[..8].to_string();
+        assert!(mention_audience_verdict(&prefix, &by_id, "academy").is_none());
     }
 
     /// what this catches (#267): relay self-election must try the PERSISTED
