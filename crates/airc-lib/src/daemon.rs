@@ -224,6 +224,7 @@ impl Airc {
         kind: FrameKind,
         body: Body,
         mut headers: airc_core::Headers,
+        delivery: airc_bus::DeliveryClass,
     ) -> Result<PublishReceipt, AircError> {
         room.stamp_name_header(&mut headers);
         let response = self
@@ -233,10 +234,19 @@ impl Airc {
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
                 kind: kind.into(),
-                // SDK chat/structured publishes are durable; the live
-                // streaming classes are reached via the typed IPC client
-                // directly (media/game-state), not this chat helper.
-                delivery: IpcDelivery::Durable,
+                // The CALLER's class, not a pin. This was hardcoded
+                // `Durable`, which meant a citizen's presence line — a
+                // glyph, a pose, a thought marker — became an ORM row and
+                // then had to be read past by recall, RAG, and every
+                // digest forever. Presence is state, not an event (#1341).
+                // `publish` still passes Durable, so chat is unchanged.
+                delivery: match delivery {
+                    airc_bus::DeliveryClass::Durable => IpcDelivery::Durable,
+                    airc_bus::DeliveryClass::EphemeralLatest => IpcDelivery::EphemeralLatest,
+                    airc_bus::DeliveryClass::EphemeralWindow => IpcDelivery::EphemeralWindow,
+                    airc_bus::DeliveryClass::RequestResponse => IpcDelivery::RequestResponse,
+                    airc_bus::DeliveryClass::StreamChunk => IpcDelivery::StreamChunk,
+                },
                 target: IpcTarget::All,
                 correlation_id: None,
                 coalesce_key: None,

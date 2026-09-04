@@ -1246,6 +1246,9 @@ impl Airc {
                 airc_protocol::FrameKind::Event,
                 body,
                 airc_core::headers::Headers::new(),
+                // A wall post is history: durable, unchanged by the
+                // presence-plane work.
+                airc_bus::DeliveryClass::Durable,
             )
             .await?;
         } else {
