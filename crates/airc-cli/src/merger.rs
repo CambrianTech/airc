@@ -1011,7 +1011,10 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].name.as_deref(), Some("cargo fmt --check"));
         assert_eq!(runs[1].conclusion.as_deref(), None);
-        assert_eq!(runs[1].status.as_deref(), Some("in_progress"));
+        // Card c03bb62f: GhCheck is GraphQL-cased at the parser now — REST's
+        // `in_progress` surfaces as `IN_PROGRESS`, the vocabulary the gate
+        // (`Some("COMPLETED")` / `Some("SUCCESS")`) actually speaks.
+        assert_eq!(runs[1].status.as_deref(), Some("IN_PROGRESS"));
     }
 
     // ------------------------------------------------------------------
