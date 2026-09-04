@@ -83,6 +83,7 @@ pub(crate) mod work_board_cache;
 pub mod work_manager;
 pub mod work_roster;
 pub mod work_subscription;
+pub mod work_worktree;
 
 pub use account_registry::{
     merge_registry_documents, prune_stale_peers, scope_home_is_temp_rooted, AccountPeerBeacon,
