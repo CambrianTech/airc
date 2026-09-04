@@ -615,13 +615,41 @@ mod tests {
     /// it fails with an ephemeral port, which is the regression.
     #[tokio::test]
     async fn a_busy_stable_port_is_retried_across_the_restart_handover() {
-        let (_dir, airc) = test_airc().await;
-        let preferred = stable_lan_port(airc.inner.identity.peer_id);
-
-        // Stand in for the outgoing daemon still holding the listener.
-        let outgoing =
-            std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
-                .expect("test must be able to hold the stable port to simulate the handover");
+        // Find an identity whose derived port this HOST will actually let us
+        // hold. `stable_lan_port` spreads uniformly over the IANA dynamic
+        // range, and a Windows box reserves chunks of that range for
+        // WinNAT/Hyper-V — binding inside a reservation returns
+        // `PermissionDenied` (os 10013) no matter that nothing is listening.
+        // A random identity therefore made this test a coin flip on CI: it
+        // turned canary RED on windows-latest at the `.expect()` below while
+        // passing on every developer box whose exclusions happened to miss.
+        //
+        // Retrying identities is the honest fix, not a skip: the invariant
+        // ("a busy preferred port is retried across the handover") holds for
+        // EVERY identity, so any bindable one proves it. What a skip would
+        // hide — and this does not — is a host where the whole range is
+        // unusable; that still fails, loudly, with the last OS error.
+        const IDENTITY_ATTEMPTS: usize = 24;
+        let mut chosen: Option<(tempfile::TempDir, Airc, u16, std::net::TcpListener)> = None;
+        let mut last_error = None;
+        for _ in 0..IDENTITY_ATTEMPTS {
+            let (dir, airc) = test_airc().await;
+            let preferred = stable_lan_port(airc.inner.identity.peer_id);
+            // Stand in for the outgoing daemon still holding the listener.
+            match std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
+            {
+                Ok(listener) => {
+                    chosen = Some((dir, airc, preferred, listener));
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let (_dir, airc, preferred, outgoing) = chosen.unwrap_or_else(|| {
+            panic!(
+                "no identity out of {IDENTITY_ATTEMPTS} derived a bindable port on this host —                  the dynamic range appears unusable (last error: {last_error:?}). On Windows                  check `netsh interface ipv4 show excludedportrange protocol=tcp`."
+            )
+        });
 
         // Release it partway through the retry window, as a real handover does.
         tokio::spawn(async move {
