@@ -443,6 +443,30 @@ impl Airc {
         Ok(card_id)
     }
 
+    /// Create a card on the board of a room the caller RESOLVED for itself.
+    ///
+    /// [`Self::create_work_card`] lands the card on "whatever room the scope's
+    /// pointer is on" — which on a fresh node is `#general`, so project cards
+    /// were landing in the lobby (Continuum, 2026-09-04). A card belongs to
+    /// its ACTIVITY's room; a caller that knows the room must be able to say
+    /// so. Same split as `work_board` / `work_board_in`.
+    pub async fn create_work_card_in(
+        &self,
+        room: &Room,
+        request: CreateWorkCard,
+    ) -> Result<WorkCardId, AircError> {
+        let card_id = WorkCardId::new();
+        let peer_id = self.peer_id();
+        let event = WorkEvent::CardCreated(build_operator_card_created(
+            card_id,
+            peer_id,
+            now_ms()?,
+            request,
+        ));
+        self.publish_work_event_in(room, &event).await?;
+        Ok(card_id)
+    }
+
     /// Claim a work card for this peer. Returns the UUIDv4 claim id
     /// generated locally for the lease.
     pub async fn claim_work_card(&self, request: ClaimWorkCard) -> Result<ClaimId, AircError> {
