@@ -712,6 +712,19 @@ pub enum Command {
         /// frame body. Pass `-` to read from stdin.
         #[arg(long, group = "body")]
         body_json: Option<String>,
+        /// Read the message body from stdin instead of an argument,
+        /// so prose never passes through shell quoting. Same flag,
+        /// same meaning as `airc msg --stdin` — `--body-text` covers
+        /// the current room only via `msg`, and every cross-room post
+        /// was forced back to inline quoting without this.
+        ///
+        /// Measured 2026-09-05: a backtick in a `--body-text` argument
+        /// was command-substituted by the shell and ate part of the
+        /// message, in a room where the fix for exactly that hazard
+        /// had already merged for `msg`. A flag that stops at one verb
+        /// stops at the verb people happen to use least.
+        #[arg(long, group = "body")]
+        stdin: bool,
         /// Header in `key=value` form. Repeatable.
         #[arg(long = "header", value_name = "KEY=VALUE")]
         headers: Vec<String>,

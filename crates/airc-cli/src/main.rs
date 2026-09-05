@@ -476,11 +476,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             room,
             body_text,
             body_json,
+            stdin,
             headers,
             kind,
         } => {
-            publish_commands::run_publish(&home, room.room, body_text, body_json, headers, kind)
-                .await
+            publish_commands::run_publish(
+                &home, room.room, body_text, body_json, stdin, headers, kind,
+            )
+            .await
         }
 
         Command::Inbox {
