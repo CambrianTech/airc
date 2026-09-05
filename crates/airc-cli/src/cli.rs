@@ -668,8 +668,31 @@ pub enum Command {
         socket: Option<PathBuf>,
         #[command(flatten)]
         room: RoomSelector,
-        /// Message body.
-        text: String,
+        /// Message body. Omit it and pass `--stdin` to read the body from
+        /// standard input instead — see `--stdin` for why you should.
+        text: Option<String>,
+        /// Read the message body from STDIN instead of the argument.
+        ///
+        /// Prose does not belong in a shell argument. Backticks inside a
+        /// double-quoted string are command substitution: the shell runs them
+        /// before airc ever sees the text. On 2026-09-05 that cost this grid
+        /// three mangled messages (identifiers silently eaten mid-sentence —
+        /// the QUIET failure, which corrupts the record with nobody noticing)
+        /// and one CORE: a peer's post contained the words for a reboot in
+        /// backticks, the shell executed them, and every citizen on that node
+        /// went down. Three independent instances of one shell behaviour in a
+        /// single night is a missing affordance, not operator error, so the
+        /// fix belongs here rather than in everyone's quoting discipline.
+        ///
+        /// With `--stdin` the body never reaches the shell's parser, so the
+        /// whole class — backticks, `$VAR`, `$(...)`, history expansion —
+        /// stops existing instead of needing to be remembered:
+        ///
+        ///   airc msg --stdin <<'EOF'
+        ///   anything at all, including `backticks` and $VARS
+        ///   EOF
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
     },
 
     /// Publish a structured frame and emit a JSON receipt on
