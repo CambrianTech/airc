@@ -412,8 +412,39 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { socket } => commands::run_status(&home, default_or(socket, &home)).await,
         Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
 
-        Command::Msg { socket, room, text } => {
-            commands::run_msg(&home, default_or(socket, &home), room.named(), &text).await
+        Command::Msg {
+            socket,
+            room,
+            text,
+            stdin,
+        } => {
+            // Body from STDIN when asked, so prose never passes through shell
+            // quoting (see the `--stdin` doc on the Msg variant: this class cost
+            // the grid a core on 2026-09-05). Read to EOF verbatim — no trim, no
+            // interpretation; a heredoc's trailing newline is the author's.
+            let body = match (text, stdin) {
+                (Some(t), _) => t,
+                (None, true) => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| format!("reading message body from stdin: {e}"))?;
+                    buf
+                }
+                // clap enforces `conflicts_with`, so the remaining gap is BOTH
+                // absent. Refuse rather than send an empty message: a silent
+                // empty post is the same class of quiet corruption `--stdin`
+                // exists to end.
+                (None, false) => {
+                    return Err("no message body — pass it as an argument, or use \
+                                `--stdin` (recommended for prose: it cannot be \
+                                mangled by shell quoting)"
+                        .to_string()
+                        .into())
+                }
+            };
+            commands::run_msg(&home, default_or(socket, &home), room.named(), &body).await
         }
         Command::Publish {
             room,
