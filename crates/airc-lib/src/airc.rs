@@ -1216,6 +1216,26 @@ impl Airc {
         supersedes: Option<uuid::Uuid>,
     ) -> Result<uuid::Uuid, AircError> {
         let room = self.current_room().await?;
+        self.publish_wall_post_in(&room, category, body, supersedes)
+            .await
+    }
+
+    /// Publish a wall post on a room the caller RESOLVED for itself.
+    ///
+    /// [`Self::publish_wall_post`] writes "whatever room I happen to point
+    /// at"; this writes THIS room. Same split, and the same reason, as
+    /// [`Self::wall_posts`] vs [`Self::wall_posts_in`]: a verb that means a
+    /// specific room (Continuum's `activity/archive --room`, a standing
+    /// declared on a finished round from wherever the operator stands) must
+    /// be able to say so — the silent current-room default lands the post on
+    /// a plausible wrong room and nothing in the receipt says which.
+    pub async fn publish_wall_post_in(
+        &self,
+        room: &crate::Room,
+        category: String,
+        body: String,
+        supersedes: Option<uuid::Uuid>,
+    ) -> Result<uuid::Uuid, AircError> {
         let post_id = uuid::Uuid::new_v4();
         let event = airc_core::doctrine::DoctrineEvent::WallPostPublished(
             airc_core::doctrine::WallPostPublished {
@@ -1242,7 +1262,7 @@ impl Airc {
         // owner-core (no daemon in front of it).
         if self.is_daemon_attached() {
             self.daemon_publish(
-                &room,
+                room,
                 airc_protocol::FrameKind::Event,
                 body,
                 airc_core::headers::Headers::new(),
