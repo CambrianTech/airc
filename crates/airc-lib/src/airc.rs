@@ -2095,7 +2095,7 @@ impl Airc {
             None => true,
             Some(stored) => stored.identity.name.trim().is_empty(),
         };
-        if needs_floor && !self.agent_name().trim().is_empty() {
+        if needs_floor && is_a_real_name(self.agent_name()) {
             // Seed + broadcast from the agent-name floor (set_local_identity_card
             // persists AND emits to every subscribed room).
             let identity = airc_core::identity::Identity {
@@ -3043,6 +3043,39 @@ mod publish_identity_tests {
         );
     }
 
+    // what this catches: the agent-name floor grounding a scope that never claimed a
+    // name. `agent_name()` resolves to DEFAULT_AGENT_NAME ("default") when neither
+    // open_as nor $AIRC_AGENT_NAME supplied one, so the floor's non-empty check passed
+    // on the SENTINEL and published a card asserting name="default".
+    //
+    // Observed on IntelMac 2026-09-05 22:28:44 UTC, nine minutes after #1385 installed:
+    //     {"name":"default","pronouns":"","role":"","bio":"", ...}
+    // for this scope's room-facing peer. That is worse than the "not published yet" it
+    // replaced — an honest unknown became a false name, and every unnamed scope on the
+    // grid asserts the SAME false name, so they collide the moment cards cross the wire.
+    #[test]
+    fn the_default_sentinel_is_not_a_name_and_never_grounds_a_citizen() {
+        assert!(
+            !is_a_real_name(airc_store::DEFAULT_AGENT_NAME),
+            "the sentinel meaning `no name was given` must never be published AS a name"
+        );
+        assert!(!is_a_real_name(""), "empty is not a name");
+        assert!(!is_a_real_name("   "), "whitespace is not a name");
+    }
+
+    // what this catches: over-correcting and breaking the floor for the case it exists
+    // for. A citizen opened as Ivar (the groundedness incident this floor was written
+    // after) must still be grounded by its agent_name; only the no-name case declines.
+    #[test]
+    fn a_citizen_that_claimed_a_name_still_gets_the_floor() {
+        assert!(is_a_real_name("Ivar"));
+        assert!(is_a_real_name("Solveig"));
+        assert!(
+            is_a_real_name("  Memento  "),
+            "a real name survives trimming"
+        );
+    }
+
     // what this catches: JOIN ITSELF not grounding the peer by name — the gap that
     // made every agent scope on the fleet render as `peer-<hex>` while Continuum
     // personas were named. `subscribe_room`'s doc has always claimed join publishes
@@ -3204,4 +3237,35 @@ mod scoped_state_tests {
             .await
             .expect("delete is idempotent");
     }
+}
+
+/// Is this `agent_name` a NAME, or the sentinel that means no name was given?
+///
+/// `agent_name()` resolves to [`airc_store::DEFAULT_AGENT_NAME`] — the literal string
+/// `"default"` — whenever neither `open_as` nor `$AIRC_AGENT_NAME` supplied one
+/// (`airc-identity/src/lib.rs`: `None => Ok(DEFAULT_AGENT_NAME.to_string())`). That
+/// sentinel is the ABSENCE of a name wearing the same type as a name, and the
+/// agent-name floor in [`Airc::publish_identity`] read it as the presence of one.
+///
+/// Measured on IntelMac 2026-09-05, 22:28:44 UTC — nine minutes after airc#1385 was
+/// installed at 17:19 local — the identity index gained a card for this scope's
+/// room-facing peer reading, in full:
+///
+///     {"name":"default","pronouns":"","role":"","bio":"","status":"", ...}
+///
+/// That is strictly worse than what #1385 replaced. Before it, an unnamed scope
+/// published nothing and `whois` said "identity: not published yet", which is an honest
+/// unknown. After it, the scope publishes a card asserting its name IS "default" — a
+/// false name, and one that every unnamed scope on every machine asserts identically.
+/// The moment cards actually cross the wire (card 9cfaeece), the grid fills with
+/// colliding citizens all called "default", which is the failure the floor was written
+/// to prevent (`docs/architecture/PERSONA-GROUNDEDNESS.md`, the "Ivar" incident).
+///
+/// The floor's purpose is intact and unchanged for the case it was built for: a citizen
+/// opened via `open_as("Ivar")` or `$AIRC_AGENT_NAME=Ivar` still gets grounded as Ivar.
+/// This only declines to invent a name for a scope that never claimed one — no name is
+/// not a name, and the substrate does not guess (see the no-fallbacks rule).
+fn is_a_real_name(agent_name: &str) -> bool {
+    let n = agent_name.trim();
+    !n.is_empty() && n != airc_store::DEFAULT_AGENT_NAME
 }
