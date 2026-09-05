@@ -20,10 +20,11 @@ pub async fn run_publish(
     room: Option<String>,
     body_text: Option<String>,
     body_json: Option<String>,
+    stdin: bool,
     headers: Vec<String>,
     kind: PublishFrameKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let body = load_body(body_text, body_json)?;
+    let body = load_body(body_text, body_json, stdin)?;
     let parsed_headers = parse_headers(&headers)?;
     let target = match room {
         Some(name) => PublishTarget::RoomByName(name),
@@ -53,7 +54,11 @@ fn frame_kind_from(kind: PublishFrameKind) -> FrameKind {
 fn load_body(
     body_text: Option<String>,
     body_json: Option<String>,
+    stdin: bool,
 ) -> Result<Body, Box<dyn std::error::Error>> {
+    if stdin {
+        return Ok(Body::text(read_prose_from_stdin()?));
+    }
     match (body_text, body_json) {
         (Some(text), None) => Ok(Body::text(text)),
         (None, Some(source)) => {
@@ -63,7 +68,7 @@ fn load_body(
             })?;
             Ok(Body::Json(value))
         }
-        (None, None) => Err("publish requires --body-text or --body-json".into()),
+        (None, None) => Err("publish requires --body-text, --body-json, or --stdin".into()),
         (Some(_), Some(_)) => {
             // Clap's `conflicts_with` catches this normally; this
             // branch is defensive in case the args are passed
@@ -71,6 +76,40 @@ fn load_body(
             Err("--body-text and --body-json are mutually exclusive".into())
         }
     }
+}
+
+/// Read a prose body from stdin, refusing the two ways that silently go wrong.
+///
+/// Both guards are the ones `airc msg --stdin` carries (#1382), and both were
+/// found there by review rather than by design: an empty pipe posted a BLANK
+/// message, and a terminal blocked forever waiting for an EOF the operator had
+/// to know to send. Duplicating the behaviour here rather than the reasoning —
+/// a flag whose guards differ between two verbs is worse than no flag, because
+/// the operator learns one contract and gets another.
+fn read_prose_from_stdin() -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Err(
+            "`--stdin` was passed but stdin is a terminal — nothing is piped in and \
+                    this would wait forever. Redirect a file (`airc publish --stdin < body.txt`) \
+                    or use a heredoc."
+                .to_string()
+                .into(),
+        );
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|error| format!("reading message body from stdin: {error}"))?;
+    if buf.trim().is_empty() {
+        return Err(
+            "`--stdin` produced an empty message body — nothing was piped in, or it \
+                    expanded to whitespace. Refusing rather than publishing a blank frame."
+                .to_string()
+                .into(),
+        );
+    }
+    Ok(buf)
 }
 
 fn read_body_source(source: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -147,18 +186,35 @@ mod tests {
         // `Body::text` is sugar for `Body::Json({"text": "..."})` —
         // the canonical chat shape. Confirm the CLI sugar
         // round-trips through it correctly.
-        match load_body(Some("hello".into()), None).expect("ok") {
+        match load_body(Some("hello".into()), None, false).expect("ok") {
             Body::Json(value) => assert_eq!(value["text"], "hello"),
             other => panic!("expected json-wrapped text body, got {other:?}"),
         }
     }
 
+    // what this catches: `--stdin` silently doing nothing because the flag was
+    // added to the CLI but never consulted by load_body — the wiring, not the
+    // read. A `true` here must NOT fall through to the "requires a source"
+    // error, which is what an unwired flag would produce.
+    #[test]
+    fn stdin_flag_is_consulted_before_the_body_source_match() {
+        // stdin is not a terminal under `cargo test` and is empty, so this
+        // reaches the empty-body refusal — proving the flag routed there rather
+        // than into the (None, None) arm.
+        let err = load_body(None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--stdin") && !msg.contains("requires --body-text"),
+            "`--stdin` was not consulted; got: {msg}"
+        );
+    }
+
     #[test]
     fn load_body_requires_one_source() {
-        let err = load_body(None, None).unwrap_err();
+        let err = load_body(None, None, false).unwrap_err();
         assert!(
             err.to_string()
-                .contains("requires --body-text or --body-json"),
+                .contains("requires --body-text, --body-json, or --stdin"),
             "unexpected error: {err}"
         );
     }
@@ -168,7 +224,8 @@ mod tests {
         // Write a temp file with bad JSON.
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(tmp.path(), b"{ not json }").expect("write");
-        let err = load_body(None, Some(tmp.path().to_string_lossy().into_owned())).unwrap_err();
+        let err =
+            load_body(None, Some(tmp.path().to_string_lossy().into_owned()), false).unwrap_err();
         assert!(
             err.to_string().contains("not valid JSON"),
             "unexpected error: {err}"
@@ -179,7 +236,7 @@ mod tests {
     fn load_body_json_file_parses() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(tmp.path(), br#"{"kind":"chat","text":"hi"}"#).expect("write");
-        match load_body(None, Some(tmp.path().to_string_lossy().into_owned())).expect("ok") {
+        match load_body(None, Some(tmp.path().to_string_lossy().into_owned()), false).expect("ok") {
             Body::Json(value) => {
                 assert_eq!(value["kind"], "chat");
                 assert_eq!(value["text"], "hi");
