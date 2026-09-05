@@ -124,7 +124,56 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    init_submodules(&path)?;
     Ok(WorktreeOutcome::Created(path))
+}
+
+/// Initialise submodules in a freshly created worktree.
+///
+/// `git worktree add` does NOT populate submodules — the new tree gets empty
+/// directories where they should be. A lease worktree exists to be built in, and a
+/// worktree that cannot build is not a lease, so this runs as part of creating one
+/// rather than being left as a step every claimer rediscovers.
+///
+/// Measured 2026-09-04: this cost three agents on two machines a full evening
+/// between them. In continuum the empty directory is `core/vendor/llama.cpp`, and
+/// the build fails as a CMake error about a missing `CMakeLists.txt` — naming a path
+/// the reader never chose, with nothing pointing at submodules.
+///
+/// The failure is WORSE than a local one because of the shared `CARGO_TARGET_DIR`
+/// the fleet runs by doctrine: the failed build caches a build-script result with the
+/// worktree's path baked in, so the operator's MAIN checkout — which has the
+/// submodule and built fine minutes earlier — then fails with the identical error
+/// naming a worktree directory it is not in. Recovery is `cargo clean -p <crate>`
+/// plus a full rebuild.
+///
+/// Do NOT "fix" this by symlinking the parent clone's vendor directory: git then
+/// refuses `status`/`diff` with "expected submodule path not to be a symbolic link",
+/// which trades a build failure for a broken diff (M5, same evening).
+///
+/// A repo with no submodules is unaffected — the command is a successful no-op — so
+/// this is safe for every scope, not only continuum.
+fn init_submodules(worktree: &std::path::Path) -> Result<(), String> {
+    let out = std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["submodule", "update", "--init", "--recursive"])
+        .output()
+        .map_err(|e| format!("spawn git submodule update in {}: {e}", worktree.display()))?;
+    if !out.status.success() {
+        // Loud, not silent: the worktree EXISTS at this point, so say so plainly and
+        // hand over the exact command. Swallowing this would hand back a lease that
+        // looks ready and fails at the first build — the shape the doc above
+        // describes, which is the thing being fixed.
+        return Err(format!(
+            "worktree {} was created but `git submodule update --init --recursive` \
+             failed there: {}\n  Builds in it will fail on the empty submodule paths \
+             (and can poison a shared CARGO_TARGET_DIR). Run that command in the \
+             worktree before building.",
+            worktree.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -192,6 +241,99 @@ mod tests {
                 path.join("uncommitted.txt").exists(),
                 "reuse must not disturb work in progress"
             );
+        });
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "t@example.invalid"]);
+        git(dir, &["config", "user.name", "t"]);
+        // A worktree of a repo with no commit has no start point to add from.
+        std::fs::write(dir.join("README"), b"root\n").expect("write README");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "root"]);
+    }
+
+    // what this catches: `git worktree add` leaving submodules EMPTY, so a lease
+    // worktree cannot build the thing it was leased for. In continuum that surfaces
+    // as a CMake error about a missing CMakeLists.txt under `core/vendor/llama.cpp`
+    // — naming a path the reader never chose, with nothing pointing at submodules —
+    // and because the fleet shares one CARGO_TARGET_DIR by doctrine, the failed
+    // build then poisons the operator's MAIN checkout too. Measured 2026-09-04 on
+    // two machines (IntelMac, and M5 three times).
+    //
+    // Uses a second local repo as the submodule source: real git submodule
+    // machinery, no network. `protocol.file.allow=always` because git refuses local
+    // file transports for submodules by default (CVE-2022-39253).
+    #[test]
+    fn a_created_worktree_has_its_submodules_populated() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let sub = tmp.path().join("subrepo");
+        let main = tmp.path().join("mainrepo");
+        for d in [&home, &sub, &main] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+
+        init_repo(&sub);
+        std::fs::write(sub.join("vendored.txt"), b"i am the submodule\n").expect("write");
+        git(&sub, &["add", "."]);
+        git(&sub, &["commit", "-qm", "vendored"]);
+
+        init_repo(&main);
+        git(
+            &main,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().expect("utf8 sub path"),
+                "vendor/dep",
+            ],
+        );
+        git(&main, &["commit", "-qm", "add submodule"]);
+
+        temp_env::with_var("HOME", Some(&home), || {
+            // Local file transport must be allowed for the recursive init too.
+            temp_env::with_var("GIT_ALLOW_PROTOCOL", Some("file"), || {
+                let spec = WorktreeSpec {
+                    card_id: card_id(),
+                    clone_path: &main,
+                    branch: "lease-branch",
+                    start_point: Some("main"),
+                };
+                let outcome = ensure_worktree(&spec).expect("worktree created");
+                let path = match outcome {
+                    WorktreeOutcome::Created(p) => p,
+                    other => panic!("expected Created, got {other:?}"),
+                };
+                assert!(
+                    path.join("vendor/dep/vendored.txt").exists(),
+                    "the submodule must be POPULATED in the lease worktree, not an \
+                     empty directory — an empty one is what breaks the build and \
+                     poisons the shared target dir. Contents: {:?}",
+                    std::fs::read_dir(path.join("vendor/dep")).map(|d| d
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name())
+                        .collect::<Vec<_>>())
+                );
+            });
         });
     }
 }
