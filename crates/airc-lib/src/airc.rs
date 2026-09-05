@@ -1951,6 +1951,40 @@ impl Airc {
         let is_default = set.default_subscription().map(|s| &s.name) == Some(&channel);
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
+
+        // GROUND THIS PEER BY NAME, which `subscribe_room`'s own doc has always
+        // promised — "this peer's identity card is published into the room so its
+        // roster sees a named arrival" — and which nothing did. `publish_presence`
+        // above beacons the channel list; it is not the identity card, so a peer
+        // that joined was PRESENT but ANONYMOUS, and every desktop rendered it as
+        // `peer-<hex>`. Measured 2026-09-05: `publish_identity` had exactly three
+        // references in the tree — its definition, its own test mod, and the ACP
+        // adapter (integrations/acp/src/main.rs:117, "ground by name so room_roster
+        // + whois see it"). The CLI and daemon never called it, so every agent scope
+        // on the fleet was nameless while Continuum personas — which DO call it, at
+        // persona/airc_runtime.rs:590 — were named. Joel: "It ought to work from
+        // install… default to agent name… this was an airc requirement."
+        //
+        // Published AFTER presence and the durable save, matching the ordering both
+        // existing callers already use: the ACP adapter publishes after subscribe,
+        // and PersonaAircRuntime after attached-and-joined. Identity is a fact about
+        // a peer that is already in the room.
+        //
+        // NON-FATAL, deliberately, and this is the one judgement call here: a join
+        // whose identity card fails to publish leaves a WORKING subscription with an
+        // anonymous peer, which is exactly today's behaviour. Failing the join
+        // instead would turn a cosmetic gap into an outage, and `airc join` is the
+        // command every install path runs. Loud in the log, never fatal.
+        if let Err(source) = self.publish_identity().await {
+            tracing::warn!(
+                agent = %self.agent_name(),
+                channel = %channel.as_str(),
+                %source,
+                "joined the room but could not publish the identity card — this peer \
+                 will render as peer-<hex> until the next successful publish"
+            );
+        }
+
         let room = subscription.as_room();
 
         // Emit the lifecycle event after the subscription is durable
@@ -3006,6 +3040,37 @@ mod publish_identity_tests {
         assert_eq!(
             stored.identity.name, "Ivar",
             "the grounded citizen is named by its agent_name, not anonymous"
+        );
+    }
+
+    // what this catches: JOIN ITSELF not grounding the peer by name — the gap that
+    // made every agent scope on the fleet render as `peer-<hex>` while Continuum
+    // personas were named. `subscribe_room`'s doc has always claimed join publishes
+    // "this peer's identity card... so its roster sees a named arrival"; until
+    // 2026-09-05 nothing did, because `publish_presence` beacons the channel list and
+    // is not the identity card. Note this deliberately does NOT call
+    // publish_identity() — the whole point is that an operator who only ever runs
+    // `airc join` ends up named. The sibling test above still calls it explicitly and
+    // pins the function itself.
+    #[tokio::test]
+    async fn join_alone_grounds_the_peer_by_name_without_an_explicit_publish() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("solveig/.airc");
+        let airc = Airc::open_as(&home, "Solveig")
+            .await
+            .expect("open as Solveig");
+
+        airc.join("general").await.expect("join a channel");
+
+        let stored = airc
+            .event_store()
+            .load_local_identity_by_agent_name("Solveig")
+            .await
+            .expect("store read")
+            .expect("join must publish the identity card — an operator who only joins must not be anonymous");
+        assert_eq!(
+            stored.identity.name, "Solveig",
+            "a peer that joined is named on the wire, never peer-<hex>"
         );
     }
 
