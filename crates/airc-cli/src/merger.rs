@@ -1076,6 +1076,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: Some("2026-06-01T07:04:07Z".to_string()),
+            author: None,
+            reviews: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);
@@ -1100,6 +1102,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: Some("2026-09-04T16:46:08Z".to_string()),
+            author: None,
+            reviews: None,
         };
         match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
             GateResult::AlreadyMerged { merged_at_ms } => {
@@ -1121,6 +1125,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: None,
+            author: None,
+            reviews: None,
         };
         match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
             GateResult::NotReady(reason) => assert!(reason.contains("CLOSED"), "{reason}"),
@@ -1139,6 +1145,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: None,
+            author: None,
+            reviews: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);
@@ -1158,6 +1166,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: None,
+            author: None,
+            reviews: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);

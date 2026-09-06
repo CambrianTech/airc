@@ -270,6 +270,92 @@ pub struct PrView {
     /// an already-merged PR.
     #[serde(default, rename = "mergedAt")]
     pub merged_at: Option<String>,
+    /// Who opened the PR. Card 267d68f5: the gate could not previously SEE this, so
+    /// "one no-objection from any peer" was satisfiable by the author's own approval on
+    /// a board where every peer authors cards.
+    #[serde(default)]
+    pub author: Option<GhActor>,
+    /// Reviews on the PR, newest state per reviewer. Used only to answer one question:
+    /// did somebody who is NOT the author approve?
+    #[serde(default)]
+    pub reviews: Option<Vec<GhReview>>,
+}
+
+/// A GitHub actor (`author`, a review's `author`). Only the login matters here.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct GhActor {
+    #[serde(default)]
+    pub login: String,
+}
+
+/// One review on a PR. `state` is APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct GhReview {
+    #[serde(default)]
+    pub author: Option<GhActor>,
+    #[serde(default)]
+    pub state: String,
+}
+
+impl PrView {
+    /// Did a peer who is NOT the author approve this PR?
+    ///
+    /// The whole of card 267d68f5. The merger's doc has always said the multi-author case
+    /// "should require a non-author LGTM" and that its behaviour was only "appropriate for
+    /// single-author scopes" — but `pr_view` never fetched `author` or `reviews`, so the
+    /// gate was structurally incapable of asking. It merged on green alone.
+    ///
+    /// Measured 2026-09-06: three peers author cards on one board, and `.airc/POLICY.md`
+    /// says "one no-objection from ANY connected peer + green = merge". With no author
+    /// known, the author's own approval satisfies that. On the night the policy landed, a
+    /// watcher merged a PR on one peer's review because the comment happened to name a
+    /// second peer — before that peer had spoken.
+    ///
+    /// CHANGES_REQUESTED is not silence and not approval: a PR carrying an unresolved
+    /// change request is never non-author-approved, even if a later COMMENTED review
+    /// exists. Approval must be the reviewer's LATEST state.
+    pub fn non_author_approval(&self) -> NonAuthorApproval {
+        let author = self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("");
+        // UNKNOWN, not "absent". `reviews: None` means this PrView came from a path that
+        // never fetched them (the REST dialect normaliser cannot without a second call) —
+        // NOT that nobody approved. Collapsing those two is the defect class this whole
+        // evening kept turning up: COULD-NOT-LOOK rendered as NOT-THERE. The merger must
+        // be able to say "I cannot verify a review" instead of "this was not reviewed".
+        let Some(reviews) = self.reviews.as_ref() else {
+            return NonAuthorApproval::Unknown;
+        };
+        // Latest state per reviewer, in gh's chronological order.
+        let mut latest: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for r in reviews {
+            let login = r.author.as_ref().map(|a| a.login.as_str()).unwrap_or("");
+            if login.is_empty() || (!author.is_empty() && login == author) {
+                continue; // the author's own review is never the second pair of eyes
+            }
+            match r.state.as_str() {
+                // COMMENTED / DISMISSED do not change a standing verdict.
+                "APPROVED" | "CHANGES_REQUESTED" => {
+                    latest.insert(login, r.state.as_str());
+                }
+                _ => {}
+            }
+        }
+        if latest.values().any(|s| *s == "APPROVED") {
+            NonAuthorApproval::Approved
+        } else {
+            NonAuthorApproval::None
+        }
+    }
+}
+
+/// Whether a peer who is not the author approved — with UNKNOWN kept distinct from NONE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonAuthorApproval {
+    /// A non-author reviewer's latest state is APPROVED.
+    Approved,
+    /// Reviews were fetched and none of them is a non-author approval.
+    None,
+    /// Reviews were not fetched on this path. Not evidence of absence.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -367,6 +453,19 @@ impl PrView {
                 .get("merged_at")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            // REST calls the author `user`; normalise it to the GraphQL name like every
+            // other field crossing this boundary.
+            author: pr_json
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(|l| l.as_str())
+                .map(|login| GhActor {
+                    login: login.to_string(),
+                }),
+            // REST serves reviews from a SEPARATE endpoint (/pulls/N/reviews), so this
+            // path genuinely does not know. `None` is the honest answer and reads as
+            // Unknown, never as "nobody approved".
+            reviews: None,
         };
         view.canonicalize();
         view
@@ -549,6 +648,105 @@ pub fn parse_pr_url(stdout: &str) -> Result<PrCreated, GhError> {
 
 #[cfg(test)]
 mod tests {
+
+    // what this catches: the author's own approval counting as the second pair of eyes.
+    // Card 267d68f5. `.airc/POLICY.md` says "one no-objection from ANY connected peer +
+    // green = merge"; on a board where all three peers author cards, that is satisfiable
+    // by the author approving their own PR unless the gate knows who wrote it. Before this
+    // change `pr_view` fetched neither `author` nor `reviews`, so it could not ask.
+    #[test]
+    fn an_authors_own_approval_is_not_a_non_author_approval() {
+        let v = PrView {
+            state: "OPEN".into(),
+            mergeable: "MERGEABLE".into(),
+            status_check_rollup: None,
+            merged_at: None,
+            author: Some(GhActor {
+                login: "alice".into(),
+            }),
+            reviews: Some(vec![GhReview {
+                author: Some(GhActor {
+                    login: "alice".into(),
+                }),
+                state: "APPROVED".into(),
+            }]),
+        };
+        assert_eq!(v.non_author_approval(), NonAuthorApproval::None);
+    }
+
+    // what this catches: a real peer review not counting.
+    #[test]
+    fn a_peers_approval_counts() {
+        let v = PrView {
+            state: "OPEN".into(),
+            mergeable: "MERGEABLE".into(),
+            status_check_rollup: None,
+            merged_at: None,
+            author: Some(GhActor {
+                login: "alice".into(),
+            }),
+            reviews: Some(vec![GhReview {
+                author: Some(GhActor {
+                    login: "bob".into(),
+                }),
+                state: "APPROVED".into(),
+            }]),
+        };
+        assert_eq!(v.non_author_approval(), NonAuthorApproval::Approved);
+    }
+
+    // what this catches: an approval that was later superseded by the SAME reviewer asking
+    // for changes. Approval must be the reviewer's LATEST state, or a stale LGTM outlives
+    // the objection that replaced it.
+    #[test]
+    fn changes_requested_supersedes_that_reviewers_earlier_approval() {
+        let v = PrView {
+            state: "OPEN".into(),
+            mergeable: "MERGEABLE".into(),
+            status_check_rollup: None,
+            merged_at: None,
+            author: Some(GhActor {
+                login: "alice".into(),
+            }),
+            reviews: Some(vec![
+                GhReview {
+                    author: Some(GhActor {
+                        login: "bob".into(),
+                    }),
+                    state: "APPROVED".into(),
+                },
+                GhReview {
+                    author: Some(GhActor {
+                        login: "bob".into(),
+                    }),
+                    state: "CHANGES_REQUESTED".into(),
+                },
+            ]),
+        };
+        assert_eq!(v.non_author_approval(), NonAuthorApproval::None);
+    }
+
+    // what this catches: UNKNOWN collapsing into NONE — the defect class that cost this
+    // fleet an evening in three other places (a route "not measured" rendered as "nothing
+    // ever crossed", an unfetched identity card rendered as "not published"). A PrView from
+    // a path that never fetched reviews knows NOTHING about approval; it must not be
+    // reported as "nobody approved", because the merger's response to those two differs.
+    #[test]
+    fn unfetched_reviews_are_unknown_never_a_denial() {
+        let v = PrView {
+            state: "OPEN".into(),
+            mergeable: "MERGEABLE".into(),
+            status_check_rollup: None,
+            merged_at: None,
+            author: Some(GhActor {
+                login: "alice".into(),
+            }),
+            reviews: None,
+        };
+        assert_eq!(v.non_author_approval(), NonAuthorApproval::Unknown);
+        assert_ne!(v.non_author_approval(), NonAuthorApproval::None);
+    }
+
     use super::*;
 
     /// what this catches (#356): the two `GhClient` impls read the SAME
@@ -1024,6 +1222,8 @@ pub mod mock {
                 mergeable: "MERGEABLE".to_string(),
                 status_check_rollup: Some(Vec::new()),
                 merged_at: None,
+                author: None,
+                reviews: None,
             }
         }
 

@@ -70,7 +70,9 @@ impl GhClient for ShellGhClient {
                 "--repo",
                 args.repo.as_str(),
                 "--json",
-                "state,mergeable,statusCheckRollup,mergedAt",
+                // author + reviews: card 267d68f5 — the gate cannot require a NON-AUTHOR
+                // approval without knowing who wrote the PR and who reviewed it.
+                "state,mergeable,statusCheckRollup,mergedAt,author,reviews",
             ])
             .output()
             .await
