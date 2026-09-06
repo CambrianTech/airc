@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use airc_core::{EventId, RoomId, TranscriptCursor};
 use airc_work::WorkBoardProjection;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bump when the persisted shape (or projection semantics feeding it)
@@ -69,20 +70,42 @@ pub(crate) enum WorkBoardCacheSource {
     Store,
 }
 
+/// A projection of one room's transcript that can be snapshotted and
+/// resumed strictly after a cursor. The work board was the first; the
+/// wall is the second (2026-09-06: a from-zero wall walk over a 244k-event
+/// room took 27–128 s per read on the fleet, inside a 30 s deadline).
+/// One cache shape, one resume rule, N projections — the next projection
+/// implements this and gets the snapshot for free.
+pub(crate) trait CachedProjection: Serialize + DeserializeOwned + Clone {
+    /// Subdirectory of the scope home holding one snapshot per room.
+    const DIR: &'static str;
+    /// Human label for the loud rebuild lines.
+    const LABEL: &'static str;
+    /// Bump when the persisted shape (or the projection semantics feeding
+    /// it) changes; old snapshots are then discarded and rebuilt.
+    const VERSION: u32;
+}
+
+impl CachedProjection for WorkBoardProjection {
+    const DIR: &'static str = CACHE_DIR;
+    const LABEL: &'static str = "work board cache";
+    const VERSION: u32 = WORK_BOARD_CACHE_FORMAT_VERSION;
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct WorkBoardCache {
+pub(crate) struct ProjectionCache<P> {
     pub version: u32,
     pub channel: RoomId,
     pub source: WorkBoardCacheSource,
     /// Cursor of the newest transcript event folded into `projection`
-    /// (work event or not) — the strictly-after resume point.
+    /// (a projected event or not) — the strictly-after resume point.
     pub cursor: TranscriptCursor,
-    pub projection: WorkBoardProjection,
+    pub projection: P,
 }
 
-impl WorkBoardCache {
+impl<P: CachedProjection> ProjectionCache<P> {
     pub fn path(home: &Path, channel: RoomId) -> PathBuf {
-        home.join(CACHE_DIR).join(format!("{channel}.json"))
+        home.join(P::DIR).join(format!("{channel}.json"))
     }
 
     /// Load the snapshot for `channel`, or `None` when the caller must
@@ -97,7 +120,8 @@ impl WorkBoardCache {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
             Err(error) => {
                 eprintln!(
-                    "work board cache: failed to read {} ({error}) — rebuilding projection from scratch",
+                    "{}: failed to read {} ({error}) — rebuilding projection from scratch",
+                    P::LABEL,
                     path.display()
                 );
                 return None;
@@ -107,23 +131,27 @@ impl WorkBoardCache {
             Ok(cache) => cache,
             Err(error) => {
                 eprintln!(
-                    "work board cache: corrupt snapshot {} ({error}) — rebuilding projection from scratch",
+                    "{}: corrupt snapshot {} ({error}) — rebuilding projection from scratch",
+                    P::LABEL,
                     path.display()
                 );
                 return None;
             }
         };
-        if cache.version != WORK_BOARD_CACHE_FORMAT_VERSION {
+        if cache.version != P::VERSION {
             eprintln!(
-                "work board cache: snapshot {} has format v{} (current v{WORK_BOARD_CACHE_FORMAT_VERSION}) — rebuilding projection from scratch",
+                "{}: snapshot {} has format v{} (current v{}) — rebuilding projection from scratch",
+                P::LABEL,
                 path.display(),
-                cache.version
+                cache.version,
+                P::VERSION
             );
             return None;
         }
         if cache.channel != channel {
             eprintln!(
-                "work board cache: snapshot {} is for channel {} (expected {channel}) — rebuilding projection from scratch",
+                "{}: snapshot {} is for channel {} (expected {channel}) — rebuilding projection from scratch",
+                P::LABEL,
                 path.display(),
                 cache.channel
             );
@@ -131,7 +159,8 @@ impl WorkBoardCache {
         }
         if cache.source != source {
             eprintln!(
-                "work board cache: snapshot {} was projected from the {:?} log but this read uses {:?} — rebuilding projection from scratch",
+                "{}: snapshot {} was projected from the {:?} log but this read uses {:?} — rebuilding projection from scratch",
+                P::LABEL,
                 path.display(),
                 cache.source,
                 source
@@ -148,7 +177,8 @@ impl WorkBoardCache {
         let path = Self::path(home, self.channel);
         if let Err(error) = self.try_save(&path) {
             eprintln!(
-                "work board cache: failed to persist snapshot {} ({error}) — next read rebuilds from scratch",
+                "{}: failed to persist snapshot {} ({error}) — next read rebuilds from scratch",
+                P::LABEL,
                 path.display()
             );
         }
@@ -180,8 +210,8 @@ impl WorkBoardCache {
 mod tests {
     use super::*;
 
-    fn sample(channel: RoomId) -> WorkBoardCache {
-        WorkBoardCache {
+    fn sample(channel: RoomId) -> ProjectionCache<WorkBoardProjection> {
+        ProjectionCache {
             version: WORK_BOARD_CACHE_FORMAT_VERSION,
             channel,
             source: WorkBoardCacheSource::Daemon,
@@ -199,8 +229,12 @@ mod tests {
         let channel = RoomId::from_u128(1);
         let cache = sample(channel);
         cache.save(home.path());
-        let loaded = WorkBoardCache::load(home.path(), channel, WorkBoardCacheSource::Daemon)
-            .expect("snapshot loads back");
+        let loaded = ProjectionCache::<WorkBoardProjection>::load(
+            home.path(),
+            channel,
+            WorkBoardCacheSource::Daemon,
+        )
+        .expect("snapshot loads back");
         assert_eq!(loaded, cache);
     }
 
@@ -219,7 +253,7 @@ mod tests {
                     let home = home.path();
                     scope.spawn(move || {
                         let cache = sample(channel);
-                        cache.try_save(&WorkBoardCache::path(home, channel))
+                        cache.try_save(&ProjectionCache::<WorkBoardProjection>::path(home, channel))
                     })
                 })
                 .collect::<Vec<_>>()
@@ -230,13 +264,18 @@ mod tests {
         for r in results {
             r.expect("every concurrent save must persist — shared tmp names race");
         }
-        assert!(WorkBoardCache::load(home.path(), channel, WorkBoardCacheSource::Daemon).is_some());
+        assert!(ProjectionCache::<WorkBoardProjection>::load(
+            home.path(),
+            channel,
+            WorkBoardCacheSource::Daemon
+        )
+        .is_some());
     }
 
     #[test]
     fn missing_file_is_silent_cold_start() {
         let home = tempfile::tempdir().expect("tempdir");
-        assert!(WorkBoardCache::load(
+        assert!(ProjectionCache::<WorkBoardProjection>::load(
             home.path(),
             RoomId::from_u128(1),
             WorkBoardCacheSource::Daemon
@@ -248,10 +287,15 @@ mod tests {
     fn corrupt_json_is_discarded() {
         let home = tempfile::tempdir().expect("tempdir");
         let channel = RoomId::from_u128(1);
-        let path = WorkBoardCache::path(home.path(), channel);
+        let path = ProjectionCache::<WorkBoardProjection>::path(home.path(), channel);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, b"{ not json").expect("write garbage");
-        assert!(WorkBoardCache::load(home.path(), channel, WorkBoardCacheSource::Daemon).is_none());
+        assert!(ProjectionCache::<WorkBoardProjection>::load(
+            home.path(),
+            channel,
+            WorkBoardCacheSource::Daemon
+        )
+        .is_none());
     }
 
     #[test]
@@ -261,7 +305,12 @@ mod tests {
         let mut cache = sample(channel);
         cache.version = WORK_BOARD_CACHE_FORMAT_VERSION + 1;
         cache.save(home.path());
-        assert!(WorkBoardCache::load(home.path(), channel, WorkBoardCacheSource::Daemon).is_none());
+        assert!(ProjectionCache::<WorkBoardProjection>::load(
+            home.path(),
+            channel,
+            WorkBoardCacheSource::Daemon
+        )
+        .is_none());
     }
 
     #[test]
@@ -270,10 +319,10 @@ mod tests {
         let written = RoomId::from_u128(1);
         let cache = sample(written);
         // Force the file under a DIFFERENT channel's name.
-        let path = WorkBoardCache::path(home.path(), RoomId::from_u128(2));
+        let path = ProjectionCache::<WorkBoardProjection>::path(home.path(), RoomId::from_u128(2));
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, serde_json::to_vec(&cache).expect("encode")).expect("write");
-        assert!(WorkBoardCache::load(
+        assert!(ProjectionCache::<WorkBoardProjection>::load(
             home.path(),
             RoomId::from_u128(2),
             WorkBoardCacheSource::Daemon
@@ -286,7 +335,12 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let channel = RoomId::from_u128(1);
         sample(channel).save(home.path());
-        assert!(WorkBoardCache::load(home.path(), channel, WorkBoardCacheSource::Store).is_none());
+        assert!(ProjectionCache::<WorkBoardProjection>::load(
+            home.path(),
+            channel,
+            WorkBoardCacheSource::Store
+        )
+        .is_none());
     }
 
     #[test]
