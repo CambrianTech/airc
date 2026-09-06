@@ -967,11 +967,23 @@ impl EventRouter {
     /// strictly after its last cursor, recent-from-ring + deep-from-sink,
     /// merged in total order with no dup. A lagging `Durable` subscriber calls
     /// this to resume; fan-out to others was never blocked.
+    ///
+    /// `limit` bounds the answer AND the work: the deep leg is one indexed
+    /// `LIMIT limit` query (never the channel's whole remainder), and the
+    /// merged page is cut to `limit` in total order. Pagination is the
+    /// caller's job — pass the last returned cursor back in. Measured
+    /// 2026-09-06 (continuum M5, the wall projection): with `usize::MAX`
+    /// here every 500-event inbox page materialized the entire remaining
+    /// transcript (academy 244k rows, cambriantech 472k), so a from-zero
+    /// walk was O(n²/page) and never returned inside the callers' 30 s
+    /// deadline, while the board — resuming from a saved cursor — was instant.
     pub async fn resume_from_cursor(
         &self,
         channel: RoomId,
         from_cursor: Option<Cursor>,
+        limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
+        let limit = limit.max(1);
         // Recent from ring (snapshot under lock; no await held).
         let (ring_events, ring_oldest) = {
             let shard = self.shard_for(channel);
@@ -986,11 +998,7 @@ impl EventRouter {
         };
 
         // Deep from sink for the window older than the ring.
-        let deep = self
-            .inner
-            .sink
-            .page(channel, from_cursor, usize::MAX)
-            .await?;
+        let deep = self.inner.sink.page(channel, from_cursor, limit).await?;
 
         let mut out: Vec<Arc<Envelope>> = Vec::new();
         for env in deep {
@@ -1018,6 +1026,9 @@ impl EventRouter {
                 .then_with(|| a.event_id.0.cmp(&b.event_id.0))
         });
         out.dedup_by(|a, b| a.event_id == b.event_id);
+        // Deep rows all precede ring rows in total order, so the first `limit`
+        // of the merge are exactly the first `limit` after the cursor.
+        out.truncate(limit);
         Ok(out)
     }
 
