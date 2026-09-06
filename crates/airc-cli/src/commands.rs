@@ -102,6 +102,53 @@ pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// `list` (aliases `rooms`, `ls`) — the DISCOVERABLE room catalog. Prints
+/// every subscribed room flat, marking the current one with `*`. Same data
+/// source as bare `airc room` (`subscription_set` + `current_room`), but this
+/// is the surface a user actually reaches for to answer "what rooms am I in?"
+/// — membership must be trivially visible or seam traffic sits unread in a
+/// subscribed-but-not-current channel while both agents blame the transport.
+pub async fn run_list(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = Airc::open(home).await?;
+    let current = airc.current_room().await?;
+    let set = airc.subscription_set().await?;
+    // Project to (name, channel, is_current) so the formatting is a pure,
+    // testable function — and so the CURRENT room is INCLUDED and marked
+    // (never filtered out; that omission is the exact "membership invisible"
+    // bug this command exists to kill).
+    let rows: Vec<(String, String, bool)> = set
+        .all()
+        .map(|sub| {
+            (
+                sub.name.as_str().to_string(),
+                sub.room_id.to_string(),
+                sub.name.as_str() == current.name,
+            )
+        })
+        .collect();
+    print!("{}", format_room_catalog(&rows));
+    Ok(())
+}
+
+/// Pure catalog formatter for `airc list`: `rows` are `(name, channel,
+/// is_current)`. The current room is printed like any other but marked `*` —
+/// it is NEVER omitted (unlike bare `airc room`, which splits current from the
+/// rest). Empty subscriptions get an actionable hint, not a blank.
+fn format_room_catalog(rows: &[(String, String, bool)]) -> String {
+    if rows.is_empty() {
+        return "no subscribed rooms — `airc join` or `airc room <name>` to join one\n".to_string();
+    }
+    let mut out = format!(
+        "{} subscribed room(s) — * = current, `airc room <name>` to switch:\n",
+        rows.len()
+    );
+    for (name, channel, is_current) in rows {
+        let mark = if *is_current { "*" } else { " " };
+        out.push_str(&format!("  {mark} {name:<24}  channel {channel}\n"));
+    }
+    out
+}
+
 /// `doctrine-publish` — read a markdown file (default: AGENTS.md at
 /// the git repo root) and publish it as the room's operating
 /// doctrine via `Airc::publish_room_doctrine`. Card 2903a8ef slice
@@ -3539,6 +3586,46 @@ mod tests {
         assert_eq!(relay_bind_candidates(Some(65280)), vec![65280, 0]);
         assert_eq!(relay_bind_candidates(None), vec![0]);
         assert_eq!(relay_bind_candidates(Some(0)), vec![0]);
+    }
+
+    /// what this catches: `airc list` must INCLUDE and mark the current room —
+    /// the whole reason the discoverable catalog exists (membership invisible =
+    /// seam traffic read as a dead transport). A regression that filters the
+    /// current room out (as bare `airc room` does for "others"), or marks more
+    /// than one, would silently hide or confuse membership. Also pins that the
+    /// empty case is an actionable hint, never a blank.
+    #[test]
+    fn room_catalog_includes_and_marks_only_the_current_room() {
+        let rows = vec![
+            ("cambriantech".to_string(), "cb2e21a1".to_string(), false),
+            ("general".to_string(), "5eedf7b1".to_string(), true),
+            ("k3-serving".to_string(), "effe5955".to_string(), false),
+        ];
+        let out = format_room_catalog(&rows);
+        assert!(
+            out.contains("cambriantech") && out.contains("general") && out.contains("k3-serving"),
+            "every subscribed room must be listed:\n{out}"
+        );
+        assert!(out.contains("3 subscribed room(s)"));
+        // Exactly one ROOM line is starred, and it is the current one. Filter to
+        // room lines ("channel …") so the header's "* = current" legend can't
+        // be miscounted.
+        let starred: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("channel "))
+            .filter(|l| l.trim_start().starts_with('*'))
+            .collect();
+        assert_eq!(starred.len(), 1, "exactly one room starred:\n{out}");
+        assert!(
+            starred[0].contains("general"),
+            "the starred room must be the current one:\n{out}"
+        );
+        // Empty subscriptions → an actionable hint, not a blank.
+        let empty = format_room_catalog(&[]);
+        assert!(
+            empty.contains("no subscribed rooms") && empty.contains("airc join"),
+            "empty catalog must hint how to join:\n{empty}"
+        );
     }
 
     /// what this catches: the send receipt must NOT report the enrolled

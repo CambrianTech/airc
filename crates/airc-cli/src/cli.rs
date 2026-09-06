@@ -771,6 +771,15 @@ pub enum Command {
         name: Option<String>,
     },
 
+    /// List every subscribed room as a flat catalog, marking the
+    /// current one with `*`. The membership was already reachable via
+    /// bare `airc room`, but nobody reaches for `room` to "see my
+    /// rooms" — this is the discoverable surface (a whole afternoon of
+    /// seam messages once sat unread in a subscribed-but-not-current
+    /// channel because the room list wasn't where anyone looked).
+    #[command(visible_aliases = ["rooms", "ls"])]
+    List,
+
     /// Publish the room's operating doctrine (card 2903a8ef slice 2/4).
     /// Reads a markdown file and emits a `RoomDoctrinePublished`
     /// substrate event so every attaching agent loads the latest

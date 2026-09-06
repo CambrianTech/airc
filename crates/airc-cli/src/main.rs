@@ -508,6 +508,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Room { name } => commands::run_room(&home, name).await,
 
+        Command::List => commands::run_list(&home).await,
+
         Command::DoctrinePublish { from_file } => {
             commands::run_doctrine_publish(&home, from_file).await
         }
