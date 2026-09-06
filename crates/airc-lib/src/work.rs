@@ -2,8 +2,8 @@
 
 use crate::time::now_ms;
 use crate::work_board_cache::{
-    cursor_strictly_before, zero_transcript_cursor, WorkBoardCache, WorkBoardCacheSource,
-    WORK_BOARD_CACHE_FORMAT_VERSION,
+    cursor_strictly_before, zero_transcript_cursor, CachedProjection, ProjectionCache,
+    WorkBoardCacheSource,
 };
 use crate::{Airc, AircError, Room};
 use airc_core::EventId;
@@ -930,14 +930,47 @@ impl Airc {
         room: &crate::Room,
         page_size: usize,
     ) -> Result<WorkBoardProjection, AircError> {
+        self.project_room_with_cache(
+            room,
+            page_size,
+            |transcripts| {
+                airc_work_store::project_transcripts(transcripts).map_err(AircError::from)
+            },
+            |projection, transcripts| {
+                airc_work_store::apply_transcripts(projection, transcripts)
+                    .map(|_newest| ())
+                    .map_err(AircError::from)
+            },
+        )
+        .await
+    }
+
+    /// ONE resume rule for every cached projection of a room's transcript
+    /// (the work board, the wall): load the snapshot for this read path,
+    /// resume strictly after its cursor with `apply`, and on any anomaly —
+    /// no snapshot, a cursor the log no longer agrees with — rebuild from
+    /// event zero with `build`. The snapshot is saved after either path.
+    /// The cache is an accelerator, never an authority.
+    pub(crate) async fn project_room_with_cache<P, B, A>(
+        &self,
+        room: &crate::Room,
+        page_size: usize,
+        build: B,
+        apply: A,
+    ) -> Result<P, AircError>
+    where
+        P: CachedProjection,
+        B: FnOnce(Vec<airc_core::TranscriptEvent>) -> Result<P, AircError>,
+        A: FnOnce(&mut P, Vec<airc_core::TranscriptEvent>) -> Result<(), AircError>,
+    {
         let source = if self.is_daemon_attached() {
             WorkBoardCacheSource::Daemon
         } else {
             WorkBoardCacheSource::Store
         };
-        if let Some(cache) = WorkBoardCache::load(self.home(), room.channel, source) {
+        if let Some(cache) = ProjectionCache::<P>::load(self.home(), room.channel, source) {
             if let Some(projection) = self
-                .resume_work_board(room, cache, source, page_size)
+                .resume_projection(room, cache, source, page_size, apply)
                 .await?
             {
                 return Ok(projection);
@@ -949,10 +982,10 @@ impl Airc {
             .room_transcripts_since(room, &zero_transcript_cursor(), page_size)
             .await?;
         let cursor = transcripts.last().map(airc_core::TranscriptEvent::cursor);
-        let projection = airc_work_store::project_transcripts(transcripts)?;
+        let projection = build(transcripts)?;
         if let Some(cursor) = cursor {
-            WorkBoardCache {
-                version: WORK_BOARD_CACHE_FORMAT_VERSION,
+            ProjectionCache {
+                version: P::VERSION,
                 channel: room.channel,
                 source,
                 cursor,
@@ -963,20 +996,24 @@ impl Airc {
         Ok(projection)
     }
 
-    /// Resume the work-board projection from a persisted snapshot:
-    /// fetch only the transcript events strictly after the snapshot's
-    /// cursor and fold them in with the same windowed-apply rule the
-    /// full replay uses. Returns `Ok(None)` when the snapshot must be
-    /// discarded (the log disagrees with its cursor) — the caller
-    /// rebuilds from scratch. Transport/store errors propagate; they
-    /// are not a cache problem.
-    async fn resume_work_board(
+    /// Resume a cached projection from a persisted snapshot: fetch only
+    /// the transcript events strictly after the snapshot's cursor and
+    /// fold them in with `apply` — the same fold the full replay uses.
+    /// Returns `Ok(None)` when the snapshot must be discarded (the log
+    /// disagrees with its cursor) — the caller rebuilds from scratch.
+    /// Transport/store errors propagate; they are not a cache problem.
+    async fn resume_projection<P, A>(
         &self,
         room: &crate::Room,
-        cache: WorkBoardCache,
+        cache: ProjectionCache<P>,
         source: WorkBoardCacheSource,
         page_size: usize,
-    ) -> Result<Option<WorkBoardProjection>, AircError> {
+        apply: A,
+    ) -> Result<Option<P>, AircError>
+    where
+        P: CachedProjection,
+        A: FnOnce(&mut P, Vec<airc_core::TranscriptEvent>) -> Result<(), AircError>,
+    {
         let new_transcripts = self
             .room_transcripts_since(room, &cache.cursor, page_size)
             .await?;
@@ -992,9 +1029,11 @@ impl Airc {
                 return Ok(Some(cache.projection));
             }
             eprintln!(
-                "work board cache: snapshot cursor (lamport {}) is not the tip of channel {} — \
+                "{}: snapshot cursor (lamport {}) is not the tip of channel {} — \
                  log rewound or replaced; rebuilding projection from scratch",
-                cache.cursor.lamport, room.channel
+                P::LABEL,
+                cache.cursor.lamport,
+                room.channel
             );
             return Ok(None);
         };
@@ -1005,9 +1044,12 @@ impl Airc {
         let first_cursor = first.cursor();
         if !cursor_strictly_before(&cache.cursor, &first_cursor) {
             eprintln!(
-                "work board cache: channel {} returned event at lamport {} not strictly after \
+                "{}: channel {} returned event at lamport {} not strictly after \
                  snapshot cursor (lamport {}) — rebuilding projection from scratch",
-                room.channel, first_cursor.lamport, cache.cursor.lamport
+                P::LABEL,
+                room.channel,
+                first_cursor.lamport,
+                cache.cursor.lamport
             );
             return Ok(None);
         }
@@ -1020,9 +1062,9 @@ impl Airc {
             .last()
             .map(airc_core::TranscriptEvent::cursor)
             .unwrap_or(first_cursor);
-        airc_work_store::apply_transcripts(&mut projection, new_transcripts)?;
-        WorkBoardCache {
-            version: WORK_BOARD_CACHE_FORMAT_VERSION,
+        apply(&mut projection, new_transcripts)?;
+        ProjectionCache {
+            version: P::VERSION,
             channel: room.channel,
             source,
             cursor: newest,

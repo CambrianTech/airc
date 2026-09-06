@@ -1328,21 +1328,33 @@ impl Airc {
         room: &crate::Room,
         category_filter: Option<&str>,
     ) -> Result<Vec<airc_core::doctrine::WallPostPublished>, AircError> {
-        let events = self
-            .room_transcripts_since(
+        // The wall is a cached projection of the room's transcript, resumed
+        // strictly after its snapshot cursor exactly like the work board
+        // (2026-09-06: a from-zero walk cost 27–128 s per read on the fleet
+        // and every citizen tick paid a 30 s deadline to it). Discriminate on
+        // each event's self-describing body, NOT its transcript `kind` — see
+        // [`wall_post_from_event`] for why the kind is unreliable on the
+        // daemon-attached read path.
+        let wall = self
+            .project_room_with_cache(
                 room,
-                &crate::work_board_cache::zero_transcript_cursor(),
                 WALL_PROJECTION_PAGE_SIZE,
+                |events| {
+                    Ok(WallProjection(
+                        events
+                            .into_iter()
+                            .filter_map(wall_post_from_event)
+                            .collect(),
+                    ))
+                },
+                |wall, events| {
+                    wall.0
+                        .extend(events.into_iter().filter_map(wall_post_from_event));
+                    Ok(())
+                },
             )
             .await?;
-        // Discriminate on each event's self-describing body, NOT its
-        // transcript `kind` — see [`wall_post_from_event`] for why the
-        // kind is unreliable on the daemon-attached read path.
-        let posts: Vec<_> = events
-            .into_iter()
-            .filter_map(wall_post_from_event)
-            .collect();
-        Ok(project_wall_posts(posts, category_filter))
+        Ok(project_wall_posts(wall.0, category_filter))
     }
 
     /// **Card 1224aac2 slice 1.** Reserved wall-post category name for
@@ -2528,6 +2540,19 @@ fn warn_subscription_rebinds(rebinds: &[subscriptions::SubscriptionRebind]) {
 /// which is worse than a slow read. Declared once so `wall_posts` and
 /// `wall_posts_in` can never disagree about what "the wall" means.
 pub const WALL_PROJECTION_PAGE_SIZE: usize = 500;
+
+/// Every wall post ever published on one room, in transcript order — the
+/// snapshot the wall read resumes from. Supersedes/category filtering is
+/// applied on top by [`project_wall_posts`], so the snapshot stays the raw
+/// fold and a filter change never invalidates it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WallProjection(pub(crate) Vec<airc_core::doctrine::WallPostPublished>);
+
+impl crate::work_board_cache::CachedProjection for WallProjection {
+    const DIR: &'static str = "wall-cache";
+    const LABEL: &'static str = "wall cache";
+    const VERSION: u32 = 1;
+}
 
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
