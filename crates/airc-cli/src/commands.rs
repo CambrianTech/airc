@@ -2623,9 +2623,14 @@ pub async fn run_inbox(
     home: &Path,
     socket: Option<PathBuf>,
     room: Option<&str>,
-    since_lamport: Option<u64>,
-    since_event_id: Option<String>,
+    // The read cursor as ONE value, because it IS one: `(lamport, event_id)`
+    // addresses a single position and neither half means anything alone. It
+    // arrived here as two `Option`s that had to be re-paired on every call;
+    // clap already enforces the pairing via `requires`, so the tuple is the
+    // honest shape and it keeps this signature inside the argument limit.
+    cursor: Option<(u64, String)>,
     limit: Option<usize>,
+    all: bool,
     as_json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = match socket {
@@ -2635,6 +2640,22 @@ pub async fn run_inbox(
         }
         None => attached_airc(home).await?,
     };
+
+    // `--all`: every subscribed room in one view. The single-room default is
+    // what made an agent present in one room and absent from five — see the
+    // flag's own docs and card a0772bba. Refuse `--all --room` rather than
+    // silently letting one win: they are opposite requests, and a quiet
+    // precedence rule here would be a smaller version of the same bug.
+    if all {
+        if room.is_some() {
+            return Err(
+                "`--all` reads EVERY subscribed room and `--room` reads exactly one \
+                        — pass one or the other, not both"
+                    .into(),
+            );
+        }
+        return run_inbox_all(&airc, limit, as_json).await;
+    }
     // `--room` reads a room this scope is subscribed to WITHOUT moving
     // the default-room pointer — the read sibling of `airc msg --room`.
     // Same resolver the writes use (name or channel id, loud refusal for
@@ -2646,18 +2667,12 @@ pub async fn run_inbox(
     };
     // Both --since-lamport and --since-event-id must be supplied
     // together; the cursor is a tuple per grievance §7.
-    let since = match (since_lamport, since_event_id) {
-        (Some(lamport), Some(ref ev)) => Some(TranscriptCursor {
+    let since = match cursor {
+        Some((lamport, ref ev)) => Some(TranscriptCursor {
             lamport,
             event_id: EventId::from_uuid(uuid::Uuid::parse_str(ev)?),
         }),
-        (None, None) => None,
-        _ => {
-            return Err(
-                "--since-lamport and --since-event-id must be passed together (cursor is a tuple)"
-                    .into(),
-            );
-        }
+        None => None,
     };
     let effective_limit = limit.unwrap_or(32);
     let events = match since {
@@ -2724,6 +2739,129 @@ pub async fn run_inbox(
 /// `--since-event-id` for the next call. Mirrors `airc events
 /// list --json` for the `{count, events}` shape and extends it
 /// with the paging tuple inbox callers need.
+/// `airc inbox --all` — every subscribed room in ONE view, grouped by room.
+///
+/// The default single-room `inbox` names the rooms it is hiding, which proves
+/// the subscription set is already in hand; this is the fold over it that was
+/// missing. Rooms are read independently and a room that fails to read is
+/// REPORTED IN PLACE rather than dropped: a room silently missing from an
+/// aggregate is precisely the failure this command exists to end
+/// ([[absence-rendered-as-positive-fact]]).
+///
+/// No cursor. `(lamport, event_id)` addresses a position in ONE room's
+/// transcript and cannot describe an aggregate, so `--all` is a recent-window
+/// read and the flags are refused at the CLI layer.
+async fn run_inbox_all(
+    airc: &Airc,
+    limit: Option<usize>,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let effective_limit = limit.unwrap_or(32);
+    let set = airc.subscription_set().await?;
+    let subscriptions: Vec<_> = set.all().collect();
+
+    #[derive(serde::Serialize)]
+    struct RoomGroup {
+        room: String,
+        /// Events RETURNED for this room.
+        count: usize,
+        /// Of those, how many `render_feed_line` actually displays. Heartbeats
+        /// and other suppressed kinds render as nothing, so a bare `count`
+        /// beside an empty section is a header claiming visibility it does not
+        /// have — the same absence-read-as-fact shape this whole command
+        /// exists to remove. Report both and name the gap.
+        shown: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        events: Vec<airc_core::TranscriptEvent>,
+    }
+
+    let mut groups: Vec<RoomGroup> = Vec::new();
+    for subscription in &subscriptions {
+        let name = subscription.name.as_str().to_string();
+        let room = subscription.as_room();
+        match airc.page_recent_in(&room, effective_limit).await {
+            Ok(events) => {
+                let shown = events
+                    .iter()
+                    .filter(|e| crate::event_render::render_feed_line(e).is_some())
+                    .count();
+                groups.push(RoomGroup {
+                    room: name,
+                    count: events.len(),
+                    shown,
+                    error: None,
+                    events,
+                })
+            }
+            // Read failure is DATA, not a reason to omit the room. An operator
+            // scanning for "who has gone quiet" must be able to tell a quiet
+            // room from a room that could not be read.
+            Err(err) => groups.push(RoomGroup {
+                room: name,
+                count: 0,
+                shown: 0,
+                error: Some(err.to_string()),
+                events: Vec::new(),
+            }),
+        }
+    }
+
+    if as_json {
+        #[derive(serde::Serialize)]
+        struct InboxAllJson<'a> {
+            rooms: &'a [RoomGroup],
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&InboxAllJson { rooms: &groups })?
+        );
+        return Ok(());
+    }
+
+    let total: usize = groups.iter().map(|g| g.count).sum();
+    let shown_total: usize = groups.iter().map(|g| g.shown).sum();
+    let suppressed = total.saturating_sub(shown_total);
+    println!(
+        "inbox: ALL {} subscribed room(s), {} event(s){}",
+        groups.len(),
+        total,
+        if suppressed > 0 {
+            format!(" — {shown_total} shown, {suppressed} suppressed (heartbeats etc)")
+        } else {
+            String::new()
+        }
+    );
+    println!();
+    for group in &groups {
+        match &group.error {
+            Some(err) => println!("── {} — READ FAILED: {}", group.room, err),
+            None if group.count == 0 => println!("── {} (no events)", group.room),
+            // count>0 with shown==0 is the case that used to read as an empty
+            // room. Say what happened instead of printing a number over silence.
+            None if group.shown == 0 => println!(
+                "── {} ({} event(s), none displayable — all suppressed kinds)",
+                group.room, group.count
+            ),
+            None => {
+                if group.shown == group.count {
+                    println!("── {} ({})", group.room, group.count);
+                } else {
+                    println!(
+                        "── {} ({} shown of {})",
+                        group.room, group.shown, group.count
+                    );
+                }
+                for event in &group.events {
+                    print_event(event);
+                }
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
 fn print_inbox_json(events: &[airc_core::TranscriptEvent]) -> Result<(), serde_json::Error> {
     #[derive(serde::Serialize)]
     struct InboxJson<'a> {
