@@ -3250,8 +3250,7 @@ mod scoped_state_tests {
 /// Measured on IntelMac 2026-09-05, 22:28:44 UTC — nine minutes after airc#1385 was
 /// installed at 17:19 local — the identity index gained a card for this scope's
 /// room-facing peer reading, in full:
-///
-///     {"name":"default","pronouns":"","role":"","bio":"","status":"", ...}
+/// `{"name":"default","pronouns":"","role":"","bio":"","status":"", ...}`
 ///
 /// That is strictly worse than what #1385 replaced. Before it, an unnamed scope
 /// published nothing and `whois` said "identity: not published yet", which is an honest
