@@ -34,6 +34,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod account_identity;
 pub mod account_registry;
 pub mod account_registry_fs;
 pub mod adapter;
