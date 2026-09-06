@@ -752,6 +752,24 @@ pub enum Command {
         since_event_id: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// Read EVERY subscribed room in one view, grouped by room,
+        /// instead of only the current one.
+        ///
+        /// An agent subscribed to six rooms is otherwise present in one
+        /// and absent from five: `inbox` shows a single room and merely
+        /// NAMES the others it is hiding. On 2026-09-06 that cost two
+        /// peers seven hours — one posted every status into `continuum`
+        /// while the other read `general`, and she correctly applied the
+        /// fleet's silent-means-down rule to a node that had been
+        /// reporting the whole time (card a0772bba). The rules this
+        /// fleet runs on are keyed to silence; silence is only evidence
+        /// if you can observe every room at once.
+        ///
+        /// Mutually exclusive with `--room` (one room or all) and with
+        /// the cursor flags, whose `(lamport, event_id)` pair is
+        /// meaningful per room and cannot address an aggregate.
+        #[arg(long, conflicts_with_all = ["since_lamport", "since_event_id"])]
+        all: bool,
         /// Emit a single JSON document on stdout instead of
         /// human-readable text. Shape mirrors `airc events list
         /// --json` and `airc publish` for machine consumers

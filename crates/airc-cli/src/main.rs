@@ -492,18 +492,21 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             since_lamport,
             since_event_id,
             limit,
+            all,
             json,
         } => {
-            commands::run_inbox(
-                &home,
-                socket,
-                room.named(),
-                since_lamport,
-                since_event_id,
-                limit,
-                json,
-            )
-            .await
+            // Re-pair the cursor here: clap enforces `requires` between the two
+            // flags, and this keeps the loud refusal for anyone constructing the
+            // command programmatically. Below this line the cursor is ONE value.
+            let cursor = match (since_lamport, since_event_id) {
+                (Some(lamport), Some(event_id)) => Some((lamport, event_id)),
+                (None, None) => None,
+                _ => {
+                    return Err("--since-lamport and --since-event-id must be passed                                 together (cursor is a tuple)"
+                        .into());
+                }
+            };
+            commands::run_inbox(&home, socket, room.named(), cursor, limit, all, json).await
         }
 
         Command::Room { name } => commands::run_room(&home, name).await,
