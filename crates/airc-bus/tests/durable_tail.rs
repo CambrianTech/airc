@@ -35,6 +35,7 @@ struct CountingSink {
     page_calls: AtomicU64,
     page_tail_calls: AtomicU64,
     max_page_tail_limit: AtomicUsize,
+    max_page_limit: AtomicUsize,
 }
 
 impl CountingSink {
@@ -44,7 +45,12 @@ impl CountingSink {
             page_calls: AtomicU64::new(0),
             page_tail_calls: AtomicU64::new(0),
             max_page_tail_limit: AtomicUsize::new(0),
+            max_page_limit: AtomicUsize::new(0),
         }
+    }
+
+    fn max_page_limit(&self) -> usize {
+        self.max_page_limit.load(Ordering::SeqCst)
     }
 
     fn page_calls(&self) -> u64 {
@@ -63,6 +69,7 @@ impl CountingSink {
         self.page_calls.store(0, Ordering::SeqCst);
         self.page_tail_calls.store(0, Ordering::SeqCst);
         self.max_page_tail_limit.store(0, Ordering::SeqCst);
+        self.max_page_limit.store(0, Ordering::SeqCst);
     }
 }
 
@@ -79,6 +86,7 @@ impl DurableSink for CountingSink {
         limit: usize,
     ) -> Result<Vec<Envelope>, BusError> {
         self.page_calls.fetch_add(1, Ordering::SeqCst);
+        self.max_page_limit.fetch_max(limit, Ordering::SeqCst);
         self.inner.page(channel, from_cursor, limit).await
     }
 
@@ -501,5 +509,66 @@ async fn tail_surfaces_sink_error_instead_of_scanning() {
     assert!(
         result.is_err(),
         "reverse-page failure is loud, not a scan fallback"
+    );
+}
+
+/// Regression (continuum 2026-09-06, the wall projection that never
+/// returned): a cursor resume must do work bounded by its page, never by
+/// the channel's remaining depth. Before, `resume_from_cursor` asked the
+/// sink for `usize::MAX` rows on every page and the daemon truncated in
+/// memory, so a from-zero walk of a 244k-event room materialized O(n²/page)
+/// rows and outlived every caller's deadline. Now: each page is ONE sink
+/// read of at most `limit` rows, pages chain by the last returned cursor
+/// with no gap and no dup, and a short page means the channel is exhausted.
+#[tokio::test]
+async fn cursor_resume_pages_are_bounded_by_limit_not_by_room_depth() {
+    const DEEP: u128 = 1_200;
+    const PAGE: usize = 500;
+
+    let (router, sink) = counted_router(64);
+    let channel = RoomId::from_u128(0xb0b0);
+    for n in 0..DEEP {
+        router
+            .publish(event(channel, n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let mut from = None;
+    let mut seen: Vec<u128> = Vec::new();
+    let mut pages = 0;
+    loop {
+        sink.reset();
+        let page = router
+            .resume_from_cursor(channel, from, PAGE)
+            .await
+            .expect("resume");
+        pages += 1;
+        assert!(page.len() <= PAGE, "a page never exceeds its limit");
+        assert!(
+            sink.page_calls() <= 1,
+            "one sink read per page, got {}",
+            sink.page_calls()
+        );
+        assert!(
+            sink.max_page_limit() <= PAGE,
+            "the sink read is bounded by the page, asked for {}",
+            sink.max_page_limit()
+        );
+        let short = page.len() < PAGE;
+        from = page.last().map(|e| e.cursor());
+        seen.extend(markers(&page));
+        if short || from.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 3, "1200 events at 500/page = 500 + 500 + 200");
+    assert_eq!(
+        seen,
+        (0..DEEP).collect::<Vec<_>>(),
+        "the chained pages are the whole channel in order, no gap, no dup"
     );
 }

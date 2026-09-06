@@ -261,29 +261,43 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
                 }
             }
         }
-        // "First N after the cursor" when resuming.
+        // "First N after the cursor" when resuming. Each router page is
+        // bounded by `limit` (one indexed query), and the durable + kinds
+        // predicates are applied per page; a page they thin below `limit`
+        // pulls the next page from the last raw cursor, so a short answer
+        // still means "the channel is exhausted" to the client's paging loop.
         Some(c) => {
-            let from = Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
-            let mut events = match state.router.resume_from_cursor(channel, from).await {
-                Ok(events) => events,
-                Err(error) => {
-                    return Response::Error {
-                        message: format!("inbox: {error}"),
+            let mut from = Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
+            let mut events: Vec<Arc<Envelope>> = Vec::new();
+            loop {
+                let batch = match state.router.resume_from_cursor(channel, from, limit).await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!("inbox: {error}"),
+                        }
                     }
+                };
+                let exhausted = batch.len() < limit;
+                let last_raw = batch.last().map(|e| e.cursor());
+                // `inbox` is the DURABLE transcript. `resume_from_cursor`
+                // merges the hot ring (which transiently holds every class,
+                // incl. StreamChunk / EphemeralLatest for live attach-replay)
+                // with the sink, so filter to durable here — non-durable
+                // classes never belong in a replay (§3.4). The kinds filter
+                // composes the same way.
+                events.extend(batch.into_iter().filter(|env| {
+                    env.delivery.is_durable()
+                        && kinds.as_ref().is_none_or(|kinds| kinds.contains(&env.kind))
+                }));
+                if events.len() >= limit || exhausted {
+                    break;
                 }
-            };
-            // `inbox` is the DURABLE transcript. `resume_from_cursor`
-            // merges the hot ring (which transiently holds every class,
-            // incl. StreamChunk / EphemeralLatest for live attach-replay)
-            // with the sink, so filter to durable here — non-durable
-            // classes never belong in a replay (§3.4). The kinds filter
-            // composes the same way, and BOTH run before `truncate`, so
-            // `since` + `kinds` still means "the first N matching events
-            // after the cursor."
-            events.retain(|env| {
-                env.delivery.is_durable()
-                    && kinds.as_ref().is_none_or(|kinds| kinds.contains(&env.kind))
-            });
+                match last_raw {
+                    Some(cursor) => from = Some(cursor),
+                    None => break,
+                }
+            }
             events.truncate(limit);
             events
         }
