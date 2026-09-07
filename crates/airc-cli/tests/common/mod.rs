@@ -35,7 +35,19 @@ pub struct DaemonTempDir {
 
 /// The ONLY way tests get a home-bearing tempdir — returns the guarded
 /// form so teardown cannot be forgotten (card f122b5b5).
+///
+/// Also the one place the staleness check is silenced for the whole test
+/// process. Every CLI test spawns the built binary with a TEMP home, so
+/// `install_source_dir()` finds no marker, `airc_repo_root()` falls back to
+/// CWD discovery, lands on the airc clone the tests are running inside, and
+/// runs a live `git fetch origin canary` — inside an assertion. The cache that
+/// normally gates that fetch is home-scoped, so a fresh temp home misses it
+/// every time. Setting it HERE rather than in each test file is deliberate:
+/// eight files spawn the binary today and a per-file opt-out is one every new
+/// file has to remember. This function is already the single funnel.
 pub fn daemon_tempdir() -> DaemonTempDir {
+    // Inherited by every child the test spawns.
+    std::env::set_var("AIRC_NO_STALENESS", "1");
     DaemonTempDir {
         dir: tempfile::TempDir::new().expect("create guarded tempdir"),
     }
