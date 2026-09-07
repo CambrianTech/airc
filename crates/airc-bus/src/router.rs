@@ -215,16 +215,24 @@ struct RouterInner {
     /// never fan out twice.
     recent_ids: Mutex<RecentEventIds>,
     /// Card 1998f6cb: the outbound route-layer sink. When installed
-    /// (`set_forward_sink`), every successfully published **durable**
-    /// envelope is offered here (bounded `try_send`, never blocking the
-    /// hot path) so the daemon's forwarder can send it over established
-    /// LAN routes. Saturation is LOUD: counted + traced, never silent.
+    /// (`set_forward_sink`), every successfully published envelope —
+    /// durable AND `EphemeralLatest` (card bf4d4556) — is offered here
+    /// (bounded `try_send`, never blocking the hot path) so the daemon's
+    /// forwarder can send it over established LAN routes. Saturation is
+    /// LOUD for durable: counted + traced, never silent.
     forward_tx: Mutex<Option<mpsc::Sender<ForwardItem>>>,
-    /// Count of durable envelopes NOT handed to the forward sink because
-    /// its bounded queue was full (or the forwarder task was gone).
-    /// Surfaced for diagnostics/tests; every increment also traces at
-    /// error level.
+    /// Count of **durable** envelopes NOT handed to the forward sink
+    /// because its bounded queue was full (or the forwarder task was
+    /// gone). Surfaced for diagnostics/tests; every increment also traces
+    /// at error level. Ephemerals are NOT counted here — losing one is
+    /// not data loss (see `ephemeral_superseded_count`).
     forward_drop_count: AtomicU64,
+    /// Card bf4d4556: count of `EphemeralLatest` envelopes not handed to
+    /// the forward sink because it was saturated. This is NOT an error:
+    /// latest-wins means the next offer carries the same truth, so a
+    /// superseded offer needs no delivery. Counted so a pathological rate
+    /// is still VISIBLE — silence and "benign" are not the same thing.
+    ephemeral_superseded_count: AtomicU64,
     /// Count of events shed because the write-behind queue was saturated and
     /// the publisher was fire-and-forget (§3.8). Surfaced for diagnostics.
     shed_count: AtomicU64,
@@ -264,6 +272,7 @@ impl EventRouter {
             recent_ids: Mutex::new(RecentEventIds::with_capacity(RECENT_PUBLISH_IDS_CAPACITY)),
             forward_tx: Mutex::new(None),
             forward_drop_count: AtomicU64::new(0),
+            ephemeral_superseded_count: AtomicU64::new(0),
             shed_count: AtomicU64::new(0),
             channels_created: AtomicU64::new(0),
         });
@@ -321,11 +330,25 @@ impl EventRouter {
         self.inner.forward_drop_count.load(Ordering::SeqCst)
     }
 
-    /// Offer a just-published durable envelope to the forward sink, if
-    /// one is installed. `try_send` only — the route layer must never
-    /// backpressure the in-memory hot path; a full queue is a LOUD,
-    /// counted drop (the forwarder is expected to be drained far faster
-    /// than the LAN can be saturated by room chat).
+    /// Card bf4d4556: `EphemeralLatest` envelopes that were superseded
+    /// rather than forwarded. Benign by class — see the field doc.
+    pub fn ephemeral_superseded_count(&self) -> u64 {
+        self.inner.ephemeral_superseded_count.load(Ordering::SeqCst)
+    }
+
+    /// Offer a just-published envelope to the forward sink, if one is
+    /// installed. `try_send` only — the route layer must never
+    /// backpressure the in-memory hot path.
+    ///
+    /// SATURATION IS CLASS-DEPENDENT (card bf4d4556). For a durable
+    /// envelope a full queue is data loss: LOUD, counted, traced at
+    /// error. For `EphemeralLatest` it is not — latest-wins means the
+    /// dropped offer is superseded by the next one, which carries the
+    /// same truth. That is precisely why this class needs no latest-map
+    /// to be "coalesced": supersede-on-full IS the coalescing. Counting
+    /// them as `forward_drop_count` would raise a data-loss alarm at the
+    /// moment the system is behaving correctly, so they get their own
+    /// counter and a debug trace.
     fn offer_to_forward_sink(&self, env: &Arc<Envelope>, origin: Option<PeerId>) {
         let tx = {
             let guard = self
@@ -338,31 +361,37 @@ impl EventRouter {
         let Some(tx) = tx else {
             return;
         };
+        let is_ephemeral = env.delivery.is_ephemeral_latest();
         let item = ForwardItem {
             env: Arc::clone(env),
             origin,
         };
-        match tx.try_send(item) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(item)) => {
-                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
-                tracing::error!(
-                    event_id = %item.env.event_id,
-                    channel = %item.env.channel,
-                    "airc-bus forward sink queue FULL — durable event was published locally \
-                     but will NOT be forwarded over LAN routes (card 1998f6cb loud-drop)"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(item)) => {
-                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
-                tracing::error!(
-                    event_id = %item.env.event_id,
-                    channel = %item.env.channel,
-                    "airc-bus forward sink receiver is GONE — durable event was published \
-                     locally but will NOT be forwarded over LAN routes (card 1998f6cb)"
-                );
-            }
+        let dropped = match tx.try_send(item) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(item)) => item,
+            Err(mpsc::error::TrySendError::Closed(item)) => item,
+        };
+        if is_ephemeral {
+            self.inner
+                .ephemeral_superseded_count
+                .fetch_add(1, Ordering::SeqCst);
+            tracing::debug!(
+                event_id = %dropped.env.event_id,
+                channel = %dropped.env.channel,
+                "airc-bus forward sink unavailable for an EphemeralLatest event — \
+                 superseded, not lost: the next offer carries the same truth \
+                 (card bf4d4556)"
+            );
+            return;
         }
+        self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+        tracing::error!(
+            event_id = %dropped.env.event_id,
+            channel = %dropped.env.channel,
+            "airc-bus forward sink queue FULL or receiver GONE — durable event was \
+             published locally but will NOT be forwarded over LAN routes \
+             (card 1998f6cb loud-drop)"
+        );
     }
 
     /// [`EventRouter::publish`] with the originating LAN-link peer
@@ -496,11 +525,24 @@ impl EventRouter {
                     return Err(crate::BusError::Sink("write-behind task gone".into()));
                 }
             }
-            // Card 1998f6cb: the event is accepted locally (ring +
-            // fan-out + write-behind enqueued) — offer it to the
-            // route layer so it traverses established LAN routes.
-            // Durable only: ephemeral/stream classes stay machine-
-            // local in this slice. Off the shard lock, non-blocking.
+        }
+
+        // Card 1998f6cb: the event is accepted locally (ring + fan-out,
+        // and for durable also write-behind enqueued) — offer it to the
+        // route layer so it traverses established LAN routes. Off the
+        // shard lock, non-blocking.
+        //
+        // Card bf4d4556: this offer used to live INSIDE the `is_durable`
+        // block above, sharing it with write-behind. That nesting is what
+        // left the capacity plane dark grid-wide: capacity offers publish
+        // as `EphemeralLatest`, so they reached the local coalesce cache
+        // and returned, and every node heard only its own echo. The two
+        // concerns were never related — write-behind is about the durable
+        // STORE, forwarding is about the WIRE — and a class that must not
+        // be persisted still very much has to cross the LAN. Stream
+        // classes remain machine-local; they are a different question and
+        // are not in this card.
+        if env.delivery.is_durable() || env.delivery.is_ephemeral_latest() {
             self.offer_to_forward_sink(&env, origin);
         }
 

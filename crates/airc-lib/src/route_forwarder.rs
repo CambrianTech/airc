@@ -273,6 +273,26 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
             }) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(dropped)) => {
+                    // Card bf4d4556: this is THE bounded queue that
+                    // actually saturates, so this is where the class
+                    // distinction has to bite. For `EphemeralLatest` a
+                    // full queue is not a fault: latest-wins means the
+                    // superseded offer needs no delivery, and the next
+                    // one carries the same truth. Emitting an error here
+                    // would raise a data-loss alarm at the exact moment
+                    // the design is working — so ephemerals are dropped
+                    // silently-by-class at debug, and only durable events
+                    // keep the loud diagnostic.
+                    if dropped.env.delivery.is_ephemeral_latest() {
+                        tracing::debug!(
+                            peer = %peer,
+                            event_id = %dropped.env.event_id,
+                            channel = %dropped.env.channel,
+                            "peer forward queue FULL for an EphemeralLatest event — \
+                             superseded, not lost (card bf4d4556)"
+                        );
+                        continue;
+                    }
                     emit(
                         &inner,
                         DiagnosticEvent::error(
