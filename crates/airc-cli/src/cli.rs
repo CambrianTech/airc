@@ -752,6 +752,14 @@ pub enum Command {
         since_event_id: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// EVERY subscribed room, grouped, newest activity first — the
+        /// one-room blindness fix (card a0772bba, 2026-09-06: seven hours
+        /// of a peer's reports sat in a room the reader was not looking at,
+        /// and the fleet's silent-means-down rule read a reporting node as
+        /// down). `--limit` applies per room. Refused alongside `--room` or
+        /// a cursor: one scope-wide view, not a paged one.
+        #[arg(long, conflicts_with_all = ["room", "since_lamport", "since_event_id"])]
+        all: bool,
         /// Emit a single JSON document on stdout instead of
         /// human-readable text. Shape mirrors `airc events list
         /// --json` and `airc publish` for machine consumers

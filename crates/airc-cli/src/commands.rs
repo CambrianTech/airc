@@ -2716,6 +2716,79 @@ pub async fn run_inbox(
     Ok(())
 }
 
+/// `airc inbox --all` — the newest `limit` events of EVERY subscribed room,
+/// grouped by room, rooms ordered by their newest event (most recent first).
+/// The one-room blindness fix (card a0772bba): a reader that can only see
+/// one room at a time turns every fleet rule that depends on hearing a peer
+/// — silent-means-down, review windows, claim boundaries — into a coin flip.
+/// Reads only; never moves the default-room pointer, never joins.
+pub async fn run_inbox_all(
+    home: &Path,
+    socket: Option<PathBuf>,
+    limit: Option<usize>,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = match socket {
+        Some(socket) => {
+            let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
+            Airc::attach(home, socket).await?
+        }
+        None => attached_airc(home).await?,
+    };
+    let per_room = limit.unwrap_or(8).max(1);
+    let set = airc.subscription_set().await?;
+    let mut groups: Vec<(airc_lib::Room, Vec<airc_core::TranscriptEvent>)> = Vec::new();
+    for sub in set.all() {
+        let room = sub.as_room();
+        let events = airc.page_recent_in(&room, per_room).await?;
+        groups.push((room, events));
+    }
+    // Newest activity first; a room with nothing sinks to the bottom.
+    groups.sort_by_key(|(_, events)| {
+        std::cmp::Reverse(events.last().map(|e| e.occurred_at_ms).unwrap_or(0))
+    });
+    if as_json {
+        let rooms: Vec<serde_json::Value> = groups
+            .iter()
+            .map(|(room, events)| {
+                serde_json::json!({
+                    "room": room.name,
+                    "channel": room.channel.to_string(),
+                    "count": events.len(),
+                    "events": events,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "rooms": rooms }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "inbox --all: {} subscribed room(s), newest {} per room, most recent room first",
+        groups.len(),
+        per_room
+    );
+    for (room, events) in &groups {
+        println!();
+        if events.is_empty() {
+            println!("── {} (channel {}) — no events", room.name, room.channel);
+            continue;
+        }
+        println!(
+            "── {} (channel {}) — {} event(s)",
+            room.name,
+            room.channel,
+            events.len()
+        );
+        for event in events {
+            print_event(event);
+        }
+    }
+    Ok(())
+}
+
 /// Emit a single JSON document for `airc inbox --json`.
 ///
 /// Shape: `{ count, events, cursor: {lamport, event_id} | null }`.
