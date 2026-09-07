@@ -70,7 +70,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use airc_bus::envelope::{Envelope, Kind, Target};
-use airc_bus::{EventRouter, ForwardItem};
+use airc_bus::{EventRouter, ForwardItem, ForwardLatest};
 use airc_core::{Body, EventId, MentionTarget, PeerId, RoomId};
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
@@ -147,6 +147,11 @@ struct ForwarderInner {
     /// The drain task, aborted when the last forwarder handle drops
     /// (RAII — hermetic tests must not leak forward workers).
     drain_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// #1397 rework: latest-wins state for coalescable ephemerals. The router
+    /// tap carries WAKES; this carries the value. Resolved at EMIT time in
+    /// `drain_loop` — resolving at enqueue would send a stale queued item
+    /// before the newer value already sitting here (Astra, review of #1397).
+    forward_latest: Arc<ForwardLatest>,
 }
 
 impl Drop for ForwarderInner {
@@ -173,8 +178,9 @@ impl RoutedForwarder {
     /// [`RoutedForwarder::add_link`] as they come up.
     pub fn install(router: &EventRouter, config: RoutedForwarderConfig) -> Self {
         let (tx, rx) = mpsc::channel::<ForwardItem>(config.queue_capacity.max(1));
-        router.set_forward_sink(tx);
+        let forward_latest = router.set_forward_sink(tx);
         let inner = Arc::new(ForwarderInner {
+            forward_latest,
             links: tokio::sync::RwLock::new(Vec::new()),
             config,
             diag: std::sync::RwLock::new(Arc::new(StderrJsonDiagnosticSink)),
@@ -256,6 +262,15 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
     while let Some(item) = rx.recv().await {
         let Some(inner) = inner.upgrade() else {
             return;
+        };
+        // RESOLVE AT EMIT, NEVER AT ENQUEUE (#1397 rework). For a coalescable
+        // ephemeral the dequeued item is only a WAKE — the value may have been
+        // superseded while it sat in the queue, and sending what was enqueued
+        // would put a stale offer on the wire ahead of the newer one already
+        // held. `None` means an earlier wake already carried this key's value;
+        // duplicate wakes are expected under coalescing and are not a loss.
+        let Some(item) = inner.forward_latest.resolve(item) else {
+            continue;
         };
         let peers = connected_peers(&inner).await;
         for peer in peers {

@@ -182,6 +182,84 @@ pub struct ForwardItem {
     pub origin: Option<PeerId>,
 }
 
+/// Identity of a coalescing slot on the forward path: the ROOM, the
+/// PUBLISHER, and the publisher's own coalesce key.
+///
+/// The publisher is `env.from.0` — the peer that SENT the envelope — and not
+/// `ForwardItem::origin`, which is the LAN link a frame happened to arrive on
+/// (Astra, review of #1397). Two publishers reaching this node over one link
+/// share an `origin`; keying on it would make their offers supersede each
+/// other, which is the same one-value-two-meanings mistake this card is about.
+pub type ForwardKey = (RoomId, PeerId, String);
+
+/// Latest-wins state for `EphemeralLatest` envelopes on the forward path.
+///
+/// WHY THIS EXISTS rather than "just drop on a full queue" (the reduction this
+/// PR originally shipped, and which was wrong): `mpsc::Sender::try_send`
+/// returns `Err(Full(msg))` — it hands back THE MESSAGE YOU PASSED and keeps
+/// whatever is already enqueued. Dropping on full is therefore DROP-NEWEST:
+/// the stale offer survives and every fresher one is discarded, which for a
+/// class named `EphemeralLatest` is exactly inverted. A bounded queue cannot
+/// express latest-wins by itself, because a sender can never evict the entry
+/// it wants to supersede.
+///
+/// So the QUEUE IS A WAKE SIGNAL and this map is the truth. The router replaces
+/// the entry for a key on every offer; the forwarder resolves by key at EMIT
+/// time, never at enqueue time — resolving early would put a stale queued item
+/// on the wire ahead of the newer value already held here.
+#[derive(Debug, Default)]
+pub struct ForwardLatest {
+    latest: Mutex<HashMap<ForwardKey, ForwardItem>>,
+}
+
+impl ForwardLatest {
+    /// Replace the pending value for this key. The newest offer always wins.
+    fn put(&self, key: ForwardKey, item: ForwardItem) {
+        self.latest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, item);
+    }
+
+    /// What should actually go on the wire for a dequeued item.
+    ///
+    /// - a durable item is returned unchanged; it was never coalesced
+    /// - an `EphemeralLatest` item is REPLACED by the newest value for its key,
+    ///   which is removed from the map as it is consumed
+    /// - `None` means this wake has nothing to carry: an earlier wake already
+    ///   took the key's value. Duplicate wakes are EXPECTED under coalescing —
+    ///   one wake is enqueued per offer while several offers share one value —
+    ///   so the drain must treat `None` as "skip", never as a lost frame.
+    pub fn resolve(&self, queued: ForwardItem) -> Option<ForwardItem> {
+        let Some(key) = forward_key(&queued.env) else {
+            return Some(queued);
+        };
+        self.latest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key)
+    }
+
+    /// Coalesced values not yet drained. A count that only grows means the
+    /// forwarder has stopped consuming.
+    pub fn pending(&self) -> usize {
+        self.latest.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+/// The coalescing slot an envelope belongs to, or `None` when it is not a
+/// coalescable ephemeral. An `EphemeralLatest` with NO `coalesce_key` cannot be
+/// keyed, so it is not coalesced — the caller says so out loud rather than
+/// silently treating it as a slot.
+fn forward_key(env: &Envelope) -> Option<ForwardKey> {
+    if !env.delivery.is_ephemeral_latest() {
+        return None;
+    }
+    env.coalesce_key
+        .as_ref()
+        .map(|k| (env.channel, env.from.0, k.clone()))
+}
+
 /// Outcome of [`EventRouter::publish_if_new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishIfNew {
@@ -233,6 +311,9 @@ struct RouterInner {
     /// superseded offer needs no delivery. Counted so a pathological rate
     /// is still VISIBLE — silence and "benign" are not the same thing.
     ephemeral_superseded_count: AtomicU64,
+    /// #1397 rework: latest-wins values for coalescable ephemerals. The
+    /// forward queue carries WAKES; this carries the truth.
+    forward_latest: Arc<ForwardLatest>,
     /// Count of events shed because the write-behind queue was saturated and
     /// the publisher was fire-and-forget (§3.8). Surfaced for diagnostics.
     shed_count: AtomicU64,
@@ -273,6 +354,7 @@ impl EventRouter {
             forward_tx: Mutex::new(None),
             forward_drop_count: AtomicU64::new(0),
             ephemeral_superseded_count: AtomicU64::new(0),
+            forward_latest: Arc::new(ForwardLatest::default()),
             shed_count: AtomicU64::new(0),
             channels_created: AtomicU64::new(0),
         });
@@ -314,13 +396,19 @@ impl EventRouter {
     /// (bounded, non-blocking) as a [`ForwardItem`] carrying the
     /// origin LAN peer (if the publish came through the inbound
     /// bridge) so the forwarder can apply loop prevention.
-    pub fn set_forward_sink(&self, tx: mpsc::Sender<ForwardItem>) {
-        let mut guard = self
-            .inner
-            .forward_tx
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        *guard = Some(tx);
+    /// Returns the latest-map the forwarder MUST resolve through before
+    /// emitting a dequeued item (see [`ForwardLatest::resolve`]). The two
+    /// crates are otherwise joined by one mpsc, so this handle is the seam.
+    pub fn set_forward_sink(&self, tx: mpsc::Sender<ForwardItem>) -> Arc<ForwardLatest> {
+        {
+            let mut guard = self
+                .inner
+                .forward_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = Some(tx);
+        }
+        Arc::clone(&self.inner.forward_latest)
     }
 
     /// Card 1998f6cb: durable envelopes NOT offered to the forward sink
@@ -361,37 +449,69 @@ impl EventRouter {
         let Some(tx) = tx else {
             return;
         };
-        let is_ephemeral = env.delivery.is_ephemeral_latest();
         let item = ForwardItem {
             env: Arc::clone(env),
             origin,
         };
-        let dropped = match tx.try_send(item) {
-            Ok(()) => return,
-            Err(mpsc::error::TrySendError::Full(item)) => item,
-            Err(mpsc::error::TrySendError::Closed(item)) => item,
-        };
-        if is_ephemeral {
-            self.inner
-                .ephemeral_superseded_count
-                .fetch_add(1, Ordering::SeqCst);
-            tracing::debug!(
-                event_id = %dropped.env.event_id,
-                channel = %dropped.env.channel,
-                "airc-bus forward sink unavailable for an EphemeralLatest event — \
-                 superseded, not lost: the next offer carries the same truth \
-                 (card bf4d4556)"
-            );
-            return;
+        // A coalescable ephemeral's VALUE lands in the map BEFORE its wake is
+        // enqueued, so a wake can never arrive pointing at nothing.
+        let coalesced = forward_key(env).inspect(|key| {
+            self.inner.forward_latest.put(key.clone(), item.clone());
+        });
+
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(dropped)) => {
+                if coalesced.is_some() {
+                    // NOT a loss: the value is in the map and an earlier wake is
+                    // still queued, so whichever wake the forwarder takes next
+                    // resolves to the newest value. This is the ONLY case where a
+                    // full queue is benign, and it is benign BECAUSE OF THE MAP —
+                    // never because "the next offer carries the same truth", which
+                    // was this PR's original false premise.
+                    self.inner
+                        .ephemeral_superseded_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    tracing::debug!(
+                        event_id = %dropped.env.event_id,
+                        channel = %dropped.env.channel,
+                        "airc-bus forward wake queue full — value coalesced into the \
+                         latest-map, a pending wake will carry it (card bf4d4556)"
+                    );
+                } else {
+                    // Durable, or an ephemeral with NO coalesce_key and therefore
+                    // no slot to hold it. Both are real losses and both are loud;
+                    // the keyless-ephemeral case is named so it cannot hide inside
+                    // the durable count.
+                    self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+                    tracing::error!(
+                        event_id = %dropped.env.event_id,
+                        channel = %dropped.env.channel,
+                        delivery = ?dropped.env.delivery,
+                        coalescable = false,
+                        "airc-bus forward sink queue FULL — event published locally but \
+                         will NOT be forwarded over LAN routes (card 1998f6cb loud-drop)"
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(dropped)) => {
+                // A CLOSED receiver is never benign for ANY class: the forwarder
+                // task is gone, so nothing crosses again — there is no "next offer"
+                // to carry the truth and the latest-map can only grow. Reporting
+                // this at debug for ephemerals (as this PR first did) hid a dead
+                // forwarder behind a word that means "a newer one is coming".
+                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    event_id = %dropped.env.event_id,
+                    channel = %dropped.env.channel,
+                    delivery = ?dropped.env.delivery,
+                    pending_coalesced = self.inner.forward_latest.pending(),
+                    "airc-bus forward sink receiver is GONE — the forwarder task has \
+                     exited and NOTHING will be forwarded over LAN routes for any \
+                     delivery class (card 1998f6cb)"
+                );
+            }
         }
-        self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
-        tracing::error!(
-            event_id = %dropped.env.event_id,
-            channel = %dropped.env.channel,
-            "airc-bus forward sink queue FULL or receiver GONE — durable event was \
-             published locally but will NOT be forwarded over LAN routes \
-             (card 1998f6cb loud-drop)"
-        );
     }
 
     /// [`EventRouter::publish`] with the originating LAN-link peer
