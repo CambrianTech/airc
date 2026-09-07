@@ -49,6 +49,16 @@ const LOCAL_THROTTLE_BACKOFF_SEC: f64 = 60.0;
 /// took the mesh down).
 pub const REGISTRY_FLOOR: usize = 6;
 
+/// The part of `limit` held back from every non-registry class. Zero when the
+/// window is too small to hold a floor at all (a test budget of 3).
+pub fn registry_floor_for(limit: usize) -> usize {
+    if limit > REGISTRY_FLOOR * 2 {
+        REGISTRY_FLOOR
+    } else {
+        0
+    }
+}
+
 /// Traffic class for a gh reservation — the prioritization that keeps
 /// load-bearing convergence traffic alive under polling pressure. One
 /// budget, one window, but the classes drain it asymmetrically:
@@ -156,9 +166,20 @@ impl GhBudget {
         }
         let count = self.recent_count(now)?;
         let limit = max_requests_per_min();
+        // The floor is reserved for the REGISTRY against EVERY other class, not
+        // only beacons: on 2026-09-07 a daemon's boot burst of ~20 interactive
+        // calls filled the window, every registry refresh was refused for an
+        // hour ("budget exhausted; 60s"), a peer whose beacon had changed was
+        // never re-learned, and a whole node fell off the grid while GitHub
+        // itself sat at 5000/5000. A refresh is how the mesh learns where its
+        // peers ARE; nothing discretionary may starve it — and prioritisation
+        // never mints budget: the registry stops at the absolute limit, the
+        // others stop REGISTRY_FLOOR short of it. A window too small to hold a
+        // floor (test budgets of 3) reserves nothing.
+        let floor = registry_floor_for(limit);
         let class_limit = match class {
-            GhClass::Beacon => limit.saturating_sub(REGISTRY_FLOOR),
-            GhClass::Registry | GhClass::Interactive => limit,
+            GhClass::Registry => limit,
+            GhClass::Beacon | GhClass::Interactive => limit.saturating_sub(floor),
         };
         if count >= class_limit {
             return Ok(Reservation::Denied {
@@ -474,6 +495,40 @@ mod tests {
     /// beacon blowing the window locked out EVERY class for 60s; now a
     /// denied beacon leaves higher classes immediately reservable, and
     /// the shared backoff remains exclusively GitHub's own signal.
+
+    // what this catches: the floor must hold against INTERACTIVE calls too — the
+    // class the daemon's own boot burst and the CLI use. With only beacons fenced,
+    // twenty interactive calls at start-up starved every registry refresh for an
+    // hour and a peer whose beacon moved was pruned and never re-learned
+    // (2026-09-07, the 5090 off the grid).
+    #[test]
+    fn interactive_calls_cannot_drain_the_registry_floor_either() {
+        let _g = env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = budget(dir.path());
+        let now = 1_700_000_000.0;
+        let limit = max_requests_per_min();
+        for _ in 0..limit - registry_floor_for(limit) {
+            assert!(b
+                .reserve_class(&gist_args(), now, GhClass::Interactive)
+                .expect("reserve")
+                .allowed());
+        }
+        assert!(
+            !b.reserve_class(&gist_args(), now, GhClass::Interactive)
+                .expect("reserve")
+                .allowed(),
+            "interactive stops short of the floor"
+        );
+        for _ in 0..registry_floor_for(limit) {
+            assert!(
+                b.reserve_class(&gist_args(), now, GhClass::Registry)
+                    .expect("reserve")
+                    .allowed(),
+                "the registry rides the floor interactive cannot touch"
+            );
+        }
+    }
     #[test]
     fn local_exceed_never_arms_the_shared_backoff() {
         let _env = env_guard();
@@ -506,18 +561,28 @@ mod tests {
     /// Interactive (full window), so existing callers keep their exact
     /// prior allowance.
     #[test]
-    fn classless_reserve_keeps_the_full_window() {
+    fn classless_reserve_stops_short_of_the_registry_floor() {
         let _env = env_guard();
         let dir = tempfile::tempdir().expect("tmp");
         let b = budget(dir.path());
         let now = 3_000_000.0;
-        for i in 0..max_requests_per_min() {
+        let fenced = max_requests_per_min() - registry_floor_for(max_requests_per_min());
+        for i in 0..fenced {
             assert!(
                 b.reserve(&gist_args(), now).expect("io").allowed(),
-                "interactive {i} within the full limit must be allowed"
+                "interactive {i} within the fenced window must be allowed"
             );
         }
-        assert!(!b.reserve(&gist_args(), now).expect("io").allowed());
+        assert!(
+            !b.reserve(&gist_args(), now).expect("io").allowed(),
+            "interactive stops short of the registry floor"
+        );
+        assert!(
+            b.reserve_class(&gist_args(), now, GhClass::Registry)
+                .expect("io")
+                .allowed(),
+            "the registry still reserves into its floor"
+        );
     }
 
     #[test]
