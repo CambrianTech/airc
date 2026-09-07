@@ -59,7 +59,27 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Run the check; print a banner on stderr if stale. Best-effort —
 /// any I/O failure is silent so this never breaks the command.
+/// Set by a test harness to silence the staleness check entirely. Same
+/// convention as `AIRC_NO_IDENTITY_PROMPT` — a courtesy for a HUMAN reader is
+/// noise (and, here, NETWORK I/O) in an automated run.
+pub const NO_STALENESS_ENV: &str = "AIRC_NO_STALENESS";
+
 pub fn warn_if_stale() {
+    // A test spawns this binary with a temp HOME, so `install_source_dir()`
+    // finds no marker and `airc_repo_root()` falls back to CWD discovery —
+    // which, for a test running inside the airc clone, resolves to the repo
+    // and then runs a live `git fetch origin canary` MID-TEST. The cache that
+    // normally gates that fetch is HOME-scoped, so a fresh temp HOME misses it
+    // every single time. That is a network round-trip inside an assertion, and
+    // on a cold Windows runner it is the difference between a green job and a
+    // flake (2026-09-07: events_commands::send_receipt_… printing "157 commits
+    // behind canary" and a gh-token line into a test that shells out to it).
+    //
+    // The check is a courtesy for a human at a terminal. It has no business
+    // running in an automated one.
+    if std::env::var_os(NO_STALENESS_ENV).is_some_and(|v| !v.is_empty()) {
+        return;
+    }
     if crate::build_info::is_unknown() {
         return;
     }
