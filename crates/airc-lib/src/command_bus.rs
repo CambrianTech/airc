@@ -310,6 +310,7 @@ impl Airc {
             Some(stream) => stream,
             None => self.subscribe().await?,
         };
+        let mut reopened: u32 = 0;
 
         loop {
             let timeout = deadline.saturating_duration_since(Instant::now());
@@ -331,7 +332,29 @@ impl Airc {
                 }
                 Ok(None) => {
                     // Stream closed before any reply arrived.
-                    return Err(AircError::CommandDeadline { correlation_id });
+                    // The per-request reply stream closed under us — the daemon
+                    // re-subscribed this handle (a room join, a restart) — and the reply,
+                    // if it comes, arrives on a NEW stream. Before 2026-09-07 this was
+                    // reported as the deadline: a sender under a 600 s budget saw nine
+                    // "timeouts" in 200 s while the peer's answers landed in its own
+                    // store. Re-open per closure and keep waiting until the real deadline;
+                    // only a re-subscribe that itself fails ends the wait early.
+                    reopened = reopened.saturating_add(1);
+                    tracing::warn!(
+                        correlation = %correlation,
+                        reopened,
+                        "await_reply: reply stream closed before the deadline; re-subscribing"
+                    );
+                    match self.subscribe().await {
+                        Ok(next) => {
+                            stream = next;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(correlation = %correlation, error = %e, "await_reply: re-subscribe failed");
+                            return Err(AircError::CommandDeadline { correlation_id });
+                        }
+                    }
                 }
                 Err(_) => {
                     return Err(AircError::CommandDeadline { correlation_id });
