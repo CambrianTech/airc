@@ -225,6 +225,7 @@ impl Airc {
         body: Body,
         mut headers: airc_core::Headers,
         delivery: airc_bus::DeliveryClass,
+        mention: IpcTarget,
     ) -> Result<PublishReceipt, AircError> {
         room.stamp_name_header(&mut headers);
         let response = self
@@ -247,7 +248,14 @@ impl Airc {
                     airc_bus::DeliveryClass::RequestResponse => IpcDelivery::RequestResponse,
                     airc_bus::DeliveryClass::StreamChunk => IpcDelivery::StreamChunk,
                 },
-                target: IpcTarget::All,
+                // The CALLER's addressing, not a pin. Hardcoding `All`
+                // here meant the whole stack could route a directed frame
+                // — the daemon maps `IpcTarget::Peer` to `Target::Peer`
+                // (airc-daemon/handlers.rs) and the monitor already
+                // RENDERS one (cli/monitor/attach.rs) — while no CLI verb
+                // could ever produce one. `publish`/`say` still pass
+                // `All`, so room broadcast is unchanged.
+                target: mention,
                 correlation_id: None,
                 coalesce_key: None,
                 // The consumer's `Body` is encoded to opaque payload

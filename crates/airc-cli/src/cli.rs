@@ -693,6 +693,20 @@ pub enum Command {
         ///   EOF
         #[arg(long, conflicts_with = "text")]
         stdin: bool,
+        /// Address this message to ONE peer instead of the whole room.
+        ///
+        /// Accepts a peer-id prefix, the same shape `airc whois` takes
+        /// (`--to e85a5bb3`). Ambiguous or unknown prefixes are refused
+        /// rather than guessed — addressing the wrong citizen is worse
+        /// than not sending.
+        ///
+        /// Without this, a message is a room broadcast and "@name" in the
+        /// body is decorative: readable by a human scanning the room,
+        /// invisible to the substrate. Every layer beneath already routes
+        /// a directed frame (the daemon maps `IpcTarget::Peer`, the
+        /// monitor renders one); this is the verb that can finally set it.
+        #[arg(long)]
+        to: Option<String>,
     },
 
     /// Publish a structured frame and emit a JSON receipt on

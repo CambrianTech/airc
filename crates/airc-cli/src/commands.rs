@@ -2571,6 +2571,7 @@ pub async fn run_msg(
     socket: PathBuf,
     room: Option<&str>,
     text: &str,
+    to: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
@@ -2580,21 +2581,67 @@ pub async fn run_msg(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room" path runs
     // unchanged.
+    // `--to <peer-prefix>` addresses ONE peer instead of the room. Resolved
+    // against the enrolled peers by the same prefix rule `airc whois` uses,
+    // and REFUSED when the prefix is unknown or ambiguous - delivering to the
+    // wrong citizen is worse than not delivering, and a silent best-guess is
+    // exactly how that happens.
+    let mention = match to {
+        None => airc_core::MentionTarget::All,
+        Some(prefix) => {
+            let peers = airc.peers().await?;
+            let matches: Vec<_> = peers
+                .iter()
+                .filter(|peer| peer.peer_id.to_string().starts_with(prefix))
+                .collect();
+            match matches.as_slice() {
+                [] => {
+                    return Err(format!(
+                        "no enrolled peer matches `{prefix}` - run `airc peers` to list them"
+                    )
+                    .into());
+                }
+                [peer] => airc_core::MentionTarget::Peer(peer.peer_id),
+                ambiguous => {
+                    return Err(format!(
+                        "`{prefix}` matches {} peers - use a longer prefix",
+                        ambiguous.len()
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+    let directed = !matches!(mention, airc_core::MentionTarget::All);
+
     let (channel_name, channel) = match room {
         Some(name) => {
             let receipt = airc
-                .publish(
+                .publish_to(
                     airc_lib::PublishTarget::RoomByName(name.to_string()),
                     airc_protocol::FrameKind::Message,
                     airc_core::Body::text(text),
                     runtime_headers()?,
+                    mention,
                 )
                 .await?;
             (receipt.channel_name, receipt.channel_id)
         }
         None => {
             let current = airc.current_room().await?;
-            airc.say_with_headers(text, runtime_headers()?).await?;
+            if directed {
+                airc.publish_to(
+                    airc_lib::PublishTarget::RoomByName(current.name.clone()),
+                    airc_protocol::FrameKind::Message,
+                    airc_core::Body::text(text),
+                    runtime_headers()?,
+                    mention,
+                )
+                .await?;
+            } else {
+                // Undirected keeps the historical say path byte-for-byte.
+                airc.say_with_headers(text, runtime_headers()?).await?;
+            }
             (current.name, current.channel)
         }
     };
