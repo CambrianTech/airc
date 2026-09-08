@@ -29,6 +29,11 @@ impl WorkBoardProjection {
             WorkEvent::ClaimHeartbeat(e) => self.apply_claim_heartbeat(e),
             WorkEvent::ClaimReleased(e) => self.apply_claim_released(e),
             WorkEvent::CardStateChanged(e) => self.apply_card_state_changed(e),
+            WorkEvent::WorkSubmitted(e) => self.apply_work_submitted(e),
+            WorkEvent::SubmissionRejected(e) => {
+                self.card_mut(e.card_id)?.last_submission_rejection = Some(e.clone());
+                Ok(())
+            }
             WorkEvent::LaneCreated(e) => self.apply_lane_created(e),
             WorkEvent::LaneStateChanged(e) => self.apply_lane_state_changed(e),
             WorkEvent::WorkspaceRequested(e) => self.apply_workspace_requested(e),
@@ -189,6 +194,8 @@ impl WorkBoardProjection {
             created_at_ms: e.created_at_ms,
             updated_at_ms: e.created_at_ms,
             reviews: e.reviews,
+            submissions: Vec::new(),
+            last_submission_rejection: None,
         };
         self.cards.insert(e.card_id, card);
         if let Some(lane_id) = e.lane_id {
@@ -213,6 +220,24 @@ impl WorkBoardProjection {
         card.claim_expires_at_ms = Some(e.claimed_at_ms + e.ttl_ms);
         card.last_heartbeat_at_ms = Some(e.claimed_at_ms);
         card.updated_at_ms = e.claimed_at_ms;
+        Ok(())
+    }
+
+    fn apply_work_submitted(
+        &mut self,
+        e: &crate::event::WorkSubmission,
+    ) -> Result<(), ProjectionError> {
+        let card = self.card_mut(e.card_id)?;
+        if card.submissions.iter().any(|prior| prior.same_candidate(e)) {
+            return Ok(());
+        }
+        if let Err(reason) = e.validate_for_card(card) {
+            card.last_submission_rejection = Some(e.rejected(reason));
+        } else {
+            // Transcript order, not a caller-controlled wall clock, selects newest.
+            card.submissions.insert(0, e.clone());
+            card.updated_at_ms = card.updated_at_ms.max(e.submitted_at_ms);
+        }
         Ok(())
     }
 

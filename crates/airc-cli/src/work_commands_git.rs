@@ -271,6 +271,8 @@ mod tests {
     /// daemon, so the result is reproducible across runs.
     fn card_with_pr(pr: Option<PullRequestRef>) -> WorkCard {
         WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
             card_id: WorkCardId::new(),
             repo: RepoId::new("acme/widgets").expect("test repo id"),
             title: "fix(scheduler): bound retry backoff".to_string(),

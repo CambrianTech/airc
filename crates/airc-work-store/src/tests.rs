@@ -341,6 +341,223 @@ fn card_claimed(card_id: WorkCardId, claim: u128, owner: u128, claimed_at_ms: u6
     })
 }
 
+fn submission(card_id: WorkCardId) -> airc_work::WorkSubmission {
+    serde_json::from_value(serde_json::json!({
+        "submission_id": airc_work::SubmissionId::from_u128(400),
+        "card_id": card_id,
+        "claim_id": airc_work::ClaimId::from_u128(90),
+        "instance": "cross-grid-case",
+        "base_sha": "a".repeat(40),
+        "artifact": { "hash": "b".repeat(64), "size_bytes": 5, "mime": "text/x-diff" },
+        "publisher": PeerId::from_u128(2),
+        "submitted_at_ms": 6000
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn submissions_survive_retry_conflict_settle_and_every_snapshot_boundary() {
+    let room = RoomId::from_u128(10);
+    let id = WorkCardId::from_u128(20);
+    let first = submission(id);
+    let mut retry = first.clone();
+    retry.submitted_at_ms += 100;
+    let mut conflict = retry.clone();
+    conflict.artifact.size_bytes += 1;
+    let mut next = first.clone();
+    next.submission_id = airc_work::SubmissionId::from_u128(401);
+    next.submitted_at_ms -= 100; // transcript order, not publisher clock, wins
+    let events = [
+        card_created(id),
+        card_claimed(id, 90, 2, 5000),
+        WorkEvent::WorkSubmitted(first.clone()),
+        WorkEvent::WorkSubmitted(retry.clone()),
+        WorkEvent::WorkSubmitted(conflict),
+        WorkEvent::WorkSubmitted(next.clone()),
+        WorkEvent::CardStateChanged(CardStateChanged {
+            card_id: id,
+            state: CardState::Closed,
+            changed_by: PeerId::from_u128(2),
+            changed_at_ms: 7000,
+        }),
+        WorkEvent::WorkSubmitted(retry),
+    ];
+    let transcripts: Vec<_> = events
+        .iter()
+        .enumerate()
+        .map(|(i, event)| work_transcript(i as u128 + 1, room, i as u64 + 1, event))
+        .collect();
+    let full = project_transcripts(transcripts.clone()).unwrap();
+    assert_eq!(full.card(id).unwrap().submissions, vec![next, first]);
+    assert_eq!(
+        full.card(id)
+            .unwrap()
+            .last_submission_rejection
+            .as_ref()
+            .unwrap()
+            .reason,
+        airc_work::SubmissionRejectionReason::ConflictingId
+    );
+    for split in 0..=transcripts.len() {
+        let mut resumed = project_transcripts(transcripts[..split].to_vec()).unwrap();
+        apply_transcripts(&mut resumed, transcripts[split..].to_vec()).unwrap();
+        assert_eq!(resumed, full);
+    }
+    let store = InMemoryEventStore::new();
+    for event in transcripts {
+        store.append(event).await.unwrap();
+    }
+    assert_eq!(
+        WorkEventStore::new(&store)
+            .project_complete(Some(room), 2)
+            .await
+            .unwrap(),
+        full
+    );
+}
+
+#[tokio::test]
+async fn malformed_submission_cannot_poison_board_or_hide_other_corruption() {
+    let room = RoomId::from_u128(10);
+    let id = WorkCardId::from_u128(20);
+    for header in [None, Some("card_created"), Some("work_submitted")] {
+        let mut malformed = work_transcript(2, room, 2, &WorkEvent::WorkSubmitted(submission(id)));
+        malformed.body = Some(Body::Json(
+            serde_json::json!({"kind": "work_submitted", "artifact": {"hash":"invalid"}}),
+        ));
+        malformed
+            .headers
+            .remove(airc_work::HEADER_FORGE_WORK_EVENT_KIND);
+        if let Some(header) = header {
+            malformed.headers.insert(
+                airc_work::HEADER_FORGE_WORK_EVENT_KIND.into(),
+                header.into(),
+            );
+        }
+        let transcripts = vec![
+            work_transcript(1, room, 1, &card_created(id)),
+            malformed,
+            work_transcript(3, room, 3, &card_state_changed(id)),
+        ];
+        let full = project_transcripts(transcripts.clone()).unwrap();
+        assert_eq!(full.card(id).unwrap().state, CardState::Review);
+        assert_eq!(
+            airc_work::project_transcript_work_events(transcripts.clone()).unwrap(),
+            full
+        );
+        let store = InMemoryEventStore::new();
+        for event in transcripts {
+            store.append(event).await.unwrap();
+        }
+        assert_eq!(
+            WorkEventStore::new(&store)
+                .project_complete(Some(room), 1)
+                .await
+                .unwrap(),
+            full
+        );
+    }
+    let mut unrelated = work_transcript(4, room, 4, &card_created(id));
+    unrelated.headers.insert(
+        airc_work::HEADER_FORGE_WORK_EVENT_KIND.into(),
+        "work_submitted".into(),
+    );
+    unrelated.body = Some(Body::Json(serde_json::json!({"kind":"card_created"})));
+    assert!(project_transcripts(vec![unrelated.clone()]).is_err());
+    assert!(airc_work::project_transcript_work_events(vec![unrelated]).is_err());
+}
+
+#[test]
+fn submission_admission_rejects_spoof_stale_claim_and_invalid_metadata() {
+    use airc_work::SubmissionRejectionReason as Reason;
+    let room = RoomId::from_u128(10);
+    let id = WorkCardId::from_u128(20);
+    let initial = vec![
+        work_transcript(1, room, 1, &card_created(id)),
+        work_transcript(2, room, 2, &card_claimed(id, 90, 2, 5000)),
+    ];
+    let mut cases = Vec::new();
+    let mut s = submission(id);
+    s.publisher = PeerId::from_u128(999);
+    cases.push((s, Reason::PublisherMismatch));
+    let mut s = submission(id);
+    s.claim_id = airc_work::ClaimId::from_u128(91);
+    cases.push((s, Reason::WrongClaim));
+    let mut s = submission(id);
+    s.submitted_at_ms = 605000;
+    cases.push((s, Reason::ExpiredClaim));
+    let mut s = submission(id);
+    s.instance.clear();
+    cases.push((s, Reason::InvalidInstance));
+    let mut s = submission(id);
+    s.artifact.mime = Some("x".repeat(129));
+    cases.push((s, Reason::InvalidArtifact));
+    let mut s = submission(id);
+    s.base_sha = serde_json::from_value(serde_json::json!("HEAD")).unwrap();
+    cases.push((s, Reason::InvalidBase));
+    for (submission, reason) in cases {
+        let mut events = initial.clone();
+        events.push(work_transcript(
+            3,
+            room,
+            3,
+            &WorkEvent::WorkSubmitted(submission),
+        ));
+        events.push(work_transcript(4, room, 4, &card_state_changed(id)));
+        let board = project_transcripts(events).unwrap();
+        let card = board.card(id).unwrap();
+        assert!(card.submissions.is_empty());
+        assert_eq!(
+            card.last_submission_rejection.as_ref().unwrap().reason,
+            reason
+        );
+        assert_eq!(card.state, CardState::Review);
+    }
+}
+
+#[test]
+fn submission_wire_stays_small_and_legacy_cards_default_to_no_submissions() {
+    let id = WorkCardId::from_u128(20);
+    let mut candidate = submission(id);
+    candidate.artifact.size_bytes = u64::MAX;
+    candidate.instance = "x".repeat(512);
+    candidate.artifact.mime = Some("x".repeat(128));
+    candidate.validate().unwrap();
+    let event = WorkEvent::WorkSubmitted(candidate.clone());
+    let (headers, body) = encode_work_event(&event).unwrap();
+    assert_eq!(
+        airc_work::decode_work_event(&headers, Some(&body)).unwrap(),
+        event
+    );
+    assert!(serde_json::to_vec(&event).unwrap().len() < 2048);
+    // Rejection receipts are projection-only, never publisher-supplied truth.
+    assert!(serde_json::from_value::<WorkEvent>(serde_json::json!({
+        "kind": "submission_rejected",
+        "submission_id": candidate.submission_id,
+        "card_id": id,
+        "publisher": candidate.publisher,
+        "submitted_at_ms": candidate.submitted_at_ms,
+        "reason": "wrong_claim"
+    }))
+    .is_err());
+    let board = project_transcripts(vec![work_transcript(
+        1,
+        RoomId::from_u128(10),
+        1,
+        &card_created(id),
+    )])
+    .unwrap();
+    let mut legacy = serde_json::to_value(board.card(id).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("submissions");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("last_submission_rejection");
+    let decoded: airc_work::WorkCard = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.submissions.is_empty());
+    assert!(decoded.last_submission_rejection.is_none());
+}
+
 #[test]
 fn apply_transcripts_resume_equals_full_replay_across_claim_arbitration() {
     let room = RoomId::from_u128(10);

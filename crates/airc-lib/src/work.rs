@@ -21,6 +21,18 @@ use airc_work::{
 
 const WORK_MUTATION_PAGE_SIZE: usize = 512;
 
+/// Stable id makes retrying a timed-out publish safe. Author and time are
+/// supplied by AIRC, never by the caller's manifest.
+#[derive(Debug, Clone)]
+pub struct SubmitWork {
+    pub submission_id: airc_work::SubmissionId,
+    pub card_id: WorkCardId,
+    pub claim_id: ClaimId,
+    pub instance: String,
+    pub base_sha: airc_work::GitObjectId,
+    pub artifact: airc_work::SubmissionArtifact,
+}
+
 /// Canonical pagination size for complete work-board projections.
 ///
 /// Card acd72c81: a complete projection read as ONE Inbox RPC asks the
@@ -427,6 +439,43 @@ fn build_operator_card_created(
 }
 
 impl Airc {
+    /// Publish an immutable artifact reference into the card's own room. This
+    /// does not upload the blob or claim remote availability: consumers fetch
+    /// by content hash and verify size/hash before using it.
+    pub async fn submit_work_in(
+        &self,
+        room: &Room,
+        request: SubmitWork,
+    ) -> Result<airc_work::WorkSubmission, AircError> {
+        let board = self.work_board_in(room).await?;
+        let card = board
+            .card(request.card_id)
+            .ok_or(airc_work::ProjectionError::UnknownCard(request.card_id))?;
+        let mut submission = airc_work::WorkSubmission {
+            submission_id: request.submission_id,
+            card_id: request.card_id,
+            claim_id: request.claim_id,
+            instance: request.instance,
+            base_sha: request.base_sha,
+            artifact: request.artifact,
+            publisher: self.peer_id(),
+            submitted_at_ms: now_ms()?,
+        };
+        if let Some(prior) = card
+            .submissions
+            .iter()
+            .find(|s| s.submission_id == submission.submission_id)
+        {
+            submission.submitted_at_ms = prior.submitted_at_ms;
+            submission.validate_for_card(card)?;
+            return Ok(prior.clone());
+        }
+        submission.validate_for_card(card)?;
+        self.publish_work_event_in(room, &WorkEvent::WorkSubmitted(submission.clone()))
+            .await?;
+        Ok(submission)
+    }
+
     /// Create a work card in the current room and publish it as a
     /// signed work-domain event. Returns the UUIDv4 card id generated
     /// locally for this card.
@@ -1439,6 +1488,8 @@ mod tests {
         pull_request: Option<airc_work::model::PullRequestRef>,
     ) -> WorkCard {
         WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
             card_id: WorkCardId::from_u128(1),
             repo: RepoId::new("CambrianTech/airc").unwrap(),
             title: "relink gate".to_string(),

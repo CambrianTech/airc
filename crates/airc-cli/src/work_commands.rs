@@ -2012,15 +2012,19 @@ pub async fn run_board(
     let me = airc.peer_id();
 
     // Pre-fetch published aliases for every distinct non-self owner on
-    // the board (kink 6f111211 / card c397567a). One scan per peer for
-    // now — N is small, and peer_alias is page_recent-backed; if this
-    // becomes a hot path the follow-up is one shared scan + a
-    // local index.
+    // the board (kink 6f111211 / card c397567a). peer_alias uses the
+    // daemon-aware durable identity index, independent of presence.
     let snapshot = board.snapshot();
     let now = now_ms();
     let mut owner_peers: std::collections::HashSet<airc_lib::PeerId> =
         std::collections::HashSet::new();
     for card in &snapshot.cards {
+        owner_peers.extend(
+            card.submissions
+                .iter()
+                .map(|submission| submission.publisher)
+                .filter(|peer| *peer != me),
+        );
         if let Some(owner) = card.owner {
             if owner != me {
                 owner_peers.insert(owner);
@@ -2246,6 +2250,20 @@ fn print_board(
             repo = card.repo,
             title = card.title,
         );
+        if let Some(submission) = card.submissions.first() {
+            println!(
+                "  submissions={} latest={} publisher={} base={} sha256={} bytes={} (artifact reference; availability not asserted)",
+                card.submissions.len(), submission.submission_id,
+                format_peer(submission.publisher, me, aliases), submission.base_sha,
+                submission.artifact.hash, submission.artifact.size_bytes,
+            );
+        }
+        if let Some(rejected) = &card.last_submission_rejection {
+            println!(
+                "  submission_rejected={} reason={}",
+                rejected.submission_id, rejected.reason
+            );
+        }
     }
     if !stale_claims.is_empty() {
         println!();
@@ -3398,6 +3416,8 @@ mod tests {
         claim_expires_at_ms: Option<u64>,
     ) -> WorkCard {
         WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
             card_id: WorkCardId::from_u128(1),
             repo: RepoId::new("test/test").unwrap(),
             title: "t".into(),

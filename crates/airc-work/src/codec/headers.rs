@@ -35,6 +35,12 @@ pub fn work_event_headers(event: &WorkEvent) -> Headers {
 
 fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
     match event {
+        WorkEvent::WorkSubmitted(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+            insert_display_header(headers, HEADER_FORGE_WORK_CLAIM_ID, e.claim_id);
+            insert_display_header(headers, HEADER_FORGE_WORK_GIT_COMMIT, &e.base_sha);
+        }
+        WorkEvent::SubmissionRejected(_) => {}
         WorkEvent::CardCreated(e) => {
             insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
             headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());

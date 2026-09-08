@@ -46,6 +46,7 @@ macro_rules! uuid_id {
 uuid_id!(WorkCardId);
 uuid_id!(LaneId);
 uuid_id!(ClaimId);
+uuid_id!(SubmissionId);
 uuid_id!(WorkspaceId);
 // Card e4cad280 slice A: idle-agent engine goals (long-running
 // aspirations recipes synthesize work against). Goal events + projection

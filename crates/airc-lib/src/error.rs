@@ -22,6 +22,9 @@ pub enum AircError {
     #[error("work event codec: {0}")]
     WorkCodec(#[from] airc_work::WorkEventCodecError),
 
+    #[error("work submission rejected: {0}")]
+    WorkSubmission(#[from] airc_work::SubmissionRejectionReason),
+
     #[error("local git observer: {0}")]
     LocalGit(#[from] airc_work::LocalGitError),
 
