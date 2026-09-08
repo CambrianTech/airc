@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use airc_core::transcript::TranscriptKind;
-use airc_core::{ClientId, HeaderFilter, PeerId, RoomId, SelfFilter, TranscriptEvent};
+use airc_core::{
+    ClientId, HeaderFilter, PeerId, RoomId, SelfFilter, TranscriptCursor, TranscriptEvent,
+};
 use futures::stream::Stream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -96,6 +98,14 @@ impl Stream for EventStream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveLag {
     pub skipped: u64,
+}
+
+/// One bounded transcript scan, with progress independent of display filters.
+/// An empty `events` with `scanned_through: Some(_)` is a filtered page, not
+/// exhaustion. Resume from that cursor to reach later matching events.
+pub struct EventScan {
+    pub events: Vec<TranscriptEvent>,
+    pub scanned_through: Option<TranscriptCursor>,
 }
 
 impl std::fmt::Display for LiveLag {

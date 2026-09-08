@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::error::AircError;
 use crate::route::{RouteClass, RouteDecision, TransportResolver, TransportRoute};
-use crate::stream::{EventFilter, EventStream, FilteredEventStream};
+use crate::stream::{EventFilter, EventScan, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
 
@@ -603,23 +603,37 @@ impl Airc {
         filter: EventFilter,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let filter = self.subscribed_event_filter(filter).await?;
-        if self.is_daemon_attached() {
-            return Ok(self
-                .daemon_resume_from_subscribed(cursor, limit)
-                .await?
-                .into_iter()
-                .filter(|event| filter.matches(event))
-                .collect());
-        }
         Ok(self
-            .inner
-            .store
-            .resume_from(cursor, filter.channel, limit)
+            .scan_subscribed_events(cursor, filter, limit)
             .await?
-            .into_iter()
-            .filter(|event| filter.matches(event))
-            .collect())
+            .events)
+    }
+
+    /// Return one page of at most `limit` records, retaining subscribed matches.
+    /// Unlike the Vec-only resume surface, this preserves raw scan progress
+    /// when an entire local-store page belongs to other rooms or is filtered
+    /// out. Only `scanned_through: None` means no records were read.
+    pub async fn scan_subscribed_events(
+        &self,
+        cursor: &TranscriptCursor,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<EventScan, AircError> {
+        let filter = self.subscribed_event_filter(filter).await?;
+        let mut events = if self.is_daemon_attached() {
+            self.daemon_resume_from_subscribed(cursor, limit).await?
+        } else {
+            self.inner
+                .store
+                .resume_from(cursor, filter.channel, limit)
+                .await?
+        };
+        let scanned_through = events.last().map(TranscriptEvent::cursor);
+        events.retain(|event| filter.matches(event));
+        Ok(EventScan {
+            events,
+            scanned_through,
+        })
     }
 
     /// Cursor of the newest event in the current room — via the daemon

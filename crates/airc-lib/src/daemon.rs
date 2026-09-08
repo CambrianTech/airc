@@ -376,9 +376,11 @@ impl Airc {
         for subscription in set.all() {
             let room = subscription.as_room();
             merged.extend(self.daemon_resume_from(&room, cursor, limit).await?);
+            // Keep at most one retained page plus the next room's page in
+            // memory, and use the full cursor order before trimming ties.
+            merged.sort_unstable_by_key(|event| (event.lamport, event.event_id.0));
+            merged.truncate(limit);
         }
-        merged.sort_by_key(|event| event.lamport);
-        merged.truncate(limit);
         Ok(merged)
     }
 
