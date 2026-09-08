@@ -133,6 +133,8 @@ pub struct PendingCommand {
     /// the request/await contract rather than constructing half-armed
     /// pending commands.
     reply_stream: Option<EventStream>,
+    // Preserve the dispatch room across default-room changes and re-subscribe.
+    reply_room: airc_core::RoomId,
 }
 
 impl std::fmt::Debug for PendingCommand {
@@ -189,14 +191,45 @@ impl Airc {
     pub async fn request(
         &self,
         target: MentionTarget,
+        headers: Headers,
+        body: Body,
+        deadline: Duration,
+    ) -> Result<PendingCommand, AircError> {
+        self.request_on(None, target, headers, body, deadline).await
+    }
+
+    /// Request in an explicit activity room without changing current-room state.
+    pub async fn request_in(
+        &self,
+        room: &crate::Room,
+        target: MentionTarget,
+        headers: Headers,
+        body: Body,
+        deadline: Duration,
+    ) -> Result<PendingCommand, AircError> {
+        self.request_on(Some(room), target, headers, body, deadline)
+            .await
+    }
+
+    async fn request_on(
+        &self,
+        room: Option<&crate::Room>,
+        target: MentionTarget,
         mut headers: Headers,
         body: Body,
         deadline: Duration,
     ) -> Result<PendingCommand, AircError> {
+        let room = match room {
+            Some(room) => {
+                self.room_by_name_or_channel(&room.channel.to_string(), "request in")
+                    .await?
+            }
+            None => self.current_room().await?,
+        };
         let correlation_id = Uuid::new_v4();
         let deadline_at_ms = now_ms()? + deadline.as_millis() as u64;
         let __sub = airc_diagnostics::timing::start();
-        let reply_stream = self.subscribe().await?;
+        let reply_stream = self.command_reply_stream(room.channel).await?;
         __sub.stop("airc.req.subscribe");
 
         headers.insert(
@@ -210,15 +243,34 @@ impl Airc {
         headers.insert(HEADER_AIRC_DEADLINE.into(), deadline_at_ms.to_string());
 
         let __send = airc_diagnostics::timing::start();
-        self.send_frame_to(airc_protocol::FrameKind::Message, target, body, headers)
-            .await?;
+        self.send_frame_to_room(
+            airc_protocol::FrameKind::Message,
+            target,
+            body,
+            headers,
+            &room,
+        )
+        .await?;
         __send.stop("airc.req.send_frame");
 
         Ok(PendingCommand {
             correlation_id,
             deadline_at_ms,
             reply_stream: Some(reply_stream),
+            reply_room: room.channel,
         })
+    }
+
+    async fn command_reply_stream(
+        &self,
+        room: airc_core::RoomId,
+    ) -> Result<EventStream, AircError> {
+        if self.is_daemon_attached() {
+            self.daemon_subscribe(vec![room], None, airc_core::HeaderFilter::Any)
+                .await
+        } else {
+            self.subscribe().await
+        }
     }
 
     /// Reply to an in-flight request INTO THE CHANNEL THE REQUEST ARRIVED ON.
@@ -308,7 +360,7 @@ impl Airc {
                 .unwrap_or_else(|| Duration::from_secs(0));
         let mut stream = match pending.reply_stream {
             Some(stream) => stream,
-            None => self.subscribe().await?,
+            None => self.command_reply_stream(pending.reply_room).await?,
         };
         let mut reopened: u32 = 0;
 
@@ -320,6 +372,7 @@ impl Airc {
             match tokio::time::timeout(timeout, stream.next()).await {
                 Ok(Some(Ok(event))) => {
                     if event.headers.get(HEADER_AIRC_CORRELATION_ID) == Some(&correlation)
+                        && event.room_id == pending.reply_room
                         && event.peer_id != self.inner.identity.peer_id
                     {
                         return Ok(event.as_ref().clone());
@@ -345,7 +398,7 @@ impl Airc {
                         reopened,
                         "await_reply: reply stream closed before the deadline; re-subscribing"
                     );
-                    match self.subscribe().await {
+                    match self.command_reply_stream(pending.reply_room).await {
                         Ok(next) => {
                             stream = next;
                             continue;
@@ -375,6 +428,7 @@ mod tests {
             correlation_id: Uuid::new_v4(),
             deadline_at_ms: 1,
             reply_stream: None,
+            reply_room: airc_core::RoomId::new(),
         };
         assert!(pending.remaining().is_none());
     }
@@ -386,6 +440,7 @@ mod tests {
             correlation_id: Uuid::new_v4(),
             deadline_at_ms: u64::MAX / 2,
             reply_stream: None,
+            reply_room: airc_core::RoomId::new(),
         };
         let remaining = pending.remaining().unwrap();
         assert!(remaining.as_millis() > 0);
