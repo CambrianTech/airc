@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use airc_core::{Body, HeaderFilter, Headers};
 use airc_protocol::{FrameKind, Subscription, HEADER_FORGE_BODY_HINT};
+use serde::Deserialize;
 
 use crate::event::WorkEvent;
 
@@ -58,7 +59,9 @@ pub fn decode_work_event(
     let Body::Json(value) = body else {
         return Err(WorkEventCodecError::NonJsonBody);
     };
-    Ok(serde_json::from_value(value.clone())?)
+    // Decode from the existing tree. Cloning it first allocates every JSON
+    // key/container on each replay; owned WorkEvent fields are sufficient.
+    Ok(WorkEvent::deserialize(value)?)
 }
 
 pub fn work_event_subscription() -> Subscription {
