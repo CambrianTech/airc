@@ -221,6 +221,19 @@ pub(crate) fn delivery_class_header_value(delivery: DeliveryClass) -> &'static s
     }
 }
 
+/// Decode the delivery contract at a wire boundary. Only a missing header is
+/// legacy durable traffic; an unknown explicit class must not become history.
+pub(crate) fn delivery_class_from_header(value: Option<&str>) -> Result<DeliveryClass, String> {
+    match value {
+        None | Some("durable") => Ok(DeliveryClass::Durable),
+        Some("ephemeral_latest") => Ok(DeliveryClass::EphemeralLatest),
+        Some("ephemeral_window") => Ok(DeliveryClass::EphemeralWindow),
+        Some("request_response") => Ok(DeliveryClass::RequestResponse),
+        Some("stream_chunk") => Ok(DeliveryClass::StreamChunk),
+        Some(value) => Err(format!("unknown airc delivery class: {value:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

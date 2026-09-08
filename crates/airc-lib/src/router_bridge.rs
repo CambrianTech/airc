@@ -28,6 +28,15 @@
 //! INSTEAD of the handle's scope store. Fan-out at delivery, no
 //! per-scope copies, one durable transcript per machine (§3.3).
 //!
+//! ## Delivery contract
+//!
+//! Inbound frames retain their explicit delivery-class header. Transient
+//! classes use the router's live delivery path without a durable ORM write;
+//! legacy frames without the header remain durable. An unknown explicit class
+//! fails delivery before publication rather than silently becoming history.
+//! This bridge does not enable outbound transient forwarding or carry missing
+//! coalescing keys across the wire.
+//!
 //! ## No double delivery
 //!
 //! The router's [`EventRouter::publish_if_new`] is idempotent on the
@@ -52,7 +61,7 @@
 
 use std::sync::Arc;
 
-use airc_bus::envelope::{DeliveryClass, Kind, Target};
+use airc_bus::envelope::{Kind, Target};
 use airc_bus::{EventRouter, PublishIfNew};
 use airc_core::transcript::MentionTarget;
 use airc_core::RoomId;
@@ -367,6 +376,10 @@ enum ChannelBinding {
 #[async_trait]
 impl InboundFrameSink for RouterInboundBridge {
     async fn deliver(&self, frame: &Frame) -> InboundDeliveryVerdict {
+        let mut env = match bus_envelope_for_inbound(frame) {
+            Ok(env) => env,
+            Err(error) => return InboundDeliveryVerdict::Failed(error),
+        };
         let event_id = frame.envelope.event_id;
         let addressed = frame.envelope.channel;
         // Resolve the local binding BEFORE publish so a name-
@@ -383,7 +396,6 @@ impl InboundFrameSink for RouterInboundBridge {
             ChannelBinding::Unbound => self.reconverge_by_name(frame, addressed).await,
             ChannelBinding::Bound | ChannelBinding::Unknown(_) => None,
         };
-        let mut env = bus_envelope_for_inbound(frame);
         if let Some(local) = remapped {
             env.channel = local;
             // Keep a room mention coherent with the delivery channel
@@ -451,7 +463,14 @@ impl InboundFrameSink for RouterInboundBridge {
 /// [`EventRouter::publish_if_new`] and the identity the delivery ack
 /// (`ack.for_event`) refers to. `seq`/`occurred_at_ms` are owner-
 /// stamped at publish, exactly like local sends.
-fn bus_envelope_for_inbound(frame: &Frame) -> airc_bus::envelope::Envelope {
+fn bus_envelope_for_inbound(frame: &Frame) -> Result<airc_bus::envelope::Envelope, String> {
+    let delivery = crate::publish::delivery_class_from_header(
+        frame
+            .envelope
+            .headers
+            .get(airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS)
+            .map(String::as_str),
+    )?;
     let payload = frame
         .envelope
         .body
@@ -467,7 +486,7 @@ fn bus_envelope_for_inbound(frame: &Frame) -> airc_bus::envelope::Envelope {
         frame.envelope.channel,
         (frame.envelope.sender, frame.envelope.sender_client),
         kind,
-        DeliveryClass::Durable,
+        delivery,
         bytes::Bytes::from(payload),
     );
     env.event_id = frame.envelope.event_id;
@@ -481,12 +500,16 @@ fn bus_envelope_for_inbound(frame: &Frame) -> airc_bus::envelope::Envelope {
     };
     env.correlation_id = frame.envelope.reply_to.map(|id| id.as_uuid());
     env.headers = frame.envelope.headers.clone();
-    env
+    Ok(env)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use airc_bus::{
+        DeliveryClass, Filter, InMemoryDurableSink, InMemoryEpochStore, ManualClock, RouterConfig,
+        SeqSource,
+    };
     use airc_core::{Body, EventId, Headers, PeerId};
     use airc_protocol::{Envelope as ProtoEnvelope, Signature};
 
@@ -515,12 +538,78 @@ mod tests {
         let channel = RoomId::new();
         let event_id = EventId::new();
         let f = frame(channel, event_id);
-        let env = bus_envelope_for_inbound(&f);
+        let env = bus_envelope_for_inbound(&f).expect("legacy durable frame");
         assert_eq!(env.event_id, event_id, "sender-minted id must survive");
         assert_eq!(env.channel, channel);
         assert_eq!(env.kind, Kind::Message);
         assert_eq!(env.delivery, DeliveryClass::Durable);
         let body = Body::from_payload(&env.payload).expect("payload round-trips");
         assert_eq!(body, Body::text("bridged"));
+    }
+
+    // Regression for 5134db66: a remote transient payload must reach live
+    // subscribers without becoming an ORM row. The final durable publication
+    // is a write-behind barrier, so this does not rely on sleeping for writes.
+    #[tokio::test]
+    async fn inbound_transient_classes_stay_off_the_durable_sink() {
+        use futures::StreamExt;
+        let sink = Arc::new(InMemoryDurableSink::new());
+        let router = EventRouter::new(
+            RouterConfig::default(),
+            Arc::new(ManualClock::new(1000)),
+            Arc::new(SeqSource::start_at_counter(&InMemoryEpochStore::new(), 0)),
+            sink.clone(),
+        );
+        let channel = RoomId::new();
+        let stream = router.subscribe(Filter::channel(channel), None);
+        futures::pin_mut!(stream);
+        for delivery in [
+            DeliveryClass::EphemeralLatest,
+            DeliveryClass::EphemeralWindow,
+            DeliveryClass::RequestResponse,
+            DeliveryClass::StreamChunk,
+            DeliveryClass::Durable,
+        ] {
+            let mut f = frame(channel, EventId::new());
+            f.envelope.headers.insert(
+                airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.to_string(),
+                crate::publish::delivery_class_header_value(delivery).to_string(),
+            );
+            let env = bus_envelope_for_inbound(&f).expect("known class");
+            assert_eq!(env.delivery, delivery);
+            router.publish_if_new(env).await.expect("publish ingress");
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .expect("live delivery")
+                .expect("subscriber open");
+            assert_eq!(received.event_id, f.envelope.event_id);
+            assert_eq!(received.delivery, delivery);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sink.len(channel) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable barrier reached sink");
+        assert_eq!(
+            sink.len(channel),
+            1,
+            "only the durable control is persisted"
+        );
+    }
+
+    // An explicit unsupported class must fail before any publish, including an
+    // empty header. Missing headers alone retain the legacy durable contract.
+    #[test]
+    fn inbound_unknown_delivery_is_rejected() {
+        for value in ["", "future_class", "Durable"] {
+            let mut f = frame(RoomId::new(), EventId::new());
+            f.envelope.headers.insert(
+                airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.to_string(),
+                value.to_string(),
+            );
+            assert!(bus_envelope_for_inbound(&f).is_err());
+        }
     }
 }
