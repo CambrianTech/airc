@@ -13,6 +13,7 @@ publish = false
 workspace = true
 
 [dependencies]
+airc-blobs = { path = "../airc-blobs" }
 airc-core = { path = "../airc-core" }
 airc-protocol = { path = "../airc-protocol" }
 serde = { version = "1", features = ["derive"] }

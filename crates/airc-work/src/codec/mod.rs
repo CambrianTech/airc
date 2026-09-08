@@ -90,6 +90,8 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::ClaimHeartbeat(_) => "claim_heartbeat",
         WorkEvent::ClaimReleased(_) => "claim_released",
         WorkEvent::CardStateChanged(_) => "card_state_changed",
+        WorkEvent::WorkSubmitted(_) => "work_submitted",
+        WorkEvent::SubmissionRejected(_) => "submission_rejected",
         WorkEvent::LaneCreated(_) => "lane_created",
         WorkEvent::LaneStateChanged(_) => "lane_state_changed",
         WorkEvent::WorkspaceRequested(_) => "workspace_requested",

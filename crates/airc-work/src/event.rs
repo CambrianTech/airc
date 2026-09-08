@@ -23,6 +23,10 @@ pub enum WorkEvent {
     ClaimHeartbeat(ClaimHeartbeat),
     ClaimReleased(ClaimReleased),
     CardStateChanged(CardStateChanged),
+    WorkSubmitted(WorkSubmission),
+    /// Derived during authenticated transcript replay, never accepted from wire.
+    #[serde(skip)]
+    SubmissionRejected(RejectedSubmission),
     LaneCreated(LaneCreated),
     LaneStateChanged(LaneStateChanged),
     WorkspaceRequested(WorkspaceRequested),
@@ -70,6 +74,8 @@ impl WorkEvent {
             WorkEvent::ClaimHeartbeat(e) => e.heartbeat_at_ms,
             WorkEvent::ClaimReleased(e) => e.released_at_ms,
             WorkEvent::CardStateChanged(e) => e.changed_at_ms,
+            WorkEvent::WorkSubmitted(e) => e.submitted_at_ms,
+            WorkEvent::SubmissionRejected(e) => e.submitted_at_ms,
             WorkEvent::LaneCreated(e) => e.created_at_ms,
             WorkEvent::LaneStateChanged(e) => e.changed_at_ms,
             WorkEvent::WorkspaceRequested(e) => e.requested_at_ms,
@@ -96,6 +102,124 @@ impl WorkEvent {
             WorkEvent::GoalAchieved(e) => e.achieved_at_ms,
             WorkEvent::GoalAbandoned(e) => e.abandoned_at_ms,
             WorkEvent::GoalDryTickRecorded(e) => e.recorded_at_ms,
+        }
+    }
+}
+
+/// A durable submission names content, not a path on its author's machine.
+/// Publishing a reference does not assert that another node has fetched it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkSubmission {
+    pub submission_id: crate::ids::SubmissionId,
+    pub card_id: WorkCardId,
+    pub claim_id: ClaimId,
+    pub instance: String,
+    pub base_sha: GitObjectId,
+    pub artifact: airc_blobs::MediaRef,
+    pub publisher: PeerId,
+    pub submitted_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionRejectionReason {
+    #[error("submission publisher differs from transcript author")]
+    PublisherMismatch,
+    #[error("submission base must be a full SHA-1 or SHA-256 commit id")]
+    InvalidBase,
+    #[error("submission instance must contain 1..=512 UTF-8 bytes")]
+    InvalidInstance,
+    #[error("artifact MIME hint exceeds 128 UTF-8 bytes")]
+    InvalidArtifact,
+    #[error("submission does not belong to the current claim holder")]
+    WrongClaim,
+    #[error("claim was expired when the submission was published")]
+    ExpiredClaim,
+    #[error("card is already settled")]
+    SettledCard,
+    #[error("submission id was already used for different immutable content")]
+    ConflictingId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedSubmission {
+    pub submission_id: crate::ids::SubmissionId,
+    pub card_id: WorkCardId,
+    pub publisher: PeerId,
+    pub submitted_at_ms: u64,
+    pub reason: SubmissionRejectionReason,
+}
+
+impl WorkSubmission {
+    /// Retries retain the first accepted publication time, even when a stale
+    /// board read causes the publisher to stamp the retry with a later time.
+    pub fn same_candidate(&self, other: &Self) -> bool {
+        self.submission_id == other.submission_id
+            && self.card_id == other.card_id
+            && self.claim_id == other.claim_id
+            && self.instance == other.instance
+            && self.base_sha == other.base_sha
+            && self.artifact == other.artifact
+            && self.publisher == other.publisher
+    }
+
+    /// Admission is also replayed against historical claim state, never today's clock.
+    pub fn validate_for_card(
+        &self,
+        card: &crate::model::WorkCard,
+    ) -> Result<(), SubmissionRejectionReason> {
+        use SubmissionRejectionReason as Reason;
+        if let Some(prior) = card
+            .submissions
+            .iter()
+            .find(|s| s.submission_id == self.submission_id)
+        {
+            return if prior.same_candidate(self) {
+                Ok(())
+            } else {
+                Err(Reason::ConflictingId)
+            };
+        }
+        self.validate()?;
+        if card.card_id != self.card_id
+            || card.owner != Some(self.publisher)
+            || card.claim_id != Some(self.claim_id)
+        {
+            return Err(Reason::WrongClaim);
+        }
+        if card.state.is_settled() {
+            return Err(Reason::SettledCard);
+        }
+        if card
+            .claim_expires_at_ms
+            .is_none_or(|expiry| self.submitted_at_ms >= expiry)
+        {
+            return Err(Reason::ExpiredClaim);
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), SubmissionRejectionReason> {
+        let base = self.base_sha.as_str();
+        if !matches!(base.len(), 40 | 64) || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SubmissionRejectionReason::InvalidBase);
+        }
+        if self.instance.trim().is_empty() || self.instance.len() > 512 {
+            return Err(SubmissionRejectionReason::InvalidInstance);
+        }
+        if self.artifact.mime.as_ref().is_some_and(|m| m.len() > 128) {
+            return Err(SubmissionRejectionReason::InvalidArtifact);
+        }
+        Ok(())
+    }
+
+    pub fn rejected(&self, reason: SubmissionRejectionReason) -> RejectedSubmission {
+        RejectedSubmission {
+            submission_id: self.submission_id,
+            card_id: self.card_id,
+            publisher: self.publisher,
+            submitted_at_ms: self.submitted_at_ms,
+            reason,
         }
     }
 }

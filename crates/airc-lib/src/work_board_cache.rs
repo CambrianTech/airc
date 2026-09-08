@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when the persisted shape (or projection semantics feeding it)
 /// changes; old snapshots are then discarded and rebuilt.
-pub(crate) const WORK_BOARD_CACHE_FORMAT_VERSION: u32 = 1;
+pub(crate) const WORK_BOARD_CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Subdirectory of the scope home holding one snapshot per room.
 const CACHE_DIR: &str = "work-board-cache";

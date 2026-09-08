@@ -484,6 +484,8 @@ mod tests {
 
     fn work_card(title: &str) -> WorkCard {
         WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
             card_id: WorkCardId::new(),
             repo: RepoId::new("CambrianTech/airc").unwrap(),
             title: title.to_string(),

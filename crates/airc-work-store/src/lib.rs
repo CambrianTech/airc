@@ -150,7 +150,14 @@ fn decode_page(transcripts: Vec<TranscriptEvent>) -> Result<WorkEventPage, WorkS
         if !transcript_is_work_event(&transcript) {
             continue;
         }
-        let item = decode_transcript_work_event(&transcript)?;
+        let item = match decode_transcript_work_event(&transcript) {
+            Ok(item) => item,
+            Err(error @ WorkReplayError::RejectedSubmission { .. }) => {
+                eprintln!("airc work replay: {error}");
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         events.push(item.event);
     }
 

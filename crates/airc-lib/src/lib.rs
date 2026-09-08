@@ -208,7 +208,7 @@ pub use work::{
     HeartbeatWorkspace, LinkCardPullRequest, MarkPullRequestMerged, ObserveLocalGitWorkspace,
     ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat,
     ReleaseWorkClaim, ReleaseWorkspace, RelinkCardPullRequest, ReportAgentAvailability,
-    RequestWorkspace, UpdateWorkCard, WorkQueueStatus, WorkQueueStatusQuery,
+    RequestWorkspace, SubmitWork, UpdateWorkCard, WorkQueueStatus, WorkQueueStatusQuery,
     WORK_BOARD_PROJECTION_PAGE_SIZE,
 };
 pub use work_manager::{

@@ -18,6 +18,8 @@ pub mod pull_requests;
 pub mod recipe;
 pub mod replay;
 
+pub use airc_blobs::MediaRef as SubmissionArtifact;
+
 pub use codec::{
     decode_work_event, encode_work_event, work_event_headers, work_event_subscription,
     WorkEventCodecError, BODY_HINT_FORGE_WORK_EVENT, HEADER_FORGE_WORK_CARD_ID,
@@ -35,15 +37,16 @@ pub use event::{
     ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded,
     LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
     PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
-    PullRequestMerged, PullRequestRelinked, PullRequestReviewSubmitted, WorkCardClaimed, WorkEvent,
-    WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
+    PullRequestMerged, PullRequestRelinked, PullRequestReviewSubmitted, RejectedSubmission,
+    SubmissionRejectionReason, WorkCardClaimed, WorkEvent, WorkSubmission, WorkspaceAllocated,
+    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
     WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 pub use goal::{ExitCondition, Goal, GoalState};
 pub use goal_event::{
     CardOrigin, ExternalSource, GoalAbandoned, GoalAchieved, GoalCreated, GoalDryTickRecorded,
 };
-pub use ids::{ClaimId, GoalId, LaneId, RepoId, WorkCardId, WorkspaceId};
+pub use ids::{ClaimId, GoalId, LaneId, RepoId, SubmissionId, WorkCardId, WorkspaceId};
 pub use local_git::{
     local_git_events_since, CommandGitRunner, GitCommandRunner, LocalGitError, LocalGitObserver,
     LocalGitSnapshot, LocalGitWorkspace,
