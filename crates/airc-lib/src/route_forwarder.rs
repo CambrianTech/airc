@@ -687,6 +687,13 @@ fn build_forward_frame(
         )
     };
     let mut headers = env.headers.clone();
+    // The typed router field governs local persistence. Stamp its wire
+    // representation before signing so a caller-supplied label cannot give
+    // the receiving node a different delivery contract.
+    headers.insert(
+        airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.to_string(),
+        crate::publish::delivery_class_header_value(env.delivery).to_string(),
+    );
     if request_ack {
         headers.insert(
             HEADER_AIRC_DELIVERY_ACK.to_string(),
@@ -787,6 +794,49 @@ mod tests {
                 env.kind,
                 Kind::Command | Kind::CommandResult | Kind::Signal | Kind::StreamChunk
             ));
+        }
+    }
+
+    // Regression for #1403: an untrusted header must not override the typed
+    // delivery class when the forwarder signs an envelope for another node.
+    #[tokio::test]
+    async fn forwarding_stamps_typed_delivery_over_misleading_headers() {
+        let dir = tempfile::tempdir().expect("isolated home");
+        let link =
+            Airc::open_with_wire_root_for_test(dir.path().join("scope"), dir.path().join("wire"))
+                .await
+                .expect("isolated signing handle");
+        for delivery in [
+            DeliveryClass::Durable,
+            DeliveryClass::EphemeralLatest,
+            DeliveryClass::EphemeralWindow,
+            DeliveryClass::RequestResponse,
+            DeliveryClass::StreamChunk,
+        ] {
+            let mut env = durable_env(Kind::Event);
+            env.delivery = delivery;
+            env.headers.insert(
+                airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.to_string(),
+                "caller_supplied_wrong_class".to_string(),
+            );
+            let frame = build_forward_frame(&link, &env, false)
+                .expect("forward encoding")
+                .expect("wire-capable event kind");
+            assert_eq!(
+                frame
+                    .envelope
+                    .headers
+                    .get(airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS)
+                    .map(String::as_str),
+                Some(crate::publish::delivery_class_header_value(delivery)),
+            );
+            assert_eq!(
+                env.headers
+                    .get(airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS)
+                    .map(String::as_str),
+                Some("caller_supplied_wrong_class"),
+                "wire projection must not mutate the shared source envelope"
+            );
         }
     }
 }

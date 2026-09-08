@@ -145,11 +145,11 @@ pub const HEADER_AIRC_CAPABILITY_GRANT: &str = "airc.capability_grant";
 /// glyph and thought behind it. Same rule the routing headers already
 /// follow (`airc.priority`, `airc.deadline`, body_hint).
 ///
-/// Advisory, never authoritative: the DAEMON decides actual persistence
-/// from the typed IPC field. This header is what the wire tells everyone
-/// else about that decision, so a subscriber and the store can never be
-/// made to disagree by a lying publisher — worst case a mislabeled line
-/// is filtered oddly by peers while the store does the right thing.
+/// The daemon decides local persistence from the typed IPC field. The routed
+/// forwarder overwrites this header from that typed field before signing;
+/// the receiving router bridge uses it to preserve the delivery contract.
+/// Missing headers on legacy frames mean durable; unknown explicit values
+/// fail ingress. Subscriber filtering can inspect this without a body decode.
 pub const HEADER_AIRC_DELIVERY_CLASS: &str = "airc.delivery_class";
 
 #[cfg(test)]
