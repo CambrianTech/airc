@@ -141,3 +141,67 @@ async fn attached_filtered_page_pushes_kinds_down_to_the_daemon() {
         "the newest 50 OF KIND Message are the 3 buried direction messages, ascending"
     );
 }
+
+/// Real daemon IPC paging must merge rooms by the entire cursor before
+/// trimming a page. Equal seqs across rooms cannot inherit room-name order.
+#[tokio::test]
+async fn attached_subscribed_resume_merges_rooms_by_full_cursor_before_limit() {
+    use airc_bus::{DeliveryClass, DurableSink, Envelope, Kind, Seq};
+    use airc_core::{EventId, TranscriptCursor};
+    use airc_lib::EventFilter;
+    use airc_store::SqliteDurableSink;
+    use bytes::Bytes;
+
+    let machine = Machine::boot().await;
+    machine.pin_identity("subscribed-merge-test").await;
+    let observer = machine.attach("observer").await;
+    let first_room = observer.join("a-merge").await.expect("join first room");
+    let last_room = observer.join("z-merge").await.expect("join last room");
+
+    // Seed historical envelopes in the fixture's real durable tier, retaining
+    // explicit seq ties that a fresh owner would normally assign uniquely.
+    // Epoch0 places these before the current epoch's hot-ring join traffic,
+    // so the daemon reads them through its actual cold replay path.
+    let sink = SqliteDurableSink::open_path(&machine.wire_root().join("events.sqlite"))
+        .await
+        .expect("open fixture durable tier");
+    for (room, counter, id) in [
+        (first_room.channel, 2, 40),
+        (first_room.channel, 3, 60),
+        (last_room.channel, 1, 10),
+        (last_room.channel, 2, 20),
+        (last_room.channel, 2, 30),
+        (last_room.channel, 4, 70),
+    ] {
+        let mut envelope = Envelope::new(
+            room,
+            (observer.peer_id(), observer.client_id()),
+            Kind::Message,
+            DeliveryClass::Durable,
+            Bytes::from_static(b"merge fixture"),
+        );
+        envelope.event_id = EventId::from_u128(id);
+        envelope.seq = Seq::new(0, counter);
+        sink.append(&envelope).await.expect("seed durable envelope");
+    }
+    let mut cursor = TranscriptCursor {
+        lamport: 0,
+        event_id: EventId::from_u128(0),
+    };
+    for expected_ids in [[10, 20], [30, 40], [60, 70]] {
+        let page = observer
+            .scan_subscribed_events(&cursor, EventFilter::default(), 2)
+            .await
+            .expect("daemon subscribed scan");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            expected_ids.map(EventId::from_u128),
+            "each limited page must retain the earliest full cursors across rooms"
+        );
+        cursor = page.scanned_through.expect("nonempty page advances");
+        assert_eq!(cursor, page.events.last().unwrap().cursor());
+    }
+}

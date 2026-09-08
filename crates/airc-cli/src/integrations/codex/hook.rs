@@ -7,11 +7,10 @@ use std::time::Duration;
 
 use airc_core::{Body, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, EventFilter, LiveLag};
-use airc_protocol::HEADER_AIRC_CLIENT;
 use futures::StreamExt;
 use serde::Serialize;
 
-use crate::client_id::current_client_id;
+use crate::client_id::{current_client_id, RuntimeSelfFilter};
 use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 const CONSUMER_PREFIX: &str = "codex-hook";
@@ -37,9 +36,10 @@ pub async fn run_user_prompt_submit(
     }
 
     let work_context = work_context(&airc, &events).await?;
+    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
     let visible: Vec<_> = events
         .into_iter()
-        .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
+        .filter(|event| include_self || !self_filter.is_self_event(event))
         .collect();
     let Some(context) = render_context(&airc, &visible, max_items, raw, work_context).await? else {
         return Ok(());
@@ -75,9 +75,10 @@ pub async fn run_poll(
     }
 
     let work_context = work_context(&airc, &events).await?;
+    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
     let visible: Vec<_> = events
         .into_iter()
-        .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
+        .filter(|event| include_self || !self_filter.is_self_event(event))
         .collect();
     let Some(context) = render_context(&airc, &visible, max_items, raw, work_context).await? else {
         return Ok(());
@@ -162,33 +163,6 @@ async fn wait_for_one_event(
         Ok(Some(Ok(event))) => Ok(vec![event.as_ref().clone()]),
         Ok(Some(Err(LiveLag { .. }))) | Ok(None) | Err(_) => Ok(Vec::new()),
     }
-}
-
-fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&str>) -> bool {
-    // Header-stamped self-detection is the only reliable signal on a
-    // shared HOME. Two scopes (Claude tab + Codex tab) using the
-    // same `~/.airc/` share the singleton local identity row →
-    // share peer_id AND client_id. The peer_id/client_id equality
-    // check would incorrectly classify EVERY frame from the other
-    // runtime as "self" and filter it out.
-    //
-    // Rule: if the event has an `airc.client` header, that IS the
-    // self attestation. Equal to OUR runtime client tag → self.
-    // Different (or our tag absent) → NOT self. Peer_id never
-    // overrides a stamped header on a shared HOME.
-    if let Some(event_client) = event.headers.get(HEADER_AIRC_CLIENT) {
-        return runtime_client.is_some_and(|rc| event_client == rc);
-    }
-    // No header: unstamped historical frame. Drop the peer_id check
-    // entirely (Codex's review on PR #869): peer_id is too coarse
-    // for shared-HOME multi-agent operation — every cross-runtime
-    // frame would be suppressed. client_id alone is still subject
-    // to identity-collision on shared HOME, but it's a tighter
-    // signal than peer_id. Current Rust-emitted frames always stamp
-    // the airc.client header in send_frame, so this branch only
-    // fires for historical frames where false-self
-    // suppression is the lesser harm.
-    event.client_id == airc.client_id()
 }
 
 /// Read Codex's hook JSON from stdin, with a hard deadline so a

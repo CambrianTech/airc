@@ -628,6 +628,25 @@ impl Airc {
         self.channel_latest_cursor(subscription.room_id).await
     }
 
+    /// Newest durable cursor across subscribed rooms. Uses the store/daemon
+    /// tip index for each room, without decoding bodies or paging unrelated
+    /// rooms before applying a subscription filter.
+    pub async fn latest_subscribed_cursor(
+        &self,
+    ) -> Result<Option<airc_core::TranscriptCursor>, AircError> {
+        let mut newest: Option<airc_core::TranscriptCursor> = None;
+        for channel in self.subscribed_room_ids().await? {
+            if let Some(cursor) = self.channel_latest_cursor(channel).await? {
+                if newest.as_ref().is_none_or(|previous| {
+                    (previous.lamport, previous.event_id.0) < (cursor.lamport, cursor.event_id.0)
+                }) {
+                    newest = Some(cursor);
+                }
+            }
+        }
+        Ok(newest)
+    }
+
     pub(crate) async fn subscribed_event_filter(
         &self,
         mut filter: EventFilter,
