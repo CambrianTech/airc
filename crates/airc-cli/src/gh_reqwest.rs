@@ -273,6 +273,34 @@ impl ReqwestGhClient {
         }
         Ok(second)
     }
+
+    /// One checked paging boundary for both head checks and base allowances.
+    /// The accumulator requires progress and caps the total, so this cannot
+    /// chase an indefinitely growing rollup or return a partial green list.
+    async fn read_check_rollup(&self, repo: &str, revision: &str) -> Result<Vec<GhCheck>, GhError> {
+        use airc_lib::gh::client::{CheckRunRollup, CheckRunsPage, CHECK_RUN_PAGE_SIZE};
+
+        let mut rollup = CheckRunRollup::default();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "{}/repos/{repo}/commits/{revision}/check-runs?per_page={CHECK_RUN_PAGE_SIZE}&page={page}",
+                self.api_base
+            );
+            let response = self
+                .send_authed(reqwest::Method::GET, &url, NO_BODY)
+                .await?;
+            if !response.status().is_success() {
+                return Err(map_http_error_status(response.status(), response).await);
+            }
+            let bytes = response.bytes().await.map_err(map_reqwest_error)?;
+            let decoded: CheckRunsPage = serde_json::from_slice(&bytes)?;
+            if rollup.push_page(decoded)? {
+                return rollup.into_checks();
+            }
+            page += 1;
+        }
+    }
 }
 
 /// `None` body for GET-shaped calls through [`ReqwestGhClient::send_authed`]
@@ -309,12 +337,8 @@ struct PrCreateResponse {
 #[async_trait]
 impl GhClient for ReqwestGhClient {
     async fn pr_view(&self, args: PrViewArgs) -> Result<PrView, GhError> {
-        // The gh-pr-view shape gh constructs via GraphQL projects two REST
-        // calls: the PR object itself (for state + mergeable) and its
-        // check-suite rollup. We mirror that shape by hitting both REST
-        // endpoints; reqwest's HTTP/2 multiplexes them over the same TCP
-        // connection so this is still ~half the wall-clock of the
-        // ShellGhClient single-call.
+        // Read PR metadata once, then the complete rollup for that head SHA.
+        // A rollup may need multiple pages; none may fail or disappear silently.
         let pr_url = format!(
             "{}/repos/{}/pulls/{}",
             self.api_base, args.repo, args.number
@@ -335,19 +359,11 @@ impl GhClient for ReqwestGhClient {
                 ))
             })?;
 
-        let runs_url = format!(
-            "{}/repos/{}/commits/{}/check-runs?per_page=100",
-            self.api_base, args.repo, head_sha
-        );
-        let runs_resp = self
-            .send_authed(reqwest::Method::GET, &runs_url, NO_BODY)
-            .await?;
-        let runs_bytes = runs_resp.bytes().await.map_err(map_reqwest_error)?;
-        let check_runs = airc_lib::gh::client::parse_check_runs(&runs_bytes)?;
+        let check_runs = self.read_check_rollup(&args.repo, head_sha).await?;
 
         // Card fc483e57: the REST→canonical translation lives beside its
         // GraphQL twin in airc-lib, not here. This client's job is the two
-        // HTTP calls; the dialect boundary owns the vocabulary.
+        // HTTP reads; the dialect boundary owns the vocabulary.
         Ok(PrView::from_rest(&pr_json, check_runs))
     }
 
@@ -473,20 +489,7 @@ impl GhClient for ReqwestGhClient {
         &self,
         args: BranchCheckRollupArgs,
     ) -> Result<Vec<GhCheck>, GhError> {
-        // The hot path the bench (#1082) measures. Single GET; no
-        // process spawn; HTTP/2 keep-alive amortised across calls.
-        let url = format!(
-            "{}/repos/{}/commits/{}/check-runs?per_page=100",
-            self.api_base, args.repo, args.branch
-        );
-        let resp = self
-            .send_authed(reqwest::Method::GET, &url, NO_BODY)
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_http_error_status(resp.status(), resp).await);
-        }
-        let bytes = resp.bytes().await.map_err(map_reqwest_error)?;
-        airc_lib::gh::client::parse_check_runs(&bytes)
+        self.read_check_rollup(&args.repo, &args.branch).await
     }
 }
 
@@ -627,9 +630,13 @@ mod tests {
     /// The listener drops after the last scripted response, so any
     /// extra request (a retry storm) fails to connect — loud in the
     /// caller's error, and visible as `captured.len()` to asserts.
-    async fn scripted_server(
-        responses: Vec<(u16, &'static str)>,
+    async fn scripted_server<B: Into<String>>(
+        responses: Vec<(u16, B)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let responses: Vec<_> = responses
+            .into_iter()
+            .map(|(status, body)| (status, body.into()))
+            .collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local listener");
@@ -686,6 +693,176 @@ mod tests {
             .await
             .expect("server saw fewer requests than scripted (client gave up early?)")
             .expect("server task panicked")
+    }
+
+    // What this catches (045083e8): the production REST path must carry
+    // the live base into the same gate used by manual and recurring merges.
+    // PR checks use head.sha; inherited failures use base.sha in that repo,
+    // never the linked card's stale branch or AIRC's integration branch.
+    #[tokio::test]
+    async fn merge_gate_queries_live_pr_base_sha_in_the_pr_repository() {
+        let (base, server) = scripted_server(vec![
+            (200, r#"{"state":"open","mergeable":true,"head":{"sha":"cccccccccccccccccccccccccccccccccccccccc"},"base":{"ref":"release/topic","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#),
+            (200, r#"{"total_count":1,"check_runs":[{"id":1,"name":"cargo test","status":"completed","conclusion":"failure"}]}"#),
+            (200, r#"{"total_count":1,"check_runs":[{"id":2,"name":"cargo test","status":"completed","conclusion":"failure"}]}"#),
+        ]).await;
+        let client = ReqwestGhClient::for_test(base, "fixture-token".into()).unwrap();
+        let pr = airc_work::model::PullRequestRef {
+            repo: airc_work::ids::RepoId::new("other/project").unwrap(),
+            number: 42,
+            head: airc_work::model::BranchName::new("topic").unwrap(),
+            base: airc_work::model::BranchName::new("outdated").unwrap(),
+        };
+        let result = crate::merger::check_pr_gate(
+            &client,
+            &pr,
+            &mut crate::merger::BaselineCache::default(),
+            crate::merger::GatePolicy {
+                pending_timeout_ms: 0,
+                now_ms: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, crate::merger::GateResult::Green),
+            "{result:?}"
+        );
+        let requests = join_server(server).await;
+        assert_eq!(requests.len(), 3);
+        for (request, path) in requests.iter().zip([
+            "/repos/other/project/pulls/42",
+            "/repos/other/project/commits/cccccccccccccccccccccccccccccccccccccccc/check-runs?per_page=100&page=1",
+            "/repos/other/project/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs?per_page=100&page=1",
+        ]) {
+            assert!(request.starts_with(&format!("GET {path} HTTP/1.1")), "{request}");
+        }
+    }
+
+    const GATE_PR_RESPONSE: &str = r#"{"state":"open","mergeable":true,"head":{"sha":"cccccccccccccccccccccccccccccccccccccccc"},"base":{"ref":"canary","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#;
+
+    fn check_page(total: usize, ids: std::ops::RangeInclusive<u64>, failed: Option<u64>) -> String {
+        serde_json::json!({
+            "total_count": total,
+            "check_runs": ids.map(|id| serde_json::json!({
+                "id": id, "name": format!("check-{id}"), "status": "completed",
+                "conclusion": if Some(id) == failed { "failure" } else { "success" }
+            })).collect::<Vec<_>>()
+        })
+        .to_string()
+    }
+
+    async fn gate_from_http(
+        responses: Vec<(u16, String)>,
+    ) -> (Result<crate::merger::GateResult, GhError>, Vec<String>) {
+        let (base, server) = scripted_server(responses).await;
+        let client = ReqwestGhClient::for_test(base, "fixture-token".into()).unwrap();
+        let pr = airc_work::model::PullRequestRef {
+            repo: airc_work::ids::RepoId::new("other/project").unwrap(),
+            number: 42,
+            head: airc_work::model::BranchName::new("topic").unwrap(),
+            base: airc_work::model::BranchName::new("stale-target").unwrap(),
+        };
+        let result = crate::merger::check_pr_gate(
+            &client,
+            &pr,
+            &mut crate::merger::BaselineCache::default(),
+            crate::merger::GatePolicy {
+                pending_timeout_ms: 0,
+                now_ms: 0,
+            },
+        )
+        .await;
+        (result, join_server(server).await)
+    }
+
+    // What this catches (045083e8): the head endpoint's 403/404 used to
+    // deserialize error JSON into an empty successful list and merge the PR.
+    #[tokio::test]
+    async fn merge_gate_rejects_head_check_http_errors() {
+        for status in [403, 404] {
+            let (result, requests) = gate_from_http(vec![
+                (200, GATE_PR_RESPONSE.into()),
+                (status, r#"{"message":"denied"}"#.into()),
+            ])
+            .await;
+            let error = result.expect_err("failed head lookup cannot become green");
+            if status == 403 {
+                assert!(matches!(error, GhError::AuthRequired { .. }), "{error:?}");
+            } else {
+                assert!(
+                    matches!(error, GhError::NotInGithubRepo { .. }),
+                    "{error:?}"
+                );
+            }
+            assert_eq!(
+                requests.len(),
+                2,
+                "no baseline query can excuse unread head checks"
+            );
+        }
+    }
+
+    // What this catches (045083e8): head check 101 must block when new,
+    // while a matching failure on BASE page two remains genuinely inherited.
+    #[tokio::test]
+    async fn merge_gate_reads_failed_checks_beyond_first_head_and_base_page() {
+        for inherited in [false, true] {
+            let mut responses = vec![
+                (200, GATE_PR_RESPONSE.into()),
+                (200, check_page(101, 1..=100, None)),
+                (200, check_page(101, 101..=101, Some(101))),
+            ];
+            if inherited {
+                responses.extend([
+                    (200, check_page(101, 1..=100, None)),
+                    (200, check_page(101, 101..=101, Some(101))),
+                ]);
+            } else {
+                responses.push((200, r#"{"total_count":0,"check_runs":[]}"#.into()));
+            }
+            let (result, requests) = gate_from_http(responses).await;
+            let decision = result.unwrap();
+            assert_eq!(
+                matches!(decision, crate::merger::GateResult::Green),
+                inherited,
+                "{decision:?}"
+            );
+            assert_eq!(requests.len(), if inherited { 5 } else { 4 });
+            assert!(requests[2].starts_with("GET /repos/other/project/commits/cccccccccccccccccccccccccccccccccccccccc/check-runs?per_page=100&page=2 "));
+            if inherited {
+                assert!(requests[4].starts_with("GET /repos/other/project/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs?per_page=100&page=2 "));
+            }
+        }
+    }
+
+    // What this catches (045083e8): a missing last page is not complete
+    // head proof, and even an already-seen base failure grants no allowance
+    // if the remainder of that base rollup could not be verified.
+    #[tokio::test]
+    async fn merge_gate_rejects_incomplete_head_and_base_rollups() {
+        let short = r#"{"total_count":101,"check_runs":[]}"#;
+        let (head_result, head_requests) = gate_from_http(vec![
+            (200, GATE_PR_RESPONSE.into()),
+            (200, check_page(101, 1..=100, None)),
+            (200, short.into()),
+        ])
+        .await;
+        assert!(matches!(head_result, Err(GhError::OutputParse(_))));
+        assert_eq!(head_requests.len(), 3);
+
+        let (base_result, base_requests) = gate_from_http(vec![
+            (200, GATE_PR_RESPONSE.into()),
+            (200, check_page(1, 1..=1, Some(1))),
+            (200, check_page(101, 1..=100, Some(1))),
+            (200, short.into()),
+        ])
+        .await;
+        assert!(matches!(
+            base_result.unwrap(),
+            crate::merger::GateResult::NotReady(_)
+        ));
+        assert_eq!(base_requests.len(), 4);
     }
 
     /// Card c1090a24 wire-shape pin — the load-bearing one. The

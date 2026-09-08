@@ -248,8 +248,10 @@ where
 #[derive(Debug, Clone)]
 pub struct BranchCheckRollupArgs {
     pub repo: String,
-    /// Branch name (e.g. `"rust-rewrite"`). Resolved by gh against
-    /// `repos/{owner}/{repo}/commits/{branch}/check-runs`. Card d5b7b07d.
+    /// Git ref or object id, resolved against
+    /// `repos/{owner}/{repo}/commits/{branch}/check-runs`. Merge gates use
+    /// the PR's immutable base object id, so a moving branch cannot change
+    /// the baseline between the PR read and the check lookup.
     pub branch: String,
 }
 
@@ -270,6 +272,12 @@ pub struct PrView {
     /// an already-merged PR.
     #[serde(default, rename = "mergedAt")]
     pub merged_at: Option<String>,
+    /// Actual target from the live PR, not the possibly stale work-card link.
+    #[serde(default, rename = "baseRefName")]
+    pub base_ref_name: Option<String>,
+    /// Target revision observed in the same PR response.
+    #[serde(default, rename = "baseRefOid")]
+    pub base_ref_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -367,6 +375,14 @@ impl PrView {
                 .get("merged_at")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            base_ref_name: pr_json
+                .pointer("/base/ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            base_ref_oid: pr_json
+                .pointer("/base/sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         };
         view.canonicalize();
         view
@@ -412,53 +428,108 @@ pub fn parse_issue_view(json: &[u8]) -> Result<IssueView, GhError> {
     Ok(serde_json::from_slice(json)?)
 }
 
-/// Decode `gh api /repos/.../check-runs` (REST shape) into the same
-/// [`GhCheck`] type the merger uses for PR rollups. Pure — synthetic
-/// JSON in, typed values out. The REST endpoint wraps results in
-/// `{total_count, check_runs: [...]}`; we project to just the run
-/// list since the merger doesn't care about pagination metadata.
-/// Card d5b7b07d.
-///
-/// REST `started_at` uses the snake_case field name (the REST API
-/// differs from the GraphQL `startedAt` here); we accept both via a
-/// custom Deserialize because [`GhCheck`] is the one struct shared
-/// across both code paths.
-///
-/// Canonicalizes each run through [`GhCheck::canonicalize`] — the same
-/// dialect boundary [`PrView::from_rest`] uses (card fc483e57), so a
-/// consumer never sees REST's lowercase.
-pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
-    #[derive(Deserialize)]
-    struct RestRun {
-        #[serde(default)]
-        conclusion: Option<String>,
-        #[serde(default)]
-        status: Option<String>,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        started_at: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct Envelope {
-        #[serde(default)]
-        check_runs: Vec<RestRun>,
-    }
-    let env: Envelope = serde_json::from_slice(json)?;
-    Ok(env
-        .check_runs
-        .into_iter()
-        .map(|r| {
+/// GitHub's maximum requested page size; shared by both HTTP adapters.
+pub const CHECK_RUN_PAGE_SIZE: usize = 100;
+/// Bound work per rollup to 100 pages. Larger rollups are unverifiable by
+/// this reader and fail closed; they are never silently truncated to green.
+const MAX_CHECK_RUNS: usize = 10_000;
+
+/// A required REST envelope. Error JSON or missing pagination metadata must
+/// not deserialize to an apparently successful empty check list (045083e8).
+#[derive(Deserialize)]
+pub struct CheckRunsPage {
+    total_count: usize,
+    check_runs: Vec<RestCheckRun>,
+}
+
+#[derive(Deserialize)]
+struct RestCheckRun {
+    id: u64,
+    #[serde(default)]
+    conclusion: Option<String>,
+    status: String,
+    name: String,
+    #[serde(default, alias = "startedAt")]
+    started_at: Option<String>,
+}
+
+/// Accumulates one bounded, complete check rollup. Run IDs detect duplicate
+/// or overlapping pages; a changed total or short page requires a fresh read.
+/// Values move into the canonical projection without re-serialization.
+#[derive(Default)]
+pub struct CheckRunRollup {
+    expected: Option<usize>,
+    seen: std::collections::HashSet<u64>,
+    checks: Vec<GhCheck>,
+}
+
+impl CheckRunRollup {
+    pub fn push_page(&mut self, page: CheckRunsPage) -> Result<bool, GhError> {
+        if page.total_count > MAX_CHECK_RUNS {
+            return Err(GhError::OutputParse(format!(
+                "check rollup reports {} runs, exceeding reader bound {MAX_CHECK_RUNS}",
+                page.total_count
+            )));
+        }
+        if let Some(expected) = self.expected {
+            if expected != page.total_count || self.checks.len() == expected {
+                return Err(GhError::OutputParse(
+                    "check rollup total changed or another page followed completion".into(),
+                ));
+            }
+        }
+        let remaining = page.total_count.saturating_sub(self.checks.len());
+        if page.check_runs.len() != remaining.min(CHECK_RUN_PAGE_SIZE) {
+            return Err(GhError::OutputParse(format!(
+                "incomplete check page: received {}, expected {} of {} remaining runs",
+                page.check_runs.len(),
+                remaining.min(CHECK_RUN_PAGE_SIZE),
+                remaining
+            )));
+        }
+        self.expected = Some(page.total_count);
+        for run in page.check_runs {
+            if !self.seen.insert(run.id) {
+                return Err(GhError::OutputParse(format!(
+                    "check rollup repeated run id {}",
+                    run.id
+                )));
+            }
             let mut check = GhCheck {
-                conclusion: r.conclusion,
-                status: r.status,
-                name: r.name,
-                started_at: r.started_at,
+                conclusion: run.conclusion,
+                status: Some(run.status),
+                name: Some(run.name),
+                started_at: run.started_at,
             };
             check.canonicalize();
-            check
-        })
-        .collect())
+            if check.status.as_deref() == Some("COMPLETED") && check.conclusion.is_none() {
+                return Err(GhError::OutputParse(
+                    "completed check run is missing its conclusion".into(),
+                ));
+            }
+            self.checks.push(check);
+        }
+        Ok(self.checks.len() == page.total_count)
+    }
+
+    pub fn into_checks(self) -> Result<Vec<GhCheck>, GhError> {
+        if self.expected != Some(self.checks.len()) {
+            return Err(GhError::OutputParse(
+                "check rollup ended before all pages arrived".into(),
+            ));
+        }
+        Ok(self.checks)
+    }
+}
+
+/// Decode a complete REST envelope or gh's concatenated `--paginate` page
+/// stream. Missing/error envelopes and incomplete streams fail closed.
+pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
+    let mut rollup = CheckRunRollup::default();
+    for page in serde_json::Deserializer::from_slice(json).into_iter::<CheckRunsPage>() {
+        rollup.push_page(page?)?;
+    }
+    rollup.into_checks()
 }
 
 /// Card 7ed1ac4f — parse an ISO-8601 timestamp gh returns (e.g.
@@ -614,6 +685,8 @@ mod tests {
         assert!(view.state.is_empty());
         assert!(view.mergeable.is_empty());
         assert!(view.status_check_rollup.is_none());
+        assert!(view.base_ref_name.is_none());
+        assert!(view.base_ref_oid.is_none());
     }
 
     #[test]
@@ -715,8 +788,8 @@ mod tests {
     #[test]
     fn parse_check_runs_normalizes_rest_lowercase_to_graphql_case() {
         let json = br#"{"total_count":2,"check_runs":[
-            {"name":"cargo test","status":"completed","conclusion":"success","started_at":"2026-09-04T17:36:00Z"},
-            {"name":"cargo check","status":"in_progress","conclusion":null}
+            {"id":1,"name":"cargo test","status":"completed","conclusion":"success","started_at":"2026-09-04T17:36:00Z"},
+            {"id":2,"name":"cargo check","status":"in_progress","conclusion":null}
         ]}"#;
         let runs = parse_check_runs(json).expect("parse");
         assert_eq!(runs[0].status.as_deref(), Some("COMPLETED"));
@@ -736,16 +809,18 @@ mod tests {
         let rest_pr = serde_json::json!({
             "state": "closed",
             "mergeable": true,
-            "merged_at": "2026-09-04T18:01:58Z"
+            "merged_at": "2026-09-04T18:01:58Z",
+            "base": {"ref": "release/topic", "sha": "0123456789abcdef0123456789abcdef01234567"}
         });
         let rest_checks = parse_check_runs(
-            br#"{"check_runs":[{"name":"cargo test","status":"completed","conclusion":"success"}]}"#,
+            br#"{"total_count":1,"check_runs":[{"id":1,"name":"cargo test","status":"completed","conclusion":"success"}]}"#,
         )
         .expect("rest checks parse");
         let from_rest = PrView::from_rest(&rest_pr, rest_checks);
 
         let from_graphql = PrView::from_graphql(
             br#"{"state":"MERGED","mergeable":"MERGEABLE","mergedAt":"2026-09-04T18:01:58Z",
+                 "baseRefName":"release/topic","baseRefOid":"0123456789abcdef0123456789abcdef01234567",
                  "statusCheckRollup":[{"name":"cargo test","status":"COMPLETED","conclusion":"SUCCESS"}]}"#,
         )
         .expect("graphql parses");
@@ -753,6 +828,11 @@ mod tests {
         assert_eq!(from_rest, from_graphql, "the dialects must converge");
         assert_eq!(from_rest.state, "MERGED");
         assert_eq!(from_rest.mergeable, "MERGEABLE");
+        assert_eq!(from_rest.base_ref_name.as_deref(), Some("release/topic"));
+        assert_eq!(
+            from_rest.base_ref_oid.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
         let check = &from_rest.status_check_rollup.as_ref().unwrap()[0];
         assert_eq!(check.status.as_deref(), Some("COMPLETED"));
         assert_eq!(check.conclusion.as_deref(), Some("SUCCESS"));
@@ -782,6 +862,7 @@ mod tests {
             "total_count": 1,
             "check_runs": [
                 {
+                    "id": 1,
                     "name": "cargo test (windows-latest)",
                     "status": "in_progress",
                     "conclusion": null,
@@ -792,6 +873,57 @@ mod tests {
         let runs = parse_check_runs(json.to_string().as_bytes()).expect("REST envelope decodes");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].started_at.as_deref(), Some("2026-05-29T03:29:46Z"));
+    }
+
+    // What this catches (045083e8): error-shaped, missing, oversized,
+    // truncated, duplicate, or changing pages cannot form a complete proof.
+    #[test]
+    fn parse_check_runs_requires_complete_consistent_pages() {
+        for invalid in [
+            "",
+            r#"{"message":"Not Found"}"#,
+            r#"{"check_runs":[]}"#,
+            r#"{"total_count":0}"#,
+            r#"{"total_count":1,"check_runs":[]}"#,
+            r#"{"total_count":10001,"check_runs":[]}"#,
+            r#"{"total_count":1,"check_runs":[{"name":"missing id"}]}"#,
+            r#"{"total_count":1,"check_runs":[{"id":1,"name":"missing status","conclusion":"success"}]}"#,
+            r#"{"total_count":1,"check_runs":[{"id":1,"name":"missing verdict","status":"completed","conclusion":null}]}"#,
+        ] {
+            assert!(parse_check_runs(invalid.as_bytes()).is_err(), "{invalid}");
+        }
+        let first = serde_json::json!({
+            "total_count":101,
+            "check_runs": (1..=100).map(|id| serde_json::json!({
+                "id":id, "name":format!("check-{id}"), "status":"completed", "conclusion":"success"
+            })).collect::<Vec<_>>()
+        })
+        .to_string();
+        assert!(
+            parse_check_runs(first.as_bytes()).is_err(),
+            "first page is incomplete"
+        );
+        for (total, id) in [(101, 1), (102, 101)] {
+            let last = serde_json::json!({
+                "total_count":total,
+                "check_runs":[{"id":id,"name":"last","status":"completed","conclusion":"failure"}]
+            });
+            assert!(parse_check_runs(format!("{first}\n{last}").as_bytes()).is_err());
+        }
+        let complete = format!(
+            "{first}\n{}",
+            serde_json::json!({
+                "total_count":101,
+                "check_runs":[{"id":101,"name":"last","status":"completed","conclusion":"failure"}]
+            })
+        );
+        let checks = parse_check_runs(complete.as_bytes()).unwrap();
+        assert_eq!(checks.len(), 101);
+        assert_eq!(checks[100].conclusion.as_deref(), Some("FAILURE"));
+        assert!(parse_check_runs(
+            format!("{complete}\n{{\"total_count\":0,\"check_runs\":[]}}").as_bytes()
+        )
+        .is_err());
     }
 }
 
@@ -1024,6 +1156,8 @@ pub mod mock {
                 mergeable: "MERGEABLE".to_string(),
                 status_check_rollup: Some(Vec::new()),
                 merged_at: None,
+                base_ref_name: None,
+                base_ref_oid: None,
             }
         }
 
