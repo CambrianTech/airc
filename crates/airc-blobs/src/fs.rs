@@ -20,7 +20,7 @@
 //! surfaces as `BlobError::HashMismatch` rather than silently
 //! returning bad bytes.
 
-use crate::{BlobError, ContentAddressedStore, ContentHash};
+use crate::{BlobError, ContentAddressedStore, ContentHash, MediaRef};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +52,50 @@ impl FsStore {
         let (fanout, rest) = hex.split_at(2);
         self.root.join(fanout).join(format!("{rest}.blob"))
     }
+
+    /// Read a candidate with a caller-selected memory ceiling, verifying both
+    /// the reference size and digest. A missing/corrupt candidate is an error,
+    /// never an empty patch. The bounded reader also catches growth after stat.
+    pub fn get_verified(
+        &self,
+        reference: &MediaRef,
+        limit_bytes: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        reference.check_read_limit(limit_bytes)?;
+        let path = self.path_for(&reference.hash);
+        let file = fs::File::open(&path).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                BlobError::NotFound {
+                    hash: reference.hash.clone(),
+                }
+            } else {
+                BlobError::Io(format!("open {path:?}: {error}"))
+            }
+        })?;
+        let actual_bytes = file
+            .metadata()
+            .map_err(|error| BlobError::Io(format!("stat {path:?}: {error}")))?
+            .len();
+        if actual_bytes > limit_bytes {
+            return Err(BlobError::ReadLimitExceeded {
+                actual_bytes,
+                limit_bytes,
+            });
+        }
+        if actual_bytes != reference.size_bytes {
+            return Err(BlobError::SizeMismatch {
+                expected_bytes: reference.size_bytes,
+                actual_bytes,
+            });
+        }
+        let mut bytes = Vec::new();
+        // One sentinel byte detects growth without reading an unbounded file.
+        file.take(reference.size_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| BlobError::Io(format!("read {path:?}: {error}")))?;
+        reference.verify(&bytes, limit_bytes)?;
+        Ok(bytes)
+    }
 }
 
 impl ContentAddressedStore for FsStore {
@@ -63,6 +107,16 @@ impl ContentAddressedStore for FsStore {
         // Saves an IO round-trip for duplicates and avoids racing with
         // a concurrent writer.
         if final_path.exists() {
+            // Presence alone is not successful durable storage: fail loudly
+            // if a prior copy is corrupt, rather than return a false receipt.
+            self.get_verified(
+                &MediaRef {
+                    hash: hash.clone(),
+                    size_bytes: bytes.len() as u64,
+                    mime: None,
+                },
+                bytes.len() as u64,
+            )?;
             return Ok(hash);
         }
 
@@ -171,6 +225,70 @@ mod tests {
         assert!(!root.exists());
         let _store = FsStore::new(&root).expect("new should succeed");
         assert!(root.exists() && root.is_dir());
+    }
+
+    #[test]
+    fn verified_candidate_distinguishes_missing_size_hash_and_budget_failures() {
+        let store = FsStore::new(fresh_root()).unwrap();
+        let bytes = b"candidate patch";
+        let reference = MediaRef {
+            hash: ContentHash::from_bytes(bytes),
+            size_bytes: bytes.len() as u64,
+            mime: None,
+        };
+        assert!(matches!(
+            store.get_verified(&reference, 100),
+            Err(BlobError::NotFound { .. })
+        ));
+        store.put(bytes).unwrap();
+        assert_eq!(store.get_verified(&reference, 100).unwrap(), bytes);
+        assert!(matches!(
+            store.get_verified(&reference, 1),
+            Err(BlobError::ReadLimitExceeded { .. })
+        ));
+        let wrong_size = MediaRef {
+            size_bytes: reference.size_bytes + 1,
+            ..reference.clone()
+        };
+        assert!(matches!(
+            store.get_verified(&wrong_size, 100),
+            Err(BlobError::SizeMismatch { .. })
+        ));
+        fs::write(store.path_for(&reference.hash), vec![0; bytes.len()]).unwrap();
+        assert!(matches!(
+            store.get_verified(&reference, 100),
+            Err(BlobError::HashMismatch { .. })
+        ));
+        assert!(
+            matches!(store.put(bytes), Err(BlobError::HashMismatch { .. })),
+            "deduplicated put must not certify a corrupt prior copy"
+        );
+        fs::write(store.path_for(&reference.hash), vec![0; 1000]).unwrap();
+        assert!(matches!(
+            store.get_verified(&reference, 100),
+            Err(BlobError::ReadLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_candidate_is_valid_only_with_matching_reference() {
+        let store = FsStore::new(fresh_root()).unwrap();
+        let hash = store.put(b"").unwrap();
+        let reference = MediaRef {
+            hash,
+            size_bytes: 0,
+            mime: None,
+        };
+        assert_eq!(store.get_verified(&reference, 0).unwrap(), b"");
+        let nonempty = MediaRef {
+            hash: ContentHash::from_bytes(b"x"),
+            size_bytes: 1,
+            mime: None,
+        };
+        assert!(matches!(
+            nonempty.verify(b"", 1),
+            Err(BlobError::SizeMismatch { .. })
+        ));
     }
 
     /// What this catches: put → get round-trip via the filesystem.
