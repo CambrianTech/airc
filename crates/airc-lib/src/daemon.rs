@@ -398,6 +398,9 @@ impl Airc {
         page_size: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let page_size = page_size.max(1);
+        // Card d399f0f7: the ROOM TIP decides exhaustion, never the page length.
+        // O(1) via the typed `room_tip` op (card a1562dbc), read once up front.
+        let tip = self.daemon_latest_transcript_cursor(channel).await?;
         let client = self.require_daemon_client()?;
         let mut all = Vec::new();
         let (epoch, counter) = unpack_seq(cursor.lamport);
@@ -419,12 +422,27 @@ impl Airc {
             for bytes in response.envelopes {
                 all.push(decode_wire_event(bytes)?);
             }
-            if count < page_size {
+            // An empty page carries no cursor to resume from: the caller's
+            // `since` stays authoritative and there is nothing left to fold.
+            let Some(newest) = response.newest else {
                 break;
-            }
-            match response.newest {
-                Some(cursor) => since = Some(cursor),
-                None => break,
+            };
+            since = Some(newest);
+            if count < page_size {
+                // A SHORT PAGE IS NOT PROOF OF EXHAUSTION. It means EITHER the
+                // room is drained OR the daemon capped this page (card d399f0f7:
+                // 1024 of #general's envelopes serialise to 15.13MB against a
+                // 16MB frame, so a byte-aware daemon MUST be free to return
+                // fewer than asked). Reading "fewer than asked" as end-of-stream
+                // is the one-value-two-meanings bug (c7ae34b2) that would turn a
+                // loud closed frame into a SILENTLY TRUNCATED board. Only the
+                // tip settles which happened.
+                if short_page_drained_the_room(
+                    pack_seq(newest.epoch, newest.counter),
+                    tip.as_ref().map(|tip| tip.lamport),
+                ) {
+                    break;
+                }
             }
         }
         Ok(all)
@@ -734,9 +752,56 @@ fn cursor_after(event: &TranscriptEvent) -> IpcCursor {
     }
 }
 
+/// Does a SHORT page (fewer envelopes than the caller asked for) prove the
+/// room is drained?
+///
+/// **Card d399f0f7: no — not on its own.** A short page means EITHER the room
+/// is exhausted OR the daemon capped it. Those must stay distinguishable: 1024
+/// of `#general`'s envelopes serialise to 15.13MB against a 16MB frame
+/// (`airc-ipc::codec::MAX_FRAME_BYTES`), so a byte-aware daemon has to be free
+/// to return fewer than asked. Reading "fewer than asked" as end-of-stream is
+/// the one-value-two-meanings bug (card c7ae34b2) — it would trade a loud
+/// closed frame for a SILENTLY TRUNCATED board, which is strictly worse.
+///
+/// Only reaching the room's durable tip settles it, so the comparison is
+/// against the tip's lamport and nothing else. `>=` rather than `==` because
+/// events can land after the tip was probed; overshoot is still drained, and
+/// an equality test there would loop until the room went quiet.
+fn short_page_drained_the_room(page_newest_lamport: u64, tip_lamport: Option<u64>) -> bool {
+    match tip_lamport {
+        Some(tip) => page_newest_lamport >= tip,
+        // No durable tip: the room has no history to fall short of.
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: a byte-capped short page being read as end-of-stream,
+    // which silently truncates a work board instead of failing loudly
+    // (regression for card d399f0f7).
+    #[test]
+    fn a_short_page_below_the_tip_is_capped_not_drained() {
+        let tip = pack_seq(4, 900);
+        // The daemon capped this page by bytes: it stopped well short of the
+        // tip, so the caller MUST keep paging rather than call the room empty.
+        assert!(!short_page_drained_the_room(pack_seq(2, 10), Some(tip)));
+        // Genuinely exhausted: the page reached the tip.
+        assert!(short_page_drained_the_room(tip, Some(tip)));
+        // Overshoot — events arrived after the tip probe — is still drained,
+        // and must not spin.
+        assert!(short_page_drained_the_room(pack_seq(5, 0), Some(tip)));
+        // A room with no durable history cannot be short of anything.
+        assert!(short_page_drained_the_room(0, None));
+        // Ordering is the packed sequence, so a lower epoch never counts as
+        // drained however high its counter runs.
+        assert!(!short_page_drained_the_room(
+            pack_seq(3, COUNTER_MASK),
+            Some(tip)
+        ));
+    }
 
     #[test]
     fn seq_packs_and_unpacks_losslessly_and_orders() {
