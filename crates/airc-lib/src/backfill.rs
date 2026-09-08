@@ -107,7 +107,7 @@ impl BackfillRequest {
         let Some(Body::Json(value)) = event.body.as_ref() else {
             return None;
         };
-        serde_json::from_value(value.clone()).ok()
+        Self::deserialize(value).ok()
     }
 }
 
