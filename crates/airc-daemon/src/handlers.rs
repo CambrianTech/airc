@@ -35,6 +35,19 @@ use crate::state::DaemonState;
 /// payload size so a slow client doesn't accidentally pull MB.
 const INBOX_DEFAULT_LIMIT: usize = 32;
 
+/// Byte budget for the envelopes of ONE `inbox` page.
+///
+/// Card d399f0f7: a page bounded only by COUNT can exceed the frame. 1024 of
+/// `#general`'s envelopes encode to 15.13MB against a 16MB
+/// [`airc_ipc::codec::MAX_FRAME_BYTES`], the frame is refused, and the board
+/// fails 3/3 grid-wide with "daemon closed before response frame" rather than
+/// paging.
+///
+/// DERIVED from `MAX_FRAME_BYTES` rather than written as its own number, so
+/// the budget cannot silently drift past the limit it exists to respect. The
+/// headroom covers the rest of the encoded response around the envelopes.
+const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES as usize) / 4 * 3;
+
 /// Dispatch one request against the daemon's state. Always returns a
 /// Response — Err paths become `Response::Error { message }` so the
 /// wire protocol stays uniform.
@@ -302,11 +315,34 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
             events
         }
     };
-    let envelopes: Vec<Vec<u8>> = events
-        .iter()
-        .map(|e| airc_wire::encode(e).to_vec())
-        .collect();
-    let newest = events.last().map(|e| {
+    // Card d399f0f7: a page is bounded by BYTES, not by count alone. 1024 of
+    // #general's envelopes encode to 15.13MB against MAX_FRAME_BYTES 16MB, so
+    // the frame is REFUSED and the caller sees "daemon closed before response
+    // frame" — the board fails outright instead of paging. Stop filling before
+    // the frame budget and let the caller page for the rest.
+    //
+    // Returning fewer envelopes than `limit` asked for is only safe because
+    // the caller no longer treats a short page as end-of-stream: it pages
+    // until it reaches the room's durable tip (`short_page_drained_the_room`
+    // in airc-lib's daemon bridge). Do not reintroduce a length-based
+    // exhaustion test on either side of this boundary.
+    let mut envelopes: Vec<Vec<u8>> = Vec::new();
+    let mut remaining = INBOX_PAGE_BYTE_BUDGET;
+    for event in &events {
+        let bytes = airc_wire::encode(event).to_vec();
+        // The first envelope always goes out, even if it alone exceeds the
+        // budget: an oversized single event must still make progress, or the
+        // caller would page forever against an empty response.
+        if !envelopes.is_empty() && bytes.len() > remaining {
+            break;
+        }
+        remaining = remaining.saturating_sub(bytes.len());
+        envelopes.push(bytes);
+    }
+    // `newest` MUST be the newest envelope actually INCLUDED, never
+    // `events.last()` — a cursor past the emitted page would make the caller
+    // resume beyond envelopes it never received, silently losing them.
+    let newest = events[..envelopes.len()].last().map(|e| {
         let cursor = e.cursor();
         IpcCursor {
             epoch: cursor.seq.epoch,
