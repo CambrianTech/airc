@@ -1758,14 +1758,7 @@ pub async fn run_merge(
     // ReqwestGhClient by default (no per-call gh spawn on the gate +
     // merge path), shell only by explicit opt-out or loud fallback.
     let gh = crate::gh_reqwest::production_gh_client();
-    let baseline = crate::merger::fetch_baseline_failures(gh.as_ref()).await;
-    if !baseline.is_empty() {
-        eprintln!(
-            "airc: baseline has {} failing check(s) on rust-rewrite — inherited \
-             failures with those names are ignored (strictly-less-red, card d5b7b07d)",
-            baseline.len()
-        );
-    }
+    let mut baselines = crate::merger::BaselineCache::default();
 
     // Card 7ed1ac4f: pending-too-long timeout. Default 30 min from
     // GatePolicy::default_for_merger; CLI flag override comes
@@ -1775,7 +1768,7 @@ pub async fn run_merge(
         now_ms: crate::merger::now_ms(),
     };
 
-    match crate::merger::check_pr_gate(gh.as_ref(), &pr, &baseline, policy).await {
+    match crate::merger::check_pr_gate(gh.as_ref(), &pr, &mut baselines, policy).await {
         Ok(crate::merger::GateResult::Green) => {
             if dry_run {
                 println!(

@@ -70,7 +70,7 @@ impl GhClient for ShellGhClient {
                 "--repo",
                 args.repo.as_str(),
                 "--json",
-                "state,mergeable,statusCheckRollup,mergedAt",
+                "state,mergeable,statusCheckRollup,mergedAt,baseRefName,baseRefOid",
             ])
             .output()
             .await
@@ -137,21 +137,31 @@ impl GhClient for ShellGhClient {
         &self,
         args: BranchCheckRollupArgs,
     ) -> Result<Vec<GhCheck>, GhError> {
-        // Card d5b7b07d: REST `/check-runs` for the integration branch's
-        // HEAD. `--paginate` so a workflow with >30 checks doesn't
-        // silently lose the failing ones to pagination. The REST shape
-        // is {total_count, check_runs:[...]}; parse_check_runs in
-        // airc-lib projects to just the run list.
-        let path = format!("repos/{}/commits/{}/check-runs", args.repo, args.branch);
-        let output = Command::new("gh")
-            .args(["api", "--paginate", &path])
-            .output()
-            .await
-            .map_err(map_spawn_error)?;
-        if !output.status.success() {
-            return Err(classify_gh_failure(&output));
+        use airc_lib::gh::client::{CheckRunRollup, CheckRunsPage, CHECK_RUN_PAGE_SIZE};
+
+        // Bound pagination here too, rather than letting gh collect an
+        // unlimited concatenated output before completeness can be checked.
+        let mut rollup = CheckRunRollup::default();
+        let mut page = 1;
+        loop {
+            let path = format!(
+                "repos/{}/commits/{}/check-runs?per_page={CHECK_RUN_PAGE_SIZE}&page={page}",
+                args.repo, args.branch
+            );
+            let output = Command::new("gh")
+                .args(["api", &path])
+                .output()
+                .await
+                .map_err(map_spawn_error)?;
+            if !output.status.success() {
+                return Err(classify_gh_failure(&output));
+            }
+            let decoded: CheckRunsPage = serde_json::from_slice(&output.stdout)?;
+            if rollup.push_page(decoded)? {
+                return rollup.into_checks();
+            }
+            page += 1;
         }
-        airc_lib::gh::client::parse_check_runs(&output.stdout)
     }
 
     /// Card #356. Same addressing and the same failure classification
