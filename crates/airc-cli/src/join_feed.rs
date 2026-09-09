@@ -17,14 +17,16 @@ use crate::client_id::{current_client_id, RuntimeSelfFilter};
 const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
 
-pub async fn run(airc: &Airc) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(airc: &Airc, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_client = current_client_id()?;
     let consumer_id = consumer_id(runtime_client.as_deref());
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
     let mut output = std::io::stdout();
     let mut attached = attach_feed(airc, &consumer_id, &self_filter, &mut output).await?;
-    println!();
-    println!("attached — Ctrl-C to detach.");
+    if !quiet {
+        println!();
+        println!("attached — Ctrl-C to detach.");
+    }
     print_stream_advancing_cursor(
         airc,
         &mut attached.stream,

@@ -180,7 +180,11 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// `join` — account-room coordinator entrypoint. With no explicit
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
-pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_join(
+    home: &Path,
+    room: Option<String>,
+    quiet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Start the machine-singular daemon and attach: join, heartbeat, and
     // the live feed all route through the daemon's router (one path).
     let socket = crate::cli::default_socket_path_in(home);
@@ -190,10 +194,12 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     match room {
         Some(room) => {
             let joined = airc.join(&room).await?;
-            println!("joined:  #{}", joined.name);
-            println!("wire:    {}", joined.wire.display());
-            println!("channel: {}", joined.channel);
-            print_scope_context(home, &joined.wire);
+            if !quiet {
+                println!("joined:  #{}", joined.name);
+                println!("wire:    {}", joined.wire.display());
+                println!("channel: {}", joined.channel);
+                print_scope_context(home, &joined.wire);
+            }
         }
         None => {
             let cwd = std::env::current_dir()?;
@@ -204,9 +210,11 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
             let default_before = airc.subscription_set().await?.default;
             let rooms = airc.join_default_context(cwd).await?;
             let current = airc.current_room().await?;
-            println!("joined default account context:");
-            for room in rooms {
-                println!("  #{} ({})", room.name, room.channel);
+            if !quiet {
+                println!("joined default account context:");
+                for room in rooms {
+                    println!("  #{} ({})", room.name, room.channel);
+                }
             }
             if let Some(before) = default_before {
                 if before.as_str() != current.name {
@@ -218,9 +226,11 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
                     );
                 }
             }
-            println!("default: #{}", current.name);
-            println!("wire:    {}", current.wire.display());
-            print_scope_context(home, &current.wire);
+            if !quiet {
+                println!("default: #{}", current.name);
+                println!("wire:    {}", current.wire.display());
+                print_scope_context(home, &current.wire);
+            }
         }
     }
     sync_daemon_peers_for_current_rooms(home, socket).await?;
@@ -268,7 +278,7 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
         .then(|| start_sos_fallback(home));
 
     if runtime_context.should_stream_join() {
-        crate::join_feed::run(&airc).await?;
+        crate::join_feed::run(&airc, quiet).await?;
     }
     Ok(())
 }

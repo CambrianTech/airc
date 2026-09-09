@@ -182,12 +182,21 @@ fn run_main() -> ExitCode {
 async fn async_main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    let parsed = Cli::parse();
+
     // Card f10c951e — print a banner if this binary is behind
     // origin/rust-rewrite tip for any airc crate. Best-effort, cheap,
     // never blocks. The single highest-friction onboarding issue.
-    staleness::warn_if_stale();
-
-    let parsed = Cli::parse();
+    //
+    // Moved AFTER parse so an unattended `join --quiet` can opt out. The
+    // banner is a nudge for a human at a prompt; on the logon autostart
+    // task it was the first thing in a permanently-visible console window,
+    // followed by a two-line `git checkout` recovery incantation, which is
+    // how the most persistent surface of the product came to look like
+    // scaffolding. Nobody at a logon screen can act on it.
+    if !matches!(parsed.command, Command::Join { quiet: true, .. }) {
+        staleness::warn_if_stale();
+    }
     match dispatch(parsed).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -614,7 +623,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             GistAction::FileContent { filename } => gist_commands::run_file_content(&filename),
         },
 
-        Command::Join { room } => commands::run_join(&home, room).await,
+        Command::Join { room, quiet } => commands::run_join(&home, room, quiet).await,
 
         Command::Sos { action } => match action {
             SosAction::Send { message } => sos_commands::run_send(&home, &message).await,
