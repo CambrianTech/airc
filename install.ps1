@@ -571,16 +571,38 @@ Write-Host '  Mesh autostart'
 Write-Host '  --------------'
 try {
     $aircExe = (Get-Command airc -ErrorAction Stop).Source
-    $action   = New-ScheduledTaskAction -Execute $aircExe -Argument 'join' -WorkingDirectory $HOME
+    # `--quiet`: nobody is reading stdout at logon. Without it the task's
+    # first output is a staleness banner plus a two-line `git checkout`
+    # recovery incantation, then GH_TOKEN length, extended-length UNC-style paths
+    # and wire/scope/mesh internals. Warnings and errors are NOT suppressed.
+    $action   = New-ScheduledTaskAction -Execute $aircExe -Argument 'join --quiet' -WorkingDirectory $HOME
     $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+
+    # S4U + -Hidden is what actually removes the console window.
+    #
+    # The default principal for a logon task is an INTERACTIVE logon, which
+    # gives a console application a console - a bare terminal window that
+    # then stays open for the life of the mesh connection, because `join`
+    # is long-running by design. It was the only long-lived window among
+    # many that flash past at startup, so it was the one the operator saw,
+    # and it read as scaffolding someone forgot to remove.
+    #
+    # S4U ("run whether logged on or not", no stored password) runs the
+    # task without an interactive desktop, so no console is allocated. airc
+    # needs no desktop - it writes under the user profile and talks over a
+    # socket - and it still runs AS the user, so `$HOME/.airc` resolves
+    # identically. `-Hidden` additionally keeps it out of the default
+    # Task Scheduler view.
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -RestartInterval (New-TimeSpan -Minutes 2) -RestartCount 999 `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+        -Hidden
     Register-ScheduledTask -TaskName 'airc-join' -Action $action -Trigger $trigger `
-        -Settings $settings -Force `
-        -Description 'Keep this node on the airc mesh: start the scope daemon at logon, restart it if it dies.' | Out-Null
-    Write-Ok "autostart registered (task 'airc-join' - at logon, auto-restart)"
+        -Principal $principal -Settings $settings -Force `
+        -Description 'Keep this node on the airc mesh: start the scope daemon at logon, restart it if it dies. Runs hidden (S4U) - inspect with `airc status`, not a console window.' | Out-Null
+    Write-Ok "autostart registered (task 'airc-join' - at logon, hidden, auto-restart)"
 } catch {
     # Never fail the install for this. A node without autostart still works
     # when started by hand; a failed install leaves the operator nothing.

@@ -862,6 +862,20 @@ pub enum Command {
     Join {
         /// Optional channel name to join.
         room: Option<String>,
+        /// Suppress the informational attach banner (joined/wire/scope/mesh,
+        /// the staleness notice, "attached — Ctrl-C to detach").
+        ///
+        /// For UNATTENDED starts — the logon autostart task registers
+        /// `join --quiet`, where nobody is reading stdout and the banner is
+        /// just a console window full of internals.
+        ///
+        /// Warnings and errors are NOT suppressed: a default-room change, a
+        /// failed gh token, an attach failure all still reach stderr, because
+        /// a start that fails silently is worse than one that is noisy. The
+        /// room-doctrine block is also preserved — agent harnesses scrape it
+        /// from stdout, so it is a transport, not decoration.
+        #[arg(long)]
+        quiet: bool,
     },
 
     /// Out-of-band coordination channel of last resort.
