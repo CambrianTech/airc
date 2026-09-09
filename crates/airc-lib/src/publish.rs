@@ -117,8 +117,50 @@ impl Airc {
         target: PublishTarget,
         kind: FrameKind,
         body: Body,
+        headers: Headers,
+        delivery: DeliveryClass,
+    ) -> Result<PublishReceipt, AircError> {
+        self.publish_addressed(target, kind, body, headers, delivery, MentionTarget::All)
+            .await
+    }
+
+    /// [`publish_with_delivery`](Self::publish_with_delivery) with the
+    /// ADDRESSING chosen by the caller — the directed-message path.
+    ///
+    /// Every layer beneath this already routes a directed frame: the daemon
+    /// maps `IpcTarget::Peer` to `Target::Peer`
+    /// (`airc-daemon/src/handlers.rs`), `command_bus` uses
+    /// `MentionTarget::Peer` for its request/reply legs, and the CLI monitor
+    /// RENDERS a peer-addressed arrival (`monitor/attach.rs`). The only
+    /// missing piece was a way for a caller to SET it: `publish` hardcoded
+    /// `All`, so "@name" was decorative — text a reader might notice, never
+    /// addressing the substrate could act on.
+    ///
+    /// `publish` and `say` still pass `All`, so room broadcast is unchanged.
+    /// [`publish`](Self::publish) addressed at ONE peer, durable like chat.
+    ///
+    /// The verb a CLI reaches for: callers that just want "send this to that
+    /// citizen" should not have to name a delivery class to do it.
+    pub async fn publish_to(
+        &self,
+        target: PublishTarget,
+        kind: FrameKind,
+        body: Body,
+        headers: Headers,
+        mention: MentionTarget,
+    ) -> Result<PublishReceipt, AircError> {
+        self.publish_addressed(target, kind, body, headers, DeliveryClass::Durable, mention)
+            .await
+    }
+
+    pub async fn publish_addressed(
+        &self,
+        target: PublishTarget,
+        kind: FrameKind,
+        body: Body,
         mut headers: Headers,
         delivery: DeliveryClass,
+        mention: MentionTarget,
     ) -> Result<PublishReceipt, AircError> {
         // Stamp before the split so BOTH paths (daemon-attached and the
         // direct send below) carry the class — a receiver must not have to
@@ -130,11 +172,11 @@ impl Airc {
         let room = self.resolve_publish_target(&target).await?;
         if self.is_daemon_attached() {
             return self
-                .daemon_publish(&room, kind, body, headers, delivery)
+                .daemon_publish(&room, kind, body, headers, delivery, mention.into())
                 .await;
         }
         let result = self
-            .send_frame_to_room(kind, MentionTarget::All, body, headers, &room)
+            .send_frame_to_room(kind, mention, body, headers, &room)
             .await?;
         Ok(PublishReceipt {
             event_id: result.event_id,

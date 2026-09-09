@@ -1269,6 +1269,8 @@ impl Airc {
                 // A wall post is history: durable, unchanged by the
                 // presence-plane work.
                 airc_bus::DeliveryClass::Durable,
+                // A wall post addresses the room, not a peer.
+                airc_ipc::IpcTarget::All,
             )
             .await?;
         } else {

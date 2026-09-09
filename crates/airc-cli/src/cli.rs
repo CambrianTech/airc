@@ -693,6 +693,31 @@ pub enum Command {
         ///   EOF
         #[arg(long, conflicts_with = "text")]
         stdin: bool,
+        /// STAMP this message as addressed to ONE peer. NOT private — every
+        /// subscriber in the room still receives it.
+        ///
+        /// What this sets is the frame's TARGET, so the substrate and the
+        /// renderers can tell who a message is for, replacing "@name" in the
+        /// body — which is decorative: readable by a human scanning the room,
+        /// invisible to the substrate. Every layer beneath already routes a
+        /// directed frame (the daemon maps `IpcTarget::Peer`, the monitor
+        /// renders one); this is the verb that can finally set it.
+        ///
+        /// It is ADDRESSING, not ISOLATION, and the distinction is the whole
+        /// caveat: `RoutedForwarder` sends to every connected peer except the
+        /// origin, and the bus subscriber filter does not filter on
+        /// `env.target`. Do not use `--to` to keep something from the room.
+        /// (This help said "to ONE peer instead of the whole room" when the
+        /// PR was opened — a claim the code does not support, caught in review
+        /// of #1398. Recipient isolation needs a subscriber-side filter and a
+        /// three-participant proof before any wording here may promise it.)
+        ///
+        /// Accepts a peer-id prefix, the same shape `airc whois` takes
+        /// (`--to e85a5bb3`). Empty, unknown and ambiguous prefixes are all
+        /// refused rather than guessed — addressing the wrong citizen is worse
+        /// than not sending.
+        #[arg(long)]
+        to: Option<String>,
     },
 
     /// Publish a structured frame and emit a JSON receipt on

@@ -417,6 +417,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             room,
             text,
             stdin,
+            to,
         } => {
             // Body from STDIN when asked, so prose never passes through shell
             // quoting (see the `--stdin` doc on the Msg variant: this class cost
@@ -470,7 +471,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .into())
                 }
             };
-            commands::run_msg(&home, default_or(socket, &home), room.named(), &body).await
+            commands::run_msg(
+                &home,
+                default_or(socket, &home),
+                room.named(),
+                &body,
+                to.as_deref(),
+            )
+            .await
         }
         Command::Publish {
             room,

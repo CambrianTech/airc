@@ -2571,6 +2571,7 @@ pub async fn run_msg(
     socket: PathBuf,
     room: Option<&str>,
     text: &str,
+    to: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
@@ -2580,21 +2581,49 @@ pub async fn run_msg(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room" path runs
     // unchanged.
+    // `--to <peer-prefix>` STAMPS the frame's target with one peer. It is
+    // addressing, not isolation - the room still receives it (see the `to`
+    // doc in cli.rs). Resolved against the enrolled peers by the same prefix
+    // rule `airc whois` uses, and REFUSED when the prefix is empty, unknown or
+    // ambiguous - addressing the wrong citizen is worse than not sending, and
+    // a silent best-guess is exactly how that happens.
+    let mention = match to {
+        None => airc_core::MentionTarget::All,
+        Some(prefix) => {
+            let peers = airc.peers().await?;
+            resolve_directed_target(peers.iter().map(|peer| peer.peer_id), prefix)?
+        }
+    };
+    let directed = !matches!(mention, airc_core::MentionTarget::All);
+
     let (channel_name, channel) = match room {
         Some(name) => {
             let receipt = airc
-                .publish(
+                .publish_to(
                     airc_lib::PublishTarget::RoomByName(name.to_string()),
                     airc_protocol::FrameKind::Message,
                     airc_core::Body::text(text),
                     runtime_headers()?,
+                    mention,
                 )
                 .await?;
             (receipt.channel_name, receipt.channel_id)
         }
         None => {
             let current = airc.current_room().await?;
-            airc.say_with_headers(text, runtime_headers()?).await?;
+            if directed {
+                airc.publish_to(
+                    airc_lib::PublishTarget::RoomByName(current.name.clone()),
+                    airc_protocol::FrameKind::Message,
+                    airc_core::Body::text(text),
+                    runtime_headers()?,
+                    mention,
+                )
+                .await?;
+            } else {
+                // Undirected keeps the historical say path byte-for-byte.
+                airc.say_with_headers(text, runtime_headers()?).await?;
+            }
             (current.name, current.channel)
         }
     };
@@ -2613,10 +2642,54 @@ pub async fn run_msg(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
+    if directed {
+        // The receipt above counts the ROOM's live links. It says nothing
+        // about the addressee: the frame carries a target, delivery does not
+        // honour it, and no line in it means "they got this". Saying so is
+        // the difference between a receipt and a promise (review of #1398).
+        println!(
+            "note: `--to` stamped the target only - this frame went to the room,              and the counts above describe the ROOM's links, not the addressee's."
+        );
+    }
     if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
         println!("{warning}");
     }
     Ok(())
+}
+
+/// Resolve `--to <peer-prefix>` against the enrolled peers.
+///
+/// Pure over (peer ids, prefix) so every arm is testable without a daemon —
+/// the inline version of this could only be exercised by a live send, which is
+/// why its empty-prefix arm shipped unnoticed (review of #1398).
+///
+/// Refuses EMPTY, UNKNOWN and AMBIGUOUS. Empty is the arm that matters:
+/// `"".starts_with("")` holds for every peer, so a node with exactly ONE
+/// enrolled peer would resolve `--to ""` to that peer and address someone the
+/// caller never named — while a node with two or more refuses it as ambiguous.
+/// The bug is invisible precisely where the blast radius is smallest.
+fn resolve_directed_target(
+    peer_ids: impl IntoIterator<Item = airc_core::PeerId>,
+    prefix: &str,
+) -> Result<airc_core::MentionTarget, String> {
+    if prefix.trim().is_empty() {
+        return Err("`--to` needs a peer-id prefix; an empty value would match every                     peer - run `airc peers` to list them"
+            .to_string());
+    }
+    let matches: Vec<airc_core::PeerId> = peer_ids
+        .into_iter()
+        .filter(|peer_id| peer_id.to_string().starts_with(prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "no enrolled peer matches `{prefix}` - run `airc peers` to list them"
+        )),
+        [peer_id] => Ok(airc_core::MentionTarget::Peer(*peer_id)),
+        ambiguous => Err(format!(
+            "`{prefix}` matches {} peers - use a longer prefix",
+            ambiguous.len()
+        )),
+    }
 }
 
 pub async fn run_inbox(
@@ -3450,6 +3523,90 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    // --- `--to` resolver (review of #1398) -------------------------------
+    //
+    // These four cover every arm of `resolve_directed_target`. The EMPTY one
+    // is the regression: it shipped in #1398, was caught in review, and could
+    // not have been caught by the existing tests because the resolver was
+    // inline in `run_msg` and only reachable through a live daemon send.
+
+    // what this catches: `--to ""` silently addressing the sole enrolled peer.
+    // `"".starts_with("")` is true, so with ONE peer the filter yields exactly
+    // one match and the old code returned Peer(that_one) — a message addressed
+    // to someone the caller never named, on precisely the small nodes least
+    // likely to notice.
+    #[test]
+    fn an_empty_to_prefix_is_refused_even_when_one_peer_would_match() {
+        let only = airc_core::PeerId::from_u128(0xa1);
+        for empty in ["", "   ", "	"] {
+            let err = super::resolve_directed_target([only], empty)
+                .expect_err("empty prefix must never resolve to a peer");
+            assert!(
+                err.contains("needs a peer-id prefix"),
+                "must say WHY it refused, got: {err}"
+            );
+        }
+        // and the same input against many peers must also refuse — the old
+        // code got this arm right by accident (ambiguous), so a fix that only
+        // handled the many-peer case would look correct here and still be wrong
+        // above.
+        let many = [
+            airc_core::PeerId::from_u128(0xa1),
+            airc_core::PeerId::from_u128(0xb2),
+        ];
+        assert!(super::resolve_directed_target(many, "").is_err());
+    }
+
+    // what this catches: a guard that refuses everything. A resolver that
+    // never resolves would pass the empty test and be useless.
+    #[test]
+    fn an_unambiguous_prefix_resolves_to_that_peer() {
+        // Real peer ids are random uuids that diverge in the FIRST bytes, so
+        // the fixture must too. The first version used `from_u128(0xa1)` /
+        // `from_u128(0xf2)`, which zero-pad to `00000000-...-0000000000a1` —
+        // both share the leading `00000000`, so an 8-char prefix matched BOTH
+        // and this test failed as ambiguous. A fixture whose ids differ only
+        // in the last byte cannot exercise prefix selection at all.
+        let wanted: airc_core::PeerId =
+            airc_core::PeerId::from_uuid("e85a5bb3-74f0-4325-87df-7d5f27637063".parse().unwrap());
+        let other: airc_core::PeerId =
+            airc_core::PeerId::from_uuid("9bb24964-1a1a-43e2-a5aa-8140362bab63".parse().unwrap());
+        let prefix = &wanted.to_string()[..8];
+        assert!(
+            !other.to_string().starts_with(prefix),
+            "fixture is degenerate: both ids share the prefix under test"
+        );
+        match super::resolve_directed_target([wanted, other], prefix) {
+            Ok(airc_core::MentionTarget::Peer(got)) => assert_eq!(got, wanted),
+            other => panic!("expected Peer({wanted}), got {other:?}"),
+        }
+    }
+
+    // what this catches: a best-guess on an unknown prefix. Addressing the
+    // wrong citizen is worse than not sending.
+    #[test]
+    fn an_unknown_prefix_is_refused_rather_than_guessed() {
+        let peer = airc_core::PeerId::from_u128(0xa1);
+        let err = super::resolve_directed_target([peer], "ffffffff")
+            .expect_err("unknown prefix must refuse");
+        assert!(err.contains("no enrolled peer matches"), "got: {err}");
+    }
+
+    // what this catches: picking the first of several matches. Two peers
+    // sharing a prefix must produce a refusal naming the count, not a winner.
+    #[test]
+    fn an_ambiguous_prefix_is_refused_and_names_the_count() {
+        // from_u128 gives a zero-padded uuid, so both share the leading run.
+        let a = airc_core::PeerId::from_u128(0x1);
+        let b = airc_core::PeerId::from_u128(0x2);
+        let err = super::resolve_directed_target([a, b], "0000")
+            .expect_err("ambiguous prefix must refuse");
+        assert!(
+            err.contains("matches 2 peers"),
+            "must name the count, got: {err}"
+        );
+    }
+
     use super::*;
 
     /// what this catches (live 2026-08-12): the @mention parse feeding the
