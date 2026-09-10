@@ -68,6 +68,8 @@ pub mod room;
 pub mod route;
 pub mod route_forwarder;
 pub mod router_bridge;
+pub mod runtime_dir;
+pub mod socket_path;
 mod stream;
 pub mod stream_chunk;
 pub mod subscriptions;

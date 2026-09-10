@@ -385,6 +385,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "temp-env",
  "tempfile",
  "thiserror 1.0.69",
