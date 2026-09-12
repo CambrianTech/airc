@@ -121,6 +121,12 @@ pub struct StatusResponse {
     /// receipt frames honestly rather than as confirmed reach.
     #[serde(default)]
     pub connected_lan_peers: usize,
+    /// Live IPC connections the daemon holds right now (request sockets
+    /// in flight + attach streams). `None` = the daemon predates the
+    /// field — not zero. A number that climbs while its clients hold a
+    /// flat count is a daemon keeping dead streams (card e28889cc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<usize>,
 }
 
 /// One entry in the `Peers` response. Mirrors `peers_store::StoredPeer`
@@ -345,6 +351,7 @@ mod tests {
             build_branch: Some("rust-rewrite".to_string()),
             executable: Some("/tmp/airc".to_string()),
             connected_lan_peers: 2,
+            connections: None,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
@@ -367,6 +374,7 @@ mod tests {
                 build_branch: None,
                 executable: None,
                 connected_lan_peers: 0,
+                connections: None,
             })
         );
     }

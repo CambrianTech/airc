@@ -2533,6 +2533,9 @@ pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std:
     }
     println!("peer_id:        {}", status.peer_id);
     println!("uptime_seconds: {}", status.uptime_seconds);
+    if let Some(connections) = status.connections {
+        println!("connections: {connections}");
+    }
     if let Some(version) = status.ipc_protocol_version {
         println!("ipc_protocol:   {version}");
     }
@@ -3980,6 +3983,7 @@ mod tests {
             build_branch: Some("rust-rewrite".to_string()),
             executable: Some("/tmp/airc".to_string()),
             connected_lan_peers: 0,
+            connections: None,
         }
     }
 

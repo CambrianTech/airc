@@ -44,7 +44,12 @@ pub enum ClientError {
     /// Daemon returned a response variant inconsistent with the
     /// request (e.g. `Status` returning `Pong`). Indicates a daemon
     /// bug or a wire-protocol mismatch.
-    UnexpectedResponse(Response),
+    ///
+    /// Boxed: an error must not grow with the status wire — every field
+    /// added to `StatusResponse` used to widen every `Result<_, ClientError>`
+    /// (clippy `result_large_err` tripped at 136 bytes the day
+    /// `connections` landed).
+    UnexpectedResponse(Box<Response>),
 }
 
 impl std::fmt::Display for ClientError {
@@ -141,7 +146,7 @@ impl DaemonClient {
     pub async fn ping_with_timeout(&self, deadline: Duration) -> Result<(), ClientError> {
         match self.call_with_timeout(Request::Ping, deadline).await? {
             Response::Pong => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -155,7 +160,7 @@ impl DaemonClient {
     ) -> Result<StatusResponse, ClientError> {
         match self.call_with_timeout(Request::Status, deadline).await? {
             Response::Status(status) => Ok(status),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -164,21 +169,21 @@ impl DaemonClient {
     pub async fn send(&self, request: SendRequest) -> Result<PublishResponse, ClientError> {
         match self.call(Request::Send(request)).await? {
             Response::Publish(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn publish(&self, request: PublishRequest) -> Result<PublishResponse, ClientError> {
         match self.call(Request::Publish(request)).await? {
             Response::Publish(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
         match self.call(Request::Inbox(request)).await? {
             Response::Inbox(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -189,7 +194,7 @@ impl DaemonClient {
     pub async fn room_tip(&self, request: RoomTipRequest) -> Result<RoomTipResponse, ClientError> {
         match self.call(Request::RoomTip(request)).await? {
             Response::RoomTip(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -205,28 +210,28 @@ impl DaemonClient {
     ) -> Result<PeerIdentityCardResponse, ClientError> {
         match self.call(Request::PeerIdentityCard(request)).await? {
             Response::PeerIdentityCard(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn stop(&self) -> Result<(), ClientError> {
         match self.call(Request::Stop).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn add_peer(&self, request: AddPeerRequest) -> Result<(), ClientError> {
         match self.call(Request::AddPeer(request)).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn remove_peer(&self, request: RemovePeerRequest) -> Result<(), ClientError> {
         match self.call(Request::RemovePeer(request)).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -238,7 +243,7 @@ impl DaemonClient {
     pub async fn route_endpoints(&self) -> Result<RouteEndpointsResponse, ClientError> {
         match self.call(Request::RouteEndpoints).await? {
             Response::RouteEndpoints(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -248,7 +253,7 @@ impl DaemonClient {
     pub async fn delivery_stats(&self) -> Result<DeliveryStatsResponse, ClientError> {
         match self.call(Request::DeliveryStats).await? {
             Response::DeliveryStats(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -258,7 +263,7 @@ impl DaemonClient {
     pub async fn list_rooms(&self) -> Result<RoomsResponse, ClientError> {
         match self.call(Request::ListRooms).await? {
             Response::Rooms(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -268,7 +273,7 @@ impl DaemonClient {
     pub async fn list_peers(&self) -> Result<PeersResponse, ClientError> {
         match self.call(Request::ListPeers).await? {
             Response::Peers(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
