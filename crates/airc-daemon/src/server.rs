@@ -15,13 +15,13 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use futures::StreamExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind};
 use airc_bus::{Filter, Seq};
@@ -111,7 +111,7 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
     // dies without tearing it down (SIGKILL escapes every Drop guard),
     // it must exit BY ITSELF once no client has been connected for the
     // idle window. Production homes never start this watchdog.
-    let idle_tracker = IdleTracker::new();
+    let idle_tracker = IdleTracker::new(state.clone());
     let watchdog = spawn_temp_home_idle_watchdog(&state, &idle_tracker);
 
     // Keep ONE `Notified` future alive across loop iterations. `select!`
@@ -243,15 +243,17 @@ fn spawn_temp_home_idle_watchdog(
 /// elapsed since `start` so the hot paths stay lock-free atomics.
 struct IdleTracker {
     start: Instant,
-    connections: AtomicUsize,
+    /// The live-connection count lives on `DaemonState::connections`
+    /// (one fact, one place — `Status` reports the same number).
+    state: Arc<DaemonState>,
     last_activity_ms: AtomicU64,
 }
 
 impl IdleTracker {
-    fn new() -> Arc<Self> {
+    fn new(state: Arc<DaemonState>) -> Arc<Self> {
         Arc::new(Self {
             start: Instant::now(),
-            connections: AtomicUsize::new(0),
+            state,
             last_activity_ms: AtomicU64::new(0),
         })
     }
@@ -260,14 +262,14 @@ impl IdleTracker {
     /// live as long as the connection task — its Drop is what marks
     /// the connection closed and stamps the idle clock.
     fn connection_opened(self: &Arc<Self>) -> ConnectionGuard {
-        self.connections.fetch_add(1, Ordering::SeqCst);
+        self.state.connections.fetch_add(1, Ordering::SeqCst);
         ConnectionGuard(self.clone())
     }
 
     /// `Some(duration since the daemon last had a client)` when no
     /// client is connected; `None` while any connection is live.
     fn idle_for(&self) -> Option<Duration> {
-        if self.connections.load(Ordering::SeqCst) > 0 {
+        if self.state.connections.load(Ordering::SeqCst) > 0 {
             return None;
         }
         let last = Duration::from_millis(self.last_activity_ms.load(Ordering::SeqCst));
@@ -288,7 +290,7 @@ struct ConnectionGuard(Arc<IdleTracker>);
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.stamp_activity();
-        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+        self.0.state.connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -450,7 +452,7 @@ async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result
     };
 
     if let Request::Attach(attach) = request {
-        return stream_attach(writer, state, attach).await;
+        return stream_attach(reader, writer, state, attach).await;
     }
 
     let response = dispatch(state, request).await;
@@ -460,12 +462,14 @@ async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result
     Ok(())
 }
 
-async fn stream_attach<W>(
+async fn stream_attach<R, W>(
+    reader: R,
     mut writer: W,
     state: Arc<DaemonState>,
     attach: AttachRequest,
 ) -> Result<(), DaemonError>
 where
+    R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     // Card c0cb6cdc: the request destructures into typed parts — the
@@ -546,6 +550,18 @@ where
     let shutdown = state.shutdown.notified();
     tokio::pin!(shutdown);
 
+    // The client's half of the socket is the ONLY signal that it hung up.
+    // Before this arm existed the reader sat unread for the stream's
+    // whole life, so a subscriber that closed — a core that died, a
+    // citizen re-opening on a membership epoch — left its daemon-side
+    // socket open until the channel's NEXT event tripped EPIPE on the
+    // write; on a quiet room, never. Measured 2026-09-12 (card e28889cc):
+    // 4,190 sockets on one daemon, ~3,500 with no peer, climbing with
+    // every core restart. Pinned once like `shutdown` so no hang-up is
+    // lost across re-subscribes.
+    let hangup = client_hung_up(reader);
+    tokio::pin!(hangup);
+
     // Card 7d5b6a65 catch-up tracking. When `coalesce_backlog` is set,
     // we count events until the ring's live-edge cursor (captured at
     // subscribe time) is reached, then emit ONE summary frame and
@@ -597,6 +613,8 @@ where
             tokio::select! {
                 biased;
                 _ = &mut shutdown => return Ok(()),
+                // Client gone: drop the subscription with the stream.
+                _ = &mut hangup => return Ok(()),
                 next = stream.next() => match next {
                     Some(env) => {
                         from = Some(env.cursor());
@@ -682,6 +700,21 @@ where
                     None => return Ok(()),
                 },
             }
+        }
+    }
+}
+
+/// Resolves when the attach client's side of the socket closes: EOF
+/// (`Ok(0)`) or a transport error (a Windows named pipe reports the
+/// disconnect as an error). Bytes a client writes on an attach stream
+/// carry no protocol meaning and are drained — the arm must stay armed
+/// for the stream's whole life, not trip on chatter.
+async fn client_hung_up<R: AsyncReadExt + Unpin>(mut reader: R) {
+    let mut scratch = [0u8; 64];
+    loop {
+        match reader.read(&mut scratch).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => continue,
         }
     }
 }

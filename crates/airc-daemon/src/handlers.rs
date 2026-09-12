@@ -51,6 +51,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             connected_lan_peers: state
                 .connected_lan_peers
                 .load(std::sync::atomic::Ordering::Relaxed),
+            connections: Some(state.connections.load(std::sync::atomic::Ordering::Relaxed)),
         }),
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
