@@ -629,6 +629,14 @@ impl Airc {
                                     }
                                 }
                             }
+                            Ok(Some(Response::AttachCursorAdvanced { .. })) => {
+                                // The daemon's CURSOR HEARTBEAT (server.rs, continuum #261): one per
+                                // second per subscription after events, so a cursor-persisting
+                                // consumer advances. This reader does not persist cursors; the frame
+                                // is bookkeeping, not an event. It used to fall through to the warn
+                                // below — 3,100 lines/min on a 16-citizen core, rotating the log
+                                // every 15 minutes (2026-09-14, airc #1411).
+                            }
                             Ok(Some(other)) => {
                                 // Non-Event frames on a live subscription
                                 // are unexpected (ack already consumed); a
