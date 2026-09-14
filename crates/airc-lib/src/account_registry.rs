@@ -400,6 +400,12 @@ pub enum AccountRegistryError {
     /// starved. Advisory backoff is not backoff.
     RateLimited {
         retry_after_secs: u64,
+        /// The governor's own reason — WHICH gate refused (shared backoff vs the
+        /// 60s window) with its numbers (count/limit). Before 2026-09-14 this was
+        /// logged at debug and dropped from the error, so a node whose registry
+        /// publish failed on every call for hours ("budget exhausted") could not be
+        /// checked against `airc gh doctor` (which read 8/30 at the same moment).
+        reason: String,
     },
 }
 
@@ -420,10 +426,13 @@ impl std::fmt::Display for AccountRegistryError {
                 "account registry peer mismatch: presence {presence_peer_id} vs spec {spec_peer_id}"
             ),
             Self::Adapter(error) => write!(f, "account registry adapter: {error}"),
-            Self::RateLimited { retry_after_secs } => write!(
+            Self::RateLimited {
+                retry_after_secs,
+                reason,
+            } => write!(
                 f,
-                "gh request budget exhausted; the governor asks for {retry_after_secs}s \
-                 before the next Registry call"
+                "gh governor refused this Registry call ({reason}); it asks for \
+                 {retry_after_secs}s before the next one"
             ),
         }
     }
@@ -861,6 +870,19 @@ impl Airc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches: a refusal that hides which gate refused and its numbers —
+    /// the M5 read "budget exhausted" for hours while `airc gh doctor` read 8/30.
+    #[test]
+    fn a_governor_refusal_names_its_gate_and_numbers() {
+        let e = AccountRegistryError::RateLimited {
+            retry_after_secs: 60,
+            reason: "gh request budget exceeded for Registry (30/30 of 30 in 60s)".into(),
+        };
+        let shown = e.to_string();
+        assert!(shown.contains("30/30 of 30 in 60s"), "{shown}");
+        assert!(shown.contains("60s"), "{shown}");
+    }
     use airc_core::PeerId;
     use airc_protocol::PeerKeypair;
     use std::net::SocketAddr;
