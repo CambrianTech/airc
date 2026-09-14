@@ -81,9 +81,34 @@ pub async fn run_publish(
             .status()
             .await;
         let daemon_answered = status.is_ok();
+        let daemon_uptime_secs = status.as_ref().ok().map(|s| s.uptime_seconds);
         let connected_lan_peers = status.map(|s| s.connected_lan_peers).unwrap_or(0);
         obj.insert("enrolled_peers".into(), enrolled_peers.into());
         obj.insert("daemon_answered".into(), daemon_answered.into());
+        // A RECONNECT IS NOT AN OUTAGE — @7711fe60's refinement, from the first real
+        // firing of this receipt 30 min after it merged.
+        //
+        // 2026-09-14 17:42:07Z my publish read connected_lan_peers 0, enrolled 101,
+        // reached_no_remote_peer true. Correct — the message reached nobody. But the
+        // CAUSE was that my daemon had auto-updated to 6c7c56fab seconds earlier and
+        // the LAN route had not re-established. From the other side at 17:44:36Z the
+        // M5 read 1143/1143 acked to this node at 58 ms rtt: nothing was broken.
+        //
+        // Without the uptime, a reader cannot tell a fresh restart from a dead route,
+        // and I nearly filed my own instrument as a false alarm on exactly that
+        // confusion. A receipt that says "0 peers, daemon up 4s" reads as "wait";
+        // one that says "0 peers, daemon up 3 hours" reads as "investigate". Same
+        // number, opposite actions.
+        //
+        // `None` when the daemon did not answer — honest-absent, never a zero that
+        // would read as "just started".
+        obj.insert(
+            "daemon_uptime_secs".into(),
+            match daemon_uptime_secs {
+                Some(secs) => secs.into(),
+                None => serde_json::Value::Null,
+            },
+        );
         if daemon_answered {
             obj.insert("connected_lan_peers".into(), connected_lan_peers.into());
         } else {
@@ -353,6 +378,40 @@ mod tests {
     /// nothing was wrong. A daemon that does not answer must never be reported as
     /// "0 connected peers": that is a guess wearing a number. It is UNKNOWN reach,
     /// and unknown reach is loud.
+    /// what this catches: a RECONNECT read as an OUTAGE.
+    ///
+    /// The first real firing of this receipt (2026-09-14 17:42:07Z) reported
+    /// connected_lan_peers 0 / enrolled 101 / reached_no_remote_peer true — all
+    /// correct, the message reached nobody. But the cause was a daemon that had
+    /// auto-updated seconds earlier, not a broken route: from the other side at
+    /// 17:44:36Z the peer read 1143/1143 acked at 58 ms rtt.
+    ///
+    /// I nearly reported my own instrument as a false alarm on that confusion. The
+    /// uptime is what separates "wait, it is reconnecting" from "investigate, the
+    /// route is dead" — same zero, opposite actions.
+    #[test]
+    fn a_fresh_daemon_is_distinguishable_from_a_dead_route() {
+        // Both are zero-reach; only the uptime tells them apart.
+        let reconnecting = (0usize, Some(4u64));
+        let dead_route = (0usize, Some(10_800u64));
+        let unknown = (0usize, None::<u64>);
+        fn reads_as_reconnect(state: (usize, Option<u64>)) -> bool {
+            matches!(state, (0, Some(secs)) if secs < 60)
+        }
+        assert!(
+            reads_as_reconnect(reconnecting),
+            "a daemon up 4s with no peers is mid-reconnect, not an outage"
+        );
+        assert!(
+            !reads_as_reconnect(dead_route),
+            "a daemon up 3h with no peers is a real loss of route"
+        );
+        assert!(
+            !reads_as_reconnect(unknown),
+            "no uptime at all cannot be claimed as a reconnect"
+        );
+    }
+
     #[test]
     fn a_daemon_that_did_not_answer_is_unknown_reach_not_zero_reach() {
         fn verdict(daemon_answered: bool, enrolled: usize, connected: usize) -> bool {
