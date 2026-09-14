@@ -397,7 +397,9 @@ where
     match run_tick(airc, store, sink).await {
         Ok(_) => TickOutcome::Imported,
         Err(crate::AircError::AccountRegistry(
-            crate::account_registry::AccountRegistryError::RateLimited { retry_after_secs, .. },
+            crate::account_registry::AccountRegistryError::RateLimited {
+                retry_after_secs, ..
+            },
         )) => TickOutcome::RateLimited { retry_after_secs },
         Err(_) => TickOutcome::NoChange,
     }

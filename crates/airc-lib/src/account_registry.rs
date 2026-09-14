@@ -426,7 +426,10 @@ impl std::fmt::Display for AccountRegistryError {
                 "account registry peer mismatch: presence {presence_peer_id} vs spec {spec_peer_id}"
             ),
             Self::Adapter(error) => write!(f, "account registry adapter: {error}"),
-            Self::RateLimited { retry_after_secs, reason } => write!(
+            Self::RateLimited {
+                retry_after_secs,
+                reason,
+            } => write!(
                 f,
                 "gh governor refused this Registry call ({reason}); it asks for \
                  {retry_after_secs}s before the next one"
@@ -868,7 +871,6 @@ impl Airc {
 mod tests {
     use super::*;
 
-
     /// what this catches: a refusal that hides which gate refused and its numbers —
     /// the M5 read "budget exhausted" for hours while `airc gh doctor` read 8/30.
     #[test]
@@ -880,7 +882,8 @@ mod tests {
         let shown = e.to_string();
         assert!(shown.contains("30/30 of 30 in 60s"), "{shown}");
         assert!(shown.contains("60s"), "{shown}");
-    }    use airc_core::PeerId;
+    }
+    use airc_core::PeerId;
     use airc_protocol::PeerKeypair;
     use std::net::SocketAddr;
     use std::path::Path;
