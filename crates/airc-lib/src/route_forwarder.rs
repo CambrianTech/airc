@@ -280,9 +280,18 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
             if Some(peer) == item.origin {
                 continue;
             }
+            let first_sight = !workers.contains_key(&peer);
             let queue = workers
                 .entry(peer)
                 .or_insert_with(|| spawn_peer_worker(Arc::downgrade(&inner), peer, &inner.config));
+            if first_sight {
+                // Backfill slice 2: a peer seen connected for the first time (a node
+                // that came back, or this daemon just started) is asked what this
+                // node missed on every subscribed channel. Off the forward path.
+                if let Some((link, _adapter)) = resolve_link(&inner, peer).await {
+                    tokio::spawn(async move { link.backfill_all_from_peer(peer).await });
+                }
+            }
             match queue.try_send(PeerItem {
                 env: Arc::clone(&item.env),
             }) {
@@ -700,7 +709,7 @@ async fn wait_for_ack(
 /// remote can't route a LAN ack back over the relay anyway (it would emit
 /// a spurious `delivery_ack_send_failed`). Relay delivery confirmation
 /// lands with the relay's durable mailbox (#1247 slice 9).
-fn build_forward_frame(
+pub(crate) fn build_forward_frame(
     link: &Airc,
     env: &Envelope,
     request_ack: bool,

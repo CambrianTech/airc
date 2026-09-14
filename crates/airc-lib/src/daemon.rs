@@ -265,6 +265,32 @@ impl Airc {
         })
     }
 
+    /// The channel's newest `limit` events as BUS envelopes (the daemon's wire
+    /// bytes decoded, nothing projected away) — what a backfill answer is built from.
+    pub(crate) async fn daemon_room_envelopes_recent(
+        &self,
+        channel: RoomId,
+        limit: usize,
+    ) -> Result<Vec<airc_bus::Envelope>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .inbox(InboxRequest {
+                since: None,
+                channel: Some(channel),
+                limit: Some(limit),
+                kinds: None,
+            })
+            .await?;
+        response
+            .envelopes
+            .into_iter()
+            .map(|bytes| {
+                airc_wire::decode(bytes.into())
+                    .map_err(|e| AircError::Crypto(format!("backfill envelope decode: {e}")))
+            })
+            .collect()
+    }
+
     pub(crate) async fn daemon_page_recent(
         &self,
         room: &Room,
