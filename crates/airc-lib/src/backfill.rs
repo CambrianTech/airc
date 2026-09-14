@@ -348,12 +348,13 @@ impl Airc {
                 .map(|f| f.envelope.occurred_at_ms)
                 .min();
             for frame in &response.frames {
+                use crate::router_bridge::InboundDeliveryVerdict as V;
                 match sink.deliver(frame).await {
-                    crate::router_bridge::InboundDeliveryVerdict::Delivered
-                    | crate::router_bridge::InboundDeliveryVerdict::DeliveredRemapped(_) => {
-                        delivered += 1;
-                    }
-                    _ => {}
+                    V::Delivered | V::DeliveredRemapped(_) => delivered += 1,
+                    // A frame for a channel this node does not host, or a
+                    // decode/publish failure: the bridge already accounted for
+                    // it the way it does for live frames; nothing to count.
+                    V::UnknownChannel | V::Failed(_) => {}
                 }
             }
             if !response.truncated {
