@@ -37,7 +37,48 @@ pub async fn run_publish(
         .await?;
 
     // One-line JSON so callers can pipe into `jq` directly.
-    let line = serde_json::to_string(&receipt)
+    let mut line = serde_json::to_value(&receipt)
+        .map_err(|error| format!("serialize publish receipt: {error}"))?;
+    // REACH, alongside the ids — the same two facts `airc msg` has always printed
+    // (see `format_send_receipt`), which this path dropped.
+    //
+    // Why it matters, measured 2026-09-14: a publish to #cambriantech returned
+    // {"event_id":"19dfdc60-…","lamport":…,"channel_id":…} and NEVER ARRIVED on the
+    // peer. The receipt was byte-for-byte the same shape as one that did arrive, so
+    // the sender had no way to tell — and reported the round trip as working on the
+    // strength of it. `airc msg` would have said "⚠ reached 0 of N enrolled remote
+    // peer(s)"; `airc publish` said nothing, because the honesty lived only in the
+    // prose formatter.
+    //
+    // This is REACH, not delivery. Delivery is a returned ACK and lives in the
+    // daemon's ledger (`airc doctor --health`, #280). A receipt cannot promise it.
+    // What it can do is distinguish "queued with a live route" from "queued into the
+    // void", which is the distinction that was missing.
+    //
+    // Do NOT divide these two numbers. `enrolled_peers` is every peer this scope ever
+    // enrolled, across every room, for all time — not this room's audience. Printing
+    // them as a ratio manufactured a false catastrophe on 2026-08-07 (card #340: the
+    // receipt read 2% reach while the ack ledger showed 99.5%), and an instrument that
+    // cries wolf during healthy operation burns the trust of every later alarm.
+    if let Some(obj) = line.as_object_mut() {
+        let enrolled_peers = airc.peers().await.map(|p| p.len()).unwrap_or(0);
+        let connected_lan_peers =
+            airc_ipc::DaemonClient::new(crate::cli::default_socket_path_in(home))
+                .status()
+                .await
+                .map(|status| status.connected_lan_peers)
+                .unwrap_or(0);
+        obj.insert("enrolled_peers".into(), enrolled_peers.into());
+        obj.insert("connected_lan_peers".into(), connected_lan_peers.into());
+        // The loud case, stated as a field so a shell consumer can branch on it
+        // without re-deriving the rule: enrolled peers exist and NONE is connected,
+        // so the fan-out reached no remote machine.
+        obj.insert(
+            "reached_no_remote_peer".into(),
+            (enrolled_peers > 0 && connected_lan_peers == 0).into(),
+        );
+    }
+    let line = serde_json::to_string(&line)
         .map_err(|error| format!("serialize publish receipt: {error}"))?;
     println!("{line}");
     Ok(())
@@ -243,5 +284,32 @@ mod tests {
             }
             other => panic!("expected json body, got {other:?}"),
         }
+    }
+
+    /// what this catches: a publish receipt that cannot say NOT DELIVERED.
+    ///
+    /// Regression for the 2026-09-14 loss: event 19dfdc60 was published to
+    /// #cambriantech, returned a complete receipt, and never arrived on the peer.
+    /// The receipt was byte-identical in SHAPE to one that did arrive, so nothing
+    /// downstream could distinguish them — and the sender reported the round trip
+    /// as working partly on its strength. `airc msg` had the honest version the
+    /// whole time (`format_send_receipt`: "⚠ reached 0 of N enrolled remote
+    /// peer(s)"); only the JSON path dropped it.
+    ///
+    /// This asserts the RULE, not the plumbing: enrolled peers with zero live
+    /// connections must set `reached_no_remote_peer`, so a shell consumer can
+    /// branch on the loud case instead of re-deriving it.
+    #[test]
+    fn a_receipt_says_so_when_it_reached_no_remote_peer() {
+        fn verdict(enrolled: usize, connected: usize) -> bool {
+            enrolled > 0 && connected == 0
+        }
+        // The failing shape: peers are enrolled, none is connected — the fan-out
+        // went nowhere, and this is the case that looked like success.
+        assert!(verdict(4, 0), "enrolled with no live route must be loud");
+        // A live route: not loud. Delivery is still ack-confirmed, not promised here.
+        assert!(!verdict(4, 1));
+        // No enrolled peers at all is a local-only scope, not a failure.
+        assert!(!verdict(0, 0), "a scope with no peers has nothing to reach");
     }
 }
