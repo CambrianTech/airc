@@ -74,9 +74,19 @@ impl SqliteDurableSink {
         let mut opts = ConnectOptions::new(db_url.to_owned());
         // Single writer (the daemon). One connection avoids SQLite
         // write-lock contention entirely (§3.3).
-        opts.connect_timeout(std::time::Duration::from_secs(5))
+        opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .max_connections(1);
+        // WAL + the busy timeout ride the connection options so the journal switch
+        // never needs a separate exclusive statement racing another opener — see
+        // `SqliteEventStore::open` (2026-09-14: "database is locked" at attach on
+        // Windows CI). `set_wal` stays as the idempotent belt for an old DB.
+        opts.map_sqlx_sqlite_opts(|so| {
+            use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
+            so.journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
+        });
         let db = Database::connect(opts)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
