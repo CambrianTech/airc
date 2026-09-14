@@ -369,11 +369,7 @@ impl Airc {
     /// Never fails the caller — a peer that cannot answer is logged, not fatal.
     pub(crate) async fn backfill_all_from_peer(&self, peer: PeerId) {
         let rooms = match self.subscription_set().await {
-            Ok(set) => set
-                .all()
-                .into_iter()
-                .map(|s| s.as_room())
-                .collect::<Vec<_>>(),
+            Ok(set) => set.all().map(|s| s.as_room()).collect::<Vec<_>>(),
             Err(error) => {
                 tracing::warn!(target: "airc::backfill", %peer, %error, "backfill skipped: no subscription set");
                 return;
