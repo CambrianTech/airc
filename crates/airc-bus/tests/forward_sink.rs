@@ -11,9 +11,15 @@
 //!   2. a `Duplicate` outcome of `publish_if_new` NEVER reaches the
 //!      sink — re-arrivals are dead-ends, which is what makes mesh
 //!      forwarding terminate;
-//!   3. ephemeral classes stay machine-local (never offered);
-//!   4. sink saturation is a counted loud-drop that neither blocks
-//!      nor fails the publish hot path.
+//!   3. `EphemeralLatest` envelopes ARE offered, carrying their origin
+//!      (card bf4d4556 — capacity offers are ephemeral, and the old
+//!      "never offered" rule is what left the capacity plane dark on
+//!      every node; stream classes remain machine-local);
+//!   4. sink saturation neither blocks nor fails the publish hot path,
+//!      and its accounting is class-dependent: a durable overflow is a
+//!      counted LOUD drop (data loss), an ephemeral overflow is a
+//!      counted benign SUPERSEDE (latest-wins — the next offer carries
+//!      the same truth).
 
 mod common;
 
@@ -70,7 +76,11 @@ async fn published_durables_reach_the_forward_sink_with_their_origin() {
 }
 
 #[tokio::test]
-async fn duplicates_and_ephemerals_never_reach_the_forward_sink() {
+async fn duplicates_never_reach_the_forward_sink() {
+    // what this catches: re-arrivals must be dead-ends. This is the half
+    // of the old `duplicates_and_ephemerals_...` test that did NOT change
+    // under card bf4d4556 — it is load-bearing loop termination, and mesh
+    // forwarding stops terminating without it.
     let owner = Owner::new(RouterConfig::default());
     let (tx, mut rx) = mpsc::channel(16);
     owner.router.set_forward_sink(tx);
@@ -93,18 +103,211 @@ async fn duplicates_and_ephemerals_never_reach_the_forward_sink() {
         .expect("echo publish");
     assert_eq!(echo, PublishIfNew::Duplicate);
 
-    // Ephemeral — machine-local in this slice, never offered.
-    owner
-        .router
-        .publish(ephemeral(channel, 8, "pose", b"xy"))
-        .await
-        .expect("ephemeral publish");
-
     let extra = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
     assert!(
         extra.is_err(),
-        "neither a Duplicate re-arrival nor an ephemeral may reach the \
-         forward sink; got {extra:?}"
+        "a Duplicate re-arrival may never reach the forward sink; got {extra:?}"
+    );
+}
+
+#[tokio::test]
+async fn ephemerals_reach_the_forward_sink_so_capacity_offers_cross_the_wire() {
+    // what this catches: regression for card bf4d4556 — the capacity
+    // plane dark on all three grid nodes. Capacity offers publish as
+    // `EphemeralLatest`; the offer to the forward sink used to sit inside
+    // the `is_durable()` block, so they never left the machine and every
+    // node heard only its own echo. This test is the inversion of the old
+    // "ephemerals never offered" assertion, which pinned that bug as if
+    // it were the design.
+    let owner = Owner::new(RouterConfig::default());
+    let (tx, mut rx) = mpsc::channel(16);
+    owner.router.set_forward_sink(tx);
+    let channel = RoomId::from_u128(0xf3);
+    let origin_peer = PeerId::from_u128(0xcafe);
+
+    owner
+        .router
+        .publish(ephemeral(channel, 8, "capacity", b"xy"))
+        .await
+        .expect("ephemeral publish");
+    let local = recv_item(&mut rx).await;
+    assert_eq!(local.env.event_id, airc_core::EventId::from_u128(8));
+    assert_eq!(
+        local.origin, None,
+        "a locally originated ephemeral must carry no origin link"
+    );
+
+    // A bridged ephemeral must carry its origin too — without it the
+    // forwarder cannot apply loop prevention and an offer would echo
+    // back over the link it arrived on.
+    owner
+        .router
+        .publish_if_new_from(ephemeral(channel, 9, "capacity", b"zz"), Some(origin_peer))
+        .await
+        .expect("bridged ephemeral publish");
+    let bridged = recv_item(&mut rx).await;
+    assert_eq!(bridged.env.event_id, airc_core::EventId::from_u128(9));
+    assert_eq!(
+        bridged.origin,
+        Some(origin_peer),
+        "a bridged ephemeral must carry the link peer it arrived from, or \
+         the forwarder will echo it back over that same link"
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_saturation_is_a_benign_supersede_not_a_loud_drop() {
+    // what this catches: card bf4d4556's second half — an overflowing
+    // ephemeral must not raise the DURABLE data-loss alarm, because that
+    // alarm means "a message is gone forever" and for this class it is not.
+    //
+    // WHAT THIS TEST DOES NOT ESTABLISH, and an earlier version of this
+    // comment wrongly claimed it did: it says nothing about WHICH offer
+    // survives. The counters below are identical under real coalescing and
+    // under drop-newest, so "supersede-on-full IS the coalescing" cannot be
+    // concluded from them — that claim was false (`try_send` hands back the
+    // message you passed, keeping what is already queued). The payload
+    // invariant is pinned separately in
+    // `a_saturated_ephemeral_tap_delivers_the_newest_offer`.
+    let owner = Owner::new(RouterConfig::default());
+    let (tx, _rx) = mpsc::channel(1);
+    owner.router.set_forward_sink(tx);
+    let channel = RoomId::from_u128(0xf4);
+
+    for marker in 0..4u128 {
+        owner
+            .router
+            .publish(ephemeral(channel, 200 + marker, "capacity", b"q"))
+            .await
+            .expect("publish must keep succeeding while the forward tap overflows");
+    }
+
+    assert_eq!(
+        owner.router.forward_drop_count(),
+        0,
+        "a superseded ephemeral is not durable data loss and must never be \
+         counted as a loud drop"
+    );
+    assert_eq!(
+        owner.router.ephemeral_superseded_count(),
+        3,
+        "superseded ephemerals must still be COUNTED — benign is not the \
+         same as invisible, and a pathological offer rate has to be visible"
+    );
+}
+
+/// what this catches: a DEAD FORWARDER reported as a benign supersede — the
+/// second defect Astra found in #1397, and one that survived a mutation check
+/// until this test existed.
+///
+/// `Closed` means the forwarder task has EXITED. Nothing will cross again for
+/// any delivery class: there is no "next offer" to carry the truth, and the
+/// latest-map can only grow. The original code folded `Closed` into the
+/// ephemeral path and logged it at debug as "superseded, not lost" — a phrase
+/// that means the opposite of what had happened. A permanently dead forward
+/// path must be as loud as a durable loss, because it IS one.
+#[tokio::test]
+async fn a_closed_forward_sink_is_loud_for_ephemerals_too() {
+    let owner = Owner::new(RouterConfig::default());
+    let (tx, rx) = mpsc::channel(8);
+    owner.router.set_forward_sink(tx);
+    drop(rx); // the forwarder task is gone
+    let channel = RoomId::from_u128(0xf6);
+
+    owner
+        .router
+        .publish(ephemeral(channel, 400, "capacity", b"q"))
+        .await
+        .expect("publish must still succeed locally");
+
+    assert_eq!(
+        owner.router.forward_drop_count(),
+        1,
+        "a closed receiver is a dead forward path and must be counted as a LOUD \
+         drop even for an ephemeral — nothing will carry this or any later offer"
+    );
+    assert_eq!(
+        owner.router.ephemeral_superseded_count(),
+        0,
+        "a dead forwarder must never be recorded as a supersede: 'superseded' \
+         promises a newer offer is coming, and none can"
+    );
+}
+
+/// what this catches: the defect Astra found reviewing #1397, and the exact
+/// reason the counter-only test above could not.
+///
+/// `mpsc::Sender::try_send` returns `Err(Full(msg))` — it hands back the
+/// message you PASSED, and the queue retains whatever is already enqueued. So
+/// a naive drop-on-full is DROP-NEWEST: the stale offer survives and every
+/// fresher one is discarded. For a class named `EphemeralLatest` that is
+/// exactly inverted — the reader is promised the latest and served the oldest,
+/// indefinitely, for as long as the queue stays full.
+///
+/// The counters cannot see this: they are identical under drop-newest and
+/// under real coalescing, which is how the original claim ("supersede-on-full
+/// IS the coalescing, so no latest-map is needed") survived a mutation check
+/// and two reviews. A test named for a latest-wins invariant must inspect the
+/// SURVIVING PAYLOAD, not the bookkeeping.
+#[tokio::test]
+async fn a_saturated_ephemeral_tap_delivers_the_newest_offer() {
+    let owner = Owner::new(RouterConfig::default());
+    // Capacity 2, never drained during the burst: offers 300 and 301 enqueue as
+    // wakes, 302 and 303 meet a full queue. Two wakes is what makes the
+    // already-consumed case below reachable; with capacity 1 only one wake ever
+    // exists and the duplicate-wake path cannot be exercised at all.
+    let (tx, mut rx) = mpsc::channel(2);
+    let latest = owner.router.set_forward_sink(tx);
+    let channel = RoomId::from_u128(0xf5);
+
+    for marker in 0..4u128 {
+        owner
+            .router
+            .publish(ephemeral(channel, 300 + marker, "capacity", b"q"))
+            .await
+            .expect("publish must keep succeeding while the forward tap overflows");
+    }
+
+    // What the forwarder dequeues is only a WAKE — here it is offer 300, which
+    // has been superseded three times since it was enqueued. Resolving through
+    // the handle `set_forward_sink` returns is what turns the wake into the
+    // current value, and is exactly what `drain_loop` does before emitting.
+    let wake = recv_item(&mut rx).await;
+    assert_eq!(
+        wake.env.event_id,
+        airc_core::EventId::from_u128(300),
+        "the queue is a wake signal and holds the FIRST offer — this is the raw \
+         item the old code put on the wire, and the reason it shipped staleness"
+    );
+
+    let survivor = latest
+        .resolve(wake)
+        .expect("the first wake for a key must resolve to that key's latest value");
+    assert_eq!(
+        survivor.env.event_id,
+        airc_core::EventId::from_u128(303),
+        "a saturated latest-wins tap must deliver the NEWEST offer (303); \
+         delivering the oldest (300) is staleness with a counter attached, and \
+         on the capacity plane it means every peer reads a stale advertisement \
+         for as long as the queue stays full"
+    );
+
+    // The SECOND wake (offer 301) finds the key already consumed and carries
+    // nothing. Duplicate wakes are the normal consequence of coalescing — the
+    // router enqueues one per offer while several offers share one value — so
+    // the drain must treat `None` as "skip", never as a lost frame.
+    let second_wake = recv_item(&mut rx).await;
+    assert_eq!(second_wake.env.event_id, airc_core::EventId::from_u128(301));
+    assert!(
+        latest.resolve(second_wake).is_none(),
+        "a wake whose key was already drained must resolve to None, not to a \
+         second copy of the same offer"
+    );
+    assert_eq!(
+        latest.pending(),
+        0,
+        "nothing may be left pending once every wake has been resolved — a \
+         non-zero count here would mean the map grows without bound"
     );
 }
 
