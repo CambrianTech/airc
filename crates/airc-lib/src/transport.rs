@@ -325,6 +325,23 @@ impl Airc {
                     // transcript, so this handle's index would never see the
                     // card via the store path otherwise — observe here.
                     self.observe_identity_event(&event).await;
+                    if event
+                        .headers
+                        .get(crate::backfill::HEADER_AIRC_BACKFILL)
+                        .map(|v| v == "request")
+                        .unwrap_or(false)
+                    // JUSTIFIED unwrap_or: no header = an ordinary event
+                    {
+                        // Backfill slice 2: a peer asked what it missed — answer off
+                        // the inbound path, from this daemon's own transcript.
+                        let me = self.clone();
+                        let request = event.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = me.serve_backfill(&request).await {
+                                tracing::warn!(target: "airc::backfill", %error, "could not serve a backfill request");
+                            }
+                        });
+                    }
                     if self.mark_broadcast(event_id) {
                         let _ = self.inner.live_tx.send(Arc::new(event));
                     }

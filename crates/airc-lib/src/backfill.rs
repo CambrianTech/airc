@@ -49,9 +49,28 @@
 //! recently-broadcast ring. That is what lets the request be sloppy about its
 //! cursor — an overlapping page costs bandwidth, never correctness.
 //!
-//! Slice 1 (this module) is the request/response pair. Nothing calls it
-//! automatically yet; the reconnect watcher that will is slice 2. Landing them
-//! separately keeps this one incapable of changing existing behaviour.
+//! Slice 1 was the request/response pair. Slice 2 (2026-09-14, the day the 5090
+//! came back after six dark days and its board had none of the cards published
+//! meanwhile) is the wiring: the routed forwarder asks every peer the first time
+//! it sees it connected ([`Airc::backfill_all_from_peer`]), and the transport's
+//! inbound path serves a request the moment it is delivered ([`Airc::serve_backfill`]).
+//!
+//! ## Cross-node "since" is TIME, not a cursor
+//!
+//! A node's transcript cursor is its OWN ingest sequence — the bus re-stamps every
+//! event, local or foreign, at publish. It means nothing to another node. So the
+//! request carries `since_ms`/`until_ms` (the responder's ingest clock) and the
+//! responder pages newest-first inside that window; the asker walks older pages
+//! by lowering `until_ms` until the page is not truncated.
+//!
+//! ## The answer is signed forward frames
+//!
+//! The responder projects each envelope onto the wire exactly as the forwarder
+//! would ([`build_forward_frame`](crate::route_forwarder::build_forward_frame) —
+//! re-signed by the responding daemon, the same attribution a live relay carries),
+//! and the asker delivers each frame through its inbound bridge: the same dedup,
+//! the same channel remap, the same trust. Backfill cannot introduce anything a
+//! live relay could not.
 
 use std::time::Duration;
 
@@ -84,6 +103,14 @@ pub struct BackfillRequest {
     pub since: Option<TranscriptCursor>,
     /// Caller's ceiling; the responder clamps to [`DEFAULT_BACKFILL_LIMIT`].
     pub limit: usize,
+    /// Responder-clock lower bound (inclusive) on `occurred_at_ms`. The
+    /// cross-node "since" — see the module doc.
+    #[serde(default)]
+    pub since_ms: Option<u64>,
+    /// Responder-clock upper bound (exclusive) — the asker lowers it to walk
+    /// older pages of a truncated answer.
+    #[serde(default)]
+    pub until_ms: Option<u64>,
 }
 
 /// The answered page.
@@ -96,6 +123,41 @@ pub struct BackfillResponse {
     /// truncated page is indistinguishable from a complete one, which is how a
     /// gap silently survives the mechanism built to close it.
     pub truncated: bool,
+    /// Slice 2: the missed events as SIGNED forward frames, oldest first, for
+    /// delivery through the asker's inbound bridge. `events` stays for the
+    /// slice-1 wire shape and is empty when `frames` is used.
+    #[serde(default)]
+    pub frames: Vec<airc_protocol::Frame>,
+}
+
+/// How far back a first ask reaches when nothing narrower is known.
+pub const BACKFILL_LOOKBACK_MS: u64 = 24 * 60 * 60 * 1000;
+/// Pages walked per (peer, channel) per ask — bounds the cost of a long absence.
+pub const BACKFILL_MAX_PAGES: usize = 4;
+/// Frames per page; a page rides one reply event.
+pub const BACKFILL_PAGE: usize = 200;
+
+/// The responder's pure selection: the newest `limit` envelopes with
+/// `since_ms <= occurred_at_ms < until_ms`, oldest first, and whether the
+/// window held more than fit. Pure so the paging contract is a unit test.
+pub fn select_window(
+    mut envs: Vec<airc_bus::Envelope>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+    limit: usize,
+) -> (Vec<airc_bus::Envelope>, bool) {
+    envs.retain(|e| {
+        since_ms.map(|s| e.occurred_at_ms >= s).unwrap_or(true) // JUSTIFIED unwrap_or: no lower bound = keep
+            && until_ms.map(|u| e.occurred_at_ms < u).unwrap_or(true) // JUSTIFIED unwrap_or: no upper bound = keep
+    });
+    envs.sort_by_key(|e| (e.occurred_at_ms, e.event_id.0));
+    let limit = limit.max(1);
+    let truncated = envs.len() > limit;
+    if truncated {
+        let drop = envs.len() - limit;
+        envs.drain(..drop);
+    }
+    (envs, truncated)
 }
 
 impl BackfillRequest {
@@ -121,13 +183,16 @@ impl Airc {
         &self,
         peer: PeerId,
         channel: RoomId,
-        since: Option<TranscriptCursor>,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
         deadline: Duration,
     ) -> Result<BackfillResponse, AircError> {
         let request = BackfillRequest {
             channel,
-            since,
-            limit: DEFAULT_BACKFILL_LIMIT,
+            since: None,
+            limit: BACKFILL_PAGE,
+            since_ms,
+            until_ms,
         };
         let mut headers = Headers::new();
         headers.insert(HEADER_AIRC_BACKFILL.into(), "request".into());
@@ -167,6 +232,44 @@ impl Airc {
         };
 
         let limit = request.limit.clamp(1, DEFAULT_BACKFILL_LIMIT);
+        if request.since_ms.is_some() || request.until_ms.is_some() {
+            // Slice 2: a time-bounded ask answered with signed forward frames.
+            let recent = self
+                .daemon_room_envelopes_recent(request.channel, DEFAULT_BACKFILL_LIMIT)
+                .await
+                .unwrap_or_default();
+            let (window, truncated) =
+                select_window(recent, request.since_ms, request.until_ms, limit);
+            let frames: Vec<airc_protocol::Frame> = window
+                .iter()
+                .filter_map(|env| {
+                    crate::route_forwarder::build_forward_frame(self, env, false)
+                        .ok()
+                        .flatten()
+                })
+                .collect();
+            let sent = frames.len();
+            let response = BackfillResponse {
+                channel: request.channel,
+                events: Vec::new(),
+                truncated,
+                frames,
+            };
+            let body = Body::Json(
+                serde_json::to_value(&response)
+                    .map_err(|e| AircError::Crypto(format!("backfill reply encode: {e}")))?,
+            );
+            self.reply(reply_to, correlation_id, Headers::new(), body)
+                .await?;
+            tracing::info!(
+                target: "airc::backfill",
+                channel = %request.channel,
+                sent,
+                truncated,
+                "served a backfill page"
+            );
+            return Ok(sent);
+        }
         let events = match request.since.as_ref() {
             Some(cursor) => self
                 .daemon_room_transcripts_since(request.channel, cursor, limit)
@@ -199,6 +302,7 @@ impl Airc {
             channel: request.channel,
             events,
             truncated,
+            frames: Vec::new(),
         };
         let body = Body::Json(
             serde_json::to_value(&response)
@@ -207,6 +311,97 @@ impl Airc {
         self.reply(reply_to, correlation_id, Headers::new(), body)
             .await?;
         Ok(sent)
+    }
+}
+
+impl Airc {
+    /// Ask `peer` for one channel's missed events and deliver them through this
+    /// node's inbound bridge. Returns how many frames were delivered (new or
+    /// duplicate — duplicates are free, see the module doc).
+    pub(crate) async fn backfill_channel_from_peer(
+        &self,
+        peer: PeerId,
+        channel: RoomId,
+        since_ms: u64,
+    ) -> Result<usize, AircError> {
+        let Some(sink) = self.inbound_frame_sink() else {
+            return Ok(0);
+        };
+        let mut delivered = 0usize;
+        let mut until_ms: Option<u64> = None;
+        for _page in 0..BACKFILL_MAX_PAGES {
+            let response = self
+                .request_backfill(
+                    peer,
+                    channel,
+                    Some(since_ms),
+                    until_ms,
+                    Duration::from_secs(30),
+                )
+                .await?;
+            if response.frames.is_empty() {
+                break;
+            }
+            let oldest = response
+                .frames
+                .iter()
+                .map(|f| f.envelope.occurred_at_ms)
+                .min();
+            for frame in &response.frames {
+                use crate::router_bridge::InboundDeliveryVerdict as V;
+                match sink.deliver(frame).await {
+                    V::Delivered | V::DeliveredRemapped(_) => delivered += 1,
+                    // A frame for a channel this node does not host, or a
+                    // decode/publish failure: the bridge already accounted for
+                    // it the way it does for live frames; nothing to count.
+                    V::UnknownChannel | V::Failed(_) => {}
+                }
+            }
+            if !response.truncated {
+                break;
+            }
+            until_ms = oldest;
+        }
+        Ok(delivered)
+    }
+
+    /// The reconnect watcher's whole job: the first time a peer is seen
+    /// connected, ask it what this node missed on every subscribed channel.
+    /// Never fails the caller — a peer that cannot answer is logged, not fatal.
+    pub(crate) async fn backfill_all_from_peer(&self, peer: PeerId) {
+        let rooms = match self.subscription_set().await {
+            Ok(set) => set.all().map(|s| s.as_room()).collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::warn!(target: "airc::backfill", %peer, %error, "backfill skipped: no subscription set");
+                return;
+            }
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0); // JUSTIFIED unwrap_or: a broken clock asks from the epoch = everything the page bound allows
+        let since_ms = now_ms.saturating_sub(BACKFILL_LOOKBACK_MS);
+        for room in rooms {
+            match self
+                .backfill_channel_from_peer(peer, room.channel, since_ms)
+                .await
+            {
+                Ok(n) => tracing::info!(
+                    target: "airc::backfill",
+                    %peer,
+                    channel = %room.channel,
+                    delivered = n,
+                    "asked a newly connected peer what this node missed"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "airc::backfill",
+                    %peer,
+                    channel = %room.channel,
+                    %error,
+                    "backfill ask failed — the peer answers nothing yet; the next connect asks again"
+                ),
+            }
+        }
     }
 }
 
@@ -241,6 +436,8 @@ mod tests {
                 event_id: EventId::new(),
             }),
             limit: 100,
+            since_ms: None,
+            until_ms: None,
         }
     }
 
@@ -308,6 +505,7 @@ mod tests {
             channel: RoomId::from_uuid(uuid::Uuid::from_u128(1)),
             events: Vec::new(),
             truncated: true,
+            frames: Vec::new(),
         };
         let decoded: BackfillResponse =
             serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
@@ -315,5 +513,62 @@ mod tests {
             decoded.truncated,
             "the `there is more` bit must survive the wire"
         );
+    }
+
+    fn env_at(ms: u64, id: u128) -> airc_bus::Envelope {
+        let mut e = airc_bus::Envelope::new(
+            RoomId::from_uuid(uuid::Uuid::from_u128(9)),
+            (PeerId::from_u128(8), airc_core::ClientId::new()),
+            airc_bus::envelope::Kind::Event,
+            airc_bus::envelope::DeliveryClass::Durable,
+            bytes::Bytes::new(),
+        );
+        e.event_id = EventId::from_u128(id);
+        e.occurred_at_ms = ms;
+        e
+    }
+
+    // what this catches: the paging contract a returning node walks — the window
+    // is inclusive below / exclusive above, the NEWEST `limit` survive when it
+    // overflows, oldest first, and `truncated` says there is an older page.
+    #[test]
+    fn select_window_keeps_the_newest_page_of_a_time_window_and_says_when_it_overflowed() {
+        let envs = vec![
+            env_at(10, 1),
+            env_at(30, 3),
+            env_at(20, 2),
+            env_at(40, 4),
+            env_at(50, 5),
+        ];
+        let (page, truncated) = select_window(envs.clone(), Some(20), Some(50), 2);
+        assert!(
+            truncated,
+            "three events in [20,50) do not fit a page of two"
+        );
+        assert_eq!(
+            page.iter().map(|e| e.occurred_at_ms).collect::<Vec<_>>(),
+            vec![30, 40]
+        );
+        let (all, truncated) = select_window(envs, None, None, 10);
+        assert!(!truncated);
+        assert_eq!(
+            all.iter().map(|e| e.occurred_at_ms).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40, 50]
+        );
+    }
+
+    // what this catches: the slice-2 fields ride the wire and an old (slice-1)
+    // request without them still parses — a fleet mid-update keeps talking.
+    #[test]
+    fn a_time_bounded_request_and_a_slice_one_request_both_parse() {
+        let mut r = a_request();
+        r.since_ms = Some(1_700_000_000_000);
+        r.until_ms = Some(1_700_000_100_000);
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(BackfillRequest::deserialize(&value).unwrap(), r);
+        let old = serde_json::json!({"channel": r.channel, "since": null, "limit": 7});
+        let parsed = BackfillRequest::deserialize(&old).unwrap();
+        assert_eq!(parsed.limit, 7);
+        assert!(parsed.since_ms.is_none() && parsed.until_ms.is_none());
     }
 }
