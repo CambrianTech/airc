@@ -599,6 +599,8 @@ where
     // The un-advanced tail at shutdown is now ≤1s of events instead of the
     // whole session. Initialized in the past so the FIRST event always
     // advances (a quiet room reconnecting tightens immediately).
+    // Opt-in per attach (`cursor_heartbeat`): a stream that never persists a
+    // cursor never receives bookkeeping it would only have to ignore.
     const ADVANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
     let mut last_advance = std::time::Instant::now()
         .checked_sub(ADVANCE_EVERY)
@@ -674,7 +676,10 @@ where
                             // Cursor heartbeat: tell the consumer this event
                             // is now safely delivered on this stream so its
                             // persisted watermark can advance past it.
-                            if last_advance.elapsed() >= ADVANCE_EVERY {
+                            // Only a consumer that asked (it persists its cursor)
+                            // gets the frame; every other stream would only have
+                            // to ignore it (airc #1416).
+                            if parts.cursor_heartbeat && last_advance.elapsed() >= ADVANCE_EVERY {
                                 last_advance = std::time::Instant::now();
                                 let c = env.cursor();
                                 write_response(

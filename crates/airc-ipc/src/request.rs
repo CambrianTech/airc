@@ -281,6 +281,16 @@ pub struct AttachRequest {
     /// simply never send it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     backlog_tail: Option<u32>,
+    /// When `true`, the daemon emits a throttled (1 Hz) live
+    /// [`Response::AttachCursorAdvanced`] after forwarded events so a
+    /// consumer that PERSISTS its cursor can advance its watermark
+    /// (continuum #261). Off by default: a consumer that does not
+    /// persist cursors has nothing to do with the frame, and every
+    /// in-tree consumer today reads only the seam summary — the
+    /// unconditional heartbeat was 3,100 warn lines/min on a 16-citizen
+    /// core (airc #1411/#1416). Wire-compat: omitted when unset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    cursor_heartbeat: bool,
     /// If set, only these kinds are delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kinds: Option<Vec<IpcKind>>,
@@ -311,6 +321,7 @@ impl AttachRequest {
             from_now,
             coalesce_backlog: false,
             backlog_tail: None,
+            cursor_heartbeat: false,
             kinds: None,
             delivery: None,
             headers: HeaderFilter::default(),
@@ -385,6 +396,19 @@ impl AttachRequest {
         self
     }
 
+    /// Ask for the live cursor heartbeat: one
+    /// [`Response::AttachCursorAdvanced`] per second after forwarded
+    /// events. Only a consumer that persists its cursor should set this.
+    pub fn with_cursor_heartbeat(mut self) -> Self {
+        self.cursor_heartbeat = true;
+        self
+    }
+
+    /// Whether this attach asked for the live cursor heartbeat.
+    pub fn wants_cursor_heartbeat(&self) -> bool {
+        self.cursor_heartbeat
+    }
+
     /// Destructure for the daemon's attach handler: moves the filter
     /// vectors out (no clone) with the start already decoded. One-way —
     /// there is no path from parts back to a request, so the typed
@@ -396,6 +420,7 @@ impl AttachRequest {
             start,
             coalesce_backlog: self.coalesce_backlog,
             backlog_tail: self.backlog_tail,
+            cursor_heartbeat: self.cursor_heartbeat,
             kinds: self.kinds,
             delivery: self.delivery,
             headers: self.headers,
@@ -410,6 +435,8 @@ pub struct AttachParts {
     pub start: AttachStart,
     pub coalesce_backlog: bool,
     pub backlog_tail: Option<u32>,
+    /// See [`AttachRequest::with_cursor_heartbeat`].
+    pub cursor_heartbeat: bool,
     pub kinds: Option<Vec<IpcKind>>,
     pub delivery: Option<Vec<IpcDelivery>>,
     pub headers: HeaderFilter,
