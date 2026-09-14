@@ -324,10 +324,12 @@ async fn attach_legacy_shape_still_replays_event_by_event() {
     let client = DaemonClient::new(daemon.socket.clone());
     let mut stream = client
         // The legacy wire shape: full transcript replay, named explicitly.
-        .attach(AttachRequest::new(
-            channel,
-            AttachStart::FromTranscriptStart,
-        ))
+        .attach(
+            AttachRequest::new(channel, AttachStart::FromTranscriptStart)
+                // This test also pins the heartbeat's no-skip guarantee, so it
+                // asks for the heartbeat (opt-in since airc #1416's follow-up).
+                .with_cursor_heartbeat(),
+        )
         .await
         .expect("attach");
     match read_frame::<_, Response>(&mut stream).await {
@@ -336,8 +338,8 @@ async fn attach_legacy_shape_still_replays_event_by_event() {
     }
 
     // Collect BACKLOG_N Event frames — legacy event-by-event replay. The
-    // cursor HEARTBEAT (continuum #261) may interleave AttachCursorAdvanced
-    // frames on ANY attach shape now; clients must tolerate them. The
+    // cursor HEARTBEAT (continuum #261) interleaves AttachCursorAdvanced
+    // frames on any attach shape that ASKED for it; clients tolerate them. The
     // no-skip property they must uphold: an advance NEVER precedes the
     // delivery of the event it points at — a consumer persisting
     // `advanced_to` can only ever resume at-or-before what it has seen.
@@ -572,6 +574,71 @@ async fn backlog_smaller_than_tail_delivers_all_plus_watermark() {
             assert_eq!(env.payload.to_vec(), b"after seam".to_vec());
         }
         other => panic!("expected live Event after watermark, got {other:?}"),
+    }
+    daemon.stop().await;
+}
+
+/// airc #1416 follow-up (the source-side fix): the live cursor heartbeat
+/// is bookkeeping for a consumer that PERSISTS its cursor. A plain live
+/// attach never asked for it, so after a live event it must see the
+/// Event and then NOTHING — no `AttachCursorAdvanced` — for a window
+/// longer than the 1 s throttle.
+#[tokio::test]
+async fn live_attach_without_the_flag_never_gets_a_cursor_heartbeat() {
+    let daemon = start_daemon().await;
+    let channel = RoomId::new();
+    let client = DaemonClient::new(daemon.socket.clone());
+    let mut stream = client
+        .attach(AttachRequest::new(channel, AttachStart::Live))
+        .await
+        .expect("attach");
+    match read_frame::<_, Response>(&mut stream).await {
+        Ok(Some(Response::Ok)) => {}
+        other => panic!("expected Ok ack from attach, got {other:?}"),
+    }
+    publish_live(&daemon, channel, b"one").await;
+    match next_frame(&mut stream, "live event").await {
+        Response::Event { .. } => {}
+        other => panic!("expected the live Event first, got {other:?}"),
+    }
+    match tokio::time::timeout(
+        Duration::from_millis(1500),
+        read_frame::<_, Response>(&mut stream),
+    )
+    .await
+    {
+        Err(_) => { /* quiet = correct: no heartbeat was requested */ }
+        Ok(Ok(Some(Response::AttachCursorAdvanced { .. }))) => {
+            panic!("a live attach that did not ask for the cursor heartbeat received one")
+        }
+        Ok(other) => panic!("unexpected frame after the live event: {other:?}"),
+    }
+    daemon.stop().await;
+}
+
+/// The other arm: an attach that ASKS for the heartbeat gets one after a
+/// forwarded event (the continuum #261 contract, now opt-in).
+#[tokio::test]
+async fn live_attach_with_the_flag_gets_a_cursor_heartbeat_after_an_event() {
+    let daemon = start_daemon().await;
+    let channel = RoomId::new();
+    let client = DaemonClient::new(daemon.socket.clone());
+    let mut stream = client
+        .attach(AttachRequest::new(channel, AttachStart::Live).with_cursor_heartbeat())
+        .await
+        .expect("attach");
+    match read_frame::<_, Response>(&mut stream).await {
+        Ok(Some(Response::Ok)) => {}
+        other => panic!("expected Ok ack from attach, got {other:?}"),
+    }
+    publish_live(&daemon, channel, b"one").await;
+    match next_frame(&mut stream, "live event").await {
+        Response::Event { .. } => {}
+        other => panic!("expected the live Event first, got {other:?}"),
+    }
+    match next_frame(&mut stream, "cursor heartbeat").await {
+        Response::AttachCursorAdvanced { skipped, .. } => assert_eq!(skipped, 0),
+        other => panic!("expected the requested cursor heartbeat, got {other:?}"),
     }
     daemon.stop().await;
 }
