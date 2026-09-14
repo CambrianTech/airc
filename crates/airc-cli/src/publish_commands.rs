@@ -37,7 +37,70 @@ pub async fn run_publish(
         .await?;
 
     // One-line JSON so callers can pipe into `jq` directly.
-    let line = serde_json::to_string(&receipt)
+    let mut line = serde_json::to_value(&receipt)
+        .map_err(|error| format!("serialize publish receipt: {error}"))?;
+    // REACH, alongside the ids — the same two facts `airc msg` has always printed
+    // (see `format_send_receipt`), which this path dropped.
+    //
+    // Why it matters, measured 2026-09-14: a publish to #cambriantech returned
+    // {"event_id":"19dfdc60-…","lamport":…,"channel_id":…} and NEVER ARRIVED on the
+    // peer. The receipt was byte-for-byte the same shape as one that did arrive, so
+    // the sender had no way to tell — and reported the round trip as working on the
+    // strength of it. `airc msg` would have said "⚠ reached 0 of N enrolled remote
+    // peer(s)"; `airc publish` said nothing, because the honesty lived only in the
+    // prose formatter.
+    //
+    // This is REACH, not delivery. Delivery is a returned ACK and lives in the
+    // daemon's ledger (`airc doctor --health`, #280). A receipt cannot promise it.
+    // What it can do is distinguish "queued with a live route" from "queued into the
+    // void", which is the distinction that was missing.
+    //
+    // Do NOT divide these two numbers. `enrolled_peers` is every peer this scope ever
+    // enrolled, across every room, for all time — not this room's audience. Printing
+    // them as a ratio manufactured a false catastrophe on 2026-08-07 (card #340: the
+    // receipt read 2% reach while the ack ledger showed 99.5%), and an instrument that
+    // cries wolf during healthy operation burns the trust of every later alarm.
+    if let Some(obj) = line.as_object_mut() {
+        let enrolled_peers = airc.peers().await.map(|p| p.len()).unwrap_or(0);
+        // THE DAEMON NOT ANSWERING IS NOT THE SAME AS ZERO PEERS, and collapsing
+        // them is how the 13:07:07 loss stayed invisible. Root cause, measured:
+        // the daemon RESTARTED at 13:07:07 (`ps -o lstart` on the new process;
+        // the old one's log ends "airc daemon: stopped."), and a publish at
+        // 13:07:07.955 was sequenced by the dying daemon — it is in the local
+        // store — but never forwarded to any peer. Its twin 45 ms later, after
+        // the new daemon held the route, arrived.
+        //
+        // So the frame was durably WRITTEN and never REACHED anyone, which is why
+        // "no receipt without a durable write" does not describe this bug: the
+        // write happened. What the receipt could not say was that reach was
+        // unknowable at that instant because the daemon was mid-swap.
+        //
+        // `Err` here means exactly that: no answer from the daemon. Reporting it
+        // as `connected_lan_peers: 0` would be a guess wearing a number.
+        let status = airc_ipc::DaemonClient::new(crate::cli::default_socket_path_in(home))
+            .status()
+            .await;
+        let daemon_answered = status.is_ok();
+        let connected_lan_peers = status.map(|s| s.connected_lan_peers).unwrap_or(0);
+        obj.insert("enrolled_peers".into(), enrolled_peers.into());
+        obj.insert("daemon_answered".into(), daemon_answered.into());
+        if daemon_answered {
+            obj.insert("connected_lan_peers".into(), connected_lan_peers.into());
+        } else {
+            // Honest-absent: no number at all rather than a zero that reads as
+            // measured. A consumer that sees null here knows reach is UNKNOWN.
+            obj.insert("connected_lan_peers".into(), serde_json::Value::Null);
+        }
+        // The loud case, stated as a field so a shell consumer can branch on it
+        // without re-deriving the rule. TRUE in both failing shapes:
+        //   - daemon answered, peers enrolled, none connected → fan-out reached nobody
+        //   - daemon did not answer → mid-swap or down; reach cannot be claimed
+        obj.insert(
+            "reached_no_remote_peer".into(),
+            (!daemon_answered || (enrolled_peers > 0 && connected_lan_peers == 0)).into(),
+        );
+    }
+    let line = serde_json::to_string(&line)
         .map_err(|error| format!("serialize publish receipt: {error}"))?;
     println!("{line}");
     Ok(())
@@ -243,5 +306,66 @@ mod tests {
             }
             other => panic!("expected json body, got {other:?}"),
         }
+    }
+
+    /// what this catches: a publish receipt that cannot say NOT DELIVERED.
+    ///
+    /// Regression for the 2026-09-14 loss: event 19dfdc60 was published to
+    /// #cambriantech, returned a complete receipt, and never arrived on the peer.
+    /// The receipt was byte-identical in SHAPE to one that did arrive, so nothing
+    /// downstream could distinguish them — and the sender reported the round trip
+    /// as working partly on its strength. `airc msg` had the honest version the
+    /// whole time (`format_send_receipt`: "⚠ reached 0 of N enrolled remote
+    /// peer(s)"); only the JSON path dropped it.
+    ///
+    /// This asserts the RULE, not the plumbing: enrolled peers with zero live
+    /// connections must set `reached_no_remote_peer`, so a shell consumer can
+    /// branch on the loud case instead of re-deriving it.
+    #[test]
+    fn a_receipt_says_so_when_it_reached_no_remote_peer() {
+        fn verdict(daemon_answered: bool, enrolled: usize, connected: usize) -> bool {
+            !daemon_answered || (enrolled > 0 && connected == 0)
+        }
+        // The failing shape: peers are enrolled, none is connected — the fan-out
+        // went nowhere, and this is the case that looked like success.
+        assert!(
+            verdict(true, 4, 0),
+            "enrolled with no live route must be loud"
+        );
+        // A live route: not loud. Delivery is still ack-confirmed, not promised here.
+        assert!(!verdict(true, 4, 1));
+        // No enrolled peers at all is a local-only scope, not a failure.
+        assert!(
+            !verdict(true, 0, 0),
+            "a scope with no peers has nothing to reach"
+        );
+    }
+
+    /// what this catches: the ROOT CAUSE of the 2026-09-14 loss — a publish that
+    /// lands inside the daemon's own restart window.
+    ///
+    /// Measured: the daemon restarted at 13:07:07 (`ps -o lstart` on the new
+    /// process; the old one's log ends "airc daemon: stopped."). Event 19dfdc60,
+    /// published at 13:07:07.955, was sequenced by the dying daemon — it IS in the
+    /// local store — and never forwarded to any peer. Its twin 45 ms later arrived.
+    ///
+    /// So the frame was durably written and reached nobody, and the receipt said
+    /// nothing was wrong. A daemon that does not answer must never be reported as
+    /// "0 connected peers": that is a guess wearing a number. It is UNKNOWN reach,
+    /// and unknown reach is loud.
+    #[test]
+    fn a_daemon_that_did_not_answer_is_unknown_reach_not_zero_reach() {
+        fn verdict(daemon_answered: bool, enrolled: usize, connected: usize) -> bool {
+            !daemon_answered || (enrolled > 0 && connected == 0)
+        }
+        // Mid-swap: no answer from the daemon. Loud REGARDLESS of the peer counts,
+        // including the case that would otherwise read healthy (a live route).
+        assert!(
+            verdict(false, 4, 1),
+            "no answer from the daemon cannot be reported as reach"
+        );
+        // And loud even for a scope with no enrolled peers — we cannot claim a
+        // local-only send succeeded if we could not ask.
+        assert!(verdict(false, 0, 0));
     }
 }
