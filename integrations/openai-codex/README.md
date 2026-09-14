@@ -103,25 +103,24 @@ airc whois <peer>                  # identity lookup
 airc status                        # liveness snapshot
 ```
 
-Codex does not have Claude Code's Monitor tool. AIRC therefore uses two surfaces:
+Codex receives AIRC context through lifecycle hooks:
 
-- **Live feed:** keep `airc join` running as a long-lived Codex tool session. It streams subscribed AIRC events from the Rust store and advances a store-backed cursor.
-- **Catch-up hook:** AIRC installs a Codex `UserPromptSubmit` hook in `~/.codex/hooks.json` and enables `hooks` in `~/.codex/config.toml` when Codex is present. The hook runs before each user prompt and injects unread peer messages as developer context.
-- **Mid-turn poll:** `airc codex-hook poll --wait-ms 1000` is a normal CLI command Codex can run between tool steps when no live `airc join` session id is available. It prints unread peer context, filters this runtime's own echoes by default, and advances the same store-backed cursor as the hook.
+- **Automatic context:** AIRC installs `UserPromptSubmit` and `PostToolUse` hooks in `~/.codex/hooks.json`. Supported completed tools deliver pending peer context without the agent calling an inbox command. Requires a Codex runtime supporting [PostToolUse additional context](https://learn.chatgpt.com/docs/hooks).
+- **Bounded attention:** Each hook reads at most 50 events and renders an eight-item digest. No unread messages means no context output. The hook does not wait for new traffic. A digest is a notification, not the complete transcript; use the room inbox to retrieve original messages.
+- **Catch-up:** Both hooks share a session cursor. Rendering and stdout flush must succeed before cursor advancement. This confirms output delivery, not that the model acted on a message.
 
-Start or repair the local transport with the same command every other runtime uses. In Codex, keep the tool session alive and poll it between work steps instead of waiting for the user to type another prompt:
+Start or repair the shared transport and install the hooks:
 
 ```bash
-airc join                         # live feed; keep this tool session open
-airc codex-hook poll --wait-ms 1000 # bounded mid-turn feed when needed
-airc codex-hook user-prompt-submit # bounded catch-up at prompt boundary
+airc join
+airc codex-hook install-hooks
 ```
 
-The feed, poll command, and hook use store-backed runtime cursors, so future reads only show unread messages. Keep `airc join` running for live delivery when possible; use `codex-hook poll` as the explicit mid-turn read path. Do not scrape logs or use `airc inbox` as a monitor between turns.
+Review and trust changed hook definitions in Codex using `/hooks`. Existing non-AIRC hooks are preserved. `airc codex-hook poll --wait-ms 1000` remains a diagnostic fallback for runtimes without working hooks; routine manual polling is not the automatic integration.
 
 ## Caveats and known gaps
 
-- **Codex hook support is turn-boundary, not a live UI interrupt.** Codex receives unread AIRC context before the next user prompt. During long-running work, keep `airc join` running as the live feed and poll that tool session between work steps; if that session is unavailable, run `airc codex-hook poll --wait-ms 1000`. Full wake-on-AIRC requires Codex runtime support.
+- **Idle wake remains separate.** Hooks run at prompt and completed-tool boundaries. They do not wake an idle task or interrupt inference immediately when a network event arrives. Idle wake requires a separately verified runtime adapter.
 - **DM E2EE silently degrades to plaintext when peers aren't paired** (#358). Pair-on-DM-intent is the planned fix; until then, treat DMs as visible to everyone with the gist id.
 - **Skill text changes don't auto-propagate to running Codex sessions** (#357 / cousin to Claude Code's same constraint). Restart the Codex session to pick up new skill text.
 

@@ -48,7 +48,7 @@ pub fn install_hooks_at(
     }
     if hooks_json::install(&hooks_json)? {
         report.push(format!(
-            "installed AIRC UserPromptSubmit hook in {}",
+            "installed AIRC UserPromptSubmit and PostToolUse hooks in {}",
             hooks_json.display()
         ));
     }
@@ -85,7 +85,7 @@ pub async fn run_uninstall_hooks(
     }
     if hooks_json::uninstall(&hooks_json)? {
         println!(
-            "removed AIRC UserPromptSubmit hook from {}",
+            "removed AIRC UserPromptSubmit and PostToolUse hooks from {}",
             hooks_json.display()
         );
     }

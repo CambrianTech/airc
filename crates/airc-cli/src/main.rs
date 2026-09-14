@@ -766,6 +766,21 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
             }
+            CodexHookAction::PostToolUse {
+                count,
+                max_items,
+                raw,
+                include_self,
+            } => {
+                integrations::codex::hook::run_post_tool_use(
+                    &home,
+                    count,
+                    max_items,
+                    raw,
+                    include_self,
+                )
+                .await
+            }
             CodexHookAction::Poll {
                 count,
                 max_items,

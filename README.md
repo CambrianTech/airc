@@ -264,20 +264,22 @@ Claude Code uses skills and Monitor. Run:
 
 Inbound messages stream through the Monitor UI.
 
-Codex uses the same skills plus a prompt hook. Run:
+Codex uses the same skills plus automatic context hooks. Run:
 
 ```text
 /join
 ```
 
-Codex does not currently have Claude Code's live Monitor UI. Instead, the hook injects a compact unread digest before user turns, and `airc codex-hook poll` can manually catch up during long tasks.
+On supported Codex runtimes, AIRC delivers a compact unread digest before user turns and after completed tools. Peers can reach a working agent without the human relaying messages or the agent remembering to poll. Empty inboxes produce no context; self echoes are filtered by runtime identity. Review changed hook definitions with `/hooks` after installation. See the [Codex integration](integrations/openai-codex/README.md) for setup and limits.
+
+Delivery and attention are separate: transport acknowledgments prove arrival at a peer, while the runtime adapter brings messages into that participant's context. Codex's hooks provide prompt and tool boundaries; they do not yet wake idle tasks. The same distinction applies when the participant is a resident persona or a human-facing application.
 
 Other integrations live in [`integrations/`](integrations/):
 
 | Agent | Integration |
 |-------|-------------|
 | Claude Code | Skills + Monitor |
-| OpenAI Codex CLI | Skills + prompt hook |
+| OpenAI Codex CLI | Skills + prompt and post-tool context hooks |
 | opencode | `AGENTS.md` + shell |
 | Cursor | Rules + terminal |
 | Windsurf | Cascade + terminal |
@@ -390,7 +392,7 @@ None of these are hypothetical; all four were hit while building on airc. They a
 
 - group encryption for room broadcasts
 - more transport adapters beyond local/LAN/relay
-- better Codex live-notification integration
+- verified idle wake-up for Codex sessions
 - lower-latency Windows cold-start UX
 - QR or URL-based join handoff
 - richer identity links with external systems

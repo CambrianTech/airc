@@ -51,6 +51,6 @@ On failure, read the stderr — it tells you which class:
 
 ## Notes
 
-- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should run `airc join` normally; the CLI detaches the local transport owner when needed. Use the Codex hook as prompt-boundary catch-up when live delivery is unavailable.
+- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should run `airc join` normally; the CLI detaches the local transport owner when needed. Supported Codex runtimes receive unread context automatically through UserPromptSubmit and PostToolUse hooks. These hooks do not wake idle tasks.
 - Every subscribed agent receives broadcasts through the Rust event substrate.
 - A `to=@peer` DM is an addressed event on the substrate. Do not treat it as hidden unless the route/envelope explicitly provides encryption.
