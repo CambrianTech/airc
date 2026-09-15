@@ -64,7 +64,7 @@
 //! peer from head-of-line-blocking forwards to healthy peers, and
 //! keep per-peer delivery in publish order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -125,7 +125,22 @@ enum AckWait {
     NoAck,
 }
 
+/// One machine, several peer ids (the identity spine): a frame addressed to the
+/// connected MACHINE identity is acked by the SCOPE identity hosted behind it. Both
+/// rows carry the same pubkey. An ack from any id that shares the target's key is
+/// this peer's ack — otherwise every ack from such a host is discarded and the
+/// ledger reads "never confirmed" in both directions (M5 ↔ 5090, 2026-09-15: 442
+/// unacked attempts one way, 522 the other, while every frame arrived).
+pub(crate) fn ack_is_for(ack_receiver: PeerId, target: PeerId, aliases: &HashSet<PeerId>) -> bool {
+    ack_receiver == target || aliases.contains(&ack_receiver)
+}
+
+/// How long a computed alias set stands before the trust store is read again.
+const ALIAS_CACHE_TTL: Duration = Duration::from_secs(60);
+
 struct ForwarderInner {
+    /// Per target peer: the ids sharing its pubkey (see [`ack_is_for`]), cached.
+    aliases: std::sync::Mutex<HashMap<PeerId, (tokio::time::Instant, HashSet<PeerId>)>>,
     /// Transport-owning handles whose live LAN connections this
     /// forwarder may reuse (the daemon registers its listener and
     /// dialer handles). Never dialed from here — route discovery owns
@@ -180,6 +195,7 @@ impl RoutedForwarder {
         let (tx, rx) = mpsc::channel::<ForwardItem>(config.queue_capacity.max(1));
         let forward_latest = router.set_forward_sink(tx);
         let inner = Arc::new(ForwarderInner {
+            aliases: std::sync::Mutex::new(HashMap::new()),
             forward_latest,
             links: tokio::sync::RwLock::new(Vec::new()),
             config,
@@ -592,7 +608,16 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
         let now_ms = crate::time::now_ms().unwrap_or(0);
         let sent_at = tokio::time::Instant::now();
         inner.ledger.record_attempt(peer, now_ms);
-        match wait_for_ack(&mut ack_rx, env.event_id, peer, inner.config.ack_timeout).await {
+        let aliases = same_key_aliases(inner, &link, peer).await;
+        match wait_for_ack(
+            &mut ack_rx,
+            env.event_id,
+            peer,
+            &aliases,
+            inner.config.ack_timeout,
+        )
+        .await
+        {
             AckWait::Delivered => {
                 inner.confirmed.fetch_add(1, Ordering::SeqCst);
                 record_ack(inner, peer, sent_at);
@@ -657,6 +682,44 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
 
 /// #1306: an ack of ANY outcome proves the pipe end-to-end — stamp the
 /// ledger with the measured send→ack round trip.
+/// The ids sharing `peer`'s pubkey in this link's trust store, cached per peer for
+/// [`ALIAS_CACHE_TTL`] so the store is not read per frame.
+async fn same_key_aliases(inner: &ForwarderInner, link: &Airc, peer: PeerId) -> HashSet<PeerId> {
+    if let Some((at, set)) = inner
+        .aliases
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&peer)
+    {
+        if at.elapsed() < ALIAS_CACHE_TTL {
+            return set.clone();
+        }
+    }
+    let set: HashSet<PeerId> = match link.peers().await {
+        Ok(peers) => {
+            let key = peers
+                .iter()
+                .find(|p| p.peer_id == peer)
+                .map(|p| p.pubkey_b64.clone());
+            match key {
+                Some(key) => peers
+                    .into_iter()
+                    .filter(|p| p.pubkey_b64 == key && p.peer_id != peer)
+                    .map(|p| p.peer_id)
+                    .collect(),
+                None => HashSet::new(),
+            }
+        }
+        Err(_) => HashSet::new(),
+    };
+    inner
+        .aliases
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(peer, (tokio::time::Instant::now(), set.clone()));
+    set
+}
+
 fn record_ack(inner: &ForwarderInner, peer: PeerId, sent_at: tokio::time::Instant) {
     let rtt_ms = u32::try_from(sent_at.elapsed().as_millis()).ok();
     inner
@@ -668,6 +731,7 @@ async fn wait_for_ack(
     ack_rx: &mut tokio::sync::broadcast::Receiver<airc_protocol::DeliveryAck>,
     event_id: EventId,
     peer: PeerId,
+    aliases: &HashSet<PeerId>,
     timeout: Duration,
 ) -> AckWait {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -678,7 +742,7 @@ async fn wait_for_ack(
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return AckWait::NoAck,
             Ok(Ok(ack)) => ack,
         };
-        if ack.for_event != event_id || ack.receiver != peer {
+        if ack.for_event != event_id || !ack_is_for(ack.receiver, peer, aliases) {
             continue;
         }
         return match ack.outcome {
@@ -793,6 +857,31 @@ fn mention_for_target(target: &Target) -> MentionTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: the M5 ↔ 5090 split (2026-09-15) — a frame sent to the
+    // connected machine id (4731e245) is acked by the scope id hosted there
+    // (e85a5bb3, same pubkey). That ack is THIS peer's ack; an ack from a peer with a
+    // different key still is not.
+    #[test]
+    fn an_ack_from_an_id_sharing_the_targets_key_counts_and_a_stranger_does_not() {
+        let machine = PeerId::from_u128(0x4731);
+        let scope = PeerId::from_u128(0xe85a);
+        let stranger = PeerId::from_u128(0x5159);
+        let aliases: HashSet<PeerId> = [scope].into_iter().collect();
+        assert!(ack_is_for(machine, machine, &aliases));
+        assert!(
+            ack_is_for(scope, machine, &aliases),
+            "the hosted scope's ack is the machine's ack"
+        );
+        assert!(
+            !ack_is_for(stranger, machine, &aliases),
+            "a different key never counts"
+        );
+        assert!(
+            !ack_is_for(scope, machine, &HashSet::new()),
+            "no alias knowledge = the old strict match"
+        );
+    }
     use airc_bus::envelope::DeliveryClass;
     use bytes::Bytes;
 
