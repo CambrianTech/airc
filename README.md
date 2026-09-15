@@ -58,6 +58,10 @@ iwr https://raw.githubusercontent.com/CambrianTech/airc/main/install.ps1 | iex
 
 Most Windows agent users should use Git Bash or WSL. The Windows shims route to one source of truth so Git Bash, PowerShell, and WSL do not drift into separate installs.
 
+The native Windows installer registers the current user's `airc-join` logon task with a hidden supervisor. Git Bash installation and `airc update` repair an existing task; they do not opt a new installation into autostart. Existing task identity, triggers and restart settings are preserved. Conversation output stays in a hidden, bounded console buffer; messages remain in AIRC's store. Errors go to `%USERPROFILE%\.airc\logs\join.err.log`, replacing that file at each supervisor launch.
+
+An unchanged task is left alone. A changed, running supervisor is restarted only after registration is verified and the daemon is absent during maintenance; stopped tasks stay stopped. Registration may request one Windows elevation prompt. If that prompt is cancelled, rerun the native installer above to retry registration: an already-current `airc update` skips installation. If a live daemon prevents the supervisor restart, the new action takes effect at the next login. To apply it sooner, run `airc stop`, rerun the installer, then run `airc join`.
+
 ## Quick Start
 
 Join from a project directory:

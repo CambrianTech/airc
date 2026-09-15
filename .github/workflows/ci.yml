@@ -213,6 +213,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Hidden child supervision and shared startup registration
+        shell: powershell
+        run: ./test/windows-autostart.ps1
+
       - name: Run install.ps1 under Windows PowerShell 5.1 (real install)
         shell: powershell
         run: |
