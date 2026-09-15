@@ -685,12 +685,17 @@ mod scope_boundary_tests {
         // scopes as sharing one simulated account. Without this, BOTH homes
         // are their own account boundary and the routing under test is
         // trivially the identity function.
+        // Every test that reads a HOME-derived path holds the same lock
+        // (`test_env::HOME_ENV`): `cargo test` runs tests as parallel threads of
+        // ONE process, so "no other thread spawned here" was never enough —
+        // `daemon_command_spawns_the_owning_scope_never_the_caller_scope` read
+        // the mutated HOME 1 run in 4 (2026-09-15).
+        let _home = crate::test_env::home_env_guard();
         let restore = std::env::var_os("HOME");
         // SAFETY: `set_var`/`remove_var` are unsound only when another thread
-        // reads the environment concurrently. Both mutations and the two
-        // resolutions between them run on this `#[test]`'s own thread with no
-        // other thread spawned, and HOME is restored before any assertion can
-        // unwind past this block.
+        // reads the environment concurrently; every reader of a HOME-derived
+        // path in this test binary holds `HOME_ENV` first, and HOME is restored
+        // before the guard drops or any assertion can unwind past this block.
         let (resolved_from_project, resolved_from_machine) = unsafe {
             std::env::set_var("HOME", root.path());
             let resolved = (identity_card_home(&project), identity_card_home(&machine));

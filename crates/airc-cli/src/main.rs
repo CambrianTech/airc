@@ -81,6 +81,8 @@ mod sos_commands;
 mod staleness;
 mod state_cli;
 mod state_commands;
+#[cfg(test)]
+mod test_env;
 mod transport_cli;
 mod transport_commands;
 mod update_commands;
