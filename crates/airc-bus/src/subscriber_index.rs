@@ -15,7 +15,11 @@ pub(crate) fn exact_key(filter: &HeaderFilter) -> Option<(&str, &str)> {
     match filter {
         HeaderFilter::Exact { key, value } => Some((key, value)),
         HeaderFilter::All(filters) => filters.iter().find_map(exact_key),
-        _ => None,
+        HeaderFilter::Any
+        | HeaderFilter::Prefix { .. }
+        | HeaderFilter::AnyOf(_)
+        | HeaderFilter::Has { .. }
+        | HeaderFilter::Not(_) => None,
     }
 }
 
