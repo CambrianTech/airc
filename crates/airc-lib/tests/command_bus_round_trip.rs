@@ -27,6 +27,8 @@ use uuid::Uuid;
 
 #[test]
 fn request_and_reply_round_trip_over_lan_without_github() {
+    // what this catches: directed logical-peer requests still complete across
+    // the authenticated LAN transport after reply identity enforcement.
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let alice_home = TempDir::new().expect("alice home");
@@ -98,7 +100,7 @@ fn request_and_reply_round_trip_over_lan_without_github() {
         headers.insert("airc.command_kind".into(), "test.lan.ping".into());
         let pending = alice
             .request(
-                MentionTarget::All,
+                MentionTarget::Peer(bob.peer_id()),
                 headers,
                 Body::text("lan-ping"),
                 Duration::from_secs(3),
@@ -108,6 +110,7 @@ fn request_and_reply_round_trip_over_lan_without_github() {
         let correlation_id = pending.correlation_id;
 
         let reply = alice.await_reply(pending).await.expect("alice gets reply");
+        assert_eq!(reply.peer_id, bob.peer_id());
         assert_eq!(
             reply.target,
             MentionTarget::Peer(alice.peer_id()),

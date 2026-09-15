@@ -135,6 +135,10 @@ pub struct PendingCommand {
     reply_stream: Option<EventStream>,
     // Preserve the dispatch room across default-room changes and re-subscribe.
     reply_room: airc_core::RoomId,
+    // Logical addressing captured at dispatch, independent of transport endpoints
+    // and of the Airc handle later used to await this pending request.
+    expected_target: MentionTarget,
+    requester: PeerId,
 }
 
 impl std::fmt::Debug for PendingCommand {
@@ -155,6 +159,18 @@ impl PendingCommand {
             None
         } else {
             Some(Duration::from_millis(self.deadline_at_ms - now))
+        }
+    }
+
+    fn accepts_author(&self, author: PeerId) -> bool {
+        if author == self.requester {
+            return false;
+        }
+        match self.expected_target {
+            MentionTarget::Peer(expected) => author == expected,
+            // Neither a broadcast nor a room reference names one responder.
+            // Preserve first-reply semantics within the dispatch room.
+            MentionTarget::All | MentionTarget::Room(_) => true,
         }
     }
 }
@@ -187,7 +203,9 @@ impl Airc {
     ///
     /// `target` selects who is expected to handle the request.
     /// `MentionTarget::All` broadcasts and the first reply wins;
-    /// `MentionTarget::Peer(id)` directs at one peer.
+    /// `MentionTarget::Peer(id)` accepts a reply only from that logical peer.
+    /// A room reference does not select a unique responding peer. All replies
+    /// must be addressed to this requester in the original dispatch room.
     pub async fn request(
         &self,
         target: MentionTarget,
@@ -245,7 +263,7 @@ impl Airc {
         let __send = airc_diagnostics::timing::start();
         self.send_frame_to_room(
             airc_protocol::FrameKind::Message,
-            target,
+            target.clone(),
             body,
             headers,
             &room,
@@ -258,6 +276,8 @@ impl Airc {
             deadline_at_ms,
             reply_stream: Some(reply_stream),
             reply_room: room.channel,
+            expected_target: target,
+            requester: self.inner.identity.peer_id,
         })
     }
 
@@ -358,7 +378,8 @@ impl Airc {
             + pending
                 .remaining()
                 .unwrap_or_else(|| Duration::from_secs(0));
-        let mut stream = match pending.reply_stream {
+        let mut pending = pending;
+        let mut stream = match pending.reply_stream.take() {
             Some(stream) => stream,
             None => self.command_reply_stream(pending.reply_room).await?,
         };
@@ -373,7 +394,8 @@ impl Airc {
                 Ok(Some(Ok(event))) => {
                     if event.headers.get(HEADER_AIRC_CORRELATION_ID) == Some(&correlation)
                         && event.room_id == pending.reply_room
-                        && event.peer_id != self.inner.identity.peer_id
+                        && event.target == MentionTarget::Peer(pending.requester)
+                        && pending.accepts_author(event.peer_id)
                     {
                         return Ok(event.as_ref().clone());
                     }
@@ -422,6 +444,85 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    // what this catches: a correlated event from a different logical peer or
+    // addressed to another requester must not complete a directed command.
+    #[tokio::test]
+    async fn await_reply_pins_dispatch_identity_and_preserves_broadcast_and_room_targets() {
+        let home = tempfile::TempDir::new().unwrap();
+        let airc = Airc::open(home.path()).await.unwrap();
+        let requester = PeerId::new();
+        let expected = PeerId::new();
+        let other = PeerId::new();
+        let room = airc_core::RoomId::new();
+        for target in [
+            MentionTarget::Peer(expected),
+            MentionTarget::All,
+            MentionTarget::Room(airc_core::RoomId::new()),
+        ] {
+            let correlation = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let pending = PendingCommand {
+                correlation_id: correlation,
+                deadline_at_ms: now_ms().unwrap() + 3000,
+                reply_stream: Some(EventStream::daemon(rx, Vec::new())),
+                reply_room: room,
+                expected_target: target.clone(),
+                requester,
+            };
+            let valid = TranscriptEvent {
+                event_id: airc_core::EventId::new(),
+                room_id: room,
+                peer_id: expected,
+                client_id: airc_core::ClientId::new(),
+                kind: airc_core::TranscriptKind::Message,
+                occurred_at_ms: 1,
+                lamport: 1,
+                target: MentionTarget::Peer(requester),
+                headers: Headers::from([(
+                    HEADER_AIRC_CORRELATION_ID.into(),
+                    correlation.to_string(),
+                )]),
+                body: Some(Body::text("accepted")),
+                attachment: None,
+                receipt: None,
+                metadata: serde_json::Value::Null,
+            };
+            let mut rejected = Vec::new();
+            for address in [
+                MentionTarget::All,
+                MentionTarget::Peer(other),
+                MentionTarget::Room(room),
+            ] {
+                let mut event = valid.clone();
+                event.target = address;
+                rejected.push(event);
+            }
+            let mut event = valid.clone();
+            event.peer_id = requester;
+            rejected.push(event);
+            let mut event = valid.clone();
+            event.room_id = airc_core::RoomId::new();
+            rejected.push(event);
+            let mut event = valid.clone();
+            event.headers.insert(
+                HEADER_AIRC_CORRELATION_ID.into(),
+                Uuid::new_v4().to_string(),
+            );
+            rejected.push(event);
+            if matches!(target, MentionTarget::Peer(_)) {
+                let mut event = valid.clone();
+                event.peer_id = other;
+                rejected.push(event);
+            }
+            for mut event in rejected {
+                event.body = Some(Body::text("must not complete request"));
+                tx.send(std::sync::Arc::new(event)).await.unwrap();
+            }
+            tx.send(std::sync::Arc::new(valid.clone())).await.unwrap();
+            assert_eq!(airc.await_reply(pending).await.unwrap(), valid);
+        }
+    }
+
     #[test]
     fn pending_command_remaining_returns_none_past_deadline() {
         let pending = PendingCommand {
@@ -429,6 +530,8 @@ mod tests {
             deadline_at_ms: 1,
             reply_stream: None,
             reply_room: airc_core::RoomId::new(),
+            expected_target: MentionTarget::All,
+            requester: PeerId::new(),
         };
         assert!(pending.remaining().is_none());
     }
@@ -441,6 +544,8 @@ mod tests {
             deadline_at_ms: u64::MAX / 2,
             reply_stream: None,
             reply_room: airc_core::RoomId::new(),
+            expected_target: MentionTarget::All,
+            requester: PeerId::new(),
         };
         let remaining = pending.remaining().unwrap();
         assert!(remaining.as_millis() > 0);
