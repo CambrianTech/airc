@@ -448,6 +448,7 @@ retain its array shape. The regression compares the borrowed and existing framed
 CBOR bytes and JSON bytes exactly, then decodes with the unchanged response type.
 Connection-tail attribution remains separate (card 1034c91d); no network, model,
 or p99 latency improvement is claimed by this copy-boundary change.
+
 ### Local IPC publish phase attribution
 
 Card 1034c91d-9a6d-43e1-a024-4215962634e2 adds opt-in observation to the
