@@ -955,3 +955,97 @@ async fn bench_daemon_publishers_many_rooms() {
     );
     daemon.stop().await;
 }
+
+// what this catches: N concurrent command reply handles must receive/decode N
+// selected envelopes total, not N copies of every unrelated bulk-room event.
+#[tokio::test]
+async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
+    const COMMANDS: usize = 32;
+    const UNRELATED: usize = 64;
+    let daemon = start_daemon().await;
+    let room = RoomId::new();
+    let client = DaemonClient::new(daemon.socket.clone());
+    let mut streams = Vec::new();
+    for n in 0..COMMANDS {
+        let mut stream = client
+            .attach(AttachRequest::live(room).with_headers(HeaderFilter::Exact {
+                key: "airc.correlation_id".into(),
+                value: n.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut stream).await,
+            Ok(Some(Response::Ok))
+        ));
+        streams.push(stream);
+    }
+    for n in 0..UNRELATED + 2 * COMMANDS {
+        let selected = n >= UNRELATED;
+        client
+            .publish(PublishRequest {
+                channel: room.as_uuid(),
+                from_peer: uuid::Uuid::new_v4(),
+                from_client: uuid::Uuid::new_v4(),
+                kind: IpcKind::Message,
+                delivery: IpcDelivery::RequestResponse,
+                target: IpcTarget::All,
+                correlation_id: None,
+                coalesce_key: None,
+                payload: if n >= UNRELATED + COMMANDS {
+                    b"fence".to_vec()
+                } else if selected {
+                    b"selected reply".to_vec()
+                } else {
+                    vec![0xff; 16 * 1024]
+                },
+                headers: Headers::from([(
+                    "airc.correlation_id".into(),
+                    if selected {
+                        ((n - UNRELATED) % COMMANDS).to_string()
+                    } else {
+                        format!("unrelated-{n}")
+                    },
+                )]),
+            })
+            .await
+            .unwrap();
+    }
+    let mut decoded = 0;
+    for (n, mut stream) in streams.into_iter().enumerate() {
+        // A matching fence follows all bulk and selected publications. Count
+        // every decoded frame through it, without a timer-based absence claim.
+        let mut replies = 0;
+        loop {
+            let frame = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_frame::<_, Response>(&mut stream),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            let Response::Event { envelope } = frame else {
+                panic!("expected event")
+            };
+            decoded += 1;
+            let envelope = airc_wire::decode(envelope.into()).unwrap();
+            assert_eq!(
+                envelope.headers.get("airc.correlation_id"),
+                Some(&n.to_string())
+            );
+            if envelope.payload.as_ref() == b"fence" {
+                break;
+            }
+            assert_eq!(envelope.payload.as_ref(), b"selected reply");
+            replies += 1;
+        }
+        assert_eq!(replies, 1);
+    }
+    assert_eq!(
+        decoded,
+        COMMANDS * 2,
+        "only selected replies and fences reach IPC decode"
+    );
+    daemon.stop().await;
+}

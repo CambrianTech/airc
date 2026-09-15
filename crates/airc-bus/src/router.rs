@@ -44,6 +44,7 @@ use crate::filter::Filter;
 use crate::ring::HotRing;
 use crate::seq::SeqSource;
 use crate::sink::DurableSink;
+use crate::subscriber_index::SubscriberIndex;
 
 /// Tunables for an [`EventRouter`].
 #[derive(Debug, Clone)]
@@ -90,7 +91,7 @@ struct SubscriberHandle {
 struct ChannelState {
     ring: HotRing,
     ephemeral: EphemeralCache,
-    subscribers: Vec<SubscriberHandle>,
+    subscribers: SubscriberIndex<SubscriberHandle>,
 }
 
 impl ChannelState {
@@ -98,7 +99,7 @@ impl ChannelState {
         Self {
             ring: HotRing::new(ring_capacity),
             ephemeral: EphemeralCache::new(ephemeral_ttl_ms),
-            subscribers: Vec::new(),
+            subscribers: SubscriberIndex::new(),
         }
     }
 }
@@ -320,6 +321,27 @@ struct RouterInner {
     /// Number of channel-state maps that have ever been created (across all
     /// shards) — the many-rooms test reads this as the allocation proxy.
     channels_created: AtomicU64,
+    next_subscription: AtomicU64,
+}
+
+struct SubscriptionGuard {
+    router: std::sync::Weak<RouterInner>,
+    channel: airc_core::RoomId,
+    id: u64,
+    headers: airc_core::HeaderFilter,
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.router.upgrade() else {
+            return;
+        };
+        let shard = &inner.shards[(self.channel.0.as_u128() % inner.shards.len() as u128) as usize];
+        let mut channels = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = channels.get_mut(&self.channel.0.as_u128()) {
+            state.subscribers.remove(self.id, &self.headers);
+        }
+    }
 }
 
 impl EventRouter {
@@ -357,6 +379,7 @@ impl EventRouter {
             forward_latest: Arc::new(ForwardLatest::default()),
             shed_count: AtomicU64::new(0),
             channels_created: AtomicU64::new(0),
+            next_subscription: AtomicU64::new(1),
         });
 
         // Write-behind task: drains durable envelopes, persists each, then
@@ -587,27 +610,24 @@ impl EventRouter {
             let mut sent_ok = 0usize;
             let mut sent_lagged = 0usize;
             let mut sent_closed = 0usize;
-            state.subscribers.retain(|sub| {
+            state.subscribers.visit(&env.headers, |sub| {
                 if !sub.filter.matches(&env) {
-                    return true; // not for this subscriber, keep it
+                    return;
                 }
                 matched += 1;
                 match sub.tx.try_send(Arc::clone(&env)) {
                     Ok(()) => {
                         sent_ok += 1;
-                        true
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // Lagged: drop the live push, flag it; the subscriber
                         // resumes from the sink via its cursor.
                         sub.lagged.store(true, Ordering::SeqCst);
                         sent_lagged += 1;
-                        true
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         // Receiver gone -> drop the handle.
                         sent_closed += 1;
-                        false
                     }
                 }
             });
@@ -1010,8 +1030,32 @@ impl EventRouter {
         filter: Filter,
         from_cursor: Option<Cursor>,
     ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+        self.subscribe_mode(filter, from_cursor, false)
+    }
+
+    /// Register at the live edge without reading or decoding transcript history.
+    pub fn subscribe_live_with_lag(
+        &self,
+        filter: Filter,
+    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+        self.subscribe_mode(filter, None, true)
+    }
+
+    fn subscribe_mode(
+        &self,
+        filter: Filter,
+        from_cursor: Option<Cursor>,
+        live_only: bool,
+    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
         let inner = Arc::clone(&self.inner);
         let channel = filter.channel;
+        let id = inner.next_subscription.fetch_add(1, Ordering::Relaxed);
+        let registration = SubscriptionGuard {
+            router: Arc::downgrade(&inner),
+            channel,
+            id,
+            headers: filter.headers.clone(),
+        };
 
         // --- step 1: register live + snapshot ring under one lock ---
         let lagged = Arc::new(AtomicBool::new(false));
@@ -1030,15 +1074,23 @@ impl EventRouter {
             if is_new {
                 inner.channels_created.fetch_add(1, Ordering::SeqCst);
             }
-            state.subscribers.push(SubscriberHandle {
-                tx,
-                filter: filter.clone(),
-                lagged: Arc::clone(&lagged),
-            });
+            state.subscribers.insert(
+                id,
+                &filter.headers,
+                SubscriberHandle {
+                    tx,
+                    filter: filter.clone(),
+                    lagged: Arc::clone(&lagged),
+                },
+            );
             // Snapshot recent replay + the oldest cursor still in RAM, while
             // holding the same lock that gated live registration.
             (
-                state.ring.replay_after(from_cursor),
+                if live_only {
+                    Vec::new()
+                } else {
+                    state.ring.replay_after(from_cursor)
+                },
                 state.ring.oldest_cursor(),
                 idx,
                 state.subscribers.len(),
@@ -1062,17 +1114,20 @@ impl EventRouter {
 
         let lag_flag = LagFlag(Arc::clone(&lagged));
         let stream = async_stream::stream! {
+            // Captured even before first poll: dropping an unpolled stream
+            // unregisters immediately, with no later publish needed for cleanup.
+            let _registration = registration;
             // --- step 2: deep replay leg from the sink ---
             // The sink covers `(from_cursor, ring_oldest)`: events older than
             // the ring still retains. If the ring is non-empty we page the sink
             // up to (but not including) the ring's oldest; if the ring is empty
             // we page the whole tail after the cursor.
             let mut high: Option<Cursor> = from_cursor;
-            let deep = inner
+            let deep = if live_only { Vec::new() } else { inner
                 .sink
                 .page(channel, from_cursor, usize::MAX)
                 .await
-                .unwrap_or_default();
+                .unwrap_or_default() };
             for env in deep {
                 // The sink (persistence) is a real copy boundary, so the deep
                 // leg arrives as owned `Envelope`s; wrap each once in `Arc` so
@@ -1245,5 +1300,47 @@ impl LagFlag {
     /// subscriber then resumes via [`EventRouter::resume_from_cursor`].
     pub fn is_lagged(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod subscription_lifetime_tests {
+    use super::*;
+    // what this catches: dropping an unpolled stream must release its indexed
+    // registration on a quiet room, without waiting for another publish.
+    #[tokio::test]
+    async fn unpolled_stream_drop_unregisters_exact_handle() {
+        let router = EventRouter::new(
+            RouterConfig::default(),
+            Arc::new(crate::ManualClock::new(0)),
+            Arc::new(SeqSource::start_at_counter(
+                &crate::InMemoryEpochStore::new(),
+                0,
+            )),
+            Arc::new(crate::InMemoryDurableSink::new()),
+        );
+        let room = airc_core::RoomId::new();
+        let filter = Filter::channel(room).with_headers(airc_core::HeaderFilter::Exact {
+            key: "correlation".into(),
+            value: "same-key".into(),
+        });
+        let count = || {
+            router
+                .shard_for(room)
+                .channels
+                .lock()
+                .unwrap()
+                .get(&room.0.as_u128())
+                .unwrap()
+                .subscribers
+                .len()
+        };
+        let (old, _) = router.subscribe_live_with_lag(filter.clone());
+        let (replacement, _) = router.subscribe_live_with_lag(filter);
+        assert_eq!(count(), 2);
+        drop(old);
+        assert_eq!(count(), 1);
+        drop(replacement);
+        assert_eq!(count(), 0);
     }
 }

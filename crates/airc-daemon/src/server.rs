@@ -491,30 +491,12 @@ where
             .await;
         }
     };
-    // Map the typed start onto the router cursor. `from` is advanced as
-    // we send, so a re-subscribe after a lag drop resumes exactly where
-    // we left off (replay the gap, no dup at the seam).
-    //
-    // `Live` (card 7d5b6a65): start at the channel's current head. The
-    // router's `subscribe_with_lag` interprets a forward-pointing cursor
-    // as "nothing newer than this yet," so the ring snapshot + deep
-    // replay legs return empty and we go straight to live.
-    //
-    // Critical: when the in-memory ring is empty (fresh daemon, no
-    // events yet this process-lifetime), `router.head_cursor` returns
-    // None — but the SINK still has the durable transcript. Without
-    // the sink fallback below, `Live` would fall through to a full
-    // sink replay (the very bug card 7d5b6a65 closes). Query the sink
-    // for its head when the ring is empty.
+    // Live registration is atomic at the router and does not read history.
+    // Explicit cursor resumes retain the existing replay/live seam.
     let mut from = match parts.start {
-        AttachStart::Live => match state.router.head_cursor(channel) {
-            Some(c) => Some(c),
-            None => state.router.sink_head_cursor(channel).await,
-        },
+        AttachStart::Live | AttachStart::FromTranscriptStart => None,
         AttachStart::After(c) => Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id)),
-        AttachStart::FromTranscriptStart => None,
     };
-
     // Card 7d5b6a65: `coalesce_backlog` lets the daemon collapse all
     // historical catch-up into ONE `AttachCursorAdvanced` summary
     // frame instead of streaming each event individually. We track the
@@ -542,7 +524,14 @@ where
     // would drop early events under concurrent senders). `subscribe_with_lag`
     // also keeps a slow IPC client from stalling fan-out to other
     // subscribers (§3.5); on lag we re-subscribe from `from`.
-    let mut pending = Some(state.router.subscribe_with_lag(filter.clone(), from));
+    let (stream, lag) = if parts.start == AttachStart::Live {
+        let (stream, lag) = state.router.subscribe_live_with_lag(filter.clone());
+        (stream.boxed(), lag)
+    } else {
+        let (stream, lag) = state.router.subscribe_with_lag(filter.clone(), from);
+        (stream.boxed(), lag)
+    };
+    let mut pending = Some((stream, lag));
     write_response(&mut writer, &Response::Ok).await?;
 
     // Pin one shutdown waiter across re-subscribes so a `notify_waiters`
@@ -607,9 +596,10 @@ where
         .unwrap_or_else(std::time::Instant::now);
 
     loop {
-        let (stream, lag) = pending
-            .take()
-            .unwrap_or_else(|| state.router.subscribe_with_lag(filter.clone(), from));
+        let (stream, lag) = pending.take().unwrap_or_else(|| {
+            let (stream, lag) = state.router.subscribe_with_lag(filter.clone(), from);
+            (stream.boxed(), lag)
+        });
         tokio::pin!(stream);
         loop {
             tokio::select! {

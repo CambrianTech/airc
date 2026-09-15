@@ -389,3 +389,34 @@ Lives in `crates/airc-lib/tests/` (extends `fanout_bench.rs` for the perf cases)
 Each row is one realistic, isolated, deterministic integration test. Together they
 are the proof that airc carries *everything* continuum needs — before the full
 stack is wired — and the regression wall that keeps it that way.
+
+### Exact-header command reply handles
+
+Command requests register an exact `airc.correlation_id` subscription before
+publishing. The existing channel router indexes `HeaderFilter::Exact` (and a
+necessary exact clause inside `All`) by borrowed header key/value lookups.
+Publishing visits general subscriptions and the matching exact buckets, never
+parses payload content, and passes `Arc<Envelope>` through the existing bounded
+queues. Work is proportional to the event header count plus selected bucket
+sizes and general subscriptions, rather than all pending commands in the room.
+Remaining predicates and the command's room, author and requester checks still
+apply. A registration's unique ID and owned stream guard remove exactly that
+handle on drop, including an unpolled stream; empty buckets are removed too.
+
+A live attach now registers without a ring snapshot or transcript page read.
+Explicit cursor attaches and lag recovery retain the replay/live seam. No
+polling, request-local history scan, or separate command bus is introduced.
+
+This is not zero-copy IPC or session multiplexing: every pending command still
+opens an IPC attach and waits for its registration acknowledgement. Each selected
+IPC delivery still runs `airc_wire::encode(&env).to_vec()`; the codec builds owned
+header values, and the SDK decodes the selected body. Embedded SDK subscriptions
+still share their existing decoded broadcast stream. Eliminating those remaining
+copy/handshake costs requires a separate owner/session change; it is not implied
+by router-side shared `Arc` delivery.
+The regression tests measure routing work and boundary counts, not elapsed
+throughput: 128 unrelated correlations select zero of 128 pending handles; 32
+IPC handles see only their 32 replies plus 32 terminal fences after 64 unrelated
+16 KiB publications. Baseline latency still needs a separate no-model measurement
+of register/ack, local dispatch and serialization, with network transit and model
+queue/inference time reported separately. No model or network speedup is claimed.
