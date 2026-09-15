@@ -3,9 +3,11 @@
 //!
 //! Owner-core model: live events and inbox pages cross the IPC boundary
 //! as **opaque airc-wire bytes** (`airc_wire::encode(&Envelope)`) — the
-//! daemon encodes once, the client decodes once. The IPC layer stays
-//! ignorant of the envelope's shape (no `airc-bus` dependency leaks
-//! here, no per-hop re-serialize).
+//! daemon encodes each selected event and the client decodes it. IPC
+//! framing serializes those bytes as a CBOR sequence into its own buffer.
+//! Event emission can borrow the wire buffer, avoiding an intermediate
+//! full payload copy. The IPC layer stays ignorant of the envelope's
+//! shape (no `airc-bus` dependency leaks here).
 
 use std::net::SocketAddr;
 
@@ -84,6 +86,20 @@ pub enum Response {
     Ok,
     /// Failure — typed message so the client can render it.
     Error { message: String },
+}
+
+impl Response {
+    /// Borrow an already-encoded event for emission without copying its payload
+    /// into a Vec. The slice deliberately retains the existing sequence encoding
+    /// in CBOR and JSON; CBOR byte strings are rejected by installed Vec readers.
+    pub fn event_ref(envelope: &[u8]) -> impl Serialize + '_ {
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum EventRef<'a> {
+            Event { envelope: &'a [u8] },
+        }
+        EventRef::Event { envelope }
+    }
 }
 
 /// Daemon health/state snapshot.

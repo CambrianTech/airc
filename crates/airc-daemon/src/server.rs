@@ -645,24 +645,12 @@ where
                                 catchup.as_mut().and_then(BacklogCatchup::take_summary)
                             {
                                 for buffered in &seam.tail {
-                                    write_response(
-                                        &mut writer,
-                                        &Response::Event {
-                                            envelope: airc_wire::encode(buffered).to_vec(),
-                                        },
-                                    )
-                                    .await?;
+                                    write_event_response(&mut writer, buffered).await?;
                                 }
                                 write_response(&mut writer, &seam.summary.into_response())
                                     .await?;
                             }
-                            write_response(
-                                &mut writer,
-                                &Response::Event {
-                                    envelope: airc_wire::encode(&env).to_vec(),
-                                },
-                            )
-                            .await?;
+                            write_event_response(&mut writer, &env).await?;
                             // Cursor heartbeat: tell the consumer this event
                             // is now safely delivered on this stream so its
                             // persisted watermark can advance past it.
@@ -850,4 +838,20 @@ where
     W: AsyncWriteExt + Unpin,
 {
     write_frame(writer, response).await.map_err(DaemonError::Io)
+}
+
+/// Keep the FlatBuffer Bytes allocation alive across framing without cloning it
+/// into Response::Event's owned Vec (the receiving API retains that owned type).
+async fn write_event_response<W>(
+    writer: &mut W,
+    envelope: &airc_bus::Envelope,
+) -> Result<(), DaemonError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let encoded = airc_wire::encode(envelope);
+    let response = Response::event_ref(&encoded);
+    write_frame(writer, &response)
+        .await
+        .map_err(DaemonError::Io)
 }
