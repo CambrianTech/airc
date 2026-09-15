@@ -448,3 +448,39 @@ retain its array shape. The regression compares the borrowed and existing framed
 CBOR bytes and JSON bytes exactly, then decodes with the unchanged response type.
 Connection-tail attribution remains separate (card 1034c91d); no network, model,
 or p99 latency improvement is claimed by this copy-boundary change.
+
+### Local IPC publish phase attribution
+
+Card 1034c91d-9a6d-43e1-a024-4215962634e2 adds opt-in observation to the
+same `DaemonClient` connect/write/read path. Ordinary calls use a generic no-op
+observer with no clock reads or allocations. Diagnostic callbacks report only
+completed boundaries; an incomplete phase emits no completion, and decoded daemon
+errors do report response completion. Callback work is inside the normal deadline.
+
+The existing ignored many-room owner-core benchmark now records paired samples
+for connection setup, request encode/write/flush, response wait/read/decode, and
+total RPC duration. Request construction is outside these samples. Three callback
+clock reads perturb the diagnostic path; no unconditional telemetry is enabled.
+A failed operation aborts the measurement rather than silently discarding it.
+Independent phase percentiles are not additive; the five slowest operations are
+also printed with their actual paired phase durations.
+
+Windows debug-profile baseline (15 concurrent publishers, 40 publishes each,
+600 completed samples per run, zero failures/exclusions), three consecutive runs
+of the cached test executable on 2026-09-15:
+
+| Repeat | Publish wall ms | Total min ms | Total p50 ms | Total p95 ms | Total p99 ms | Connect p99 ms | Write p99 ms | Response p99 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 161.044 | 0.204 | 0.319 | 1.160 | 64.435 | 64.098 | 0.360 | 0.710 |
+| 2 | 157.338 | 0.216 | 0.322 | 0.895 | 64.943 | 64.666 | 0.314 | 0.652 |
+| 3 | 131.393 | 0.219 | 0.352 | 1.826 | 50.288 | 50.027 | 0.356 | 0.817 |
+
+The slowest paired connect/total durations were 144.092/145.417 ms,
+140.654/140.846 ms, and 102.170/102.851 ms. This localizes the observed tail
+to the connection phase in these runs. That phase includes Windows pipe-name
+resolution, blocking-open task scheduling, actual opens and busy retries; these
+measurements do not distinguish those causes. The existing 15 ms busy backoff
+remains unchanged. Minimum observed times are a baseline under this workload,
+not a lower bound or a latency target proven achieved. Publish acknowledgement
+excludes durable commit, remote network transport, and model execution. Release
+and cross-platform measurements remain necessary before broader performance claims.
