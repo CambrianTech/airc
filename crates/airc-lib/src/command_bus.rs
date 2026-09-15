@@ -247,7 +247,9 @@ impl Airc {
         let correlation_id = Uuid::new_v4();
         let deadline_at_ms = now_ms()? + deadline.as_millis() as u64;
         let __sub = airc_diagnostics::timing::start();
-        let reply_stream = self.command_reply_stream(room.channel).await?;
+        let reply_stream = self
+            .command_reply_stream(room.channel, correlation_id)
+            .await?;
         __sub.stop("airc.req.subscribe");
 
         headers.insert(
@@ -284,10 +286,18 @@ impl Airc {
     async fn command_reply_stream(
         &self,
         room: airc_core::RoomId,
+        correlation_id: Uuid,
     ) -> Result<EventStream, AircError> {
         if self.is_daemon_attached() {
-            self.daemon_subscribe(vec![room], None, airc_core::HeaderFilter::Any)
-                .await
+            self.daemon_subscribe(
+                vec![room],
+                None,
+                airc_core::HeaderFilter::Exact {
+                    key: HEADER_AIRC_CORRELATION_ID.to_string(),
+                    value: correlation_id.to_string(),
+                },
+            )
+            .await
         } else {
             self.subscribe().await
         }
@@ -381,7 +391,10 @@ impl Airc {
         let mut pending = pending;
         let mut stream = match pending.reply_stream.take() {
             Some(stream) => stream,
-            None => self.command_reply_stream(pending.reply_room).await?,
+            None => {
+                self.command_reply_stream(pending.reply_room, correlation_id)
+                    .await?
+            }
         };
         let mut reopened: u32 = 0;
 
@@ -420,7 +433,10 @@ impl Airc {
                         reopened,
                         "await_reply: reply stream closed before the deadline; re-subscribing"
                     );
-                    match self.command_reply_stream(pending.reply_room).await {
+                    match self
+                        .command_reply_stream(pending.reply_room, correlation_id)
+                        .await
+                    {
                         Ok(next) => {
                             stream = next;
                             continue;

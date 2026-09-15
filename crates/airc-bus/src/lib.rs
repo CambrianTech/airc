@@ -44,6 +44,7 @@ pub mod ring;
 pub mod router;
 pub mod seq;
 pub mod sink;
+mod subscriber_index;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use envelope::{Cursor, DeliveryClass, Envelope, Kind, Seq, Target};
