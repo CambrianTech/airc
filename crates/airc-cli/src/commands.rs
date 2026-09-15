@@ -1817,7 +1817,10 @@ pub async fn run_daemon(
                 // down on the first tick.
                 match daemon_state.delivery_stats.try_read() {
                     Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
-                        stats.iter().map(|s| (s.attempts_since_ack, s.suspect)),
+                        stats
+                            .peers
+                            .iter()
+                            .map(|s| (s.attempts_since_ack, s.suspect)),
                     ),
                     Err(_) => {
                         // Contended write (stats being refreshed). Skip THIS
@@ -2170,7 +2173,7 @@ fn spawn_route_refresh(
 async fn refresh_routes_once(
     airc: &Airc,
     connected_lan_peers: &std::sync::atomic::AtomicUsize,
-    delivery_stats: &tokio::sync::RwLock<Vec<airc_ipc::IpcPeerDeliveryStats>>,
+    delivery_stats: &tokio::sync::RwLock<airc_ipc::DeliveryStatsResponse>,
     endpoint_resync: &tokio::sync::Notify,
     rendezvous: &SharedRendezvousSlot,
 ) {
@@ -2301,7 +2304,14 @@ async fn refresh_routes_once(
                         suspect: stats.suspect(),
                     })
                     .collect::<Vec<_>>();
-                *delivery_stats.write().await = rows;
+                *delivery_stats.write().await = airc_ipc::DeliveryStatsResponse {
+                    peers: rows,
+                    sampled_at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|elapsed| elapsed.as_millis() as u64),
+                    connected_lan_peers: Some(snapshot.connected_lan_peers.len()),
+                };
             }
 
             // #1247 slice 4b — relay self-election. When this node can
