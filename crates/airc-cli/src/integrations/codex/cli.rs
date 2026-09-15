@@ -12,13 +12,13 @@ pub struct CodexHookArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CodexHookAction {
-    /// Install the Rust UserPromptSubmit hook into Codex config.
+    /// Install the Rust prompt and post-tool hooks into Codex config.
     InstallHooks {
         /// Codex home directory. Defaults to `$HOME/.codex`.
         #[arg(long)]
         codex_home: Option<PathBuf>,
     },
-    /// Remove AIRC-managed UserPromptSubmit hooks from Codex config.
+    /// Remove AIRC-managed prompt and post-tool hooks from Codex config.
     UninstallHooks {
         /// Codex home directory. Defaults to `$HOME/.codex`.
         #[arg(long)]
@@ -26,6 +26,22 @@ pub enum CodexHookAction {
     },
     /// Emit Codex UserPromptSubmit JSON with unread AIRC context.
     UserPromptSubmit {
+        /// Maximum unread events to fetch from the transcript store.
+        #[arg(long, default_value_t = 50)]
+        count: usize,
+        /// Maximum events to show in digest mode.
+        #[arg(long, default_value_t = 8)]
+        max_items: usize,
+        /// Emit raw unread lines instead of a compact digest.
+        #[arg(long)]
+        raw: bool,
+        /// Include events from this peer. Default excludes same-peer
+        /// self echoes so Codex does not re-inject its own sends.
+        #[arg(long)]
+        include_self: bool,
+    },
+    /// Emit Codex PostToolUse JSON with unread AIRC context.
+    PostToolUse {
         /// Maximum unread events to fetch from the transcript store.
         #[arg(long, default_value_t = 50)]
         count: usize,

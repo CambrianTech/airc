@@ -370,7 +370,8 @@ fn codex_hook_installer_adds_turn_contract_when_unset() {
     let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("read config");
     assert!(config.contains("AIRC-CODEX-INSTRUCTIONS-START"));
     assert!(config.contains("developer_instructions"));
-    assert!(config.contains("airc codex-hook poll --wait-ms 1000"));
+    assert!(config.contains("UserPromptSubmit and PostToolUse"));
+    assert!(config.contains("Do not add routine manual polling"));
     assert!(config.contains("hooks = true"));
 }
 
@@ -585,6 +586,14 @@ fn command_for_home(home: &Path) -> Command {
     // throwaway home are mismatched, the rendezvous fails, and the
     // command exits non-zero. See `inject_gh_token` in commands.rs.
     command.env("AIRC_NO_GH_TOKEN_INJECT", "1");
+    for name in [
+        "AIRC_CLIENT_ID",
+        "CODEX_THREAD_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+    ] {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -739,5 +748,51 @@ fn drain_stdin_timeout_proceeds_when_eof_never_arrives() {
         "hook must emit the deadline-hit diagnostic on stderr so an \
          operator sees WHY the hook ran with empty payload: \
          stderr={stderr_text}"
+    );
+}
+
+#[test]
+fn post_tool_hook_frames_context_and_shares_prompt_cursor() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    run_ok(&home, &["send", "arrived during work"]);
+    let output = run_hook(
+        &home,
+        &["codex-hook", "post-tool-use", "--include-self"],
+        "{}",
+    );
+    let payload: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(
+        payload["hookSpecificOutput"]["hookEventName"],
+        "PostToolUse"
+    );
+    assert!(additional_context(&output).contains("arrived during work"));
+    assert_eq!(
+        run_hook(
+            &home,
+            &["codex-hook", "user-prompt-submit", "--include-self"],
+            "{}"
+        ),
+        ""
+    );
+}
+
+#[test]
+fn post_tool_hook_session_input_isolates_shared_home_cursors() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    run_ok_with_client(&home, "claude:peer", &["send", "message for both tasks"]);
+    let args = &["codex-hook", "post-tool-use"];
+    // Empty identity overrides make the test independent of the test runner's
+    // inherited Codex task identity (Windows has no process-walk fallback).
+    let first = run_hook_with_client(&home, "", args, r#"{"session_id":"first"}"#);
+    let second = run_hook_with_client(&home, "", args, r#"{"session_id":"second"}"#);
+    assert!(additional_context(&first).contains("message for both tasks"));
+    assert!(additional_context(&second).contains("message for both tasks"));
+    assert_eq!(
+        run_hook_with_client(&home, "", args, r#"{"session_id":"first"}"#),
+        ""
     );
 }

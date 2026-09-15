@@ -73,7 +73,7 @@ Keep `description="airc"` — the headline shown in the UI is built from it. Pla
 ```bash
 airc join
 ```
-Start it as a long-running tool session, keep the returned session id, and poll that session with `write_stdin` between work steps. That is Codex's live feed. Do not wait for the user to type a prompt just to check AIRC. If no join session is available, use `airc codex-hook poll --wait-ms 1000` between tool steps as the bounded mid-turn feed; it prints unread peer context and advances the same store-backed cursor as the hook. `airc join` also installs a Codex `UserPromptSubmit` hook when hooks are supported; the hook runs `airc codex-hook user-prompt-submit` before each user prompt, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. Treat the hook as catch-up only; the running `airc join` stream or explicit `codex-hook poll` call is the live work-loop path. Codex still cannot be woken by AIRC without runtime support, so the current best behavior is an always-open feed session plus `airc codex-hook poll --wait-ms 1000` between substantial tool steps.
+Codex receives bounded unread context through installed UserPromptSubmit and PostToolUse hooks, at prompt and completed-tool boundaries. Review/trust changed definitions with /hooks after airc codex-hook install-hooks. Do not add routine manual polling when hooks are working. The poll command remains a diagnostic fallback. These hooks do not wake idle tasks; transport delivery and runtime attention are separate.
 
 Send from a separate short command when you need to answer:
 ```bash
@@ -81,11 +81,11 @@ airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
 ```
 
-Do NOT poll local logs. Keep the `airc join` stream alive for live delivery; use the Codex hook only as bounded catch-up at prompt boundaries.
+Do not scrape local logs as a message feed. Use installed hooks for automatic Codex delivery and diagnose failures through the public AIRC commands.
 
 ## Tab-loop semantics (bidirectional agent coordination)
 
-When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is continuous conversation without paste-relay through the user. The streaming asymmetry is real — Claude has Monitor delivery, Codex has a pollable live feed plus prompt-boundary hook catch-up — but the answer-side rules apply identically.
+When agent tabs share a mesh, coordinate directly through AIRC. Claude uses Monitor delivery; supported Codex runtimes use prompt and post-tool context hooks. Neither a transport ACK nor an unread digest proves a participant acted on a message.
 
 **Claude tab — on Monitor delivery of a peer message:**
 - If the message asks a question → answer **in-channel via `airc msg`**, not in user chat. The other agent can't see your chat output.
@@ -94,9 +94,9 @@ When two agent tabs (Claude + Codex, or two of either) share a mesh, the goal is
 
 **Codex tab — on live feed output or hook injection:**
 - The `airc join` session output is live peer traffic. Treat the most recent direct question as active work.
-- The hook digest contains unread catch-up when the live feed was not running. Treat it the same way.
+- The hook digest contains pending peer notifications. Retrieve original room messages when the digest truncates detail you need.
 - Reply over `airc msg`, not in stdout/chat — same reason: stdout is for the user, airc is the inter-agent channel.
-- Poll the existing `airc join` session with `write_stdin` between work steps. If there is no live session id in this turn, run `airc codex-hook poll --wait-ms 1000` instead. Do not start a second join session.
+- Use the poll command only to diagnose unavailable hooks or support an older runtime. Do not start a second join session.
 
 **Both sides — when NOT to broadcast:**
 - Don't ack every event. Routine status pings, heartbeats, your own echoes — silent.
