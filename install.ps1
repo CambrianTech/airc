@@ -570,25 +570,7 @@ Write-Host ''
 Write-Host '  Mesh autostart'
 Write-Host '  --------------'
 try {
-    $aircExe = (Get-Command airc -ErrorAction Stop).Source
-    # A console-subsystem exe launched directly by Task Scheduler opens a visible
-    # terminal at login. Keep join in a hidden foreground supervisor, preserving
-    # its exit code so RestartOnFailure remains effective. EncodedCommand avoids
-    # re-parsing paths containing spaces or apostrophes as PowerShell syntax.
-    $joinCommand = "`$ErrorActionPreference = 'Stop'; & '" + $aircExe.Replace("'", "''") + "' join; exit `$LASTEXITCODE"
-    $joinEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($joinCommand))
-    $taskShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $action   = New-ScheduledTaskAction -Execute $taskShell `
-        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $joinEncoded" `
-        -WorkingDirectory $HOME
-    $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-        -RestartInterval (New-TimeSpan -Minutes 2) -RestartCount 999 `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-    Register-ScheduledTask -TaskName 'airc-join' -Action $action -Trigger $trigger `
-        -Settings $settings -Force `
-        -Description 'Keep this node on the airc mesh: start the scope daemon at logon, restart it if it dies.' | Out-Null
+    & (Join-Path $CLONE_DIR 'windows\register-autostart.ps1') -AircPath (Join-Path $BIN_TARGET 'airc.exe')
     Write-Ok "autostart registered (task 'airc-join' - at logon, auto-restart)"
 } catch {
     # Never fail the install for this. A node without autostart still works

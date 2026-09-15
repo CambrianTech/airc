@@ -845,6 +845,16 @@ _setup_windows_firewall() {
   fi
 }
 
+_setup_windows_autostart() {
+  local registrar="$CLONE_DIR/windows/register-autostart.ps1"
+  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned \
+       -File "$(_to_win_path "$registrar")" -AircPath "$(_to_win_path "$BIN_DIR/airc.exe")" -ExistingOnly; then
+    ok "Windows mesh autostart checked (existing tasks repaired; no new opt-in)"
+  else
+    warn "Could not repair Windows mesh autostart; rerun this installer from a normal Windows session."
+  fi
+}
+
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
   # Belt-and-suspenders: even when prereq install was skipped (AIRC_SKIP_PREREQS)
@@ -870,6 +880,7 @@ _install_airc_binary() {
       # Reachable-inbound on a typical Windows box (idempotent; prompts for
       # elevation only when the firewall rule is missing/broken).
       _setup_windows_firewall
+      _setup_windows_autostart
       ;;
     *)
       local built="$target_dir/release/airc"
