@@ -31,7 +31,7 @@ use airc_diagnostics::{
 use airc_ipc::codec::{read_frame, write_frame};
 use airc_ipc::request::{AttachRequest, AttachStart, IpcDelivery, IpcKind, Request};
 use airc_ipc::response::Response;
-use airc_ipc::transport::{IpcListener, IpcStream};
+use airc_ipc::transport::{IpcAcceptError, IpcListener, IpcStream};
 
 use crate::handlers::dispatch;
 use crate::state::DaemonState;
@@ -41,8 +41,10 @@ use crate::state::DaemonState;
 pub enum DaemonError {
     /// Another daemon already owns this IPC endpoint.
     AlreadyRunning(PathBuf),
-    /// Socket bind / accept I/O failure.
+    /// Socket bind or connection I/O failure.
     Io(std::io::Error),
+    /// Listener failure, retaining the accept operation and OS error.
+    Accept(IpcAcceptError),
     /// Could not remove a stale socket file from a prior daemon
     /// instance.
     StaleSocket(std::io::Error),
@@ -55,6 +57,7 @@ impl std::fmt::Display for DaemonError {
                 write!(f, "daemon already running on {}", path.display())
             }
             DaemonError::Io(error) => write!(f, "daemon I/O: {error}"),
+            DaemonError::Accept(error) => write!(f, "daemon accept: {error}"),
             DaemonError::StaleSocket(error) => {
                 write!(f, "stale socket cleanup: {error}")
             }
@@ -67,6 +70,7 @@ impl std::error::Error for DaemonError {
         match self {
             DaemonError::AlreadyRunning(_) => None,
             DaemonError::Io(error) | DaemonError::StaleSocket(error) => Some(error),
+            DaemonError::Accept(error) => Some(error),
         }
     }
 }
@@ -132,7 +136,39 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
                 break;
             }
             accept = listener.accept() => {
-                let stream = accept?;
+                let stream = match accept {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let recoverable = error.is_client_disconnect();
+                        let event = if recoverable {
+                            DiagnosticEvent::warn(
+                                DiagnosticComponent::Daemon,
+                                DiagnosticCode::IpcAcceptFailed,
+                                "IPC client disconnected before accept; next pipe remains available",
+                            )
+                        } else {
+                            DiagnosticEvent::error(
+                                DiagnosticComponent::Daemon,
+                                DiagnosticCode::IpcAcceptFailed,
+                                "IPC listener failed; daemon is exiting",
+                            )
+                        };
+                        let mut event = event
+                            .with_field("stage", error.stage())
+                            .with_field("recoverable", recoverable)
+                            .with_field("error", &error);
+                        if let Some(code) = error.raw_os_error() {
+                            event = event.with_field("os_error", code);
+                        }
+                        StderrJsonDiagnosticSink.emit(event);
+                        if recoverable {
+                            // A new pipe awaits a new client. No retry of the
+                            // failed handle, polling timer, or generic error loop.
+                            continue;
+                        }
+                        return Err(DaemonError::Accept(error));
+                    }
+                };
                 let state = state.clone();
                 let connection = idle_tracker.connection_opened();
                 tokio::spawn(async move {
