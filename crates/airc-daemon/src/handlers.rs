@@ -23,9 +23,9 @@ use airc_ipc::request::{
     SendRequest,
 };
 use airc_ipc::response::{
-    DeliveryStatsResponse, InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry,
-    PeerIdentityCardResponse, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    RoomsResponse, RouteEndpointsResponse, StatusResponse,
+    InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry, PeerIdentityCardResponse,
+    PeersResponse, PublishResponse, Response, RoomTipResponse, RoomsResponse,
+    RouteEndpointsResponse, StatusResponse,
 };
 use bytes::Bytes;
 
@@ -68,9 +68,9 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         // #1306 slice 2: serve the host-written delivery-ledger snapshot
         // — the delivery-truth read behind doctor's "last confirmed
         // delivery to X: N ago".
-        Request::DeliveryStats => Response::DeliveryStats(DeliveryStatsResponse {
-            peers: state.delivery_stats.read().await.clone(),
-        }),
+        Request::DeliveryStats => {
+            Response::DeliveryStats(state.delivery_stats.read().await.clone())
+        }
         // Card 4b6a0ffa (#33): serve the endpoints the registry glue
         // recorded after binding its listener. Empty means "up but not
         // dialable" — the client decides what that implies.

@@ -184,9 +184,16 @@ pub struct IpcRoomInfo {
 /// ledger lives on an `airc-lib` handle this crate must not depend on,
 /// so the host's route-refresh loop snapshots it into `DaemonState`
 /// each tick and the daemon serves that snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryStatsResponse {
     pub peers: Vec<IpcPeerDeliveryStats>,
+    /// When the host completed this snapshot. Absent before the first refresh
+    /// or with an older daemon; absence is not a current empty ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at_ms: Option<u64>,
+    /// Connected LAN peers at the same refresh as `peers`, not a second IPC read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_lan_peers: Option<usize>,
 }
 
 /// One peer's end-to-end delivery accounting — mirrors
@@ -423,6 +430,25 @@ mod tests {
         assert!(encoded.contains("boom"));
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, error);
+    }
+
+    // Regression for doctor-health c7873cba: an older daemon's missing snapshot
+    // metadata is unknown, while new metadata survives serialization.
+    #[test]
+    fn delivery_snapshot_metadata_is_backward_compatible() {
+        let old: Response =
+            serde_json::from_str(r#"{"kind":"delivery_stats","peers":[]}"#).unwrap();
+        assert_eq!(
+            old,
+            Response::DeliveryStats(DeliveryStatsResponse::default())
+        );
+        let current = Response::DeliveryStats(DeliveryStatsResponse {
+            peers: Vec::new(),
+            sampled_at_ms: Some(123_000),
+            connected_lan_peers: Some(2),
+        });
+        let json = serde_json::to_string(&current).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), current);
     }
 
     #[test]

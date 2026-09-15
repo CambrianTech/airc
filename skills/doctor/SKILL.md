@@ -24,7 +24,7 @@ Audience: Claude Code, Codex, future agent runtimes. Goal: leave the user with a
 
 When something feels wrong, in this order:
 
-1. **`airc doctor --health`** — live route/process state. Fast. Catches stopped local transport or bad route health. Green → bus is fine, issue is upstream.
+1. **`airc doctor --health`** — daemon process state and its timestamped route/delivery snapshot. Check the observation age and intended peer's acknowledgement; a daemon ACK does not prove the intended reader consumed a message.
 2. **`airc doctor`** — env regression check.
 3. **`airc inbox`** — pull buffered frames for the current room to confirm whether traffic is arriving.
 4. **`airc doctor --fix`** — apply safe auto-recovery (e.g. clear a stale daemon socket) once 1-3 point at a recoverable local issue.
@@ -42,9 +42,10 @@ When something feels wrong, in this order:
 | `[BLOCKED] gh governor shared backoff active` | GitHub told this user/device to wait | Do not retry; wait for displayed seconds |
 | `[ok] airc process running` | Daemon up | None |
 | `[WARN] airc process not running` | Disconnected scope | `airc join` |
-| `[ok] route health` | Healthy selected route | None |
-| `[WARN] route health` | Degraded selected route | Run `airc transport health` |
-| `[BLOCKED] route health` | No usable route | `airc join`, then inspect discovery/transport health |
+| `[info] route health: daemon snapshot ... connected LAN peer(s)` | Connection count from the daemon's last refresh; not delivery confirmation | Read the per-peer delivery findings |
+| `[WARN] route health: ... no connected LAN peers` | The daemon observed zero connected LAN peers | Inspect the intended peer's route; other transports are not measured by this count |
+| `[WARN] ... UNAVAILABLE`, `STALE`, or `UNKNOWN` | The daemon observation is missing, old, or cannot be dated | Check daemon build/status and route-refresh diagnostics; do not infer delivery success or failure |
+| `[info] delivery account scope` | Trust-store classification of peers that have acknowledged | `OwnAccount` means shared account ownership, not physical loopback |
 
 ## env probe (`airc doctor`)
 
