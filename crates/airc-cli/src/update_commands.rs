@@ -31,7 +31,7 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     // Ordering below, in the order the reasons apply:
     //   1. fetch/checkout — a git op on a separate worktree, no daemon involved
     //   2. nothing-to-do  — return WITHOUT ever stopping the daemon
-    //   3. pre-warm build — compile while the node is still on the air
+    //   3. prepare artifact — compile and verify while the node is still on the air
     //   4. stop → install → restart — the genuinely exclusive part
     let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
 
@@ -53,30 +53,23 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
         return Ok(());
     }
 
-    // Compile BEFORE the node goes off the air. `install.sh` runs
-    // `cargo build --release -p airc-cli` in this same directory, so this warms
-    // exactly the cache it will use and its rebuild becomes near-incremental —
-    // the outage shrinks from "fetch + full rebuild + install" to roughly
-    // "install + restart".
-    //
-    // Best-effort ON PURPOSE, and not a masking fallback: `run_installer` below
-    // performs the authoritative build moments later and fails loud if the code
-    // does not compile. Nothing is hidden by ignoring a failure here — a broken
-    // build still stops the update, it just stops it a few seconds later.
-    prewarm_build(&build_dir);
+    let prepared =
+        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
 
-    if daemon_was_running {
-        stop_daemon(&airc_exe, home, &socket)?;
-    }
     // What the OPERATOR is holding, read before we replace it. `before`/`after`
     // above describe the git checkout; this describes the tool. They are
     // independent, and the summary at the end has to speak about this one.
     // (Canary's #1332 moved `prepare_build_source` before the no-op gate;
-    // this read only has to precede `run_installer`, which is what replaces
+    // this read only has to precede installation, which is what replaces
     // the binary.)
     let binary_before = installed_binary_sha(&airc_exe);
 
-    run_installer(&build_dir)?;
+    prepared.install_after(|| {
+        if daemon_was_running {
+            stop_daemon(&airc_exe, home, &socket)?;
+        }
+        Ok(())
+    })?;
 
     // Prove the BINARY became `after` before claiming anything about it (#354).
     //
@@ -321,8 +314,8 @@ fn prepare_build_source(
 /// leave a peer with a binary that compiles-but-doesn't-run.
 ///
 /// Flow: fetch + ff-pull the channel → if HEAD unchanged, nothing to do
-/// (the daemon is NEVER touched — see below) → else stop the daemon, back
-/// up the installed binary to `airc.prev`, rebuild in place, smoke-test
+/// (the daemon is NEVER touched — see below) → else prepare a verified artifact,
+/// back up the installed binary to `airc.prev`, stop and install, smoke-test
 /// (the new binary's `version` reports the pulled SHA), and on failure
 /// restore `airc.prev`.
 ///
@@ -372,13 +365,10 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         );
     }
 
-    // A real update is pending — only NOW does the binary swap need the
-    // transport owner down.
-    if daemon_was_running {
-        stop_daemon(&airc_exe, home, &socket)?;
-    }
+    let prepared =
+        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
 
-    // Back up the live binary BEFORE the rebuild — this is the rollback
+    // Back up the live binary BEFORE stopping the daemon — this is the rollback
     // anchor. Copying a running exe for read is allowed on every platform.
     let prev = airc_exe.with_file_name("airc.prev");
     std::fs::copy(&airc_exe, &prev).map_err(|e| {
@@ -411,20 +401,33 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     // Unix does not need this (write-over-running is legal there), but it is
     // harmless and one code path beats two.
     let displaced = airc_exe.with_file_name(format!("airc.old-{before}"));
-    let _ = std::fs::remove_file(&displaced); // a previous update's leftover
-    if let Err(e) = std::fs::rename(&airc_exe, &displaced) {
-        return Err(format!(
-            "could not move the live binary aside before installing ({e}). \
+    let mut displaced_current = false;
+    let installed = prepared.install_after(|| {
+        if daemon_was_running {
+            stop_daemon(&airc_exe, home, &socket)?;
+        }
+        let _ = std::fs::remove_file(&displaced); // a previous update's leftover
+        if let Err(e) = std::fs::rename(&airc_exe, &displaced) {
+            return Err(format!(
+                "could not move the live binary aside before installing ({e}). \
              {} is still the running executable and nothing was changed. \
              Something holds it that a rename cannot displace — check for \
              other airc processes ({}).",
-            airc_exe.display(),
-            "airc.exe, airc-acp-bridge.exe"
-        )
-        .into());
-    }
+                airc_exe.display(),
+                "airc.exe, airc-acp-bridge.exe"
+            )
+            .into());
+        }
 
-    let installed = run_installer(&build_dir);
+        displaced_current = true;
+        Ok(())
+    });
+
+    // A failed stop or rename never entered installation. Preserve that error
+    // and the unchanged live binary instead of attempting installer rollback.
+    if !displaced_current {
+        return installed;
+    }
 
     // If the installer did not produce a binary, put the original back NOW —
     // otherwise the rename above has left the box with no `airc` on PATH at
@@ -588,8 +591,33 @@ fn stop_daemon(
     home: &Path,
     socket: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Capture before requesting stop: the PID file is removed during graceful
+    // shutdown, and an open process handle avoids PID-reuse races on Windows.
+    #[cfg(windows)]
+    let exiting = crate::update_shutdown::DaemonExit::capture(
+        &airc_lib::machine_account_home(home).join("daemon.pid"),
+    )?;
     let mut command = daemon_command(airc_exe, home, "stop", socket);
-    run_checked(&mut command, "airc stop before update")
+    let stop_result = run_checked(&mut command, "airc stop before update");
+    #[cfg(not(windows))]
+    stop_result?;
+    #[cfg(windows)]
+    {
+        // Shutdown can close IPC before delivering its reply. Only the pinned
+        // process's confirmed exit permits proceeding after a failed response.
+        exiting.wait(Duration::from_secs(20))?;
+        if let Err(error) = stop_result {
+            eprintln!("Stop response failed ({error}), but the original daemon has exited.");
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while daemon_is_running(airc_exe, home, socket)? {
+        if Instant::now() >= deadline {
+            return Err("daemon still answers after stop; update not installed".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 fn restart_daemon(
@@ -815,54 +843,6 @@ fn daemon_build_matches(airc_exe: &Path, home: &Path, socket: &Path, expected: &
         Some(sha) => smoke_sha_matches(&sha, expected),
         None => false,
     }
-}
-
-/// Compile the new build while the daemon is still serving, so the outage
-/// covers only the binary swap.
-///
-/// Mirrors `install.sh`'s own `cargo build --release -p airc-cli` in the same
-/// directory, so this populates precisely the cache the installer will hit.
-/// Silent on success, one line on failure — and deliberately infallible to the
-/// caller: `run_installer` does the authoritative build immediately after and
-/// surfaces any real compile error there. Treating a pre-warm failure as fatal
-/// would turn an optimization into a new way for `airc update` to refuse.
-fn prewarm_build(source: &Path) {
-    println!("Pre-building while the daemon stays up (keeps the node reachable)…");
-    let status = Command::new("cargo")
-        .args(["build", "--release", "-p", "airc-cli"])
-        .current_dir(source)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => println!("pre-build exited {s} — the installer will build it properly."),
-        Err(e) => println!("pre-build could not run ({e}) — the installer will build it."),
-    }
-}
-
-fn run_installer(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Stream the installer's output live instead of buffering it with
-    // `Command::output()` (what run_checked does). install.sh does the
-    // cargo rebuild, which can take minutes; with buffered stdio the
-    // operator saw NOTHING while it ran, so a long-or-hung build was
-    // indistinguishable from a working one — on a live Windows node
-    // `airc update` "hung" silently for 15+ minutes with no visible
-    // progress. Inheriting stdio surfaces cargo's progress live; the
-    // banner sets the expectation up front. Failure behavior is
-    // unchanged: a non-zero exit still returns an Err.
-    println!("Rebuilding airc (this can take a few minutes)…");
-    let status = Command::new(installer_shell())
-        .arg(source.join("install.sh"))
-        .env("AIRC_DIR", source)
-        .env("AIRC_INSTALL_NO_PULL", "1")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(format!("install.sh failed: exit status {status}").into())
 }
 
 /// The shell used to run install.sh during `airc update`.

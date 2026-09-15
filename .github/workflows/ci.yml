@@ -37,6 +37,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Update artifact handoff (no daemon or Cargo build)
+        run: |
+          rustc --edition 2021 --test test/update-handoff.rs -o "$RUNNER_TEMP/update-handoff"
+          "$RUNNER_TEMP/update-handoff" --nocapture
+
       - name: Stage install.sh in a temp dir (simulate first-time user)
         # The shipped install.sh clones from the canonical github URL.
         # In CI we want it to install FROM THIS COMMIT, not from main —
@@ -216,6 +221,15 @@ jobs:
       - name: Hidden child supervision and shared startup registration
         shell: powershell
         run: ./test/windows-autostart.ps1
+
+      - name: Update artifact handoff through Git Bash
+        shell: powershell
+        run: |
+          $env:AIRC_TEST_BASH = 'C:/Program Files/Git/bin/bash.exe'
+          $fixture = Join-Path $env:RUNNER_TEMP 'update-handoff.exe'
+          rustc --edition 2021 --test test/update-handoff.rs -o $fixture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $fixture --nocapture
 
       - name: Run install.ps1 under Windows PowerShell 5.1 (real install)
         shell: powershell

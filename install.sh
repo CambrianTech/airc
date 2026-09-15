@@ -39,6 +39,44 @@ ok()    { printf '  \033[1;32m->\033[0m %s\n' "$*"; }
 warn()  { printf '  \033[1;33m!\033[0m %s\n' "$*" >&2; }
 fail()  { printf '  \033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Public two-phase handoff: prepare while the daemon serves; install that exact
+# snapshot afterward without invoking Cargo again. Both modes pin this checkout.
+PREPARE_ARTIFACT=""
+PREBUILT_ARTIFACT=""
+EXPECTED_BUILD=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prepare-artifact|--prebuilt|--expected-build)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || fail "Missing value for $1"
+      case "$1" in
+        --prepare-artifact) PREPARE_ARTIFACT="$2" ;;
+        --prebuilt) PREBUILT_ARTIFACT="$2" ;;
+        --expected-build) EXPECTED_BUILD="$2" ;;
+      esac
+      shift 2 ;;
+    --help)
+      printf '%s\n' 'Usage: bash install.sh [--prepare-artifact PATH | --prebuilt PATH] --expected-build GIT_SHA' \
+        'Without arguments, build and install normally. Handoff modes use the current checkout without pulling.'
+      exit 0 ;;
+    *) fail "Unknown installer argument: $1" ;;
+  esac
+done
+if [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT$EXPECTED_BUILD" ]; then
+  [ -z "$PREPARE_ARTIFACT" ] || [ -z "$PREBUILT_ARTIFACT" ] || fail 'Choose prepare or prebuilt, not both'
+  [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT" ] || fail '--expected-build requires a handoff mode'
+  [[ "$EXPECTED_BUILD" =~ ^[0-9a-fA-F]{7,40}$ ]] || fail 'Handoff requires --expected-build with a Git SHA'
+  [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ] || fail 'Handoff cannot skip artifact validation'
+fi
+
+_verify_artifact() {
+  local binary="$1" output actual
+  [ -f "$binary" ] && [ -x "$binary" ] || fail "Artifact missing or not executable: $binary"
+  output="$("$binary" version)" || fail "Artifact cannot run: $binary"
+  actual="$(printf '%s\n' "$output" | awk '$1 == "build:" {print $2; exit}')"
+  [[ "$actual" =~ ^[0-9a-fA-F]{7,40}$ ]] || fail "Artifact has no valid build SHA: $binary"
+  [[ "$actual" == "$EXPECTED_BUILD"* || "$EXPECTED_BUILD" == "$actual"* ]] || fail "Artifact build $actual does not match $EXPECTED_BUILD"
+}
+
 # MSYS / Git Bash path conversion. Three callsites in this file used the
 # same `if command -v cygpath ... else sed ...` block; #205 Target #3
 # collapsed them. Mirrors lib/airc_bash/platform_adapters.sh's helpers
@@ -58,6 +96,8 @@ _to_bash_path() {
     printf '%s' "$1" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|'
   fi
 }
+
+CLONE_DIR="$(_to_bash_path "$CLONE_DIR")"
 
 # ── Prereq auto-install ─────────────────────────────────────────────────
 # Mirrors the Windows install.ps1 winget path: detect what's missing,
@@ -533,7 +573,7 @@ ensure_prereqs() {
   fi
 }
 
-ensure_prereqs
+if [ -z "$PREBUILT_ARTIFACT" ]; then ensure_prereqs; fi
 
 # ── Clone or update ─────────────────────────────────────────────────────
 
@@ -545,7 +585,7 @@ if [ -d "$CLONE_DIR/.git" ] || [ -f "$CLONE_DIR/.git" ]; then
   # Without this escape hatch, install.sh's "I'm-on-a-non-channel-branch
   # so let me reset to main" recovery path silently overwrites the
   # PR's code with origin/main's — making the PR's CI a no-op.
-  if [ "${AIRC_INSTALL_NO_PULL:-0}" = "1" ]; then
+  if [ "${AIRC_INSTALL_NO_PULL:-0}" = "1" ] || [ -n "$EXPECTED_BUILD" ]; then
     info "AIRC_INSTALL_NO_PULL=1 — using CLONE_DIR tree as-is, skipping branch-switch + pull"
   else
   info "Updating existing install"
@@ -630,6 +670,11 @@ else
       exit 1
     }
   fi
+fi
+
+if [ -n "$EXPECTED_BUILD" ]; then
+  checkout_build="$(git -C "$CLONE_DIR" rev-parse HEAD)" || fail 'Cannot verify handoff checkout'
+  [[ "$checkout_build" == "$EXPECTED_BUILD"* ]] || fail "Checkout $checkout_build does not match $EXPECTED_BUILD"
 fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
@@ -857,6 +902,12 @@ _setup_windows_autostart() {
 
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
+  local built target_dir
+  if [ -n "$PREBUILT_ARTIFACT" ]; then
+    built="$(_to_bash_path "$PREBUILT_ARTIFACT")"
+    _verify_artifact "$built"
+    info "Installing verified prebuilt artifact: $built"
+  else
   # Belt-and-suspenders: even when prereq install was skipped (AIRC_SKIP_PREREQS)
   # the build still needs cargo on PATH. On macOS that means sourcing brew env.
   ensure_brew_on_path
@@ -866,16 +917,30 @@ _install_airc_binary() {
   ensure_cargo_recent
   info "Building Rust CLI: airc"
   (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
-  mkdir -p "$BIN_DIR"
 
   # Where cargo ACTUALLY put it (honors CARGO_TARGET_DIR + cargo config),
   # not the assumed "$CLONE_DIR/target" — see `_airc_target_dir`.
-  local target_dir; target_dir="$(_airc_target_dir)"
+  target_dir="$(_airc_target_dir)"
+  built="$target_dir/release/airc"
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) built="$built.exe" ;; esac
+  [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+  if [ -n "$PREPARE_ARTIFACT" ]; then
+    local prepared; prepared="$(_to_bash_path "$PREPARE_ARTIFACT")"
+    [ ! -e "$prepared" ] || fail "Artifact destination already exists: $prepared"
+    cp "$built" "$prepared"
+    chmod +x "$prepared"
+    _verify_artifact "$prepared"
+    checkout_build="$(git -C "$CLONE_DIR" rev-parse HEAD)" || fail 'Cannot verify prepared checkout'
+    [[ "$checkout_build" == "$EXPECTED_BUILD"* ]] || fail 'Checkout changed while preparing the artifact'
+    ok "Prepared verified artifact: $prepared"
+    exit 0
+  fi
+  fi
+  mkdir -p "$BIN_DIR"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      local built="$target_dir/release/airc.exe"
-      [ -x "$built" ] || fail "airc build completed but binary is missing: $built (target dir: $target_dir)"
       cp -f "$built" "$BIN_DIR/airc.exe"
+      if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$BIN_DIR/airc.exe"; fi
       ok "Installed airc: $BIN_DIR/airc.exe"
       # Reachable-inbound on a typical Windows box (idempotent; prompts for
       # elevation only when the firewall rule is missing/broken).
@@ -883,8 +948,6 @@ _install_airc_binary() {
       _setup_windows_autostart
       ;;
     *)
-      local built="$target_dir/release/airc"
-      [ -x "$built" ] || fail "airc build completed but binary is missing: $built (target dir: $target_dir)"
       local tmp="$BIN_DIR/.airc.tmp.$$"
       cp -f "$built" "$tmp"
       chmod +x "$tmp"
@@ -910,6 +973,7 @@ _install_airc_binary() {
 typically an invalid code signature on macOS). Refusing to report success on a binary that \
 cannot execute — a silently-dead airc looks exactly like a broken mesh."
       fi
+      if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$BIN_DIR/airc"; fi
       ok "Installed airc: $BIN_DIR/airc ($("$BIN_DIR/airc" --version 2>/dev/null))"
       ;;
   esac
