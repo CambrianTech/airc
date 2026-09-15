@@ -48,7 +48,7 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     // install can have failed while the checkout stayed current). The smoke
     // test is what makes skipping safe — unchanged source AND a binary that
     // already reports it means there is genuinely nothing to do.
-    if before == after && smoke_test_new_binary(&airc_exe, &after) {
+    if nothing_to_install(&before, &after, || smoke_test_new_binary(&airc_exe, &after)) {
         println!("Already at {after} on channel {channel} — daemon left running.");
         return Ok(());
     }
@@ -351,12 +351,25 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     // binary and never a dev checkout's working tree.
     let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
 
-    if before == after {
-        // Nothing pulled → nothing to rebuild → the daemon was never
-        // stopped and MUST NOT be restarted. Restart-on-no-op is the bug
-        // this ordering exists to prevent (hourly transport-owner death).
+    // BOTH halves, same as `airc update` (#354): unchanged SOURCE alone does not
+    // mean the INSTALLED binary is current — a prior install can have failed or
+    // been interrupted while the checkout stayed at the channel head. Astra,
+    // 2026-09-15: `airc doctor` reported installed bef90b65 vs channel badefb6f
+    // while `update --auto` said "Already at badefb6 — nothing to auto-update"
+    // and left the stale daemon running on every cadence. The smoke test asks
+    // the binary on disk what it is; only its answer makes skipping safe.
+    if nothing_to_install(&before, &after, || smoke_test_new_binary(&airc_exe, &after)) {
+        // Nothing pulled AND the installed binary reports it → nothing to
+        // rebuild → the daemon was never stopped and MUST NOT be restarted.
+        // Restart-on-no-op is the bug this ordering exists to prevent (hourly
+        // transport-owner death).
         println!("Already at {after} on channel {channel} — nothing to auto-update.");
         return Ok(());
+    }
+    if before == after {
+        println!(
+            "Source is at {after} on channel {channel} but the installed binary does not report it — reinstalling."
+        );
     }
 
     // A real update is pending — only NOW does the binary swap need the
@@ -458,6 +471,19 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         )
         .into())
     }
+}
+
+/// THE skip rule, one place for `airc update` and `airc update --auto` (#354, and
+/// its 2026-09-15 recurrence on the `--auto` path): an update is a no-op only when
+/// the SOURCE did not move this run AND the INSTALLED binary already reports that
+/// sha. `installed_reports_after` is asked only when the source is unchanged (it
+/// runs the binary), never on a real update.
+fn nothing_to_install(
+    before: &str,
+    after: &str,
+    installed_reports_after: impl FnOnce() -> bool,
+) -> bool {
+    before == after && installed_reports_after()
 }
 
 /// Run the freshly-installed binary's `version` and confirm it reports
@@ -1106,6 +1132,8 @@ mod tests {
     /// account here exactly as `ensure_daemon_running` does.
     #[test]
     fn daemon_command_spawns_the_owning_scope_never_the_caller_scope() {
+        // Derives from HOME on both sides of the assertion; see `test_env`.
+        let _home = crate::test_env::home_env_guard();
         let project_scope = Path::new("/tmp/home/some-project/.airc");
         let command = daemon_command(
             Path::new("/usr/local/bin/airc"),
@@ -1221,5 +1249,27 @@ mod tests {
         assert!(!smoke_sha_matches("9cc678fc0203", "deadbeef")); // mismatch -> rollback
         assert!(!smoke_sha_matches("", "9cc678f"));
         assert!(!smoke_sha_matches("9cc678f", ""));
+    }
+
+    // what this catches: `--auto` skipping on "source unchanged" alone (Astra,
+    // 2026-09-15: installed bef90b65, channel badefb6f, "Already at badefb6 — nothing
+    // to auto-update" every cadence). Unchanged source with a binary that does NOT
+    // report it is an install, not a no-op; a moved source never consults the binary.
+    #[test]
+    fn unchanged_source_is_a_no_op_only_when_the_installed_binary_reports_it() {
+        assert!(nothing_to_install("badefb6", "badefb6", || true));
+        assert!(
+            !nothing_to_install("badefb6", "badefb6", || false),
+            "stale binary → install"
+        );
+        let mut asked = false;
+        assert!(!nothing_to_install("bef90b6", "badefb6", || {
+            asked = true;
+            true
+        }));
+        assert!(
+            !asked,
+            "a moved source never runs the smoke test before the build"
+        );
     }
 }
