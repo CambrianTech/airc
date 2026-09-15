@@ -78,6 +78,58 @@ mod tests {
     use super::*;
     use crate::request::Request;
 
+    // what this catches: replacing the existing byte-array encoding with CBOR
+    // byte strings must first prove that already-installed Vec decoders accept it.
+    #[tokio::test]
+    async fn opaque_event_byte_string_compatibility_and_size() {
+        struct ByteString<'a>(&'a [u8]);
+        impl Serialize for ByteString<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum BytesResponse<'a> {
+            Event { envelope: ByteString<'a> },
+        }
+        for size in [0, 23, 24, 255, 256, 16 * 1024, 1024 * 1024] {
+            let payload: Vec<u8> = (0..size).map(|n| (n % 256) as u8).collect();
+            let old = crate::response::Response::Event {
+                envelope: payload.clone(),
+            };
+            let candidate = BytesResponse::Event {
+                envelope: ByteString(&payload),
+            };
+            let mut old_frame = Vec::new();
+            write_frame(&mut old_frame, &old).await.unwrap();
+            let mut bytes_frame = Vec::new();
+            write_frame(&mut bytes_frame, &candidate).await.unwrap();
+            let old_decode =
+                read_frame::<_, crate::response::Response>(&mut bytes_frame.as_slice()).await;
+            eprintln!("opaque IPC payload={size} old_frame={} byte_string_frame={} old_decoder_accepts={}", old_frame.len(), bytes_frame.len(), old_decode.is_ok());
+            assert!(bytes_frame.len() <= old_frame.len());
+            let error = old_decode.expect_err("installed Vec readers reject CBOR byte strings");
+            assert!(error.to_string().contains("expected a sequence"));
+
+            // Borrowing the existing sequence representation removes the source
+            // Vec allocation/copy while preserving every wire byte and JSON field.
+            let borrowed = crate::response::Response::event_ref(&payload);
+            let mut borrowed_frame = Vec::new();
+            write_frame(&mut borrowed_frame, &borrowed).await.unwrap();
+            assert_eq!(borrowed_frame, old_frame);
+            assert_eq!(
+                serde_json::to_vec(&borrowed).unwrap(),
+                serde_json::to_vec(&old).unwrap()
+            );
+            let decoded: crate::response::Response = read_frame(&mut borrowed_frame.as_slice())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, old);
+        }
+    }
+
     #[tokio::test]
     async fn frame_round_trips_newline_bearing_payload() {
         let mut bytes = Vec::new();

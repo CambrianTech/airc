@@ -409,8 +409,8 @@ polling, request-local history scan, or separate command bus is introduced.
 
 This is not zero-copy IPC or session multiplexing: every pending command still
 opens an IPC attach and waits for its registration acknowledgement. Each selected
-IPC delivery still runs `airc_wire::encode(&env).to_vec()`; the codec builds owned
-header values, and the SDK decodes the selected body. Embedded SDK subscriptions
+IPC delivery still builds the airc-wire buffer and owned header values; CBOR
+framing allocates its output, and the SDK decodes the selected body. Embedded SDK subscriptions
 still share their existing decoded broadcast stream. Eliminating those remaining
 copy/handshake costs requires a separate owner/session change; it is not implied
 by router-side shared `Arc` delivery.
@@ -420,3 +420,31 @@ IPC handles see only their 32 replies plus 32 terminal fences after 64 unrelated
 16 KiB publications. Baseline latency still needs a separate no-model measurement
 of register/ack, local dispatch and serialization, with network transit and model
 queue/inference time reported separately. No model or network speedup is claimed.
+### IPC event payload borrowing and byte-string compatibility
+
+Card 59b79686-2a1f-4253-9594-a21e08fde2b2 removes the intermediate
+`Bytes::to_vec()` from live and buffered attach event emission. The typed
+`Response::event_ref` borrows the already-encoded FlatBuffer through framing.
+For each nonempty selected event this removes one payload-sized allocation and
+copy, while preserving the exact CBOR integer-sequence representation and JSON
+array. It does not reduce frame size, remove the FlatBuffer or CBOR output
+allocations, optimize inbox pages, or establish an elapsed-time speedup.
+
+Measured length-framed sizes for deterministic bytes cycling through 0..255:
+
+| Payload bytes | Current/borrowed sequence frame | Candidate byte-string frame |
+| ---: | ---: | ---: |
+| 0 | 26 | 26 |
+| 256 | 516 | 284 |
+| 16,384 | 31,260 | 16,412 |
+| 1,048,576 | 1,998,878 | 1,048,606 |
+
+The byte-string candidate is **incompatible**: the installed `Response::Event`
+`Vec<u8>` decoder rejects every tested size with “invalid type: byte array,
+expected a sequence”. Production keeps the sequence encoding. A future migration
+requires readers that accept both representations first, plus explicit
+capability/version negotiation before a sender emits byte strings; JSON must
+retain its array shape. The regression compares the borrowed and existing framed
+CBOR bytes and JSON bytes exactly, then decodes with the unchanged response type.
+Connection-tail attribution remains separate (card 1034c91d); no network, model,
+or p99 latency improvement is claimed by this copy-boundary change.
