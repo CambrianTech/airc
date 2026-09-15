@@ -23,10 +23,11 @@ use std::time::{Duration, Instant};
 use airc_bus::envelope::{DeliveryClass, Envelope, Kind};
 use airc_core::{HeaderFilter, Headers, PeerId, RoomId};
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
+use airc_ipc::client::RpcPhase;
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
     AttachRequest, DaemonClient, InboxRequest, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
-    Response, SendRequest,
+    Request, Response, SendRequest,
 };
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, InMemoryEventStore};
@@ -830,13 +831,14 @@ fn report_latency(label: &str, wall: std::time::Duration, mut lat_ns: Vec<u64>) 
 
 /// Spawn `publishers` concurrent DaemonClient tasks, each publishing
 /// `per_publisher` durable messages to `channel_for(p)`. Returns (wall covering
-/// all publishes, per-op publish latencies ns).
+/// all publishes, paired per-op phase durations ns). Reporting is kept outside
+/// the driver's wall and the one-room collector's live-delivery wall.
 async fn drive_publishers(
     socket: PathBuf,
     publishers: usize,
     per_publisher: usize,
     channel_for: impl Fn(usize) -> RoomId,
-) -> (std::time::Duration, Vec<u64>) {
+) -> (std::time::Duration, Vec<[u64; 4]>) {
     let start = Instant::now();
     let mut handles = Vec::with_capacity(publishers);
     for p in 0..publishers {
@@ -846,12 +848,30 @@ async fn drive_publishers(
             let client = DaemonClient::new(socket);
             let mut lat = Vec::with_capacity(per_publisher);
             for i in 0..per_publisher {
+                // Request construction is outside the phase measurement. The
+                // production RPC owns transport, framing, deadline and errors.
+                let request = Request::Publish(durable_text(channel, &format!("p{p} m{i}")));
                 let t = Instant::now();
-                client
-                    .publish(durable_text(channel, &format!("p{p} m{i}")))
+                let mut boundaries = [None; 3];
+                let response = client
+                    .call_observed(request, Duration::from_secs(5), |phase| {
+                        let index = match phase {
+                            RpcPhase::Connected => 0,
+                            RpcPhase::RequestWritten => 1,
+                            RpcPhase::ResponseRead => 2,
+                        };
+                        boundaries[index] = Some(t.elapsed().as_nanos() as u64);
+                    })
                     .await
                     .expect("daemon publish");
-                lat.push(t.elapsed().as_nanos() as u64);
+                assert!(matches!(response, Response::Publish(_)));
+                let [connect, written, read] = boundaries.map(|v| v.expect("completed phase"));
+                lat.push([
+                    connect,
+                    written - connect,
+                    read - written,
+                    t.elapsed().as_nanos() as u64,
+                ]);
             }
             lat
         }));
@@ -861,6 +881,40 @@ async fn drive_publishers(
         all.extend(h.await.expect("publisher join"));
     }
     (start.elapsed(), all)
+}
+
+fn report_phases(mut all: Vec<[u64; 4]>) -> Vec<u64> {
+    // Retain paired samples: separate percentiles must never be added together.
+    for (index, label) in [
+        "connect",
+        "request encode/write/flush",
+        "response wait/read/decode",
+        "RPC total",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut values: Vec<u64> = all.iter().map(|sample| sample[index]).collect();
+        values.sort_unstable();
+        let pct = |n: usize| values[(values.len() * n / 100).min(values.len() - 1)];
+        eprintln!(
+            "RPC phase {label} ns: min {} p50 {} p95 {} p99 {} max {}",
+            values[0],
+            pct(50),
+            pct(95),
+            pct(99),
+            values[values.len() - 1]
+        );
+    }
+    all.sort_unstable_by_key(|sample| sample[3]);
+    for sample in all.iter().rev().take(5) {
+        eprintln!(
+            "RPC slow paired ns: connect={} write={} response={} total={}",
+            sample[0], sample[1], sample[2], sample[3]
+        );
+    }
+    eprintln!("RPC samples: completed={} failed=0 excluded=0 (any failure aborts measurement); callback clock overhead included", all.len());
+    all.into_iter().map(|sample| sample[3]).collect()
 }
 
 /// 15 concurrent publishers → ONE room, with a collector measuring LIVE
@@ -912,7 +966,7 @@ async fn bench_daemon_concurrent_publishers_one_room() {
     let p95 = report_latency(
         "daemon ONE-room publish (15×40, single-writer + write-behind)",
         publish_wall,
-        lat,
+        report_phases(lat),
     );
 
     // Collapse-guard only; the printed distribution is the signal.
@@ -947,7 +1001,7 @@ async fn bench_daemon_publishers_many_rooms() {
     let p95 = report_latency(
         "daemon MANY-rooms publish (15 publishers × 15 shards × 40)",
         wall,
-        lat,
+        report_phases(lat),
     );
     assert!(
         p95 < 200_000_000,
