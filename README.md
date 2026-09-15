@@ -64,6 +64,8 @@ An unchanged task is left alone. A changed, running supervisor is restarted only
 
 ## Quick Start
 
+Source installers support a verified two-phase update: `bash install.sh --prepare-artifact /path/to/airc --expected-build <git-sha>` builds and snapshots a runnable binary without installing it; `bash install.sh --prebuilt /path/to/airc --expected-build <git-sha>` installs that snapshot through the normal copy, verification and integration steps without invoking Cargo. The destination for preparation must not exist. Both modes keep the current checkout pinned and reject a mismatched checkout or binary build. `airc update` and `airc update --auto` use this contract automatically, completing preparation before stopping the daemon and removing their temporary snapshot afterward. A failed build leaves the daemon running.
+
 Join from a project directory:
 
 ```bash
