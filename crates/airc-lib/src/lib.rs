@@ -210,8 +210,8 @@ pub use work::{
     HeartbeatWorkspace, LinkCardPullRequest, MarkPullRequestMerged, ObserveLocalGitWorkspace,
     ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat,
     ReleaseWorkClaim, ReleaseWorkspace, RelinkCardPullRequest, ReportAgentAvailability,
-    RequestWorkspace, SubmitWork, UpdateWorkCard, WorkQueueStatus, WorkQueueStatusQuery,
-    WORK_BOARD_PROJECTION_PAGE_SIZE,
+    RequestWorkspace, ReviewWorkSubmission, SubmitWork, UpdateWorkCard, WorkQueueStatus,
+    WorkQueueStatusQuery, WORK_BOARD_PROJECTION_PAGE_SIZE,
 };
 pub use work_manager::{
     SeededWorkCard, WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBacklogSeedResult,

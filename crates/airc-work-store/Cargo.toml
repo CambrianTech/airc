@@ -19,5 +19,6 @@ airc-work = { path = "../airc-work" }
 thiserror = "1"
 
 [dev-dependencies]
+airc-protocol = { path = "../airc-protocol" }
 tokio = { version = "1", features = ["rt", "macros"] }
 serde_json = "1"

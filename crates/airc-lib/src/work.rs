@@ -33,6 +33,20 @@ pub struct SubmitWork {
     pub artifact: airc_work::SubmissionArtifact,
 }
 
+/// Review an exact accepted candidate as the caller. The immutable review id
+/// survives retries; the SDK owns reviewer identity and publication time.
+#[derive(Debug, Clone)]
+pub struct ReviewWorkSubmission {
+    pub review_id: airc_work::WorkReviewId,
+    pub card_id: WorkCardId,
+    pub submission_id: airc_work::SubmissionId,
+    pub artifact: airc_work::SubmissionArtifact,
+    pub review_card_id: WorkCardId,
+    pub review_claim_id: ClaimId,
+    pub outcome: airc_work::WorkReviewOutcome,
+    pub evidence: airc_work::SubmissionArtifact,
+}
+
 /// Canonical pagination size for complete work-board projections.
 ///
 /// Card acd72c81: a complete projection read as ONE Inbox RPC asks the
@@ -439,6 +453,36 @@ fn build_operator_card_created(
 }
 
 impl Airc {
+    /// Record judgement with evidence under the historical linked review claim.
+    /// This does not infer a pass from card state, fetch evidence, or establish
+    /// independent review: consumers compare the reviewer with the publisher.
+    pub async fn review_work_submission_in(
+        &self,
+        room: &Room,
+        request: ReviewWorkSubmission,
+    ) -> Result<airc_work::WorkSubmissionReview, AircError> {
+        let board = self.work_board_in(room).await?;
+        let review = airc_work::WorkSubmissionReview {
+            review_id: request.review_id,
+            card_id: request.card_id,
+            submission_id: request.submission_id,
+            artifact: request.artifact,
+            review_card_id: request.review_card_id,
+            review_claim_id: request.review_claim_id,
+            reviewer: self.peer_id(),
+            outcome: request.outcome,
+            evidence: request.evidence,
+            reviewed_at_ms: now_ms()?,
+        };
+        review.validate_for_board(&board)?;
+        if let Some(prior) = board.submission_review(review.review_id) {
+            return Ok(prior.clone());
+        }
+        self.publish_work_event_in(room, &WorkEvent::WorkSubmissionReviewed(review.clone()))
+            .await?;
+        Ok(review)
+    }
+
     /// Publish an immutable artifact reference into the card's own room. This
     /// does not upload the blob or claim remote availability: consumers fetch
     /// by content hash and verify size/hash before using it.
@@ -1426,6 +1470,149 @@ fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: card89af25c7 — the real SDK must sign as its caller,
+    // preserve the chosen room, and return the first receipt after claim closure.
+    #[tokio::test]
+    async fn submission_review_api_is_scoped_and_idempotent_after_claim_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room = airc.join("review-contract").await.unwrap();
+        let repo = RepoId::new("fixture/ordinary-project").unwrap();
+        let parent = airc
+            .create_work_card(CreateWorkCard::new(
+                repo.clone(),
+                "ordinary task",
+                Priority::P1,
+            ))
+            .await
+            .unwrap();
+        let claim = airc
+            .claim_work_card(ClaimWorkCard {
+                card_id: parent,
+                ttl_ms: 600_000,
+            })
+            .await
+            .unwrap();
+        let artifact: airc_work::SubmissionArtifact = serde_json::from_value(serde_json::json!({
+            "hash": "b".repeat(64), "size_bytes": 5, "mime": "text/x-diff"
+        }))
+        .unwrap();
+        let submission = airc
+            .submit_work_in(
+                &room,
+                SubmitWork {
+                    submission_id: airc_work::SubmissionId::new(),
+                    card_id: parent,
+                    claim_id: claim,
+                    instance: "ordinary-task".into(),
+                    base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+                    artifact: artifact.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let review_card = airc
+            .create_work_card(
+                CreateWorkCard::new(repo, "review exact artifact", Priority::P1).reviewing(parent),
+            )
+            .await
+            .unwrap();
+        let review_claim = airc
+            .claim_work_card(ClaimWorkCard {
+                card_id: review_card,
+                ttl_ms: 600_000,
+            })
+            .await
+            .unwrap();
+        let other_room = airc.join("unrelated").await.unwrap();
+        let request = ReviewWorkSubmission {
+            review_id: airc_work::WorkReviewId::new(),
+            card_id: parent,
+            submission_id: submission.submission_id,
+            artifact: artifact.clone(),
+            review_card_id: review_card,
+            review_claim_id: review_claim,
+            outcome: airc_work::WorkReviewOutcome::Unknown,
+            evidence: artifact,
+        };
+        let first = airc
+            .review_work_submission_in(&room, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.reviewer, airc.peer_id());
+        assert_eq!(first.outcome, airc_work::WorkReviewOutcome::Unknown);
+        assert_eq!(
+            airc.current_room().await.unwrap().channel,
+            other_room.channel
+        );
+        assert_eq!(
+            airc.work_board_in(&room)
+                .await
+                .unwrap()
+                .submission_review(first.review_id),
+            Some(&first)
+        );
+        // A legacy reader advanced its cursor over an unfamiliar review hint.
+        // Upgrade must replay it, not accept that apparently current old cache.
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        legacy["version"] = 2.into();
+        let projection = legacy["projection"].as_object_mut().unwrap();
+        projection.remove("submission_reviews");
+        projection.remove("review_rejections");
+        std::fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            airc.work_board_in(&room)
+                .await
+                .unwrap()
+                .submission_review(first.review_id),
+            Some(&first)
+        );
+        assert!(airc
+            .work_board_in(&other_room)
+            .await
+            .unwrap()
+            .submission_review(first.review_id)
+            .is_none());
+        airc.change_work_card_state_in(
+            &room,
+            ChangeWorkCardState {
+                card_id: review_card,
+                state: CardState::Closed,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            airc.review_work_submission_in(&room, request.clone())
+                .await
+                .unwrap(),
+            first
+        );
+        let mut conflict = request.clone();
+        conflict.outcome = airc_work::WorkReviewOutcome::Passed;
+        assert!(matches!(
+            airc.review_work_submission_in(&room, conflict).await,
+            Err(AircError::WorkReview(
+                airc_work::WorkReviewRejectionReason::ConflictingId
+            ))
+        ));
+        let mut late = request;
+        late.review_id = airc_work::WorkReviewId::new();
+        assert!(matches!(
+            airc.review_work_submission_in(&room, late).await,
+            Err(AircError::WorkReview(
+                airc_work::WorkReviewRejectionReason::SettledReviewCard
+            ))
+        ));
+    }
 
     #[test]
     fn build_operator_card_created_never_emits_origin_none() {

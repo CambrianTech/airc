@@ -30,6 +30,23 @@ impl WorkBoardProjection {
             WorkEvent::ClaimReleased(e) => self.apply_claim_released(e),
             WorkEvent::CardStateChanged(e) => self.apply_card_state_changed(e),
             WorkEvent::WorkSubmitted(e) => self.apply_work_submitted(e),
+            WorkEvent::WorkSubmissionReviewed(e) => {
+                match e.validate_for_board(self) {
+                    Ok(()) => {
+                        self.submission_reviews
+                            .entry(e.review_id)
+                            .or_insert_with(|| e.clone());
+                    }
+                    Err(reason) => {
+                        self.review_rejections.insert(e.card_id, e.rejected(reason));
+                    }
+                }
+                Ok(())
+            }
+            WorkEvent::ReviewRejected(e) => {
+                self.review_rejections.insert(e.card_id, e.clone());
+                Ok(())
+            }
             WorkEvent::SubmissionRejected(e) => {
                 self.card_mut(e.card_id)?.last_submission_rejection = Some(e.clone());
                 Ok(())
