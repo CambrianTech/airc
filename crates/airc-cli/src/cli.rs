@@ -383,7 +383,7 @@ pub enum Command {
         socket: Option<PathBuf>,
     },
 
-    /// Daemon health snapshot.
+    /// Observe daemon health without starting it; use `join` to start or reconnect.
     Status {
         #[arg(long)]
         socket: Option<PathBuf>,
