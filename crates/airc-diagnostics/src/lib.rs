@@ -43,6 +43,8 @@ pub enum DiagnosticComponent {
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticCode {
     ConnectionError,
+    /// IPC listener failure with its accept stage and original OS error.
+    IpcAcceptFailed,
     FrameVerificationFailed,
     StoreAppendFailed,
     TrustRefreshFailed,

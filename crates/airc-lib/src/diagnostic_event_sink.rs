@@ -239,6 +239,7 @@ fn component_header_value(component: DiagnosticComponent) -> &'static str {
 fn code_header_value(code: DiagnosticCode) -> &'static str {
     match code {
         DiagnosticCode::ConnectionError => "connection_error",
+        DiagnosticCode::IpcAcceptFailed => "ipc_accept_failed",
         DiagnosticCode::FrameVerificationFailed => "frame_verification_failed",
         DiagnosticCode::StoreAppendFailed => "store_append_failed",
         DiagnosticCode::TrustRefreshFailed => "trust_refresh_failed",
@@ -301,6 +302,7 @@ mod tests {
     fn code_headers_stable() {
         for code in [
             DiagnosticCode::ConnectionError,
+            DiagnosticCode::IpcAcceptFailed,
             DiagnosticCode::FrameVerificationFailed,
             DiagnosticCode::StoreAppendFailed,
             DiagnosticCode::TrustRefreshFailed,
