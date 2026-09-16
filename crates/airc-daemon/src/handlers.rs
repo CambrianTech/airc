@@ -34,6 +34,9 @@ use crate::state::DaemonState;
 /// Default `Inbox.limit` when the client doesn't pass one. Caps the
 /// payload size so a slow client doesn't accidentally pull MB.
 const INBOX_DEFAULT_LIMIT: usize = 32;
+/// Half the codec's frame cap: the page's envelopes plus the response's own CBOR
+/// framing and the cursor must fit under `airc_ipc::codec::MAX_FRAME_BYTES`.
+const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as usize;
 
 /// Dispatch one request against the daemon's state. Always returns a
 /// Response — Err paths become `Response::Error { message }` so the
@@ -303,11 +306,9 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
             events
         }
     };
-    let envelopes: Vec<Vec<u8>> = events
-        .iter()
-        .map(|e| airc_wire::encode(e).to_vec())
-        .collect();
-    let newest = events.last().map(|e| {
+    let page_full = events.len() >= limit;
+    let (envelopes, kept, cut) = encode_page_within_budget(&events, INBOX_PAGE_BYTE_BUDGET);
+    let newest = kept.last().map(|e| {
         let cursor = e.cursor();
         IpcCursor {
             epoch: cursor.seq.epoch,
@@ -315,7 +316,38 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
             event_id: cursor.event_id,
         }
     });
-    Response::Inbox(InboxResponse { envelopes, newest })
+    Response::Inbox(InboxResponse {
+        envelopes,
+        newest,
+        has_more: cut || (page_full && request.since.is_some()),
+    })
+}
+
+/// A page is bounded by BYTES as well as by count: the IPC codec refuses a frame
+/// over `MAX_FRAME_BYTES` and drops the connection, so a page that would exceed it
+/// is not "large", it is undeliverable — and a client that re-asks the same page
+/// re-fails forever (the M5, 2026-09-16: 1024 × ~23 KB remote-inference prompts in
+/// one room = a 23.9 MB page, refused every 6 s for six hours). Keep the oldest
+/// envelopes that fit under `budget` (the cursor order the caller resumes from),
+/// always at least one so a single oversize event still moves the cursor; report
+/// whether the page was cut.
+fn encode_page_within_budget(
+    events: &[Arc<Envelope>],
+    budget: usize,
+) -> (Vec<Vec<u8>>, Vec<Arc<Envelope>>, bool) {
+    let mut out = Vec::with_capacity(events.len());
+    let mut kept = Vec::with_capacity(events.len());
+    let mut bytes = 0usize;
+    for e in events {
+        let enc = airc_wire::encode(e).to_vec();
+        if !out.is_empty() && bytes + enc.len() > budget {
+            return (out, kept, true);
+        }
+        bytes += enc.len();
+        out.push(enc);
+        kept.push(Arc::clone(e));
+    }
+    (out, kept, false)
 }
 
 /// Card a1562dbc: the O(1) tip probe. Answered by the router's
@@ -442,5 +474,40 @@ async fn handle_list_rooms(state: Arc<DaemonState>) -> Response {
         Err(error) => Response::Error {
             message: format!("list_rooms: {error}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(payload_len: usize) -> Arc<Envelope> {
+        Arc::new(Envelope::new(
+            RoomId::from_u128(7),
+            (PeerId::from_u128(1), ClientId::from_u128(2)),
+            Kind::Message,
+            DeliveryClass::Durable,
+            Bytes::from(vec![b'x'; payload_len]),
+        ))
+    }
+
+    // what this catches (M5, 2026-09-16): a 1024-event page of ~23 KB prompts is a
+    // 23.9 MB frame the codec refuses — the daemon answered it every 6 s for six hours,
+    // dropping the client each time. A page is cut at the byte budget, keeps the OLDEST
+    // events (the resume order), reports `has_more`, and a single oversize event still
+    // moves the cursor instead of wedging the client on it forever.
+    #[test]
+    fn a_page_is_cut_at_the_byte_budget_and_says_so() {
+        let events: Vec<Arc<Envelope>> = (0..10).map(|_| envelope(1000)).collect();
+        let (out, kept, cut) = encode_page_within_budget(&events, 3_500);
+        assert!(cut, "ten 1 KB events do not fit a 3.5 KB budget");
+        assert_eq!(out.len(), kept.len());
+        assert!(out.len() >= 2 && out.len() <= 3, "kept the oldest that fit: {}", out.len());
+        assert!(Arc::ptr_eq(&kept[0], &events[0]), "resume order: the oldest first");
+        let (all, _, cut) = encode_page_within_budget(&events, 1 << 20);
+        assert!(!cut && all.len() == 10, "a page under budget is whole");
+        let huge = vec![envelope(64 * 1024)];
+        let (one, _, cut) = encode_page_within_budget(&huge, 100);
+        assert_eq!((one.len(), cut), (1, false), "one oversize event is still delivered so the cursor moves");
     }
 }
