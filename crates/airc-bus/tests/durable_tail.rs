@@ -9,8 +9,10 @@
 //! (`resume_from_cursor(channel, None)` + truncate) materialized the
 //! WHOLE room — exactly one `page(…, None, usize::MAX)` — to answer N.
 
+use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -627,4 +629,138 @@ async fn cursor_resume_pages_are_bounded_by_limit_not_by_room_depth() {
         (0..DEEP).collect::<Vec<_>>(),
         "the chained pages are the whole channel in order, no gap, no dup"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Card ddbab098 — attach path (subscribe_with_lag) bounded-work proof, the
+// sibling of #1389's resume_from_cursor bound. The deep leg must page in
+// DEEP_REPLAY_PAGE-row chunks instead of one `usize::MAX` query, and still
+// deliver every event exactly once across the deep->ring seam — including
+// when whole pages are filtered out (the raw cursor advances past them).
+
+/// Mirrors the router's private `DEEP_REPLAY_PAGE`; a test that passed with a
+/// larger bound would not prove the router is bounded.
+const ATTACH_DEEP_REPLAY_PAGE: usize = 1024;
+
+async fn wait_persisted(sink: &Arc<CountingSink>, id: u128) {
+    for _ in 0..6_000 {
+        // ~30s at 5ms ticks
+        if sink.contains(EventId::from_u128(id)).await.unwrap_or(false) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("write-behind never persisted the marker event (id {})", id);
+}
+
+/// Attach from zero over a 5,000-event room: every event arrives exactly once,
+/// in order, across the deep->ring seam, and no sink page ever requests more
+/// than DEEP_REPLAY_PAGE rows.
+#[tokio::test]
+async fn attach_deep_leg_pages_bounded_and_delivers_every_event_once() {
+    const DEEP: u128 = 5_000;
+
+    let (router, sink) = counted_router(64); // small ring: deep history lives in the sink
+    let channel = RoomId::from_u128(0xa77a);
+
+    for n in 0..DEEP {
+        router
+            .publish(event(channel, n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await; // let write-behind drain
+        }
+    }
+    wait_persisted(&sink, DEEP).await; // last marker is DEEP-1 -> event_id DEEP
+    sink.reset();
+
+    let (stream, _lag) = router.subscribe_with_lag(airc_bus::Filter::channel(channel), None);
+    futures::pin_mut!(stream);
+    for expected in 0..DEEP {
+        let env = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("attach replay stalled — deep leg looped or deadlocked")
+            .expect("live tail ended mid-replay");
+        assert_eq!(
+            env.event_id.0.as_u128() - 1,
+            expected,
+            "gap or duplicate at marker {expected}"
+        );
+    }
+
+    // Ring holds the last 64 events, so the deep leg walked ~4,937 rows: five
+    // pages of 1024 — never one unbounded query.
+    assert!(
+        sink.page_calls() >= 5,
+        "deep leg should have paged at least 5 times, got {}",
+        sink.page_calls()
+    );
+    assert!(
+        sink.max_page_limit() <= ATTACH_DEEP_REPLAY_PAGE,
+        "attach deep leg requested an unbounded page: limit {}",
+        sink.max_page_limit()
+    );
+}
+
+/// A kinds filter that drops ~4 full pages must not stall the raw cursor:
+/// filtered rows advance the paging cursor (no infinite loop), and accepted
+/// rows still arrive exactly once through to the ring boundary.
+#[tokio::test]
+async fn attach_deep_leg_advances_past_filtered_pages() {
+    const EVENTS: u128 = 5_000; // all Kind::Event — filtered out by the subscription
+    const MESSAGES: u128 = 1_000; // tail is Messages; the ring boundary sits inside it
+
+    let (router, sink) = counted_router(64);
+    let channel = RoomId::from_u128(0xa77b);
+
+    for n in 0..EVENTS {
+        router
+            .publish(kinded_event(
+                channel,
+                n,
+                Kind::Event,
+                DeliveryClass::Durable,
+            ))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    for n in 0..MESSAGES {
+        router
+            .publish(event(channel, EVENTS + n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    wait_persisted(&sink, EVENTS + MESSAGES).await;
+    sink.reset();
+
+    let filter = airc_bus::Filter::channel(channel).with_kinds(vec![Kind::Message]);
+    let (stream, _lag) = router.subscribe_with_lag(filter, None);
+    futures::pin_mut!(stream);
+    for expected in 0..MESSAGES {
+        let env = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("attach replay stalled — raw cursor must advance past filtered rows")
+            .expect("live tail ended mid-replay");
+        assert_eq!(
+            env.event_id.0.as_u128() - 1,
+            EVENTS + expected,
+            "gap or duplicate at message {expected}"
+        );
+    }
+
+    // The deep leg walked ~5,936 raw rows — four-plus full filtered pages plus
+    // the partial page holding accepted messages — before the ring boundary.
+    assert!(
+        sink.page_calls() >= 6,
+        "filtered pages must still be paged past, got {}",
+        sink.page_calls()
+    );
+    assert!(sink.max_page_limit() <= ATTACH_DEEP_REPLAY_PAGE);
 }
