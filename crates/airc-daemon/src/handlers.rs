@@ -502,12 +502,23 @@ mod tests {
         let (out, kept, cut) = encode_page_within_budget(&events, 3_500);
         assert!(cut, "ten 1 KB events do not fit a 3.5 KB budget");
         assert_eq!(out.len(), kept.len());
-        assert!(out.len() >= 2 && out.len() <= 3, "kept the oldest that fit: {}", out.len());
-        assert!(Arc::ptr_eq(&kept[0], &events[0]), "resume order: the oldest first");
+        assert!(
+            out.len() >= 2 && out.len() <= 3,
+            "kept the oldest that fit: {}",
+            out.len()
+        );
+        assert!(
+            Arc::ptr_eq(&kept[0], &events[0]),
+            "resume order: the oldest first"
+        );
         let (all, _, cut) = encode_page_within_budget(&events, 1 << 20);
         assert!(!cut && all.len() == 10, "a page under budget is whole");
         let huge = vec![envelope(64 * 1024)];
         let (one, _, cut) = encode_page_within_budget(&huge, 100);
-        assert_eq!((one.len(), cut), (1, false), "one oversize event is still delivered so the cursor moves");
+        assert_eq!(
+            (one.len(), cut),
+            (1, false),
+            "one oversize event is still delivered so the cursor moves"
+        );
     }
 }
