@@ -152,7 +152,10 @@ fn decode_page(transcripts: Vec<TranscriptEvent>) -> Result<WorkEventPage, WorkS
         }
         let item = match decode_transcript_work_event(&transcript) {
             Ok(item) => item,
-            Err(error @ WorkReplayError::RejectedSubmission { .. }) => {
+            Err(
+                error @ (WorkReplayError::RejectedSubmission { .. }
+                | WorkReplayError::RejectedReview { .. }),
+            ) => {
                 eprintln!("airc work replay: {error}");
                 continue;
             }

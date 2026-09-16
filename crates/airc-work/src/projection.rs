@@ -43,9 +43,34 @@ pub struct WorkBoardProjection {
     pub(super) manager_hats: BTreeMap<RepoId, ManagerHat>,
     pub(super) agent_availability: BTreeMap<String, AgentAvailabilityRecord>,
     pub(super) hygiene_reports: Vec<HygieneReport>,
+    #[serde(default)]
+    pub(super) submission_reviews: BTreeMap<crate::WorkReviewId, crate::WorkSubmissionReview>,
+    /// Latest refusal per parent; invalid reviews never replace accepted evidence.
+    #[serde(default)]
+    pub(super) review_rejections: BTreeMap<WorkCardId, crate::RejectedWorkReview>,
 }
 
 impl WorkBoardProjection {
+    pub fn submission_review(
+        &self,
+        id: crate::WorkReviewId,
+    ) -> Option<&crate::WorkSubmissionReview> {
+        self.submission_reviews.get(&id)
+    }
+
+    pub fn submission_reviews_for(
+        &self,
+        submission: crate::SubmissionId,
+    ) -> impl Iterator<Item = &crate::WorkSubmissionReview> {
+        self.submission_reviews
+            .values()
+            .filter(move |review| review.submission_id == submission)
+    }
+
+    pub fn last_review_rejection(&self, card: WorkCardId) -> Option<&crate::RejectedWorkReview> {
+        self.review_rejections.get(&card)
+    }
+
     /// Latest pressure observation for a workspace, if any reporter has
     /// emitted one.
     pub fn workspace_pressure(

@@ -25,6 +25,9 @@ pub enum AircError {
     #[error("work submission rejected: {0}")]
     WorkSubmission(#[from] airc_work::SubmissionRejectionReason),
 
+    #[error("work review rejected: {0}")]
+    WorkReview(#[from] airc_work::WorkReviewRejectionReason),
+
     #[error("local git observer: {0}")]
     LocalGit(#[from] airc_work::LocalGitError),
 

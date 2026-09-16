@@ -518,6 +518,7 @@ name = "airc-work-store"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "airc-protocol",
  "airc-store",
  "airc-work",
  "serde_json",

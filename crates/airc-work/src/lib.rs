@@ -22,11 +22,11 @@ pub use airc_blobs::MediaRef as SubmissionArtifact;
 
 pub use codec::{
     decode_work_event, encode_work_event, work_event_headers, work_event_subscription,
-    WorkEventCodecError, BODY_HINT_FORGE_WORK_EVENT, HEADER_FORGE_WORK_CARD_ID,
-    HEADER_FORGE_WORK_CLAIM_ID, HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_GIT_BRANCH,
-    HEADER_FORGE_WORK_GIT_COMMIT, HEADER_FORGE_WORK_GOAL_ID, HEADER_FORGE_WORK_LANE_ID,
-    HEADER_FORGE_WORK_POLICY_RULE_ID, HEADER_FORGE_WORK_PR_NUMBER, HEADER_FORGE_WORK_REPO,
-    HEADER_FORGE_WORK_WORKSPACE_ID,
+    WorkEventCodecError, BODY_HINT_FORGE_WORK_EVENT, BODY_HINT_FORGE_WORK_REVIEW,
+    HEADER_FORGE_WORK_CARD_ID, HEADER_FORGE_WORK_CLAIM_ID, HEADER_FORGE_WORK_EVENT_KIND,
+    HEADER_FORGE_WORK_GIT_BRANCH, HEADER_FORGE_WORK_GIT_COMMIT, HEADER_FORGE_WORK_GOAL_ID,
+    HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID, HEADER_FORGE_WORK_PR_NUMBER,
+    HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_WORKSPACE_ID,
 };
 pub use drain_policy::{
     evaluate as evaluate_drain_policy, AdmitReason, DrainDecision, GitStatusSummary, PolicyConfig,
@@ -38,7 +38,8 @@ pub use event::{
     LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
     PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
     PullRequestMerged, PullRequestRelinked, PullRequestReviewSubmitted, RejectedSubmission,
-    SubmissionRejectionReason, WorkCardClaimed, WorkEvent, WorkSubmission, WorkspaceAllocated,
+    RejectedWorkReview, SubmissionRejectionReason, WorkCardClaimed, WorkEvent, WorkReviewOutcome,
+    WorkReviewRejectionReason, WorkSubmission, WorkSubmissionReview, WorkspaceAllocated,
     WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
     WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
@@ -46,7 +47,9 @@ pub use goal::{ExitCondition, Goal, GoalState};
 pub use goal_event::{
     CardOrigin, ExternalSource, GoalAbandoned, GoalAchieved, GoalCreated, GoalDryTickRecorded,
 };
-pub use ids::{ClaimId, GoalId, LaneId, RepoId, SubmissionId, WorkCardId, WorkspaceId};
+pub use ids::{
+    ClaimId, GoalId, LaneId, RepoId, SubmissionId, WorkCardId, WorkReviewId, WorkspaceId,
+};
 pub use local_git::{
     local_git_events_since, CommandGitRunner, GitCommandRunner, LocalGitError, LocalGitObserver,
     LocalGitSnapshot, LocalGitWorkspace,
