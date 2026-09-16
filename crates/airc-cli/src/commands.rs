@@ -2495,52 +2495,18 @@ pub async fn run_ping(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// `status` — daemon health snapshot.
-///
-/// Card 2bdae532: regression-fix. Earlier builds auto-spawned the
-/// daemon if the socket wasn't reachable, so `airc status` doubled as
-/// a "make the daemon ready" command. The current binary had lost
-/// that, so a fresh attach (cargo install then airc status) failed
-/// with "daemon not reachable: No such file or directory" with no
-/// next step — Codex hit this on first onboard 2026-05-28. Restoring
-/// `ensure_daemon_running` before the probe gives every recipe that
-/// says "run `airc status` first" a working contract again.
+/// Observe the existing daemon without spawning or repairing it.
+/// Health probes must not restart an old binary during an update or hide an outage.
 pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    // `ensure_daemon_running` may SPAWN a daemon (see card 2bdae532 above), which
-    // makes this command unable to report "down" — asking creates the answer.
-    // That is fine as convenience and fatal as a measurement, so establish
-    // whether one was already answering BEFORE we ensure, and say so.
-    //
-    // Incident 2026-08-08: a grid blackout drill measured a 0.0s outage across
-    // an `airc update` because its probe was `airc status`. The positive control
-    // failed — status reported UP one second after `airc stop` — and the number
-    // was retracted. An instrument that changes what it measures reads as
-    // healthy precisely when the thing it watches is broken.
-    //
-    // Worse than a bad number: anything polling `status` DURING an update
-    // respawns a daemon from the OLD binary mid-swap, which is a candidate cause
-    // of the stale-process class `update_commands.rs` already guards against
-    // ("a stale process that survived `stop_daemon` answers IPC perfectly").
-    //
-    // The spawn is NOT removed — 2bdae532 added it so a fresh onboard has a
-    // working contract, and breaking onboarding to fix an honesty bug trades one
-    // defect for another. It is now DISCLOSED instead, and `airc ping` remains
-    // the non-spawning probe for anyone who needs to observe rather than ensure.
-    let was_already_up = DaemonClient::new(socket.clone())
-        .status_with_timeout(Duration::from_millis(250))
-        .await
-        .is_ok();
-
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
-    let client = DaemonClient::new(socket);
-    let status = client.status().await?;
-    if !was_already_up {
-        println!(
-            "note: no daemon was answering — this command STARTED one. \
-             It was not running until you asked. Use `airc ping` to observe \
-             liveness without starting anything."
-        );
-    }
+    let client = DaemonClient::new(socket.clone());
+    let status = client.status().await.map_err(|error| {
+        format!(
+            "daemon unavailable at {} (scope {}): {error}. No daemon was started. \
+             Run `airc join` to start or reconnect this scope explicitly.",
+            socket.display(),
+            home.display()
+        )
+    })?;
     println!("peer_id:        {}", status.peer_id);
     println!("uptime_seconds: {}", status.uptime_seconds);
     if let Some(connections) = status.connections {

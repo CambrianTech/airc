@@ -225,3 +225,21 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     assert_no_frames_jsonl(acct);
     stop_daemon(acct);
 }
+
+#[test]
+fn status_does_not_start_an_absent_daemon() {
+    // Recovery regression: observing a stopped owner must not respawn it mid-update.
+    let account = common::daemon_tempdir();
+    let acct = account.path();
+    for scope in ["claude", "codex"] {
+        let output = tab(acct, scope, "codex:probe", &["status"]);
+        assert!(
+            !output.status.success(),
+            "an absent daemon must report failure"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("No daemon was started"), "{error}");
+        assert!(error.contains("airc join"), "{error}");
+        assert!(!tab(acct, scope, "codex:probe", &["ping"]).status.success());
+    }
+}
