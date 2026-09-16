@@ -1062,6 +1062,10 @@ _install_airc_skills_into "$SKILLS_TARGET" "claude-code"
 # harnesses + non-default Codex layouts).
 if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_skills_into "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}" "codex"
+  # Preserve fresh-install hook setup without selecting user permissions.
+  if [ "${AIRC_SKIP_CODEX_CONFIG:-0}" != "1" ] && [ ! -f "$HOME/.codex/config.toml" ]; then
+    touch "$HOME/.codex/config.toml"
+  fi
 fi
 
 # Codex permission selection belongs to the user. Do not install or select a
