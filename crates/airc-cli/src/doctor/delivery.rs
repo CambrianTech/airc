@@ -4,10 +4,12 @@
 //! Per peer, from the daemon's delivery ledger. The 2026-07-31 failure
 //! shape — both doctors 8/8 clean while outbound silently queued for hours
 //! — is exactly what this makes visible. An absent daemon or an empty
-//! ledger is reported as informational, never vacuously ok: neither
+//! ledger is reported as a warning, never vacuously ok: neither
 //! establishes that anything was delivered.
 
 use std::path::Path;
+
+use airc_ipc::IpcPeerDeliveryStats;
 
 use super::{Check, CheckConfig, CheckContext, Finding};
 
@@ -15,11 +17,9 @@ use super::{Check, CheckConfig, CheckContext, Finding};
 ///
 /// Registered as its own check rather than being called from the tail of
 /// [`super::health`]. It used to be, and that coupling meant delivery truth
-/// SILENTLY DISAPPEARED whenever route health took an early return — opening
-/// the substrate failed, or there were zero routes. Zero routes is exactly
-/// when you most want to hear "the ledger is empty, nothing has ever been
-/// attempted": one check quietly suppressing another's evidence is the same
-/// shape as the bugs this module exists to catch.
+/// disappeared whenever route health took an early return. Route availability
+/// and the delivery ledger are separate observations; neither check should
+/// suppress the other's evidence.
 pub(super) struct DeliveryTruthCheck;
 
 #[async_trait::async_trait]
@@ -29,7 +29,7 @@ impl Check for DeliveryTruthCheck {
     }
 
     async fn run(&self, ctx: &CheckContext<'_>) -> Vec<Finding> {
-        check_delivery_truth(ctx.home).await
+        check_delivery_truth(ctx).await
     }
 }
 
@@ -55,12 +55,11 @@ const _: () = assert!(NO_RTT_GRACE_MS <= 2_000 * RTT_GRACE_MULTIPLE);
 
 /// Which peers are THIS operator's own machines.
 ///
-/// A `TrustTier::OwnAccount` ack proves the loopback: our own node received our
-/// own broadcast. It says nothing about whether any OTHER operator's node did.
-/// Returning a set (rather than filtering here) keeps the caller free to report
-/// per tier instead of hiding self-traffic — self-acks are real, they are just
-/// not evidence of a grid.
-async fn own_account_peers(home: &Path) -> std::collections::HashSet<airc_core::PeerId> {
+/// `OwnAccount` describes account ownership, not physical placement. Another
+/// machine on the same account can acknowledge delivery; do not call it loopback.
+async fn own_account_peers(
+    home: &Path,
+) -> Result<std::collections::HashSet<airc_core::PeerId>, String> {
     airc_trust::load(home)
         .await
         .map(|peers| {
@@ -70,19 +69,12 @@ async fn own_account_peers(home: &Path) -> std::collections::HashSet<airc_core::
                 .map(|peer| peer.peer_id)
                 .collect()
         })
-        // A trust-store read failure must not silently reclassify every peer as
-        // cross-machine — that is the direction that INVENTS proof. An empty set
-        // means nothing is marked self, so every ack reports as cross-operator
-        // and the operator sees an over-claim rather than a hidden one... which
-        // is still wrong, so the caller states the tier it used.
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
 }
 
-async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
-    let socket = crate::cli::default_socket_path_in(home);
-    let own = own_account_peers(home).await;
-    let stats = match airc_ipc::DaemonClient::new(socket).delivery_stats().await {
-        Ok(response) => response.peers,
+async fn check_delivery_truth(ctx: &CheckContext<'_>) -> Vec<Finding> {
+    let snapshot = match ctx.delivery_stats().await {
+        Ok(response) => response,
         Err(error) => {
             // #1344 semantics, carried through the module split (the split was
             // generated from pre-#1344 text and downgraded these to `info`).
@@ -98,12 +90,34 @@ async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
             // an unprovable node.
             return vec![Finding::warn(
                 "delivery truth",
-                format!("UNKNOWN — the daemon did not answer delivery_stats ({error})"),
-                "no delivery can be confirmed while this is unknown; \
-                 `airc join` respawns the daemon, then re-run doctor",
+                format!("UNAVAILABLE — the daemon did not answer delivery_stats ({error})"),
+                "check daemon status; no delivery can be confirmed from this observation",
             )];
         }
     };
+    let Some(now) = super::health::now_ms() else {
+        return vec![Finding::warn(
+            "delivery truth",
+            "UNKNOWN — local clock cannot date the daemon snapshot",
+            "check the local clock before interpreting delivery timestamps",
+        )];
+    };
+    if let Err(detail) = super::health::snapshot_age(snapshot, Some(now)) {
+        return vec![Finding::warn(
+            "delivery truth",
+            detail,
+            "check daemon build and route-refresh diagnostics; historical acknowledgements cannot establish current delivery",
+        )];
+    }
+    let own = own_account_peers(ctx.home).await;
+    delivery_findings(&snapshot.peers, own.as_ref().map_err(String::as_str), now)
+}
+
+fn delivery_findings(
+    stats: &[IpcPeerDeliveryStats],
+    own: Result<&std::collections::HashSet<airc_core::PeerId>, &str>,
+    now_ms: u64,
+) -> Vec<Finding> {
     if stats.is_empty() {
         // NOT `ok`, and NOT "no deliveries attempted yet" — the ledger being
         // empty is not evidence that nothing was sent. Entries are only created
@@ -118,17 +132,12 @@ async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
         // the finding (a WARN, per #1344) rather than dressing it as a clean bill.
         return vec![Finding::warn(
             "delivery truth",
-            "ledger EMPTY — no cross-machine delivery has been confirmed, and \
+            "ledger EMPTY — no peer delivery has been confirmed in this snapshot, and \
              an empty ledger is NOT proof that none was attempted (a send to \
              zero connected peers records nothing)",
-            "send one message and re-run; if the ledger stays empty while peers \
-             are enrolled, outbound is not reaching anyone",
+            "check the intended room and peer acknowledgement; an empty snapshot does not prove a transport failure",
         )];
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     let age = |stamp_ms: u64| -> String {
         let secs = now_ms.saturating_sub(stamp_ms) / 1000;
         if secs < 120 {
@@ -140,7 +149,7 @@ async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
         }
     };
     let mut findings = Vec::new();
-    for peer in &stats {
+    for peer in stats {
         match (peer.suspect, peer.last_ack_ms) {
             (true, last) => findings.push(Finding::warn(
                 "delivery truth",
@@ -234,55 +243,32 @@ async fn check_delivery_truth(home: &Path) -> Vec<Finding> {
             )),
         }
     }
-    // SELF IS NOT OTHER. A confirmed delivery to one of THIS operator's own
-    // machines proves the loopback — our node received our own broadcast — and
-    // says nothing about whether any other operator's node did.
-    //
-    // Measured on BIGMAMA 2026-08-12, and it cost a night: doctor reported
-    // `[ok] delivery truth: 2f0aed7f … rtt ~93ms (4 of 4 acked)` and it was
-    // read, by me, as "airc delivery is proven". `2f0aed7f` is tier=OwnAccount.
-    // There were FORTY own-account peers on that scope. Every ack was this node
-    // acking itself, while zero frames had ever reached the intended peer —
-    // whose daemon, it turned out, was serving a different scope entirely.
-    //
-    // Per-tier partition rather than filtering self out (M5's shape, and it is
-    // the better one): self-acks are REAL and worth printing — they prove the
-    // local pipe — they are just not grid evidence. Hiding them would trade one
-    // wrong impression for another.
-    let (self_acked, grid_acked): (Vec<_>, Vec<_>) = stats
-        .iter()
-        .filter(|peer| peer.acked > 0)
-        .partition(|peer| own.contains(&peer.peer_id));
-    if grid_acked.is_empty() {
-        if self_acked.is_empty() {
-            findings.push(Finding::warn(
-                "cross-operator delivery",
-                "NO delivery confirmed to any peer, own-account or otherwise".to_string(),
-                "nothing here proves the wire works; send one message and re-run",
-            ));
-        } else {
-            findings.push(Finding::warn(
-                "cross-operator delivery",
+    // Account ownership is not a physical topology test. Keep every peer's
+    // receipt above, and describe the trust partition without inventing locality.
+    match own {
+        Ok(own) => {
+            let (same_account, not_tagged) = stats.iter().filter(|peer| peer.acked > 0).fold(
+                (0, 0),
+                |(same, other), peer| {
+                    if own.contains(&peer.peer_id) {
+                        (same + 1, other)
+                    } else {
+                        (same, other + 1)
+                    }
+                },
+            );
+            findings.push(Finding::info(
+                "delivery account scope",
                 format!(
-                    "NONE CONFIRMED. {} own-account peer(s) acked (that is the LOOPBACK - this \
-                     node receiving its own broadcasts), and {} non-self peer(s) never did. \
-                     Self-acks are not grid delivery.",
-                    self_acked.len(),
-                    stats.len().saturating_sub(self_acked.len()),
+                    "{same_account} OwnAccount peer(s) and {not_tagged} peer(s) not tagged OwnAccount in this scope have acknowledged; OwnAccount does not imply physical loopback, and a daemon ACK does not prove the intended reader consumed a message"
                 ),
-                "check `airc peers` for the peer's tier, and that the daemon's --home is the \
-                 scope that peer is enrolled in",
             ));
         }
-    } else {
-        findings.push(Finding::ok(
-            "cross-operator delivery",
-            format!(
-                "{} non-self peer(s) confirmed ({} own-account ack(s) excluded as loopback)",
-                grid_acked.len(),
-                self_acked.len()
-            ),
-        ));
+        Err(error) => findings.push(Finding::warn(
+            "delivery account scope",
+            format!("UNKNOWN — trust store could not classify peer acknowledgements ({error})"),
+            "inspect the trust-store read error; peer receipts remain valid but their account scope is unknown",
+        )),
     }
 
     findings
@@ -301,24 +287,20 @@ mod tests {
     /// own rtt grace, is a swallowing route — not a healthy one.
     #[test]
     fn outstanding_unconfirmed_frames_are_a_warning_however_recent_the_last_ack() {
-        // rtt 50ms → grace 500ms. Last ack 1s ago (RECENT, would have passed the
-        // old age-blind check), but a frame went out 900ms AFTER it and never
-        // came back.
         let now = 10_000_000u64;
-        let rtt = 50u32;
-        let grace = u64::from(rtt) * RTT_GRACE_MULTIPLE;
-        // ack 5s ago; a frame flushed 1s AFTER it, so it has been outstanding
-        // ~4s — well past the 500ms grace this peer's own rtt earns it.
-        let last_ack = now - 5_000;
-        let last_attempt = last_ack + 1_000;
-        assert!(
-            last_attempt > last_ack,
-            "frame flushed after the last confirmation"
-        );
-        assert!(
-            now.saturating_sub(last_attempt) > grace,
-            "outstanding past the peer's own rtt grace → must WARN, not ok"
-        );
+        let peer = IpcPeerDeliveryStats {
+            peer_id: airc_core::PeerId::from_u128(1),
+            attempts: 2,
+            acked: 1,
+            attempts_since_ack: 1,
+            last_attempt_ms: Some(now - 4_000),
+            last_ack_ms: Some(now - 5_000),
+            rtt_ema_ms: Some(50),
+            suspect: false,
+        };
+        let findings = delivery_findings(&[peer], Ok(&Default::default()), now);
+        assert_eq!(findings[0].status, super::super::Status::Warn);
+        assert!(findings[0].detail.contains("still unacked"));
     }
 
     /// what this catches: flapping the check on a healthy but IDLE route. An old
@@ -329,11 +311,19 @@ mod tests {
     fn an_idle_route_stays_ok_however_old_its_last_confirmation() {
         let now = 100_000_000u64;
         let last_ack = now - 10 * 60 * 60 * 1000; // 10h ago
-        let last_attempt = last_ack - 5_000; // last send PRECEDED the ack
-        assert!(
-            last_attempt <= last_ack,
-            "nothing was sent after the last confirmation — idle, not broken"
-        );
+        let peer = IpcPeerDeliveryStats {
+            peer_id: airc_core::PeerId::from_u128(1),
+            attempts: 1,
+            acked: 1,
+            attempts_since_ack: 0,
+            last_attempt_ms: Some(last_ack - 5_000),
+            last_ack_ms: Some(last_ack),
+            rtt_ema_ms: Some(50),
+            suspect: false,
+        };
+        let findings = delivery_findings(&[peer], Ok(&Default::default()), now);
+        assert_eq!(findings[0].status, super::super::Status::Ok);
+        assert!(findings[0].detail.contains("last confirmed delivery"));
     }
 
     /// what this catches: judging a slow link by a wall-clock guess. Grace is a
@@ -341,13 +331,50 @@ mod tests {
     /// declared broken at the same instant as a 50ms LAN peer.
     #[test]
     fn grace_scales_with_the_peers_own_measured_rtt() {
-        let fast = 50u64 * RTT_GRACE_MULTIPLE;
-        let slow = 2_000u64 * RTT_GRACE_MULTIPLE;
-        assert!(
-            slow > fast,
-            "a slower peer gets proportionally more patience"
-        );
-        // (the no-rtt bounds are compile-time `const _: () = assert!(..)` next to
-        // the constants — stronger than a test, since they cannot be deleted)
+        let now = 10_000;
+        let mut peer = IpcPeerDeliveryStats {
+            peer_id: airc_core::PeerId::from_u128(1),
+            attempts: 2,
+            acked: 1,
+            attempts_since_ack: 1,
+            last_attempt_ms: Some(now - 1_000),
+            last_ack_ms: Some(now - 2_000),
+            rtt_ema_ms: Some(50),
+            suspect: false,
+        };
+        let fast = delivery_findings(&[peer.clone()], Ok(&Default::default()), now);
+        peer.rtt_ema_ms = Some(2_000);
+        let slow = delivery_findings(&[peer], Ok(&Default::default()), now);
+        assert_eq!(fast[0].status, super::super::Status::Warn);
+        assert_eq!(slow[0].status, super::super::Status::Ok);
+    }
+
+    // c7873cba: an OwnAccount ACK is retained; a trust-store read failure must
+    // not reclassify it as another operator or physical loopback.
+    #[test]
+    fn account_scope_does_not_invent_physical_loopback() {
+        let peer = IpcPeerDeliveryStats {
+            peer_id: airc_core::PeerId::from_u128(1),
+            attempts: 1,
+            acked: 1,
+            attempts_since_ack: 0,
+            last_attempt_ms: Some(900),
+            last_ack_ms: Some(950),
+            rtt_ema_ms: Some(50),
+            suspect: false,
+        };
+        let own = std::collections::HashSet::from([peer.peer_id]);
+        let findings = delivery_findings(std::slice::from_ref(&peer), Ok(&own), 1_000);
+        assert_eq!(findings[0].status, super::super::Status::Ok);
+        assert_eq!(findings[1].status, super::super::Status::Info);
+        assert!(findings[1].detail.contains("1 OwnAccount peer(s)"));
+        assert!(findings[1]
+            .detail
+            .contains("does not imply physical loopback"));
+
+        let findings = delivery_findings(&[peer], Err("trust read failed"), 1_000);
+        assert_eq!(findings[0].status, super::super::Status::Ok);
+        assert_eq!(findings[1].status, super::super::Status::Warn);
+        assert!(findings[1].detail.contains("trust read failed"));
     }
 }

@@ -37,8 +37,8 @@
 //! - "no recent diagnostic events" on a busy node, because higher-volume
 //!   traffic had evicted every diagnostic from the scan window (see
 //!   [`diagnostics`]).
-//! - An empty delivery ledger reported as ok, when an empty ledger means
-//!   nothing was ever ATTEMPTED (see [`delivery`]).
+//! - An empty delivery ledger reported as ok, although it establishes neither
+//!   successful delivery nor whether anything was attempted (see [`delivery`]).
 //!
 //! When adding a check, ask the question that catches all of these:
 //! **can this `[ok]` be produced by a node that is broken, or by one I
@@ -131,8 +131,7 @@ fn short_sha(sha: &str) -> String {
 pub enum CheckTier {
     /// Cheap and local: filesystem probes, one 250ms IPC ping. Always runs.
     Always,
-    /// Expensive: opens the substrate, re-runs route discovery, dials peers,
-    /// queries the daemon's ledger. Only under `--health`.
+    /// Queries live daemon metadata and delivery observations. Only under `--health`.
     Health,
 }
 
@@ -171,6 +170,24 @@ impl CheckConfig {
 /// `ServiceModule::initialize` takes a `ModuleContext`.
 pub struct CheckContext<'a> {
     pub home: &'a Path,
+    delivery_stats: tokio::sync::OnceCell<Result<airc_ipc::DeliveryStatsResponse, String>>,
+}
+
+impl CheckContext<'_> {
+    /// Both health checks interpret ONE daemon observation, including its error.
+    /// Opening a fresh local Airc handle loses the daemon's measured ledger.
+    async fn delivery_stats(&self) -> Result<&airc_ipc::DeliveryStatsResponse, &str> {
+        self.delivery_stats
+            .get_or_init(|| async {
+                airc_ipc::DaemonClient::new(crate::cli::default_socket_path_in(self.home))
+                    .delivery_stats()
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .as_ref()
+            .map_err(String::as_str)
+    }
 }
 
 /// One diagnostic concern.
@@ -197,8 +214,7 @@ pub trait Check: Send + Sync {
 
 /// The diagnostic walk, in report order.
 ///
-/// Cheap checks first so a broken scope is named before we spend time dialing
-/// peers; the `Health` tier is filtered out entirely unless `--health`.
+/// Cheap checks first; the `Health` tier is filtered out entirely unless `--health`.
 fn registry() -> Vec<Box<dyn Check>> {
     vec![
         Box::new(identity::IdentityCheck),
@@ -218,7 +234,10 @@ pub async fn run(home: &Path, fix: bool, health: bool) -> Result<(), Box<dyn std
     let mut applied = Vec::new();
     let mut findings = Vec::new();
 
-    let ctx = CheckContext { home };
+    let ctx = CheckContext {
+        home,
+        delivery_stats: tokio::sync::OnceCell::new(),
+    };
     for check in registry() {
         let config = check.config();
         if config.tier == CheckTier::Health && !health {
@@ -372,5 +391,110 @@ mod tests {
         // over-sliced (no panic on a sub-12-char sha).
         assert_eq!(short_sha("abcdef1234567890abcdef"), "abcdef123456");
         assert_eq!(short_sha("abc123"), "abc123");
+    }
+
+    // Regression for c7873cba: production route diagnostics consume the daemon
+    // observation, distinguish absent/stale evidence, and do not invent failure.
+    #[test]
+    fn route_health_reports_the_daemon_observation_and_its_freshness() {
+        let now = 1_000_000;
+        let mut snapshot = airc_ipc::DeliveryStatsResponse {
+            peers: Vec::new(),
+            sampled_at_ms: Some(now - 10_000),
+            connected_lan_peers: Some(2),
+        };
+        let finding = health::route_finding(Ok(&snapshot), Some(now));
+        assert_eq!(finding.status, Status::Info);
+        assert!(finding.detail.contains("2 connected LAN peer(s)"));
+        assert!(finding.detail.contains("10s old"));
+        assert!(!finding.detail.contains("NONE MEASURED"));
+
+        snapshot.connected_lan_peers = Some(0);
+        let finding = health::route_finding(Ok(&snapshot), Some(now));
+        assert_eq!(finding.status, Status::Warn);
+        assert!(finding.detail.contains("no connected LAN peers"));
+
+        snapshot.connected_lan_peers = None;
+        let finding = health::route_finding(Ok(&snapshot), Some(now));
+        assert_eq!(finding.status, Status::Warn);
+        assert!(finding.detail.contains("UNAVAILABLE"));
+        snapshot.connected_lan_peers = Some(2);
+
+        snapshot.sampled_at_ms = None;
+        let finding = health::route_finding(Ok(&snapshot), Some(now));
+        assert_eq!(finding.status, Status::Warn);
+        assert!(finding.detail.contains("UNAVAILABLE"));
+
+        snapshot.sampled_at_ms = Some(now - 120_001);
+        let finding = health::route_finding(Ok(&snapshot), Some(now));
+        assert_eq!(finding.status, Status::Warn);
+        assert!(finding.detail.contains("STALE"));
+
+        snapshot.sampled_at_ms = Some(now + 1);
+        assert!(health::route_finding(Ok(&snapshot), Some(now))
+            .detail
+            .contains("ahead of the local clock"));
+        assert!(health::route_finding(Err("IPC unavailable"), Some(now))
+            .detail
+            .contains("IPC unavailable"));
+    }
+
+    // Both registered checks must retain a failed shared read as unavailable;
+    // neither may open another handle or replace it with an empty success.
+    #[tokio::test]
+    async fn health_checks_share_the_daemon_observation_error() {
+        let context = CheckContext {
+            home: Path::new("unused"),
+            delivery_stats: tokio::sync::OnceCell::new(),
+        };
+        context
+            .delivery_stats
+            .set(Err("test IPC failure".into()))
+            .unwrap();
+        for check in registry()
+            .into_iter()
+            .filter(|check| matches!(check.config().name, "route health" | "delivery truth"))
+        {
+            let findings = check.run(&context).await;
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].status, Status::Warn);
+            assert!(findings[0].detail.contains("test IPC failure"));
+        }
+    }
+
+    // A stale host snapshot may contain real old ACKs. Both production checks
+    // must still refuse to present it as current delivery or route evidence.
+    #[tokio::test]
+    async fn health_checks_reject_stale_daemon_observations() {
+        let context = CheckContext {
+            home: Path::new("unused"),
+            delivery_stats: tokio::sync::OnceCell::new(),
+        };
+        context
+            .delivery_stats
+            .set(Ok(airc_ipc::DeliveryStatsResponse {
+                peers: vec![airc_ipc::IpcPeerDeliveryStats {
+                    peer_id: airc_core::PeerId::from_u128(1),
+                    attempts: 1,
+                    acked: 1,
+                    attempts_since_ack: 0,
+                    last_attempt_ms: Some(1),
+                    last_ack_ms: Some(2),
+                    rtt_ema_ms: Some(1),
+                    suspect: false,
+                }],
+                sampled_at_ms: Some(3),
+                connected_lan_peers: Some(1),
+            }))
+            .unwrap();
+        for check in registry()
+            .into_iter()
+            .filter(|check| matches!(check.config().name, "route health" | "delivery truth"))
+        {
+            let findings = check.run(&context).await;
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].status, Status::Warn);
+            assert!(findings[0].detail.contains("STALE"));
+        }
     }
 }

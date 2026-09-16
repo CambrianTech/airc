@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use airc_core::PeerId;
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
-use airc_ipc::{DaemonClient, IpcPeerDeliveryStats};
+use airc_ipc::{DaemonClient, DeliveryStatsResponse, IpcPeerDeliveryStats};
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, InMemoryEventStore};
 use tokio::task::JoinHandle;
@@ -99,6 +99,11 @@ async fn delivery_stats_round_trips_host_written_rows() {
         empty.peers.is_empty(),
         "no snapshot written yet must read as an empty list"
     );
+    assert_eq!(
+        empty.sampled_at_ms, None,
+        "startup is not a fresh observation"
+    );
+    assert_eq!(empty.connected_lan_peers, None);
 
     // The host's route-refresh loop publishes a snapshot: one confirmed
     // peer, one suspect (the half-open signature).
@@ -126,12 +131,17 @@ async fn delivery_stats_round_trips_host_written_rows() {
             suspect: true,
         },
     ];
-    *daemon.state.delivery_stats.write().await = rows.clone();
+    let snapshot = DeliveryStatsResponse {
+        peers: rows,
+        sampled_at_ms: Some(2_000_100),
+        connected_lan_peers: Some(2),
+    };
+    *daemon.state.delivery_stats.write().await = snapshot.clone();
 
     let served = client.delivery_stats().await.expect("stats call");
     assert_eq!(
-        served.peers, rows,
-        "the daemon must serve the host-written snapshot verbatim"
+        served, snapshot,
+        "rows, timestamp and connection count must be one host-written observation"
     );
 
     daemon.handle.abort();

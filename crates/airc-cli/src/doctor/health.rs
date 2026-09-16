@@ -1,16 +1,10 @@
-//! Route / transport health (under `--health`) — measures the PIPES.
-//!
-//! Pairs with [`super::delivery`], which measures whether anything
-//! actually arrives through them. Both are needed: healthy pipes with no
-//! confirmed deliveries is precisely the failure shape that hid for 10
-//! hours on 2026-08-05.
+//! Route availability from the daemon's delivery snapshot. A new local Airc
+//! handle has no daemon ledger and cannot report the running transport's health.
 
-use std::path::Path;
+use airc_ipc::DeliveryStatsResponse;
 
 use super::{Check, CheckConfig, CheckContext, Finding};
 
-/// Route/transport health. Re-runs discovery and dials peers — expensive, so
-/// `--health` only.
 pub(super) struct RouteHealthCheck;
 
 #[async_trait::async_trait]
@@ -20,112 +14,82 @@ impl Check for RouteHealthCheck {
     }
 
     async fn run(&self, ctx: &CheckContext<'_>) -> Vec<Finding> {
-        check_health(ctx.home).await
+        vec![route_finding(ctx.delivery_stats().await, now_ms())]
     }
 }
 
-async fn check_health(home: &Path) -> Vec<Finding> {
-    use airc_lib::{Airc, TransportHealthState};
+pub(super) fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_millis() as u64)
+}
 
-    let airc = match Airc::open(home).await {
-        Ok(airc) => airc,
-        Err(error) => {
-            return vec![Finding::blocked(
-                "route health",
-                format!("can't open substrate: {error}"),
-                "address the identity/store errors above first",
-            )];
-        }
-    };
-    let snapshot = match airc.refresh_route_discovery().await {
-        Ok(s) => s,
-        Err(error) => {
-            return vec![Finding::warn(
-                "route health",
-                format!("route refresh failed: {error}"),
-                "run `airc transport health` for the underlying detail",
-            )];
-        }
-    };
-    let total = snapshot.health.len();
-    // #267: zero routes is NOT vacuously healthy. `degraded == 0` was true
-    // for an EMPTY health list, so doctor stamped "[ok] 0 route(s) healthy"
-    // while every remote peer was unreachable — the exact lie that hid a
-    // dead mesh behind a green check. With remote peers enrolled, no routes
-    // means beyond-this-machine delivery is DOWN: say so, loudly.
-    if total == 0 {
-        let enrolled = airc.peers().await.map(|peers| peers.len()).unwrap_or(0);
-        if enrolled > 0 {
-            return vec![Finding::warn(
-                "route health",
-                format!("0 routes with {enrolled} enrolled peer(s) — remote delivery is DOWN"),
-                "run `airc transport health` for the dial errors; `airc join` re-runs discovery",
-            )];
-        }
-        return vec![Finding::ok(
-            "route health",
-            "0 routes (no remote peers enrolled — nothing to route to)",
-        )];
+/// Allow an in-flight refresh before declaring an observation stale. This is
+/// diagnostic freshness, not a new transport timeout or refresh schedule.
+pub(super) fn snapshot_age(
+    snapshot: &DeliveryStatsResponse,
+    now_ms: Option<u64>,
+) -> Result<u64, String> {
+    let sampled_at = snapshot.sampled_at_ms.ok_or_else(|| {
+        "UNAVAILABLE — daemon has not supplied a timestamped delivery snapshot (first refresh pending or older daemon)".to_string()
+    })?;
+    let now = now_ms
+        .ok_or_else(|| "UNKNOWN — local clock cannot date the daemon snapshot".to_string())?;
+    let age = now.checked_sub(sampled_at).ok_or_else(|| {
+        "UNKNOWN — daemon snapshot timestamp is ahead of the local clock".to_string()
+    })?;
+    let freshness_ms = airc_daemon::route_refresh::REFRESH_INTERVAL.as_millis() as u64 * 2;
+    if age > freshness_ms {
+        return Err(format!(
+            "STALE — daemon delivery snapshot is {}s old (more than two refresh intervals); current route and delivery state are unknown",
+            age / 1000
+        ));
     }
-    let degraded = snapshot
-        .health
-        .iter()
-        .filter(|sample| sample.state != TransportHealthState::Healthy)
-        .count();
-    // UNMEASURED IS NOT HEALTHY.
-    //
-    // `TransportHealthState::Healthy` with `rtt_ms: None` and
-    // `success_ppm: None` means "optimistically marked usable, never actually
-    // exercised" — `airc transport health` prints it honestly as
-    // `state=healthy (not measured)`. Doctor counted those rows toward
-    // "N route(s) healthy", so a route that had never carried a single frame
-    // reported as proof the wire works.
-    //
-    // Measured on BIGMAMA 2026-08-12: `[ok] route health: 1 route(s) healthy`
-    // on a lan-tcp row with no rtt and no success rate, while every frame this
-    // node sent went to a peer it could not reach. The count was true and the
-    // conclusion it invited was false.
-    //
-    // Same family as the delivery-truth self-ack fix in this branch, one layer
-    // up: there, SELF was rendered as OTHER; here, UNMEASURED is rendered as
-    // MEASURED. Both let a green board describe a dead wire.
-    //
-    // Not downgraded to a warning on its own — an unmeasured route is not a
-    // fault, it is an unknown, and a fresh route legitimately starts here. It
-    // is simply not evidence, so it is counted and named separately.
-    let unmeasured = snapshot
-        .health
-        .iter()
-        .filter(|sample| {
-            sample.state == TransportHealthState::Healthy
-                && sample.rtt_ms.is_none()
-                && sample.success_ppm.is_none()
-        })
-        .count();
-    if degraded == 0 && unmeasured == total {
-        vec![Finding::warn(
+    Ok(age)
+}
+
+pub(super) fn route_finding(
+    snapshot: Result<&DeliveryStatsResponse, &str>,
+    now_ms: Option<u64>,
+) -> Finding {
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Finding::warn(
+                "route health",
+                format!("UNAVAILABLE — daemon delivery_stats did not answer ({error})"),
+                "check daemon status; this is missing evidence, not a measured route failure",
+            );
+        }
+    };
+    let age = match snapshot_age(snapshot, now_ms) {
+        Ok(age) => age,
+        Err(detail) => {
+            return Finding::warn(
+                "route health",
+                detail,
+                "check daemon build and route-refresh diagnostics; do not infer delivery from a stale or missing snapshot",
+            );
+        }
+    };
+    match snapshot.connected_lan_peers {
+        Some(0) => Finding::warn(
+            "route health",
+            format!("daemon snapshot {}s old: no connected LAN peers", age / 1000),
+            "check the intended peer's route; this count does not measure other transports or prove delivery failure",
+        ),
+        Some(count) => Finding::info(
             "route health",
             format!(
-                "{total} route(s) present but NONE MEASURED - no rtt, no success rate, \
-                 so nothing here shows a frame has ever crossed"
+                "daemon snapshot {}s old: {count} connected LAN peer(s); connection count is not delivery confirmation (see delivery truth)",
+                age / 1000
             ),
-            "send one message and re-run; a route that stays unmeasured while peers are \
-             enrolled is not carrying traffic",
-        )]
-    } else if degraded == 0 {
-        vec![Finding::ok(
+        ),
+        None => Finding::warn(
             "route health",
-            if unmeasured > 0 {
-                format!("{total} route(s) healthy ({unmeasured} not yet measured)")
-            } else {
-                format!("{total} route(s) healthy")
-            },
-        )]
-    } else {
-        vec![Finding::warn(
-            "route health",
-            format!("{degraded} of {total} route(s) degraded"),
-            "run `airc transport health` to see the row-level detail",
-        )]
+            "UNAVAILABLE — daemon snapshot does not report connected LAN peers",
+            "check daemon build; no route count can be inferred from delivery history",
+        ),
     }
 }
