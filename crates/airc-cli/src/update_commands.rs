@@ -625,6 +625,13 @@ fn restart_daemon(
     home: &Path,
     socket: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    spawn_restarted_daemon(daemon_command(airc_exe, home, "daemon", socket), home)
+}
+
+fn spawn_restarted_daemon(
+    mut command: Command,
+    home: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(home)?;
     let log = home.join("airc-daemon.log");
     let stdout = std::fs::OpenOptions::new()
@@ -632,12 +639,11 @@ fn restart_daemon(
         .append(true)
         .open(&log)?;
     let stderr = stdout.try_clone()?;
-    let mut command = daemon_command(airc_exe, home, "daemon", socket);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    detach_daemon(&mut command);
+    crate::commands::detach_daemon(&mut command);
     command.spawn()?;
     Ok(())
 }
@@ -699,24 +705,6 @@ fn daemon_command(airc_exe: &Path, home: &Path, subcommand: &str, socket: &Path)
     // that let one site drift from the other in the first place.
     airc_lib::daemon_command(airc_exe, home, subcommand, socket)
 }
-
-#[cfg(unix)]
-fn detach_daemon(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: this closure runs in the child just before exec and
-    // only calls setsid, which is async-signal-safe.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn detach_daemon(_command: &mut Command) {}
 
 pub(crate) fn install_source_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = env::var_os("AIRC_DIR").filter(|value| !value.is_empty()) {
@@ -924,6 +912,122 @@ fn command_error(label: &str, output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression for 2ec5d74f: a successful update exited, but its Windows daemon
+    // inherited captured pipe writers and kept the caller waiting for EOF.
+    #[test]
+    fn restarted_daemon_does_not_hold_updater_output_open() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        const MODE: &str = "AIRC_UPDATE_CAPTURE_FIXTURE_MODE";
+        const FIXTURE_HOME: &str = "AIRC_UPDATE_CAPTURE_FIXTURE_HOME";
+        const ADDRESS: &str = "AIRC_UPDATE_CAPTURE_FIXTURE_ADDRESS";
+        const TEST: &str =
+            "update_commands::tests::restarted_daemon_does_not_hold_updater_output_open";
+
+        if env::var(MODE).as_deref() == Ok("daemon") {
+            println!("fixture daemon stdout");
+            eprintln!("fixture daemon stderr");
+            std::io::stdout().flush().unwrap();
+            std::io::stderr().flush().unwrap();
+            let mut stream = TcpStream::connect(env::var(ADDRESS).unwrap()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            std::fs::write(
+                Path::new(&env::var(FIXTURE_HOME).unwrap()).join("fixture.pid"),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+            stream.write_all(b"R").unwrap();
+            let mut command = [0];
+            stream.read_exact(&mut command).unwrap();
+            assert_eq!(command, *b"P");
+            stream.write_all(b"p").unwrap();
+            stream.read_exact(&mut command).unwrap();
+            assert_eq!(command, *b"Q");
+            stream.write_all(b"q").unwrap();
+            return;
+        }
+
+        if env::var(MODE).as_deref() == Ok("launcher") {
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture"])
+                .env(MODE, "daemon");
+            spawn_restarted_daemon(command, Path::new(&env::var(FIXTURE_HOME).unwrap())).unwrap();
+            println!("fixture updater stdout");
+            eprintln!("fixture updater stderr");
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut launcher = Command::new(env::current_exe().unwrap());
+        launcher
+            .args(["--exact", TEST, "--nocapture"])
+            .env(MODE, "launcher")
+            .env(FIXTURE_HOME, home.path())
+            .env(ADDRESS, listener.local_addr().unwrap().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            launcher.creation_flags(0x08000000); // CREATE_NO_WINDOW for the fixture caller.
+        }
+        let child = launcher.spawn().unwrap();
+        let (output_tx, output_rx) = mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            output_tx.send(child.wait_with_output()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut control = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "fixture daemon did not connect");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fixture listener failed: {error}"),
+            }
+        };
+        control.set_nonblocking(false).unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut response = [0];
+        control.read_exact(&mut response).unwrap();
+        assert_eq!(response, *b"R");
+        #[cfg(windows)]
+        let daemon_exit =
+            crate::update_shutdown::DaemonExit::capture(&home.path().join("fixture.pid")).unwrap();
+        let output = output_rx.recv_timeout(Duration::from_secs(5));
+        // Prove the daemon is alive AFTER the caller's output should reach EOF.
+        // Release this fixture before asserting EOF, including the broken path.
+        control.write_all(b"P").unwrap();
+        control.read_exact(&mut response).unwrap();
+        assert_eq!(response, *b"p");
+        control.write_all(b"Q").unwrap();
+        control.read_exact(&mut response).unwrap();
+        assert_eq!(response, *b"q");
+        #[cfg(windows)]
+        daemon_exit.wait(Duration::from_secs(10)).unwrap();
+        collector.join().unwrap();
+        let output = output
+            .expect("updater output must close while its daemon remains alive")
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fixture updater stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("fixture updater stderr"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture daemon stdout"));
+        let log = std::fs::read_to_string(home.path().join("airc-daemon.log")).unwrap();
+        assert!(log.contains("fixture daemon stdout") && log.contains("fixture daemon stderr"));
+    }
 
     /// what this catches (#354): the exact live shape that motivated wiring
     /// the smoke-test into the MANUAL update path. On 2026-08-07 a peer's
