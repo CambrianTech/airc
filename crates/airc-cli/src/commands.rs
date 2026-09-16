@@ -748,7 +748,7 @@ fn resolve_gh_bin_with(override_bin: Option<std::path::PathBuf>) -> Option<std::
 }
 
 #[cfg(unix)]
-fn detach_daemon(command: &mut Command) {
+pub(crate) fn detach_daemon(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: this closure runs in the child just before exec and
     // only calls setsid, which is async-signal-safe.
@@ -763,7 +763,7 @@ fn detach_daemon(command: &mut Command) {
 }
 
 #[cfg(windows)]
-fn detach_daemon(command: &mut Command) {
+pub(crate) fn detach_daemon(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
