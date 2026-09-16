@@ -113,6 +113,23 @@ pub enum InboundDeliveryVerdict {
 #[async_trait]
 pub trait InboundFrameSink: Send + Sync {
     async fn deliver(&self, frame: &Frame) -> InboundDeliveryVerdict;
+
+    /// Durable room bindings served by this owner, including quiet scopes.
+    /// An inbound-only adapter must report unavailable, never an empty history.
+    async fn backfill_channels(&self) -> Result<Vec<RoomId>, String> {
+        Err("inbound sink does not expose owner history".to_string())
+    }
+
+    /// Read a bounded page from the same owner that receives inbound frames.
+    /// `before` is an opaque position returned by this owner's prior page.
+    async fn backfill_page(
+        &self,
+        _channel: RoomId,
+        _before: Option<airc_bus::Cursor>,
+        _limit: usize,
+    ) -> Result<Vec<Arc<airc_bus::Envelope>>, String> {
+        Err("inbound sink does not expose owner history".to_string())
+    }
 }
 
 /// The production sink: delivers inbound frames into the daemon's
@@ -171,25 +188,43 @@ impl RouterInboundBridge {
     /// names there. Stale beacons count: a subscription is durable
     /// scope state, and a quiet scope still reads its transcript later.
     async fn channel_has_subscribed_scope(&self, channel: RoomId) -> Result<bool, String> {
+        let snapshot = self.subscribed_scope_snapshot().await?;
+        Ok(snapshot
+            .live
+            .iter()
+            .chain(snapshot.stale.iter())
+            .flat_map(|beacon| beacon.subscribed_channels.iter())
+            .any(|name| derive_room_id(&snapshot.mesh_identity, name) == channel))
+    }
+
+    async fn subscribed_scope_snapshot(&self) -> Result<coordinator::CoordinatorSnapshot, String> {
         let cached = crate::mesh_identity::resolve(self.coordinator_store.as_ref())
             .await
             .map_err(|e| format!("mesh identity: {e}"))?;
         let identity = cached.as_mesh_identity();
         let now_ms = time::now_ms().map_err(|e| format!("clock: {e}"))?;
-        let snapshot = coordinator::snapshot_store(
+        coordinator::snapshot_store(
             self.coordinator_store.as_ref(),
             &identity,
             &CoordinatorConfig::default(),
             now_ms,
         )
         .await
-        .map_err(|e| format!("beacon snapshot: {e}"))?;
-        Ok(snapshot
+        .map_err(|e| format!("beacon snapshot: {e}"))
+    }
+
+    async fn subscribed_scope_channels(&self) -> Result<Vec<RoomId>, String> {
+        let snapshot = self.subscribed_scope_snapshot().await?;
+        let mut channels: Vec<_> = snapshot
             .live
             .iter()
             .chain(snapshot.stale.iter())
             .flat_map(|beacon| beacon.subscribed_channels.iter())
-            .any(|name| derive_room_id(&identity, name) == channel))
+            .map(|name| derive_room_id(&snapshot.mesh_identity, name))
+            .collect();
+        channels.sort_by_key(|channel| channel.0);
+        channels.dedup();
+        Ok(channels)
     }
 
     /// Self-healing join — the "blind room" heal (M5↔bigmama decay
@@ -375,6 +410,27 @@ enum ChannelBinding {
 
 #[async_trait]
 impl InboundFrameSink for RouterInboundBridge {
+    async fn backfill_channels(&self) -> Result<Vec<RoomId>, String> {
+        self.subscribed_scope_channels().await
+    }
+
+    async fn backfill_page(
+        &self,
+        channel: RoomId,
+        before: Option<airc_bus::Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Arc<airc_bus::Envelope>>, String> {
+        if !self.channel_has_subscribed_scope(channel).await? {
+            return Err(format!(
+                "owner has no subscribed scope for channel {channel}"
+            ));
+        }
+        self.router
+            .durable_tail_before(channel, before, limit)
+            .await
+            .map_err(|error| format!("owner history: {error}"))
+    }
+
     async fn deliver(&self, frame: &Frame) -> InboundDeliveryVerdict {
         let mut env = match bus_envelope_for_inbound(frame) {
             Ok(env) => env,

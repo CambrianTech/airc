@@ -911,7 +911,20 @@ impl EventRouter {
         channel: RoomId,
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
-        self.durable_tail_filtered(channel, None, limit).await
+        self.durable_tail_filtered(channel, None, None, limit).await
+    }
+
+    /// A bounded durable page strictly before a position in THIS router's
+    /// channel order. The cursor must come from an earlier page of this same
+    /// owner and channel; another machine's ingest position is unrelated.
+    pub async fn durable_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        self.durable_tail_filtered(channel, before, None, limit)
+            .await
     }
 
     /// **Continuum #297.** [`Self::durable_tail`] restricted to
@@ -932,7 +945,7 @@ impl EventRouter {
         kinds: &[Kind],
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
-        self.durable_tail_filtered(channel, Some(kinds), limit)
+        self.durable_tail_filtered(channel, None, Some(kinds), limit)
             .await
     }
 
@@ -945,6 +958,7 @@ impl EventRouter {
     async fn durable_tail_filtered(
         &self,
         channel: RoomId,
+        before: Option<Cursor>,
         kinds: Option<&[Kind]>,
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
@@ -961,7 +975,11 @@ impl EventRouter {
                         .ring
                         .replay_after(None)
                         .into_iter()
-                        .filter(|env| env.delivery.is_durable() && matches_kind(env))
+                        .filter(|env| {
+                            env.delivery.is_durable()
+                                && matches_kind(env)
+                                && before.is_none_or(|gate| env.cursor().is_before(&gate))
+                        })
                         .collect::<Vec<_>>(),
                     state.ring.oldest_cursor(),
                 ),
@@ -977,17 +995,24 @@ impl EventRouter {
         // before `ring_oldest` cannot also be in the ring, so the two
         // legs concatenate with no dup and no gap.
         let remainder = limit - tail.len();
+        // A page wholly behind the hot ring must retain the caller's older
+        // bound. Otherwise the sink would repeat the same newest stored page.
+        let sink_before = match (before, ring_oldest) {
+            (Some(before), Some(oldest)) if before.is_before(&oldest) => Some(before),
+            (_, Some(oldest)) => Some(oldest),
+            (before, None) => before,
+        };
         let older = match kinds {
             None => {
                 self.inner
                     .sink
-                    .page_tail(channel, ring_oldest, remainder)
+                    .page_tail(channel, sink_before, remainder)
                     .await?
             }
             Some(kinds) => {
                 self.inner
                     .sink
-                    .page_tail_of_kinds(channel, ring_oldest, kinds, remainder)
+                    .page_tail_of_kinds(channel, sink_before, kinds, remainder)
                     .await?
             }
         };

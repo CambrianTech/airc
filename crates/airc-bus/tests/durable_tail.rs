@@ -487,6 +487,12 @@ async fn pending_unpersisted_durable_is_served_from_the_ring() {
         "un-persisted durables are in the tail — the ring leads the sink"
     );
 
+    let prior = router
+        .durable_tail_before(channel, Some(tail[3].cursor()), 10)
+        .await
+        .expect("page before unpersisted durable");
+    assert_eq!(markers(&prior), vec![0, 1, 2]);
+
     gated.open(); // release the write-behind so the router task drains
 }
 
@@ -510,6 +516,56 @@ async fn tail_surfaces_sink_error_instead_of_scanning() {
         result.is_err(),
         "reverse-page failure is loud, not a scan fallback"
     );
+    assert!(router
+        .durable_tail_before(
+            RoomId::from_u128(0xbad),
+            Some(Cursor::new(airc_bus::Seq::new(1, 9), EventId::new())),
+            25,
+        )
+        .await
+        .is_err());
+}
+
+/// Walk beyond the old fixed500 tail, across the ring/store seam. Every
+/// envelope has the SAME measured timestamp, so a timestamp continuation
+/// cannot pass this test. Each read remains bounded by its requested page.
+#[tokio::test]
+async fn reverse_cursor_pages_cover_deep_equal_timestamp_history_once() {
+    const DEEP: u128 = 650;
+    const PAGE: usize = 200;
+    let (router, sink) = counted_router(64);
+    let channel = RoomId::from_u128(0xba4f111);
+    for n in 0..DEEP {
+        router
+            .publish(event(channel, n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 128 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let mut before = None;
+    let mut seen = Vec::new();
+    loop {
+        sink.reset();
+        let page = router
+            .durable_tail_before(channel, before, PAGE)
+            .await
+            .expect("bounded reverse page");
+        assert_eq!(sink.page_calls(), 0);
+        assert!(sink.page_tail_calls() <= 1);
+        assert!(sink.max_page_tail_limit() <= PAGE);
+        assert!(page
+            .iter()
+            .all(|event| event.occurred_at_ms == 1_700_000_000_000));
+        before = page.first().map(|env| env.cursor());
+        seen.extend(markers(&page));
+        if page.len() < PAGE {
+            break;
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, (0..DEEP).collect::<Vec<_>>());
 }
 
 /// Regression (continuum 2026-09-06, the wall projection that never
