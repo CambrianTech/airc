@@ -852,6 +852,10 @@ _airc_target_dir() {
 # binary. Changing firewall rules requires elevation (signing wouldn't help —
 # firewall != SmartScreen), so we CHECK first (read-only, no prompt) and only
 # UAC-prompt when a fix is actually needed — every later update stays silent.
+_windows_powershell() {
+  bash "$CLONE_DIR/windows/run-powershell.sh" "$@"
+}
+
 _setup_windows_firewall() {
   local ps1="$CLONE_DIR/windows/firewall-allow.ps1"
   [ -f "$ps1" ] || return 0   # tolerate older checkouts
@@ -859,7 +863,7 @@ _setup_windows_firewall() {
   airc_win="$(_to_win_path "$BIN_DIR/airc.exe")"
   ps1_win="$(_to_win_path "$ps1")"
   # Read-only state check — no admin, no prompt.
-  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
     ok "Windows Firewall: airc inbound already allowed"
     return 0
@@ -875,10 +879,10 @@ _setup_windows_firewall() {
   info "        until the rule exists. This is the airc grid's front door."
   info "  HOW:  Windows will show ONE UAC prompt — click Yes to allow it."
   info "        (Updates stay silent afterward; nothing to re-approve.)"
-  powershell.exe -NoProfile -Command \
+  _windows_powershell -NoProfile -Command \
     "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$ps1_win','-AircPath','$airc_win')" \
     >/dev/null 2>&1 || true
-  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
     ok "Windows Firewall: airc inbound allowed — LAN peers can now reach this node."
   else
@@ -892,7 +896,7 @@ _setup_windows_firewall() {
 
 _setup_windows_autostart() {
   local registrar="$CLONE_DIR/windows/register-autostart.ps1"
-  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned \
+  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned \
        -File "$(_to_win_path "$registrar")" -AircPath "$(_to_win_path "$BIN_DIR/airc.exe")" -ExistingOnly; then
     ok "Windows mesh autostart checked (existing tasks repaired; no new opt-in)"
   else

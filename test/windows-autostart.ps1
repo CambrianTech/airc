@@ -1,6 +1,34 @@
 # Public startup regression: no task registration or real AIRC process changes.
+param([switch]$BoundaryParent, [switch]$BoundaryChild)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
+if ($BoundaryParent) {
+    if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'Boundary parent must run in PowerShell 7' }
+    # Reproduce PS7 -> Git Bash -> PS5 inheritance in this disposable process.
+    $env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' + $env:PSModulePath
+    $inheritedModulePath = $env:PSModulePath
+    $gitDirectory = [IO.DirectoryInfo]((& git --exec-path).Trim())
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot locate Git Bash for the boundary regression' }
+    while ($gitDirectory -and -not (Test-Path -LiteralPath (Join-Path $gitDirectory.FullName 'bin/bash.exe'))) {
+        $gitDirectory = $gitDirectory.Parent
+    }
+    if (-not $gitDirectory) { throw 'Git Bash is required for the public installer boundary regression' }
+    $bash = Join-Path $gitDirectory.FullName 'bin/bash.exe'
+    $launcher = Join-Path $repo 'windows/run-powershell.sh'
+    & $bash $launcher -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File $PSCommandPath -BoundaryChild
+    if ($LASTEXITCODE -ne 0) { throw 'Registrar fixture failed through the actual Bash to PS5 launcher' }
+    if ($env:PSModulePath -cne $inheritedModulePath) { throw 'Bash launcher changed its parent module path' }
+    & $bash $launcher -NoProfile -NonInteractive -Command 'exit 37'
+    if ($LASTEXITCODE -ne 37) { throw 'Bash launcher lost the PowerShell exit status' }
+    if ($env:PSModulePath -cne $inheritedModulePath) { throw 'Failed child changed its parent module path' }
+    Write-Output 'PASS: PS7 -> Git Bash -> PS5 registrar, unchanged parent environment, and exit 37'
+    exit 0
+}
+if ($BoundaryChild) {
+    if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Boundary child must run in Windows PowerShell 5' }
+    # Assert before the fixture's task/CIM mocks can hide module-load failures.
+    Get-Command Get-FileHash, Get-CimInstance, Get-ScheduledTask -ErrorAction Stop | Out-Null
+}
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('airc-autostart-test-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch | Out-Null
 $descendant = $null
@@ -90,6 +118,14 @@ fn main() {
     $missing.WaitForExit()
     if ($missing.ExitCode -eq 0) { throw 'Missing join executable reported success' }
     $missing.Dispose()
+
+    if (-not $BoundaryChild) {
+        $parentModulePath = $env:PSModulePath
+        $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+        & $pwsh -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File $PSCommandPath -BoundaryParent
+        if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 installer boundary regression failed' }
+        if ($env:PSModulePath -cne $parentModulePath) { throw 'Boundary regression changed the caller environment' }
+    }
 
     # Existing tasks retain their identity/settings/trigger; only action changes.
     $global:aircStartupFixture = @{ updated=$null; registered=$null; existing=$null; events=@(); daemons=@(); failRegistration=$false; deny=$false; rejectElevation=$false; elevation=$null }
