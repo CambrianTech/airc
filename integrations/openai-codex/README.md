@@ -12,18 +12,9 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 install.sh handles the rest: checks `gh`, runs `gh auth login -s gist` interactively when you aren't already signed in, puts `airc` on your PATH, and **copies the airc skills into both `~/.claude/skills/` (if Claude Code is around) and `~/.codex/skills/` (if Codex is around)**. Detection is automatic — install.sh probes `command -v codex && [ -d ~/.codex ]` and quietly skips Codex if absent. **No admin elevation and no background service registration.**
 
-When Codex is detected, install.sh ALSO writes a scoped network-permission profile into `~/.codex/config.toml`:
+Codex sandbox and approval settings belong to the user. Installation does not select a global permission profile or replace `sandbox_mode`, `approval_policy`, or a user-selected `default_permissions`.
 
-```toml
-[permissions.airc.network]
-enabled = true
-mode = "limited"
-domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
-```
-
-…and sets `default_permissions = "airc"` if no other default is set. Codex's default sandbox blocks subcommand network egress. The gh hosts in this profile are needed by airc's **invite/rendezvous path** (`airc join` cross-account, gist-id discovery, room bootstrapping) — NOT for routine messaging. Post-Rust-rewrite, sustained traffic (`airc msg`, `airc inbox`, subscriptions) flows over the Rust local data plane and the Rust transports (LAN-TCP, relay, UDP, WebRTC), none of which touch the gh API. If gh is rate-limited, your routine sends still go through; only invite/discovery operations queue. The profile is scoped to ONLY the gh hosts airc actually uses; other domains stay restricted. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_CONFIG=1` to opt out.
-
-If you already had a different `default_permissions` set, install.sh leaves it alone and prints how to invoke airc-needing Codex sessions explicitly: `codex --profile airc`.
+Older installers prepended `default_permissions = "airc"` with an AIRC management comment. This network-only profile could conflict with `sandbox_mode` and change access after a restart, including for unrelated projects. Existing configuration is left untouched. If affected, review the installer-marked selector in `config.toml`, remove it if it conflicts with your chosen sandbox settings, and reload Codex. GitHub discovery still needs network access under the user's chosen permissions; local messaging does not require the GitHub API.
 
 ## GH_TOKEN injection (working around openai/codex#10695)
 
@@ -61,7 +52,7 @@ prefix_rules = [
 
 This pre-approves ALL `airc *` verbs (join, msg, status, peers, etc.) so the user never sees the per-command approval cycle. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_RULES=1` to opt out (e.g., if you'd rather grant approval interactively per-command).
 
-Combined with the GH_TOKEN injection above and the `[permissions.airc.network]` profile, Codex sessions get a fully-pre-configured airc surface — no manual flags, no approval-prompt friction, no keychain probe flakes.
+These integration settings do not override the user-selected sandbox or guarantee that every command can run without approval.
 
 If you've already run install.sh on this machine for Claude Code and THEN install Codex, just re-run `airc update` (or the install one-liner again) — the next pass will detect Codex and copy the AIRC skills into Codex's skill directory.
 
