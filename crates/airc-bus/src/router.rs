@@ -1192,7 +1192,11 @@ impl EventRouter {
                     if !full_page {
                         break 'deep;
                     }
-                    page_from = Some(last_cursor.expect("a full page is non-empty"));
+                    // A full page (>= DEEP_REPLAY_PAGE rows) always has a last cursor; `None`
+                    // here would mean the sink contradicted its own length. Bail rather than panic:
+                    // steps 3/4 still hand off from there on.
+                    let Some(next_from) = last_cursor else { break 'deep; };
+                    page_from = Some(next_from);
                 }
             }
 
