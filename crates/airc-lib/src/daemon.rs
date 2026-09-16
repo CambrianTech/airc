@@ -418,10 +418,13 @@ impl Airc {
                 })
                 .await?;
             let count = response.envelopes.len();
+            let has_more = response.has_more;
             for bytes in response.envelopes {
                 all.push(decode_wire_event(bytes)?);
             }
-            if count < page_size {
+            // A page cut by BYTES (has_more) continues from its newest cursor; a
+            // short page from a daemon that never cuts is the channel exhausted.
+            if !has_more && count < page_size {
                 break;
             }
             match response.newest {

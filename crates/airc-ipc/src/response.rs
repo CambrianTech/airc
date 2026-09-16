@@ -232,6 +232,16 @@ pub struct InboxResponse {
     /// page was empty — the caller's `since` stays authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest: Option<IpcCursor>,
+    /// The page was CUT before `limit` and more events follow `newest`.
+    /// A page is bounded by bytes as well as by count (card: the M5
+    /// daemon answered one 23.9 MB page — 1024 events of ~23 KB
+    /// prompts — every 6 s for six hours, each one refused by the
+    /// 16 MiB frame cap, each one dropping the client's connection).
+    /// A client's paging loop continues on `has_more || count == limit`;
+    /// an old daemon never sets it, so `count < limit` still reads as
+    /// exhausted there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_more: bool,
 }
 
 /// Result of a `RoomTip` probe (card a1562dbc): the durable tip of one
@@ -474,6 +484,7 @@ mod tests {
                 counter: 2,
                 event_id: EventId::from_u128(3),
             }),
+            has_more: true,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
