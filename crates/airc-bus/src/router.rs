@@ -1143,36 +1143,60 @@ impl EventRouter {
             // unregisters immediately, with no later publish needed for cleanup.
             let _registration = registration;
             // --- step 2: deep replay leg from the sink ---
-            // The sink covers `(from_cursor, ring_oldest)`: events older than
-            // the ring still retains. If the ring is non-empty we page the sink
-            // up to (but not including) the ring's oldest; if the ring is empty
-            // we page the whole tail after the cursor.
+            // Card ddbab098 — sibling of #1389 on the attach path. The old code
+            // pulled everything after `from_cursor` in one unbounded query and
+            // filtered it in memory; now we page the sink in bounded chunks, so
+            // attaching to a deep channel costs bounded time and never
+            // materializes the whole tail. Delivery semantics are unchanged:
+            // every row strictly after `from_cursor` and before the ring's
+            // oldest is still delivered, in total order.
+            const DEEP_REPLAY_PAGE: usize = 1024;
             let mut high: Option<Cursor> = from_cursor;
-            let deep = if live_only { Vec::new() } else { inner
-                .sink
-                .page(channel, from_cursor, usize::MAX)
-                .await
-                .unwrap_or_default() };
-            for env in deep {
-                // The sink (persistence) is a real copy boundary, so the deep
-                // leg arrives as owned `Envelope`s; wrap each once in `Arc` so
-                // the stream item type is uniform with the (already-`Arc`) ring
-                // and live legs and downstream stays zero-copy.
-                let env = Arc::new(env);
-                // Only emit sink events strictly before the ring snapshot's
-                // window — the ring snapshot is authoritative for the recent
-                // tail (it may hold un-persisted Durable the sink lacks).
-                let before_ring = match ring_oldest {
-                    Some(o) => env.cursor().is_before(&o),
-                    None => true,
-                };
-                let after_gate = match high {
-                    Some(h) => env.cursor().is_after(&h),
-                    None => true,
-                };
-                if before_ring && after_gate && filter.matches(&env) {
-                    high = Some(env.cursor());
-                    yield env;
+            if !live_only {
+                let mut page_from: Option<Cursor> = from_cursor;
+                'deep: loop {
+                    let deep = inner
+                        .sink
+                        .page(channel, page_from, DEEP_REPLAY_PAGE)
+                        .await
+                        .unwrap_or_default();
+                    // A short or empty page means the sink holds nothing further
+                    // past `page_from` — the tail is exhausted. (A failed query
+                    // surfaces as a short page too: same posture as the old single
+                    // fetch, where steps 3/4 still deliver recent + live.)
+                    let full_page = deep.len() >= DEEP_REPLAY_PAGE;
+                    let last_cursor = deep.last().map(|e| e.cursor());
+                    for env in deep {
+                        let cursor = env.cursor();
+                        // Hand off to step 3 once we reach the ring snapshot's
+                        // window — it is authoritative from there on (it may hold
+                        // un-persisted Durable the sink lacks). Rows arrive in total
+                        // order, so this break ends the whole leg.
+                        if matches!(ring_oldest, Some(o) if !cursor.is_before(&o)) {
+                            break 'deep;
+                        }
+                        let after_gate = match high {
+                            Some(h) => cursor.is_after(&h),
+                            None => true,
+                        };
+                        // The sink (persistence) is a real copy boundary, so the deep
+                        // leg arrives as owned `Envelope`s; wrap each once in `Arc`
+                        // so the stream item type stays uniform with the
+                        // (already-`Arc`) ring and live legs.
+                        let env = Arc::new(env);
+                        if after_gate && filter.matches(&env) {
+                            high = Some(cursor);
+                            yield env;
+                        }
+                    }
+                    if !full_page {
+                        break 'deep;
+                    }
+                    // A full page (>= DEEP_REPLAY_PAGE rows) always has a last cursor; `None`
+                    // here would mean the sink contradicted its own length. Bail rather than panic:
+                    // steps 3/4 still hand off from there on.
+                    let Some(next_from) = last_cursor else { break 'deep; };
+                    page_from = Some(next_from);
                 }
             }
 
