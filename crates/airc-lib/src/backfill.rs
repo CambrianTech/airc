@@ -55,13 +55,15 @@
 //! it sees it connected ([`Airc::backfill_all_from_peer`]), and the transport's
 //! inbound path serves a request the moment it is delivered ([`Airc::serve_backfill`]).
 //!
-//! ## Cross-node "since" is TIME, not a cursor
+//! ## Continuation belongs to the responder
 //!
 //! A node's transcript cursor is its OWN ingest sequence — the bus re-stamps every
 //! event, local or foreign, at publish. It means nothing to another node. So the
-//! request carries `since_ms`/`until_ms` (the responder's ingest clock) and the
-//! responder pages newest-first inside that window; the asker walks older pages
-//! by lowering `until_ms` until the page is not truncated.
+//! request carries time bounds as filters. Paging uses an opaque `before`
+//! cursor returned by that SAME responder for that SAME channel. Timestamp-only
+//! continuation loses events when a page boundary splits a millisecond. The
+//! capability echo prevents an older responder from silently ignoring this
+//! cursor and returning the same tail as if history were exhausted.
 //!
 //! ## The answer is signed forward frames
 //!
@@ -90,16 +92,16 @@ pub const HEADER_AIRC_BACKFILL: &str = "airc.backfill";
 ///
 /// Bounded on purpose: a peer returning from a long absence could otherwise ask
 /// for a page the size of the whole transcript. When the cap binds, the reply
-/// says so (`truncated`) and the caller can ask again from the newer cursor —
+/// says so (`truncated`) and the caller can ask again before `next_before` —
 /// never a silent cap, which would present a partial history as a complete one.
 pub const DEFAULT_BACKFILL_LIMIT: usize = 500;
 
-/// "What did I miss on `channel` since `since`?"
+/// A bounded history request for one channel hosted by the responder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackfillRequest {
     pub channel: RoomId,
-    /// The asker's cursor. `None` means "I have nothing for this channel" —
-    /// a fresh scope, or a room it just joined — and yields the newest page.
+    /// Legacy slice-one field retained for wire decoding only. It is NOT a
+    /// valid position in a different owner's transcript; use `before`.
     pub since: Option<TranscriptCursor>,
     /// Caller's ceiling; the responder clamps to [`DEFAULT_BACKFILL_LIMIT`].
     pub limit: usize,
@@ -107,10 +109,18 @@ pub struct BackfillRequest {
     /// cross-node "since" — see the module doc.
     #[serde(default)]
     pub since_ms: Option<u64>,
-    /// Responder-clock upper bound (exclusive) — the asker lowers it to walk
-    /// older pages of a truncated answer.
+    /// Responder-clock upper bound (exclusive), a filter rather than a paging
+    /// position. Keep this unchanged when following `next_before`.
     #[serde(default)]
     pub until_ms: Option<u64>,
+    /// Explicit support for responder-owned cursor paging. Missing on old
+    /// requests, which remain parseable but cannot claim complete history.
+    #[serde(default)]
+    pub cursor_paging: bool,
+    /// Opaque continuation from this responder's previous page of `channel`.
+    /// Never put the requester's local transcript cursor here.
+    #[serde(default)]
+    pub before: Option<airc_bus::Cursor>,
 }
 
 /// The answered page.
@@ -119,7 +129,7 @@ pub struct BackfillResponse {
     pub channel: RoomId,
     pub events: Vec<TranscriptEvent>,
     /// True when the limit bound the page — there is MORE beyond it. The
-    /// caller re-asks from the newest event it received. Without this a
+    /// caller re-asks before `next_before`. Without this a
     /// truncated page is indistinguishable from a complete one, which is how a
     /// gap silently survives the mechanism built to close it.
     pub truncated: bool,
@@ -128,6 +138,13 @@ pub struct BackfillResponse {
     /// slice-1 wire shape and is empty when `frames` is used.
     #[serde(default)]
     pub frames: Vec<airc_protocol::Frame>,
+    /// Echo of the responder-owned paging contract, absent on old responders.
+    #[serde(default)]
+    pub cursor_paging: bool,
+    /// Position of the oldest RAW envelope examined, even when time filters or
+    /// machine-local kinds leave no forwardable frames in this page.
+    #[serde(default)]
+    pub next_before: Option<airc_bus::Cursor>,
 }
 
 /// How far back a first ask reaches when nothing narrower is known.
@@ -173,12 +190,61 @@ impl BackfillRequest {
     }
 }
 
+fn decode_page(
+    value: serde_json::Value,
+    request: &BackfillRequest,
+) -> Result<BackfillResponse, AircError> {
+    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+        return Err(AircError::Transport(format!("backfill peer: {error}")));
+    }
+    let response: BackfillResponse = serde_json::from_value(value)
+        .map_err(|error| AircError::Crypto(format!("backfill reply decode: {error}")))?;
+    if !response.cursor_paging {
+        return Err(AircError::Transport(
+            "backfill peer does not support responder cursor paging; history is incomplete"
+                .to_string(),
+        ));
+    }
+    if response.channel != request.channel {
+        return Err(AircError::Transport(
+            "backfill reply channel does not match request".to_string(),
+        ));
+    }
+    if response.truncated {
+        let next = response.next_before.ok_or_else(|| {
+            AircError::Transport("backfill incomplete page lacks continuation".to_string())
+        })?;
+        if request
+            .before
+            .is_some_and(|before| !next.is_before(&before))
+        {
+            return Err(AircError::Transport(
+                "backfill continuation made no backward progress".to_string(),
+            ));
+        }
+    }
+    Ok(response)
+}
+
+fn exchange_headers() -> Headers {
+    let mut headers = Headers::new();
+    // Recovery exchanges are not history themselves. Otherwise subsequent
+    // pages can recursively include earlier replies containing entire pages.
+    headers.insert(
+        airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.to_string(),
+        crate::publish::delivery_class_header_value(airc_bus::DeliveryClass::RequestResponse)
+            .to_string(),
+    );
+    headers
+}
+
 impl Airc {
-    /// Ask `peer` for everything on `channel` since `since`.
+    /// Ask `peer` for one bounded owner-history page on `channel`.
     ///
-    /// Returns the events the peer had. An empty page is the ordinary answer
-    /// when the cursor is current, NOT an error — which is what makes it safe
-    /// to ask on every reconnect.
+    /// Time bounds filter the page. An empty page is exhausted only when
+    /// `truncated` is false; otherwise `next_before` advances past the raw
+    /// envelopes examined even if none matched. An old responder is an
+    /// explicit unsupported result, not evidence of empty history.
     pub async fn request_backfill(
         &self,
         peer: PeerId,
@@ -193,8 +259,19 @@ impl Airc {
             limit: BACKFILL_PAGE,
             since_ms,
             until_ms,
+            cursor_paging: true,
+            before: None,
         };
-        let mut headers = Headers::new();
+        self.request_backfill_page(peer, request, deadline).await
+    }
+
+    async fn request_backfill_page(
+        &self,
+        peer: PeerId,
+        request: BackfillRequest,
+        deadline: Duration,
+    ) -> Result<BackfillResponse, AircError> {
+        let mut headers = exchange_headers();
         headers.insert(HEADER_AIRC_BACKFILL.into(), "request".into());
         let body = Body::Json(
             serde_json::to_value(&request)
@@ -209,16 +286,15 @@ impl Airc {
                 "backfill reply carried no JSON body".to_string(),
             ));
         };
-        serde_json::from_value(value)
-            .map_err(|e| AircError::Crypto(format!("backfill reply decode: {e}")))
+        decode_page(value, &request)
     }
 
-    /// Answer a backfill request from this scope's own durable transcript.
+    /// Answer a backfill request from the daemon owner's durable transcript.
     ///
-    /// Returns the number of events sent. A request for a channel this scope
-    /// does not subscribe to answers with an EMPTY page rather than an error:
-    /// "I have nothing for you" is true and actionable, whereas a failure would
-    /// make the asker retry against a peer that will never have it.
+    /// Returns the number of frames sent. Unavailable history, unhosted rooms,
+    /// and unsupported paging receive an error-only reply, never an empty
+    /// success. Old decoders also reject that shape instead of claiming that
+    /// a failed read exhausted history.
     pub async fn serve_backfill(
         &self,
         request_event: &TranscriptEvent,
@@ -231,86 +307,91 @@ impl Airc {
             return Ok(0);
         };
 
-        let limit = request.limit.clamp(1, DEFAULT_BACKFILL_LIMIT);
-        if request.since_ms.is_some() || request.until_ms.is_some() {
-            // Slice 2: a time-bounded ask answered with signed forward frames.
-            let recent = self
-                .daemon_room_envelopes_recent(request.channel, DEFAULT_BACKFILL_LIMIT)
-                .await
-                .unwrap_or_default();
-            let (window, truncated) =
-                select_window(recent, request.since_ms, request.until_ms, limit);
-            let frames: Vec<airc_protocol::Frame> = window
-                .iter()
-                .filter_map(|env| {
-                    crate::route_forwarder::build_forward_frame(self, env, false)
-                        .ok()
-                        .flatten()
-                })
-                .collect();
-            let sent = frames.len();
-            let response = BackfillResponse {
-                channel: request.channel,
-                events: Vec::new(),
-                truncated,
-                frames,
-            };
-            let body = Body::Json(
-                serde_json::to_value(&response)
-                    .map_err(|e| AircError::Crypto(format!("backfill reply encode: {e}")))?,
-            );
-            self.reply(reply_to, correlation_id, Headers::new(), body)
-                .await?;
-            tracing::info!(
-                target: "airc::backfill",
-                channel = %request.channel,
-                sent,
-                truncated,
-                "served a backfill page"
-            );
-            return Ok(sent);
-        }
-        let events = match request.since.as_ref() {
-            Some(cursor) => self
-                .daemon_room_transcripts_since(request.channel, cursor, limit)
-                .await
-                .unwrap_or_default(),
-            None => {
-                // No cursor: the newest page of the channel.
-                let mut filter = crate::EventFilter {
-                    channel: Some(request.channel),
-                    ..Default::default()
-                };
-                filter.self_echo = None;
-                self.page_recent_filtered(filter, limit)
-                    .await
-                    .unwrap_or_default()
-            }
+        let response = self.backfill_response(&request).await;
+        let value = match &response {
+            Ok(response) => serde_json::to_value(response)?,
+            Err(error) => serde_json::json!({"error": error.to_string()}),
         };
-
-        let truncated = events.len() >= limit;
-        if truncated {
-            tracing::debug!(
-                target: "airc::backfill",
-                channel = %request.channel,
-                limit,
-                "backfill page hit the limit — replying `truncated` so the asker re-asks"
-            );
-        }
-        let sent = events.len();
-        let response = BackfillResponse {
-            channel: request.channel,
-            events,
-            truncated,
-            frames: Vec::new(),
-        };
-        let body = Body::Json(
-            serde_json::to_value(&response)
-                .map_err(|e| AircError::Crypto(format!("backfill reply encode: {e}")))?,
+        self.reply_in(
+            request_event.room_id,
+            request_event
+                .headers
+                .get(airc_protocol::HEADER_AIRC_CHANNEL_NAME)
+                .map(String::as_str),
+            reply_to,
+            correlation_id,
+            exchange_headers(),
+            Body::Json(value),
+        )
+        .await?;
+        let response = response?;
+        tracing::info!(
+            target: "airc::backfill",
+            channel = %request.channel,
+            sent = response.frames.len(),
+            truncated = response.truncated,
+            "served an owner history page"
         );
-        self.reply(reply_to, correlation_id, Headers::new(), body)
-            .await?;
-        Ok(sent)
+        Ok(response.frames.len())
+    }
+
+    async fn backfill_response(
+        &self,
+        request: &BackfillRequest,
+    ) -> Result<BackfillResponse, AircError> {
+        if !request.cursor_paging {
+            return Err(AircError::Transport(
+                "backfill requires responder cursor paging; legacy history recovery is incomplete"
+                    .to_string(),
+            ));
+        }
+        if request.since.is_some() {
+            return Err(AircError::Transport(
+                "requester transcript cursor cannot select responder history".to_string(),
+            ));
+        }
+        let sink = self.inbound_frame_sink().ok_or_else(|| {
+            AircError::Transport("backfill owner history is unavailable".to_string())
+        })?;
+        let limit = request.limit.clamp(1, DEFAULT_BACKFILL_LIMIT);
+        let mut raw = sink
+            .backfill_page(request.channel, request.before, limit + 1)
+            .await
+            .map_err(AircError::Transport)?;
+        let truncated = raw.len() > limit;
+        if truncated {
+            raw.drain(..raw.len() - limit);
+        }
+        let next_before = if truncated {
+            raw.first().map(|env| env.cursor())
+        } else {
+            None
+        };
+        // Continue from the raw owner cursor, NOT the oldest returned frame:
+        // time filters and machine-local kinds may yield an empty full page.
+        let mut frames = Vec::with_capacity(raw.len());
+        for env in raw.iter().filter(|env| {
+            request
+                .since_ms
+                .is_none_or(|since| env.occurred_at_ms >= since)
+                && request
+                    .until_ms
+                    .is_none_or(|until| env.occurred_at_ms < until)
+        }) {
+            if let Some(frame) = crate::route_forwarder::build_forward_frame(self, env, false)
+                .map_err(AircError::Transport)?
+            {
+                frames.push(frame);
+            }
+        }
+        Ok(BackfillResponse {
+            channel: request.channel,
+            events: Vec::new(),
+            truncated,
+            frames,
+            cursor_paging: true,
+            next_before,
+        })
     }
 }
 
@@ -324,55 +405,65 @@ impl Airc {
         channel: RoomId,
         since_ms: u64,
     ) -> Result<usize, AircError> {
-        let Some(sink) = self.inbound_frame_sink() else {
-            return Ok(0);
-        };
+        let sink = self.inbound_frame_sink().ok_or_else(|| {
+            AircError::Transport("backfill inbound owner is unavailable".to_string())
+        })?;
         let mut delivered = 0usize;
-        let mut until_ms: Option<u64> = None;
+        let mut before = None;
         for _page in 0..BACKFILL_MAX_PAGES {
             let response = self
-                .request_backfill(
+                .request_backfill_page(
                     peer,
-                    channel,
-                    Some(since_ms),
-                    until_ms,
+                    BackfillRequest {
+                        channel,
+                        since: None,
+                        limit: BACKFILL_PAGE,
+                        since_ms: Some(since_ms),
+                        until_ms: None,
+                        cursor_paging: true,
+                        before,
+                    },
                     Duration::from_secs(30),
                 )
                 .await?;
-            if response.frames.is_empty() {
-                break;
-            }
-            let oldest = response
-                .frames
-                .iter()
-                .map(|f| f.envelope.occurred_at_ms)
-                .min();
             for frame in &response.frames {
                 use crate::router_bridge::InboundDeliveryVerdict as V;
                 match sink.deliver(frame).await {
                     V::Delivered | V::DeliveredRemapped(_) => delivered += 1,
-                    // A frame for a channel this node does not host, or a
-                    // decode/publish failure: the bridge already accounted for
-                    // it the way it does for live frames; nothing to count.
-                    V::UnknownChannel | V::Failed(_) => {}
+                    V::UnknownChannel => {
+                        return Err(AircError::Transport(format!(
+                            "backfill incomplete after {delivered} frames: local channel is unbound"
+                        )));
+                    }
+                    V::Failed(error) => {
+                        return Err(AircError::Transport(format!(
+                            "backfill incomplete after {delivered} frames: {error}"
+                        )));
+                    }
                 }
             }
             if !response.truncated {
-                break;
+                return Ok(delivered);
             }
-            until_ms = oldest;
+            before = response.next_before;
         }
-        Ok(delivered)
+        Err(AircError::Transport(format!(
+            "backfill incomplete: page budget {BACKFILL_MAX_PAGES} reached after {delivered} frames; next_before={before:?}"
+        )))
     }
 
     /// The reconnect watcher's whole job: the first time a peer is seen
     /// connected, ask it what this node missed on every subscribed channel.
     /// Never fails the caller — a peer that cannot answer is logged, not fatal.
     pub(crate) async fn backfill_all_from_peer(&self, peer: PeerId) {
-        let rooms = match self.subscription_set().await {
-            Ok(set) => set.all().map(|s| s.as_room()).collect::<Vec<_>>(),
+        let Some(sink) = self.inbound_frame_sink() else {
+            tracing::warn!(target: "airc::backfill", %peer, "backfill skipped: no owner history boundary");
+            return;
+        };
+        let channels = match sink.backfill_channels().await {
+            Ok(channels) => channels,
             Err(error) => {
-                tracing::warn!(target: "airc::backfill", %peer, %error, "backfill skipped: no subscription set");
+                tracing::warn!(target: "airc::backfill", %peer, %error, "backfill skipped: owner room bindings unavailable");
                 return;
             }
         };
@@ -381,24 +472,25 @@ impl Airc {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0); // JUSTIFIED unwrap_or: a broken clock asks from the epoch = everything the page bound allows
         let since_ms = now_ms.saturating_sub(BACKFILL_LOOKBACK_MS);
-        for room in rooms {
+        for channel in channels {
             match self
-                .backfill_channel_from_peer(peer, room.channel, since_ms)
+                .backfill_channel_from_peer(peer, channel, since_ms)
                 .await
             {
                 Ok(n) => tracing::info!(
                     target: "airc::backfill",
                     %peer,
-                    channel = %room.channel,
+                    %channel,
                     delivered = n,
-                    "asked a newly connected peer what this node missed"
+                    since_ms,
+                    "finished bounded recent-history backfill; older history is outside this pass"
                 ),
                 Err(error) => tracing::warn!(
                     target: "airc::backfill",
                     %peer,
-                    channel = %room.channel,
+                    %channel,
                     %error,
-                    "backfill ask failed — the peer answers nothing yet; the next connect asks again"
+                    "backfill did not complete"
                 ),
             }
         }
@@ -438,6 +530,8 @@ mod tests {
             limit: 100,
             since_ms: None,
             until_ms: None,
+            cursor_paging: true,
+            before: None,
         }
     }
 
@@ -506,6 +600,11 @@ mod tests {
             events: Vec::new(),
             truncated: true,
             frames: Vec::new(),
+            cursor_paging: true,
+            next_before: Some(airc_bus::Cursor::new(
+                airc_bus::Seq::new(3, 7),
+                EventId::from_u128(8),
+            )),
         };
         let decoded: BackfillResponse =
             serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
@@ -513,6 +612,7 @@ mod tests {
             decoded.truncated,
             "the `there is more` bit must survive the wire"
         );
+        assert_eq!(decoded.next_before, full.next_before);
     }
 
     fn env_at(ms: u64, id: u128) -> airc_bus::Envelope {
@@ -570,5 +670,42 @@ mod tests {
         let parsed = BackfillRequest::deserialize(&old).unwrap();
         assert_eq!(parsed.limit, 7);
         assert!(parsed.since_ms.is_none() && parsed.until_ms.is_none());
+        assert!(!parsed.cursor_paging && parsed.before.is_none());
+    }
+
+    #[test]
+    fn old_empty_replies_and_read_errors_never_mean_exhausted_history() {
+        let request = a_request();
+        let old = serde_json::json!({
+            "channel": request.channel, "events": [], "frames": [], "truncated": false
+        });
+        let error = decode_page(old, &request).unwrap_err().to_string();
+        assert!(error.contains("does not support"), "{error}");
+        let failed = serde_json::json!({"error": "owner history read failed"});
+        assert!(serde_json::from_value::<BackfillResponse>(failed.clone()).is_err());
+        let error = decode_page(failed, &request).unwrap_err().to_string();
+        assert!(error.contains("owner history read failed"), "{error}");
+    }
+
+    #[test]
+    fn continuation_requires_progress_even_when_no_frames_pass_the_filter() {
+        let mut request = a_request();
+        let cursor = airc_bus::Cursor::new(airc_bus::Seq::new(2, 40), EventId::new());
+        let mut response = BackfillResponse {
+            channel: request.channel,
+            events: Vec::new(),
+            frames: Vec::new(),
+            truncated: true,
+            cursor_paging: true,
+            next_before: Some(cursor),
+        };
+        assert!(decode_page(serde_json::to_value(&response).unwrap(), &request).is_ok());
+        request.before = Some(cursor);
+        assert!(decode_page(serde_json::to_value(&response).unwrap(), &request).is_err());
+        response.next_before = None;
+        assert!(decode_page(serde_json::to_value(&response).unwrap(), &request).is_err());
+        response.truncated = false;
+        response.channel = RoomId::new();
+        assert!(decode_page(serde_json::to_value(&response).unwrap(), &request).is_err());
     }
 }

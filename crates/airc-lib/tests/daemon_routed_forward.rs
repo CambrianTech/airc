@@ -219,6 +219,235 @@ async fn routed_room_send_traverses_lan_both_directions() {
     assert_eq!(copies_in(&recent_b, id_ba), 1);
 }
 
+/// The daemon's gateway is NOT IPC-attached and does not subscribe to the
+/// project room. Both history and the hosted-room set must come from its real
+/// owner bridge. Seed before installing the forwarder so live delivery cannot
+/// disguise a broken backfill. The oldest card lies behind the former500 tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_backfill_recovers_project_card_beyond_gateway_tail() {
+    use airc_bus::{DeliveryClass, Envelope, Kind};
+    use airc_lib::CreateWorkCard;
+    use airc_work::{Priority, RepoId};
+    use futures::StreamExt;
+
+    let source = Machine::boot().await;
+    source.pin_identity("fixture:owner-backfill").await;
+    let source_gateway = boot_gateway(&source, None).await;
+    source_gateway
+        .join("backfill-control")
+        .await
+        .expect("control");
+    // Response dispatch must use the request room, not this different default.
+    source_gateway
+        .join("source-default")
+        .await
+        .expect("default");
+    let publisher = source.attach("publisher").await;
+    let room = publisher.join(ROOM).await.expect("project room");
+    let card_id = publisher
+        .create_work_card(CreateWorkCard::new(
+            RepoId::new("fixture/backfill").expect("repo"),
+            "created while the other machine was offline",
+            Priority::P1,
+        ))
+        .await
+        .expect("create source card");
+    let created = source
+        .daemon
+        .router()
+        .durable_tail(room.channel, 16)
+        .await
+        .expect("creation receipt")
+        .into_iter()
+        .find(|env| env.headers.get("forge.work.card_id") == Some(&card_id.to_string()))
+        .expect("exact CardCreated receipt");
+    let mut expected = vec![created.event_id];
+    for n in 1..650 {
+        let env = Envelope::new(
+            room.channel,
+            (publisher.peer_id(), airc_core::ClientId::new()),
+            Kind::Message,
+            DeliveryClass::Durable,
+            bytes::Bytes::from(Body::text(format!("offline history {n}")).to_payload()),
+        );
+        expected.push(env.event_id);
+        source
+            .daemon
+            .router()
+            .publish(env)
+            .await
+            .expect("seed history");
+        if n % 128 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let source_forwarder =
+        RoutedForwarder::install(&source.daemon.router(), RoutedForwarderConfig::default());
+    source_forwarder.add_link(source_gateway.clone()).await;
+
+    let receiving = boot_linked(RoutedForwarderConfig::default()).await;
+    receiving
+        .machine
+        .pin_identity("fixture:owner-backfill")
+        .await;
+    receiving
+        .gateway
+        .join("backfill-control")
+        .await
+        .expect("control");
+    let reader = receiving.machine.attach("project-reader").await;
+    reader.join(ROOM).await.expect("reader joins project only");
+    for gateway in [&source_gateway, &receiving.gateway] {
+        assert!(!gateway.is_daemon_attached(), "actual daemon-host shape");
+        assert!(gateway
+            .subscription_set()
+            .await
+            .expect("gateway subscriptions")
+            .all()
+            .all(|subscription| subscription.room_id != room.channel));
+    }
+    assert!(reader
+        .work_board()
+        .await
+        .expect("empty board")
+        .card(card_id)
+        .is_none());
+    let mut changes = reader.subscribe().await.expect("arm recovery observer");
+    let mut pending: std::collections::HashSet<_> = expected.iter().copied().collect();
+    link(&receiving.gateway, &source_gateway).await;
+    reader
+        .say("wake the existing forwarder")
+        .await
+        .expect("wake");
+    // The oldest creation is first in the final ascending page. Seeing it
+    // alone is not a barrier for the remaining frames in that page.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !pending.is_empty() {
+            let event = changes
+                .next()
+                .await
+                .expect("recovery observer remains open")
+                .expect("recovery observer did not lag");
+            pending.remove(&event.event_id);
+        }
+    })
+    .await
+    .expect("all expected owner-history frames arrive before the final assertion");
+    assert!(reader
+        .work_board()
+        .await
+        .expect("recovered board")
+        .card(card_id)
+        .is_some());
+    let received = receiving
+        .machine
+        .daemon
+        .router()
+        .durable_tail(room.channel, 1_000)
+        .await
+        .expect("received owner history");
+    for event_id in expected {
+        assert_eq!(
+            received
+                .iter()
+                .filter(|env| env.event_id == event_id)
+                .count(),
+            1
+        );
+    }
+}
+
+/// Inject failure only at the owner read boundary; TLS, dispatch, correlation,
+/// and reply room selection remain the actual production path.
+struct UnavailableHistory {
+    inner: Arc<RouterInboundBridge>,
+}
+
+#[async_trait]
+impl InboundFrameSink for UnavailableHistory {
+    async fn deliver(&self, frame: &Frame) -> InboundDeliveryVerdict {
+        self.inner.deliver(frame).await
+    }
+
+    async fn backfill_channels(&self) -> Result<Vec<airc_core::RoomId>, String> {
+        self.inner.backfill_channels().await
+    }
+
+    async fn backfill_page(
+        &self,
+        _channel: airc_core::RoomId,
+        _before: Option<airc_bus::Cursor>,
+        _limit: usize,
+    ) -> Result<Vec<Arc<airc_bus::Envelope>>, String> {
+        Err("injected owner history read failure".to_string())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_backfill_read_failure_and_legacy_request_are_explicit_errors() {
+    use airc_lib::backfill::{BackfillResponse, HEADER_AIRC_BACKFILL};
+
+    let source = Machine::boot().await;
+    source.pin_identity("fixture:backfill-error").await;
+    let wrap = |inner: Arc<RouterInboundBridge>| -> Arc<dyn InboundFrameSink> {
+        Arc::new(UnavailableHistory { inner })
+    };
+    let gateway = boot_gateway(&source, Some(&wrap)).await;
+    let room = gateway.join("backfill-control").await.expect("source room");
+    gateway
+        .join("different-source-default")
+        .await
+        .expect("source default");
+    let receiving = Machine::boot().await;
+    receiving.pin_identity("fixture:backfill-error").await;
+    let requester = boot_gateway(&receiving, None).await;
+    requester
+        .join("backfill-control")
+        .await
+        .expect("request room");
+    link(&requester, &gateway).await;
+    let error = requester
+        .request_backfill(
+            gateway.peer_id(),
+            room.channel,
+            Some(0),
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("unavailable history cannot be empty success")
+        .to_string();
+    assert!(
+        error.contains("injected owner history read failure"),
+        "{error}"
+    );
+
+    let mut headers = airc_core::Headers::new();
+    headers.insert(HEADER_AIRC_BACKFILL.into(), "request".into());
+    let pending = requester
+        .request(
+            airc_core::MentionTarget::Peer(gateway.peer_id()),
+            headers,
+            Body::Json(serde_json::json!({
+                "channel": room.channel, "since": null, "limit": 200, "since_ms": 0
+            })),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("legacy request send");
+    let reply = requester
+        .await_reply(pending)
+        .await
+        .expect("legacy explicit reply");
+    let Some(Body::Json(value)) = reply.body else {
+        panic!("JSON failure reply required");
+    };
+    assert!(value["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("legacy")));
+    assert!(serde_json::from_value::<BackfillResponse>(value).is_err());
+}
+
 /// Loop prevention: a frame B received FROM A must never be forwarded
 /// back to A. B's `forwarded_count` counts frames flushed to the wire
 /// — with A as B's only link and B originating nothing after the
