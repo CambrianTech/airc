@@ -137,6 +137,9 @@ pub(crate) fn ack_is_for(ack_receiver: PeerId, target: PeerId, aliases: &HashSet
 
 /// How long a computed alias set stands before the trust store is read again.
 const ALIAS_CACHE_TTL: Duration = Duration::from_secs(60);
+/// #1f58fc16: a peer unseen for this long is treated as reconnected the
+/// next time it appears, re-arming its bounded backfill pass.
+const REARM_GAP: Duration = Duration::from_secs(300);
 
 struct ForwarderInner {
     /// Per target peer: the ids sharing its pubkey (see [`ack_is_for`]), cached.
@@ -268,6 +271,13 @@ struct PeerItem {
 /// minus the item's origin), spawning workers on demand.
 async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardItem>) {
     let mut workers: HashMap<PeerId, mpsc::Sender<PeerItem>> = HashMap::new();
+    // #1f58fc16: last tick each peer was observed live. Workers are
+    // never pruned, so first-sight alone fires exactly once per drain;
+    // a reconnecting peer would otherwise recover nothing. Re-arm when
+    // the gap since last observation exceeds REARM_GAP (bounded pass,
+    // idempotent at the board fold).
+    let mut last_seen: std::collections::HashMap<PeerId, std::time::Instant> =
+        std::collections::HashMap::new();
     // #1247 slice 3: the relay tier. A connected relay is a SINGLE pipe
     // (it fans out by target), not a per-peer link, so it gets ONE worker
     // — lazily spawned the first time a relay is actually connected, so a
@@ -296,7 +306,15 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
             if Some(peer) == item.origin {
                 continue;
             }
-            let first_sight = !workers.contains_key(&peer);
+            // #1f58fc16: re-arm on reappearance as well as true first sight.
+            // A peer absent from the live set for REARM_GAP and then seen
+            // again gets another bounded pass; duplicates are free at fold.
+            let now = std::time::Instant::now();
+            let rearm = last_seen
+                .get(&peer)
+                .is_some_and(|t| now.duration_since(*t) > REARM_GAP);
+            last_seen.insert(peer, now);
+            let first_sight = !workers.contains_key(&peer) || rearm;
             let queue = workers
                 .entry(peer)
                 .or_insert_with(|| spawn_peer_worker(Arc::downgrade(&inner), peer, &inner.config));
