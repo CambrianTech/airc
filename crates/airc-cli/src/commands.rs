@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use airc_core::{ClientId, EventId, PeerId, TranscriptCursor};
+use airc_core::{ClientId, EventId, PeerId, RoomId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
@@ -245,11 +245,58 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
         None
     };
 
+    // SOS rides ALONG with the live feed instead of waiting to be remembered.
+    //
+    // The out-of-band channel exists for the case where the wire is down — and
+    // that is precisely the case where nobody thinks to run `airc sos watch`,
+    // because the wire being down is not announced, it is INFERRED from silence.
+    // On 2026-08-12 two operators sat in that silence for hours; the human
+    // relayed between them by hand, and `airc sos` had been merged only that
+    // night after sitting unmerged through the exact outage it was built for.
+    //
+    // So: whenever this node streams a join, it also surfaces peer SOS posts.
+    // No flag, no verb to recall, no decision to make while blind. `poll_once`
+    // is cursor-gated and self-filtering, so a healthy node sees nothing and
+    // pays one `gh` call per interval; a blind one sees its peers.
+    //
+    // Best-effort and detached ON PURPOSE: SOS is the recovery channel, so it
+    // must never be able to take down the feed it backs up. A missing `gh`, an
+    // unauthenticated shell, or no SOS gist yet all degrade to "no fallback",
+    // which is exactly where we were before this existed.
+    let _sos_fallback = runtime_context
+        .should_stream_join()
+        .then(|| start_sos_fallback(home));
+
     if runtime_context.should_stream_join() {
         crate::join_feed::run(&airc).await?;
     }
     Ok(())
 }
+
+/// Poll the SOS gist alongside the live feed, printing any NEW peer posts.
+///
+/// Returns a task handle whose drop cancels the poll — it lives exactly as long
+/// as the join it accompanies.
+fn start_sos_fallback(home: &Path) -> tokio::task::JoinHandle<()> {
+    let home = home.to_path_buf();
+    tokio::spawn(async move {
+        // First poll is delayed: a node that just joined is the LEAST likely to
+        // need the fallback, and an immediate `gh` call on every join would tax
+        // the healthy path to serve the broken one.
+        loop {
+            tokio::time::sleep(SOS_FALLBACK_POLL_INTERVAL).await;
+            // Errors are swallowed rather than reported every tick: `gh` absent
+            // or unauthenticated is a STANDING condition, not an event, and a
+            // recurring complaint in a live feed is its own kind of noise. The
+            // explicit `airc sos status` says so plainly when asked.
+            let _ = crate::sos_commands::poll_fallback_once(&home).await;
+        }
+    })
+}
+
+/// How often a joined node checks the out-of-band channel. Deliberately slow:
+/// this is a rendezvous, not a bus, and the healthy case must stay cheap.
+const SOS_FALLBACK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 async fn start_join_heartbeat(
     airc: &Airc,
@@ -392,13 +439,39 @@ pub async fn ensure_daemon_running(
         .open(&log)?;
     let stderr = stdout.try_clone()?;
     let exe = std::env::current_exe()?;
-    let mut command = Command::new(exe);
+    // The daemon's HOME must be the home that OWNS the socket, not the
+    // caller's scope.
+    //
+    // `default_socket_path_in` resolves through `machine_account_home`, so a
+    // caller in a git-project scope (`<repo>/.airc`) legitimately shares the
+    // MACHINE-account socket — one daemon per machine is the design. But this
+    // spawn passed the CALLER's `home` through, so whichever scope happened to
+    // start the daemon first imposed ITS identity on every scope that later
+    // attached to that socket. Nothing detected it: both paths are real, the
+    // daemon is healthy, and `doctor` reports a clean bill.
+    //
+    // Measured on BIGMAMA 2026-08-12, the whole night's blackout in one line:
+    //
+    //   airc.exe --home \\?\C:\...\development\continuum\.airc \
+    //            daemon --socket C:\Users\joelt\.airc\runtime\airc-machine-...sock
+    //
+    // Downstream, all diagnosed separately as unrelated bugs before the cause
+    // was found: messages sent through the machine socket were served by the
+    // PROJECT identity, so they landed in a scope the intended peer was not
+    // enrolled in (a one-way mirror — our sends left, their replies could not
+    // arrive); the wrong scope means a different `peer_id`, hence a different
+    // `stable_lan_port`, so the advertised endpoint moved and peers' stored
+    // endpoints went stale (read from the far side as "SYN dropped / stale
+    // ports / firewall"); and the event store read as a monologue because it
+    // was the other scope's store.
+    //
+    // ONE rule, and now ONE implementation of it: `airc_lib::daemon_command`
+    // is the only place a daemon's `--home` is chosen. It was previously
+    // derived here and, separately, at `update_commands::daemon_command` —
+    // where it was missed, which is how `airc update` started taking nodes
+    // dark (#1352). A rule with two implementations has one that is wrong.
+    let mut command = airc_lib::daemon_command(&exe, home, "daemon", &socket);
     command
-        .arg("--home")
-        .arg(home)
-        .arg("daemon")
-        .arg("--socket")
-        .arg(&socket)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -675,7 +748,7 @@ fn resolve_gh_bin_with(override_bin: Option<std::path::PathBuf>) -> Option<std::
 }
 
 #[cfg(unix)]
-fn detach_daemon(command: &mut Command) {
+pub(crate) fn detach_daemon(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: this closure runs in the child just before exec and
     // only calls setsid, which is async-signal-safe.
@@ -690,7 +763,7 @@ fn detach_daemon(command: &mut Command) {
 }
 
 #[cfg(windows)]
-fn detach_daemon(command: &mut Command) {
+pub(crate) fn detach_daemon(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
@@ -957,6 +1030,159 @@ fn format_send_receipt(
     }
 }
 
+/// Presence horizon for the @mention audience check. Generous on
+/// purpose: a peer who reads this room but is between heartbeats must
+/// still count as audience — this warning exists to catch a peer who
+/// has NEVER been seen here, not to police liveness.
+const MENTION_AUDIENCE_WITHIN: Duration = Duration::from_secs(48 * 60 * 60);
+/// Presence-scan window for the @mention audience check (events).
+const MENTION_AUDIENCE_WINDOW: usize = 4096;
+
+/// The leading `@name` of a message body — the human addressing
+/// convention (`airc msg @peer …`). The `@` is a label, not routing:
+/// delivery is still room broadcast, which is exactly why the audience
+/// check below exists. Returns the bare name without `@`.
+fn leading_mention(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('@')?;
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// #270 family, live-proven 2026-08-12: a message addressed `@peer` was
+/// sent — twice, with green receipts — into a room whose channel id was
+/// the sender's own operator uuid, a room the addressed peer cannot
+/// hear. The receipt never said so, and the miss was diagnosed as a
+/// transport failure for an hour. This check resolves the leading
+/// @mention against the room's roster (durable presence + identity
+/// join) and returns a LOUD warning line when nobody matching the
+/// mention has ever been seen in the room. Advisory only: the send has
+/// already happened, the roster is presence-derived (an offline-but-
+/// subscribed peer beyond the horizon is a possible false alarm — the
+/// wording says "not seen", never "not subscribed"), and any roster
+/// error yields `None` so the check can never break a send.
+async fn mention_audience_warning(
+    airc: &Airc,
+    text: &str,
+    channel: RoomId,
+    channel_name: &str,
+) -> Option<String> {
+    let mention = leading_mention(text)?;
+    let roster = airc
+        .room_roster_in(
+            Some(channel),
+            MENTION_AUDIENCE_WITHIN,
+            MENTION_AUDIENCE_WINDOW,
+        )
+        .await
+        .ok()?;
+    mention_audience_verdict(mention, &roster, airc.peer_id(), channel_name)
+}
+
+/// The decision half of [`mention_audience_warning`], split out from the
+/// roster fetch so the wording is testable without an `Airc`.
+///
+/// The strong "has not been seen" line asserts ABSENCE. That is only
+/// honest when the roster could have answered the question at all — every
+/// OTHER peer in the window is named, so a failed match really does mean
+/// "not seen in this window". (Never "not subscribed": a peer quieter than
+/// [`MENTION_AUDIENCE_WITHIN`] is absent from the roster entirely, which is
+/// why the emitted string says "not seen" and hedges the rest.)
+/// `RoomMember::display_name` is documented as `None` for a peer that is
+/// PRESENT but has not published an identity card; a mention that matches
+/// nobody may simply BE one of those peers.
+///
+/// #262 caught the all-unnamed case. #1378 caught the same defect one
+/// level up, live on IntelMac 2026-09-04: both other grid peers were
+/// reported as "will NEVER receive this" seconds after each had posted,
+/// because a single OTHER named member satisfied `any()`. One named member
+/// cannot license a negative about a different, unnamed one — so the guard
+/// is `all`, not `any`.
+///
+/// Two things the #1378 review then caught in that fix (card 74e8e6af):
+///
+/// - **`me` is excluded from the accounting.** A roster includes `self`, so
+///   an operator who has never run `airc identity set` is an unnamed member
+///   of EVERY room: `unnamed > 0` would be permanently true, the strong line
+///   could never fire, and the soft line would describe the operator to
+///   themselves as a third party. `heard` still scans the FULL roster, so
+///   mentioning your own name resolves rather than warning.
+/// - **Peers are counted distinctly.** `room_roster_in` yields one row per
+///   (peer, client session) — two agent tabs on one box are two rows sharing
+///   a peer id — so a row count printed as "peer(s)" is a number the data
+///   does not support.
+fn mention_audience_verdict(
+    mention: &str,
+    roster: &[airc_lib::RoomMember],
+    me: airc_lib::PeerId,
+    channel_name: &str,
+) -> Option<String> {
+    let needle = mention.to_ascii_lowercase();
+    let heard = roster.iter().any(|member| {
+        member
+            .display_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(mention))
+            || member
+                .peer_id
+                .to_string()
+                .to_ascii_lowercase()
+                .starts_with(&needle)
+    });
+    if heard {
+        return None;
+    }
+    // Both clauses matter and neither depends on anyone's naming state: the
+    // "send in a room they read" half is what actually ended #270's hour of
+    // misdiagnosis, and after the `all` guard the soft path is the COMMON
+    // path in any room holding an uncarded peer.
+    let hint = "Check where they speak (`airc events list --limit 5000 --kind message`) \
+                and send in a room they read, e.g. `airc msg --room general ...`.";
+    let others: Vec<&airc_lib::RoomMember> = roster.iter().filter(|m| m.peer_id != me).collect();
+    let distinct = |members: &[&airc_lib::RoomMember]| {
+        members
+            .iter()
+            .map(|m| m.peer_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    // Two different facts, said separately: an empty roster means nobody was
+    // seen INCLUDING you, so "other than yourself" would imply you were.
+    if roster.is_empty() {
+        return Some(format!(
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no peer at all has been \
+             seen in this room within the presence window, so this mention cannot be \
+             resolved either way (#262). {hint}"
+        ));
+    }
+    if others.is_empty() {
+        return Some(format!(
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': no peer other than \
+             yourself has been seen in this room within the presence window, so this \
+             mention cannot be resolved either way (#262). {hint}"
+        ));
+    }
+    let unnamed: Vec<&airc_lib::RoomMember> = others
+        .iter()
+        .copied()
+        .filter(|m| m.display_name.is_none())
+        .collect();
+    if !unnamed.is_empty() {
+        return Some(format!(
+            "⚠ cannot verify '@{mention}' reaches '{channel_name}': {} of {} peer(s) seen \
+             here have not published an identity card, so a name match cannot succeed \
+             against them either way (#262). {hint}",
+            distinct(&unnamed),
+            distinct(&others)
+        ));
+    }
+    Some(format!(
+        "⚠ '@{mention}' has not been seen in '{channel_name}' (48h presence window) — \
+         if they are not subscribed to this room they will NEVER receive this. {hint}"
+    ))
+}
+
 /// `send` — local-fs single-shot send to the current room. Routes
 /// through `Airc::say`; ad-hoc `--peer` flags are enrolled in the
 /// in-process registry for the duration of the invocation.
@@ -991,7 +1217,7 @@ pub async fn run_send(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room + runtime
     // headers" path runs unchanged.
-    let (channel_name, channel_id) = match room {
+    let (channel_name, channel) = match room {
         Some(name) => {
             let receipt = airc
                 .publish(
@@ -1001,14 +1227,15 @@ pub async fn run_send(
                     runtime_headers()?,
                 )
                 .await?;
-            (receipt.channel_name, receipt.channel_id.to_string())
+            (receipt.channel_name, receipt.channel_id)
         }
         None => {
             let current = airc.current_room().await?;
             airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel.to_string())
+            (current.name, current.channel)
         }
     };
+    let channel_id = channel.to_string();
     // `peers()` is the enrolled-remote-peer address book, NOT a
     // delivery count — see `format_send_receipt` for why the receipt
     // says "queued/addressed" rather than "sent to N peers".
@@ -1027,6 +1254,9 @@ pub async fn run_send(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
+    if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
+        println!("{warning}");
+    }
     Ok(())
 }
 
@@ -1367,6 +1597,68 @@ pub async fn run_daemon(
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // REFUSE a socket this home does not own.
+    //
+    // A daemon serves ONE scope's identity to every client that attaches. If
+    // its `--home` is not the home the socket resolves from, it serves the
+    // wrong identity to everyone — silently, while looking completely healthy.
+    // That is not a degraded mode worth limping in; it is a wrong answer to
+    // every question, so it fails at startup instead of running.
+    //
+    // This is the guard that was missing on 2026-08-12. The spawn passed the
+    // caller's project home through to a machine-account socket, and NOTHING
+    // objected: daemon up, routes healthy, doctor 10/10 clean, while sends
+    // went into a scope the intended peer was not enrolled in. Two operators
+    // spent a night diagnosing the symptoms (stale ports, dropped SYNs, a
+    // monologue event store, a phantom "inbound not persisting" bug) because
+    // the one condition that explained all of them was never checked.
+    //
+    // The spawn is now correct, so this can only fire on a hand-rolled
+    // invocation — which is exactly when a human needs to be told, by name,
+    // which two scopes disagree.
+    // The invariant that is actually derivable HERE: a daemon's home must
+    // BE a machine-account root, not a project scope that merely resolves
+    // to one. `machine_account_home` is idempotent on a real machine home,
+    // so `machine_account_home(home) != home` is exactly "this is somebody
+    // else's scope". The socket path can NOT be re-derived for comparison —
+    // `resolve_socket_path` takes the scope home AND the machine home, so
+    // the same socket is minted from many scopes by design.
+    //
+    // EXEMPT a simulated account. `machine_account_home` documents a carve-out:
+    // when HOME/USERPROFILE is ITSELF temp-rooted, a harness is simulating a
+    // machine account with a TempDir and scopes deliberately SHARE it. Under
+    // that simulation `machine_account_home(home) != home` is the NORMAL,
+    // correct state, so the check above reads a legitimate pairing as theft.
+    //
+    // Measured: ~10 `codex_hook_*` tests plus `drain_stdin_timeout` failing with
+    // "daemon did not become ready" — a 22s hang each, because the daemon
+    // refused to start and the CLI waited out its readiness window. Caught by M5
+    // with a positive control (same test passes on canary's parent, fails with
+    // the guard) rather than from reading the diff, which is what made it a
+    // five-minute fix instead of a hunt.
+    //
+    // A guard that fires on correct configurations is worse than no guard: it
+    // does not merely fail tests, it teaches everyone to route around the check.
+    // Enforce only where a foreign socket is genuinely reachable — a real
+    // machine account, which is also the only place the original bug can bite.
+    let owning_home = airc_lib::machine_account_home(home);
+    let simulated_account = airc_core::temp_home::scope_home_is_temp_rooted(home);
+    if !simulated_account && owning_home.as_path() != home {
+        return Err(format!(
+            "refusing to serve a socket this scope does not own.\n  \
+             --home  {}\n  \
+             --socket {}\n  \
+             this home's machine account is {}\n\
+             A daemon serves ITS home's identity to every client on that socket, so \
+             serving a foreign one silently gives every caller the wrong peer_id, the \
+             wrong rooms, and the wrong advertised endpoint. Start the daemon with the \
+             home that owns the socket, or let `airc join` spawn it.",
+            home.display(),
+            socket.display(),
+            owning_home.display(),
+        )
+        .into());
+    }
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call
@@ -1411,7 +1703,7 @@ pub async fn run_daemon(
             identity.keypair,
             registry,
             VerificationPolicy::Strict,
-            machine_home,
+            machine_home.into_path_buf(),
             &db_path,
             coordinator_store,
             current_daemon_runtime_info(),
@@ -1525,7 +1817,10 @@ pub async fn run_daemon(
                 // down on the first tick.
                 match daemon_state.delivery_stats.try_read() {
                     Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
-                        stats.iter().map(|s| (s.attempts_since_ack, s.suspect)),
+                        stats
+                            .peers
+                            .iter()
+                            .map(|s| (s.attempts_since_ack, s.suspect)),
                     ),
                     Err(_) => {
                         // Contended write (stats being refreshed). Skip THIS
@@ -1657,6 +1952,26 @@ pub async fn run_daemon(
                          (LAN dialed first; off-LAN peers fall through to Tailscale \
                          after a ~3s LAN-rung timeout, once per session)"
                     );
+                    // LAN presence beacon: same-network peers discover this
+                    // node (and it discovers them) with ZERO gh requests —
+                    // the gh rendezvous stays the CROSS-network path only.
+                    // Non-fatal on purpose: a node that cannot join the
+                    // multicast group (locked-down interface, container
+                    // without multicast) still dials out and still rides the
+                    // rendezvous; it says so once, loudly, instead of
+                    // failing the daemon.
+                    let presence_port = endpoints.iter().find_map(|endpoint| {
+                        if let airc_lib::RouteEndpoint::LanTcp { addr } = endpoint {
+                            Some(addr.port())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(port) = presence_port {
+                        if let Err(error) = airc.start_lan_presence(port) {
+                            eprintln!("airc daemon: {error}");
+                        }
+                    }
                     // Self-healing join — publish-on-bind: a freshly bound
                     // listener (daemon restart, possibly on a NEW port when
                     // the stable port was taken) must propagate to the
@@ -1858,7 +2173,7 @@ fn spawn_route_refresh(
 async fn refresh_routes_once(
     airc: &Airc,
     connected_lan_peers: &std::sync::atomic::AtomicUsize,
-    delivery_stats: &tokio::sync::RwLock<Vec<airc_ipc::IpcPeerDeliveryStats>>,
+    delivery_stats: &tokio::sync::RwLock<airc_ipc::DeliveryStatsResponse>,
     endpoint_resync: &tokio::sync::Notify,
     rendezvous: &SharedRendezvousSlot,
 ) {
@@ -1989,7 +2304,14 @@ async fn refresh_routes_once(
                         suspect: stats.suspect(),
                     })
                     .collect::<Vec<_>>();
-                *delivery_stats.write().await = rows;
+                *delivery_stats.write().await = airc_ipc::DeliveryStatsResponse {
+                    peers: rows,
+                    sampled_at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|elapsed| elapsed.as_millis() as u64),
+                    connected_lan_peers: Some(snapshot.connected_lan_peers.len()),
+                };
             }
 
             // #1247 slice 4b — relay self-election. When this node can
@@ -2113,6 +2435,10 @@ fn relay_bind_candidates(persisted: Option<u16>) -> Vec<u16> {
 /// Self-elect as a relay on a RESTART-STABLE port (#267). Tries the
 /// persisted previous port, falls back to OS-assigned, and persists
 /// whatever actually bound so the next incarnation lands on it again.
+// AircError is >=128B (clippy 1.98 result_large_err); this is a cold
+// startup path, not a hot loop — scoped allow until AircError's large
+// variants are boxed library-wide.
+#[allow(clippy::result_large_err)]
 async fn become_relay_with_stable_port(
     airc: &Airc,
     lan_ip: Option<std::net::Ipv4Addr>,
@@ -2169,54 +2495,23 @@ pub async fn run_ping(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// `status` — daemon health snapshot.
-///
-/// Card 2bdae532: regression-fix. Earlier builds auto-spawned the
-/// daemon if the socket wasn't reachable, so `airc status` doubled as
-/// a "make the daemon ready" command. The current binary had lost
-/// that, so a fresh attach (cargo install then airc status) failed
-/// with "daemon not reachable: No such file or directory" with no
-/// next step — Codex hit this on first onboard 2026-05-28. Restoring
-/// `ensure_daemon_running` before the probe gives every recipe that
-/// says "run `airc status` first" a working contract again.
+/// Observe the existing daemon without spawning or repairing it.
+/// Health probes must not restart an old binary during an update or hide an outage.
 pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    // `ensure_daemon_running` may SPAWN a daemon (see card 2bdae532 above), which
-    // makes this command unable to report "down" — asking creates the answer.
-    // That is fine as convenience and fatal as a measurement, so establish
-    // whether one was already answering BEFORE we ensure, and say so.
-    //
-    // Incident 2026-08-08: a grid blackout drill measured a 0.0s outage across
-    // an `airc update` because its probe was `airc status`. The positive control
-    // failed — status reported UP one second after `airc stop` — and the number
-    // was retracted. An instrument that changes what it measures reads as
-    // healthy precisely when the thing it watches is broken.
-    //
-    // Worse than a bad number: anything polling `status` DURING an update
-    // respawns a daemon from the OLD binary mid-swap, which is a candidate cause
-    // of the stale-process class `update_commands.rs` already guards against
-    // ("a stale process that survived `stop_daemon` answers IPC perfectly").
-    //
-    // The spawn is NOT removed — 2bdae532 added it so a fresh onboard has a
-    // working contract, and breaking onboarding to fix an honesty bug trades one
-    // defect for another. It is now DISCLOSED instead, and `airc ping` remains
-    // the non-spawning probe for anyone who needs to observe rather than ensure.
-    let was_already_up = DaemonClient::new(socket.clone())
-        .status_with_timeout(Duration::from_millis(250))
-        .await
-        .is_ok();
-
-    ensure_daemon_running(home, socket.clone(), Vec::new()).await?;
-    let client = DaemonClient::new(socket);
-    let status = client.status().await?;
-    if !was_already_up {
-        println!(
-            "note: no daemon was answering — this command STARTED one. \
-             It was not running until you asked. Use `airc ping` to observe \
-             liveness without starting anything."
-        );
-    }
+    let client = DaemonClient::new(socket.clone());
+    let status = client.status().await.map_err(|error| {
+        format!(
+            "daemon unavailable at {} (scope {}): {error}. No daemon was started. \
+             Run `airc join` to start or reconnect this scope explicitly.",
+            socket.display(),
+            home.display()
+        )
+    })?;
     println!("peer_id:        {}", status.peer_id);
     println!("uptime_seconds: {}", status.uptime_seconds);
+    if let Some(connections) = status.connections {
+        println!("connections: {connections}");
+    }
     if let Some(version) = status.ipc_protocol_version {
         println!("ipc_protocol:   {version}");
     }
@@ -2264,7 +2559,7 @@ pub async fn run_msg(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room" path runs
     // unchanged.
-    let (channel_name, channel_id) = match room {
+    let (channel_name, channel) = match room {
         Some(name) => {
             let receipt = airc
                 .publish(
@@ -2274,14 +2569,15 @@ pub async fn run_msg(
                     runtime_headers()?,
                 )
                 .await?;
-            (receipt.channel_name, receipt.channel_id.to_string())
+            (receipt.channel_name, receipt.channel_id)
         }
         None => {
             let current = airc.current_room().await?;
             airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel.to_string())
+            (current.name, current.channel)
         }
     };
+    let channel_id = channel.to_string();
     // Same enrolled-vs-delivered honesty fix as run_send, for the
     // daemon-attached send path. `peers()` is the address book, not a
     // delivery receipt; the daemon's live-connection count (Status) is
@@ -2296,12 +2592,16 @@ pub async fn run_msg(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
+    if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
+        println!("{warning}");
+    }
     Ok(())
 }
 
 pub async fn run_inbox(
     home: &Path,
     socket: Option<PathBuf>,
+    room: Option<&str>,
     since_lamport: Option<u64>,
     since_event_id: Option<String>,
     limit: Option<usize>,
@@ -2313,6 +2613,15 @@ pub async fn run_inbox(
             Airc::attach(home, socket).await?
         }
         None => attached_airc(home).await?,
+    };
+    // `--room` reads a room this scope is subscribed to WITHOUT moving
+    // the default-room pointer — the read sibling of `airc msg --room`.
+    // Same resolver the writes use (name or channel id, loud refusal for
+    // an unsubscribed room, never auto-joins), so a room `msg --room` can
+    // reach is exactly a room `inbox --room` can read.
+    let room = match room {
+        Some(name) => airc.room_by_name_or_channel(name, "read").await?,
+        None => airc.current_room().await?,
     };
     // Both --since-lamport and --since-event-id must be supplied
     // together; the cursor is a tuple per grievance §7.
@@ -2331,28 +2640,33 @@ pub async fn run_inbox(
     };
     let effective_limit = limit.unwrap_or(32);
     let events = match since {
-        Some(cursor) => airc.resume_from(&cursor, effective_limit).await?,
-        None => airc.page_recent(effective_limit).await?,
+        Some(cursor) => airc.resume_from_in(&room, &cursor, effective_limit).await?,
+        None => airc.page_recent_in(&room, effective_limit).await?,
     };
-    // #270: `inbox` reads ONE room (the current one) — say so, loudly,
-    // and name what it is NOT showing. The unlabeled view is how "your
-    // message isn't in my inbox" became a false transport diagnosis
-    // twice in one day: the message was in the store the whole time,
-    // in a subscribed room that wasn't current.
+    // #270: `inbox` reads ONE room — say so, loudly, and name what it is
+    // NOT showing. The unlabeled view is how "your message isn't in my
+    // inbox" became a false transport diagnosis twice in one day: the
+    // message was in the store the whole time, in a subscribed room that
+    // wasn't current.
+    //
+    // The remedy this prints is now `--room <name>`, not `airc room
+    // <name>`: reading another room must not require MOVING this scope's
+    // default-room pointer. Telling the operator to switch rooms in order
+    // to read one was the bug wearing a label.
     if !as_json {
-        if let (Ok(current), Ok(set)) = (airc.current_room().await, airc.subscription_set().await) {
+        if let Ok(set) = airc.subscription_set().await {
             let others: Vec<String> = set
                 .all()
-                .filter(|s| s.name.as_str() != current.name)
+                .filter(|s| s.name.as_str() != room.name)
                 .map(|s| s.name.as_str().to_string())
                 .collect();
             if others.is_empty() {
-                println!("inbox: room '{}' (your only subscribed room)", current.name);
+                println!("inbox: room '{}' (your only subscribed room)", room.name);
             } else {
                 println!(
                     "inbox: room '{}' ONLY — {} other subscribed room(s) NOT shown: {} \
-                     (switch with `airc room <name>`)",
-                    current.name,
+                     (read one with `airc inbox --room <name>`)",
+                    room.name,
                     others.len(),
                     others.join(", ")
                 );
@@ -2377,6 +2691,79 @@ pub async fn run_inbox(
             "cursor: lamport={} event_id={} — pass both as --since-lamport / --since-event-id",
             cursor.lamport, cursor.event_id
         );
+    }
+    Ok(())
+}
+
+/// `airc inbox --all` — the newest `limit` events of EVERY subscribed room,
+/// grouped by room, rooms ordered by their newest event (most recent first).
+/// The one-room blindness fix (card a0772bba): a reader that can only see
+/// one room at a time turns every fleet rule that depends on hearing a peer
+/// — silent-means-down, review windows, claim boundaries — into a coin flip.
+/// Reads only; never moves the default-room pointer, never joins.
+pub async fn run_inbox_all(
+    home: &Path,
+    socket: Option<PathBuf>,
+    limit: Option<usize>,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let airc = match socket {
+        Some(socket) => {
+            let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
+            Airc::attach(home, socket).await?
+        }
+        None => attached_airc(home).await?,
+    };
+    let per_room = limit.unwrap_or(8).max(1);
+    let set = airc.subscription_set().await?;
+    let mut groups: Vec<(airc_lib::Room, Vec<airc_core::TranscriptEvent>)> = Vec::new();
+    for sub in set.all() {
+        let room = sub.as_room();
+        let events = airc.page_recent_in(&room, per_room).await?;
+        groups.push((room, events));
+    }
+    // Newest activity first; a room with nothing sinks to the bottom.
+    groups.sort_by_key(|(_, events)| {
+        std::cmp::Reverse(events.last().map(|e| e.occurred_at_ms).unwrap_or(0))
+    });
+    if as_json {
+        let rooms: Vec<serde_json::Value> = groups
+            .iter()
+            .map(|(room, events)| {
+                serde_json::json!({
+                    "room": room.name,
+                    "channel": room.channel.to_string(),
+                    "count": events.len(),
+                    "events": events,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "rooms": rooms }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "inbox --all: {} subscribed room(s), newest {} per room, most recent room first",
+        groups.len(),
+        per_room
+    );
+    for (room, events) in &groups {
+        println!();
+        if events.is_empty() {
+            println!("── {} (channel {}) — no events", room.name, room.channel);
+            continue;
+        }
+        println!(
+            "── {} (channel {}) — {} event(s)",
+            room.name,
+            room.channel,
+            events.len()
+        );
+        for event in events {
+            print_event(event);
+        }
     }
     Ok(())
 }
@@ -3044,6 +3431,156 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    /// what this catches (live 2026-08-12): the @mention parse feeding the
+    /// deaf-room warning. `@name` at the start of a body is an addressing
+    /// intent and must lift the bare name (stopping at the first
+    /// non-name char); a mid-text `@`, a bare `@`, or plain prose must
+    /// not — a false mention would fire the audience warning on
+    /// messages that never addressed anyone.
+    #[test]
+    fn leading_mention_lifts_addressing_intent_only() {
+        assert_eq!(
+            leading_mention("@BigMama LANE SPLIT per Joel"),
+            Some("BigMama")
+        );
+        assert_eq!(
+            leading_mention("@peer-7711fe60: ping"),
+            Some("peer-7711fe60")
+        );
+        assert_eq!(leading_mention("@M5,ack"), Some("M5"));
+        assert_eq!(leading_mention("hello @BigMama"), None);
+        assert_eq!(leading_mention("@ stray at"), None);
+        assert_eq!(leading_mention("plain prose"), None);
+        assert_eq!(leading_mention(""), None);
+    }
+
+    fn roster_member(name: Option<&str>) -> airc_lib::RoomMember {
+        airc_lib::RoomMember {
+            peer_id: airc_lib::PeerId(uuid::Uuid::new_v4()),
+            display_name: name.map(str::to_string),
+            runtime: "test".to_string(),
+            availability: None,
+            last_seen_ms: 0,
+        }
+    }
+
+    /// what this catches (live 2026-09-04, #262 follow-up): asserting ABSENCE
+    /// about a peer the roster structurally cannot resolve. Both other grid
+    /// peers were told "@them will NEVER receive this" seconds after each had
+    /// posted into the room, because ONE other member — the sender's own
+    /// published card — satisfied the old `any(display_name.is_some())` guard.
+    /// `display_name: None` means present-but-unnamed, so an unmatched mention
+    /// may BE that peer; only an all-named roster can license the strong line.
+    ///
+    /// The mixed roster must hold a named OTHER peer, not just a named `me`:
+    /// once `me` is excluded from the accounting (card 74e8e6af) an all-unnamed
+    /// remainder is merely the #262 case, which was already fixed before #1378.
+    /// The invariant that needs pinning is one named peer failing to license a
+    /// negative about a DIFFERENT unnamed one.
+    ///
+    /// Mutation check: expressing the guard as `any` over either subject —
+    /// `roster` or `others` — fails the mixed-roster asserts below.
+    #[test]
+    fn absence_is_only_asserted_when_every_present_peer_is_named() {
+        let strong = "will NEVER receive";
+        let me = roster_member(Some("IntelMac"));
+
+        // Mixed roster — the live shape. A named OTHER member must NOT license
+        // a negative about the unnamed one beside it.
+        let mixed = vec![me.clone(), roster_member(Some("M5")), roster_member(None)];
+        let warning = mention_audience_verdict("BigMama", &mixed, me.peer_id, "academy")
+            .expect("unresolvable");
+        assert!(!warning.contains(strong), "asserted absence: {warning}");
+        assert!(warning.contains("1 of 2 peer(s)"), "vague: {warning}");
+
+        // Empty roster — nobody seen at all cannot license it either.
+        let empty =
+            mention_audience_verdict("M5", &[], me.peer_id, "academy").expect("unresolvable");
+        assert!(!empty.contains(strong), "asserted absence: {empty}");
+
+        // All named and no match — the roster CAN answer, so the loud line is
+        // earned. This is the #270 case the warning exists for.
+        let named = vec![me.clone(), roster_member(Some("M5"))];
+        let deaf =
+            mention_audience_verdict("BigMama", &named, me.peer_id, "academy").expect("absent");
+        assert!(deaf.contains(strong), "lost the real warning: {deaf}");
+        // Both soft paths and the strong one carry the remediation that ended
+        // #270 — it is true regardless of anyone's naming state.
+        for line in [&warning, &empty, &deaf] {
+            assert!(line.contains("--room general"), "lost remediation: {line}");
+        }
+
+        // A present, named match stays silent.
+        assert!(mention_audience_verdict("m5", &named, me.peer_id, "academy").is_none());
+
+        // Peer-id prefixes are two DIFFERENT properties and both need pinning:
+        // an unnamed OTHER peer is still resolvable by id (so no warning), and
+        // `heard` scanning the full roster means your OWN id resolves too —
+        // otherwise self-exclusion would emit "@you has not been seen here".
+        let other = roster_member(None);
+        let other_prefix = other.peer_id.to_string()[..8].to_uppercase();
+        let by_id = vec![me.clone(), other.clone()];
+        assert!(mention_audience_verdict(&other_prefix, &by_id, me.peer_id, "academy").is_none());
+        let own_prefix = me.peer_id.to_string()[..8].to_uppercase();
+        assert!(mention_audience_verdict(&own_prefix, &by_id, me.peer_id, "academy").is_none());
+    }
+
+    /// what this catches (#1378 review, card 74e8e6af): two defects in the
+    /// `all` guard itself, both of which put a number or a verdict in front of
+    /// the operator that the roster does not support.
+    ///
+    /// 1. A roster INCLUDES self. An operator who never ran `airc identity set`
+    ///    is an unnamed member of every room, so counting self would make
+    ///    `unnamed > 0` permanently true — the #270 warning could never fire
+    ///    again for exactly the fresh-install operator most likely to need it,
+    ///    and the soft line would describe them to themselves as a third party.
+    /// 2. `room_roster_in` yields one row per (peer, CLIENT SESSION), so two
+    ///    agent tabs on one box are two rows sharing a peer id. Counting rows
+    ///    and printing "peer(s)" is a fabricated number.
+    ///
+    /// Mutation check: counting `roster` instead of `others` fails the first
+    /// assert; counting rows instead of distinct peer ids fails the second.
+    #[test]
+    fn the_count_is_distinct_peers_and_never_includes_the_sender() {
+        let me = roster_member(None); // uncarded operator — the fresh-install shape
+
+        // Self must not suppress the real warning, even unnamed.
+        let named_other = vec![me.clone(), roster_member(Some("M5"))];
+        let deaf = mention_audience_verdict("BigMama", &named_other, me.peer_id, "academy")
+            .expect("absent");
+        assert!(
+            deaf.contains("will NEVER receive"),
+            "self suppressed the #270 warning: {deaf}"
+        );
+
+        // Two sessions of ONE unnamed peer is one peer, not two — and the
+        // named peer plus that one makes two, not three.
+        let twice = roster_member(None);
+        let mut second_session = twice.clone();
+        second_session.runtime = "codex".to_string();
+        let rows = vec![
+            me.clone(),
+            twice.clone(),
+            second_session,
+            roster_member(Some("M5")),
+        ];
+        let soft = mention_audience_verdict("BigMama", &rows, me.peer_id, "academy")
+            .expect("unresolvable");
+        assert!(
+            soft.contains("1 of 2 peer(s)"),
+            "counted rows, not peers: {soft}"
+        );
+
+        // A roster of only the sender cannot license anything.
+        let alone = vec![me.clone()];
+        let solo =
+            mention_audience_verdict("M5", &alone, me.peer_id, "academy").expect("unresolvable");
+        assert!(
+            solo.contains("no peer other than yourself"),
+            "counted self as an audience: {solo}"
+        );
+    }
+
     /// what this catches (#267): relay self-election must try the PERSISTED
     /// previous port before an OS-assigned one — port drift across daemon
     /// restarts is what stranded every peer's imported relay card on a dead
@@ -3422,6 +3959,7 @@ mod tests {
             build_branch: Some("rust-rewrite".to_string()),
             executable: Some("/tmp/airc".to_string()),
             connected_lan_peers: 0,
+            connections: None,
         }
     }
 

@@ -38,10 +38,32 @@ pub(crate) fn reserve_guarded_request(
     // governor (two implementations over one budget file is the
     // registry_bridge smell).
     let cap = limit.saturating_sub(airc_lib::gh::governor::REGISTRY_FLOOR);
-    if count >= cap {
+    // SOS is the channel of last resort: it is what a human or agent
+    // reaches for precisely when the wire is down and the poller is hot.
+    // Starving it behind the same bucket as beacon/channel polling meant
+    // "airc sos watch" answered "budget exceeded" during the exact
+    // incident it exists to coordinate — observed live 2026-08-13, and
+    // it is why an operator concluded the emergency channel was dead.
+    // It gets its own reserve above the poller cap, mirroring the
+    // REGISTRY_FLOOR carve-out one tier down.
+    let effective_cap = if is_sos_request(args) {
+        cap + SOS_RESERVE
+    } else {
+        cap
+    };
+    if count >= effective_cap {
+        // Report when the LOCAL window actually frees, not the shared
+        // backoff. `wait_seconds` reads GitHub's voice, which is 0 here —
+        // so the old message told the caller "retry in 0s" while refusing
+        // them, and a retry loop honoring it would spin at full speed
+        // against the very limiter that just said no.
         return Ok((
             false,
-            format!("local request budget exceeded ({count}/{cap} of {limit} in 60s)"),
+            format!(
+                "local request budget exceeded ({count}/{effective_cap} of {limit} in 60s); \
+                 window frees in {}s",
+                local_window_frees_in(now)?
+            ),
         ));
     }
     if guarded_command(args) {
@@ -137,6 +159,36 @@ fn write_backoff(until: f64) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&tmp, format!("{}", until as i64))?;
     fs::rename(tmp, path)
+}
+
+/// Extra 60s-window slots reserved for `airc sos`, ON TOP of the poller
+/// cap. Small on purpose: SOS is low-rate human/agent coordination, not a
+/// poller, so a handful of slots is the difference between "the emergency
+/// channel answers" and "the emergency channel is dead".
+const SOS_RESERVE: usize = 6;
+
+/// True when this gh invocation is SOS traffic (the gist-comment channel
+/// of last resort). Matched on the request itself rather than threaded
+/// through as a flag so no future caller can forget to mark it.
+fn is_sos_request(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg.contains("/comments") || arg == "rate_limit")
+}
+
+/// Seconds until the OLDEST request in the sliding window ages out — i.e.
+/// when a slot actually frees. Returns 1 rather than 0 when the window is
+/// somehow empty, because a refusal must never advertise "retry now".
+fn local_window_frees_in(now: f64) -> std::io::Result<i64> {
+    let oldest = fs::read_to_string(budget_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .filter(|ts| *ts >= now - 60.0)
+        .fold(f64::INFINITY, f64::min);
+    if !oldest.is_finite() {
+        return Ok(1);
+    }
+    Ok(((oldest + 60.0 - now).ceil() as i64).max(1))
 }
 
 fn recent_request_count(now: f64) -> std::io::Result<usize> {

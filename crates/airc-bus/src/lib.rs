@@ -44,6 +44,7 @@ pub mod ring;
 pub mod router;
 pub mod seq;
 pub mod sink;
+mod subscriber_index;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use envelope::{Cursor, DeliveryClass, Envelope, Kind, Seq, Target};
@@ -51,6 +52,8 @@ pub use ephemeral::EphemeralCache;
 pub use error::{BusError, Result};
 pub use filter::Filter;
 pub use ring::HotRing;
-pub use router::{EventRouter, ForwardItem, LagFlag, PublishIfNew, RouterConfig};
+pub use router::{
+    EventRouter, ForwardItem, ForwardKey, ForwardLatest, LagFlag, PublishIfNew, RouterConfig,
+};
 pub use seq::{EpochStore, InMemoryEpochStore, SeqSource};
 pub use sink::{DurableSink, InMemoryDurableSink};

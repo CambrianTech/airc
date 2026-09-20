@@ -12,6 +12,37 @@ use sha2::{Digest, Sha256};
 
 #[cfg(any(unix, test))]
 use airc_core::humanhash;
+use airc_core::{ClientId, TranscriptEvent};
+use airc_protocol::HEADER_AIRC_CLIENT;
+
+/// Self-echo policy for one runtime sharing a durable AIRC identity.
+/// Borrows the runtime tag; filtering inspects only headers and the client ID.
+pub(crate) struct RuntimeSelfFilter<'a> {
+    client_id: ClientId,
+    runtime_client: Option<&'a str>,
+}
+
+impl<'a> RuntimeSelfFilter<'a> {
+    pub(crate) fn new(client_id: ClientId, runtime_client: Option<&'a str>) -> Self {
+        Self {
+            client_id,
+            runtime_client,
+        }
+    }
+
+    pub(crate) fn is_self_event(&self, event: &TranscriptEvent) -> bool {
+        // Shared HOME can share BOTH peer_id and client_id. A stamped runtime
+        // header is authoritative: a different tag (or no local tag) stays
+        // visible, regardless of either durable identity matching.
+        if let Some(event_client) = event.headers.get(HEADER_AIRC_CLIENT) {
+            return self.runtime_client.is_some_and(|rc| event_client == rc);
+        }
+        // Historical unstamped events retain the Codex hook's narrower client
+        // fallback. It is still ambiguous on shared HOME; peer equality cannot
+        // resolve that ambiguity and must never hide another runtime's header.
+        event.client_id == self.client_id
+    }
+}
 
 #[cfg(any(unix, test))]
 const AGENT_PREFIX: &str = "agent:";
@@ -143,7 +174,66 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_label, current_client_id};
+    use airc_core::{
+        Body, ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
+    };
+
+    use super::{
+        agent_label, current_client_id, RuntimeSelfFilter, TranscriptEvent, HEADER_AIRC_CLIENT,
+    };
+
+    #[test]
+    fn runtime_self_filter_header_is_authoritative_across_shared_identities() {
+        let local_client = ClientId::new();
+        let local_peer = PeerId::new();
+        let self_filter = RuntimeSelfFilter::new(local_client, Some("codex:thread-1"));
+        let no_runtime = RuntimeSelfFilter::new(local_client, None);
+        let mut event = TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: RoomId::new(),
+            peer_id: local_peer,
+            client_id: local_client,
+            kind: TranscriptKind::Message,
+            occurred_at_ms: 1,
+            lamport: 1,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            // Identity-like body content is deliberately irrelevant. The
+            // predicate must not sniff or deserialize it to determine self.
+            body: Some(Body::text(r#"{"airc.client":"codex:thread-1"}"#)),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+
+        for peer_id in [local_peer, PeerId::new()] {
+            for client_id in [local_client, ClientId::new()] {
+                event.peer_id = peer_id;
+                event.client_id = client_id;
+                event
+                    .headers
+                    .insert(HEADER_AIRC_CLIENT.to_string(), "codex:thread-1".to_string());
+                assert!(self_filter.is_self_event(&event));
+                assert!(!no_runtime.is_self_event(&event));
+
+                event.headers.insert(
+                    HEADER_AIRC_CLIENT.to_string(),
+                    "claude:session-1".to_string(),
+                );
+                assert!(!self_filter.is_self_event(&event));
+                assert!(!no_runtime.is_self_event(&event));
+
+                // An unrelated header cannot impersonate the runtime tag;
+                // unstamped events keep the existing durable-client fallback.
+                event.headers.remove(HEADER_AIRC_CLIENT);
+                event
+                    .headers
+                    .insert("other.client".to_string(), "codex:thread-1".to_string());
+                assert_eq!(self_filter.is_self_event(&event), client_id == local_client);
+                assert_eq!(no_runtime.is_self_event(&event), client_id == local_client);
+            }
+        }
+    }
 
     #[test]
     fn explicit_env_wins() {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::error::AircError;
 use crate::route::{RouteClass, RouteDecision, TransportResolver, TransportRoute};
-use crate::stream::{EventFilter, EventStream, FilteredEventStream};
+use crate::stream::{EventFilter, EventScan, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
 
@@ -199,7 +199,7 @@ impl Airc {
         // "wrote it down" with "you heard it" is what made an offline node
         // mute.
         let __route = airc_diagnostics::timing::start();
-        match self.resolve_send_route(kind) {
+        match self.resolve_send_route(kind, &frame.envelope.target).await {
             Ok(route) => {
                 if let Err(error) = self.execute_send_route(route.kind, room, frame).await {
                     tracing::warn!(
@@ -233,11 +233,48 @@ impl Airc {
         })
     }
 
-    fn resolve_send_route(&self, kind: FrameKind) -> Result<TransportRoute, AircError> {
+    async fn resolve_send_route(
+        &self,
+        kind: FrameKind,
+        target: &airc_core::MentionTarget,
+    ) -> Result<TransportRoute, AircError> {
         let class = route_class_for_frame(kind);
-        let samples = self.inner.route_health.samples();
-        TransportResolver::from_health(samples)
-            .resolve(class)
+        // Peer-directed frames may ride the per-peer direct rung — but only
+        // on the EVIDENCE of an established DataChannel to that exact peer
+        // (see RouteTarget docs; a phantom claim would route frames into
+        // "no webrtc channel for peer" instead of a live Relay).
+        let route_target = match target {
+            airc_core::MentionTarget::Peer(peer) => crate::route::policy::RouteTarget::Peer {
+                webrtc_channel_ready: self.has_webrtc_channel(*peer).await,
+            },
+            airc_core::MentionTarget::All | airc_core::MentionTarget::Room(_) => {
+                crate::route::policy::RouteTarget::Broadcast
+            }
+        };
+        let mut candidates = self
+            .inner
+            .route_health
+            .samples()
+            .into_iter()
+            .map(crate::route::health::TransportHealthSample::candidate)
+            .collect::<Vec<_>>();
+        // The per-peer DataChannel never registers in the kind-keyed health
+        // table (one row can't speak for N peers); the registered channel to
+        // THIS peer is its own health evidence, injected per-resolution.
+        if matches!(
+            route_target,
+            crate::route::policy::RouteTarget::Peer {
+                webrtc_channel_ready: true
+            }
+        ) {
+            candidates.push(crate::route::policy::TransportCandidate {
+                kind: crate::route::policy::TransportKind::WebRtcDataChannel,
+                role: crate::route::policy::TransportRole::Direct,
+                healthy: true,
+            });
+        }
+        TransportResolver::new(candidates)
+            .resolve_for_target(class, route_target)
             .map_err(format_route_refusal)
     }
 
@@ -278,7 +315,9 @@ impl Airc {
     pub async fn subscribe(&self) -> Result<EventStream, AircError> {
         let room = self.current_room().await?;
         if self.is_daemon_attached() {
-            return self.daemon_subscribe(vec![room.channel]).await;
+            return self
+                .daemon_subscribe(vec![room.channel], None, airc_core::HeaderFilter::Any)
+                .await;
         }
         let rx = self.inner.live_tx.subscribe();
         Ok(EventStream::from_broadcast(rx))
@@ -303,6 +342,32 @@ impl Airc {
         &self,
         filter: EventFilter,
     ) -> Result<FilteredEventStream, AircError> {
+        self.subscribe_subscribed_delivery(filter, None).await
+    }
+
+    /// [`Self::subscribe_subscribed_filtered`] with a ROUTER-SIDE
+    /// delivery-class filter: when `delivery` is `Some`, the daemon only
+    /// fans out events of those classes to this subscription — nothing
+    /// else ever crosses the socket. The caller's
+    /// `filter.headers_filter` also rides the attach, so header
+    /// predicates (including `HeaderFilter::Not` exclusions — e.g.
+    /// dropping `airc.heartbeat.*`-stamped liveness beacons) are
+    /// enforced BEFORE fan-out too, not just client-side after a
+    /// decode the consumer paid for. This is the consumer-shaped
+    /// subscription [`airc_ipc::AttachRequest`] always supported and
+    /// clients never used: a mind that perceives settled room lines
+    /// attaches with `[IpcDelivery::Durable]` and stops paying a decode
+    /// per peer StreamChunk / ephemeral fan-out (measured on a continuum
+    /// node 2026-08-15: 6,736 events crossed to every persona in 40
+    /// minutes, 100% discarded post-decode). The `EventFilter` still
+    /// applies client-side on top, and is the ONLY filter on the
+    /// non-daemon (in-process broadcast) fallback, which has no router
+    /// to filter at.
+    pub async fn subscribe_subscribed_delivery(
+        &self,
+        filter: EventFilter,
+        delivery: Option<Vec<airc_ipc::IpcDelivery>>,
+    ) -> Result<FilteredEventStream, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
         if self.is_daemon_attached() {
             let channels: Vec<airc_core::RoomId> = self
@@ -312,7 +377,9 @@ impl Airc {
                 .map(|sub| sub.as_room().channel)
                 .collect();
             return Ok(FilteredEventStream {
-                inner: self.daemon_subscribe(channels).await?,
+                inner: self
+                    .daemon_subscribe(channels, delivery, filter.headers_filter.clone())
+                    .await?,
                 filter,
             });
         }
@@ -324,10 +391,31 @@ impl Airc {
     }
 
     /// Fetch the most recent `limit` events from the current room.
+    ///
+    /// The current room is the DEFAULT scope for this read, not the only
+    /// one it can express: this is `page_recent_in` against
+    /// `current_room()`. Callers that already know which room they want
+    /// (`airc inbox --room`, a consumer paging a room it is subscribed to
+    /// but not sitting in) call `page_recent_in` directly and never have
+    /// to move the scope's default-room pointer to perform a READ.
     pub async fn page_recent(&self, limit: usize) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
+        self.page_recent_in(&room, limit).await
+    }
+
+    /// Fetch the most recent `limit` events from `room`.
+    ///
+    /// The room-explicit half of `page_recent` — same daemon-attached
+    /// routing, no implicit scope. Resolve `room` with
+    /// `room_by_name_or_channel`, which refuses loudly for a room this
+    /// scope is not subscribed to (reading must not auto-join).
+    pub async fn page_recent_in(
+        &self,
+        room: &crate::Room,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
         if self.is_daemon_attached() {
-            return self.daemon_page_recent(&room, limit).await;
+            return self.daemon_page_recent(room, limit).await;
         }
         Ok(self
             .inner
@@ -457,15 +545,29 @@ impl Airc {
             .collect())
     }
 
-    /// Fetch up to `limit` events strictly after `cursor`.
+    /// Fetch up to `limit` events strictly after `cursor` in the current room.
+    ///
+    /// `resume_from_in` against `current_room()` — see `page_recent` for why
+    /// the current room is a default here rather than the only expressible
+    /// scope.
     pub async fn resume_from(
         &self,
         cursor: &TranscriptCursor,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let room = self.current_room().await?;
+        self.resume_from_in(&room, cursor, limit).await
+    }
+
+    /// Fetch up to `limit` events strictly after `cursor` in `room`.
+    pub async fn resume_from_in(
+        &self,
+        room: &crate::Room,
+        cursor: &TranscriptCursor,
+        limit: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
         if self.is_daemon_attached() {
-            return self.daemon_resume_from(&room, cursor, limit).await;
+            return self.daemon_resume_from(room, cursor, limit).await;
         }
         Ok(self
             .inner
@@ -501,23 +603,37 @@ impl Airc {
         filter: EventFilter,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let filter = self.subscribed_event_filter(filter).await?;
-        if self.is_daemon_attached() {
-            return Ok(self
-                .daemon_resume_from_subscribed(cursor, limit)
-                .await?
-                .into_iter()
-                .filter(|event| filter.matches(event))
-                .collect());
-        }
         Ok(self
-            .inner
-            .store
-            .resume_from(cursor, filter.channel, limit)
+            .scan_subscribed_events(cursor, filter, limit)
             .await?
-            .into_iter()
-            .filter(|event| filter.matches(event))
-            .collect())
+            .events)
+    }
+
+    /// Return one page of at most `limit` records, retaining subscribed matches.
+    /// Unlike the Vec-only resume surface, this preserves raw scan progress
+    /// when an entire local-store page belongs to other rooms or is filtered
+    /// out. Only `scanned_through: None` means no records were read.
+    pub async fn scan_subscribed_events(
+        &self,
+        cursor: &TranscriptCursor,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<EventScan, AircError> {
+        let filter = self.subscribed_event_filter(filter).await?;
+        let mut events = if self.is_daemon_attached() {
+            self.daemon_resume_from_subscribed(cursor, limit).await?
+        } else {
+            self.inner
+                .store
+                .resume_from(cursor, filter.channel, limit)
+                .await?
+        };
+        let scanned_through = events.last().map(TranscriptEvent::cursor);
+        events.retain(|event| filter.matches(event));
+        Ok(EventScan {
+            events,
+            scanned_through,
+        })
     }
 
     /// Cursor of the newest event in the current room — via the daemon

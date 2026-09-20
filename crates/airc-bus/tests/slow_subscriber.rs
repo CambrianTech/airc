@@ -84,7 +84,7 @@ async fn lagging_subscriber_never_stalls_fanout_and_resumes_from_sink() {
         tokio::time::sleep(Duration::from_millis(5)).await;
         waited += 5;
     }
-    let resumed = r.resume_from_cursor(ch, None).await.unwrap();
+    let resumed = r.resume_from_cursor(ch, None, usize::MAX).await.unwrap();
     let resumed_markers: Vec<u128> = resumed.iter().map(|e| e.event_id.0.as_u128()).collect();
     assert_eq!(
         resumed_markers, expected,

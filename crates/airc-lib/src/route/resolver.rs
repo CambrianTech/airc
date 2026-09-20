@@ -8,7 +8,7 @@
 
 use crate::route::health::TransportHealthSample;
 use crate::route::policy::{
-    RouteClass, RouteDecision, RoutePolicy, TransportCandidate, TransportKind,
+    RouteClass, RouteDecision, RoutePolicy, RouteTarget, TransportCandidate, TransportKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +47,21 @@ impl TransportResolver {
     }
 
     pub fn resolve(&self, class: RouteClass) -> Result<TransportRoute, RouteDecision> {
-        match self.policy.choose(class, self.candidates.iter().copied()) {
+        self.resolve_for_target(class, RouteTarget::Broadcast)
+    }
+
+    /// Target-aware resolution: peer-directed frames may ride the
+    /// per-peer direct rung (an established WebRTC DataChannel);
+    /// broadcasts never can. See [`RouteTarget`].
+    pub fn resolve_for_target(
+        &self,
+        class: RouteClass,
+        target: RouteTarget,
+    ) -> Result<TransportRoute, RouteDecision> {
+        match self
+            .policy
+            .choose_for_target(class, target, self.candidates.iter().copied())
+        {
             RouteDecision::Selected(kind) => Ok(TransportRoute { kind }),
             decision @ RouteDecision::NoRoute { .. } => Err(decision),
         }

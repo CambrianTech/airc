@@ -28,6 +28,8 @@ airc-core = { path = "../airc-core" }
 airc-diagnostics = { path = "../airc-diagnostics" }
 airc-identity = { path = "../airc-identity" }
 airc-ipc = { path = "../airc-ipc" }
+# socket_path: 16-char account key namespacing the machine-singular socket
+sha2 = "0.10"
 airc-protocol = { path = "../airc-protocol" }
 airc-wire = { path = "../airc-wire" }
 airc-store = { path = "../airc-store" }

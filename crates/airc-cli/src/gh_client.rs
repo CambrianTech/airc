@@ -29,8 +29,9 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 pub use airc_lib::gh::client::{
-    parse_pr_url, parse_pr_view, BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt,
-    PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+    parse_issue_view, parse_pr_url, parse_pr_view, BranchCheckRollupArgs, GhCheck, GhClient,
+    GhError, IssueView, IssueViewArgs, MergeReceipt, PrCreateArgs, PrCreated, PrEditBaseArgs,
+    PrMergeArgs, PrView, PrViewArgs,
 };
 // parse_check_runs is only used inside merger's #[cfg(test)] block — accessed
 // via the airc_lib path there to avoid a "unused re-export" lint in non-test
@@ -69,7 +70,7 @@ impl GhClient for ShellGhClient {
                 "--repo",
                 args.repo.as_str(),
                 "--json",
-                "state,mergeable,statusCheckRollup,mergedAt",
+                "state,mergeable,statusCheckRollup,mergedAt,baseRefName,baseRefOid",
             ])
             .output()
             .await
@@ -136,21 +137,56 @@ impl GhClient for ShellGhClient {
         &self,
         args: BranchCheckRollupArgs,
     ) -> Result<Vec<GhCheck>, GhError> {
-        // Card d5b7b07d: REST `/check-runs` for the integration branch's
-        // HEAD. `--paginate` so a workflow with >30 checks doesn't
-        // silently lose the failing ones to pagination. The REST shape
-        // is {total_count, check_runs:[...]}; parse_check_runs in
-        // airc-lib projects to just the run list.
-        let path = format!("repos/{}/commits/{}/check-runs", args.repo, args.branch);
+        use airc_lib::gh::client::{CheckRunRollup, CheckRunsPage, CHECK_RUN_PAGE_SIZE};
+
+        // Bound pagination here too, rather than letting gh collect an
+        // unlimited concatenated output before completeness can be checked.
+        let mut rollup = CheckRunRollup::default();
+        let mut page = 1;
+        loop {
+            let path = format!(
+                "repos/{}/commits/{}/check-runs?per_page={CHECK_RUN_PAGE_SIZE}&page={page}",
+                args.repo, args.branch
+            );
+            let output = Command::new("gh")
+                .args(["api", &path])
+                .output()
+                .await
+                .map_err(map_spawn_error)?;
+            if !output.status.success() {
+                return Err(classify_gh_failure(&output));
+            }
+            let decoded: CheckRunsPage = serde_json::from_slice(&output.stdout)?;
+            if rollup.push_page(decoded)? {
+                return rollup.into_checks();
+            }
+            page += 1;
+        }
+    }
+
+    /// Card #356. Same addressing and the same failure classification
+    /// as the PR verbs — `--json` field list mirrors what
+    /// [`IssueView`] deserializes, so a gh schema drift surfaces as a
+    /// loud `JsonParse` rather than a silently empty body (which the
+    /// closer would read as "no envelope, skip this card").
+    async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError> {
         let output = Command::new("gh")
-            .args(["api", "--paginate", &path])
+            .args([
+                "issue",
+                "view",
+                &args.number.to_string(),
+                "--repo",
+                args.repo.as_str(),
+                "--json",
+                "number,title,body,state",
+            ])
             .output()
             .await
             .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
-        airc_lib::gh::client::parse_check_runs(&output.stdout)
+        parse_issue_view(&output.stdout)
     }
 }
 

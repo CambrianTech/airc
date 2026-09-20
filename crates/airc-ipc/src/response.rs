@@ -3,9 +3,11 @@
 //!
 //! Owner-core model: live events and inbox pages cross the IPC boundary
 //! as **opaque airc-wire bytes** (`airc_wire::encode(&Envelope)`) — the
-//! daemon encodes once, the client decodes once. The IPC layer stays
-//! ignorant of the envelope's shape (no `airc-bus` dependency leaks
-//! here, no per-hop re-serialize).
+//! daemon encodes each selected event and the client decodes it. IPC
+//! framing serializes those bytes as a CBOR sequence into its own buffer.
+//! Event emission can borrow the wire buffer, avoiding an intermediate
+//! full payload copy. The IPC layer stays ignorant of the envelope's
+//! shape (no `airc-bus` dependency leaks here).
 
 use std::net::SocketAddr;
 
@@ -86,6 +88,20 @@ pub enum Response {
     Error { message: String },
 }
 
+impl Response {
+    /// Borrow an already-encoded event for emission without copying its payload
+    /// into a Vec. The slice deliberately retains the existing sequence encoding
+    /// in CBOR and JSON; CBOR byte strings are rejected by installed Vec readers.
+    pub fn event_ref(envelope: &[u8]) -> impl Serialize + '_ {
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum EventRef<'a> {
+            Event { envelope: &'a [u8] },
+        }
+        EventRef::Event { envelope }
+    }
+}
+
 /// Daemon health/state snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusResponse {
@@ -121,6 +137,12 @@ pub struct StatusResponse {
     /// receipt frames honestly rather than as confirmed reach.
     #[serde(default)]
     pub connected_lan_peers: usize,
+    /// Live IPC connections the daemon holds right now (request sockets
+    /// in flight + attach streams). `None` = the daemon predates the
+    /// field — not zero. A number that climbs while its clients hold a
+    /// flat count is a daemon keeping dead streams (card e28889cc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<usize>,
 }
 
 /// One entry in the `Peers` response. Mirrors `peers_store::StoredPeer`
@@ -162,9 +184,16 @@ pub struct IpcRoomInfo {
 /// ledger lives on an `airc-lib` handle this crate must not depend on,
 /// so the host's route-refresh loop snapshots it into `DaemonState`
 /// each tick and the daemon serves that snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryStatsResponse {
     pub peers: Vec<IpcPeerDeliveryStats>,
+    /// When the host completed this snapshot. Absent before the first refresh
+    /// or with an older daemon; absence is not a current empty ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at_ms: Option<u64>,
+    /// Connected LAN peers at the same refresh as `peers`, not a second IPC read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_lan_peers: Option<usize>,
 }
 
 /// One peer's end-to-end delivery accounting — mirrors
@@ -203,6 +232,16 @@ pub struct InboxResponse {
     /// page was empty — the caller's `since` stays authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest: Option<IpcCursor>,
+    /// The page was CUT before `limit` and more events follow `newest`.
+    /// A page is bounded by bytes as well as by count (card: the M5
+    /// daemon answered one 23.9 MB page — 1024 events of ~23 KB
+    /// prompts — every 6 s for six hours, each one refused by the
+    /// 16 MiB frame cap, each one dropping the client's connection).
+    /// A client's paging loop continues on `has_more || count == limit`;
+    /// an old daemon never sets it, so `count < limit` still reads as
+    /// exhausted there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_more: bool,
 }
 
 /// Result of a `RoomTip` probe (card a1562dbc): the durable tip of one
@@ -345,6 +384,7 @@ mod tests {
             build_branch: Some("rust-rewrite".to_string()),
             executable: Some("/tmp/airc".to_string()),
             connected_lan_peers: 2,
+            connections: None,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
@@ -367,6 +407,7 @@ mod tests {
                 build_branch: None,
                 executable: None,
                 connected_lan_peers: 0,
+                connections: None,
             })
         );
     }
@@ -401,6 +442,25 @@ mod tests {
         assert_eq!(decoded, error);
     }
 
+    // Regression for doctor-health c7873cba: an older daemon's missing snapshot
+    // metadata is unknown, while new metadata survives serialization.
+    #[test]
+    fn delivery_snapshot_metadata_is_backward_compatible() {
+        let old: Response =
+            serde_json::from_str(r#"{"kind":"delivery_stats","peers":[]}"#).unwrap();
+        assert_eq!(
+            old,
+            Response::DeliveryStats(DeliveryStatsResponse::default())
+        );
+        let current = Response::DeliveryStats(DeliveryStatsResponse {
+            peers: Vec::new(),
+            sampled_at_ms: Some(123_000),
+            connected_lan_peers: Some(2),
+        });
+        let json = serde_json::to_string(&current).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), current);
+    }
+
     #[test]
     fn publish_response_roundtrips_with_epoch_counter() {
         let original = Response::Publish(PublishResponse {
@@ -424,6 +484,7 @@ mod tests {
                 counter: 2,
                 event_id: EventId::from_u128(3),
             }),
+            has_more: true,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();

@@ -227,6 +227,13 @@ pub struct WorkCard {
     /// body prose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviews: Option<WorkCardId>,
+    /// Immutable artifact references, newest accepted transcript event first.
+    /// Payload bytes live in the content-addressed store, never in the board.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submissions: Vec<crate::event::WorkSubmission>,
+    /// A rejected submission is visible without poisoning the rest of replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_submission_rejection: Option<crate::event::RejectedSubmission>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -22,6 +22,7 @@
 
 pub mod error;
 pub mod gh_gist;
+pub mod lan_presence;
 pub mod lan_tcp;
 pub mod relay;
 pub mod signed;

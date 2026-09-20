@@ -144,3 +144,39 @@ async fn evicted_pending_durable_is_served_from_sink_not_skipped() {
         "evicted-pending durables come from the sink — none skipped (§3.8 no-gap)"
     );
 }
+
+// what this catches: a live request handle must not scan historical payloads;
+// explicit resume must still replay the gap before joining the same live index.
+#[tokio::test]
+async fn exact_live_handles_skip_history_while_explicit_resume_keeps_it() {
+    use airc_bus::DurableSink;
+    use airc_core::HeaderFilter;
+    let owner = common::Owner::new(RouterConfig::default());
+    let room = RoomId::new();
+    let historical = durable(room, 1, "old body");
+    owner.sink.append(&historical).await.unwrap();
+    let filter = Filter::channel(room).with_headers(HeaderFilter::Exact {
+        key: "airc.correlation_id".into(),
+        value: "wanted".into(),
+    });
+    let (live, _) = owner.router.subscribe_live_with_lag(filter.clone());
+    futures::pin_mut!(live);
+    let mut answer = durable(room, 2, "answer");
+    answer
+        .headers
+        .insert("airc.correlation_id".into(), "wanted".into());
+    owner.router.publish(answer).await.unwrap();
+    assert_eq!(take_n(&mut live, 1).await[0].event_id.0.as_u128(), 2);
+    assert_eq!(owner.sink.page_count(), 0);
+    let replay = owner.router.subscribe(Filter::channel(room), None);
+    futures::pin_mut!(replay);
+    let events = take_n(&mut replay, 2).await;
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e.event_id.0.as_u128())
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(owner.sink.page_count(), 1);
+}

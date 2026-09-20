@@ -164,6 +164,68 @@ impl AsyncWrite for IpcStream {
     }
 }
 
+/// The operation that failed while accepting a local IPC connection. Keep the
+/// original OS error: a broken client and a broken listener need different action.
+#[derive(Debug)]
+pub enum IpcAcceptError {
+    UnixAccept(std::io::Error),
+    WindowsPipeCreate(std::io::Error),
+    WindowsPipeConnect(std::io::Error),
+    MissingPreparedPipe,
+}
+
+impl IpcAcceptError {
+    pub fn stage(&self) -> &'static str {
+        match self {
+            Self::UnixAccept(_) => "unix_accept",
+            Self::WindowsPipeCreate(_) => "windows_pipe_create",
+            Self::WindowsPipeConnect(_) => "windows_pipe_connect",
+            Self::MissingPreparedPipe => "windows_pipe_state",
+        }
+    }
+
+    fn io_error(&self) -> Option<&std::io::Error> {
+        match self {
+            Self::UnixAccept(error)
+            | Self::WindowsPipeCreate(error)
+            | Self::WindowsPipeConnect(error) => Some(error),
+            Self::MissingPreparedPipe => None,
+        }
+    }
+
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.io_error().and_then(std::io::Error::raw_os_error)
+    }
+
+    /// Only the current pipe's client disconnected. `accept` has already
+    /// prepared the next server instance. Never retry invalid handles (6),
+    /// creation failures, or unknown listener errors as though they were clients.
+    pub fn is_client_disconnect(&self) -> bool {
+        matches!(self, Self::WindowsPipeConnect(_))
+            && matches!(self.raw_os_error(), Some(109 | 232 | 233))
+        // ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED.
+    }
+}
+
+impl std::fmt::Display for IpcAcceptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.io_error() {
+            Some(error) => write!(formatter, "{}: {error}", self.stage()),
+            None => write!(
+                formatter,
+                "{}: no next pipe instance prepared",
+                self.stage()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IpcAcceptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.io_error().map(|error| error as _)
+    }
+}
+
 /// Daemon-side listener.
 ///
 /// On Unix this wraps a `UnixListener` bound to `<path>`.
@@ -223,11 +285,14 @@ impl IpcListener {
 
     /// Accept one connection. Returns an `IpcStream` ready for the
     /// wire protocol.
-    pub async fn accept(&self) -> std::io::Result<IpcStream> {
+    pub async fn accept(&self) -> Result<IpcStream, IpcAcceptError> {
         match self {
             #[cfg(unix)]
             IpcListener::Unix { listener, .. } => {
-                let (stream, _addr) = listener.accept().await?;
+                let (stream, _addr) = listener
+                    .accept()
+                    .await
+                    .map_err(IpcAcceptError::UnixAccept)?;
                 Ok(IpcStream::Unix(stream))
             }
             #[cfg(windows)]
@@ -250,13 +315,17 @@ impl IpcListener {
                 // beyond the in-flight+1 capacity simply retry instead
                 // of failing.
                 let mut guard = next.lock().await;
-                let server = guard.take().ok_or_else(|| {
-                    std::io::Error::other("ipc listener: no next pipe instance prepared")
-                })?;
-                *guard =
-                    Some(tokio::net::windows::named_pipe::ServerOptions::new().create(pipe_name)?);
+                let server = guard.take().ok_or(IpcAcceptError::MissingPreparedPipe)?;
+                *guard = Some(
+                    tokio::net::windows::named_pipe::ServerOptions::new()
+                        .create(pipe_name)
+                        .map_err(IpcAcceptError::WindowsPipeCreate)?,
+                );
                 drop(guard);
-                server.connect().await?;
+                server
+                    .connect()
+                    .await
+                    .map_err(IpcAcceptError::WindowsPipeConnect)?;
                 Ok(IpcStream::WindowsServer(server))
             }
         }
@@ -485,6 +554,85 @@ mod tests {
         assert_eq!(&received_b, b"PING-B", "home B received its own ping");
         assert_eq!(&reply_a, b"PONG-A", "home A client got A's pong");
         assert_eq!(&reply_b, b"PONG-B", "home B client got B's pong");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_dropped_client_leaves_next_pipe_usable() {
+        // Regression for 7e0e9f47: losing one client before accept must not
+        // destroy the listener. This does not reproduce the observed OS6 fault.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let listener = IpcListener::bind(&sock).await.unwrap();
+        let client = IpcStream::connect(&sock).await.unwrap();
+        drop(client);
+
+        let abandoned = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .expect("dropped client accept must complete");
+        match abandoned {
+            Ok(stream) => drop(stream),
+            Err(error) => assert!(error.is_client_disconnect(), "{error}"),
+        }
+
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"PING");
+            stream.write_all(b"PONG").await.unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut client = IpcStream::connect(&sock).await.unwrap();
+            client.write_all(b"PING").await.unwrap();
+            let mut reply = [0; 4];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"PONG");
+            server.await.unwrap();
+        })
+        .await
+        .expect("healthy client must still complete after abandoned one");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_pipe_creation_failure_keeps_its_stage_and_os_error() {
+        // A real CreateNamedPipe failure must remain fatal and distinguishable
+        // from a single client's connect failure, without closing raw handles.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let mut listener = IpcListener::bind(&sock).await.unwrap();
+        let IpcListener::Windows { pipe_name, .. } = &mut listener;
+        *pipe_name = r"\\.\pipe\".into(); // no pipe name: invalid on Windows
+        let error = match listener.accept().await {
+            Ok(_) => panic!("invalid pipe name unexpectedly created an instance"),
+            Err(error) => error,
+        };
+        assert_eq!(error.stage(), "windows_pipe_create");
+        assert!(error.raw_os_error().is_some());
+        assert!(!error.is_client_disconnect());
+    }
+
+    #[test]
+    fn only_disconnected_windows_connect_instances_are_recoverable() {
+        // The observed invalid-handle OS6 remains fatal; merely knowing an OS
+        // code is insufficient if it came from creating the listener instance.
+        for code in [109, 232, 233] {
+            let connect =
+                IpcAcceptError::WindowsPipeConnect(std::io::Error::from_raw_os_error(code));
+            assert!(connect.is_client_disconnect());
+            assert_eq!(connect.raw_os_error(), Some(code));
+            let create = IpcAcceptError::WindowsPipeCreate(std::io::Error::from_raw_os_error(code));
+            assert!(!create.is_client_disconnect());
+        }
+        for code in [6, 5, 8] {
+            let error = IpcAcceptError::WindowsPipeConnect(std::io::Error::from_raw_os_error(code));
+            assert!(!error.is_client_disconnect());
+            assert_eq!(error.raw_os_error(), Some(code));
+            assert!(error.to_string().starts_with("windows_pipe_connect:"));
+        }
+        assert!(!IpcAcceptError::MissingPreparedPipe.is_client_disconnect());
     }
 
     #[cfg(windows)]

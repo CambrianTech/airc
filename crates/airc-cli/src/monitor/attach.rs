@@ -2,13 +2,13 @@ use std::error::Error;
 use std::io::Write;
 use std::path::Path;
 
-use airc_core::{Body, MentionTarget, PeerId, RoomId, TranscriptEvent, TranscriptKind};
+use airc_core::{Body, MentionTarget, RoomId, TranscriptEvent, TranscriptKind};
 use airc_ipc::{codec::read_frame, AttachRequest, AttachStart, DaemonClient, Response};
 use airc_lib::{decode_wire_event, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
-use crate::client_id::current_client_id;
+use crate::client_id::{current_client_id, RuntimeSelfFilter};
 use crate::work_suggestions::render_claimable_work_for_event;
 
 /// One frame to surface on stdout — either a decoded transcript event
@@ -54,13 +54,8 @@ pub(crate) async fn run(
     coalesce_backlog: bool,
 ) -> Result<(), Box<dyn Error>> {
     let airc = Airc::open(home).await?;
-    // This monitoring scope's OWN peer. Its outbound echoes back through
-    // the room transcript; matching the frame's sender peer against this
-    // is how we keep own sends from reading as inbound (the loopback
-    // trap). Peer-level — not just client_id — because a separate `airc
-    // send` invocation is a different client but the SAME peer.
-    let my_peer = airc.peer_id();
     let client_id = current_client_id().ok().flatten();
+    let self_filter = RuntimeSelfFilter::new(airc.client_id(), client_id.as_deref());
     let socket = crate::cli::default_socket_path_in(home);
     let set = airc.subscription_set().await?;
     let channels: Vec<RoomId> = set.all().map(|sub| sub.as_room().channel).collect();
@@ -182,9 +177,9 @@ pub(crate) async fn run(
                 let event = *event;
                 if let Some(text) = render_claimable_work_for_event(&airc, &event).await? {
                     sandbox.emit_contract_once();
-                    render_text_event(&event, client_id.as_deref(), &text, &mut sandbox);
+                    render_text_event(&event, &text, &mut sandbox);
                 } else if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
-                    render_event(&event, &my_peer, client_id.as_deref(), &mut sandbox);
+                    render_event(&event, &self_filter, &mut sandbox);
                 }
             }
             MonitorFrame::CatchUpSummary { channel, skipped } => {
@@ -207,11 +202,10 @@ pub(crate) async fn run(
 
 fn render_event(
     event: &TranscriptEvent,
-    my_peer: &PeerId,
-    client_id: Option<&str>,
+    self_filter: &RuntimeSelfFilter<'_>,
     sandbox: &mut Sandbox,
 ) {
-    if is_own_runtime_event(event, my_peer, client_id) {
+    if self_filter.is_self_event(event) {
         return;
     }
 
@@ -220,15 +214,10 @@ fn render_event(
     };
 
     sandbox.emit_contract_once();
-    render_text_event(event, client_id, body, sandbox);
+    render_text_event(event, body, sandbox);
 }
 
-fn render_text_event(
-    event: &TranscriptEvent,
-    _client_id: Option<&str>,
-    body: &str,
-    sandbox: &mut Sandbox,
-) {
+fn render_text_event(event: &TranscriptEvent, body: &str, sandbox: &mut Sandbox) {
     let channel = normalize_channel(&event.room_id.to_string());
     let mut attrs = vec![
         format!("from=\"{}\"", xml_escape(&event.peer_id.to_string())),
@@ -252,31 +241,6 @@ fn render_text_event(
         attrs = attrs.join(" "),
         body = xml_escape(body)
     );
-}
-
-fn is_own_runtime_event(
-    event: &TranscriptEvent,
-    my_peer: &PeerId,
-    client_id: Option<&str>,
-) -> bool {
-    // PEER-level first: the monitoring scope's own outbound carries its
-    // peer id, and a separate `airc send` invocation is a different
-    // client_id but the SAME peer — so the prior client-id-only check
-    // let own sends echo back as if inbound (the loopback trap). This
-    // mirrors `TranscriptEvent::is_self_echo(.., ExcludeSamePeer)`.
-    if event.peer_id == *my_peer {
-        return true;
-    }
-    // Defensive retain: a runtime client header (or client_id) marking
-    // the frame as ours even when the peer differs — rare cross-identity
-    // CLI paths where one scope drives another's client surface.
-    let Some(client_id) = client_id else {
-        return false;
-    };
-    if let Some(event_client) = event.headers.get(HEADER_AIRC_CLIENT) {
-        return event_client == client_id;
-    }
-    event.client_id.to_string() == client_id
 }
 
 fn display_client(event: &TranscriptEvent) -> String {
@@ -330,16 +294,10 @@ mod tests {
     #[test]
     fn render_event_filters_same_client() {
         let event = event("hello");
-        // A different monitor peer, so the client-id path is what's exercised.
-        let other_peer = PeerId::new();
+        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
-        render_event(
-            &event,
-            &other_peer,
-            Some(&event.client_id.to_string()),
-            &mut sandbox,
-        );
+        render_event(&event, &self_filter, &mut sandbox);
 
         assert!(!sandbox.has_emitted());
     }
@@ -350,10 +308,10 @@ mod tests {
         event
             .headers
             .insert(HEADER_AIRC_CLIENT.to_string(), "codex:thread-1".to_string());
-        let other_peer = PeerId::new();
+        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
-        render_event(&event, &other_peer, Some("codex:thread-1"), &mut sandbox);
+        render_event(&event, &self_filter, &mut sandbox);
 
         assert!(!sandbox.has_emitted());
     }
@@ -365,35 +323,26 @@ mod tests {
             HEADER_AIRC_CLIENT.to_string(),
             "claude:session-1".to_string(),
         );
-        let other_peer = PeerId::new();
+        // Shared HOME: both durable IDs may match, but the runtime differs.
+        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
-        render_event(&event, &other_peer, Some("codex:thread-1"), &mut sandbox);
+        render_event(&event, &self_filter, &mut sandbox);
 
         assert!(sandbox.has_emitted());
     }
 
-    /// what this catches (the loopback trap, 2026-06-17): the monitoring
-    /// scope's OWN outbound — same peer, but a SEPARATE `airc send`
-    /// invocation with a different client_id and NO matching client
-    /// header — must be filtered. The prior client-id-only check let it
-    /// through, so a sender saw its own messages as inbound and dismissed
-    /// real peer traffic as echo.
+    /// Unstamped legacy events cannot distinguish runtimes by peer ID.
+    /// Only the durable-client fallback can suppress one as self.
     #[test]
-    fn render_event_filters_own_peer_echo_from_a_different_client() {
-        let mut event = event("my own send");
-        let my_peer = event.peer_id; // the monitor IS this peer…
-        event.client_id = ClientId::new(); // …but a different client instance sent it
+    fn render_event_keeps_unstamped_different_client() {
+        let event = event("another client on this peer");
+        let self_filter = RuntimeSelfFilter::new(ClientId::new(), Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
-        // No client_id match available and no matching header — only the
-        // peer identifies it as ours.
-        render_event(&event, &my_peer, Some("monitor:other-client"), &mut sandbox);
+        render_event(&event, &self_filter, &mut sandbox);
 
-        assert!(
-            !sandbox.has_emitted(),
-            "own-peer outbound must be filtered even from a different client"
-        );
+        assert!(sandbox.has_emitted());
     }
 
     fn event(text: &str) -> TranscriptEvent {

@@ -23,9 +23,9 @@ use airc_ipc::request::{
     SendRequest,
 };
 use airc_ipc::response::{
-    DeliveryStatsResponse, InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry,
-    PeerIdentityCardResponse, PeersResponse, PublishResponse, Response, RoomTipResponse,
-    RoomsResponse, RouteEndpointsResponse, StatusResponse,
+    InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry, PeerIdentityCardResponse,
+    PeersResponse, PublishResponse, Response, RoomTipResponse, RoomsResponse,
+    RouteEndpointsResponse, StatusResponse,
 };
 use bytes::Bytes;
 
@@ -34,6 +34,9 @@ use crate::state::DaemonState;
 /// Default `Inbox.limit` when the client doesn't pass one. Caps the
 /// payload size so a slow client doesn't accidentally pull MB.
 const INBOX_DEFAULT_LIMIT: usize = 32;
+/// Half the codec's frame cap: the page's envelopes plus the response's own CBOR
+/// framing and the cursor must fit under `airc_ipc::codec::MAX_FRAME_BYTES`.
+const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as usize;
 
 /// Dispatch one request against the daemon's state. Always returns a
 /// Response — Err paths become `Response::Error { message }` so the
@@ -51,6 +54,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             connected_lan_peers: state
                 .connected_lan_peers
                 .load(std::sync::atomic::Ordering::Relaxed),
+            connections: Some(state.connections.load(std::sync::atomic::Ordering::Relaxed)),
         }),
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
@@ -67,9 +71,9 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         // #1306 slice 2: serve the host-written delivery-ledger snapshot
         // — the delivery-truth read behind doctor's "last confirmed
         // delivery to X: N ago".
-        Request::DeliveryStats => Response::DeliveryStats(DeliveryStatsResponse {
-            peers: state.delivery_stats.read().await.clone(),
-        }),
+        Request::DeliveryStats => {
+            Response::DeliveryStats(state.delivery_stats.read().await.clone())
+        }
         // Card 4b6a0ffa (#33): serve the endpoints the registry glue
         // recorded after binding its listener. Empty means "up but not
         // dialable" — the client decides what that implies.
@@ -261,38 +265,50 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
                 }
             }
         }
-        // "First N after the cursor" when resuming.
+        // "First N after the cursor" when resuming. Each router page is
+        // bounded by `limit` (one indexed query), and the durable + kinds
+        // predicates are applied per page; a page they thin below `limit`
+        // pulls the next page from the last raw cursor, so a short answer
+        // still means "the channel is exhausted" to the client's paging loop.
         Some(c) => {
-            let from = Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
-            let mut events = match state.router.resume_from_cursor(channel, from).await {
-                Ok(events) => events,
-                Err(error) => {
-                    return Response::Error {
-                        message: format!("inbox: {error}"),
+            let mut from = Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id));
+            let mut events: Vec<Arc<Envelope>> = Vec::new();
+            loop {
+                let batch = match state.router.resume_from_cursor(channel, from, limit).await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!("inbox: {error}"),
+                        }
                     }
+                };
+                let exhausted = batch.len() < limit;
+                let last_raw = batch.last().map(|e| e.cursor());
+                // `inbox` is the DURABLE transcript. `resume_from_cursor`
+                // merges the hot ring (which transiently holds every class,
+                // incl. StreamChunk / EphemeralLatest for live attach-replay)
+                // with the sink, so filter to durable here — non-durable
+                // classes never belong in a replay (§3.4). The kinds filter
+                // composes the same way.
+                events.extend(batch.into_iter().filter(|env| {
+                    env.delivery.is_durable()
+                        && kinds.as_ref().is_none_or(|kinds| kinds.contains(&env.kind))
+                }));
+                if events.len() >= limit || exhausted {
+                    break;
                 }
-            };
-            // `inbox` is the DURABLE transcript. `resume_from_cursor`
-            // merges the hot ring (which transiently holds every class,
-            // incl. StreamChunk / EphemeralLatest for live attach-replay)
-            // with the sink, so filter to durable here — non-durable
-            // classes never belong in a replay (§3.4). The kinds filter
-            // composes the same way, and BOTH run before `truncate`, so
-            // `since` + `kinds` still means "the first N matching events
-            // after the cursor."
-            events.retain(|env| {
-                env.delivery.is_durable()
-                    && kinds.as_ref().is_none_or(|kinds| kinds.contains(&env.kind))
-            });
+                match last_raw {
+                    Some(cursor) => from = Some(cursor),
+                    None => break,
+                }
+            }
             events.truncate(limit);
             events
         }
     };
-    let envelopes: Vec<Vec<u8>> = events
-        .iter()
-        .map(|e| airc_wire::encode(e).to_vec())
-        .collect();
-    let newest = events.last().map(|e| {
+    let page_full = events.len() >= limit;
+    let (envelopes, kept, cut) = encode_page_within_budget(&events, INBOX_PAGE_BYTE_BUDGET);
+    let newest = kept.last().map(|e| {
         let cursor = e.cursor();
         IpcCursor {
             epoch: cursor.seq.epoch,
@@ -300,7 +316,38 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
             event_id: cursor.event_id,
         }
     });
-    Response::Inbox(InboxResponse { envelopes, newest })
+    Response::Inbox(InboxResponse {
+        envelopes,
+        newest,
+        has_more: cut || (page_full && request.since.is_some()),
+    })
+}
+
+/// A page is bounded by BYTES as well as by count: the IPC codec refuses a frame
+/// over `MAX_FRAME_BYTES` and drops the connection, so a page that would exceed it
+/// is not "large", it is undeliverable — and a client that re-asks the same page
+/// re-fails forever (the M5, 2026-09-16: 1024 × ~23 KB remote-inference prompts in
+/// one room = a 23.9 MB page, refused every 6 s for six hours). Keep the oldest
+/// envelopes that fit under `budget` (the cursor order the caller resumes from),
+/// always at least one so a single oversize event still moves the cursor; report
+/// whether the page was cut.
+fn encode_page_within_budget(
+    events: &[Arc<Envelope>],
+    budget: usize,
+) -> (Vec<Vec<u8>>, Vec<Arc<Envelope>>, bool) {
+    let mut out = Vec::with_capacity(events.len());
+    let mut kept = Vec::with_capacity(events.len());
+    let mut bytes = 0usize;
+    for e in events {
+        let enc = airc_wire::encode(e).to_vec();
+        if !out.is_empty() && bytes + enc.len() > budget {
+            return (out, kept, true);
+        }
+        bytes += enc.len();
+        out.push(enc);
+        kept.push(Arc::clone(e));
+    }
+    (out, kept, false)
 }
 
 /// Card a1562dbc: the O(1) tip probe. Answered by the router's
@@ -427,5 +474,51 @@ async fn handle_list_rooms(state: Arc<DaemonState>) -> Response {
         Err(error) => Response::Error {
             message: format!("list_rooms: {error}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(payload_len: usize) -> Arc<Envelope> {
+        Arc::new(Envelope::new(
+            RoomId::from_u128(7),
+            (PeerId::from_u128(1), ClientId::from_u128(2)),
+            Kind::Message,
+            DeliveryClass::Durable,
+            Bytes::from(vec![b'x'; payload_len]),
+        ))
+    }
+
+    // what this catches (M5, 2026-09-16): a 1024-event page of ~23 KB prompts is a
+    // 23.9 MB frame the codec refuses — the daemon answered it every 6 s for six hours,
+    // dropping the client each time. A page is cut at the byte budget, keeps the OLDEST
+    // events (the resume order), reports `has_more`, and a single oversize event still
+    // moves the cursor instead of wedging the client on it forever.
+    #[test]
+    fn a_page_is_cut_at_the_byte_budget_and_says_so() {
+        let events: Vec<Arc<Envelope>> = (0..10).map(|_| envelope(1000)).collect();
+        let (out, kept, cut) = encode_page_within_budget(&events, 3_500);
+        assert!(cut, "ten 1 KB events do not fit a 3.5 KB budget");
+        assert_eq!(out.len(), kept.len());
+        assert!(
+            out.len() >= 2 && out.len() <= 3,
+            "kept the oldest that fit: {}",
+            out.len()
+        );
+        assert!(
+            Arc::ptr_eq(&kept[0], &events[0]),
+            "resume order: the oldest first"
+        );
+        let (all, _, cut) = encode_page_within_budget(&events, 1 << 20);
+        assert!(!cut && all.len() == 10, "a page under budget is whole");
+        let huge = vec![envelope(64 * 1024)];
+        let (one, _, cut) = encode_page_within_budget(&huge, 100);
+        assert_eq!(
+            (one.len(), cut),
+            (1, false),
+            "one oversize event is still delivered so the cursor moves"
+        );
     }
 }

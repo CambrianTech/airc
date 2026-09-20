@@ -58,26 +58,56 @@ pub enum RouteDecision {
     NoRoute { class: RouteClass },
 }
 
+/// The delivery shape of the frame being routed. Peer-directed frames
+/// may ride per-peer transports (an established WebRTC DataChannel);
+/// broadcasts never can — a datachannel reaches ONE peer, and selecting
+/// it for a room fan-out would silently narrow delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteTarget {
+    /// Room/All fan-out — only shared transports are admissible.
+    Broadcast,
+    /// Directed at one peer. `webrtc_channel_ready` is whether an
+    /// established DataChannel to THAT peer is registered right now —
+    /// the admission evidence for the direct-p2p rung. Passing `true`
+    /// without a live channel would route frames into "no webrtc
+    /// channel for peer" errors, so callers must derive it from the
+    /// per-peer channel table, never assume it.
+    Peer { webrtc_channel_ready: bool },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RoutePolicy;
 
 impl RoutePolicy {
+    /// Target-agnostic selection — equivalent to
+    /// [`choose_for_target`](Self::choose_for_target) with
+    /// [`RouteTarget::Broadcast`], the conservative shape (per-peer
+    /// transports never admitted).
     pub fn choose(
         &self,
         class: RouteClass,
         candidates: impl IntoIterator<Item = TransportCandidate>,
     ) -> RouteDecision {
+        self.choose_for_target(class, RouteTarget::Broadcast, candidates)
+    }
+
+    pub fn choose_for_target(
+        &self,
+        class: RouteClass,
+        target: RouteTarget,
+        candidates: impl IntoIterator<Item = TransportCandidate>,
+    ) -> RouteDecision {
         candidates
             .into_iter()
             .filter(|candidate| candidate.healthy)
-            .filter(|candidate| allows(class, *candidate))
+            .filter(|candidate| allows(class, target, *candidate))
             .min_by_key(|candidate| priority(class, candidate.kind, candidate.role))
             .map(|candidate| RouteDecision::Selected(candidate.kind))
             .unwrap_or(RouteDecision::NoRoute { class })
     }
 }
 
-fn allows(class: RouteClass, candidate: TransportCandidate) -> bool {
+fn allows(class: RouteClass, target: RouteTarget, candidate: TransportCandidate) -> bool {
     match candidate.kind {
         TransportKind::GhGist => matches!(
             (class, candidate.role),
@@ -88,7 +118,7 @@ fn allows(class: RouteClass, candidate: TransportCandidate) -> bool {
             candidate.role == TransportRole::Direct
                 && (is_live_class(class) || class == RouteClass::PeerRendezvous)
         }
-        TransportKind::Udp | TransportKind::WebRtcDataChannel => {
+        TransportKind::Udp => {
             candidate.role == TransportRole::Direct
                 && matches!(
                     class,
@@ -96,6 +126,22 @@ fn allows(class: RouteClass, candidate: TransportCandidate) -> bool {
                         | RouteClass::MediaSignaling
                         | RouteClass::PresenceEphemeral
                 )
+        }
+        TransportKind::WebRtcDataChannel => {
+            candidate.role == TransportRole::Direct
+                && (matches!(
+                    class,
+                    RouteClass::ControlInteractive
+                        | RouteClass::MediaSignaling
+                        | RouteClass::PresenceEphemeral
+                )
+                // The direct-p2p data rung: an ESTABLISHED DataChannel to
+                // the target peer carries durable data classes — this is
+                // the NAT-traversed coffee-shop path. Evidence-gated
+                // (channel registered NOW) so no phantom route ever beats
+                // a live Relay/Reticulum.
+                || (matches!(class, RouteClass::DataInteractive | RouteClass::DataBulk)
+                    && matches!(target, RouteTarget::Peer { webrtc_channel_ready: true })))
         }
         TransportKind::Reticulum => {
             (candidate.role == TransportRole::Direct
@@ -141,13 +187,11 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
         },
         RouteClass::DataInteractive => match kind {
             TransportKind::LanTcp => 0,
+            TransportKind::WebRtcDataChannel => 1,
             TransportKind::Tailscale => 2,
             TransportKind::Reticulum => 3,
             TransportKind::Relay => 4,
-            TransportKind::Udp
-            | TransportKind::WebRtcDataChannel
-            | TransportKind::Ssh
-            | TransportKind::GhGist => 255,
+            TransportKind::Udp | TransportKind::Ssh | TransportKind::GhGist => 255,
         },
         RouteClass::MediaSignaling => match kind {
             TransportKind::Udp => 1,
@@ -160,13 +204,11 @@ fn priority(class: RouteClass, kind: TransportKind, role: TransportRole) -> u8 {
         },
         RouteClass::DataBulk => match kind {
             TransportKind::LanTcp => 0,
+            TransportKind::WebRtcDataChannel => 1,
             TransportKind::Tailscale => 2,
             TransportKind::Reticulum => 3,
             TransportKind::Relay => 4,
-            TransportKind::Udp
-            | TransportKind::WebRtcDataChannel
-            | TransportKind::Ssh
-            | TransportKind::GhGist => 255,
+            TransportKind::Udp | TransportKind::Ssh | TransportKind::GhGist => 255,
         },
         RouteClass::PeerRendezvous => match (kind, role) {
             (TransportKind::LanTcp, TransportRole::Direct) => 0,
@@ -221,6 +263,86 @@ pub fn crypto_mode(transport: TransportKind) -> CryptoMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct(kind: TransportKind) -> TransportCandidate {
+        TransportCandidate {
+            kind,
+            role: TransportRole::Direct,
+            healthy: true,
+        }
+    }
+
+    // what this catches: the direct-p2p data rung's admission contract.
+    // A DataChannel reaches exactly ONE peer — selecting it for a
+    // broadcast silently narrows room fan-out to one recipient, and
+    // selecting it without an established channel routes durable frames
+    // into "no webrtc channel for peer" instead of a live Relay. The
+    // rung must be evidence-gated (Peer + channel-ready) and must beat
+    // Relay/Tailscale only then; LAN stays first.
+    #[test]
+    fn webrtc_data_rung_is_peer_directed_and_evidence_gated() {
+        let policy = RoutePolicy;
+        let with_channel = RouteTarget::Peer {
+            webrtc_channel_ready: true,
+        };
+        let without_channel = RouteTarget::Peer {
+            webrtc_channel_ready: false,
+        };
+        let candidates = || {
+            [
+                direct(TransportKind::WebRtcDataChannel),
+                TransportCandidate {
+                    kind: TransportKind::Relay,
+                    role: TransportRole::Relay,
+                    healthy: true,
+                },
+            ]
+        };
+
+        for class in [RouteClass::DataInteractive, RouteClass::DataBulk] {
+            // Established channel: direct p2p beats the relay.
+            assert_eq!(
+                policy.choose_for_target(class, with_channel, candidates()),
+                RouteDecision::Selected(TransportKind::WebRtcDataChannel),
+                "{class:?}: established channel must win over relay"
+            );
+            // No channel: the relay carries it — never the phantom rung.
+            assert_eq!(
+                policy.choose_for_target(class, without_channel, candidates()),
+                RouteDecision::Selected(TransportKind::Relay),
+                "{class:?}: no channel means relay"
+            );
+            // Broadcast: never a per-peer transport, channel or not.
+            assert_eq!(
+                policy.choose_for_target(class, RouteTarget::Broadcast, candidates()),
+                RouteDecision::Selected(TransportKind::Relay),
+                "{class:?}: broadcast must not ride a per-peer channel"
+            );
+            // Same LAN: LanTcp still outranks the datachannel.
+            assert_eq!(
+                policy.choose_for_target(
+                    class,
+                    with_channel,
+                    [
+                        direct(TransportKind::LanTcp),
+                        direct(TransportKind::WebRtcDataChannel)
+                    ]
+                ),
+                RouteDecision::Selected(TransportKind::LanTcp),
+                "{class:?}: LAN beats datachannel"
+            );
+        }
+
+        // The legacy classes keep their target-agnostic admission (the
+        // signaling path itself rides them) — choose() == Broadcast shape.
+        assert_eq!(
+            policy.choose(
+                RouteClass::MediaSignaling,
+                [direct(TransportKind::WebRtcDataChannel)]
+            ),
+            RouteDecision::Selected(TransportKind::WebRtcDataChannel),
+        );
+    }
 
     // what this catches: the two-plane crypto split — ONLY the packet-rate
     // stream transports use a session; every other transport keeps per-frame

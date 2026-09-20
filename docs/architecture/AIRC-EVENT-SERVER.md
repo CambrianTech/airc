@@ -389,3 +389,98 @@ Lives in `crates/airc-lib/tests/` (extends `fanout_bench.rs` for the perf cases)
 Each row is one realistic, isolated, deterministic integration test. Together they
 are the proof that airc carries *everything* continuum needs — before the full
 stack is wired — and the regression wall that keeps it that way.
+
+### Exact-header command reply handles
+
+Command requests register an exact `airc.correlation_id` subscription before
+publishing. The existing channel router indexes `HeaderFilter::Exact` (and a
+necessary exact clause inside `All`) by borrowed header key/value lookups.
+Publishing visits general subscriptions and the matching exact buckets, never
+parses payload content, and passes `Arc<Envelope>` through the existing bounded
+queues. Work is proportional to the event header count plus selected bucket
+sizes and general subscriptions, rather than all pending commands in the room.
+Remaining predicates and the command's room, author and requester checks still
+apply. A registration's unique ID and owned stream guard remove exactly that
+handle on drop, including an unpolled stream; empty buckets are removed too.
+
+A live attach now registers without a ring snapshot or transcript page read.
+Explicit cursor attaches and lag recovery retain the replay/live seam. No
+polling, request-local history scan, or separate command bus is introduced.
+
+This is not zero-copy IPC or session multiplexing: every pending command still
+opens an IPC attach and waits for its registration acknowledgement. Each selected
+IPC delivery still builds the airc-wire buffer and owned header values; CBOR
+framing allocates its output, and the SDK decodes the selected body. Embedded SDK subscriptions
+still share their existing decoded broadcast stream. Eliminating those remaining
+copy/handshake costs requires a separate owner/session change; it is not implied
+by router-side shared `Arc` delivery.
+The regression tests measure routing work and boundary counts, not elapsed
+throughput: 128 unrelated correlations select zero of 128 pending handles; 32
+IPC handles see only their 32 replies plus 32 terminal fences after 64 unrelated
+16 KiB publications. Baseline latency still needs a separate no-model measurement
+of register/ack, local dispatch and serialization, with network transit and model
+queue/inference time reported separately. No model or network speedup is claimed.
+### IPC event payload borrowing and byte-string compatibility
+
+Card 59b79686-2a1f-4253-9594-a21e08fde2b2 removes the intermediate
+`Bytes::to_vec()` from live and buffered attach event emission. The typed
+`Response::event_ref` borrows the already-encoded FlatBuffer through framing.
+For each nonempty selected event this removes one payload-sized allocation and
+copy, while preserving the exact CBOR integer-sequence representation and JSON
+array. It does not reduce frame size, remove the FlatBuffer or CBOR output
+allocations, optimize inbox pages, or establish an elapsed-time speedup.
+
+Measured length-framed sizes for deterministic bytes cycling through 0..255:
+
+| Payload bytes | Current/borrowed sequence frame | Candidate byte-string frame |
+| ---: | ---: | ---: |
+| 0 | 26 | 26 |
+| 256 | 516 | 284 |
+| 16,384 | 31,260 | 16,412 |
+| 1,048,576 | 1,998,878 | 1,048,606 |
+
+The byte-string candidate is **incompatible**: the installed `Response::Event`
+`Vec<u8>` decoder rejects every tested size with “invalid type: byte array,
+expected a sequence”. Production keeps the sequence encoding. A future migration
+requires readers that accept both representations first, plus explicit
+capability/version negotiation before a sender emits byte strings; JSON must
+retain its array shape. The regression compares the borrowed and existing framed
+CBOR bytes and JSON bytes exactly, then decodes with the unchanged response type.
+Connection-tail attribution remains separate (card 1034c91d); no network, model,
+or p99 latency improvement is claimed by this copy-boundary change.
+
+### Local IPC publish phase attribution
+
+Card 1034c91d-9a6d-43e1-a024-4215962634e2 adds opt-in observation to the
+same `DaemonClient` connect/write/read path. Ordinary calls use a generic no-op
+observer with no clock reads or allocations. Diagnostic callbacks report only
+completed boundaries; an incomplete phase emits no completion, and decoded daemon
+errors do report response completion. Callback work is inside the normal deadline.
+
+The existing ignored many-room owner-core benchmark now records paired samples
+for connection setup, request encode/write/flush, response wait/read/decode, and
+total RPC duration. Request construction is outside these samples. Three callback
+clock reads perturb the diagnostic path; no unconditional telemetry is enabled.
+A failed operation aborts the measurement rather than silently discarding it.
+Independent phase percentiles are not additive; the five slowest operations are
+also printed with their actual paired phase durations.
+
+Windows debug-profile baseline (15 concurrent publishers, 40 publishes each,
+600 completed samples per run, zero failures/exclusions), three consecutive runs
+of the cached test executable on 2026-09-15:
+
+| Repeat | Publish wall ms | Total min ms | Total p50 ms | Total p95 ms | Total p99 ms | Connect p99 ms | Write p99 ms | Response p99 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 161.044 | 0.204 | 0.319 | 1.160 | 64.435 | 64.098 | 0.360 | 0.710 |
+| 2 | 157.338 | 0.216 | 0.322 | 0.895 | 64.943 | 64.666 | 0.314 | 0.652 |
+| 3 | 131.393 | 0.219 | 0.352 | 1.826 | 50.288 | 50.027 | 0.356 | 0.817 |
+
+The slowest paired connect/total durations were 144.092/145.417 ms,
+140.654/140.846 ms, and 102.170/102.851 ms. This localizes the observed tail
+to the connection phase in these runs. That phase includes Windows pipe-name
+resolution, blocking-open task scheduling, actual opens and busy retries; these
+measurements do not distinguish those causes. The existing 15 ms busy backoff
+remains unchanged. Minimum observed times are a baseline under this workload,
+not a lower bound or a latency target proven achieved. Publish acknowledgement
+excludes durable commit, remote network transport, and model execution. Release
+and cross-platform measurements remain necessary before broader performance claims.

@@ -506,7 +506,9 @@ impl GhAccountRegistryStore {
             }) => {
                 // Typed, not formatted — the caller must be able to HONOR
                 // the wait, which it cannot do with a message string.
-                tracing::debug!(
+                // A refused REGISTRY call starves the mesh (peers cannot find this
+                // node); it is a warn, and the reason rides the error as data.
+                tracing::warn!(
                     target: "airc::gh",
                     retry_after_secs,
                     %reason,
@@ -516,6 +518,7 @@ impl GhAccountRegistryStore {
                     // Governor reports i64; a negative wait is nonsense,
                     // clamp rather than panic on a clock oddity.
                     retry_after_secs: retry_after_secs.max(0) as u64,
+                    reason,
                 });
             }
             // Allowed, or a governor I/O glitch: fail OPEN so a filesystem

@@ -63,11 +63,108 @@ use airc_core::PEER_IDENTITY_STATE_KEY;
 /// that need durable replay use `Airc::resume_from` against the store.
 const LIVE_BROADCAST_CAPACITY: usize = 1024;
 
+/// The home that OWNS the machine's daemon socket, as distinct from the
+/// caller's scope home. Constructible ONLY by [`machine_account_home`].
+///
+/// Why this is a type and not a `PathBuf`: a scope home and an owning
+/// home are both "a directory", so for the substrate's whole life the
+/// compiler could not tell them apart and every call site had to
+/// REMEMBER to derive. Two forgot — `ensure_daemon_running` (#1347) and
+/// `daemon_command` (#1352) — and each time the spawned daemon served
+/// the machine socket under the CALLER's identity. That single confusion
+/// wore five costumes before it was named: one-way delivery (replies
+/// arrived in a scope the peer was not enrolled in), stale advertised
+/// endpoints (a different scope means a different `peer_id`, hence a
+/// different `stable_lan_port`), an event store that read as a monologue,
+/// a `doctor` that reported a clean bill throughout, and finally — once
+/// #1347 added a guard that refuses a foreign scope — `airc update`
+/// taking the node dark on every run, SOS included.
+///
+/// The rule was documented at both spawn sites and honoured at neither
+/// by anything stronger than prose. Now the daemon-spawn API takes this
+/// type, so a raw scope home is a COMPILE error rather than a night.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MachineAccountHome(PathBuf);
+
+impl MachineAccountHome {
+    /// Borrow as a plain path — for comparisons against a scope home
+    /// (`owning.as_path() != scope`), which is the ownership guard.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Consume into the underlying path.
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+impl std::ops::Deref for MachineAccountHome {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for MachineAccountHome {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for MachineAccountHome {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl std::fmt::Display for MachineAccountHome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
 /// The machine-account home (`$HOME/.airc`) that owns the singular
 /// daemon + the one ORM for every scope under this user's home. Scopes
 /// outside `$HOME` (CI temp dirs, isolated test roots) get their own
 /// `scope_home` back — they are their own account boundary.
-pub fn machine_account_home(scope_home: &Path) -> PathBuf {
+///
+/// Idempotent on a home it already owns, which is what makes
+/// `machine_account_home(h).as_path() != h` a sound ownership test.
+pub fn machine_account_home(scope_home: &Path) -> MachineAccountHome {
+    MachineAccountHome(machine_account_home_inner(scope_home))
+}
+
+/// THE one place a daemon process's `--home` is chosen.
+///
+/// Builds `<exe> --home <owning> <subcommand> --socket <socket>` with the
+/// home derived from `scope_home`, never `scope_home` itself. Callers add
+/// their own stdio/detach and spawn it.
+///
+/// This exists because the rule "the daemon serving a socket is the scope
+/// that owns it" was previously enforced by each spawn site remembering to
+/// call [`machine_account_home`] — documented in a comment at one site,
+/// and silently absent at the other. See [`MachineAccountHome`] for the
+/// five symptoms that one omission produced. A third spawn site now
+/// inherits the rule instead of re-deriving it.
+pub fn daemon_command(
+    airc_exe: &Path,
+    scope_home: &Path,
+    subcommand: &str,
+    socket: &Path,
+) -> std::process::Command {
+    let daemon_home = machine_account_home(scope_home);
+    let mut command = std::process::Command::new(airc_exe);
+    command
+        .arg("--home")
+        .arg(&daemon_home)
+        .arg(subcommand)
+        .arg("--socket")
+        .arg(socket);
+    command
+}
+
+fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
     // Temp-rooted scopes are their own account boundary on EVERY
     // platform. On Linux/macOS that falls out of `/tmp` living outside
     // `$HOME`, but on Windows `%TEMP%` is
@@ -247,6 +344,12 @@ pub(crate) struct AircInner {
     pub(crate) relay_server: Mutex<Option<airc_relay::RelayServer>>,
     pub(crate) udp: Mutex<Option<UdpAdapter>>,
     pub(crate) udp_subscriber: Mutex<Option<FrameSubscriber>>,
+    /// ICE gathering configuration for every PeerConnection this handle
+    /// builds (STUN servers + bind address). Defaults to
+    /// [`crate::IceConfig::from_env`] — NAT-capable out of the box; tests
+    /// pin [`crate::IceConfig::loopback_only`] via
+    /// [`crate::Airc::set_ice_config`] to stay hermetic.
+    pub(crate) ice_config: std::sync::RwLock<crate::IceConfig>,
     /// Per-peer WebRTC DataChannel adapters, keyed by the remote
     /// peer id. Populated by `Airc::open_webrtc_to` /
     /// `Airc::accept_webrtc_offers` after a handshake completes.
@@ -472,7 +575,7 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let wire_root = machine_account_home(&home);
+        let wire_root = machine_account_home(&home).into_path_buf();
         Self::open_inner(home, wire_root, policy, None, None).await
     }
 
@@ -485,7 +588,7 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let wire_root = machine_account_home(&home);
+        let wire_root = machine_account_home(&home).into_path_buf();
         Self::open_inner(home, wire_root, policy, Some(agent_name.into()), None).await
     }
 
@@ -503,7 +606,7 @@ impl Airc {
     ) -> Result<Self, AircError> {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
-        let wire_root = machine_account_home(&home);
+        let wire_root = machine_account_home(&home).into_path_buf();
         Self::open_inner(
             home,
             wire_root,
@@ -616,6 +719,7 @@ impl Airc {
                 relay_server: Mutex::new(None),
                 udp: Mutex::new(None),
                 udp_subscriber: Mutex::new(None),
+                ice_config: std::sync::RwLock::new(crate::IceConfig::from_env()),
                 webrtc_channels: Mutex::new(HashMap::new()),
                 webrtc_subscribers: Mutex::new(HashMap::new()),
                 webrtc_peer_connections: Mutex::new(HashMap::new()),
@@ -694,6 +798,29 @@ impl Airc {
     /// Emit a diagnostic through this handle's configured sink.
     pub(crate) fn emit_diag(&self, event: airc_diagnostics::DiagnosticEvent) {
         self.diag_sink().emit(event);
+    }
+
+    /// Replace the ICE gathering config for PeerConnections this handle
+    /// builds from now on (existing connections are unaffected). Tests
+    /// pin [`crate::IceConfig::loopback_only`] to stay hermetic;
+    /// embedders may point STUN at their own infrastructure.
+    pub fn set_ice_config(&self, config: crate::IceConfig) {
+        // Poison-recover: a panicked writer can't corrupt a plain config
+        // swap — take the lock anyway rather than propagate the panic.
+        *self
+            .inner
+            .ice_config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+    }
+
+    /// The ICE gathering config PeerConnections are currently built with.
+    pub fn ice_config(&self) -> crate::IceConfig {
+        self.inner
+            .ice_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Return the home directory backing this handle.
@@ -1089,6 +1216,26 @@ impl Airc {
         supersedes: Option<uuid::Uuid>,
     ) -> Result<uuid::Uuid, AircError> {
         let room = self.current_room().await?;
+        self.publish_wall_post_in(&room, category, body, supersedes)
+            .await
+    }
+
+    /// Publish a wall post on a room the caller RESOLVED for itself.
+    ///
+    /// [`Self::publish_wall_post`] writes "whatever room I happen to point
+    /// at"; this writes THIS room. Same split, and the same reason, as
+    /// [`Self::wall_posts`] vs [`Self::wall_posts_in`]: a verb that means a
+    /// specific room (Continuum's `activity/archive --room`, a standing
+    /// declared on a finished round from wherever the operator stands) must
+    /// be able to say so — the silent current-room default lands the post on
+    /// a plausible wrong room and nothing in the receipt says which.
+    pub async fn publish_wall_post_in(
+        &self,
+        room: &crate::Room,
+        category: String,
+        body: String,
+        supersedes: Option<uuid::Uuid>,
+    ) -> Result<uuid::Uuid, AircError> {
         let post_id = uuid::Uuid::new_v4();
         let event = airc_core::doctrine::DoctrineEvent::WallPostPublished(
             airc_core::doctrine::WallPostPublished {
@@ -1115,10 +1262,13 @@ impl Airc {
         // owner-core (no daemon in front of it).
         if self.is_daemon_attached() {
             self.daemon_publish(
-                &room,
+                room,
                 airc_protocol::FrameKind::Event,
                 body,
                 airc_core::headers::Headers::new(),
+                // A wall post is history: durable, unchanged by the
+                // presence-plane work.
+                airc_bus::DeliveryClass::Durable,
             )
             .await?;
         } else {
@@ -1178,21 +1328,33 @@ impl Airc {
         room: &crate::Room,
         category_filter: Option<&str>,
     ) -> Result<Vec<airc_core::doctrine::WallPostPublished>, AircError> {
-        let events = self
-            .room_transcripts_since(
+        // The wall is a cached projection of the room's transcript, resumed
+        // strictly after its snapshot cursor exactly like the work board
+        // (2026-09-06: a from-zero walk cost 27–128 s per read on the fleet
+        // and every citizen tick paid a 30 s deadline to it). Discriminate on
+        // each event's self-describing body, NOT its transcript `kind` — see
+        // [`wall_post_from_event`] for why the kind is unreliable on the
+        // daemon-attached read path.
+        let wall = self
+            .project_room_with_cache(
                 room,
-                &crate::work_board_cache::zero_transcript_cursor(),
                 WALL_PROJECTION_PAGE_SIZE,
+                |events| {
+                    Ok(WallProjection(
+                        events
+                            .into_iter()
+                            .filter_map(wall_post_from_event)
+                            .collect(),
+                    ))
+                },
+                |wall, events| {
+                    wall.0
+                        .extend(events.into_iter().filter_map(wall_post_from_event));
+                    Ok(())
+                },
             )
             .await?;
-        // Discriminate on each event's self-describing body, NOT its
-        // transcript `kind` — see [`wall_post_from_event`] for why the
-        // kind is unreliable on the daemon-attached read path.
-        let posts: Vec<_> = events
-            .into_iter()
-            .filter_map(wall_post_from_event)
-            .collect();
-        Ok(project_wall_posts(posts, category_filter))
+        Ok(project_wall_posts(wall.0, category_filter))
     }
 
     /// **Card 1224aac2 slice 1.** Reserved wall-post category name for
@@ -1489,6 +1651,7 @@ impl Airc {
             relay_server: Mutex::new(None),
             udp: Mutex::new(None),
             udp_subscriber: Mutex::new(None),
+            ice_config: std::sync::RwLock::new(crate::IceConfig::from_env()),
             webrtc_channels: Mutex::new(HashMap::new()),
             webrtc_subscribers: Mutex::new(HashMap::new()),
             webrtc_peer_connections: Mutex::new(HashMap::new()),
@@ -1743,19 +1906,6 @@ impl Airc {
     }
 
     async fn join_channel(&self, name: &str, focus: Focus) -> Result<Room, AircError> {
-        // Card c409eaf5: refuse uuid-shaped names. `ChannelName::new`
-        // hashes the name into a derived UUID; a uuid-shaped string
-        // re-hashes into a DIFFERENT channel UUID, silently. The
-        // resulting subscription registers on the wrong channel and
-        // the fan-out misses every publish. Better to fail loudly at
-        // the API boundary than to let the trap close on the next
-        // consumer like it closed on the continuum demo 2026-06-01.
-        if uuid::Uuid::parse_str(name.trim()).is_ok() {
-            return Err(AircError::JoinUuidString {
-                string: name.to_string(),
-            });
-        }
-        let channel = ChannelName::new(name)?;
         let identity = self.mesh_identity().await?;
         let mut set = subscriptions::load_or_init(self.event_store()).await?;
         // Self-healing join: `mesh_identity()` above may have HEALED
@@ -1765,6 +1915,43 @@ impl Airc {
         // room while inbound frames land in the converged one. Saved +
         // re-beaconed by the save/publish_presence below.
         warn_subscription_rebinds(&set.rebind_diverged(&identity));
+        // Card c409eaf5, both octaves: an id-shaped token must RESOLVE
+        // against the channels this scope already knows, never reach
+        // `ChannelName::new` (which would hash it into a brand-new
+        // channel). Octave 1 (2026-06-01, continuum demo): a FULL uuid
+        // string minted a diverged channel — refused since. Octave 2
+        // (2026-08-11): the 8-hex SHORT id walked past that guard and
+        // minted ghost room 7d1a76de from academy's prefix "3be59578" —
+        // this scope then wrote and read a room nobody else was in, and
+        // every store read looked like a monologue. Resolution wins
+        // over refusal: a token matching exactly one subscribed channel
+        // binds to THAT room; no match or several is a loud error.
+        let channel = match set.resolve_id_token(name) {
+            subscriptions::IdTokenResolution::Match(sub) => sub.name.clone(),
+            subscriptions::IdTokenResolution::NotAnId => ChannelName::new(name)?,
+            subscriptions::IdTokenResolution::Unknown => {
+                // Preserve the documented c409eaf5 error for full-uuid
+                // tokens; the short-id form gets its own guidance.
+                return Err(if uuid::Uuid::parse_str(name.trim()).is_ok() {
+                    AircError::JoinUuidString {
+                        string: name.to_string(),
+                    }
+                } else {
+                    AircError::JoinIdUnknown {
+                        token: name.trim().to_string(),
+                    }
+                });
+            }
+            subscriptions::IdTokenResolution::Ambiguous(subs) => {
+                return Err(AircError::JoinIdAmbiguous {
+                    token: name.trim().to_string(),
+                    candidates: subs
+                        .iter()
+                        .map(|s| format!("{} ({})", s.name.as_str(), s.room_id))
+                        .collect(),
+                });
+            }
+        };
         let subscription =
             set.subscribe_with_wire_root(&self.inner.wire_root, &identity, channel.clone())?;
         if focus == Focus::MakeDefault {
@@ -1776,6 +1963,40 @@ impl Airc {
         let is_default = set.default_subscription().map(|s| &s.name) == Some(&channel);
         subscriptions::save(self.event_store(), &set).await?;
         self.publish_presence(&identity, &set).await?;
+
+        // GROUND THIS PEER BY NAME, which `subscribe_room`'s own doc has always
+        // promised — "this peer's identity card is published into the room so its
+        // roster sees a named arrival" — and which nothing did. `publish_presence`
+        // above beacons the channel list; it is not the identity card, so a peer
+        // that joined was PRESENT but ANONYMOUS, and every desktop rendered it as
+        // `peer-<hex>`. Measured 2026-09-05: `publish_identity` had exactly three
+        // references in the tree — its definition, its own test mod, and the ACP
+        // adapter (integrations/acp/src/main.rs:117, "ground by name so room_roster
+        // + whois see it"). The CLI and daemon never called it, so every agent scope
+        // on the fleet was nameless while Continuum personas — which DO call it, at
+        // persona/airc_runtime.rs:590 — were named. Joel: "It ought to work from
+        // install… default to agent name… this was an airc requirement."
+        //
+        // Published AFTER presence and the durable save, matching the ordering both
+        // existing callers already use: the ACP adapter publishes after subscribe,
+        // and PersonaAircRuntime after attached-and-joined. Identity is a fact about
+        // a peer that is already in the room.
+        //
+        // NON-FATAL, deliberately, and this is the one judgement call here: a join
+        // whose identity card fails to publish leaves a WORKING subscription with an
+        // anonymous peer, which is exactly today's behaviour. Failing the join
+        // instead would turn a cosmetic gap into an outage, and `airc join` is the
+        // command every install path runs. Loud in the log, never fatal.
+        if let Err(source) = self.publish_identity().await {
+            tracing::warn!(
+                agent = %self.agent_name(),
+                channel = %channel.as_str(),
+                %source,
+                "joined the room but could not publish the identity card — this peer \
+                 will render as peer-<hex> until the next successful publish"
+            );
+        }
+
         let room = subscription.as_room();
 
         // Emit the lifecycle event after the subscription is durable
@@ -1886,7 +2107,7 @@ impl Airc {
             None => true,
             Some(stored) => stored.identity.name.trim().is_empty(),
         };
-        if needs_floor && !self.agent_name().trim().is_empty() {
+        if needs_floor && is_a_real_name(self.agent_name()) {
             // Seed + broadcast from the agent-name floor (set_local_identity_card
             // persists AND emits to every subscribed room).
             let identity = airc_core::identity::Identity {
@@ -2320,6 +2541,19 @@ fn warn_subscription_rebinds(rebinds: &[subscriptions::SubscriptionRebind]) {
 /// `wall_posts_in` can never disagree about what "the wall" means.
 pub const WALL_PROJECTION_PAGE_SIZE: usize = 500;
 
+/// Every wall post ever published on one room, in transcript order — the
+/// snapshot the wall read resumes from. Supersedes/category filtering is
+/// applied on top by [`project_wall_posts`], so the snapshot stays the raw
+/// fold and a filter change never invalidates it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WallProjection(pub(crate) Vec<airc_core::doctrine::WallPostPublished>);
+
+impl crate::work_board_cache::CachedProjection for WallProjection {
+    const DIR: &'static str = "wall-cache";
+    const LABEL: &'static str = "wall cache";
+    const VERSION: u32 = 1;
+}
+
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
 ) -> Option<airc_core::doctrine::WallPostPublished> {
@@ -2674,6 +2908,42 @@ mod room_trust_policy_tests {
         assert_eq!(super::Airc::WALL_CATEGORY_TRUST_POLICY, "trust-policy");
     }
 
+    /// what this catches (#1347 + #1352, the same bug at two spawn
+    /// sites): a daemon must be spawned with the home that OWNS its
+    /// socket, never the caller's scope. Both sites used to derive that
+    /// themselves; one forgot, and the daemon served the machine socket
+    /// under a project identity — one-way delivery, moving LAN ports, a
+    /// monologue event store, and eventually `airc update` taking the
+    /// node dark. Asserts the relationship rather than an absolute path
+    /// so it holds under any HOME (CI, tempdir, real box).
+    #[test]
+    fn daemon_command_always_spawns_the_owning_home_never_the_caller_scope() {
+        use std::path::Path;
+        let dir = tempfile::tempdir().unwrap();
+        let project_scope = dir.path().join("repo").join(".airc");
+        std::fs::create_dir_all(&project_scope).unwrap();
+        let socket = dir.path().join("airc-machine.sock");
+
+        let command = super::daemon_command(
+            Path::new("/usr/local/bin/airc"),
+            &project_scope,
+            "daemon",
+            &socket,
+        );
+        let args: Vec<_> = command.get_args().map(|a| a.to_os_string()).collect();
+        let home_pos = args
+            .iter()
+            .position(|a| a == "--home")
+            .expect("spawn must pass --home");
+        let passed = Path::new(&args[home_pos + 1]);
+
+        assert_eq!(
+            passed,
+            super::machine_account_home(&project_scope).as_path(),
+            "daemon --home must be the socket's OWNING scope, not the caller's"
+        );
+    }
+
     /// Card b0a81c31: a temp-rooted scope must stay its own account
     /// boundary on every platform. On Windows `%TEMP%` lives inside
     /// `%USERPROFILE%`, so before the temp_dir guard this resolved to
@@ -2685,7 +2955,7 @@ mod room_trust_policy_tests {
         let dir = tempfile::tempdir().unwrap();
         let scope = dir.path().join("scope-home");
         std::fs::create_dir(&scope).unwrap();
-        assert_eq!(super::machine_account_home(&scope), scope);
+        assert_eq!(super::machine_account_home(&scope).as_path(), scope);
     }
 }
 
@@ -2764,10 +3034,10 @@ mod publish_identity_tests {
         );
 
         // And the operator verb still means join-and-focus, unchanged.
-        airc.join("k3-serving").await.expect("operator join");
+        airc.join("bench-swe-run-1").await.expect("operator join");
         assert_eq!(
             airc.current_room().await.expect("current room").name,
-            "k3-serving",
+            "bench-swe-run-1",
             "join still moves the focus — this split must not change the operator's verb"
         );
     }
@@ -2795,6 +3065,70 @@ mod publish_identity_tests {
         assert_eq!(
             stored.identity.name, "Ivar",
             "the grounded citizen is named by its agent_name, not anonymous"
+        );
+    }
+
+    // what this catches: the agent-name floor grounding a scope that never claimed a
+    // name. `agent_name()` resolves to DEFAULT_AGENT_NAME ("default") when neither
+    // open_as nor $AIRC_AGENT_NAME supplied one, so the floor's non-empty check passed
+    // on the SENTINEL and published a card asserting name="default".
+    //
+    // Observed on IntelMac 2026-09-05 22:28:44 UTC, nine minutes after #1385 installed:
+    //     {"name":"default","pronouns":"","role":"","bio":"", ...}
+    // for this scope's room-facing peer. That is worse than the "not published yet" it
+    // replaced — an honest unknown became a false name, and every unnamed scope on the
+    // grid asserts the SAME false name, so they collide the moment cards cross the wire.
+    #[test]
+    fn the_default_sentinel_is_not_a_name_and_never_grounds_a_citizen() {
+        assert!(
+            !is_a_real_name(airc_store::DEFAULT_AGENT_NAME),
+            "the sentinel meaning `no name was given` must never be published AS a name"
+        );
+        assert!(!is_a_real_name(""), "empty is not a name");
+        assert!(!is_a_real_name("   "), "whitespace is not a name");
+    }
+
+    // what this catches: over-correcting and breaking the floor for the case it exists
+    // for. A citizen opened as Ivar (the groundedness incident this floor was written
+    // after) must still be grounded by its agent_name; only the no-name case declines.
+    #[test]
+    fn a_citizen_that_claimed_a_name_still_gets_the_floor() {
+        assert!(is_a_real_name("Ivar"));
+        assert!(is_a_real_name("Solveig"));
+        assert!(
+            is_a_real_name("  Memento  "),
+            "a real name survives trimming"
+        );
+    }
+
+    // what this catches: JOIN ITSELF not grounding the peer by name — the gap that
+    // made every agent scope on the fleet render as `peer-<hex>` while Continuum
+    // personas were named. `subscribe_room`'s doc has always claimed join publishes
+    // "this peer's identity card... so its roster sees a named arrival"; until
+    // 2026-09-05 nothing did, because `publish_presence` beacons the channel list and
+    // is not the identity card. Note this deliberately does NOT call
+    // publish_identity() — the whole point is that an operator who only ever runs
+    // `airc join` ends up named. The sibling test above still calls it explicitly and
+    // pins the function itself.
+    #[tokio::test]
+    async fn join_alone_grounds_the_peer_by_name_without_an_explicit_publish() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("solveig/.airc");
+        let airc = Airc::open_as(&home, "Solveig")
+            .await
+            .expect("open as Solveig");
+
+        airc.join("general").await.expect("join a channel");
+
+        let stored = airc
+            .event_store()
+            .load_local_identity_by_agent_name("Solveig")
+            .await
+            .expect("store read")
+            .expect("join must publish the identity card — an operator who only joins must not be anonymous");
+        assert_eq!(
+            stored.identity.name, "Solveig",
+            "a peer that joined is named on the wire, never peer-<hex>"
         );
     }
 
@@ -2928,4 +3262,34 @@ mod scoped_state_tests {
             .await
             .expect("delete is idempotent");
     }
+}
+
+/// Is this `agent_name` a NAME, or the sentinel that means no name was given?
+///
+/// `agent_name()` resolves to [`airc_store::DEFAULT_AGENT_NAME`] — the literal string
+/// `"default"` — whenever neither `open_as` nor `$AIRC_AGENT_NAME` supplied one
+/// (`airc-identity/src/lib.rs`: `None => Ok(DEFAULT_AGENT_NAME.to_string())`). That
+/// sentinel is the ABSENCE of a name wearing the same type as a name, and the
+/// agent-name floor in [`Airc::publish_identity`] read it as the presence of one.
+///
+/// Measured on IntelMac 2026-09-05, 22:28:44 UTC — nine minutes after airc#1385 was
+/// installed at 17:19 local — the identity index gained a card for this scope's
+/// room-facing peer reading, in full:
+/// `{"name":"default","pronouns":"","role":"","bio":"","status":"", ...}`
+///
+/// That is strictly worse than what #1385 replaced. Before it, an unnamed scope
+/// published nothing and `whois` said "identity: not published yet", which is an honest
+/// unknown. After it, the scope publishes a card asserting its name IS "default" — a
+/// false name, and one that every unnamed scope on every machine asserts identically.
+/// The moment cards actually cross the wire (card 9cfaeece), the grid fills with
+/// colliding citizens all called "default", which is the failure the floor was written
+/// to prevent (`docs/architecture/PERSONA-GROUNDEDNESS.md`, the "Ivar" incident).
+///
+/// The floor's purpose is intact and unchanged for the case it was built for: a citizen
+/// opened via `open_as("Ivar")` or `$AIRC_AGENT_NAME=Ivar` still gets grounded as Ivar.
+/// This only declines to invent a name for a scope that never claimed one — no name is
+/// not a name, and the substrate does not guess (see the no-fallbacks rule).
+fn is_a_real_name(agent_name: &str) -> bool {
+    let n = agent_name.trim();
+    !n.is_empty() && n != airc_store::DEFAULT_AGENT_NAME
 }

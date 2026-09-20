@@ -39,6 +39,7 @@ pub mod account_registry_fs;
 pub mod adapter;
 pub mod agent_heartbeat;
 pub mod airc;
+pub mod backfill;
 mod broadcast_deduper;
 pub mod capability_registry;
 pub mod command_bus;
@@ -56,6 +57,7 @@ pub mod lane_coordination;
 pub mod lifecycle;
 pub mod mesh_identity;
 mod messaging;
+pub mod nat_ice;
 mod peers;
 pub mod publish;
 pub mod registry;
@@ -66,6 +68,8 @@ pub mod room;
 pub mod route;
 pub mod route_forwarder;
 pub mod router_bridge;
+pub mod runtime_dir;
+pub mod socket_path;
 mod stream;
 pub mod stream_chunk;
 pub mod subscriptions;
@@ -81,6 +85,7 @@ pub(crate) mod work_board_cache;
 pub mod work_manager;
 pub mod work_roster;
 pub mod work_subscription;
+pub mod work_worktree;
 
 pub use account_registry::{
     merge_registry_documents, prune_stale_peers, scope_home_is_temp_rooted, AccountPeerBeacon,
@@ -92,7 +97,7 @@ pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
     RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
 };
-pub use airc::{machine_account_home, Airc};
+pub use airc::{daemon_command, machine_account_home, Airc, MachineAccountHome};
 pub use airc_protocol::{
     AssertionError, IdentityAssertion, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE,
     HEADER_AIRC_REPLY_TO,
@@ -119,8 +124,10 @@ pub use coordinator::{
 pub use daemon::decode_wire_event;
 pub use delivery_ack::DeliverySendOutcome;
 pub use diagnostic_event_sink::{
-    AircEventDiagnosticSink, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT, HEADER_DIAG_SEVERITY,
+    AircEventDiagnosticSink, RecentDiagnostics, HEADER_DIAG_CODE, HEADER_DIAG_COMPONENT,
+    HEADER_DIAG_SEVERITY,
 };
+pub use nat_ice::IceConfig;
 pub use rendezvous::{
     parse_rendezvous_dir, resolve_account_registry_store, GistRendezvous, RendezvousChoice,
     RendezvousConfigError, RENDEZVOUS_DIR_ENV,
@@ -185,7 +192,7 @@ pub use route::{
 };
 pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};
-pub use stream::{EventFilter, EventStream, FilteredEventStream, LiveLag};
+pub use stream::{EventFilter, EventScan, EventStream, FilteredEventStream, LiveLag};
 pub use subscriptions::{
     derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
     SubscriptionSet,
@@ -203,8 +210,8 @@ pub use work::{
     HeartbeatWorkspace, LinkCardPullRequest, MarkPullRequestMerged, ObserveLocalGitWorkspace,
     ObservePullRequests, ObservedLocalGitWorkspace, ObservedPullRequests, ReleaseManagerHat,
     ReleaseWorkClaim, ReleaseWorkspace, RelinkCardPullRequest, ReportAgentAvailability,
-    RequestWorkspace, UpdateWorkCard, WorkQueueStatus, WorkQueueStatusQuery,
-    WORK_BOARD_PROJECTION_PAGE_SIZE,
+    RequestWorkspace, ReviewWorkSubmission, SubmitWork, UpdateWorkCard, WorkQueueStatus,
+    WorkQueueStatusQuery, WORK_BOARD_PROJECTION_PAGE_SIZE,
 };
 pub use work_manager::{
     SeededWorkCard, WorkBacklogSeedCandidate, WorkBacklogSeedOutcome, WorkBacklogSeedResult,

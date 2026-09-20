@@ -15,14 +15,30 @@ pub async fn run_request(
     claim_id: String,
     repo: String,
     branch: String,
-    base: String,
+    base: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
+    let repo = RepoId::new(repo)?;
+    // Card 5e04ab56: resolve the integration branch through the SAME
+    // resolver PR creation uses. A second hardcoded default is how the
+    // old `rust-rewrite` pin went stale in two places at once. No
+    // fallback: an unpinned repo must be told explicitly, loudly
+    // ([[no-fallbacks-ever]]).
+    let base = match base {
+        Some(explicit) => explicit,
+        None => crate::work_commands_gh::configured_base_branch(&repo).ok_or_else(|| {
+            format!(
+                "no integration branch configured for {} — pass --base explicitly \
+                 (or add the repo to configured_base_branch)",
+                repo.as_str()
+            )
+        })?,
+    };
     let workspace_id = airc
         .request_workspace(RequestWorkspace {
             card_id: parse_work_card_id(&card_id)?,
             claim_id: parse_claim_id(&claim_id)?,
-            repo: RepoId::new(repo)?,
+            repo,
             branch: BranchName::new(branch)?,
             base: BranchName::new(base)?,
         })

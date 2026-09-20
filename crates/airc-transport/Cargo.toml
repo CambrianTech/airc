@@ -13,6 +13,8 @@ airc-core = { path = "../airc-core" }
 airc-diagnostics = { path = "../airc-diagnostics" }
 airc-protocol = { path = "../airc-protocol" }
 serde = { version = "1", features = ["derive"] }
+# lan_presence: SO_REUSEADDR before bind (multi-scope shared group) — std/tokio cannot.
+socket2 = "0.6"
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "0.1"

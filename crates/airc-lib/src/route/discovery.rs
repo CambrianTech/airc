@@ -98,6 +98,49 @@ fn learned_lan_candidates(
     candidates
 }
 
+/// #1301 (caller side): pair every IP we know for a peer with the port its
+/// transport host's IDENTITY derives — [`crate::lan::stable_lan_port`] —
+/// because that is the one port knowable WITHOUT any advertisement.
+///
+/// Why this rung exists, measured live 2026-08-15 (BigMama -> M5): the peer
+/// was enrolled, its Mac answered mDNS, its daemon was LISTENING on its
+/// stable port — and every STORED endpoint for it carried a stale ephemeral
+/// port from the pre-#1369 churn, so discovery dialed corpses and reported
+/// "0 routes, 96 enrolled". The connection that finally worked was a human
+/// running the derivation by hand: arp for the IP, `stable_lan_port(peer)`
+/// for the port, `airc dial --expected-peer`. A user without a terminal
+/// cannot do that, so the daemon must.
+///
+/// The port derives from the TRANSPORT HOST (the dial pin), not the record
+/// peer: the listener binds the wire-owning scope's identity port, and a
+/// record whose endpoints are answered by a declared host must derive from
+/// that host (machine-vs-scope, same rule as the TLS pin).
+///
+/// Appended AFTER stored/learned candidates, not prepended: post-#1369 the
+/// advertised port IS the stable port, so stored endpoints usually win and
+/// this rung costs nothing. It pays exactly when the stored set is stale —
+/// churn-era records, or a peer whose bind fell back — and failure-counted
+/// eviction retires the corpses so this rung stops paying their timeouts.
+fn identity_port_candidates(
+    existing: &[RouteEndpoint],
+    transport_host: PeerId,
+) -> Vec<RouteEndpoint> {
+    let derived = crate::lan::stable_lan_port(transport_host);
+    let mut candidates = Vec::new();
+    for endpoint in existing {
+        // Same non-wildcard match discipline as `learned_lan_candidates`.
+        if let RouteEndpoint::LanTcp { addr } | RouteEndpoint::TailscaleTcp { addr } = endpoint {
+            let candidate = RouteEndpoint::LanTcp {
+                addr: std::net::SocketAddr::from((addr.ip(), derived)),
+            };
+            if !existing.contains(&candidate) && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
 /// Card 625abe6d slice 1 — a stored peer endpoint that could not be
 /// dialed during discovery. Surfaced on the snapshot (and printed by
 /// `airc transport health`) instead of being swallowed: an offline
@@ -515,6 +558,11 @@ impl Airc {
                             );
                         }
                     }
+                    // #1301 caller side: the identity-derived port rides as
+                    // the LAST candidate for every known IP — the recovery
+                    // rung when every stored endpoint is a churn-era corpse.
+                    let mut eps = eps;
+                    eps.extend(identity_port_candidates(&eps, pin));
                     (peer_id, pin, eps, stamp, alive)
                 })
             })
@@ -1194,6 +1242,62 @@ mod tests {
             substitute_self_relay_port(recorded, None),
             recorded,
             "foreign relay (or no live server): dial as recorded"
+        );
+    }
+
+    /// what this catches: the by-hand dial that connected BigMama->M5 on
+    /// 2026-08-15, encoded so no human ever runs it again. Every STORED
+    /// endpoint carried a churn-era ephemeral port; the peer was listening on
+    /// its identity-derived port at a known IP. The candidate set must
+    /// therefore include (known_ip, stable_lan_port(transport_host)) — and
+    /// derive from the TRANSPORT HOST, not the record peer, because the
+    /// listener binds the wire-owning scope's identity (machine-vs-scope,
+    /// same rule as the TLS pin).
+    #[test]
+    fn identity_port_candidates_pair_known_ips_with_the_derived_port() {
+        let record_peer = PeerId::from_u128(0x2f0aed7f_3359_4dd5_9f9b_aaa0b07c6266);
+        let host = PeerId::from_u128(0x7711fe60_a19f_4f41_9ab6_24c884757338);
+        let stale = RouteEndpoint::LanTcp {
+            addr: "192.168.1.249:65209".parse().unwrap(),
+        };
+
+        // Derives from the record peer when it is its own transport host…
+        let own = identity_port_candidates(std::slice::from_ref(&stale), record_peer);
+        assert_eq!(
+            own,
+            vec![RouteEndpoint::LanTcp {
+                addr: std::net::SocketAddr::from((
+                    "192.168.1.249".parse::<std::net::IpAddr>().unwrap(),
+                    crate::lan::stable_lan_port(record_peer),
+                )),
+            }],
+            "a stale stored port must still yield (same ip, identity-derived port)"
+        );
+
+        // …and from the DECLARED HOST when one answers the endpoints.
+        let hosted = identity_port_candidates(std::slice::from_ref(&stale), host);
+        assert_eq!(
+            hosted[0],
+            RouteEndpoint::LanTcp {
+                addr: std::net::SocketAddr::from((
+                    "192.168.1.249".parse::<std::net::IpAddr>().unwrap(),
+                    crate::lan::stable_lan_port(host),
+                )),
+            },
+            "the port must derive from the transport host that owns the listener"
+        );
+
+        // A stored endpoint ALREADY at the derived port adds nothing — the
+        // rung is free exactly when #1369 has done its job.
+        let current = RouteEndpoint::LanTcp {
+            addr: std::net::SocketAddr::from((
+                "192.168.1.249".parse::<std::net::IpAddr>().unwrap(),
+                crate::lan::stable_lan_port(record_peer),
+            )),
+        };
+        assert!(
+            identity_port_candidates(std::slice::from_ref(&current), record_peer).is_empty(),
+            "no duplicate candidate when the stored endpoint already carries the derived port"
         );
     }
 

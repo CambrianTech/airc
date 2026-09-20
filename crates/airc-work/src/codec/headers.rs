@@ -3,7 +3,7 @@
 use airc_core::Headers;
 use airc_protocol::HEADER_FORGE_BODY_HINT;
 
-use crate::codec::{event_kind, BODY_HINT_FORGE_WORK_EVENT};
+use crate::codec::{event_kind, work_event_body_hint};
 use crate::event::WorkEvent;
 
 pub const HEADER_FORGE_WORK_EVENT_KIND: &str = "forge.work.kind";
@@ -23,7 +23,7 @@ pub fn work_event_headers(event: &WorkEvent) -> Headers {
     let mut headers = Headers::new();
     headers.insert(
         HEADER_FORGE_BODY_HINT.to_string(),
-        BODY_HINT_FORGE_WORK_EVENT.to_string(),
+        work_event_body_hint(event).to_string(),
     );
     headers.insert(
         HEADER_FORGE_WORK_EVENT_KIND.to_string(),
@@ -35,6 +35,16 @@ pub fn work_event_headers(event: &WorkEvent) -> Headers {
 
 fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
     match event {
+        WorkEvent::WorkSubmitted(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+            insert_display_header(headers, HEADER_FORGE_WORK_CLAIM_ID, e.claim_id);
+            insert_display_header(headers, HEADER_FORGE_WORK_GIT_COMMIT, &e.base_sha);
+        }
+        WorkEvent::WorkSubmissionReviewed(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
+            insert_display_header(headers, HEADER_FORGE_WORK_CLAIM_ID, e.review_claim_id);
+        }
+        WorkEvent::SubmissionRejected(_) | WorkEvent::ReviewRejected(_) => {}
         WorkEvent::CardCreated(e) => {
             insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
             headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.repo.to_string());

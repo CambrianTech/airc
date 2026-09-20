@@ -44,6 +44,7 @@ use crate::filter::Filter;
 use crate::ring::HotRing;
 use crate::seq::SeqSource;
 use crate::sink::DurableSink;
+use crate::subscriber_index::SubscriberIndex;
 
 /// Tunables for an [`EventRouter`].
 #[derive(Debug, Clone)]
@@ -90,7 +91,7 @@ struct SubscriberHandle {
 struct ChannelState {
     ring: HotRing,
     ephemeral: EphemeralCache,
-    subscribers: Vec<SubscriberHandle>,
+    subscribers: SubscriberIndex<SubscriberHandle>,
 }
 
 impl ChannelState {
@@ -98,7 +99,7 @@ impl ChannelState {
         Self {
             ring: HotRing::new(ring_capacity),
             ephemeral: EphemeralCache::new(ephemeral_ttl_ms),
-            subscribers: Vec::new(),
+            subscribers: SubscriberIndex::new(),
         }
     }
 }
@@ -182,6 +183,84 @@ pub struct ForwardItem {
     pub origin: Option<PeerId>,
 }
 
+/// Identity of a coalescing slot on the forward path: the ROOM, the
+/// PUBLISHER, and the publisher's own coalesce key.
+///
+/// The publisher is `env.from.0` — the peer that SENT the envelope — and not
+/// `ForwardItem::origin`, which is the LAN link a frame happened to arrive on
+/// (Astra, review of #1397). Two publishers reaching this node over one link
+/// share an `origin`; keying on it would make their offers supersede each
+/// other, which is the same one-value-two-meanings mistake this card is about.
+pub type ForwardKey = (RoomId, PeerId, String);
+
+/// Latest-wins state for `EphemeralLatest` envelopes on the forward path.
+///
+/// WHY THIS EXISTS rather than "just drop on a full queue" (the reduction this
+/// PR originally shipped, and which was wrong): `mpsc::Sender::try_send`
+/// returns `Err(Full(msg))` — it hands back THE MESSAGE YOU PASSED and keeps
+/// whatever is already enqueued. Dropping on full is therefore DROP-NEWEST:
+/// the stale offer survives and every fresher one is discarded, which for a
+/// class named `EphemeralLatest` is exactly inverted. A bounded queue cannot
+/// express latest-wins by itself, because a sender can never evict the entry
+/// it wants to supersede.
+///
+/// So the QUEUE IS A WAKE SIGNAL and this map is the truth. The router replaces
+/// the entry for a key on every offer; the forwarder resolves by key at EMIT
+/// time, never at enqueue time — resolving early would put a stale queued item
+/// on the wire ahead of the newer value already held here.
+#[derive(Debug, Default)]
+pub struct ForwardLatest {
+    latest: Mutex<HashMap<ForwardKey, ForwardItem>>,
+}
+
+impl ForwardLatest {
+    /// Replace the pending value for this key. The newest offer always wins.
+    fn put(&self, key: ForwardKey, item: ForwardItem) {
+        self.latest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, item);
+    }
+
+    /// What should actually go on the wire for a dequeued item.
+    ///
+    /// - a durable item is returned unchanged; it was never coalesced
+    /// - an `EphemeralLatest` item is REPLACED by the newest value for its key,
+    ///   which is removed from the map as it is consumed
+    /// - `None` means this wake has nothing to carry: an earlier wake already
+    ///   took the key's value. Duplicate wakes are EXPECTED under coalescing —
+    ///   one wake is enqueued per offer while several offers share one value —
+    ///   so the drain must treat `None` as "skip", never as a lost frame.
+    pub fn resolve(&self, queued: ForwardItem) -> Option<ForwardItem> {
+        let Some(key) = forward_key(&queued.env) else {
+            return Some(queued);
+        };
+        self.latest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key)
+    }
+
+    /// Coalesced values not yet drained. A count that only grows means the
+    /// forwarder has stopped consuming.
+    pub fn pending(&self) -> usize {
+        self.latest.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+/// The coalescing slot an envelope belongs to, or `None` when it is not a
+/// coalescable ephemeral. An `EphemeralLatest` with NO `coalesce_key` cannot be
+/// keyed, so it is not coalesced — the caller says so out loud rather than
+/// silently treating it as a slot.
+fn forward_key(env: &Envelope) -> Option<ForwardKey> {
+    if !env.delivery.is_ephemeral_latest() {
+        return None;
+    }
+    env.coalesce_key
+        .as_ref()
+        .map(|k| (env.channel, env.from.0, k.clone()))
+}
+
 /// Outcome of [`EventRouter::publish_if_new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishIfNew {
@@ -215,22 +294,54 @@ struct RouterInner {
     /// never fan out twice.
     recent_ids: Mutex<RecentEventIds>,
     /// Card 1998f6cb: the outbound route-layer sink. When installed
-    /// (`set_forward_sink`), every successfully published **durable**
-    /// envelope is offered here (bounded `try_send`, never blocking the
-    /// hot path) so the daemon's forwarder can send it over established
-    /// LAN routes. Saturation is LOUD: counted + traced, never silent.
+    /// (`set_forward_sink`), every successfully published envelope —
+    /// durable AND `EphemeralLatest` (card bf4d4556) — is offered here
+    /// (bounded `try_send`, never blocking the hot path) so the daemon's
+    /// forwarder can send it over established LAN routes. Saturation is
+    /// LOUD for durable: counted + traced, never silent.
     forward_tx: Mutex<Option<mpsc::Sender<ForwardItem>>>,
-    /// Count of durable envelopes NOT handed to the forward sink because
-    /// its bounded queue was full (or the forwarder task was gone).
-    /// Surfaced for diagnostics/tests; every increment also traces at
-    /// error level.
+    /// Count of **durable** envelopes NOT handed to the forward sink
+    /// because its bounded queue was full (or the forwarder task was
+    /// gone). Surfaced for diagnostics/tests; every increment also traces
+    /// at error level. Ephemerals are NOT counted here — losing one is
+    /// not data loss (see `ephemeral_superseded_count`).
     forward_drop_count: AtomicU64,
+    /// Card bf4d4556: count of `EphemeralLatest` envelopes not handed to
+    /// the forward sink because it was saturated. This is NOT an error:
+    /// latest-wins means the next offer carries the same truth, so a
+    /// superseded offer needs no delivery. Counted so a pathological rate
+    /// is still VISIBLE — silence and "benign" are not the same thing.
+    ephemeral_superseded_count: AtomicU64,
+    /// #1397 rework: latest-wins values for coalescable ephemerals. The
+    /// forward queue carries WAKES; this carries the truth.
+    forward_latest: Arc<ForwardLatest>,
     /// Count of events shed because the write-behind queue was saturated and
     /// the publisher was fire-and-forget (§3.8). Surfaced for diagnostics.
     shed_count: AtomicU64,
     /// Number of channel-state maps that have ever been created (across all
     /// shards) — the many-rooms test reads this as the allocation proxy.
     channels_created: AtomicU64,
+    next_subscription: AtomicU64,
+}
+
+struct SubscriptionGuard {
+    router: std::sync::Weak<RouterInner>,
+    channel: airc_core::RoomId,
+    id: u64,
+    headers: airc_core::HeaderFilter,
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.router.upgrade() else {
+            return;
+        };
+        let shard = &inner.shards[(self.channel.0.as_u128() % inner.shards.len() as u128) as usize];
+        let mut channels = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = channels.get_mut(&self.channel.0.as_u128()) {
+            state.subscribers.remove(self.id, &self.headers);
+        }
+    }
 }
 
 impl EventRouter {
@@ -264,8 +375,11 @@ impl EventRouter {
             recent_ids: Mutex::new(RecentEventIds::with_capacity(RECENT_PUBLISH_IDS_CAPACITY)),
             forward_tx: Mutex::new(None),
             forward_drop_count: AtomicU64::new(0),
+            ephemeral_superseded_count: AtomicU64::new(0),
+            forward_latest: Arc::new(ForwardLatest::default()),
             shed_count: AtomicU64::new(0),
             channels_created: AtomicU64::new(0),
+            next_subscription: AtomicU64::new(1),
         });
 
         // Write-behind task: drains durable envelopes, persists each, then
@@ -305,13 +419,19 @@ impl EventRouter {
     /// (bounded, non-blocking) as a [`ForwardItem`] carrying the
     /// origin LAN peer (if the publish came through the inbound
     /// bridge) so the forwarder can apply loop prevention.
-    pub fn set_forward_sink(&self, tx: mpsc::Sender<ForwardItem>) {
-        let mut guard = self
-            .inner
-            .forward_tx
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        *guard = Some(tx);
+    /// Returns the latest-map the forwarder MUST resolve through before
+    /// emitting a dequeued item (see [`ForwardLatest::resolve`]). The two
+    /// crates are otherwise joined by one mpsc, so this handle is the seam.
+    pub fn set_forward_sink(&self, tx: mpsc::Sender<ForwardItem>) -> Arc<ForwardLatest> {
+        {
+            let mut guard = self
+                .inner
+                .forward_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *guard = Some(tx);
+        }
+        Arc::clone(&self.inner.forward_latest)
     }
 
     /// Card 1998f6cb: durable envelopes NOT offered to the forward sink
@@ -321,11 +441,25 @@ impl EventRouter {
         self.inner.forward_drop_count.load(Ordering::SeqCst)
     }
 
-    /// Offer a just-published durable envelope to the forward sink, if
-    /// one is installed. `try_send` only — the route layer must never
-    /// backpressure the in-memory hot path; a full queue is a LOUD,
-    /// counted drop (the forwarder is expected to be drained far faster
-    /// than the LAN can be saturated by room chat).
+    /// Card bf4d4556: `EphemeralLatest` envelopes that were superseded
+    /// rather than forwarded. Benign by class — see the field doc.
+    pub fn ephemeral_superseded_count(&self) -> u64 {
+        self.inner.ephemeral_superseded_count.load(Ordering::SeqCst)
+    }
+
+    /// Offer a just-published envelope to the forward sink, if one is
+    /// installed. `try_send` only — the route layer must never
+    /// backpressure the in-memory hot path.
+    ///
+    /// SATURATION IS CLASS-DEPENDENT (card bf4d4556). For a durable
+    /// envelope a full queue is data loss: LOUD, counted, traced at
+    /// error. For `EphemeralLatest` it is not — latest-wins means the
+    /// dropped offer is superseded by the next one, which carries the
+    /// same truth. That is precisely why this class needs no latest-map
+    /// to be "coalesced": supersede-on-full IS the coalescing. Counting
+    /// them as `forward_drop_count` would raise a data-loss alarm at the
+    /// moment the system is behaving correctly, so they get their own
+    /// counter and a debug trace.
     fn offer_to_forward_sink(&self, env: &Arc<Envelope>, origin: Option<PeerId>) {
         let tx = {
             let guard = self
@@ -342,24 +476,62 @@ impl EventRouter {
             env: Arc::clone(env),
             origin,
         };
+        // A coalescable ephemeral's VALUE lands in the map BEFORE its wake is
+        // enqueued, so a wake can never arrive pointing at nothing.
+        let coalesced = forward_key(env).inspect(|key| {
+            self.inner.forward_latest.put(key.clone(), item.clone());
+        });
+
         match tx.try_send(item) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(item)) => {
-                self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
-                tracing::error!(
-                    event_id = %item.env.event_id,
-                    channel = %item.env.channel,
-                    "airc-bus forward sink queue FULL — durable event was published locally \
-                     but will NOT be forwarded over LAN routes (card 1998f6cb loud-drop)"
-                );
+            Err(mpsc::error::TrySendError::Full(dropped)) => {
+                if coalesced.is_some() {
+                    // NOT a loss: the value is in the map and an earlier wake is
+                    // still queued, so whichever wake the forwarder takes next
+                    // resolves to the newest value. This is the ONLY case where a
+                    // full queue is benign, and it is benign BECAUSE OF THE MAP —
+                    // never because "the next offer carries the same truth", which
+                    // was this PR's original false premise.
+                    self.inner
+                        .ephemeral_superseded_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    tracing::debug!(
+                        event_id = %dropped.env.event_id,
+                        channel = %dropped.env.channel,
+                        "airc-bus forward wake queue full — value coalesced into the \
+                         latest-map, a pending wake will carry it (card bf4d4556)"
+                    );
+                } else {
+                    // Durable, or an ephemeral with NO coalesce_key and therefore
+                    // no slot to hold it. Both are real losses and both are loud;
+                    // the keyless-ephemeral case is named so it cannot hide inside
+                    // the durable count.
+                    self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
+                    tracing::error!(
+                        event_id = %dropped.env.event_id,
+                        channel = %dropped.env.channel,
+                        delivery = ?dropped.env.delivery,
+                        coalescable = false,
+                        "airc-bus forward sink queue FULL — event published locally but \
+                         will NOT be forwarded over LAN routes (card 1998f6cb loud-drop)"
+                    );
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(item)) => {
+            Err(mpsc::error::TrySendError::Closed(dropped)) => {
+                // A CLOSED receiver is never benign for ANY class: the forwarder
+                // task is gone, so nothing crosses again — there is no "next offer"
+                // to carry the truth and the latest-map can only grow. Reporting
+                // this at debug for ephemerals (as this PR first did) hid a dead
+                // forwarder behind a word that means "a newer one is coming".
                 self.inner.forward_drop_count.fetch_add(1, Ordering::SeqCst);
                 tracing::error!(
-                    event_id = %item.env.event_id,
-                    channel = %item.env.channel,
-                    "airc-bus forward sink receiver is GONE — durable event was published \
-                     locally but will NOT be forwarded over LAN routes (card 1998f6cb)"
+                    event_id = %dropped.env.event_id,
+                    channel = %dropped.env.channel,
+                    delivery = ?dropped.env.delivery,
+                    pending_coalesced = self.inner.forward_latest.pending(),
+                    "airc-bus forward sink receiver is GONE — the forwarder task has \
+                     exited and NOTHING will be forwarded over LAN routes for any \
+                     delivery class (card 1998f6cb)"
                 );
             }
         }
@@ -438,27 +610,24 @@ impl EventRouter {
             let mut sent_ok = 0usize;
             let mut sent_lagged = 0usize;
             let mut sent_closed = 0usize;
-            state.subscribers.retain(|sub| {
+            state.subscribers.visit(&env.headers, |sub| {
                 if !sub.filter.matches(&env) {
-                    return true; // not for this subscriber, keep it
+                    return;
                 }
                 matched += 1;
                 match sub.tx.try_send(Arc::clone(&env)) {
                     Ok(()) => {
                         sent_ok += 1;
-                        true
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // Lagged: drop the live push, flag it; the subscriber
                         // resumes from the sink via its cursor.
                         sub.lagged.store(true, Ordering::SeqCst);
                         sent_lagged += 1;
-                        true
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         // Receiver gone -> drop the handle.
                         sent_closed += 1;
-                        false
                     }
                 }
             });
@@ -496,11 +665,24 @@ impl EventRouter {
                     return Err(crate::BusError::Sink("write-behind task gone".into()));
                 }
             }
-            // Card 1998f6cb: the event is accepted locally (ring +
-            // fan-out + write-behind enqueued) — offer it to the
-            // route layer so it traverses established LAN routes.
-            // Durable only: ephemeral/stream classes stay machine-
-            // local in this slice. Off the shard lock, non-blocking.
+        }
+
+        // Card 1998f6cb: the event is accepted locally (ring + fan-out,
+        // and for durable also write-behind enqueued) — offer it to the
+        // route layer so it traverses established LAN routes. Off the
+        // shard lock, non-blocking.
+        //
+        // Card bf4d4556: this offer used to live INSIDE the `is_durable`
+        // block above, sharing it with write-behind. That nesting is what
+        // left the capacity plane dark grid-wide: capacity offers publish
+        // as `EphemeralLatest`, so they reached the local coalesce cache
+        // and returned, and every node heard only its own echo. The two
+        // concerns were never related — write-behind is about the durable
+        // STORE, forwarding is about the WIRE — and a class that must not
+        // be persisted still very much has to cross the LAN. Stream
+        // classes remain machine-local; they are a different question and
+        // are not in this card.
+        if env.delivery.is_durable() || env.delivery.is_ephemeral_latest() {
             self.offer_to_forward_sink(&env, origin);
         }
 
@@ -729,7 +911,20 @@ impl EventRouter {
         channel: RoomId,
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
-        self.durable_tail_filtered(channel, None, limit).await
+        self.durable_tail_filtered(channel, None, None, limit).await
+    }
+
+    /// A bounded durable page strictly before a position in THIS router's
+    /// channel order. The cursor must come from an earlier page of this same
+    /// owner and channel; another machine's ingest position is unrelated.
+    pub async fn durable_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        self.durable_tail_filtered(channel, before, None, limit)
+            .await
     }
 
     /// **Continuum #297.** [`Self::durable_tail`] restricted to
@@ -750,7 +945,7 @@ impl EventRouter {
         kinds: &[Kind],
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
-        self.durable_tail_filtered(channel, Some(kinds), limit)
+        self.durable_tail_filtered(channel, None, Some(kinds), limit)
             .await
     }
 
@@ -763,6 +958,7 @@ impl EventRouter {
     async fn durable_tail_filtered(
         &self,
         channel: RoomId,
+        before: Option<Cursor>,
         kinds: Option<&[Kind]>,
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
@@ -779,7 +975,11 @@ impl EventRouter {
                         .ring
                         .replay_after(None)
                         .into_iter()
-                        .filter(|env| env.delivery.is_durable() && matches_kind(env))
+                        .filter(|env| {
+                            env.delivery.is_durable()
+                                && matches_kind(env)
+                                && before.is_none_or(|gate| env.cursor().is_before(&gate))
+                        })
                         .collect::<Vec<_>>(),
                     state.ring.oldest_cursor(),
                 ),
@@ -795,17 +995,24 @@ impl EventRouter {
         // before `ring_oldest` cannot also be in the ring, so the two
         // legs concatenate with no dup and no gap.
         let remainder = limit - tail.len();
+        // A page wholly behind the hot ring must retain the caller's older
+        // bound. Otherwise the sink would repeat the same newest stored page.
+        let sink_before = match (before, ring_oldest) {
+            (Some(before), Some(oldest)) if before.is_before(&oldest) => Some(before),
+            (_, Some(oldest)) => Some(oldest),
+            (before, None) => before,
+        };
         let older = match kinds {
             None => {
                 self.inner
                     .sink
-                    .page_tail(channel, ring_oldest, remainder)
+                    .page_tail(channel, sink_before, remainder)
                     .await?
             }
             Some(kinds) => {
                 self.inner
                     .sink
-                    .page_tail_of_kinds(channel, ring_oldest, kinds, remainder)
+                    .page_tail_of_kinds(channel, sink_before, kinds, remainder)
                     .await?
             }
         };
@@ -848,8 +1055,32 @@ impl EventRouter {
         filter: Filter,
         from_cursor: Option<Cursor>,
     ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+        self.subscribe_mode(filter, from_cursor, false)
+    }
+
+    /// Register at the live edge without reading or decoding transcript history.
+    pub fn subscribe_live_with_lag(
+        &self,
+        filter: Filter,
+    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+        self.subscribe_mode(filter, None, true)
+    }
+
+    fn subscribe_mode(
+        &self,
+        filter: Filter,
+        from_cursor: Option<Cursor>,
+        live_only: bool,
+    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
         let inner = Arc::clone(&self.inner);
         let channel = filter.channel;
+        let id = inner.next_subscription.fetch_add(1, Ordering::Relaxed);
+        let registration = SubscriptionGuard {
+            router: Arc::downgrade(&inner),
+            channel,
+            id,
+            headers: filter.headers.clone(),
+        };
 
         // --- step 1: register live + snapshot ring under one lock ---
         let lagged = Arc::new(AtomicBool::new(false));
@@ -868,15 +1099,23 @@ impl EventRouter {
             if is_new {
                 inner.channels_created.fetch_add(1, Ordering::SeqCst);
             }
-            state.subscribers.push(SubscriberHandle {
-                tx,
-                filter: filter.clone(),
-                lagged: Arc::clone(&lagged),
-            });
+            state.subscribers.insert(
+                id,
+                &filter.headers,
+                SubscriberHandle {
+                    tx,
+                    filter: filter.clone(),
+                    lagged: Arc::clone(&lagged),
+                },
+            );
             // Snapshot recent replay + the oldest cursor still in RAM, while
             // holding the same lock that gated live registration.
             (
-                state.ring.replay_after(from_cursor),
+                if live_only {
+                    Vec::new()
+                } else {
+                    state.ring.replay_after(from_cursor)
+                },
                 state.ring.oldest_cursor(),
                 idx,
                 state.subscribers.len(),
@@ -900,37 +1139,64 @@ impl EventRouter {
 
         let lag_flag = LagFlag(Arc::clone(&lagged));
         let stream = async_stream::stream! {
+            // Captured even before first poll: dropping an unpolled stream
+            // unregisters immediately, with no later publish needed for cleanup.
+            let _registration = registration;
             // --- step 2: deep replay leg from the sink ---
-            // The sink covers `(from_cursor, ring_oldest)`: events older than
-            // the ring still retains. If the ring is non-empty we page the sink
-            // up to (but not including) the ring's oldest; if the ring is empty
-            // we page the whole tail after the cursor.
+            // Card ddbab098 — sibling of #1389 on the attach path. The old code
+            // pulled everything after `from_cursor` in one unbounded query and
+            // filtered it in memory; now we page the sink in bounded chunks, so
+            // attaching to a deep channel costs bounded time and never
+            // materializes the whole tail. Delivery semantics are unchanged:
+            // every row strictly after `from_cursor` and before the ring's
+            // oldest is still delivered, in total order.
+            const DEEP_REPLAY_PAGE: usize = 1024;
             let mut high: Option<Cursor> = from_cursor;
-            let deep = inner
-                .sink
-                .page(channel, from_cursor, usize::MAX)
-                .await
-                .unwrap_or_default();
-            for env in deep {
-                // The sink (persistence) is a real copy boundary, so the deep
-                // leg arrives as owned `Envelope`s; wrap each once in `Arc` so
-                // the stream item type is uniform with the (already-`Arc`) ring
-                // and live legs and downstream stays zero-copy.
-                let env = Arc::new(env);
-                // Only emit sink events strictly before the ring snapshot's
-                // window — the ring snapshot is authoritative for the recent
-                // tail (it may hold un-persisted Durable the sink lacks).
-                let before_ring = match ring_oldest {
-                    Some(o) => env.cursor().is_before(&o),
-                    None => true,
-                };
-                let after_gate = match high {
-                    Some(h) => env.cursor().is_after(&h),
-                    None => true,
-                };
-                if before_ring && after_gate && filter.matches(&env) {
-                    high = Some(env.cursor());
-                    yield env;
+            if !live_only {
+                let mut page_from: Option<Cursor> = from_cursor;
+                'deep: loop {
+                    let deep = inner
+                        .sink
+                        .page(channel, page_from, DEEP_REPLAY_PAGE)
+                        .await
+                        .unwrap_or_default();
+                    // A short or empty page means the sink holds nothing further
+                    // past `page_from` — the tail is exhausted. (A failed query
+                    // surfaces as a short page too: same posture as the old single
+                    // fetch, where steps 3/4 still deliver recent + live.)
+                    let full_page = deep.len() >= DEEP_REPLAY_PAGE;
+                    let last_cursor = deep.last().map(|e| e.cursor());
+                    for env in deep {
+                        let cursor = env.cursor();
+                        // Hand off to step 3 once we reach the ring snapshot's
+                        // window — it is authoritative from there on (it may hold
+                        // un-persisted Durable the sink lacks). Rows arrive in total
+                        // order, so this break ends the whole leg.
+                        if matches!(ring_oldest, Some(o) if !cursor.is_before(&o)) {
+                            break 'deep;
+                        }
+                        let after_gate = match high {
+                            Some(h) => cursor.is_after(&h),
+                            None => true,
+                        };
+                        // The sink (persistence) is a real copy boundary, so the deep
+                        // leg arrives as owned `Envelope`s; wrap each once in `Arc`
+                        // so the stream item type stays uniform with the
+                        // (already-`Arc`) ring and live legs.
+                        let env = Arc::new(env);
+                        if after_gate && filter.matches(&env) {
+                            high = Some(cursor);
+                            yield env;
+                        }
+                    }
+                    if !full_page {
+                        break 'deep;
+                    }
+                    // A full page (>= DEEP_REPLAY_PAGE rows) always has a last cursor; `None`
+                    // here would mean the sink contradicted its own length. Bail rather than panic:
+                    // steps 3/4 still hand off from there on.
+                    let Some(next_from) = last_cursor else { break 'deep; };
+                    page_from = Some(next_from);
                 }
             }
 
@@ -967,11 +1233,23 @@ impl EventRouter {
     /// strictly after its last cursor, recent-from-ring + deep-from-sink,
     /// merged in total order with no dup. A lagging `Durable` subscriber calls
     /// this to resume; fan-out to others was never blocked.
+    ///
+    /// `limit` bounds the answer AND the work: the deep leg is one indexed
+    /// `LIMIT limit` query (never the channel's whole remainder), and the
+    /// merged page is cut to `limit` in total order. Pagination is the
+    /// caller's job — pass the last returned cursor back in. Measured
+    /// 2026-09-06 (continuum M5, the wall projection): with `usize::MAX`
+    /// here every 500-event inbox page materialized the entire remaining
+    /// transcript (academy 244k rows, cambriantech 472k), so a from-zero
+    /// walk was O(n²/page) and never returned inside the callers' 30 s
+    /// deadline, while the board — resuming from a saved cursor — was instant.
     pub async fn resume_from_cursor(
         &self,
         channel: RoomId,
         from_cursor: Option<Cursor>,
+        limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
+        let limit = limit.max(1);
         // Recent from ring (snapshot under lock; no await held).
         let (ring_events, ring_oldest) = {
             let shard = self.shard_for(channel);
@@ -986,11 +1264,7 @@ impl EventRouter {
         };
 
         // Deep from sink for the window older than the ring.
-        let deep = self
-            .inner
-            .sink
-            .page(channel, from_cursor, usize::MAX)
-            .await?;
+        let deep = self.inner.sink.page(channel, from_cursor, limit).await?;
 
         let mut out: Vec<Arc<Envelope>> = Vec::new();
         for env in deep {
@@ -1018,6 +1292,9 @@ impl EventRouter {
                 .then_with(|| a.event_id.0.cmp(&b.event_id.0))
         });
         out.dedup_by(|a, b| a.event_id == b.event_id);
+        // Deep rows all precede ring rows in total order, so the first `limit`
+        // of the merge are exactly the first `limit` after the cursor.
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -1072,5 +1349,47 @@ impl LagFlag {
     /// subscriber then resumes via [`EventRouter::resume_from_cursor`].
     pub fn is_lagged(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod subscription_lifetime_tests {
+    use super::*;
+    // what this catches: dropping an unpolled stream must release its indexed
+    // registration on a quiet room, without waiting for another publish.
+    #[tokio::test]
+    async fn unpolled_stream_drop_unregisters_exact_handle() {
+        let router = EventRouter::new(
+            RouterConfig::default(),
+            Arc::new(crate::ManualClock::new(0)),
+            Arc::new(SeqSource::start_at_counter(
+                &crate::InMemoryEpochStore::new(),
+                0,
+            )),
+            Arc::new(crate::InMemoryDurableSink::new()),
+        );
+        let room = airc_core::RoomId::new();
+        let filter = Filter::channel(room).with_headers(airc_core::HeaderFilter::Exact {
+            key: "correlation".into(),
+            value: "same-key".into(),
+        });
+        let count = || {
+            router
+                .shard_for(room)
+                .channels
+                .lock()
+                .unwrap()
+                .get(&room.0.as_u128())
+                .unwrap()
+                .subscribers
+                .len()
+        };
+        let (old, _) = router.subscribe_live_with_lag(filter.clone());
+        let (replacement, _) = router.subscribe_live_with_lag(filter);
+        assert_eq!(count(), 2);
+        drop(old);
+        assert_eq!(count(), 1);
+        drop(replacement);
+        assert_eq!(count(), 0);
     }
 }

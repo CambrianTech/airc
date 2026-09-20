@@ -94,10 +94,15 @@ fn json_detail(value: &Value) -> Option<String> {
         return Some(work_summary(&event));
     }
     // Some other structured body — still beats "<non-text body>".
-    Some(match value.get("kind").and_then(Value::as_str) {
-        Some(kind) => format!("⟨{kind}⟩"),
-        None => "⟨structured⟩".to_owned(),
-    })
+    // A structured frame with no `kind` is substrate bookkeeping (a capacity
+    // beacon, a presence sample) — nothing an agent can answer or act on. It used
+    // to render as "⟨structured⟩" and woke the agent's live feed every ~5 s from
+    // its OWN daemon (2026-09-14, Joel: "make sure airc isn't spamming agents").
+    // Silence is the correct rendering; `airc events` still lists every frame.
+    value
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(|kind| format!("⟨{kind}⟩"))
 }
 
 fn work_summary(event: &WorkEvent) -> String {
@@ -143,6 +148,21 @@ fn kind_label(event: &WorkEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what this catches: substrate bookkeeping frames (no `kind`, not a work event)
+    /// rendering as "⟨structured⟩" and waking an agent's feed every few seconds.
+    #[test]
+    fn a_kindless_structured_frame_renders_as_nothing() {
+        assert_eq!(
+            json_detail(&serde_json::json!({"gpuTotalBytes": 1, "atMs": 2})),
+            None
+        );
+        assert_eq!(json_detail(&serde_json::json!({"kind": "alive"})), None);
+        assert_eq!(
+            json_detail(&serde_json::json!({"kind": "note"})),
+            Some("⟨note⟩".to_owned())
+        );
+    }
     use serde_json::json;
 
     #[test]

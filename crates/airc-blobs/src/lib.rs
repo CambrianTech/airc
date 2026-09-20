@@ -65,6 +65,15 @@ pub enum BlobError {
     #[error("storage capacity exceeded: need {needed_bytes} bytes")]
     CapacityExceeded { needed_bytes: u64 },
 
+    #[error("blob size {actual_bytes} exceeds retrieval limit {limit_bytes}")]
+    ReadLimitExceeded { actual_bytes: u64, limit_bytes: u64 },
+
+    #[error("blob reference size mismatch: expected {expected_bytes}, received {actual_bytes}")]
+    SizeMismatch {
+        expected_bytes: u64,
+        actual_bytes: u64,
+    },
+
     /// Underlying I/O error. Backend-agnostic carrier for the
     /// std::io::Error / network error that prevented the operation.
     /// Caller surfaces the inner message; never silently swallows.
@@ -90,6 +99,46 @@ pub struct MediaRef {
     /// dispatch (recipient may re-sniff after fetch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
+}
+
+impl MediaRef {
+    /// Verify the referenced bytes identically whether obtained locally or
+    /// from a peer. Callers must also bound allocation while receiving bytes;
+    /// checking an already allocated buffer is not a transport memory limit.
+    pub fn verify(&self, bytes: &[u8], limit_bytes: u64) -> Result<(), BlobError> {
+        self.check_read_limit(limit_bytes)?;
+        let actual_bytes = bytes.len() as u64;
+        if actual_bytes > limit_bytes {
+            return Err(BlobError::ReadLimitExceeded {
+                actual_bytes,
+                limit_bytes,
+            });
+        }
+        if actual_bytes != self.size_bytes {
+            return Err(BlobError::SizeMismatch {
+                expected_bytes: self.size_bytes,
+                actual_bytes,
+            });
+        }
+        let actual = ContentHash::from_bytes(bytes);
+        if actual != self.hash {
+            return Err(BlobError::HashMismatch {
+                expected: self.hash.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn check_read_limit(&self, limit_bytes: u64) -> Result<(), BlobError> {
+        if self.size_bytes > limit_bytes {
+            return Err(BlobError::ReadLimitExceeded {
+                actual_bytes: self.size_bytes,
+                limit_bytes,
+            });
+        }
+        Ok(())
+    }
 }
 
 // ─── The trait every backend implements ──────────────────────────────

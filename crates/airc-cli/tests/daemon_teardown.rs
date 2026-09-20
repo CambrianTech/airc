@@ -250,20 +250,20 @@ fn temp_home_daemon_self_exits_when_idle() {
 fn explicit_temp_home_keeps_its_socket_under_the_home() {
     let guard = common::daemon_tempdir();
     let root = guard.path().to_path_buf();
-    // An isolated home OUTSIDE any user account — `airc status`
+    // An isolated home OUTSIDE any user account — `airc inbox`
     // spawn-or-connects a daemon and derives its socket.
     let home = root.join(".airc");
 
     let out = Command::new(airc())
         .arg("--home")
         .arg(&home)
-        .arg("status")
+        .arg("inbox")
         .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
         .output()
-        .expect("airc status runs");
+        .expect("airc inbox runs");
     assert!(
         out.status.success(),
-        "airc status failed: {}",
+        "airc inbox failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 

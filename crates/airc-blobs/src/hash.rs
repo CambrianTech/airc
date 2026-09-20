@@ -19,6 +19,11 @@ use std::fmt;
 pub struct ContentHash([u8; 32]);
 
 impl ContentHash {
+    /// Internal bridge from a completed streaming digest; no hex/JSON roundtrip.
+    pub(crate) fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     /// Compute the SHA-256 hash of `bytes`. The canonical constructor.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut hasher = Sha256::new();

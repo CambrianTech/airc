@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use airc_bus::{BusError, Clock, EventRouter, RouterConfig, SeqSource, SystemClock};
 use airc_core::PeerId;
-use airc_ipc::{IpcPeerDeliveryStats, IpcRouteEndpoint};
+use airc_ipc::{DeliveryStatsResponse, IpcRouteEndpoint};
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, SqliteDurableSink};
 
@@ -75,13 +75,20 @@ pub struct DaemonState {
     /// counter each tick — exactly the wiring split used for
     /// `route_endpoints`. `0` until the first refresh completes.
     pub connected_lan_peers: Arc<AtomicUsize>,
+    /// Live IPC connections the daemon holds right now: request sockets
+    /// in flight plus attach streams. ONE counter, owned here — the
+    /// temp-home idle watchdog reads it and `Status` reports it, so an
+    /// operator can see a daemon whose streams outlive their clients
+    /// (card e28889cc: 4,190 sockets on one daemon, ~3,500 with no peer,
+    /// measured 2026-09-12).
+    pub connections: AtomicUsize,
     /// #1306 slice 2: per-peer delivery-ledger snapshot, served via
     /// `Request::DeliveryStats`. Same wiring split as
     /// `connected_lan_peers`: the concrete ledger lives on an
     /// `airc-lib` handle this crate must not depend on, so the host's
-    /// route-refresh loop writes this snapshot each tick. Empty until
-    /// the first refresh after any cross-machine forward.
-    pub delivery_stats: Arc<RwLock<Vec<IpcPeerDeliveryStats>>>,
+    /// route-refresh loop writes rows, timestamp and connected count together
+    /// each tick. No timestamp until the first completed refresh.
+    pub delivery_stats: Arc<RwLock<DeliveryStatsResponse>>,
     /// Edge-triggered resync nudge for the account-registry loop. The
     /// route-refresh loop detects this node's own LAN/Tailscale IP
     /// changing (router swap, DHCP renew, Tailscale toggle) and, ONLY when
@@ -148,7 +155,8 @@ impl DaemonState {
             runtime,
             route_endpoints: RwLock::new(Vec::new()),
             connected_lan_peers: Arc::new(AtomicUsize::new(0)),
-            delivery_stats: Arc::new(RwLock::new(Vec::new())),
+            connections: AtomicUsize::new(0),
+            delivery_stats: Arc::new(RwLock::new(DeliveryStatsResponse::default())),
             endpoint_resync: Arc::new(Notify::new()),
             route_wake: Arc::new(Notify::new()),
         })

@@ -93,6 +93,24 @@ pub enum HeaderFilter {
     },
     All(Vec<HeaderFilter>),
     AnyOf(Vec<HeaderFilter>),
+    /// Matches when `key` is present, whatever its value. The
+    /// presence check `Prefix { key, value_prefix: "" }` also
+    /// expresses is intentionally NOT the idiom — an empty-prefix
+    /// match reads as an accident at the call site; `Has` reads as
+    /// the decision it is.
+    Has {
+        key: String,
+    },
+    /// Inverts the inner predicate. This is the exclusion half the
+    /// combinator set was missing: a consumer that wants "every
+    /// event EXCEPT the `airc.heartbeat.*`-stamped liveness beacons"
+    /// (continuum #445 — measured 149 of 177 inbound events on a
+    /// persona subscription were heartbeats, all discarded
+    /// post-decode) writes `Not(Has { key })` and the router drops
+    /// them BEFORE fan-out. Without `Not`, allowlists were the only
+    /// shape, and an allowlist over headers no publisher stamps yet
+    /// matches nothing.
+    Not(Box<HeaderFilter>),
 }
 
 impl HeaderFilter {
@@ -109,6 +127,8 @@ impl HeaderFilter {
                 .is_some_and(|value| value.starts_with(value_prefix)),
             HeaderFilter::All(filters) => filters.iter().all(|filter| filter.matches(headers)),
             HeaderFilter::AnyOf(filters) => filters.iter().any(|filter| filter.matches(headers)),
+            HeaderFilter::Has { key } => headers.get(key).is_some(),
+            HeaderFilter::Not(inner) => !inner.matches(headers),
         }
     }
 
@@ -134,6 +154,8 @@ impl HeaderFilter {
                 .is_some_and(|value| value.starts_with(value_prefix.as_str())),
             HeaderFilter::All(filters) => filters.iter().all(|filter| filter.matches_view(view)),
             HeaderFilter::AnyOf(filters) => filters.iter().any(|filter| filter.matches_view(view)),
+            HeaderFilter::Has { key } => view.get(key).is_some(),
+            HeaderFilter::Not(inner) => !inner.matches_view(view),
         }
     }
 }
@@ -377,6 +399,16 @@ mod tests {
                     value: "video-room".to_string(),
                 },
             ]),
+            HeaderFilter::Has {
+                key: "continuum.widget".to_string(),
+            },
+            HeaderFilter::Has {
+                key: "missing.key".to_string(),
+            },
+            HeaderFilter::Not(Box::new(HeaderFilter::Has {
+                key: "continuum.widget".to_string(),
+            })),
+            HeaderFilter::Not(Box::new(HeaderFilter::Any)),
         ];
         for filter in &cases {
             assert_eq!(
@@ -385,6 +417,34 @@ mod tests {
                 "matches/matches_view divergence for {filter:?}"
             );
         }
+    }
+
+    #[test]
+    fn not_has_excludes_stamped_events_and_round_trips_the_wire() {
+        // what this catches: the continuum #445 exclusion shape — a
+        // persona subscription that wants room content but not the
+        // 60s liveness beacons every peer emits. Heartbeats already
+        // stamp `airc.heartbeat.kind`; `Not(Has)` is the first
+        // filter that can act on that stamp as an exclusion. The
+        // serde round-trip half pins the wire encoding: this enum
+        // crosses the IPC boundary inside AttachRequest, so a
+        // variant that (de)serializes asymmetrically would filter
+        // correctly in-process and silently mis-filter daemon-side.
+        let beacon = Headers::from([("airc.heartbeat.kind".to_string(), "alive".to_string())]);
+        let chat = Headers::from([("continuum.schema".to_string(), "chat".to_string())]);
+        let exclude_beacons = HeaderFilter::Not(Box::new(HeaderFilter::Has {
+            key: "airc.heartbeat.kind".to_string(),
+        }));
+        assert!(!exclude_beacons.matches(&beacon), "beacon must be excluded");
+        assert!(exclude_beacons.matches(&chat), "chat must pass");
+        assert!(
+            exclude_beacons.matches(&Headers::new()),
+            "unstamped events pass an exclusion filter — exclusion is never an allowlist"
+        );
+
+        let encoded = serde_json::to_string(&exclude_beacons).expect("encode");
+        let decoded: HeaderFilter = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, exclude_beacons, "wire round-trip must be identity");
     }
 
     /// Large-scale fixture: 50 headers (dense), modelling a busy room

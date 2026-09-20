@@ -133,6 +133,12 @@ pub struct PendingCommand {
     /// the request/await contract rather than constructing half-armed
     /// pending commands.
     reply_stream: Option<EventStream>,
+    // Preserve the dispatch room across default-room changes and re-subscribe.
+    reply_room: airc_core::RoomId,
+    // Logical addressing captured at dispatch, independent of transport endpoints
+    // and of the Airc handle later used to await this pending request.
+    expected_target: MentionTarget,
+    requester: PeerId,
 }
 
 impl std::fmt::Debug for PendingCommand {
@@ -155,6 +161,36 @@ impl PendingCommand {
             Some(Duration::from_millis(self.deadline_at_ms - now))
         }
     }
+
+    fn accepts_author(&self, author: PeerId) -> bool {
+        if author == self.requester {
+            return false;
+        }
+        match self.expected_target {
+            MentionTarget::Peer(expected) => author == expected,
+            // Neither a broadcast nor a room reference names one responder.
+            // Preserve first-reply semantics within the dispatch room.
+            MentionTarget::All | MentionTarget::Room(_) => true,
+        }
+    }
+}
+
+/// Read the addressing a responder needs off an in-flight request:
+/// `(reply_to, correlation_id)`.
+///
+/// `None` when either header is missing or unparseable, which means the event
+/// is not an answerable request — a responder that guessed here would reply
+/// into the void or, worse, correlate its answer to someone else's question.
+/// Extracted because every responder needs exactly this pair, and each one
+/// re-deriving it from raw headers is how they drift apart.
+pub fn reply_addressing(event: &TranscriptEvent) -> Option<(PeerId, Uuid)> {
+    let reply_to = PeerId::from_uuid(event.headers.get(HEADER_AIRC_REPLY_TO)?.parse().ok()?);
+    let correlation_id = event
+        .headers
+        .get(HEADER_AIRC_CORRELATION_ID)?
+        .parse()
+        .ok()?;
+    Some((reply_to, correlation_id))
 }
 
 impl Airc {
@@ -167,18 +203,53 @@ impl Airc {
     ///
     /// `target` selects who is expected to handle the request.
     /// `MentionTarget::All` broadcasts and the first reply wins;
-    /// `MentionTarget::Peer(id)` directs at one peer.
+    /// `MentionTarget::Peer(id)` accepts a reply only from that logical peer.
+    /// A room reference does not select a unique responding peer. All replies
+    /// must be addressed to this requester in the original dispatch room.
     pub async fn request(
         &self,
+        target: MentionTarget,
+        headers: Headers,
+        body: Body,
+        deadline: Duration,
+    ) -> Result<PendingCommand, AircError> {
+        self.request_on(None, target, headers, body, deadline).await
+    }
+
+    /// Request in an explicit activity room without changing current-room state.
+    pub async fn request_in(
+        &self,
+        room: &crate::Room,
+        target: MentionTarget,
+        headers: Headers,
+        body: Body,
+        deadline: Duration,
+    ) -> Result<PendingCommand, AircError> {
+        self.request_on(Some(room), target, headers, body, deadline)
+            .await
+    }
+
+    async fn request_on(
+        &self,
+        room: Option<&crate::Room>,
         target: MentionTarget,
         mut headers: Headers,
         body: Body,
         deadline: Duration,
     ) -> Result<PendingCommand, AircError> {
+        let room = match room {
+            Some(room) => {
+                self.room_by_name_or_channel(&room.channel.to_string(), "request in")
+                    .await?
+            }
+            None => self.current_room().await?,
+        };
         let correlation_id = Uuid::new_v4();
         let deadline_at_ms = now_ms()? + deadline.as_millis() as u64;
         let __sub = airc_diagnostics::timing::start();
-        let reply_stream = self.subscribe().await?;
+        let reply_stream = self
+            .command_reply_stream(room.channel, correlation_id)
+            .await?;
         __sub.stop("airc.req.subscribe");
 
         headers.insert(
@@ -192,20 +263,93 @@ impl Airc {
         headers.insert(HEADER_AIRC_DEADLINE.into(), deadline_at_ms.to_string());
 
         let __send = airc_diagnostics::timing::start();
-        self.send_frame_to(airc_protocol::FrameKind::Message, target, body, headers)
-            .await?;
+        self.send_frame_to_room(
+            airc_protocol::FrameKind::Message,
+            target.clone(),
+            body,
+            headers,
+            &room,
+        )
+        .await?;
         __send.stop("airc.req.send_frame");
 
         Ok(PendingCommand {
             correlation_id,
             deadline_at_ms,
             reply_stream: Some(reply_stream),
+            reply_room: room.channel,
+            expected_target: target,
+            requester: self.inner.identity.peer_id,
         })
+    }
+
+    async fn command_reply_stream(
+        &self,
+        room: airc_core::RoomId,
+        correlation_id: Uuid,
+    ) -> Result<EventStream, AircError> {
+        if self.is_daemon_attached() {
+            self.daemon_subscribe(
+                vec![room],
+                None,
+                airc_core::HeaderFilter::Exact {
+                    key: HEADER_AIRC_CORRELATION_ID.to_string(),
+                    value: correlation_id.to_string(),
+                },
+            )
+            .await
+        } else {
+            self.subscribe().await
+        }
+    }
+
+    /// Reply to an in-flight request INTO THE CHANNEL THE REQUEST ARRIVED ON.
+    ///
+    /// [`reply`](Self::reply) sends via the responder's CURRENT room — correct
+    /// only when both sides happen to share it. Two scopes on one machine can
+    /// be parked in different rooms (an operator CLI in `#general`, citizens
+    /// landed in `#academy`): the request crosses (responders subscribe every
+    /// room) but the answer leaves through the responder's room and the
+    /// requester — awaiting on the channel it asked in — never sees it. Every
+    /// dispatch then dies at the command deadline (2026-08-27 grid-smoke 0/3).
+    ///
+    /// `channel` is the request event's `room_id`, adopted verbatim;
+    /// `channel_name` is the request's stamped
+    /// [`airc_protocol::HEADER_AIRC_CHANNEL_NAME`] (for the blind-room heal
+    /// header on the reply), if present.
+    pub async fn reply_in(
+        &self,
+        channel: airc_core::RoomId,
+        channel_name: Option<&str>,
+        reply_to: PeerId,
+        correlation_id: Uuid,
+        mut headers: Headers,
+        body: Body,
+    ) -> Result<(), AircError> {
+        headers.insert(
+            HEADER_AIRC_CORRELATION_ID.into(),
+            correlation_id.to_string(),
+        );
+        headers.insert(HEADER_AIRC_REPLY_TO.into(), reply_to.to_string());
+        let room = crate::Room::at_channel(self.home(), channel_name.unwrap_or(""), channel)?;
+        self.send_frame_to_room(
+            airc_protocol::FrameKind::Message,
+            MentionTarget::Peer(reply_to),
+            body,
+            headers,
+            &room,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Reply to an in-flight request. `reply_to` is the
     /// `airc.reply_to` value read off the request event;
     /// `correlation_id` is the request's `airc.correlation_id`.
+    ///
+    /// Sends via the responder's CURRENT room — prefer
+    /// [`reply_in`](Self::reply_in) with the request's own channel when the
+    /// requester may live in a different room than this scope.
     pub async fn reply(
         &self,
         reply_to: PeerId,
@@ -244,10 +388,15 @@ impl Airc {
             + pending
                 .remaining()
                 .unwrap_or_else(|| Duration::from_secs(0));
-        let mut stream = match pending.reply_stream {
+        let mut pending = pending;
+        let mut stream = match pending.reply_stream.take() {
             Some(stream) => stream,
-            None => self.subscribe().await?,
+            None => {
+                self.command_reply_stream(pending.reply_room, correlation_id)
+                    .await?
+            }
         };
+        let mut reopened: u32 = 0;
 
         loop {
             let timeout = deadline.saturating_duration_since(Instant::now());
@@ -257,7 +406,9 @@ impl Airc {
             match tokio::time::timeout(timeout, stream.next()).await {
                 Ok(Some(Ok(event))) => {
                     if event.headers.get(HEADER_AIRC_CORRELATION_ID) == Some(&correlation)
-                        && event.peer_id != self.inner.identity.peer_id
+                        && event.room_id == pending.reply_room
+                        && event.target == MentionTarget::Peer(pending.requester)
+                        && pending.accepts_author(event.peer_id)
                     {
                         return Ok(event.as_ref().clone());
                     }
@@ -269,7 +420,32 @@ impl Airc {
                 }
                 Ok(None) => {
                     // Stream closed before any reply arrived.
-                    return Err(AircError::CommandDeadline { correlation_id });
+                    // The per-request reply stream closed under us — the daemon
+                    // re-subscribed this handle (a room join, a restart) — and the reply,
+                    // if it comes, arrives on a NEW stream. Before 2026-09-07 this was
+                    // reported as the deadline: a sender under a 600 s budget saw nine
+                    // "timeouts" in 200 s while the peer's answers landed in its own
+                    // store. Re-open per closure and keep waiting until the real deadline;
+                    // only a re-subscribe that itself fails ends the wait early.
+                    reopened = reopened.saturating_add(1);
+                    tracing::warn!(
+                        correlation = %correlation,
+                        reopened,
+                        "await_reply: reply stream closed before the deadline; re-subscribing"
+                    );
+                    match self
+                        .command_reply_stream(pending.reply_room, correlation_id)
+                        .await
+                    {
+                        Ok(next) => {
+                            stream = next;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(correlation = %correlation, error = %e, "await_reply: re-subscribe failed");
+                            return Err(AircError::CommandDeadline { correlation_id });
+                        }
+                    }
                 }
                 Err(_) => {
                     return Err(AircError::CommandDeadline { correlation_id });
@@ -284,12 +460,94 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    // what this catches: a correlated event from a different logical peer or
+    // addressed to another requester must not complete a directed command.
+    #[tokio::test]
+    async fn await_reply_pins_dispatch_identity_and_preserves_broadcast_and_room_targets() {
+        let home = tempfile::TempDir::new().unwrap();
+        let airc = Airc::open(home.path()).await.unwrap();
+        let requester = PeerId::new();
+        let expected = PeerId::new();
+        let other = PeerId::new();
+        let room = airc_core::RoomId::new();
+        for target in [
+            MentionTarget::Peer(expected),
+            MentionTarget::All,
+            MentionTarget::Room(airc_core::RoomId::new()),
+        ] {
+            let correlation = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let pending = PendingCommand {
+                correlation_id: correlation,
+                deadline_at_ms: now_ms().unwrap() + 3000,
+                reply_stream: Some(EventStream::daemon(rx, Vec::new())),
+                reply_room: room,
+                expected_target: target.clone(),
+                requester,
+            };
+            let valid = TranscriptEvent {
+                event_id: airc_core::EventId::new(),
+                room_id: room,
+                peer_id: expected,
+                client_id: airc_core::ClientId::new(),
+                kind: airc_core::TranscriptKind::Message,
+                occurred_at_ms: 1,
+                lamport: 1,
+                target: MentionTarget::Peer(requester),
+                headers: Headers::from([(
+                    HEADER_AIRC_CORRELATION_ID.into(),
+                    correlation.to_string(),
+                )]),
+                body: Some(Body::text("accepted")),
+                attachment: None,
+                receipt: None,
+                metadata: serde_json::Value::Null,
+            };
+            let mut rejected = Vec::new();
+            for address in [
+                MentionTarget::All,
+                MentionTarget::Peer(other),
+                MentionTarget::Room(room),
+            ] {
+                let mut event = valid.clone();
+                event.target = address;
+                rejected.push(event);
+            }
+            let mut event = valid.clone();
+            event.peer_id = requester;
+            rejected.push(event);
+            let mut event = valid.clone();
+            event.room_id = airc_core::RoomId::new();
+            rejected.push(event);
+            let mut event = valid.clone();
+            event.headers.insert(
+                HEADER_AIRC_CORRELATION_ID.into(),
+                Uuid::new_v4().to_string(),
+            );
+            rejected.push(event);
+            if matches!(target, MentionTarget::Peer(_)) {
+                let mut event = valid.clone();
+                event.peer_id = other;
+                rejected.push(event);
+            }
+            for mut event in rejected {
+                event.body = Some(Body::text("must not complete request"));
+                tx.send(std::sync::Arc::new(event)).await.unwrap();
+            }
+            tx.send(std::sync::Arc::new(valid.clone())).await.unwrap();
+            assert_eq!(airc.await_reply(pending).await.unwrap(), valid);
+        }
+    }
+
     #[test]
     fn pending_command_remaining_returns_none_past_deadline() {
         let pending = PendingCommand {
             correlation_id: Uuid::new_v4(),
             deadline_at_ms: 1,
             reply_stream: None,
+            reply_room: airc_core::RoomId::new(),
+            expected_target: MentionTarget::All,
+            requester: PeerId::new(),
         };
         assert!(pending.remaining().is_none());
     }
@@ -301,6 +559,9 @@ mod tests {
             correlation_id: Uuid::new_v4(),
             deadline_at_ms: u64::MAX / 2,
             reply_stream: None,
+            reply_room: airc_core::RoomId::new(),
+            expected_target: MentionTarget::All,
+            requester: PeerId::new(),
         };
         let remaining = pending.remaining().unwrap();
         assert!(remaining.as_millis() > 0);

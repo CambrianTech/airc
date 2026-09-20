@@ -27,6 +27,15 @@ use crate::response::{
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Completed boundaries of an RPC, for opt-in diagnostic observation.
+/// Failure or cancellation emits no boundary for the incomplete phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcPhase {
+    Connected,
+    RequestWritten,
+    ResponseRead,
+}
+
 /// Reasons a daemon RPC fails.
 #[derive(Debug)]
 pub enum ClientError {
@@ -44,7 +53,12 @@ pub enum ClientError {
     /// Daemon returned a response variant inconsistent with the
     /// request (e.g. `Status` returning `Pong`). Indicates a daemon
     /// bug or a wire-protocol mismatch.
-    UnexpectedResponse(Response),
+    ///
+    /// Boxed: an error must not grow with the status wire — every field
+    /// added to `StatusResponse` used to widen every `Result<_, ClientError>`
+    /// (clippy `result_large_err` tripped at 136 bytes the day
+    /// `connections` landed).
+    UnexpectedResponse(Box<Response>),
 }
 
 impl std::fmt::Display for ClientError {
@@ -103,21 +117,41 @@ impl DaemonClient {
         request: Request,
         deadline: Duration,
     ) -> Result<Response, ClientError> {
-        timeout(deadline, self.call_inner(request))
+        self.call_observed(request, deadline, |_| {}).await
+    }
+
+    /// Run the normal RPC path with synchronous phase-completion callbacks.
+    /// Observers should be cheap: their work is inside the deadline and perturbs
+    /// measured latency. ResponseRead means framing/decoding completed, including
+    /// a decoded daemon error. Failed phases and cancellation emit no callback.
+    /// Ordinary calls use a monomorphized no-op, with no clocks or allocations.
+    pub async fn call_observed(
+        &self,
+        request: Request,
+        deadline: Duration,
+        observer: impl FnMut(RpcPhase),
+    ) -> Result<Response, ClientError> {
+        timeout(deadline, self.call_inner(request, observer))
             .await
             .map_err(|_| ClientError::Timeout)?
     }
 
-    async fn call_inner(&self, request: Request) -> Result<Response, ClientError> {
+    async fn call_inner(
+        &self,
+        request: Request,
+        mut observer: impl FnMut(RpcPhase),
+    ) -> Result<Response, ClientError> {
         let stream = IpcStream::connect(&self.socket_path)
             .await
             .map_err(ClientError::NotConnected)?;
+        observer(RpcPhase::Connected);
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = reader;
 
         write_frame(&mut writer, &request)
             .await
             .map_err(ClientError::Io)?;
+        observer(RpcPhase::RequestWritten);
         let response: Response = read_frame(&mut reader)
             .await
             .map_err(ClientError::Io)?
@@ -127,6 +161,7 @@ impl DaemonClient {
                     "daemon closed before response frame",
                 ))
             })?;
+        observer(RpcPhase::ResponseRead);
 
         match response {
             Response::Error { message } => Err(ClientError::Daemon(message)),
@@ -141,7 +176,7 @@ impl DaemonClient {
     pub async fn ping_with_timeout(&self, deadline: Duration) -> Result<(), ClientError> {
         match self.call_with_timeout(Request::Ping, deadline).await? {
             Response::Pong => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -155,7 +190,7 @@ impl DaemonClient {
     ) -> Result<StatusResponse, ClientError> {
         match self.call_with_timeout(Request::Status, deadline).await? {
             Response::Status(status) => Ok(status),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -164,21 +199,21 @@ impl DaemonClient {
     pub async fn send(&self, request: SendRequest) -> Result<PublishResponse, ClientError> {
         match self.call(Request::Send(request)).await? {
             Response::Publish(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn publish(&self, request: PublishRequest) -> Result<PublishResponse, ClientError> {
         match self.call(Request::Publish(request)).await? {
             Response::Publish(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
         match self.call(Request::Inbox(request)).await? {
             Response::Inbox(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -189,7 +224,7 @@ impl DaemonClient {
     pub async fn room_tip(&self, request: RoomTipRequest) -> Result<RoomTipResponse, ClientError> {
         match self.call(Request::RoomTip(request)).await? {
             Response::RoomTip(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -205,28 +240,28 @@ impl DaemonClient {
     ) -> Result<PeerIdentityCardResponse, ClientError> {
         match self.call(Request::PeerIdentityCard(request)).await? {
             Response::PeerIdentityCard(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn stop(&self) -> Result<(), ClientError> {
         match self.call(Request::Stop).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn add_peer(&self, request: AddPeerRequest) -> Result<(), ClientError> {
         match self.call(Request::AddPeer(request)).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
     pub async fn remove_peer(&self, request: RemovePeerRequest) -> Result<(), ClientError> {
         match self.call(Request::RemovePeer(request)).await? {
             Response::Ok => Ok(()),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -238,7 +273,7 @@ impl DaemonClient {
     pub async fn route_endpoints(&self) -> Result<RouteEndpointsResponse, ClientError> {
         match self.call(Request::RouteEndpoints).await? {
             Response::RouteEndpoints(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -248,7 +283,7 @@ impl DaemonClient {
     pub async fn delivery_stats(&self) -> Result<DeliveryStatsResponse, ClientError> {
         match self.call(Request::DeliveryStats).await? {
             Response::DeliveryStats(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -258,7 +293,7 @@ impl DaemonClient {
     pub async fn list_rooms(&self) -> Result<RoomsResponse, ClientError> {
         match self.call(Request::ListRooms).await? {
             Response::Rooms(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -268,7 +303,7 @@ impl DaemonClient {
     pub async fn list_peers(&self) -> Result<PeersResponse, ClientError> {
         match self.call(Request::ListPeers).await? {
             Response::Peers(response) => Ok(response),
-            other => Err(ClientError::UnexpectedResponse(other)),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
         }
     }
 
@@ -286,5 +321,105 @@ impl DaemonClient {
             .await
             .map_err(ClientError::Io)?;
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use crate::transport::IpcListener;
+
+    // A server that holds the connection open must still hit the normal RPC
+    // deadline, without reporting the unfinished response phase as complete.
+    #[tokio::test]
+    async fn observed_rpc_timeout_does_not_complete_response_phase() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("timeout.sock");
+        let listener = IpcListener::bind(&socket).await.unwrap();
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_frame::<_, Request>(&mut stream).await.unwrap(),
+                Some(Request::Ping)
+            ));
+            let _ = hold.await;
+            drop(stream);
+            listener.cleanup();
+        });
+        let client = DaemonClient::new(socket);
+        let mut phases = Vec::new();
+        let result = client
+            .call_observed(Request::Ping, Duration::from_secs(1), |phase| {
+                phases.push(phase)
+            })
+            .await;
+        assert!(matches!(result, Err(ClientError::Timeout)));
+        assert_eq!(phases, [RpcPhase::Connected, RpcPhase::RequestWritten]);
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    // Completion callbacks follow the real codec path, including a decoded
+    // daemon error; EOF must not advertise a response completion.
+    #[tokio::test]
+    async fn observed_rpc_preserves_responses_errors_and_incomplete_phases() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("observed.sock");
+        let listener = IpcListener::bind(&socket).await.unwrap();
+        let server = tokio::spawn(async move {
+            for response in [
+                Some(Response::Pong),
+                Some(Response::Error {
+                    message: "rejected".into(),
+                }),
+                None,
+            ] {
+                let mut stream = listener.accept().await.unwrap();
+                assert!(matches!(
+                    read_frame::<_, Request>(&mut stream).await.unwrap(),
+                    Some(Request::Ping)
+                ));
+                if let Some(response) = response {
+                    write_frame(&mut stream, &response).await.unwrap();
+                }
+            }
+            listener.cleanup();
+        });
+        let client = DaemonClient::new(socket);
+        for n in 0..3 {
+            let mut phases = Vec::new();
+            let result = client
+                .call_observed(Request::Ping, Duration::from_secs(5), |phase| {
+                    phases.push(phase)
+                })
+                .await;
+            assert_eq!(
+                &phases[..2],
+                &[RpcPhase::Connected, RpcPhase::RequestWritten]
+            );
+            if n < 2 {
+                assert_eq!(
+                    phases,
+                    [
+                        RpcPhase::Connected,
+                        RpcPhase::RequestWritten,
+                        RpcPhase::ResponseRead
+                    ]
+                );
+            } else {
+                assert_eq!(phases.len(), 2);
+            }
+            match n {
+                0 => assert!(matches!(result, Ok(Response::Pong))),
+                1 => assert!(
+                    matches!(result, Err(ClientError::Daemon(message)) if message == "rejected")
+                ),
+                _ => assert!(
+                    matches!(result, Err(ClientError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+                ),
+            }
+        }
+        server.await.unwrap();
     }
 }

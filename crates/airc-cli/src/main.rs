@@ -77,12 +77,17 @@ mod route_commands;
 mod route_proof_commands;
 mod runtime_context;
 mod runtime_dir;
+mod sos_commands;
 mod staleness;
 mod state_cli;
 mod state_commands;
+#[cfg(test)]
+mod test_env;
 mod transport_cli;
 mod transport_commands;
+mod update_artifact;
 mod update_commands;
+mod update_shutdown;
 mod work_cli;
 mod work_commands;
 mod work_commands_gh;
@@ -104,7 +109,7 @@ use airc_core::PeerId;
 
 use airc_identity::LocalIdentity;
 use channel_gist_cli::ChannelGistAction;
-use cli::{Cli, Command, PeerAction};
+use cli::{Cli, Command, PeerAction, SosAction};
 use collaboration_cli::CollaborationAction;
 use envelope_cli::EnvelopeAction;
 use events_cli::EventsAction;
@@ -370,7 +375,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Send { room, text } => {
-            commands::run_send(&home, parsed.peers, room.as_deref(), &text).await
+            commands::run_send(&home, parsed.peers, room.named(), &text).await
         }
 
         Command::Listen { replay } => commands::run_listen(&home, parsed.peers, replay).await,
@@ -411,24 +416,104 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { socket } => commands::run_status(&home, default_or(socket, &home)).await,
         Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
 
-        Command::Msg { socket, room, text } => {
-            commands::run_msg(&home, default_or(socket, &home), room.as_deref(), &text).await
+        Command::Msg {
+            socket,
+            room,
+            text,
+            stdin,
+        } => {
+            // Body from STDIN when asked, so prose never passes through shell
+            // quoting (see the `--stdin` doc on the Msg variant: this class cost
+            // the grid a core on 2026-09-05). Read to EOF verbatim — no trim, no
+            // interpretation; a heredoc's trailing newline is the author's.
+            let body = match (text, stdin) {
+                (Some(t), _) => t,
+                (None, true) => {
+                    use std::io::{IsTerminal, Read};
+                    // `--stdin` with nothing piped in would BLOCK on a terminal, waiting for an
+                    // EOF the operator has to know to send. That is a hang in a deploy-adjacent
+                    // tool, which is the failure class this grid spent tonight removing — so
+                    // refuse it immediately and say how, rather than appearing to freeze.
+                    if std::io::stdin().is_terminal() {
+                        return Err("`--stdin` was passed but stdin is a terminal — nothing is \
+                                    piped in and this would wait forever. Redirect a file \
+                                    (`airc msg --stdin < body.txt`) or use a heredoc."
+                            .to_string()
+                            .into());
+                    }
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| format!("reading message body from stdin: {e}"))?;
+                    // An EMPTY read is the same silent corruption this flag exists to end, and
+                    // my own commit message claimed it was handled when only the both-absent
+                    // case was (caught in review by ce8b9074 — the review the expired window
+                    // would have skipped). Whitespace-only counts: a heredoc that expanded to
+                    // nothing posts a blank message that reads as a delivery failure to
+                    // everyone who sees it.
+                    if buf.trim().is_empty() {
+                        return Err(
+                            "`--stdin` produced an empty message body — nothing was piped \
+                                    in, or it expanded to whitespace. Refusing rather than \
+                                    posting a blank message."
+                                .to_string()
+                                .into(),
+                        );
+                    }
+                    buf
+                }
+                // clap enforces `conflicts_with`, so the remaining gap is BOTH
+                // absent. Refuse rather than send an empty message: a silent
+                // empty post is the same class of quiet corruption `--stdin`
+                // exists to end.
+                (None, false) => {
+                    return Err("no message body — pass it as an argument, or use \
+                                `--stdin` (recommended for prose: it cannot be \
+                                mangled by shell quoting)"
+                        .to_string()
+                        .into())
+                }
+            };
+            commands::run_msg(&home, default_or(socket, &home), room.named(), &body).await
         }
         Command::Publish {
             room,
             body_text,
             body_json,
+            stdin,
             headers,
             kind,
-        } => publish_commands::run_publish(&home, room, body_text, body_json, headers, kind).await,
+        } => {
+            publish_commands::run_publish(
+                &home, room.room, body_text, body_json, stdin, headers, kind,
+            )
+            .await
+        }
 
         Command::Inbox {
             socket,
+            room,
             since_lamport,
             since_event_id,
             limit,
+            all,
             json,
-        } => commands::run_inbox(&home, socket, since_lamport, since_event_id, limit, json).await,
+        } => {
+            if all {
+                commands::run_inbox_all(&home, socket, limit, json).await
+            } else {
+                commands::run_inbox(
+                    &home,
+                    socket,
+                    room.named(),
+                    since_lamport,
+                    since_event_id,
+                    limit,
+                    json,
+                )
+                .await
+            }
+        }
 
         Command::Room { name } => commands::run_room(&home, name).await,
 
@@ -534,6 +619,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Join { room } => commands::run_join(&home, room).await,
+
+        Command::Sos { action } => match action {
+            SosAction::Send { message } => sos_commands::run_send(&home, &message).await,
+            SosAction::Watch { follow } => sos_commands::run_watch(&home, follow).await,
+            SosAction::Status => sos_commands::run_status(&home).await,
+        },
 
         Command::Version => commands::run_version(),
 
@@ -671,6 +762,21 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 include_self,
             } => {
                 integrations::codex::hook::run_user_prompt_submit(
+                    &home,
+                    count,
+                    max_items,
+                    raw,
+                    include_self,
+                )
+                .await
+            }
+            CodexHookAction::PostToolUse {
+                count,
+                max_items,
+                raw,
+                include_self,
+            } => {
+                integrations::codex::hook::run_post_tool_use(
                     &home,
                     count,
                     max_items,

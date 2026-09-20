@@ -92,6 +92,22 @@ impl Room {
         Self::from_name(home, DEFAULT_ROOM_NAME)
     }
 
+    /// A `Room` handle for a channel we did NOT derive ourselves — the
+    /// channel is adopted verbatim instead of re-derived from `name`.
+    ///
+    /// This exists for replying into the channel a REQUEST arrived on.
+    /// Identity-scoped channel derivation can diverge between machines
+    /// (the M5↔bigmama blind-room bug), and two scopes on one machine
+    /// can be parked in different rooms — a responder that answers into
+    /// its own current room talks past a requester listening where it
+    /// asked. The request event's `room_id` is the one channel both
+    /// sides provably share; use it as-is.
+    pub fn at_channel(home: &Path, name: &str, channel: RoomId) -> Result<Self, RoomError> {
+        let mut room = Self::from_name(home, name)?;
+        room.channel = channel;
+        Ok(room)
+    }
+
     /// Stamp this room's human NAME onto outbound headers
     /// ([`airc_protocol::HEADER_AIRC_CHANNEL_NAME`]) — the convergence
     /// key that lets a receiving machine whose identity-scoped channel

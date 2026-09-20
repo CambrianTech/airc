@@ -182,6 +182,8 @@ mod tests {
 
     fn work_card(card_id: WorkCardId, repo: RepoId) -> WorkCard {
         WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
             card_id,
             repo,
             title: "wire work suggestions into feed".to_string(),

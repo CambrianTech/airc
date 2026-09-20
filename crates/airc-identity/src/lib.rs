@@ -180,6 +180,43 @@ impl LocalIdentity {
         home.join(IDENTITY_KEY_FILENAME)
     }
 
+    /// Path to the secret key belonging to ONE agent identity in `home`.
+    ///
+    /// A distinct peer identity requires distinct key material (#402). The
+    /// wire authenticates by KEY: `PinnedServerVerifier` resolves the
+    /// presented pubkey through `PeerKeyRegistry::find_peer`, which maps a
+    /// pubkey to exactly ONE peer and rejects anything else as an identity
+    /// mismatch. So two agents sharing a keypair are the same principal on
+    /// the wire, and minting them separate `peer_id`s is a claim the
+    /// transport cannot uphold — the peer store ends up with N rows for one
+    /// key and sends land on whichever twin routing picked (measured: 73
+    /// rows / 59 pubkeys, only 4 rows carrying any endpoint).
+    ///
+    /// The DEFAULT agent keeps the historical `identity.key` filename, so
+    /// every existing home loads exactly as before.
+    pub fn agent_key_path(home: &Path, agent_name: &str) -> PathBuf {
+        if agent_name == airc_store::DEFAULT_AGENT_NAME {
+            Self::key_path(home)
+        } else {
+            home.join(format!("identity-{agent_name}.key"))
+        }
+    }
+
+    /// The key this agent should read, tolerating homes written before
+    /// per-agent keys existed: prefer the agent's own file, fall back to the
+    /// shared `identity.key`. The fallback is what keeps already-enrolled
+    /// named agents working — their pubkey does not change under this fix,
+    /// so peers need no re-enrolment. New agents get their own key and are
+    /// never phantoms.
+    fn existing_agent_key_path(home: &Path, agent_name: &str) -> PathBuf {
+        let own = Self::agent_key_path(home, agent_name);
+        if own.exists() {
+            own
+        } else {
+            Self::key_path(home)
+        }
+    }
+
     /// Load the existing identity from `home`, or generate a fresh
     /// one (writing both halves) if neither exists. Refuses to
     /// recover from a half-initialised state.
@@ -229,10 +266,10 @@ impl LocalIdentity {
                     Self::load_with_metadata(home, stored)
                 }
                 Some(_) => {
-                    Self::generate_and_save_agent_with_existing_key(home, &store, &agent_name).await
+                    Self::generate_and_save_agent_with_own_key(home, &store, &agent_name).await
                 }
                 None if store.has_local_identity_rows().await? => {
-                    Self::generate_and_save_agent_with_existing_key(home, &store, &agent_name).await
+                    Self::generate_and_save_agent_with_own_key(home, &store, &agent_name).await
                 }
                 None => Err(IdentityError::PartialState {
                     key_exists: true,
@@ -291,7 +328,9 @@ impl LocalIdentity {
                 expected: IDENTITY_STATE_VERSION,
             });
         }
-        let key_bytes = std::fs::read(Self::key_path(home))?;
+        // Per-agent key when this identity has one, else the shared legacy
+        // file — an already-enrolled agent keeps its pubkey (#402).
+        let key_bytes = std::fs::read(Self::existing_agent_key_path(home, &stored.agent_name))?;
         if key_bytes.len() != 32 {
             return Err(IdentityError::BadKeyLength(key_bytes.len()));
         }
@@ -306,19 +345,30 @@ impl LocalIdentity {
         })
     }
 
-    async fn generate_and_save_agent_with_existing_key(
+    /// Mint a NEW agent identity in a home that already holds one
+    /// (multi-agent-in-one-home).
+    ///
+    /// This used to reuse the home's `identity.key` while stamping a fresh
+    /// random `peer_id` — one keypair, N peer identities. That is the root
+    /// of #402: `PeerKeyRegistry::find_peer` maps a pubkey to exactly ONE
+    /// peer, so the twins were unrepresentable downstream. Peers enrolled a
+    /// row per peer_id, all with the same pubkey, and sends went to whichever
+    /// twin routing chose — usually the endpoint-less one.
+    ///
+    /// A new identity now gets its OWN keypair, written to its own key file.
+    /// Fresh key material is exactly what a fresh identity means; sharing it
+    /// was the bug.
+    async fn generate_and_save_agent_with_own_key(
         home: &Path,
         store: &SqliteEventStore,
         agent_name: &str,
     ) -> Result<Self, IdentityError> {
-        let key_bytes = std::fs::read(Self::key_path(home))?;
-        if key_bytes.len() != 32 {
-            return Err(IdentityError::BadKeyLength(key_bytes.len()));
-        }
-        let mut secret = [0u8; 32];
-        secret.copy_from_slice(&key_bytes);
-        let keypair = PeerKeypair::from_secret_bytes(&secret);
+        let keypair = PeerKeypair::generate();
         let peer_id = PeerId::new();
+        write_owner_only(
+            &Self::agent_key_path(home, agent_name),
+            &keypair.secret_bytes(),
+        )?;
         let client_id = ClientId::new();
         let created_at_ms = now_ms()?;
 
@@ -584,7 +634,12 @@ mod tests {
         let default = LocalIdentity::load_or_generate(home.path()).await.unwrap();
         assert_eq!(default.agent_name, airc_store::DEFAULT_AGENT_NAME);
         assert_ne!(default.peer_id, identity.peer_id);
-        assert_eq!(
+        // #402: this assertion used to demand the OPPOSITE — that the two
+        // agents share one secret. Paired with the assert_ne! above it pinned
+        // the contradiction itself (distinct peer_ids, identical key), which
+        // is unrepresentable downstream: find_peer maps a pubkey to exactly
+        // one peer. Distinct identities carry distinct key material.
+        assert_ne!(
             default.keypair.secret_bytes(),
             identity.keypair.secret_bytes()
         );
@@ -601,7 +656,10 @@ mod tests {
         assert_eq!(codex.agent_name, "codex");
         assert_ne!(default.peer_id, codex.peer_id);
         assert_ne!(default.client_id, codex.client_id);
-        assert_eq!(default.keypair.secret_bytes(), codex.keypair.secret_bytes());
+        // #402: was assert_eq! — it pinned the shared keypair that made these
+        // two distinct peer_ids indistinguishable on the wire, so every peer
+        // enrolled two rows for one key and sent to the endpoint-less twin.
+        assert_ne!(default.keypair.secret_bytes(), codex.keypair.secret_bytes());
 
         let store = open_store(home.path()).await.unwrap();
         let default_row = store.load_local_identity().await.unwrap().unwrap();
@@ -783,5 +841,49 @@ mod tests {
         let key = LocalIdentity::key_path(home.path());
         let mode = std::fs::metadata(&key).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "{} not 0600", key.display());
+    }
+
+    // what this catches: two agent identities in ONE home sharing a keypair
+    // (#402). The wire authenticates by KEY — PinnedServerVerifier resolves a
+    // presented pubkey via PeerKeyRegistry::find_peer, which maps a pubkey to
+    // exactly ONE peer and rejects anything else as an identity mismatch. So a
+    // shared key makes distinct peer_ids unrepresentable downstream: peers
+    // enrol a row per peer_id all carrying the same pubkey, and sends land on
+    // whichever twin routing picked (measured on the live store: 73 rows / 59
+    // pubkeys, only 4 rows with any endpoint). Goes RED the moment a new agent
+    // identity borrows the home's existing key again.
+    #[tokio::test]
+    async fn two_agents_in_one_home_are_cryptographically_distinct() {
+        let home = TempDir::new().unwrap();
+
+        let first = LocalIdentity::load_or_generate_as(home.path(), "alpha")
+            .await
+            .unwrap();
+        let second = LocalIdentity::load_or_generate_as(home.path(), "beta")
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.peer_id, second.peer_id,
+            "distinct agents must have distinct peer_ids"
+        );
+        assert_ne!(
+            first.keypair.public_bytes(),
+            second.keypair.public_bytes(),
+            "distinct peer_ids REQUIRE distinct key material — a shared pubkey \
+             makes find_peer ambiguous and misroutes every send (#402)"
+        );
+
+        // …and each is stable across reload: the second agent must come back
+        // with its OWN key, not the home's shared one.
+        let reloaded = LocalIdentity::load_or_generate_as(home.path(), "beta")
+            .await
+            .unwrap();
+        assert_eq!(reloaded.peer_id, second.peer_id);
+        assert_eq!(
+            reloaded.keypair.public_bytes(),
+            second.keypair.public_bytes(),
+            "an existing agent must never rotate its key on reload"
+        );
     }
 }

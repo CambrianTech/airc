@@ -224,6 +224,7 @@ impl Airc {
         kind: FrameKind,
         body: Body,
         mut headers: airc_core::Headers,
+        delivery: airc_bus::DeliveryClass,
     ) -> Result<PublishReceipt, AircError> {
         room.stamp_name_header(&mut headers);
         let response = self
@@ -233,10 +234,19 @@ impl Airc {
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
                 kind: kind.into(),
-                // SDK chat/structured publishes are durable; the live
-                // streaming classes are reached via the typed IPC client
-                // directly (media/game-state), not this chat helper.
-                delivery: IpcDelivery::Durable,
+                // The CALLER's class, not a pin. This was hardcoded
+                // `Durable`, which meant a citizen's presence line — a
+                // glyph, a pose, a thought marker — became an ORM row and
+                // then had to be read past by recall, RAG, and every
+                // digest forever. Presence is state, not an event (#1341).
+                // `publish` still passes Durable, so chat is unchanged.
+                delivery: match delivery {
+                    airc_bus::DeliveryClass::Durable => IpcDelivery::Durable,
+                    airc_bus::DeliveryClass::EphemeralLatest => IpcDelivery::EphemeralLatest,
+                    airc_bus::DeliveryClass::EphemeralWindow => IpcDelivery::EphemeralWindow,
+                    airc_bus::DeliveryClass::RequestResponse => IpcDelivery::RequestResponse,
+                    airc_bus::DeliveryClass::StreamChunk => IpcDelivery::StreamChunk,
+                },
                 target: IpcTarget::All,
                 correlation_id: None,
                 coalesce_key: None,
@@ -366,9 +376,11 @@ impl Airc {
         for subscription in set.all() {
             let room = subscription.as_room();
             merged.extend(self.daemon_resume_from(&room, cursor, limit).await?);
+            // Keep at most one retained page plus the next room's page in
+            // memory, and use the full cursor order before trimming ties.
+            merged.sort_unstable_by_key(|event| (event.lamport, event.event_id.0));
+            merged.truncate(limit);
         }
-        merged.sort_by_key(|event| event.lamport);
-        merged.truncate(limit);
         Ok(merged)
     }
 
@@ -406,10 +418,13 @@ impl Airc {
                 })
                 .await?;
             let count = response.envelopes.len();
+            let has_more = response.has_more;
             for bytes in response.envelopes {
                 all.push(decode_wire_event(bytes)?);
             }
-            if count < page_size {
+            // A page cut by BYTES (has_more) continues from its newest cursor; a
+            // short page from a daemon that never cuts is the channel exhausted.
+            if !has_more && count < page_size {
                 break;
             }
             match response.newest {
@@ -512,9 +527,24 @@ impl Airc {
     /// owned by the stream (aborted on drop). Each attach is registered
     /// at the live edge before we move on (subscribe-before-ack on the
     /// daemon side), so no early event is missed.
+    ///
+    /// `delivery`: optional ROUTER-SIDE delivery-class filter, applied on
+    /// every attach (initial AND every reconnect). `None` keeps the
+    /// historical behaviour — every class is delivered. This is the seam
+    /// [`AttachRequest`] built for and nobody used: without it, a consumer
+    /// that only wants settled room lines receives every peer's
+    /// StreamChunks and ephemeral fan-out and pays a decode per event to
+    /// discard them. Measured on a continuum node 2026-08-15: 6,736
+    /// events crossed to EVERY persona subscription in 40 minutes and
+    /// 100% were discarded post-decode; an earlier solve measured 55% of
+    /// inbound as stream chunks decoded identically by four minds. Filter
+    /// at the router; the socket never carries what the consumer will
+    /// throw away.
     pub(crate) async fn daemon_subscribe(
         &self,
         channels: Vec<RoomId>,
+        delivery: Option<Vec<IpcDelivery>>,
+        headers: airc_core::HeaderFilter,
     ) -> Result<EventStream, AircError> {
         // Own the client so each reader task can re-attach after a daemon
         // restart (the borrow from `require_daemon_client` can't outlive
@@ -534,8 +564,13 @@ impl Airc {
             // stream starts at the live edge. Catch-up is a separate,
             // bounded concern (`resume_from_subscribed_filtered` with a
             // stored cursor — see `join_feed`).
+            let mut request = AttachRequest::live(channel);
+            if let Some(classes) = delivery.clone() {
+                request = request.with_delivery(classes);
+            }
+            request = request.with_headers(headers.clone());
             let mut stream = client
-                .attach(AttachRequest::live(channel))
+                .attach(request)
                 .await
                 .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
             match read_frame::<_, Response>(&mut stream).await {
@@ -550,6 +585,12 @@ impl Airc {
             }
             let tx = tx.clone();
             let client = client.clone();
+            // Per-task copy of the delivery + header filters: each
+            // channel's reader task re-applies them on every reconnect
+            // (see below), and the loop must keep its own copy for the
+            // remaining channels.
+            let delivery = delivery.clone();
+            let headers = headers.clone();
             handles.push(tokio::spawn(async move {
                 // Drain the live stream; when it drops (daemon restart /
                 // transient loss) re-attach and RESUME strictly after the
@@ -591,6 +632,14 @@ impl Airc {
                                     }
                                 }
                             }
+                            Ok(Some(Response::AttachCursorAdvanced { .. })) => {
+                                // The daemon's CURSOR HEARTBEAT (server.rs, continuum #261): one per
+                                // second per subscription after events, so a cursor-persisting
+                                // consumer advances. This reader does not persist cursors; the frame
+                                // is bookkeeping, not an event. It used to fall through to the warn
+                                // below — 3,100 lines/min on a 16-citizen core, rotating the log
+                                // every 15 minutes (2026-09-14, airc #1411).
+                            }
                             Ok(Some(other)) => {
                                 // Non-Event frames on a live subscription
                                 // are unexpected (ack already consumed); a
@@ -631,10 +680,17 @@ impl Airc {
                             Some(cursor) => AttachStart::After(cursor),
                             None => AttachStart::Live,
                         };
-                        let mut s = match client
-                            .attach(AttachRequest::new(channel, start))
-                            .await
-                        {
+                        // The reconnect attach carries the SAME delivery
+                        // filter as the initial one — a filter that
+                        // silently vanished on the first daemon restart
+                        // would re-open the fan-out flood and no reader
+                        // could tell why the socket got loud again.
+                        let mut request = AttachRequest::new(channel, start);
+                        if let Some(classes) = delivery.clone() {
+                            request = request.with_delivery(classes);
+                        }
+                        request = request.with_headers(headers.clone());
+                        let mut s = match client.attach(request).await {
                             Ok(s) => s,
                             Err(error) => {
                                 // Card 807193ab: silent `continue` left

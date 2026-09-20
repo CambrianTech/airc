@@ -133,10 +133,16 @@ async fn discovery_records_failed_dial_instead_of_swallowing_it() {
         .await
         .expect("refresh must survive an unreachable peer");
 
+    // TWO failures since the identity-port rung (#1370): the stored
+    // endpoint, then (same ip, stable_lan_port(peer)) appended as the
+    // recovery candidate. Post-#1369 records advertise their stable port,
+    // so the derived candidate dedups away and this costs nothing; a
+    // synthetic/churn-era record like this one pays exactly one extra
+    // fast local dial. Order is pinned: stored endpoint first.
     assert_eq!(
         snapshot.peer_dial_failures.len(),
-        1,
-        "exactly one failed dial must be recorded: {:?}",
+        2,
+        "stored endpoint + identity-derived recovery candidate must both record: {:?}",
         snapshot.peer_dial_failures
     );
     let failure = &snapshot.peer_dial_failures[0];
@@ -200,8 +206,8 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
     let first = bob.refresh_route_discovery().await.expect("first refresh");
     assert_eq!(
         first.peer_dial_failures.len(),
-        1,
-        "first refresh attempts and fails the dial"
+        2,
+        "first refresh attempts and fails the stored endpoint AND its          identity-derived recovery candidate (#1370)"
     );
     assert!(
         first.peer_dial_skips.is_empty(),
@@ -220,8 +226,8 @@ async fn quarantined_endpoint_surfaces_as_skip_not_failure_on_re_refresh() {
     );
     assert_eq!(
         second.peer_dial_skips.len(),
-        1,
-        "the backed-off endpoint is surfaced as a skip: {:?}",
+        2,
+        "both backed-off endpoints (stored + derived, #1370) surface as skips: {:?}",
         second.peer_dial_skips
     );
     let skip = &second.peer_dial_skips[0];
@@ -464,8 +470,8 @@ async fn identity_mismatch_never_retries_an_unenrolled_identity() {
     );
     assert_eq!(
         snapshot.peer_dial_failures.len(),
-        1,
-        "the refused dial must be recorded loudly: {:?}",
+        2,
+        "the refused dial AND its identity-derived recovery candidate (#1370)          must be recorded loudly: {:?}",
         snapshot.peer_dial_failures
     );
     let failure = &snapshot.peer_dial_failures[0];
@@ -977,10 +983,15 @@ async fn peers_are_dialed_concurrently_not_serially() {
     let elapsed = started.elapsed();
 
     // Every tarpit dial must be recorded as a failure (none connects).
+    // 2 per peer since #1370: the tarpit endpoint (3s timeout) plus the
+    // identity-derived candidate (instant local refuse — nothing listens
+    // there). The concurrency bound below is unaffected: the slow dial per
+    // peer is still the single 3s tarpit; the derived dial adds
+    // milliseconds to each peer's serial walk.
     assert_eq!(
         snapshot.peer_dial_failures.len(),
-        N_TARPITS,
-        "each tarpit peer must record one failed dial: {:?}",
+        2 * N_TARPITS,
+        "each tarpit peer must record its stored + derived failed dials: {:?}",
         snapshot.peer_dial_failures
     );
     // The load-bearing assert: concurrent, not serial. Serial would be
@@ -1121,8 +1132,8 @@ async fn heal_failed_dials_rereads_rendezvous_and_dials_fresh_endpoint() {
         .expect("bob discovery refresh");
     assert_eq!(
         snapshot.peer_dial_failures.len(),
-        1,
-        "the stale endpoint must fail: {:?}",
+        2,
+        "the stale endpoint AND its identity-derived recovery candidate (#1370)          must both fail: {:?}",
         snapshot.peer_dial_failures
     );
 

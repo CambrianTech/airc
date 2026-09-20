@@ -64,13 +64,13 @@
 //! peer from head-of-line-blocking forwards to healthy peers, and
 //! keep per-peer delivery in publish order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use airc_bus::envelope::{Envelope, Kind, Target};
-use airc_bus::{EventRouter, ForwardItem};
+use airc_bus::{EventRouter, ForwardItem, ForwardLatest};
 use airc_core::{Body, EventId, MentionTarget, PeerId, RoomId};
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
@@ -125,7 +125,22 @@ enum AckWait {
     NoAck,
 }
 
+/// One machine, several peer ids (the identity spine): a frame addressed to the
+/// connected MACHINE identity is acked by the SCOPE identity hosted behind it. Both
+/// rows carry the same pubkey. An ack from any id that shares the target's key is
+/// this peer's ack — otherwise every ack from such a host is discarded and the
+/// ledger reads "never confirmed" in both directions (M5 ↔ 5090, 2026-09-15: 442
+/// unacked attempts one way, 522 the other, while every frame arrived).
+pub(crate) fn ack_is_for(ack_receiver: PeerId, target: PeerId, aliases: &HashSet<PeerId>) -> bool {
+    ack_receiver == target || aliases.contains(&ack_receiver)
+}
+
+/// How long a computed alias set stands before the trust store is read again.
+const ALIAS_CACHE_TTL: Duration = Duration::from_secs(60);
+
 struct ForwarderInner {
+    /// Per target peer: the ids sharing its pubkey (see [`ack_is_for`]), cached.
+    aliases: std::sync::Mutex<HashMap<PeerId, (tokio::time::Instant, HashSet<PeerId>)>>,
     /// Transport-owning handles whose live LAN connections this
     /// forwarder may reuse (the daemon registers its listener and
     /// dialer handles). Never dialed from here — route discovery owns
@@ -147,6 +162,11 @@ struct ForwarderInner {
     /// The drain task, aborted when the last forwarder handle drops
     /// (RAII — hermetic tests must not leak forward workers).
     drain_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// #1397 rework: latest-wins state for coalescable ephemerals. The router
+    /// tap carries WAKES; this carries the value. Resolved at EMIT time in
+    /// `drain_loop` — resolving at enqueue would send a stale queued item
+    /// before the newer value already sitting here (Astra, review of #1397).
+    forward_latest: Arc<ForwardLatest>,
 }
 
 impl Drop for ForwarderInner {
@@ -173,8 +193,10 @@ impl RoutedForwarder {
     /// [`RoutedForwarder::add_link`] as they come up.
     pub fn install(router: &EventRouter, config: RoutedForwarderConfig) -> Self {
         let (tx, rx) = mpsc::channel::<ForwardItem>(config.queue_capacity.max(1));
-        router.set_forward_sink(tx);
+        let forward_latest = router.set_forward_sink(tx);
         let inner = Arc::new(ForwarderInner {
+            aliases: std::sync::Mutex::new(HashMap::new()),
+            forward_latest,
             links: tokio::sync::RwLock::new(Vec::new()),
             config,
             diag: std::sync::RwLock::new(Arc::new(StderrJsonDiagnosticSink)),
@@ -257,6 +279,15 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
         let Some(inner) = inner.upgrade() else {
             return;
         };
+        // RESOLVE AT EMIT, NEVER AT ENQUEUE (#1397 rework). For a coalescable
+        // ephemeral the dequeued item is only a WAKE — the value may have been
+        // superseded while it sat in the queue, and sending what was enqueued
+        // would put a stale offer on the wire ahead of the newer one already
+        // held. `None` means an earlier wake already carried this key's value;
+        // duplicate wakes are expected under coalescing and are not a loss.
+        let Some(item) = inner.forward_latest.resolve(item) else {
+            continue;
+        };
         let peers = connected_peers(&inner).await;
         for peer in peers {
             // LOOP PREVENTION: never send a frame back over the link
@@ -265,14 +296,43 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
             if Some(peer) == item.origin {
                 continue;
             }
+            let first_sight = !workers.contains_key(&peer);
             let queue = workers
                 .entry(peer)
                 .or_insert_with(|| spawn_peer_worker(Arc::downgrade(&inner), peer, &inner.config));
+            if first_sight {
+                // Backfill slice 2: a peer seen connected for the first time (a node
+                // that came back, or this daemon just started) is asked what this
+                // node missed on every subscribed channel. Off the forward path.
+                if let Some((link, _adapter)) = resolve_link(&inner, peer).await {
+                    tokio::spawn(async move { link.backfill_all_from_peer(peer).await });
+                }
+            }
             match queue.try_send(PeerItem {
                 env: Arc::clone(&item.env),
             }) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(dropped)) => {
+                    // Card bf4d4556: this is THE bounded queue that
+                    // actually saturates, so this is where the class
+                    // distinction has to bite. For `EphemeralLatest` a
+                    // full queue is not a fault: latest-wins means the
+                    // superseded offer needs no delivery, and the next
+                    // one carries the same truth. Emitting an error here
+                    // would raise a data-loss alarm at the exact moment
+                    // the design is working — so ephemerals are dropped
+                    // silently-by-class at debug, and only durable events
+                    // keep the loud diagnostic.
+                    if dropped.env.delivery.is_ephemeral_latest() {
+                        tracing::debug!(
+                            peer = %peer,
+                            event_id = %dropped.env.event_id,
+                            channel = %dropped.env.channel,
+                            "peer forward queue FULL for an EphemeralLatest event — \
+                             superseded, not lost (card bf4d4556)"
+                        );
+                        continue;
+                    }
                     emit(
                         &inner,
                         DiagnosticEvent::error(
@@ -548,7 +608,16 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
         let now_ms = crate::time::now_ms().unwrap_or(0);
         let sent_at = tokio::time::Instant::now();
         inner.ledger.record_attempt(peer, now_ms);
-        match wait_for_ack(&mut ack_rx, env.event_id, peer, inner.config.ack_timeout).await {
+        let aliases = same_key_aliases(inner, &link, peer).await;
+        match wait_for_ack(
+            &mut ack_rx,
+            env.event_id,
+            peer,
+            &aliases,
+            inner.config.ack_timeout,
+        )
+        .await
+        {
             AckWait::Delivered => {
                 inner.confirmed.fetch_add(1, Ordering::SeqCst);
                 record_ack(inner, peer, sent_at);
@@ -613,6 +682,44 @@ async fn forward_one(inner: &ForwarderInner, peer: PeerId, env: Arc<Envelope>) {
 
 /// #1306: an ack of ANY outcome proves the pipe end-to-end — stamp the
 /// ledger with the measured send→ack round trip.
+/// The ids sharing `peer`'s pubkey in this link's trust store, cached per peer for
+/// [`ALIAS_CACHE_TTL`] so the store is not read per frame.
+async fn same_key_aliases(inner: &ForwarderInner, link: &Airc, peer: PeerId) -> HashSet<PeerId> {
+    if let Some((at, set)) = inner
+        .aliases
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&peer)
+    {
+        if at.elapsed() < ALIAS_CACHE_TTL {
+            return set.clone();
+        }
+    }
+    let set: HashSet<PeerId> = match link.peers().await {
+        Ok(peers) => {
+            let key = peers
+                .iter()
+                .find(|p| p.peer_id == peer)
+                .map(|p| p.pubkey_b64.clone());
+            match key {
+                Some(key) => peers
+                    .into_iter()
+                    .filter(|p| p.pubkey_b64 == key && p.peer_id != peer)
+                    .map(|p| p.peer_id)
+                    .collect(),
+                None => HashSet::new(),
+            }
+        }
+        Err(_) => HashSet::new(),
+    };
+    inner
+        .aliases
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(peer, (tokio::time::Instant::now(), set.clone()));
+    set
+}
+
 fn record_ack(inner: &ForwarderInner, peer: PeerId, sent_at: tokio::time::Instant) {
     let rtt_ms = u32::try_from(sent_at.elapsed().as_millis()).ok();
     inner
@@ -624,6 +731,7 @@ async fn wait_for_ack(
     ack_rx: &mut tokio::sync::broadcast::Receiver<airc_protocol::DeliveryAck>,
     event_id: EventId,
     peer: PeerId,
+    aliases: &HashSet<PeerId>,
     timeout: Duration,
 ) -> AckWait {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -634,7 +742,7 @@ async fn wait_for_ack(
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return AckWait::NoAck,
             Ok(Ok(ack)) => ack,
         };
-        if ack.for_event != event_id || ack.receiver != peer {
+        if ack.for_event != event_id || !ack_is_for(ack.receiver, peer, aliases) {
             continue;
         }
         return match ack.outcome {
@@ -665,7 +773,7 @@ async fn wait_for_ack(
 /// remote can't route a LAN ack back over the relay anyway (it would emit
 /// a spurious `delivery_ack_send_failed`). Relay delivery confirmation
 /// lands with the relay's durable mailbox (#1247 slice 9).
-fn build_forward_frame(
+pub(crate) fn build_forward_frame(
     link: &Airc,
     env: &Envelope,
     request_ack: bool,
@@ -687,6 +795,13 @@ fn build_forward_frame(
         )
     };
     let mut headers = env.headers.clone();
+    // The typed router field governs local persistence. Stamp its wire
+    // representation before signing so a caller-supplied label cannot give
+    // the receiving node a different delivery contract.
+    headers.insert(
+        airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.to_string(),
+        crate::publish::delivery_class_header_value(env.delivery).to_string(),
+    );
     if request_ack {
         headers.insert(
             HEADER_AIRC_DELIVERY_ACK.to_string(),
@@ -742,6 +857,31 @@ fn mention_for_target(target: &Target) -> MentionTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: the M5 ↔ 5090 split (2026-09-15) — a frame sent to the
+    // connected machine id (4731e245) is acked by the scope id hosted there
+    // (e85a5bb3, same pubkey). That ack is THIS peer's ack; an ack from a peer with a
+    // different key still is not.
+    #[test]
+    fn an_ack_from_an_id_sharing_the_targets_key_counts_and_a_stranger_does_not() {
+        let machine = PeerId::from_u128(0x4731);
+        let scope = PeerId::from_u128(0xe85a);
+        let stranger = PeerId::from_u128(0x5159);
+        let aliases: HashSet<PeerId> = [scope].into_iter().collect();
+        assert!(ack_is_for(machine, machine, &aliases));
+        assert!(
+            ack_is_for(scope, machine, &aliases),
+            "the hosted scope's ack is the machine's ack"
+        );
+        assert!(
+            !ack_is_for(stranger, machine, &aliases),
+            "a different key never counts"
+        );
+        assert!(
+            !ack_is_for(scope, machine, &HashSet::new()),
+            "no alias knowledge = the old strict match"
+        );
+    }
     use airc_bus::envelope::DeliveryClass;
     use bytes::Bytes;
 
@@ -787,6 +927,49 @@ mod tests {
                 env.kind,
                 Kind::Command | Kind::CommandResult | Kind::Signal | Kind::StreamChunk
             ));
+        }
+    }
+
+    // Regression for #1403: an untrusted header must not override the typed
+    // delivery class when the forwarder signs an envelope for another node.
+    #[tokio::test]
+    async fn forwarding_stamps_typed_delivery_over_misleading_headers() {
+        let dir = tempfile::tempdir().expect("isolated home");
+        let link =
+            Airc::open_with_wire_root_for_test(dir.path().join("scope"), dir.path().join("wire"))
+                .await
+                .expect("isolated signing handle");
+        for delivery in [
+            DeliveryClass::Durable,
+            DeliveryClass::EphemeralLatest,
+            DeliveryClass::EphemeralWindow,
+            DeliveryClass::RequestResponse,
+            DeliveryClass::StreamChunk,
+        ] {
+            let mut env = durable_env(Kind::Event);
+            env.delivery = delivery;
+            env.headers.insert(
+                airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.to_string(),
+                "caller_supplied_wrong_class".to_string(),
+            );
+            let frame = build_forward_frame(&link, &env, false)
+                .expect("forward encoding")
+                .expect("wire-capable event kind");
+            assert_eq!(
+                frame
+                    .envelope
+                    .headers
+                    .get(airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS)
+                    .map(String::as_str),
+                Some(crate::publish::delivery_class_header_value(delivery)),
+            );
+            assert_eq!(
+                env.headers
+                    .get(airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS)
+                    .map(String::as_str),
+                Some("caller_supplied_wrong_class"),
+                "wire projection must not mutate the shared source envelope"
+            );
         }
     }
 }

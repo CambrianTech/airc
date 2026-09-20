@@ -39,6 +39,44 @@ ok()    { printf '  \033[1;32m->\033[0m %s\n' "$*"; }
 warn()  { printf '  \033[1;33m!\033[0m %s\n' "$*" >&2; }
 fail()  { printf '  \033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Public two-phase handoff: prepare while the daemon serves; install that exact
+# snapshot afterward without invoking Cargo again. Both modes pin this checkout.
+PREPARE_ARTIFACT=""
+PREBUILT_ARTIFACT=""
+EXPECTED_BUILD=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prepare-artifact|--prebuilt|--expected-build)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || fail "Missing value for $1"
+      case "$1" in
+        --prepare-artifact) PREPARE_ARTIFACT="$2" ;;
+        --prebuilt) PREBUILT_ARTIFACT="$2" ;;
+        --expected-build) EXPECTED_BUILD="$2" ;;
+      esac
+      shift 2 ;;
+    --help)
+      printf '%s\n' 'Usage: bash install.sh [--prepare-artifact PATH | --prebuilt PATH] --expected-build GIT_SHA' \
+        'Without arguments, build and install normally. Handoff modes use the current checkout without pulling.'
+      exit 0 ;;
+    *) fail "Unknown installer argument: $1" ;;
+  esac
+done
+if [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT$EXPECTED_BUILD" ]; then
+  [ -z "$PREPARE_ARTIFACT" ] || [ -z "$PREBUILT_ARTIFACT" ] || fail 'Choose prepare or prebuilt, not both'
+  [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT" ] || fail '--expected-build requires a handoff mode'
+  [[ "$EXPECTED_BUILD" =~ ^[0-9a-fA-F]{7,40}$ ]] || fail 'Handoff requires --expected-build with a Git SHA'
+  [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ] || fail 'Handoff cannot skip artifact validation'
+fi
+
+_verify_artifact() {
+  local binary="$1" output actual
+  [ -f "$binary" ] && [ -x "$binary" ] || fail "Artifact missing or not executable: $binary"
+  output="$("$binary" version)" || fail "Artifact cannot run: $binary"
+  actual="$(printf '%s\n' "$output" | awk '$1 == "build:" {print $2; exit}')"
+  [[ "$actual" =~ ^[0-9a-fA-F]{7,40}$ ]] || fail "Artifact has no valid build SHA: $binary"
+  [[ "$actual" == "$EXPECTED_BUILD"* || "$EXPECTED_BUILD" == "$actual"* ]] || fail "Artifact build $actual does not match $EXPECTED_BUILD"
+}
+
 # MSYS / Git Bash path conversion. Three callsites in this file used the
 # same `if command -v cygpath ... else sed ...` block; #205 Target #3
 # collapsed them. Mirrors lib/airc_bash/platform_adapters.sh's helpers
@@ -58,6 +96,8 @@ _to_bash_path() {
     printf '%s' "$1" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|'
   fi
 }
+
+CLONE_DIR="$(_to_bash_path "$CLONE_DIR")"
 
 # ── Prereq auto-install ─────────────────────────────────────────────────
 # Mirrors the Windows install.ps1 winget path: detect what's missing,
@@ -533,7 +573,7 @@ ensure_prereqs() {
   fi
 }
 
-ensure_prereqs
+if [ -z "$PREBUILT_ARTIFACT" ]; then ensure_prereqs; fi
 
 # ── Clone or update ─────────────────────────────────────────────────────
 
@@ -545,7 +585,7 @@ if [ -d "$CLONE_DIR/.git" ] || [ -f "$CLONE_DIR/.git" ]; then
   # Without this escape hatch, install.sh's "I'm-on-a-non-channel-branch
   # so let me reset to main" recovery path silently overwrites the
   # PR's code with origin/main's — making the PR's CI a no-op.
-  if [ "${AIRC_INSTALL_NO_PULL:-0}" = "1" ]; then
+  if [ "${AIRC_INSTALL_NO_PULL:-0}" = "1" ] || [ -n "$EXPECTED_BUILD" ]; then
     info "AIRC_INSTALL_NO_PULL=1 — using CLONE_DIR tree as-is, skipping branch-switch + pull"
   else
   info "Updating existing install"
@@ -566,6 +606,28 @@ EOF
     exit 1
   fi
   info "Channel = current branch '$CURRENT_BRANCH'"
+  # A LOCAL-ONLY branch is not an error — it is the most common thing a
+  # contributor does. "Fast-forward whatever branch is checked out" has nothing
+  # to fast-forward when the branch exists only here, so build the tree as-is
+  # rather than failing.
+  #
+  # Measured 2026-08-07: `./install.sh` from a dev checkout on an unpushed
+  # feature branch died with "fatal: couldn't find remote ref <branch>" +
+  # "Network? gh auth?" — a message that sends you to check your token when
+  # your token is fine. The one action this script exists for, installing the
+  # build you just made, was the action it refused. The documented recovery
+  # ("git checkout canary && ./install.sh") works only because it throws your
+  # branch away, which is the opposite of what you asked for.
+  #
+  # This preserves the design intent above — git stays the state manager and we
+  # still never silently switch branches — while removing the footgun for the
+  # case that intent implies should work: testing your own commits. Same shape
+  # as the Rust updater's #288 fix (a channel must not be whatever branch the
+  # checkout happens to sit on); that one was fixed in update_commands.rs and
+  # this path kept the original behaviour.
+  if ! git -C "$CLONE_DIR" ls-remote --exit-code --heads origin "$CURRENT_BRANCH" >/dev/null 2>&1; then
+    info "Branch '$CURRENT_BRANCH' has no remote counterpart — installing this tree as-is (nothing to pull)"
+  else
   git -C "$CLONE_DIR" fetch --quiet origin "$CURRENT_BRANCH" || {
     echo "ERROR: Couldn't fetch origin/$CURRENT_BRANCH. Network? gh auth?" >&2
     exit 1
@@ -584,6 +646,7 @@ Recover with:
 EOF
     exit 1
   fi
+  fi  # local-only-branch guard
   fi  # AIRC_INSTALL_NO_PULL guard
 else
   # First install. The channel is just a git branch — git is the state
@@ -607,6 +670,11 @@ else
       exit 1
     }
   fi
+fi
+
+if [ -n "$EXPECTED_BUILD" ]; then
+  checkout_build="$(git -C "$CLONE_DIR" rev-parse HEAD)" || fail 'Cannot verify handoff checkout'
+  [[ "$checkout_build" == "$EXPECTED_BUILD"* ]] || fail "Checkout $checkout_build does not match $EXPECTED_BUILD"
 fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
@@ -784,6 +852,10 @@ _airc_target_dir() {
 # binary. Changing firewall rules requires elevation (signing wouldn't help —
 # firewall != SmartScreen), so we CHECK first (read-only, no prompt) and only
 # UAC-prompt when a fix is actually needed — every later update stays silent.
+_windows_powershell() {
+  bash "$CLONE_DIR/windows/run-powershell.sh" "$@"
+}
+
 _setup_windows_firewall() {
   local ps1="$CLONE_DIR/windows/firewall-allow.ps1"
   [ -f "$ps1" ] || return 0   # tolerate older checkouts
@@ -791,7 +863,7 @@ _setup_windows_firewall() {
   airc_win="$(_to_win_path "$BIN_DIR/airc.exe")"
   ps1_win="$(_to_win_path "$ps1")"
   # Read-only state check — no admin, no prompt.
-  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
     ok "Windows Firewall: airc inbound already allowed"
     return 0
@@ -807,10 +879,10 @@ _setup_windows_firewall() {
   info "        until the rule exists. This is the airc grid's front door."
   info "  HOW:  Windows will show ONE UAC prompt — click Yes to allow it."
   info "        (Updates stay silent afterward; nothing to re-approve.)"
-  powershell.exe -NoProfile -Command \
+  _windows_powershell -NoProfile -Command \
     "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$ps1_win','-AircPath','$airc_win')" \
     >/dev/null 2>&1 || true
-  if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
     ok "Windows Firewall: airc inbound allowed — LAN peers can now reach this node."
   else
@@ -822,8 +894,24 @@ _setup_windows_firewall() {
   fi
 }
 
+_setup_windows_autostart() {
+  local registrar="$CLONE_DIR/windows/register-autostart.ps1"
+  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned \
+       -File "$(_to_win_path "$registrar")" -AircPath "$(_to_win_path "$BIN_DIR/airc.exe")" -ExistingOnly; then
+    ok "Windows mesh autostart checked (existing tasks repaired; no new opt-in)"
+  else
+    warn "Could not repair Windows mesh autostart; rerun this installer from a normal Windows session."
+  fi
+}
+
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
+  local built target_dir
+  if [ -n "$PREBUILT_ARTIFACT" ]; then
+    built="$(_to_bash_path "$PREBUILT_ARTIFACT")"
+    _verify_artifact "$built"
+    info "Installing verified prebuilt artifact: $built"
+  else
   # Belt-and-suspenders: even when prereq install was skipped (AIRC_SKIP_PREREQS)
   # the build still needs cargo on PATH. On macOS that means sourcing brew env.
   ensure_brew_on_path
@@ -833,24 +921,37 @@ _install_airc_binary() {
   ensure_cargo_recent
   info "Building Rust CLI: airc"
   (cd "$CLONE_DIR" && cargo build --release -p airc-cli)
-  mkdir -p "$BIN_DIR"
 
   # Where cargo ACTUALLY put it (honors CARGO_TARGET_DIR + cargo config),
   # not the assumed "$CLONE_DIR/target" — see `_airc_target_dir`.
-  local target_dir; target_dir="$(_airc_target_dir)"
+  target_dir="$(_airc_target_dir)"
+  built="$target_dir/release/airc"
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) built="$built.exe" ;; esac
+  [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
+  if [ -n "$PREPARE_ARTIFACT" ]; then
+    local prepared; prepared="$(_to_bash_path "$PREPARE_ARTIFACT")"
+    [ ! -e "$prepared" ] || fail "Artifact destination already exists: $prepared"
+    cp "$built" "$prepared"
+    chmod +x "$prepared"
+    _verify_artifact "$prepared"
+    checkout_build="$(git -C "$CLONE_DIR" rev-parse HEAD)" || fail 'Cannot verify prepared checkout'
+    [[ "$checkout_build" == "$EXPECTED_BUILD"* ]] || fail 'Checkout changed while preparing the artifact'
+    ok "Prepared verified artifact: $prepared"
+    exit 0
+  fi
+  fi
+  mkdir -p "$BIN_DIR"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      local built="$target_dir/release/airc.exe"
-      [ -x "$built" ] || fail "airc build completed but binary is missing: $built (target dir: $target_dir)"
       cp -f "$built" "$BIN_DIR/airc.exe"
+      if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$BIN_DIR/airc.exe"; fi
       ok "Installed airc: $BIN_DIR/airc.exe"
       # Reachable-inbound on a typical Windows box (idempotent; prompts for
       # elevation only when the firewall rule is missing/broken).
       _setup_windows_firewall
+      _setup_windows_autostart
       ;;
     *)
-      local built="$target_dir/release/airc"
-      [ -x "$built" ] || fail "airc build completed but binary is missing: $built (target dir: $target_dir)"
       local tmp="$BIN_DIR/.airc.tmp.$$"
       cp -f "$built" "$tmp"
       chmod +x "$tmp"
@@ -876,6 +977,7 @@ _install_airc_binary() {
 typically an invalid code signature on macOS). Refusing to report success on a binary that \
 cannot execute — a silently-dead airc looks exactly like a broken mesh."
       fi
+      if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$BIN_DIR/airc"; fi
       ok "Installed airc: $BIN_DIR/airc ($("$BIN_DIR/airc" --version 2>/dev/null))"
       ;;
   esac
@@ -960,101 +1062,15 @@ _install_airc_skills_into "$SKILLS_TARGET" "claude-code"
 # harnesses + non-default Codex layouts).
 if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_skills_into "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}" "codex"
+  # Preserve fresh-install hook setup without selecting user permissions.
+  if [ "${AIRC_SKIP_CODEX_CONFIG:-0}" != "1" ] && [ ! -f "$HOME/.codex/config.toml" ]; then
+    touch "$HOME/.codex/config.toml"
+  fi
 fi
 
-# ── Codex permission profile (network access for gh subcommands) ───────
-# Codex's default sandbox blocks subcommand network egress. airc's substrate
-# IS gh-API-driven, so without elevation, every airc verb fails with
-# 'error connecting to github.com' or 'token invalid' depending on which
-# layer the call lands at. Codex skills can't declare required permissions
-# inline, so the cleanest automation is to write a named permission profile
-# scoped to ONLY github.com / api.github.com / gist.github.com, then set
-# default_permissions = "airc" if no other default is configured. Per
-# Codex docs, named permission profiles round-trip across TUI sessions
-# and are the preferred way to grant scoped network access.
-#
-# Idempotent: only adds [permissions.airc.network] if not already present;
-# only sets default_permissions = "airc" if no default is currently set.
-# A user who has set a different default keeps it + can invoke airc-needing
-# Codex sessions via `codex --profile airc`.
-#
-# Honors AIRC_SKIP_CODEX_CONFIG=1 if a user (or test harness) wants the
-# skill install but NOT the config write.
-
-_install_airc_codex_permission_profile() {
-  local config="$HOME/.codex/config.toml"
-  [ "${AIRC_SKIP_CODEX_CONFIG:-0}" = "1" ] && return 0
-  [ -f "$config" ] || touch "$config"
-
-  local _changed=0
-
-  # Append the named profile if absent. The block goes at the end of the
-  # file (TOML allows section order to be arbitrary; downstream sections
-  # don't capture this one because [permissions.airc.network] is its own
-  # explicit header).
-  if ! grep -q '^\[permissions\.airc\.network\]' "$config" 2>/dev/null; then
-    cat >> "$config" <<'TOML'
-
-# airc network permissions — added by airc install.sh so gh subcommands
-# (which the substrate is built on) can reach GitHub from inside Codex's
-# default sandbox. Scoped to ONLY the gh hosts airc actually uses; other
-# domains stay restricted. Remove this block + `default_permissions = "airc"`
-# below to opt out. Re-runs of install.sh detect existing presence and
-# don't duplicate.
-[permissions.airc.network]
-enabled = true
-mode = "limited"
-domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
-TOML
-    _changed=1
-  fi
-
-  # Filesystem permissions: NOT WRITTEN. Initially we tried granting writes
-  # to ~/.airc/src/ + ~/.airc/ + a :project_roots
-  # block — Codex's runtime hard-rejected the profile at startup with:
-  #   "permissions profile requests filesystem writes outside the
-  #   workspace root, which is not supported until the runtime enforces
-  #   FileSystemSandboxPolicy directly"
-  # …meaning Codex 0.125 can't honor home-dir-scoped filesystem grants in
-  # named profiles yet. Even the :project_roots-only variant didn't help.
-  # The startup error broke every Codex session on the machine. We removed
-  # the block entirely; living with Codex's "does not define any recognized
-  # filesystem entries" warning is preferable to a hard-fail-on-startup.
-  # When Codex's runtime supports outside-workspace filesystem profiles,
-  # restore the block (history at git log -- install.sh).
-
-  # Cleanup for managed [permissions.airc.filesystem] blocks lives in the
-  # Rust Codex hook installer below. Keep this profile function focused
-  # on the network profile it owns.
-
-  # Set default_permissions = "airc" at the file's top level, but only if
-  # no default is currently set. A pre-existing default belongs to the
-  # user; we don't overwrite. We prepend to the file so the assignment
-  # lands at the top level and is not captured by any section that
-  # already opens further down.
-  if ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=' "$config" 2>/dev/null; then
-    local _tmp; _tmp=$(mktemp)
-    {
-      printf '# airc: default permission profile (added by install.sh; remove to opt out)\n'
-      printf 'default_permissions = "airc"\n\n'
-      cat "$config"
-    } > "$_tmp"
-    mv "$_tmp" "$config"
-    _changed=1
-  elif ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=[[:space:]]*"airc"' "$config" 2>/dev/null; then
-    # Different default already set — don't override, but tell the user
-    # how to use airc explicitly without changing their default.
-    info "  ~/.codex/config.toml already has default_permissions set; invoke airc-needing Codex sessions via:  codex --profile airc"
-  fi
-
-  if [ "$_changed" = "1" ]; then
-    ok "Added airc network profile to ~/.codex/config.toml — restart Codex to activate (gh subcommands work in airc-needing sessions)."
-  fi
-}
-
-if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
-  _install_airc_codex_permission_profile
-fi
+# Codex permission selection belongs to the user. Do not install or select a
+# global network-only profile: it conflicts with sandbox_mode and changes every
+# project after restart. Leave existing configuration untouched.
 
 # ── Codex model-visible AIRC turn contract ─────────────────────────────
 # Codex currently has no Claude-style Monitor tool. Keep `airc join`

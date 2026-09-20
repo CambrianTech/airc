@@ -44,6 +44,7 @@
 //! lock is `flock(LOCK_EX | LOCK_NB)` — non-blocking; a second launch
 //! exits cleanly with a "merger already running" message.
 
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -125,18 +126,10 @@ async fn tick_once(
         .await?;
     let snapshot = board.snapshot();
 
-    // Card d5b7b07d: fetch the baseline (integration-branch HEAD's
-    // failing check names) ONCE per tick — every per-card gate consults
-    // the same snapshot. The set is small (handful of check names) and
-    // the query is one REST call; cheap relative to per-PR pr_view.
-    let baseline_failures = fetch_baseline_failures(gh).await;
-    if !baseline_failures.is_empty() {
-        eprintln!(
-            "airc-merger: baseline has {} failing check(s) on canary — \
-             those won't block per-PR gates this tick",
-            baseline_failures.len()
-        );
-    }
+    // Card 045083e8: a room can contain cards from multiple repositories
+    // and target branches. Reuse only the same immutable target's baseline,
+    // and discard all cached observations at the end of this tick.
+    let mut baselines = BaselineCache::default();
 
     // Card 7ed1ac4f: snapshot `now_ms` ONCE per tick so every per-card
     // gate sees the same wall clock. Otherwise a long-running tick
@@ -148,7 +141,7 @@ async fn tick_once(
     let policy = GatePolicy::default_for_merger(now_ms());
 
     for card in &snapshot.cards {
-        let Some(decision) = evaluate(gh, card, &baseline_failures, policy).await? else {
+        let Some(decision) = evaluate(gh, card, &mut baselines, policy).await? else {
             continue;
         };
         match decision {
@@ -237,7 +230,7 @@ enum MergeDecision {
 async fn evaluate(
     gh: &dyn crate::gh_client::GhClient,
     card: &WorkCard,
-    baseline_failures: &std::collections::HashSet<String>,
+    baselines: &mut BaselineCache,
     policy: GatePolicy,
 ) -> Result<Option<MergeDecision>, Box<dyn std::error::Error>> {
     use airc_work::model::CardState;
@@ -248,7 +241,7 @@ async fn evaluate(
         return Ok(None);
     };
 
-    match check_pr_gate(gh, &pr, baseline_failures, policy).await {
+    match check_pr_gate(gh, &pr, baselines, policy).await {
         Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
         Ok(GateResult::AlreadyMerged { merged_at_ms }) => {
             Ok(Some(MergeDecision::Reconcile(pr, merged_at_ms)))
@@ -341,7 +334,7 @@ pub(crate) fn parse_iso8601_to_ms(s: &str) -> Option<u64> {
 pub(crate) async fn check_pr_gate(
     gh: &dyn crate::gh_client::GhClient,
     pr: &airc_work::model::PullRequestRef,
-    baseline_failures: &std::collections::HashSet<String>,
+    baselines: &mut BaselineCache,
     policy: GatePolicy,
 ) -> Result<GateResult, crate::gh_client::GhError> {
     let view = gh
@@ -351,43 +344,100 @@ pub(crate) async fn check_pr_gate(
             cwd: None,
         })
         .await?;
-    Ok(evaluate_gh_view(&view, baseline_failures, policy))
+    let no_allowance = HashSet::new();
+    let without_baseline = evaluate_gh_view(&view, &no_allowance, policy);
+    if !matches!(without_baseline, GateResult::NotReady(_)) {
+        // A decision needing no base allowance (including the configured
+        // pending-timeout policy) does not depend on another lookup succeeding.
+        return Ok(without_baseline);
+    }
+    let Some(target) = BaselineTarget::from_view(&pr.repo, &view) else {
+        eprintln!(
+            "airc-merger: PR #{} in {} has no verified target branch/revision \
+             (degrading to no-allowance gate)",
+            pr.number, pr.repo
+        );
+        return Ok(without_baseline);
+    };
+    let failures = match baselines.failures.entry(target) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let failures = fetch_baseline_failures(gh, entry.key()).await;
+            entry.insert(failures)
+        }
+    };
+    Ok(evaluate_gh_view(&view, failures, policy))
 }
 
-/// Fetch the integration branch (canary) HEAD's check-run rollup and
-/// return the SET of names that are currently FAILURE on base. Calls this
-/// once per tick; each per-card gate consults the same snapshot. On
-/// error (rate-limit, network), returns empty set — the gate
-/// degrades to "no allowance" rather than over-trusting.
-pub(crate) async fn fetch_baseline_failures(
+/// Short-lived baseline observations for one merger tick or manual command.
+/// No cross-repository, cross-branch, or cross-revision failure allowance.
+#[derive(Default)]
+pub(crate) struct BaselineCache {
+    failures: HashMap<BaselineTarget, HashSet<String>>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct BaselineTarget {
+    repo: airc_work::ids::RepoId,
+    branch: airc_work::model::BranchName,
+    revision: airc_work::model::GitObjectId,
+}
+
+impl BaselineTarget {
+    fn from_view(repo: &airc_work::ids::RepoId, view: &crate::gh_client::PrView) -> Option<Self> {
+        let branch = airc_work::model::BranchName::new(view.base_ref_name.as_deref()?).ok()?;
+        let revision = airc_work::model::GitObjectId::new(view.base_ref_oid.as_deref()?).ok()?;
+        // GitHub supplies a complete object id. A short or malformed value
+        // must never fall back to resolving a mutable branch or ambiguous ref.
+        if !matches!(revision.as_str().len(), 40 | 64) {
+            return None;
+        }
+        Some(Self {
+            repo: repo.clone(),
+            branch,
+            revision,
+        })
+    }
+}
+
+/// Query the target revision from the same live PR response as its checks.
+/// Lookup failure is cached as an empty allowance for this tick; failures in
+/// another repository or branch can never supply the missing evidence.
+async fn fetch_baseline_failures(
     gh: &dyn crate::gh_client::GhClient,
-) -> std::collections::HashSet<String> {
-    // Card 70e87d33 made the PR base per-repo. This baseline lookup is
-    // airc-specific (the repo is hardcoded to CambrianTech/airc below),
-    // so it resolves to airc's integration branch — **canary** since the
-    // rust-rewrite→canary promotion (#1173) DELETED origin/rust-rewrite.
-    // A stale `rust-rewrite` here 422s on every merger tick (no commit
-    // for that SHA) and silently degrades the baseline-allowance gate to
-    // all-green-required. Same stale-base class as the airc-fetch-base
-    // hook bug (#1185).
-    let base_branch = "canary";
+    target: &BaselineTarget,
+) -> HashSet<String> {
     let runs = match gh
         .branch_check_rollup(crate::gh_client::BranchCheckRollupArgs {
-            repo: "CambrianTech/airc".to_string(),
-            branch: base_branch.to_string(),
+            repo: target.repo.as_str().to_string(),
+            branch: target.revision.as_str().to_string(),
         })
         .await
     {
         Ok(runs) => runs,
         Err(error) => {
             eprintln!(
-                "airc-merger: baseline-failures lookup failed for {base_branch}: {error} \
-                 (degrading to no-allowance gate)"
+                "airc-merger: baseline lookup failed for {}:{} at {}: {error} \
+                 (degrading to no-allowance gate)",
+                target.repo,
+                target.branch.as_str(),
+                target.revision.as_str()
             );
             return std::collections::HashSet::new();
         }
     };
-    baseline_failing_names(&runs)
+    let failures = baseline_failing_names(&runs);
+    if !failures.is_empty() {
+        eprintln!(
+            "airc-merger: baseline {}:{} at {} has {} failing check(s) — \
+             only this target's inherited failures are ignored",
+            target.repo,
+            target.branch.as_str(),
+            target.revision.as_str(),
+            failures.len()
+        );
+    }
+    failures
 }
 
 /// Pure projection: rollup → set of check NAMES whose conclusion is
@@ -414,7 +464,17 @@ pub(crate) fn baseline_failing_names(
 }
 
 /// Decide whether a PR is ready to merge, given the parsed `gh pr
-/// view` payload. Pure — no IO, no async. First-cut policy:
+/// view` payload. Pure — no IO, no async.
+///
+/// CONTRACT (card fc483e57): this function NEVER sees dialect. Its
+/// [`PrView`] comes from `PrView::from_graphql` / `PrView::from_rest`,
+/// which emit the canonical (GraphQL) vocabulary — so `MERGED`,
+/// `SUCCESS`, `COMPLETED` are matched as written, and a REST/GraphQL
+/// difference is fixed at that boundary, never here. Do not add a
+/// `to_uppercase()` or a `state == "closed"` arm below; add it to
+/// `canonicalize`.
+///
+/// First-cut policy:
 ///
 /// - state must be `OPEN` (not already MERGED/CLOSED)
 /// - mergeable must not be `CONFLICTING` (no rebase needed)
@@ -437,7 +497,15 @@ pub(crate) fn evaluate_gh_view(
     baseline_failures: &std::collections::HashSet<String>,
     policy: GatePolicy,
 ) -> GateResult {
-    if view.state == "MERGED" {
+    // Card c03bb62f: "merged" is a FACT (`merged_at` is set), not a state
+    // string. GraphQL (`gh pr view`) reports `state: MERGED`; REST
+    // (`/repos/../pulls/N`, the production ReqwestGhClient) reports
+    // `state: closed` + `merged_at` for the same PR — so a string-only
+    // check let every merged PR read as CLOSED and skipped the reconcile,
+    // leaving cards at Review forever (2026-09-04: three continuum cards
+    // whose PRs merged on GitHub, `airc work merge` refusing "state is
+    // CLOSED"). Decide on the fact; the state string is a hint.
+    if view.state == "MERGED" || view.merged_at.is_some() {
         // Card acd72c81 follow-up: reconcile, don't skip. The kanban
         // projection needs `PullRequestMerged` to transition; the GH
         // merge already happened, so the merger just emits the event.
@@ -632,6 +700,169 @@ mod tests {
             pending_timeout_ms: 0,
             now_ms: 0,
         }
+    }
+
+    fn linked_pr(repo: &str, number: u64) -> airc_work::model::PullRequestRef {
+        airc_work::model::PullRequestRef {
+            repo: airc_work::ids::RepoId::new(repo).unwrap(),
+            number,
+            head: airc_work::model::BranchName::new("topic").unwrap(),
+            // Deliberately stale: live PR metadata must select the baseline.
+            base: airc_work::model::BranchName::new("old-target").unwrap(),
+        }
+    }
+
+    fn failing_pr_view(branch: &str, revision: &str) -> crate::gh_client::PrView {
+        parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "baseRefName": branch,
+            "baseRefOid": revision,
+            "statusCheckRollup": [
+                {"name": "cargo test", "status": "COMPLETED", "conclusion": "FAILURE"}
+            ]
+        }))
+    }
+
+    // What this catches (045083e8): a shared check name in AIRC must not
+    // excuse a new Continuum failure. The actual PR target also wins over
+    // a stale card link; moving either the ref or its SHA starts a new baseline.
+    #[tokio::test]
+    async fn merge_gate_isolates_baselines_by_live_repo_branch_and_revision() {
+        use airc_lib::gh::client::mock::MockGhClient;
+
+        let gh = MockGhClient::new();
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let next = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut baselines = BaselineCache::default();
+        for (number, repo, branch, revision, should_merge) in [
+            (1, "CambrianTech/airc", "canary", first, true),
+            (2, "CambrianTech/continuum", "canary", first, false),
+            (3, "CambrianTech/airc", "canary", first, true),
+            (4, "CambrianTech/airc", "release/topic", first, false),
+            (5, "CambrianTech/airc", "canary", next, false),
+        ] {
+            let view = failing_pr_view(branch, revision);
+            if number == 1 {
+                gh.queue_branch_check_rollup(Ok(view.status_check_rollup.clone().unwrap()));
+            } else if number != 3 {
+                gh.queue_branch_check_rollup(Ok(Vec::new()));
+            }
+            gh.queue_pr_view(Ok(view));
+            let result = check_pr_gate(
+                &gh,
+                &linked_pr(repo, number),
+                &mut baselines,
+                empty_policy(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                matches!(result, GateResult::Green),
+                should_merge,
+                "PR {number} {repo}:{branch}@{revision}: {result:?}"
+            );
+        }
+        let calls = gh.received_branch_check_rollup_calls();
+        let targets: Vec<_> = calls
+            .iter()
+            .map(|call| (call.repo.as_str(), call.branch.as_str()))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                ("CambrianTech/airc", first),
+                ("CambrianTech/continuum", first),
+                ("CambrianTech/airc", first),
+                ("CambrianTech/airc", next),
+            ],
+            "only matching repo/ref/SHA shares a lookup; query immutable SHA, never card.base"
+        );
+        assert_eq!(
+            gh.pr_view_call_count(),
+            5,
+            "each PR gets a live status read"
+        );
+    }
+
+    // What this catches (045083e8): missing metadata, ambiguous refs, and
+    // lookup errors grant no exemption. An independently green PR remains
+    // green without needing a baseline request or inventing a target.
+    #[tokio::test]
+    async fn merge_gate_missing_or_failed_baseline_preserves_strict_outcome() {
+        use airc_lib::gh::client::{mock::MockGhClient, GhError};
+
+        let gh = MockGhClient::new();
+        let revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pr = linked_pr("CambrianTech/continuum", 42);
+        let mut baselines = BaselineCache::default();
+        for (branch, oid) in [
+            (None, Some(revision)),
+            (Some("canary"), None),
+            (Some(""), Some(revision)),
+            (Some("canary"), Some("abcd")),
+            (Some("canary"), Some("refs/heads/canary")),
+        ] {
+            let mut view = failing_pr_view("canary", revision);
+            view.base_ref_name = branch.map(str::to_string);
+            view.base_ref_oid = oid.map(str::to_string);
+            gh.queue_pr_view(Ok(view));
+            assert!(matches!(
+                check_pr_gate(&gh, &pr, &mut baselines, empty_policy())
+                    .await
+                    .unwrap(),
+                GateResult::NotReady(_)
+            ));
+        }
+        assert_eq!(gh.branch_check_rollup_call_count(), 0);
+
+        gh.queue_branch_check_rollup(Err(GhError::RateLimited {
+            stderr: "fixture rate limit".into(),
+        }));
+        for _ in 0..2 {
+            gh.queue_pr_view(Ok(failing_pr_view("canary", revision)));
+            assert!(matches!(
+                check_pr_gate(&gh, &pr, &mut baselines, empty_policy())
+                    .await
+                    .unwrap(),
+                GateResult::NotReady(_)
+            ));
+        }
+        assert_eq!(
+            gh.branch_check_rollup_call_count(),
+            1,
+            "failed lookup is cached for this tick"
+        );
+
+        gh.queue_pr_view(Ok(parse(json!({
+            "state": "OPEN", "mergeable": "MERGEABLE",
+            "statusCheckRollup": [{"name": "cargo test", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        }))));
+        assert!(matches!(
+            check_pr_gate(&gh, &pr, &mut baselines, empty_policy())
+                .await
+                .unwrap(),
+            GateResult::Green
+        ));
+        assert_eq!(
+            gh.branch_check_rollup_call_count(),
+            1,
+            "green needs no allowance"
+        );
+
+        // A later tick/manual command retries; a transient error is not a
+        // permanent exemption or a process-global negative cache.
+        gh.queue_pr_view(Ok(failing_pr_view("canary", revision)));
+        gh.queue_branch_check_rollup(Ok(failing_pr_view("canary", revision)
+            .status_check_rollup
+            .unwrap()));
+        assert!(matches!(
+            check_pr_gate(&gh, &pr, &mut BaselineCache::default(), empty_policy())
+                .await
+                .unwrap(),
+            GateResult::Green
+        ));
+        assert_eq!(gh.branch_check_rollup_call_count(), 2);
     }
 
     #[test]
@@ -994,8 +1225,8 @@ mod tests {
         let json = serde_json::json!({
             "total_count": 2,
             "check_runs": [
-                {"name": "cargo fmt --check", "status": "completed", "conclusion": "success"},
-                {"name": "cargo test (windows-latest)", "status": "in_progress", "conclusion": null},
+                {"id": 1, "name": "cargo fmt --check", "status": "completed", "conclusion": "success"},
+                {"id": 2, "name": "cargo test (windows-latest)", "status": "in_progress", "conclusion": null},
             ]
         });
         let runs = airc_lib::gh::client::parse_check_runs(json.to_string().as_bytes())
@@ -1003,7 +1234,10 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].name.as_deref(), Some("cargo fmt --check"));
         assert_eq!(runs[1].conclusion.as_deref(), None);
-        assert_eq!(runs[1].status.as_deref(), Some("in_progress"));
+        // Card c03bb62f: GhCheck is GraphQL-cased at the parser now — REST's
+        // `in_progress` surfaces as `IN_PROGRESS`, the vocabulary the gate
+        // (`Some("COMPLETED")` / `Some("SUCCESS")`) actually speaks.
+        assert_eq!(runs[1].status.as_deref(), Some("IN_PROGRESS"));
     }
 
     // ------------------------------------------------------------------
@@ -1055,6 +1289,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: Some("2026-06-01T07:04:07Z".to_string()),
+            base_ref_name: None,
+            base_ref_oid: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);
@@ -1064,6 +1300,50 @@ mod tests {
                 assert_eq!(merged_at_ms, 1780297447000);
             }
             other => panic!("expected AlreadyMerged, got {other:?}"),
+        }
+    }
+
+    // what this catches: the production ReqwestGhClient reads REST, where a
+    // merged PR is `state: closed` + `merged_at: <ts>`; only GraphQL says
+    // MERGED. A string-only gate skipped every REST-viewed merged PR and the
+    // card sat at Review forever (card c03bb62f, 2026-09-04 receipts:
+    // continuum #3692/#3694/#3695). Merged is the `merged_at` FACT.
+    #[test]
+    fn evaluate_gh_view_reconciles_rest_shaped_closed_plus_merged_at() {
+        let view = crate::gh_client::PrView {
+            state: "CLOSED".to_string(),
+            mergeable: "".to_string(),
+            status_check_rollup: None,
+            merged_at: Some("2026-09-04T16:46:08Z".to_string()),
+            base_ref_name: None,
+            base_ref_oid: None,
+        };
+        match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
+            GateResult::AlreadyMerged { merged_at_ms } => {
+                assert_eq!(
+                    merged_at_ms,
+                    parse_iso8601_to_ms("2026-09-04T16:46:08Z").unwrap()
+                );
+            }
+            other => panic!("expected AlreadyMerged, got {other:?}"),
+        }
+    }
+
+    // what this catches: a PR closed WITHOUT merging must never be
+    // reconciled as merged — `merged_at` absent means the fact is absent.
+    #[test]
+    fn evaluate_gh_view_does_not_reconcile_closed_unmerged() {
+        let view = crate::gh_client::PrView {
+            state: "CLOSED".to_string(),
+            mergeable: "".to_string(),
+            status_check_rollup: None,
+            merged_at: None,
+            base_ref_name: None,
+            base_ref_oid: None,
+        };
+        match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
+            GateResult::NotReady(reason) => assert!(reason.contains("CLOSED"), "{reason}"),
+            other => panic!("expected NotReady, got {other:?}"),
         }
     }
 
@@ -1078,6 +1358,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: None,
+            base_ref_name: None,
+            base_ref_oid: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);
@@ -1097,6 +1379,8 @@ mod tests {
             mergeable: "".to_string(),
             status_check_rollup: None,
             merged_at: None,
+            base_ref_name: None,
+            base_ref_oid: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);

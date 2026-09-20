@@ -546,6 +546,39 @@ if ($ghAvail -and $gitAvail) {
     }
 }
 
+# -- Mesh autostart ------------------------------------------------------
+#
+# An unsupervised daemon dying is the STEADY STATE, not an edge case: a
+# Windows Update reboot, a crash, or a closed shell all end it, and nothing
+# brought it back. Measured on BIGMAMA 2026-08-12 - a scheduled servicing
+# reboot took the node off the mesh and it stayed off until a human noticed
+# hours later. Every "peer unreachable" in that window was this.
+#
+# The INSTALLER registers it, deliberately. The same lifecycle was first
+# hand-rolled onto one operator's machine, which is worse than not having
+# it: the operator's box stops exhibiting the bug, so it reads as fixed,
+# while every other node keeps dropping off the mesh exactly as before.
+#
+# User-scoped (no elevation), idempotent (-Force replaces), and self-healing:
+# RestartCount 999 at 2-minute intervals so a crash loop recovers without a
+# human; ExecutionTimeLimit 0 because a mesh daemon is meant to run forever;
+# IgnoreNew so re-running this installer cannot stack duplicate daemons -
+# which matters more than it sounds, because two daemons racing the same
+# identity-derived port is how a node ends up on an ephemeral one and stales
+# every peer's stored endpoint for it.
+Write-Host ''
+Write-Host '  Mesh autostart'
+Write-Host '  --------------'
+try {
+    & (Join-Path $CLONE_DIR 'windows\register-autostart.ps1') -AircPath (Join-Path $BIN_TARGET 'airc.exe')
+    Write-Ok "autostart registered (task 'airc-join' - at logon, auto-restart)"
+} catch {
+    # Never fail the install for this. A node without autostart still works
+    # when started by hand; a failed install leaves the operator nothing.
+    Write-Warn2 "could not register the autostart task: $($_.Exception.Message)"
+    Write-Warn2 "airc still works - run 'airc join' by hand, or re-run this installer from a normal session"
+}
+
 # -- Final guidance ------------------------------------------------------
 Write-Host ''
 Write-Ok 'airc installed.'

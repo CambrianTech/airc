@@ -3,9 +3,7 @@
 use airc_core::{EventId, TranscriptCursor, TranscriptEvent};
 use airc_protocol::HEADER_FORGE_BODY_HINT;
 
-use crate::{
-    decode_work_event, ProjectionError, WorkBoardProjection, WorkEvent, BODY_HINT_FORGE_WORK_EVENT,
-};
+use crate::{decode_work_event, ProjectionError, WorkBoardProjection, WorkEvent};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkReplayItem {
@@ -15,6 +13,18 @@ pub struct WorkReplayItem {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkReplayError {
+    #[error("review transcript {event_id} rejected: {source}")]
+    RejectedReview {
+        event_id: EventId,
+        #[source]
+        source: crate::WorkEventCodecError,
+    },
+    #[error("submission transcript {event_id} rejected: {source}")]
+    RejectedSubmission {
+        event_id: EventId,
+        #[source]
+        source: crate::WorkEventCodecError,
+    },
     #[error("transcript event {event_id} is not a work-domain event")]
     NotWorkEvent { event_id: EventId },
     #[error("transcript event {event_id} has invalid work payload: {source}")]
@@ -35,7 +45,7 @@ pub fn transcript_is_work_event(event: &TranscriptEvent) -> bool {
     event
         .headers
         .get(HEADER_FORGE_BODY_HINT)
-        .is_some_and(|hint| hint == BODY_HINT_FORGE_WORK_EVENT)
+        .is_some_and(|hint| crate::codec::is_work_event_hint(hint))
 }
 
 pub fn decode_transcript_work_event(
@@ -46,12 +56,71 @@ pub fn decode_transcript_work_event(
             event_id: event.event_id,
         });
     }
-    let work_event = decode_work_event(&event.headers, event.body.as_ref()).map_err(|source| {
-        WorkReplayError::Codec {
-            event_id: event.event_id,
-            source,
+    let mut work_event =
+        decode_work_event(&event.headers, event.body.as_ref()).map_err(|source| {
+            // The body discriminator wins over the optional routing hint. A
+            // spoofed hint must not hide corruption in another event family.
+            let body_kind = match event.body.as_ref() {
+                Some(airc_core::Body::Json(value)) => {
+                    value.get("kind").and_then(|kind| kind.as_str())
+                }
+                _ => None,
+            };
+            let kind = body_kind.or_else(|| {
+                event
+                    .headers
+                    .get(crate::HEADER_FORGE_WORK_EVENT_KIND)
+                    .map(String::as_str)
+            });
+            // Nothing under the extension hint may mutate a legacy board. Drop
+            // unsupported/mismatched review packets visibly, exactly as older
+            // readers ignore the extension, while preserving stream progress.
+            if event
+                .headers
+                .get(HEADER_FORGE_BODY_HINT)
+                .is_some_and(|hint| hint == crate::BODY_HINT_FORGE_WORK_REVIEW)
+                || kind == Some("work_submission_reviewed")
+            {
+                WorkReplayError::RejectedReview {
+                    event_id: event.event_id,
+                    source,
+                }
+            } else if kind == Some("work_submitted") {
+                WorkReplayError::RejectedSubmission {
+                    event_id: event.event_id,
+                    source,
+                }
+            } else {
+                WorkReplayError::Codec {
+                    event_id: event.event_id,
+                    source,
+                }
+            }
+        })?;
+    if let WorkEvent::WorkSubmitted(submission) = &work_event {
+        let reason = if submission.publisher != event.peer_id {
+            Some(crate::event::SubmissionRejectionReason::PublisherMismatch)
+        } else {
+            submission.validate().err()
+        };
+        if let Some(reason) = reason {
+            let mut rejected = submission.rejected(reason);
+            rejected.publisher = event.peer_id;
+            work_event = WorkEvent::SubmissionRejected(rejected);
         }
-    })?;
+    }
+    if let WorkEvent::WorkSubmissionReviewed(review) = &work_event {
+        let reason = if review.reviewer != event.peer_id {
+            Some(crate::WorkReviewRejectionReason::ReviewerMismatch)
+        } else {
+            review.validate().err()
+        };
+        if let Some(reason) = reason {
+            let mut rejected = review.rejected(reason);
+            rejected.reviewer = event.peer_id;
+            work_event = WorkEvent::ReviewRejected(rejected);
+        }
+    }
     Ok(WorkReplayItem {
         cursor: event.cursor(),
         event: work_event,
@@ -66,7 +135,17 @@ pub fn project_transcript_work_events(
 
     let mut projection = WorkBoardProjection::new();
     for transcript_event in events {
-        let item = decode_transcript_work_event(&transcript_event)?;
+        let item = match decode_transcript_work_event(&transcript_event) {
+            Ok(item) => item,
+            Err(
+                error @ (WorkReplayError::RejectedSubmission { .. }
+                | WorkReplayError::RejectedReview { .. }),
+            ) => {
+                eprintln!("airc work replay: {error}");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         projection
             .apply(&item.event)
             .map_err(|source| WorkReplayError::Projection {

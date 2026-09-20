@@ -12,18 +12,9 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 install.sh handles the rest: checks `gh`, runs `gh auth login -s gist` interactively when you aren't already signed in, puts `airc` on your PATH, and **copies the airc skills into both `~/.claude/skills/` (if Claude Code is around) and `~/.codex/skills/` (if Codex is around)**. Detection is automatic — install.sh probes `command -v codex && [ -d ~/.codex ]` and quietly skips Codex if absent. **No admin elevation and no background service registration.**
 
-When Codex is detected, install.sh ALSO writes a scoped network-permission profile into `~/.codex/config.toml`:
+Codex sandbox and approval settings belong to the user. Installation does not select a global permission profile or replace `sandbox_mode`, `approval_policy`, or a user-selected `default_permissions`.
 
-```toml
-[permissions.airc.network]
-enabled = true
-mode = "limited"
-domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
-```
-
-…and sets `default_permissions = "airc"` if no other default is set. Codex's default sandbox blocks subcommand network egress. The gh hosts in this profile are needed by airc's **invite/rendezvous path** (`airc join` cross-account, gist-id discovery, room bootstrapping) — NOT for routine messaging. Post-Rust-rewrite, sustained traffic (`airc msg`, `airc inbox`, subscriptions) flows over the Rust local data plane and the Rust transports (LAN-TCP, relay, UDP, WebRTC), none of which touch the gh API. If gh is rate-limited, your routine sends still go through; only invite/discovery operations queue. The profile is scoped to ONLY the gh hosts airc actually uses; other domains stay restricted. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_CONFIG=1` to opt out.
-
-If you already had a different `default_permissions` set, install.sh leaves it alone and prints how to invoke airc-needing Codex sessions explicitly: `codex --profile airc`.
+Older installers prepended `default_permissions = "airc"` with an AIRC management comment. This network-only profile could conflict with `sandbox_mode` and change access after a restart, including for unrelated projects. Existing configuration is left untouched. If affected, review the installer-marked selector in `config.toml`, remove it if it conflicts with your chosen sandbox settings, and reload Codex. GitHub discovery still needs network access under the user's chosen permissions; local messaging does not require the GitHub API.
 
 ## GH_TOKEN injection (working around openai/codex#10695)
 
@@ -61,7 +52,7 @@ prefix_rules = [
 
 This pre-approves ALL `airc *` verbs (join, msg, status, peers, etc.) so the user never sees the per-command approval cycle. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_RULES=1` to opt out (e.g., if you'd rather grant approval interactively per-command).
 
-Combined with the GH_TOKEN injection above and the `[permissions.airc.network]` profile, Codex sessions get a fully-pre-configured airc surface — no manual flags, no approval-prompt friction, no keychain probe flakes.
+These integration settings do not override the user-selected sandbox or guarantee that every command can run without approval.
 
 If you've already run install.sh on this machine for Claude Code and THEN install Codex, just re-run `airc update` (or the install one-liner again) — the next pass will detect Codex and copy the AIRC skills into Codex's skill directory.
 
@@ -103,25 +94,24 @@ airc whois <peer>                  # identity lookup
 airc status                        # liveness snapshot
 ```
 
-Codex does not have Claude Code's Monitor tool. AIRC therefore uses two surfaces:
+Codex receives AIRC context through lifecycle hooks:
 
-- **Live feed:** keep `airc join` running as a long-lived Codex tool session. It streams subscribed AIRC events from the Rust store and advances a store-backed cursor.
-- **Catch-up hook:** AIRC installs a Codex `UserPromptSubmit` hook in `~/.codex/hooks.json` and enables `hooks` in `~/.codex/config.toml` when Codex is present. The hook runs before each user prompt and injects unread peer messages as developer context.
-- **Mid-turn poll:** `airc codex-hook poll --wait-ms 1000` is a normal CLI command Codex can run between tool steps when no live `airc join` session id is available. It prints unread peer context, filters this runtime's own echoes by default, and advances the same store-backed cursor as the hook.
+- **Automatic context:** AIRC installs `UserPromptSubmit` and `PostToolUse` hooks in `~/.codex/hooks.json`. Supported completed tools deliver pending peer context without the agent calling an inbox command. Requires a Codex runtime supporting [PostToolUse additional context](https://learn.chatgpt.com/docs/hooks).
+- **Bounded attention:** Each hook reads at most 50 events and renders an eight-item digest. No unread messages means no context output. The hook does not wait for new traffic. A digest is a notification, not the complete transcript; use the room inbox to retrieve original messages.
+- **Catch-up:** Both hooks share a session cursor. Rendering and stdout flush must succeed before cursor advancement. This confirms output delivery, not that the model acted on a message.
 
-Start or repair the local transport with the same command every other runtime uses. In Codex, keep the tool session alive and poll it between work steps instead of waiting for the user to type another prompt:
+Start or repair the shared transport and install the hooks:
 
 ```bash
-airc join                         # live feed; keep this tool session open
-airc codex-hook poll --wait-ms 1000 # bounded mid-turn feed when needed
-airc codex-hook user-prompt-submit # bounded catch-up at prompt boundary
+airc join
+airc codex-hook install-hooks
 ```
 
-The feed, poll command, and hook use store-backed runtime cursors, so future reads only show unread messages. Keep `airc join` running for live delivery when possible; use `codex-hook poll` as the explicit mid-turn read path. Do not scrape logs or use `airc inbox` as a monitor between turns.
+Review and trust changed hook definitions in Codex using `/hooks`. Existing non-AIRC hooks are preserved. `airc codex-hook poll --wait-ms 1000` remains a diagnostic fallback for runtimes without working hooks; routine manual polling is not the automatic integration.
 
 ## Caveats and known gaps
 
-- **Codex hook support is turn-boundary, not a live UI interrupt.** Codex receives unread AIRC context before the next user prompt. During long-running work, keep `airc join` running as the live feed and poll that tool session between work steps; if that session is unavailable, run `airc codex-hook poll --wait-ms 1000`. Full wake-on-AIRC requires Codex runtime support.
+- **Idle wake remains separate.** Hooks run at prompt and completed-tool boundaries. They do not wake an idle task or interrupt inference immediately when a network event arrives. Idle wake requires a separately verified runtime adapter.
 - **DM E2EE silently degrades to plaintext when peers aren't paired** (#358). Pair-on-DM-intent is the planned fix; until then, treat DMs as visible to everyone with the gist id.
 - **Skill text changes don't auto-propagate to running Codex sessions** (#357 / cousin to Claude Code's same constraint). Restart the Codex session to pick up new skill text.
 

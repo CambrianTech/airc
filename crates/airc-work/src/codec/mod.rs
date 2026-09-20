@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use airc_core::{Body, HeaderFilter, Headers};
 use airc_protocol::{FrameKind, Subscription, HEADER_FORGE_BODY_HINT};
+use serde::Deserialize;
 
 use crate::event::WorkEvent;
 
@@ -24,6 +25,58 @@ pub use headers::{
 };
 
 pub const BODY_HINT_FORGE_WORK_EVENT: &str = "forge.work.event.v1";
+/// Separate typed extension: legacy work readers skip this hint rather than
+/// failing to deserialize an unfamiliar variant in their closed WorkEvent enum.
+pub const BODY_HINT_FORGE_WORK_REVIEW: &str = "forge.work.review.v1";
+
+pub(crate) fn is_work_event_hint(hint: &str) -> bool {
+    matches!(
+        hint,
+        BODY_HINT_FORGE_WORK_EVENT | BODY_HINT_FORGE_WORK_REVIEW
+    )
+}
+
+pub(crate) fn work_event_body_hint(event: &WorkEvent) -> &'static str {
+    match event {
+        WorkEvent::WorkSubmissionReviewed(_) | WorkEvent::ReviewRejected(_) => {
+            BODY_HINT_FORGE_WORK_REVIEW
+        }
+        WorkEvent::CardCreated(_)
+        | WorkEvent::CardUpdated(_)
+        | WorkEvent::CardClaimed(_)
+        | WorkEvent::ClaimHeartbeat(_)
+        | WorkEvent::ClaimReleased(_)
+        | WorkEvent::CardStateChanged(_)
+        | WorkEvent::WorkSubmitted(_)
+        | WorkEvent::SubmissionRejected(_)
+        | WorkEvent::LaneCreated(_)
+        | WorkEvent::LaneStateChanged(_)
+        | WorkEvent::WorkspaceRequested(_)
+        | WorkEvent::WorkspaceAllocated(_)
+        | WorkEvent::WorkspaceHeartbeat(_)
+        | WorkEvent::WorkspaceReleased(_)
+        | WorkEvent::WorkspacePressureReported(_)
+        | WorkEvent::WorkspaceDrainRequested(_)
+        | WorkEvent::WorkspaceDrainCompleted(_)
+        | WorkEvent::GitCommitObserved(_)
+        | WorkEvent::GitBranchMoved(_)
+        | WorkEvent::GitDirtyStateChanged(_)
+        | WorkEvent::PullRequestCheckSuiteChanged(_)
+        | WorkEvent::PullRequestReviewSubmitted(_)
+        | WorkEvent::PullRequestMergeStateChanged(_)
+        | WorkEvent::PullRequestLinked(_)
+        | WorkEvent::PullRequestRelinked(_)
+        | WorkEvent::PullRequestMerged(_)
+        | WorkEvent::HygieneReportRecorded(_)
+        | WorkEvent::ManagerHatClaimed(_)
+        | WorkEvent::ManagerHatReleased(_)
+        | WorkEvent::AgentAvailabilityReported(_)
+        | WorkEvent::GoalCreated(_)
+        | WorkEvent::GoalAchieved(_)
+        | WorkEvent::GoalAbandoned(_)
+        | WorkEvent::GoalDryTickRecorded(_) => BODY_HINT_FORGE_WORK_EVENT,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkEventCodecError {
@@ -33,6 +86,11 @@ pub enum WorkEventCodecError {
     NonJsonBody,
     #[error("work event body uses hint {actual:?}, expected {expected:?}")]
     BodyHintMismatch {
+        actual: Option<String>,
+        expected: &'static str,
+    },
+    #[error("work event variant requires hint {expected:?}, received {actual:?}")]
+    VariantHintMismatch {
         actual: Option<String>,
         expected: &'static str,
     },
@@ -58,23 +116,38 @@ pub fn decode_work_event(
     let Body::Json(value) = body else {
         return Err(WorkEventCodecError::NonJsonBody);
     };
-    Ok(serde_json::from_value(value.clone())?)
+    // Decode from the existing tree. Cloning it first allocates every JSON
+    // key/container on each replay; owned WorkEvent fields are sufficient.
+    let event = WorkEvent::deserialize(value)?;
+    let expected = work_event_body_hint(&event);
+    if headers.get(HEADER_FORGE_BODY_HINT).map(String::as_str) != Some(expected) {
+        return Err(WorkEventCodecError::VariantHintMismatch {
+            actual: headers.get(HEADER_FORGE_BODY_HINT).cloned(),
+            expected,
+        });
+    }
+    Ok(event)
 }
 
 pub fn work_event_subscription() -> Subscription {
     Subscription {
         kinds: BTreeSet::from([FrameKind::Event]),
-        headers_filter: HeaderFilter::Exact {
-            key: HEADER_FORGE_BODY_HINT.to_string(),
-            value: BODY_HINT_FORGE_WORK_EVENT.to_string(),
-        },
+        headers_filter: HeaderFilter::AnyOf(
+            [BODY_HINT_FORGE_WORK_EVENT, BODY_HINT_FORGE_WORK_REVIEW]
+                .into_iter()
+                .map(|value| HeaderFilter::Exact {
+                    key: HEADER_FORGE_BODY_HINT.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
+        ),
         ..Default::default()
     }
 }
 
 fn require_work_event_hint(headers: &Headers) -> Result<(), WorkEventCodecError> {
     match headers.get(HEADER_FORGE_BODY_HINT) {
-        Some(value) if value == BODY_HINT_FORGE_WORK_EVENT => Ok(()),
+        Some(value) if is_work_event_hint(value) => Ok(()),
         actual => Err(WorkEventCodecError::BodyHintMismatch {
             actual: actual.cloned(),
             expected: BODY_HINT_FORGE_WORK_EVENT,
@@ -90,6 +163,10 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::ClaimHeartbeat(_) => "claim_heartbeat",
         WorkEvent::ClaimReleased(_) => "claim_released",
         WorkEvent::CardStateChanged(_) => "card_state_changed",
+        WorkEvent::WorkSubmitted(_) => "work_submitted",
+        WorkEvent::WorkSubmissionReviewed(_) => "work_submission_reviewed",
+        WorkEvent::SubmissionRejected(_) => "submission_rejected",
+        WorkEvent::ReviewRejected(_) => "review_rejected",
         WorkEvent::LaneCreated(_) => "lane_created",
         WorkEvent::LaneStateChanged(_) => "lane_state_changed",
         WorkEvent::WorkspaceRequested(_) => "workspace_requested",

@@ -28,4 +28,11 @@
 //! forces a substrate-internal import into `src/`, that's a signal
 //! `airc-lib` is missing a re-export.
 
+// Examples deliberately mirror airc-lib's REAL signatures, whose Err type
+// (`AircError`) is >=128 bytes — clippy 1.98's `result_large_err` fires on
+// every such fn. Boxing here would misdocument the API; the actual fix is
+// shrinking `AircError` (boxing its large variants) library-wide. Scoped
+// allow until that refactor lands.
+#![allow(clippy::result_large_err)]
+
 pub mod agent;

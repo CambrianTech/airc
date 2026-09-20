@@ -158,13 +158,22 @@ pub(crate) fn extract_pr_number(url: &str) -> Option<u64> {
 /// `None` to signal "use the repo's GitHub default branch".
 ///
 /// History: card 28f1440c hardcoded a single global `rust-rewrite`
-/// base because airc's substrate work lives on rust-rewrite, not its
-/// GitHub default (`main`). Correct for airc, wrong for every other
+/// base because airc's substrate work lived on rust-rewrite, not its
+/// GitHub default (`main`). Correct for airc then, wrong for every other
 /// repo — continuum has no `rust-rewrite` branch, so `gh pr create
 /// --base rust-rewrite` failed, `PullRequestLinked` never fired, and
 /// the merger never saw the PR. The fix is per-repo, NOT a blanket
-/// default-branch switch (which would re-break airc by landing PRs on
-/// main — the exact fallback 28f1440c set out to refuse).
+/// default-branch switch (which would land PRs on main — the exact
+/// fallback 28f1440c set out to refuse).
+///
+/// Card 5e04ab56: airc's integration branch is now `canary`, and
+/// `rust-rewrite` no longer exists on the remote — so the airc pin
+/// itself had gone stale and `airc work state <card> review` could not
+/// open a PR for the airc repo at all ("No commits between rust-rewrite
+/// and <branch>, Base ref must be a branch"), i.e. the substrate's own
+/// disciplined review path was broken for its own repo. The invariant
+/// 28f1440c protects is unchanged: airc pins its integration branch and
+/// never falls through to `main`; only the branch's name moved.
 ///
 /// `AIRC_PR_BASE` overrides everything (tests / one-offs). The carded
 /// end state surfaces this as `.airc/work.toml` per-repo config; for
@@ -177,7 +186,7 @@ pub(crate) fn configured_base_branch(repo: &airc_work::RepoId) -> Option<String>
         }
     }
     match repo.as_str() {
-        "CambrianTech/airc" => Some("rust-rewrite".to_string()),
+        "CambrianTech/airc" => Some("canary".to_string()),
         "CambrianTech/continuum" => Some("canary".to_string()),
         _ => None,
     }
@@ -423,8 +432,9 @@ mod tests {
         std::env::remove_var("AIRC_PR_BASE");
         assert_eq!(
             configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
-            Some("rust-rewrite"),
-            "airc must pin rust-rewrite, never fall through to main"
+            Some("canary"),
+            "airc must pin its integration branch (canary — card 5e04ab56 \
+             retired rust-rewrite), never fall through to main"
         );
         assert_eq!(
             configured_base_branch(&repo("CambrianTech/continuum")).as_deref(),
@@ -456,7 +466,7 @@ mod tests {
         std::env::set_var("AIRC_PR_BASE", "   ");
         assert_eq!(
             configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
-            Some("rust-rewrite"),
+            Some("canary"),
             "blank AIRC_PR_BASE must not shadow the pinned base"
         );
         std::env::remove_var("AIRC_PR_BASE");

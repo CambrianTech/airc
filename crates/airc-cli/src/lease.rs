@@ -26,8 +26,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// The lease zone subdirectory under `$HOME`.
-const LEASE_ZONE_RELATIVE: &str = ".airc/worktrees";
+/// The lease zone subdirectory under `$HOME`. Card 01611f25: ONE definition,
+/// owned by the substrate module that also resolves and creates the zone —
+/// this file used to spell the same string a second time, so a change to the
+/// location would have moved the worktrees without moving the policy that
+/// guards them.
+use airc_lib::work_worktree::LEASE_ZONE_RELATIVE;
 
 /// Resolve the lease zone path (`~/.airc/worktrees`). Returns
 /// `None` only when neither `$HOME` nor `$USERPROFILE` is set — in

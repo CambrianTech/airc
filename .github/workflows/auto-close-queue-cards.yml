@@ -22,10 +22,30 @@ name: auto-close-queue-cards
 #   then closes the issue. Plain mentions ("Refs #N", "See #N") do not
 #   close cards; they may point at follow-up implementation work.
 #
-#   Runs `airc queue close-merged` from the checkout — no install
-#   step required because the `./airc` dispatcher works from a clone
-#   when gh + bash + the AIRC implementation binary are present (all on
-#   ubuntu-latest).
+#   Builds `airc-cli` from the checkout and composes its two queue-card
+#   helpers with `gh`: `close-merged-refs` extracts the closing refs from
+#   the PR title+body, `close-merged-meta` supplies the merge facts for
+#   the audit comment.
+#
+# DEAD FOR THE WHOLE RUST REWRITE — and it announced it every time.
+#
+#   Until 2026-08-13 this job ran `./airc queue close-merged <url> …`. That
+#   was the BASH-era dispatcher: a `./airc` script at the repo root, which
+#   the rewrite deleted. A fresh checkout has no such file, so every run
+#   died at `./airc: No such file or directory` with exit 127 — 8 for 8 on
+#   the runs still in retention, going back to the rewrite.
+#
+#   The verb was stale too: the Rust CLI has `queue-card close-merged-meta`
+#   and `close-merged-refs` (JSON transforms over `gh pr view` output), not
+#   a single `queue close-merged` that also does the closing. So both ends
+#   existed — a workflow that wanted to close cards, and helpers that could
+#   compute what to close — with nothing joining them. Neither helper had a
+#   single caller anywhere in the tree.
+#
+#   Nobody read the red X because it lands AFTER merge, when attention has
+#   already moved to the next thing. The visible cost was a work board full
+#   of cards whose PRs shipped days ago, which then read as idle lanes and
+#   drew nudges — the exact litter this job was written to prevent (#576).
 #
 # Scope:
 #   - Same-repo only. Cross-repo refs (e.g. airc PR closing
@@ -60,27 +80,77 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout (for the airc dispatcher)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify environment (gh + bash)
-        run: |
-          set -euo pipefail
-          which gh bash
-          gh --version | head -1
-          bash --version | head -1
+      - name: install rust toolchain
+        run: rustup toolchain install stable --profile minimal
 
-      - name: Run airc queue close-merged
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-queue-cards-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-queue-cards-
+
+      # Debug, not release: these subcommands are JSON transforms whose
+      # runtime is microseconds. Optimising them would only lengthen the
+      # build this job pays for on every merge.
+      - name: build airc-cli
+        run: cargo build -p airc-cli --bin airc
+
+      - name: Close the queue cards this PR merged
         env:
           # gh uses GH_TOKEN; the workflow's GITHUB_TOKEN has issues:write
           # (granted via the permissions block above) on THIS repo only.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Source identity: the actor field on status-log entries names
-          # the github-actions bot so the audit trail is clear that the
-          # card was closed by automation, not a person/AI.
-          ./airc queue close-merged \
-            "${{ github.event.pull_request.html_url }}" \
-            --merge-sha "${{ github.event.pull_request.merge_commit_sha }}" \
-            --actor "github-actions[airc#576]"
+          AIRC=target/debug/airc
+
+          # Fail loudly if the build did not produce the binary, rather than
+          # letting the next line die at exit 127 the way this job did for
+          # the whole rewrite. An absent tool and a tool that found nothing
+          # to close are different outcomes and must not print the same way.
+          test -x "$AIRC" || {
+            echo "::error::$AIRC missing after cargo build — nothing was closed."
+            exit 1
+          }
+
+          gh pr view "$PR_URL" \
+            --json mergedAt,baseRefName,mergeCommit,url,title,body > pr.json
+
+          "$AIRC" queue-card close-merged-meta --pr-file pr.json
+
+          # No refs is a legitimate, common outcome: most PRs close no card.
+          # Report it as the distinct fact it is; do not dress it as work.
+          refs="$("$AIRC" queue-card close-merged-refs --pr-file pr.json --repo "$REPO")"
+          if [ -z "$refs" ]; then
+            echo "No queue-card closing refs in this PR — nothing to close."
+            exit 0
+          fi
+
+          # Source identity: the comment names the bot so the audit trail is
+          # clear that the card was closed by automation, not a person/AI.
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            case "$ref" in
+              "$REPO"#*) ;;
+              *)
+                # Cross-repo refs are in scope to REPORT, out of scope to
+                # close: GITHUB_TOKEN is repo-scoped (see Scope note above).
+                echo "::notice::cross-repo ref $ref not closed (token is repo-scoped)"
+                continue
+                ;;
+            esac
+            number="${ref##*#}"
+            echo "closing $ref"
+            gh issue close "$number" --repo "$REPO" \
+              --comment "Closed by automation: merged via $PR_URL ($MERGE_SHA). — github-actions[airc#576]"
+          done <<< "$refs"

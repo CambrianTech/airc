@@ -155,9 +155,17 @@ struct SinkInner {
     events: BTreeMap<u128, Vec<Envelope>>,
     /// Total successful appends — the assertion lever for ephemeral-off-sink.
     append_count: u64,
+    page_count: u64,
 }
 
 impl InMemoryDurableSink {
+    /// Number of transcript page reads, for live-attach/replay boundary tests.
+    pub fn page_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .page_count
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -230,7 +238,8 @@ impl DurableSink for InMemoryDurableSink {
         from_cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Envelope>> {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.page_count += 1;
         let Some(bucket) = guard.events.get(&channel.0.as_u128()) else {
             return Ok(Vec::new());
         };

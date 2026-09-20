@@ -13,6 +13,8 @@
 //! The test model IS the production model: a real `DaemonState` over a
 //! real SQLite ORM on a Unix socket, driven by the real `DaemonClient`.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -123,33 +125,17 @@ fn stream_chunk(channel: RoomId, bytes: &[u8]) -> PublishRequest {
 }
 
 async fn publish_n(client: &DaemonClient, channel: RoomId, n: usize) -> PublishResponse {
+    // §3.8 back-pressure, shared policy (`common::retry_while_saturated`): this
+    // file previously carried an INLINED copy of the same 500x10ms budget while
+    // driving DEEP = 5_000 publishes through it, so a fix applied only to
+    // inbox_paging.rs would have left the same flake live in the same crate,
+    // same CI job. ONE deadline bounds the whole run.
+    let deadline = common::saturation_deadline();
     let mut last = None;
     for i in 0..n {
         let request = durable_text(channel, &format!("event {i}"));
-        // The write-behind queue is bounded: on a slow runner a tight
-        // publish loop can outpace the SQLite drain, and the daemon
-        // sheds with a LOUD typed error (§3.8 — the designed
-        // back-pressure signal, never a silent drop). Honour the
-        // contract the way a real producer would: back off and retry
-        // the same event. Any other error is a real failure.
-        let mut receipt = None;
-        for _ in 0..500 {
-            match client.publish(request.clone()).await {
-                Ok(r) => {
-                    receipt = Some(r);
-                    break;
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    assert!(
-                        message.contains("saturated"),
-                        "unexpected publish error: {message}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-        }
-        last = Some(receipt.expect("publish kept saturating after 500 backoff retries"));
+        last =
+            Some(common::retry_while_saturated(deadline, || client.publish(request.clone())).await);
     }
     last.expect("n > 0")
 }

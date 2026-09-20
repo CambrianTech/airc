@@ -1,17 +1,16 @@
 //! `airc codex-hook ...` handlers.
 
 use std::collections::BTreeSet;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use airc_core::{Body, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, EventFilter, LiveLag};
-use airc_protocol::HEADER_AIRC_CLIENT;
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::client_id::current_client_id;
+use crate::client_id::{current_client_id, RuntimeSelfFilter};
 use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 const CONSUMER_PREFIX: &str = "codex-hook";
@@ -23,28 +22,57 @@ pub async fn run_user_prompt_submit(
     raw: bool,
     include_self: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    drain_stdin()?;
+    run_hook(
+        home,
+        count,
+        max_items,
+        raw,
+        include_self,
+        "UserPromptSubmit",
+    )
+    .await
+}
+
+pub async fn run_post_tool_use(
+    home: &Path,
+    count: usize,
+    max_items: usize,
+    raw: bool,
+    include_self: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_hook(home, count, max_items, raw, include_self, "PostToolUse").await
+}
+
+async fn run_hook(
+    home: &Path,
+    count: usize,
+    max_items: usize,
+    raw: bool,
+    include_self: bool,
+    event_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hook_session = drain_stdin()?;
 
     let airc = crate::commands::attached_airc(home).await?;
     let filter = hook_filter();
-    let runtime_client = current_client_id()?;
+    let runtime_client = current_client_id()?.or(hook_session);
     let consumer_id = consumer_id(runtime_client.as_deref());
     let events = unread_events(&airc, &consumer_id, filter, count).await?;
 
+    let work_context = work_context(&airc, &events).await?;
+    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
+    let visible: Vec<_> = events
+        .iter()
+        .filter(|event| include_self || !self_filter.is_self_event(event))
+        .collect();
+    if let Some(context) = render_context(&visible, max_items, raw, work_context) {
+        print_hook_payload(&context, event_name)?;
+    }
     if let Some(newest) = events.last() {
         airc.save_runtime_cursor_for_event(&consumer_id, newest)
             .await?;
     }
 
-    let work_context = work_context(&airc, &events).await?;
-    let visible: Vec<_> = events
-        .into_iter()
-        .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
-        .collect();
-    let Some(context) = render_context(&airc, &visible, max_items, raw, work_context).await? else {
-        return Ok(());
-    };
-    print_hook_payload(&context)?;
     Ok(())
 }
 
@@ -69,20 +97,22 @@ pub async fn run_poll(
         }
     }
 
+    let work_context = work_context(&airc, &events).await?;
+    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
+    let visible: Vec<_> = events
+        .iter()
+        .filter(|event| include_self || !self_filter.is_self_event(event))
+        .collect();
+    if let Some(context) = render_context(&visible, max_items, raw, work_context) {
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "{context}")?;
+        output.flush()?;
+    }
     if let Some(newest) = events.last() {
         airc.save_runtime_cursor_for_event(&consumer_id, newest)
             .await?;
     }
 
-    let work_context = work_context(&airc, &events).await?;
-    let visible: Vec<_> = events
-        .into_iter()
-        .filter(|event| include_self || !is_self_event(event, &airc, runtime_client.as_deref()))
-        .collect();
-    let Some(context) = render_context(&airc, &visible, max_items, raw, work_context).await? else {
-        return Ok(());
-    };
-    println!("{context}");
     Ok(())
 }
 
@@ -97,18 +127,17 @@ async fn work_context(
     }
 }
 
-async fn render_context(
-    _airc: &Airc,
-    events: &[TranscriptEvent],
+fn render_context(
+    events: &[&TranscriptEvent],
     max_items: usize,
     raw: bool,
     work_context: Option<String>,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Option<String> {
     let chat_context = if raw {
-        let text = render_raw(events);
+        let text = render_raw(events.iter().copied());
         (!text.is_empty()).then_some(text)
     } else {
-        let text = render_digest(events, max_items);
+        let text = render_digest(events.iter().copied(), max_items);
         (!text.is_empty()).then_some(text)
     };
     let mut sections = Vec::new();
@@ -118,7 +147,7 @@ async fn render_context(
     if let Some(context) = work_context {
         sections.push(context);
     }
-    Ok((!sections.is_empty()).then(|| sections.join("\n\n")))
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 fn consumer_id(runtime_client: Option<&str>) -> String {
@@ -162,33 +191,6 @@ async fn wait_for_one_event(
         Ok(Some(Ok(event))) => Ok(vec![event.as_ref().clone()]),
         Ok(Some(Err(LiveLag { .. }))) | Ok(None) | Err(_) => Ok(Vec::new()),
     }
-}
-
-fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&str>) -> bool {
-    // Header-stamped self-detection is the only reliable signal on a
-    // shared HOME. Two scopes (Claude tab + Codex tab) using the
-    // same `~/.airc/` share the singleton local identity row →
-    // share peer_id AND client_id. The peer_id/client_id equality
-    // check would incorrectly classify EVERY frame from the other
-    // runtime as "self" and filter it out.
-    //
-    // Rule: if the event has an `airc.client` header, that IS the
-    // self attestation. Equal to OUR runtime client tag → self.
-    // Different (or our tag absent) → NOT self. Peer_id never
-    // overrides a stamped header on a shared HOME.
-    if let Some(event_client) = event.headers.get(HEADER_AIRC_CLIENT) {
-        return runtime_client.is_some_and(|rc| event_client == rc);
-    }
-    // No header: unstamped historical frame. Drop the peer_id check
-    // entirely (Codex's review on PR #869): peer_id is too coarse
-    // for shared-HOME multi-agent operation — every cross-runtime
-    // frame would be suppressed. client_id alone is still subject
-    // to identity-collision on shared HOME, but it's a tighter
-    // signal than peer_id. Current Rust-emitted frames always stamp
-    // the airc.client header in send_frame, so this branch only
-    // fires for historical frames where false-self
-    // suppression is the lesser harm.
-    event.client_id == airc.client_id()
 }
 
 /// Read Codex's hook JSON from stdin, with a hard deadline so a
@@ -247,7 +249,7 @@ fn is_self_event(event: &TranscriptEvent, airc: &Airc, runtime_client: Option<&s
 /// `drain_stdin_timeout_proceeds_when_eof_never_arrives` in
 /// `tests/codex_hook_commands.rs` — see the regression test for the
 /// exact failure shape if a future refactor reverts the deadline.
-fn drain_stdin() -> Result<(), Box<dyn std::error::Error>> {
+fn drain_stdin() -> Result<Option<String>, Box<dyn std::error::Error>> {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -272,21 +274,30 @@ fn drain_stdin() -> Result<(), Box<dyn std::error::Error>> {
                 "airc codex-hook: stdin EOF not received within {STDIN_READ_DEADLINE:?}, \
                  proceeding with empty payload (see airc#1097)"
             );
-            return Ok(());
+            return Ok(None);
         }
     };
 
     if raw.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_str(&raw)?;
-    if !value.is_object() {
+    // PostToolUse may include a large tool response. Validate the JSON while
+    // skipping unknown fields instead of building a DOM for the entire payload.
+    #[derive(Deserialize)]
+    struct HookInput {
+        session_id: Option<String>,
+    }
+    if !raw.trim_start().starts_with('{') {
         return Err("Codex hook stdin must be a JSON object".into());
     }
-    Ok(())
+    let input: HookInput = serde_json::from_str(&raw)?;
+    Ok(input
+        .session_id
+        .filter(|session| !session.trim().is_empty())
+        .map(|session| format!("codex:{session}")))
 }
 
-fn print_hook_payload(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn print_hook_payload(context: &str, event_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct HookPayload<'a> {
@@ -302,17 +313,20 @@ fn print_hook_payload(context: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let payload = HookPayload {
         hook_specific_output: HookSpecificOutput {
-            hook_event_name: "UserPromptSubmit",
+            hook_event_name: event_name,
             additional_context: context,
         },
     };
-    println!("{}", serde_json::to_string(&payload)?);
+    let mut output = std::io::stdout().lock();
+    serde_json::to_writer(&mut output, &payload)?;
+    writeln!(output)?;
+    output.flush()?;
     Ok(())
 }
 
-fn render_raw(events: &[TranscriptEvent]) -> String {
+fn render_raw<'a>(events: impl IntoIterator<Item = &'a TranscriptEvent>) -> String {
     events
-        .iter()
+        .into_iter()
         .map(|event| {
             format!(
                 "[{}] {}: {}",
@@ -325,7 +339,10 @@ fn render_raw(events: &[TranscriptEvent]) -> String {
         .join("\n")
 }
 
-fn render_digest(events: &[TranscriptEvent], max_items: usize) -> String {
+fn render_digest<'a>(
+    events: impl IntoIterator<Item = &'a TranscriptEvent>,
+    max_items: usize,
+) -> String {
     let messages = dedupe(events);
     if messages.is_empty() {
         return String::new();
@@ -377,7 +394,7 @@ struct DigestMessage {
     body: String,
 }
 
-fn dedupe(events: &[TranscriptEvent]) -> Vec<DigestMessage> {
+fn dedupe<'a>(events: impl IntoIterator<Item = &'a TranscriptEvent>) -> Vec<DigestMessage> {
     let mut seen = BTreeSet::new();
     let mut messages = Vec::new();
     for event in events {

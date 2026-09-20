@@ -15,13 +15,13 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use futures::StreamExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind};
 use airc_bus::{Filter, Seq};
@@ -31,7 +31,7 @@ use airc_diagnostics::{
 use airc_ipc::codec::{read_frame, write_frame};
 use airc_ipc::request::{AttachRequest, AttachStart, IpcDelivery, IpcKind, Request};
 use airc_ipc::response::Response;
-use airc_ipc::transport::{IpcListener, IpcStream};
+use airc_ipc::transport::{IpcAcceptError, IpcListener, IpcStream};
 
 use crate::handlers::dispatch;
 use crate::state::DaemonState;
@@ -41,8 +41,10 @@ use crate::state::DaemonState;
 pub enum DaemonError {
     /// Another daemon already owns this IPC endpoint.
     AlreadyRunning(PathBuf),
-    /// Socket bind / accept I/O failure.
+    /// Socket bind or connection I/O failure.
     Io(std::io::Error),
+    /// Listener failure, retaining the accept operation and OS error.
+    Accept(IpcAcceptError),
     /// Could not remove a stale socket file from a prior daemon
     /// instance.
     StaleSocket(std::io::Error),
@@ -55,6 +57,7 @@ impl std::fmt::Display for DaemonError {
                 write!(f, "daemon already running on {}", path.display())
             }
             DaemonError::Io(error) => write!(f, "daemon I/O: {error}"),
+            DaemonError::Accept(error) => write!(f, "daemon accept: {error}"),
             DaemonError::StaleSocket(error) => {
                 write!(f, "stale socket cleanup: {error}")
             }
@@ -67,6 +70,7 @@ impl std::error::Error for DaemonError {
         match self {
             DaemonError::AlreadyRunning(_) => None,
             DaemonError::Io(error) | DaemonError::StaleSocket(error) => Some(error),
+            DaemonError::Accept(error) => Some(error),
         }
     }
 }
@@ -82,7 +86,21 @@ impl From<std::io::Error> for DaemonError {
 /// a Stop request handler), the temp-home idle watchdog trips (card
 /// f122b5b5), or the listener errors.
 pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), DaemonError> {
-    let _guard = DaemonBindGuard::acquire(&socket_path)?;
+    // #355: a contended lock is not automatically "already running" — the
+    // holder must PROVE it serves (request-response ping). A wedged holder
+    // is reclaimed via the pidfile kill-handle and the acquire retried
+    // once; a responsive holder keeps the lock and we bow out as before.
+    let _guard = match DaemonBindGuard::acquire(&socket_path) {
+        Ok(guard) => guard,
+        Err(DaemonError::AlreadyRunning(path)) => {
+            match crate::reclaim::reclaim_wedged_holder(&state.home, &socket_path).await {
+                Some(()) => DaemonBindGuard::acquire(&socket_path)
+                    .map_err(|_| DaemonError::AlreadyRunning(path))?,
+                None => return Err(DaemonError::AlreadyRunning(path)),
+            }
+        }
+        Err(error) => return Err(error),
+    };
     cleanup_stale_socket(&socket_path).map_err(DaemonError::StaleSocket)?;
     let listener = IpcListener::bind(&socket_path).await?;
 
@@ -97,7 +115,7 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
     // dies without tearing it down (SIGKILL escapes every Drop guard),
     // it must exit BY ITSELF once no client has been connected for the
     // idle window. Production homes never start this watchdog.
-    let idle_tracker = IdleTracker::new();
+    let idle_tracker = IdleTracker::new(state.clone());
     let watchdog = spawn_temp_home_idle_watchdog(&state, &idle_tracker);
 
     // Keep ONE `Notified` future alive across loop iterations. `select!`
@@ -118,7 +136,39 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
                 break;
             }
             accept = listener.accept() => {
-                let stream = accept?;
+                let stream = match accept {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let recoverable = error.is_client_disconnect();
+                        let event = if recoverable {
+                            DiagnosticEvent::warn(
+                                DiagnosticComponent::Daemon,
+                                DiagnosticCode::IpcAcceptFailed,
+                                "IPC client disconnected before accept; next pipe remains available",
+                            )
+                        } else {
+                            DiagnosticEvent::error(
+                                DiagnosticComponent::Daemon,
+                                DiagnosticCode::IpcAcceptFailed,
+                                "IPC listener failed; daemon is exiting",
+                            )
+                        };
+                        let mut event = event
+                            .with_field("stage", error.stage())
+                            .with_field("recoverable", recoverable)
+                            .with_field("error", &error);
+                        if let Some(code) = error.raw_os_error() {
+                            event = event.with_field("os_error", code);
+                        }
+                        StderrJsonDiagnosticSink.emit(event);
+                        if recoverable {
+                            // A new pipe awaits a new client. No retry of the
+                            // failed handle, polling timer, or generic error loop.
+                            continue;
+                        }
+                        return Err(DaemonError::Accept(error));
+                    }
+                };
                 let state = state.clone();
                 let connection = idle_tracker.connection_opened();
                 tokio::spawn(async move {
@@ -229,15 +279,17 @@ fn spawn_temp_home_idle_watchdog(
 /// elapsed since `start` so the hot paths stay lock-free atomics.
 struct IdleTracker {
     start: Instant,
-    connections: AtomicUsize,
+    /// The live-connection count lives on `DaemonState::connections`
+    /// (one fact, one place — `Status` reports the same number).
+    state: Arc<DaemonState>,
     last_activity_ms: AtomicU64,
 }
 
 impl IdleTracker {
-    fn new() -> Arc<Self> {
+    fn new(state: Arc<DaemonState>) -> Arc<Self> {
         Arc::new(Self {
             start: Instant::now(),
-            connections: AtomicUsize::new(0),
+            state,
             last_activity_ms: AtomicU64::new(0),
         })
     }
@@ -246,14 +298,14 @@ impl IdleTracker {
     /// live as long as the connection task — its Drop is what marks
     /// the connection closed and stamps the idle clock.
     fn connection_opened(self: &Arc<Self>) -> ConnectionGuard {
-        self.connections.fetch_add(1, Ordering::SeqCst);
+        self.state.connections.fetch_add(1, Ordering::SeqCst);
         ConnectionGuard(self.clone())
     }
 
     /// `Some(duration since the daemon last had a client)` when no
     /// client is connected; `None` while any connection is live.
     fn idle_for(&self) -> Option<Duration> {
-        if self.connections.load(Ordering::SeqCst) > 0 {
+        if self.state.connections.load(Ordering::SeqCst) > 0 {
             return None;
         }
         let last = Duration::from_millis(self.last_activity_ms.load(Ordering::SeqCst));
@@ -274,7 +326,7 @@ struct ConnectionGuard(Arc<IdleTracker>);
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.stamp_activity();
-        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+        self.0.state.connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -436,7 +488,7 @@ async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result
     };
 
     if let Request::Attach(attach) = request {
-        return stream_attach(writer, state, attach).await;
+        return stream_attach(reader, writer, state, attach).await;
     }
 
     let response = dispatch(state, request).await;
@@ -446,12 +498,14 @@ async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result
     Ok(())
 }
 
-async fn stream_attach<W>(
+async fn stream_attach<R, W>(
+    reader: R,
     mut writer: W,
     state: Arc<DaemonState>,
     attach: AttachRequest,
 ) -> Result<(), DaemonError>
 where
+    R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     // Card c0cb6cdc: the request destructures into typed parts — the
@@ -473,30 +527,12 @@ where
             .await;
         }
     };
-    // Map the typed start onto the router cursor. `from` is advanced as
-    // we send, so a re-subscribe after a lag drop resumes exactly where
-    // we left off (replay the gap, no dup at the seam).
-    //
-    // `Live` (card 7d5b6a65): start at the channel's current head. The
-    // router's `subscribe_with_lag` interprets a forward-pointing cursor
-    // as "nothing newer than this yet," so the ring snapshot + deep
-    // replay legs return empty and we go straight to live.
-    //
-    // Critical: when the in-memory ring is empty (fresh daemon, no
-    // events yet this process-lifetime), `router.head_cursor` returns
-    // None — but the SINK still has the durable transcript. Without
-    // the sink fallback below, `Live` would fall through to a full
-    // sink replay (the very bug card 7d5b6a65 closes). Query the sink
-    // for its head when the ring is empty.
+    // Live registration is atomic at the router and does not read history.
+    // Explicit cursor resumes retain the existing replay/live seam.
     let mut from = match parts.start {
-        AttachStart::Live => match state.router.head_cursor(channel) {
-            Some(c) => Some(c),
-            None => state.router.sink_head_cursor(channel).await,
-        },
+        AttachStart::Live | AttachStart::FromTranscriptStart => None,
         AttachStart::After(c) => Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id)),
-        AttachStart::FromTranscriptStart => None,
     };
-
     // Card 7d5b6a65: `coalesce_backlog` lets the daemon collapse all
     // historical catch-up into ONE `AttachCursorAdvanced` summary
     // frame instead of streaming each event individually. We track the
@@ -524,13 +560,32 @@ where
     // would drop early events under concurrent senders). `subscribe_with_lag`
     // also keeps a slow IPC client from stalling fan-out to other
     // subscribers (§3.5); on lag we re-subscribe from `from`.
-    let mut pending = Some(state.router.subscribe_with_lag(filter.clone(), from));
+    let (stream, lag) = if parts.start == AttachStart::Live {
+        let (stream, lag) = state.router.subscribe_live_with_lag(filter.clone());
+        (stream.boxed(), lag)
+    } else {
+        let (stream, lag) = state.router.subscribe_with_lag(filter.clone(), from);
+        (stream.boxed(), lag)
+    };
+    let mut pending = Some((stream, lag));
     write_response(&mut writer, &Response::Ok).await?;
 
     // Pin one shutdown waiter across re-subscribes so a `notify_waiters`
     // can't be lost between iterations (same discipline as `run`).
     let shutdown = state.shutdown.notified();
     tokio::pin!(shutdown);
+
+    // The client's half of the socket is the ONLY signal that it hung up.
+    // Before this arm existed the reader sat unread for the stream's
+    // whole life, so a subscriber that closed — a core that died, a
+    // citizen re-opening on a membership epoch — left its daemon-side
+    // socket open until the channel's NEXT event tripped EPIPE on the
+    // write; on a quiet room, never. Measured 2026-09-12 (card e28889cc):
+    // 4,190 sockets on one daemon, ~3,500 with no peer, climbing with
+    // every core restart. Pinned once like `shutdown` so no hang-up is
+    // lost across re-subscribes.
+    let hangup = client_hung_up(reader);
+    tokio::pin!(hangup);
 
     // Card 7d5b6a65 catch-up tracking. When `coalesce_backlog` is set,
     // we count events until the ring's live-edge cursor (captured at
@@ -569,20 +624,25 @@ where
     // The un-advanced tail at shutdown is now ≤1s of events instead of the
     // whole session. Initialized in the past so the FIRST event always
     // advances (a quiet room reconnecting tightens immediately).
+    // Opt-in per attach (`cursor_heartbeat`): a stream that never persists a
+    // cursor never receives bookkeeping it would only have to ignore.
     const ADVANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
     let mut last_advance = std::time::Instant::now()
         .checked_sub(ADVANCE_EVERY)
         .unwrap_or_else(std::time::Instant::now);
 
     loop {
-        let (stream, lag) = pending
-            .take()
-            .unwrap_or_else(|| state.router.subscribe_with_lag(filter.clone(), from));
+        let (stream, lag) = pending.take().unwrap_or_else(|| {
+            let (stream, lag) = state.router.subscribe_with_lag(filter.clone(), from);
+            (stream.boxed(), lag)
+        });
         tokio::pin!(stream);
         loop {
             tokio::select! {
                 biased;
                 _ = &mut shutdown => return Ok(()),
+                // Client gone: drop the subscription with the stream.
+                _ = &mut hangup => return Ok(()),
                 next = stream.next() => match next {
                     Some(env) => {
                         from = Some(env.cursor());
@@ -621,28 +681,19 @@ where
                                 catchup.as_mut().and_then(BacklogCatchup::take_summary)
                             {
                                 for buffered in &seam.tail {
-                                    write_response(
-                                        &mut writer,
-                                        &Response::Event {
-                                            envelope: airc_wire::encode(buffered).to_vec(),
-                                        },
-                                    )
-                                    .await?;
+                                    write_event_response(&mut writer, buffered).await?;
                                 }
                                 write_response(&mut writer, &seam.summary.into_response())
                                     .await?;
                             }
-                            write_response(
-                                &mut writer,
-                                &Response::Event {
-                                    envelope: airc_wire::encode(&env).to_vec(),
-                                },
-                            )
-                            .await?;
+                            write_event_response(&mut writer, &env).await?;
                             // Cursor heartbeat: tell the consumer this event
                             // is now safely delivered on this stream so its
                             // persisted watermark can advance past it.
-                            if last_advance.elapsed() >= ADVANCE_EVERY {
+                            // Only a consumer that asked (it persists its cursor)
+                            // gets the frame; every other stream would only have
+                            // to ignore it (airc #1416).
+                            if parts.cursor_heartbeat && last_advance.elapsed() >= ADVANCE_EVERY {
                                 last_advance = std::time::Instant::now();
                                 let c = env.cursor();
                                 write_response(
@@ -668,6 +719,21 @@ where
                     None => return Ok(()),
                 },
             }
+        }
+    }
+}
+
+/// Resolves when the attach client's side of the socket closes: EOF
+/// (`Ok(0)`) or a transport error (a Windows named pipe reports the
+/// disconnect as an error). Bytes a client writes on an attach stream
+/// carry no protocol meaning and are drained — the arm must stay armed
+/// for the stream's whole life, not trip on chatter.
+async fn client_hung_up<R: AsyncReadExt + Unpin>(mut reader: R) {
+    let mut scratch = [0u8; 64];
+    loop {
+        match reader.read(&mut scratch).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => continue,
         }
     }
 }
@@ -808,4 +874,20 @@ where
     W: AsyncWriteExt + Unpin,
 {
     write_frame(writer, response).await.map_err(DaemonError::Io)
+}
+
+/// Keep the FlatBuffer Bytes allocation alive across framing without cloning it
+/// into Response::Event's owned Vec (the receiving API retains that owned type).
+async fn write_event_response<W>(
+    writer: &mut W,
+    envelope: &airc_bus::Envelope,
+) -> Result<(), DaemonError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let encoded = airc_wire::encode(envelope);
+    let response = Response::event_ref(&encoded);
+    write_frame(writer, &response)
+        .await
+        .map_err(DaemonError::Io)
 }

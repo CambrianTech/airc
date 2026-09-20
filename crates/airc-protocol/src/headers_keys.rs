@@ -129,6 +129,29 @@ pub const HEADER_AIRC_CHANNEL_NAME: &str = "airc.channel_name";
 /// decodes + verifies. See airc-lib `grid_auth`.
 pub const HEADER_AIRC_CAPABILITY_GRANT: &str = "airc.capability_grant";
 
+/// The publisher's DELIVERY CLASS, stamped so a receiver can route on it
+/// WITHOUT decoding the body — presence vs durable is a header question,
+/// not a payload question.
+///
+/// Values are the lowercase `DeliveryClass` names: `durable`,
+/// `ephemeral_latest`, `ephemeral_window`, `request_response`,
+/// `stream_chunk`.
+///
+/// Why a header and not "read the frame and see": every hop that has to
+/// deserialize a body to learn how to treat it pays the cost of the whole
+/// payload to answer a question the envelope could have answered. A
+/// citizen's working attention filter is a hop too — it should drop a
+/// presence line by reading four bytes of header, not by parsing the
+/// glyph and thought behind it. Same rule the routing headers already
+/// follow (`airc.priority`, `airc.deadline`, body_hint).
+///
+/// The daemon decides local persistence from the typed IPC field. The routed
+/// forwarder overwrites this header from that typed field before signing;
+/// the receiving router bridge uses it to preserve the delivery contract.
+/// Missing headers on legacy frames mean durable; unknown explicit values
+/// fail ingress. Subscriber filtering can inspect this without a body decode.
+pub const HEADER_AIRC_DELIVERY_CLASS: &str = "airc.delivery_class";
+
 #[cfg(test)]
 mod tests {
     use super::*;

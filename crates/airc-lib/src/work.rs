@@ -2,8 +2,8 @@
 
 use crate::time::now_ms;
 use crate::work_board_cache::{
-    cursor_strictly_before, zero_transcript_cursor, WorkBoardCache, WorkBoardCacheSource,
-    WORK_BOARD_CACHE_FORMAT_VERSION,
+    cursor_strictly_before, zero_transcript_cursor, CachedProjection, ProjectionCache,
+    WorkBoardCacheSource,
 };
 use crate::{Airc, AircError, Room};
 use airc_core::EventId;
@@ -20,6 +20,32 @@ use airc_work::{
 };
 
 const WORK_MUTATION_PAGE_SIZE: usize = 512;
+
+/// Stable id makes retrying a timed-out publish safe. Author and time are
+/// supplied by AIRC, never by the caller's manifest.
+#[derive(Debug, Clone)]
+pub struct SubmitWork {
+    pub submission_id: airc_work::SubmissionId,
+    pub card_id: WorkCardId,
+    pub claim_id: ClaimId,
+    pub instance: String,
+    pub base_sha: airc_work::GitObjectId,
+    pub artifact: airc_work::SubmissionArtifact,
+}
+
+/// Review an exact accepted candidate as the caller. The immutable review id
+/// survives retries; the SDK owns reviewer identity and publication time.
+#[derive(Debug, Clone)]
+pub struct ReviewWorkSubmission {
+    pub review_id: airc_work::WorkReviewId,
+    pub card_id: WorkCardId,
+    pub submission_id: airc_work::SubmissionId,
+    pub artifact: airc_work::SubmissionArtifact,
+    pub review_card_id: WorkCardId,
+    pub review_claim_id: ClaimId,
+    pub outcome: airc_work::WorkReviewOutcome,
+    pub evidence: airc_work::SubmissionArtifact,
+}
 
 /// Canonical pagination size for complete work-board projections.
 ///
@@ -427,6 +453,73 @@ fn build_operator_card_created(
 }
 
 impl Airc {
+    /// Record judgement with evidence under the historical linked review claim.
+    /// This does not infer a pass from card state, fetch evidence, or establish
+    /// independent review: consumers compare the reviewer with the publisher.
+    pub async fn review_work_submission_in(
+        &self,
+        room: &Room,
+        request: ReviewWorkSubmission,
+    ) -> Result<airc_work::WorkSubmissionReview, AircError> {
+        let board = self.work_board_in(room).await?;
+        let review = airc_work::WorkSubmissionReview {
+            review_id: request.review_id,
+            card_id: request.card_id,
+            submission_id: request.submission_id,
+            artifact: request.artifact,
+            review_card_id: request.review_card_id,
+            review_claim_id: request.review_claim_id,
+            reviewer: self.peer_id(),
+            outcome: request.outcome,
+            evidence: request.evidence,
+            reviewed_at_ms: now_ms()?,
+        };
+        review.validate_for_board(&board)?;
+        if let Some(prior) = board.submission_review(review.review_id) {
+            return Ok(prior.clone());
+        }
+        self.publish_work_event_in(room, &WorkEvent::WorkSubmissionReviewed(review.clone()))
+            .await?;
+        Ok(review)
+    }
+
+    /// Publish an immutable artifact reference into the card's own room. This
+    /// does not upload the blob or claim remote availability: consumers fetch
+    /// by content hash and verify size/hash before using it.
+    pub async fn submit_work_in(
+        &self,
+        room: &Room,
+        request: SubmitWork,
+    ) -> Result<airc_work::WorkSubmission, AircError> {
+        let board = self.work_board_in(room).await?;
+        let card = board
+            .card(request.card_id)
+            .ok_or(airc_work::ProjectionError::UnknownCard(request.card_id))?;
+        let mut submission = airc_work::WorkSubmission {
+            submission_id: request.submission_id,
+            card_id: request.card_id,
+            claim_id: request.claim_id,
+            instance: request.instance,
+            base_sha: request.base_sha,
+            artifact: request.artifact,
+            publisher: self.peer_id(),
+            submitted_at_ms: now_ms()?,
+        };
+        if let Some(prior) = card
+            .submissions
+            .iter()
+            .find(|s| s.submission_id == submission.submission_id)
+        {
+            submission.submitted_at_ms = prior.submitted_at_ms;
+            submission.validate_for_card(card)?;
+            return Ok(prior.clone());
+        }
+        submission.validate_for_card(card)?;
+        self.publish_work_event_in(room, &WorkEvent::WorkSubmitted(submission.clone()))
+            .await?;
+        Ok(submission)
+    }
+
     /// Create a work card in the current room and publish it as a
     /// signed work-domain event. Returns the UUIDv4 card id generated
     /// locally for this card.
@@ -440,6 +533,30 @@ impl Airc {
             request,
         ));
         self.publish_work_event(&event).await?;
+        Ok(card_id)
+    }
+
+    /// Create a card on the board of a room the caller RESOLVED for itself.
+    ///
+    /// [`Self::create_work_card`] lands the card on "whatever room the scope's
+    /// pointer is on" — which on a fresh node is `#general`, so project cards
+    /// were landing in the lobby (Continuum, 2026-09-04). A card belongs to
+    /// its ACTIVITY's room; a caller that knows the room must be able to say
+    /// so. Same split as `work_board` / `work_board_in`.
+    pub async fn create_work_card_in(
+        &self,
+        room: &Room,
+        request: CreateWorkCard,
+    ) -> Result<WorkCardId, AircError> {
+        let card_id = WorkCardId::new();
+        let peer_id = self.peer_id();
+        let event = WorkEvent::CardCreated(build_operator_card_created(
+            card_id,
+            peer_id,
+            now_ms()?,
+            request,
+        ));
+        self.publish_work_event_in(room, &event).await?;
         Ok(card_id)
     }
 
@@ -507,20 +624,37 @@ impl Airc {
 
     /// Change a work card's lifecycle state through the work event
     /// stream. This is the queue hygiene path agents use to stop
-    /// completed work from remaining claimable.
+    /// completed work from remaining claimable. Current-room projection
+    /// of [`Airc::change_work_card_state_in`].
     pub async fn change_work_card_state(
         &self,
         request: ChangeWorkCardState,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.change_work_card_state_in(&room, request).await
+    }
+
+    /// Change a work card's lifecycle state in a SPECIFIC room, without
+    /// touching this scope's current-room pointer — the mutate sibling of
+    /// [`Airc::work_board_in`]. The reads grew room-scoped variants while
+    /// every mutate stayed pinned to `current_room()`, which made
+    /// multi-room supervisors (a grader sweeping lapsed bench cards across
+    /// per-run rooms) structurally unable to act on any board but the one
+    /// their author happened to be standing in. The guard is unchanged in
+    /// strength: the card must be on THIS room's board.
+    pub async fn change_work_card_state_in(
+        &self,
+        room: &Room,
+        request: ChangeWorkCardState,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::CardStateChanged(CardStateChanged {
             card_id: request.card_id,
             state: request.state,
             changed_by: self.peer_id(),
             changed_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -889,14 +1023,47 @@ impl Airc {
         room: &crate::Room,
         page_size: usize,
     ) -> Result<WorkBoardProjection, AircError> {
+        self.project_room_with_cache(
+            room,
+            page_size,
+            |transcripts| {
+                airc_work_store::project_transcripts(transcripts).map_err(AircError::from)
+            },
+            |projection, transcripts| {
+                airc_work_store::apply_transcripts(projection, transcripts)
+                    .map(|_newest| ())
+                    .map_err(AircError::from)
+            },
+        )
+        .await
+    }
+
+    /// ONE resume rule for every cached projection of a room's transcript
+    /// (the work board, the wall): load the snapshot for this read path,
+    /// resume strictly after its cursor with `apply`, and on any anomaly —
+    /// no snapshot, a cursor the log no longer agrees with — rebuild from
+    /// event zero with `build`. The snapshot is saved after either path.
+    /// The cache is an accelerator, never an authority.
+    pub(crate) async fn project_room_with_cache<P, B, A>(
+        &self,
+        room: &crate::Room,
+        page_size: usize,
+        build: B,
+        apply: A,
+    ) -> Result<P, AircError>
+    where
+        P: CachedProjection,
+        B: FnOnce(Vec<airc_core::TranscriptEvent>) -> Result<P, AircError>,
+        A: FnOnce(&mut P, Vec<airc_core::TranscriptEvent>) -> Result<(), AircError>,
+    {
         let source = if self.is_daemon_attached() {
             WorkBoardCacheSource::Daemon
         } else {
             WorkBoardCacheSource::Store
         };
-        if let Some(cache) = WorkBoardCache::load(self.home(), room.channel, source) {
+        if let Some(cache) = ProjectionCache::<P>::load(self.home(), room.channel, source) {
             if let Some(projection) = self
-                .resume_work_board(room, cache, source, page_size)
+                .resume_projection(room, cache, source, page_size, apply)
                 .await?
             {
                 return Ok(projection);
@@ -908,10 +1075,10 @@ impl Airc {
             .room_transcripts_since(room, &zero_transcript_cursor(), page_size)
             .await?;
         let cursor = transcripts.last().map(airc_core::TranscriptEvent::cursor);
-        let projection = airc_work_store::project_transcripts(transcripts)?;
+        let projection = build(transcripts)?;
         if let Some(cursor) = cursor {
-            WorkBoardCache {
-                version: WORK_BOARD_CACHE_FORMAT_VERSION,
+            ProjectionCache {
+                version: P::VERSION,
                 channel: room.channel,
                 source,
                 cursor,
@@ -922,20 +1089,24 @@ impl Airc {
         Ok(projection)
     }
 
-    /// Resume the work-board projection from a persisted snapshot:
-    /// fetch only the transcript events strictly after the snapshot's
-    /// cursor and fold them in with the same windowed-apply rule the
-    /// full replay uses. Returns `Ok(None)` when the snapshot must be
-    /// discarded (the log disagrees with its cursor) — the caller
-    /// rebuilds from scratch. Transport/store errors propagate; they
-    /// are not a cache problem.
-    async fn resume_work_board(
+    /// Resume a cached projection from a persisted snapshot: fetch only
+    /// the transcript events strictly after the snapshot's cursor and
+    /// fold them in with `apply` — the same fold the full replay uses.
+    /// Returns `Ok(None)` when the snapshot must be discarded (the log
+    /// disagrees with its cursor) — the caller rebuilds from scratch.
+    /// Transport/store errors propagate; they are not a cache problem.
+    async fn resume_projection<P, A>(
         &self,
         room: &crate::Room,
-        cache: WorkBoardCache,
+        cache: ProjectionCache<P>,
         source: WorkBoardCacheSource,
         page_size: usize,
-    ) -> Result<Option<WorkBoardProjection>, AircError> {
+        apply: A,
+    ) -> Result<Option<P>, AircError>
+    where
+        P: CachedProjection,
+        A: FnOnce(&mut P, Vec<airc_core::TranscriptEvent>) -> Result<(), AircError>,
+    {
         let new_transcripts = self
             .room_transcripts_since(room, &cache.cursor, page_size)
             .await?;
@@ -951,9 +1122,11 @@ impl Airc {
                 return Ok(Some(cache.projection));
             }
             eprintln!(
-                "work board cache: snapshot cursor (lamport {}) is not the tip of channel {} — \
+                "{}: snapshot cursor (lamport {}) is not the tip of channel {} — \
                  log rewound or replaced; rebuilding projection from scratch",
-                cache.cursor.lamport, room.channel
+                P::LABEL,
+                cache.cursor.lamport,
+                room.channel
             );
             return Ok(None);
         };
@@ -964,9 +1137,12 @@ impl Airc {
         let first_cursor = first.cursor();
         if !cursor_strictly_before(&cache.cursor, &first_cursor) {
             eprintln!(
-                "work board cache: channel {} returned event at lamport {} not strictly after \
+                "{}: channel {} returned event at lamport {} not strictly after \
                  snapshot cursor (lamport {}) — rebuilding projection from scratch",
-                room.channel, first_cursor.lamport, cache.cursor.lamport
+                P::LABEL,
+                room.channel,
+                first_cursor.lamport,
+                cache.cursor.lamport
             );
             return Ok(None);
         }
@@ -979,9 +1155,9 @@ impl Airc {
             .last()
             .map(airc_core::TranscriptEvent::cursor)
             .unwrap_or(first_cursor);
-        airc_work_store::apply_transcripts(&mut projection, new_transcripts)?;
-        WorkBoardCache {
-            version: WORK_BOARD_CACHE_FORMAT_VERSION,
+        apply(&mut projection, new_transcripts)?;
+        ProjectionCache {
+            version: P::VERSION,
             channel: room.channel,
             source,
             cursor: newest,
@@ -1154,10 +1330,41 @@ impl Airc {
         self.send_frame(FrameKind::Event, body, headers).await
     }
 
+    /// Room-targeted sibling of [`Airc::publish_work_event`]: the event
+    /// frame is addressed to `room`'s channel, not the current room's, so
+    /// board mutations land where the card actually lives.
+    async fn publish_work_event_in(
+        &self,
+        room: &Room,
+        event: &WorkEvent,
+    ) -> Result<EventId, AircError> {
+        let (headers, body) = encode_work_event(event)?;
+        self.send_frame_to_room(
+            FrameKind::Event,
+            crate::MentionTarget::All,
+            body,
+            headers,
+            room,
+        )
+        .await
+        .map(|receipt| receipt.event_id)
+    }
+
     async fn ensure_work_card_in_current_room(&self, card_id: WorkCardId) -> Result<(), AircError> {
         let room = self.current_room().await?;
+        self.ensure_work_card_in_room(&room, card_id).await
+    }
+
+    /// The one mutation guard, room-parameterized: a card may only be
+    /// mutated against a board it is actually on. `..._in_current_room`
+    /// is its current-room projection.
+    async fn ensure_work_card_in_room(
+        &self,
+        room: &Room,
+        card_id: WorkCardId,
+    ) -> Result<(), AircError> {
         let board = self
-            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
+            .project_room_work_board(room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         if board.card(card_id).is_some() {
             return Ok(());
@@ -1165,7 +1372,7 @@ impl Airc {
 
         Err(AircError::WorkCardNotInCurrentRoom {
             card_id,
-            room_name: room.name,
+            room_name: room.name.clone(),
             room_id: room.channel,
         })
     }
@@ -1264,6 +1471,149 @@ fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
 mod tests {
     use super::*;
 
+    // what this catches: card89af25c7 — the real SDK must sign as its caller,
+    // preserve the chosen room, and return the first receipt after claim closure.
+    #[tokio::test]
+    async fn submission_review_api_is_scoped_and_idempotent_after_claim_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room = airc.join("review-contract").await.unwrap();
+        let repo = RepoId::new("fixture/ordinary-project").unwrap();
+        let parent = airc
+            .create_work_card(CreateWorkCard::new(
+                repo.clone(),
+                "ordinary task",
+                Priority::P1,
+            ))
+            .await
+            .unwrap();
+        let claim = airc
+            .claim_work_card(ClaimWorkCard {
+                card_id: parent,
+                ttl_ms: 600_000,
+            })
+            .await
+            .unwrap();
+        let artifact: airc_work::SubmissionArtifact = serde_json::from_value(serde_json::json!({
+            "hash": "b".repeat(64), "size_bytes": 5, "mime": "text/x-diff"
+        }))
+        .unwrap();
+        let submission = airc
+            .submit_work_in(
+                &room,
+                SubmitWork {
+                    submission_id: airc_work::SubmissionId::new(),
+                    card_id: parent,
+                    claim_id: claim,
+                    instance: "ordinary-task".into(),
+                    base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+                    artifact: artifact.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let review_card = airc
+            .create_work_card(
+                CreateWorkCard::new(repo, "review exact artifact", Priority::P1).reviewing(parent),
+            )
+            .await
+            .unwrap();
+        let review_claim = airc
+            .claim_work_card(ClaimWorkCard {
+                card_id: review_card,
+                ttl_ms: 600_000,
+            })
+            .await
+            .unwrap();
+        let other_room = airc.join("unrelated").await.unwrap();
+        let request = ReviewWorkSubmission {
+            review_id: airc_work::WorkReviewId::new(),
+            card_id: parent,
+            submission_id: submission.submission_id,
+            artifact: artifact.clone(),
+            review_card_id: review_card,
+            review_claim_id: review_claim,
+            outcome: airc_work::WorkReviewOutcome::Unknown,
+            evidence: artifact,
+        };
+        let first = airc
+            .review_work_submission_in(&room, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.reviewer, airc.peer_id());
+        assert_eq!(first.outcome, airc_work::WorkReviewOutcome::Unknown);
+        assert_eq!(
+            airc.current_room().await.unwrap().channel,
+            other_room.channel
+        );
+        assert_eq!(
+            airc.work_board_in(&room)
+                .await
+                .unwrap()
+                .submission_review(first.review_id),
+            Some(&first)
+        );
+        // A legacy reader advanced its cursor over an unfamiliar review hint.
+        // Upgrade must replay it, not accept that apparently current old cache.
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        legacy["version"] = 2.into();
+        let projection = legacy["projection"].as_object_mut().unwrap();
+        projection.remove("submission_reviews");
+        projection.remove("review_rejections");
+        std::fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            airc.work_board_in(&room)
+                .await
+                .unwrap()
+                .submission_review(first.review_id),
+            Some(&first)
+        );
+        assert!(airc
+            .work_board_in(&other_room)
+            .await
+            .unwrap()
+            .submission_review(first.review_id)
+            .is_none());
+        airc.change_work_card_state_in(
+            &room,
+            ChangeWorkCardState {
+                card_id: review_card,
+                state: CardState::Closed,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            airc.review_work_submission_in(&room, request.clone())
+                .await
+                .unwrap(),
+            first
+        );
+        let mut conflict = request.clone();
+        conflict.outcome = airc_work::WorkReviewOutcome::Passed;
+        assert!(matches!(
+            airc.review_work_submission_in(&room, conflict).await,
+            Err(AircError::WorkReview(
+                airc_work::WorkReviewRejectionReason::ConflictingId
+            ))
+        ));
+        let mut late = request;
+        late.review_id = airc_work::WorkReviewId::new();
+        assert!(matches!(
+            airc.review_work_submission_in(&room, late).await,
+            Err(AircError::WorkReview(
+                airc_work::WorkReviewRejectionReason::SettledReviewCard
+            ))
+        ));
+    }
+
     #[test]
     fn build_operator_card_created_never_emits_origin_none() {
         // what this catches: regression where the production operator
@@ -1325,6 +1675,8 @@ mod tests {
         pull_request: Option<airc_work::model::PullRequestRef>,
     ) -> WorkCard {
         WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
             card_id: WorkCardId::from_u128(1),
             repo: RepoId::new("CambrianTech/airc").unwrap(),
             title: "relink gate".to_string(),

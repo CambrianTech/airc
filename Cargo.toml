@@ -17,6 +17,7 @@ members = [
     "crates/airc-daemon",
     "crates/airc-lib",
     "crates/airc-cli",
+    "crates/airc-acp",
     "crates/examples/embedded_consumer_smoke",
     "crates/examples/consumer_shapes",
     "crates/examples/persona_spawn_smoke",

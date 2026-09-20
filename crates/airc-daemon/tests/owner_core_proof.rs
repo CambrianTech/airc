@@ -23,10 +23,11 @@ use std::time::{Duration, Instant};
 use airc_bus::envelope::{DeliveryClass, Envelope, Kind};
 use airc_core::{HeaderFilter, Headers, PeerId, RoomId};
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
+use airc_ipc::client::RpcPhase;
 use airc_ipc::codec::read_frame;
 use airc_ipc::{
     AttachRequest, DaemonClient, InboxRequest, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
-    Response, SendRequest,
+    Request, Response, SendRequest,
 };
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, InMemoryEventStore};
@@ -830,13 +831,14 @@ fn report_latency(label: &str, wall: std::time::Duration, mut lat_ns: Vec<u64>) 
 
 /// Spawn `publishers` concurrent DaemonClient tasks, each publishing
 /// `per_publisher` durable messages to `channel_for(p)`. Returns (wall covering
-/// all publishes, per-op publish latencies ns).
+/// all publishes, paired per-op phase durations ns). Reporting is kept outside
+/// the driver's wall and the one-room collector's live-delivery wall.
 async fn drive_publishers(
     socket: PathBuf,
     publishers: usize,
     per_publisher: usize,
     channel_for: impl Fn(usize) -> RoomId,
-) -> (std::time::Duration, Vec<u64>) {
+) -> (std::time::Duration, Vec<[u64; 4]>) {
     let start = Instant::now();
     let mut handles = Vec::with_capacity(publishers);
     for p in 0..publishers {
@@ -846,12 +848,30 @@ async fn drive_publishers(
             let client = DaemonClient::new(socket);
             let mut lat = Vec::with_capacity(per_publisher);
             for i in 0..per_publisher {
+                // Request construction is outside the phase measurement. The
+                // production RPC owns transport, framing, deadline and errors.
+                let request = Request::Publish(durable_text(channel, &format!("p{p} m{i}")));
                 let t = Instant::now();
-                client
-                    .publish(durable_text(channel, &format!("p{p} m{i}")))
+                let mut boundaries = [None; 3];
+                let response = client
+                    .call_observed(request, Duration::from_secs(5), |phase| {
+                        let index = match phase {
+                            RpcPhase::Connected => 0,
+                            RpcPhase::RequestWritten => 1,
+                            RpcPhase::ResponseRead => 2,
+                        };
+                        boundaries[index] = Some(t.elapsed().as_nanos() as u64);
+                    })
                     .await
                     .expect("daemon publish");
-                lat.push(t.elapsed().as_nanos() as u64);
+                assert!(matches!(response, Response::Publish(_)));
+                let [connect, written, read] = boundaries.map(|v| v.expect("completed phase"));
+                lat.push([
+                    connect,
+                    written - connect,
+                    read - written,
+                    t.elapsed().as_nanos() as u64,
+                ]);
             }
             lat
         }));
@@ -861,6 +881,40 @@ async fn drive_publishers(
         all.extend(h.await.expect("publisher join"));
     }
     (start.elapsed(), all)
+}
+
+fn report_phases(mut all: Vec<[u64; 4]>) -> Vec<u64> {
+    // Retain paired samples: separate percentiles must never be added together.
+    for (index, label) in [
+        "connect",
+        "request encode/write/flush",
+        "response wait/read/decode",
+        "RPC total",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut values: Vec<u64> = all.iter().map(|sample| sample[index]).collect();
+        values.sort_unstable();
+        let pct = |n: usize| values[(values.len() * n / 100).min(values.len() - 1)];
+        eprintln!(
+            "RPC phase {label} ns: min {} p50 {} p95 {} p99 {} max {}",
+            values[0],
+            pct(50),
+            pct(95),
+            pct(99),
+            values[values.len() - 1]
+        );
+    }
+    all.sort_unstable_by_key(|sample| sample[3]);
+    for sample in all.iter().rev().take(5) {
+        eprintln!(
+            "RPC slow paired ns: connect={} write={} response={} total={}",
+            sample[0], sample[1], sample[2], sample[3]
+        );
+    }
+    eprintln!("RPC samples: completed={} failed=0 excluded=0 (any failure aborts measurement); callback clock overhead included", all.len());
+    all.into_iter().map(|sample| sample[3]).collect()
 }
 
 /// 15 concurrent publishers → ONE room, with a collector measuring LIVE
@@ -912,7 +966,7 @@ async fn bench_daemon_concurrent_publishers_one_room() {
     let p95 = report_latency(
         "daemon ONE-room publish (15×40, single-writer + write-behind)",
         publish_wall,
-        lat,
+        report_phases(lat),
     );
 
     // Collapse-guard only; the printed distribution is the signal.
@@ -947,11 +1001,105 @@ async fn bench_daemon_publishers_many_rooms() {
     let p95 = report_latency(
         "daemon MANY-rooms publish (15 publishers × 15 shards × 40)",
         wall,
-        lat,
+        report_phases(lat),
     );
     assert!(
         p95 < 200_000_000,
         "daemon many-rooms publish p95 regressed to {p95} ns/op (200ms collapse-guard)"
+    );
+    daemon.stop().await;
+}
+
+// what this catches: N concurrent command reply handles must receive/decode N
+// selected envelopes total, not N copies of every unrelated bulk-room event.
+#[tokio::test]
+async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
+    const COMMANDS: usize = 32;
+    const UNRELATED: usize = 64;
+    let daemon = start_daemon().await;
+    let room = RoomId::new();
+    let client = DaemonClient::new(daemon.socket.clone());
+    let mut streams = Vec::new();
+    for n in 0..COMMANDS {
+        let mut stream = client
+            .attach(AttachRequest::live(room).with_headers(HeaderFilter::Exact {
+                key: "airc.correlation_id".into(),
+                value: n.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut stream).await,
+            Ok(Some(Response::Ok))
+        ));
+        streams.push(stream);
+    }
+    for n in 0..UNRELATED + 2 * COMMANDS {
+        let selected = n >= UNRELATED;
+        client
+            .publish(PublishRequest {
+                channel: room.as_uuid(),
+                from_peer: uuid::Uuid::new_v4(),
+                from_client: uuid::Uuid::new_v4(),
+                kind: IpcKind::Message,
+                delivery: IpcDelivery::RequestResponse,
+                target: IpcTarget::All,
+                correlation_id: None,
+                coalesce_key: None,
+                payload: if n >= UNRELATED + COMMANDS {
+                    b"fence".to_vec()
+                } else if selected {
+                    b"selected reply".to_vec()
+                } else {
+                    vec![0xff; 16 * 1024]
+                },
+                headers: Headers::from([(
+                    "airc.correlation_id".into(),
+                    if selected {
+                        ((n - UNRELATED) % COMMANDS).to_string()
+                    } else {
+                        format!("unrelated-{n}")
+                    },
+                )]),
+            })
+            .await
+            .unwrap();
+    }
+    let mut decoded = 0;
+    for (n, mut stream) in streams.into_iter().enumerate() {
+        // A matching fence follows all bulk and selected publications. Count
+        // every decoded frame through it, without a timer-based absence claim.
+        let mut replies = 0;
+        loop {
+            let frame = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_frame::<_, Response>(&mut stream),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            let Response::Event { envelope } = frame else {
+                panic!("expected event")
+            };
+            decoded += 1;
+            let envelope = airc_wire::decode(envelope.into()).unwrap();
+            assert_eq!(
+                envelope.headers.get("airc.correlation_id"),
+                Some(&n.to_string())
+            );
+            if envelope.payload.as_ref() == b"fence" {
+                break;
+            }
+            assert_eq!(envelope.payload.as_ref(), b"selected reply");
+            replies += 1;
+        }
+        assert_eq!(replies, 1);
+    }
+    assert_eq!(
+        decoded,
+        COMMANDS * 2,
+        "only selected replies and fences reach IPC decode"
     );
     daemon.stop().await;
 }

@@ -1758,14 +1758,7 @@ pub async fn run_merge(
     // ReqwestGhClient by default (no per-call gh spawn on the gate +
     // merge path), shell only by explicit opt-out or loud fallback.
     let gh = crate::gh_reqwest::production_gh_client();
-    let baseline = crate::merger::fetch_baseline_failures(gh.as_ref()).await;
-    if !baseline.is_empty() {
-        eprintln!(
-            "airc: baseline has {} failing check(s) on rust-rewrite — inherited \
-             failures with those names are ignored (strictly-less-red, card d5b7b07d)",
-            baseline.len()
-        );
-    }
+    let mut baselines = crate::merger::BaselineCache::default();
 
     // Card 7ed1ac4f: pending-too-long timeout. Default 30 min from
     // GatePolicy::default_for_merger; CLI flag override comes
@@ -1775,7 +1768,7 @@ pub async fn run_merge(
         now_ms: crate::merger::now_ms(),
     };
 
-    match crate::merger::check_pr_gate(gh.as_ref(), &pr, &baseline, policy).await {
+    match crate::merger::check_pr_gate(gh.as_ref(), &pr, &mut baselines, policy).await {
         Ok(crate::merger::GateResult::Green) => {
             if dry_run {
                 println!(
@@ -2012,15 +2005,19 @@ pub async fn run_board(
     let me = airc.peer_id();
 
     // Pre-fetch published aliases for every distinct non-self owner on
-    // the board (kink 6f111211 / card c397567a). One scan per peer for
-    // now — N is small, and peer_alias is page_recent-backed; if this
-    // becomes a hot path the follow-up is one shared scan + a
-    // local index.
+    // the board (kink 6f111211 / card c397567a). peer_alias uses the
+    // daemon-aware durable identity index, independent of presence.
     let snapshot = board.snapshot();
     let now = now_ms();
     let mut owner_peers: std::collections::HashSet<airc_lib::PeerId> =
         std::collections::HashSet::new();
     for card in &snapshot.cards {
+        owner_peers.extend(
+            card.submissions
+                .iter()
+                .map(|submission| submission.publisher)
+                .filter(|peer| *peer != me),
+        );
         if let Some(owner) = card.owner {
             if owner != me {
                 owner_peers.insert(owner);
@@ -2246,6 +2243,20 @@ fn print_board(
             repo = card.repo,
             title = card.title,
         );
+        if let Some(submission) = card.submissions.first() {
+            println!(
+                "  submissions={} latest={} publisher={} base={} sha256={} bytes={} (artifact reference; availability not asserted)",
+                card.submissions.len(), submission.submission_id,
+                format_peer(submission.publisher, me, aliases), submission.base_sha,
+                submission.artifact.hash, submission.artifact.size_bytes,
+            );
+        }
+        if let Some(rejected) = &card.last_submission_rejection {
+            println!(
+                "  submission_rejected={} reason={}",
+                rejected.submission_id, rejected.reason
+            );
+        }
     }
     if !stale_claims.is_empty() {
         println!();
@@ -3398,6 +3409,8 @@ mod tests {
         claim_expires_at_ms: Option<u64>,
     ) -> WorkCard {
         WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
             card_id: WorkCardId::from_u128(1),
             repo: RepoId::new("test/test").unwrap(),
             title: "t".into(),
@@ -3859,25 +3872,26 @@ mod tests {
     }
 
     /// Card 28f1440c — the airc PR target branch must be the
-    /// substrate's working branch (`rust-rewrite`), NOT the repo's
-    /// GitHub default (`main`). Card 70e87d33 made the base per-repo
-    /// (so continuum can target `canary`), but the airc invariant is
-    /// unchanged and pinned here: a regression that routes airc
-    /// through the GitHub default would surface `main` and silently
-    /// bypass the substrate work the doctrine requires (AGENTS.md §8).
-    /// This is the per-repo-aware successor to the old constant test —
-    /// extended per its own instruction, not deleted.
+    /// substrate's working branch, NOT the repo's GitHub default
+    /// (`main`). Card 70e87d33 made the base per-repo (so continuum can
+    /// target `canary`); card 5e04ab56 retired `rust-rewrite` (deleted
+    /// on the remote — the stale pin broke `airc work state review` for
+    /// airc's own repo) and the working branch is now `canary`. The
+    /// INVARIANT is unchanged and is what this test pins: a regression
+    /// that routes airc through the GitHub default would surface `main`
+    /// and silently bypass the substrate work the doctrine requires
+    /// (AGENTS.md §8).
     #[test]
-    fn airc_pr_base_targets_rust_rewrite_never_main() {
+    fn airc_pr_base_targets_the_working_branch_never_main() {
         std::env::remove_var("AIRC_PR_BASE");
         let airc_repo = airc_work::RepoId::new("CambrianTech/airc").expect("valid repo key");
         let base = crate::work_commands_gh::configured_base_branch(&airc_repo);
         assert_eq!(
             base.as_deref(),
-            Some("rust-rewrite"),
-            "card 28f1440c: airc PR target must be the substrate working \
-             branch, never the repo's GitHub default ('main' on this \
-             repo today)"
+            Some("canary"),
+            "cards 28f1440c + 5e04ab56: airc PR target must be the substrate \
+             working branch (canary), never the repo's GitHub default \
+             ('main' on this repo today)"
         );
         assert_ne!(base.as_deref(), Some("main"));
     }

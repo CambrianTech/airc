@@ -58,6 +58,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 libc = "0.2"
 
 [dev-dependencies]
+airc-lib = { path = "../airc-lib", features = ["mock"] }
 tempfile = "3"
 temp-env = "0.3"
 

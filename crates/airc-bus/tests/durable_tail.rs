@@ -9,8 +9,10 @@
 //! (`resume_from_cursor(channel, None)` + truncate) materialized the
 //! WHOLE room — exactly one `page(…, None, usize::MAX)` — to answer N.
 
+use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,6 +37,7 @@ struct CountingSink {
     page_calls: AtomicU64,
     page_tail_calls: AtomicU64,
     max_page_tail_limit: AtomicUsize,
+    max_page_limit: AtomicUsize,
 }
 
 impl CountingSink {
@@ -44,7 +47,12 @@ impl CountingSink {
             page_calls: AtomicU64::new(0),
             page_tail_calls: AtomicU64::new(0),
             max_page_tail_limit: AtomicUsize::new(0),
+            max_page_limit: AtomicUsize::new(0),
         }
+    }
+
+    fn max_page_limit(&self) -> usize {
+        self.max_page_limit.load(Ordering::SeqCst)
     }
 
     fn page_calls(&self) -> u64 {
@@ -63,6 +71,7 @@ impl CountingSink {
         self.page_calls.store(0, Ordering::SeqCst);
         self.page_tail_calls.store(0, Ordering::SeqCst);
         self.max_page_tail_limit.store(0, Ordering::SeqCst);
+        self.max_page_limit.store(0, Ordering::SeqCst);
     }
 }
 
@@ -79,6 +88,7 @@ impl DurableSink for CountingSink {
         limit: usize,
     ) -> Result<Vec<Envelope>, BusError> {
         self.page_calls.fetch_add(1, Ordering::SeqCst);
+        self.max_page_limit.fetch_max(limit, Ordering::SeqCst);
         self.inner.page(channel, from_cursor, limit).await
     }
 
@@ -479,6 +489,12 @@ async fn pending_unpersisted_durable_is_served_from_the_ring() {
         "un-persisted durables are in the tail — the ring leads the sink"
     );
 
+    let prior = router
+        .durable_tail_before(channel, Some(tail[3].cursor()), 10)
+        .await
+        .expect("page before unpersisted durable");
+    assert_eq!(markers(&prior), vec![0, 1, 2]);
+
     gated.open(); // release the write-behind so the router task drains
 }
 
@@ -502,4 +518,249 @@ async fn tail_surfaces_sink_error_instead_of_scanning() {
         result.is_err(),
         "reverse-page failure is loud, not a scan fallback"
     );
+    assert!(router
+        .durable_tail_before(
+            RoomId::from_u128(0xbad),
+            Some(Cursor::new(airc_bus::Seq::new(1, 9), EventId::new())),
+            25,
+        )
+        .await
+        .is_err());
+}
+
+/// Walk beyond the old fixed500 tail, across the ring/store seam. Every
+/// envelope has the SAME measured timestamp, so a timestamp continuation
+/// cannot pass this test. Each read remains bounded by its requested page.
+#[tokio::test]
+async fn reverse_cursor_pages_cover_deep_equal_timestamp_history_once() {
+    const DEEP: u128 = 650;
+    const PAGE: usize = 200;
+    let (router, sink) = counted_router(64);
+    let channel = RoomId::from_u128(0xba4f111);
+    for n in 0..DEEP {
+        router
+            .publish(event(channel, n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 128 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let mut before = None;
+    let mut seen = Vec::new();
+    loop {
+        sink.reset();
+        let page = router
+            .durable_tail_before(channel, before, PAGE)
+            .await
+            .expect("bounded reverse page");
+        assert_eq!(sink.page_calls(), 0);
+        assert!(sink.page_tail_calls() <= 1);
+        assert!(sink.max_page_tail_limit() <= PAGE);
+        assert!(page
+            .iter()
+            .all(|event| event.occurred_at_ms == 1_700_000_000_000));
+        before = page.first().map(|env| env.cursor());
+        seen.extend(markers(&page));
+        if page.len() < PAGE {
+            break;
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, (0..DEEP).collect::<Vec<_>>());
+}
+
+/// Regression (continuum 2026-09-06, the wall projection that never
+/// returned): a cursor resume must do work bounded by its page, never by
+/// the channel's remaining depth. Before, `resume_from_cursor` asked the
+/// sink for `usize::MAX` rows on every page and the daemon truncated in
+/// memory, so a from-zero walk of a 244k-event room materialized O(n²/page)
+/// rows and outlived every caller's deadline. Now: each page is ONE sink
+/// read of at most `limit` rows, pages chain by the last returned cursor
+/// with no gap and no dup, and a short page means the channel is exhausted.
+#[tokio::test]
+async fn cursor_resume_pages_are_bounded_by_limit_not_by_room_depth() {
+    const DEEP: u128 = 1_200;
+    const PAGE: usize = 500;
+
+    let (router, sink) = counted_router(64);
+    let channel = RoomId::from_u128(0xb0b0);
+    for n in 0..DEEP {
+        router
+            .publish(event(channel, n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let mut from = None;
+    let mut seen: Vec<u128> = Vec::new();
+    let mut pages = 0;
+    loop {
+        sink.reset();
+        let page = router
+            .resume_from_cursor(channel, from, PAGE)
+            .await
+            .expect("resume");
+        pages += 1;
+        assert!(page.len() <= PAGE, "a page never exceeds its limit");
+        assert!(
+            sink.page_calls() <= 1,
+            "one sink read per page, got {}",
+            sink.page_calls()
+        );
+        assert!(
+            sink.max_page_limit() <= PAGE,
+            "the sink read is bounded by the page, asked for {}",
+            sink.max_page_limit()
+        );
+        let short = page.len() < PAGE;
+        from = page.last().map(|e| e.cursor());
+        seen.extend(markers(&page));
+        if short || from.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 3, "1200 events at 500/page = 500 + 500 + 200");
+    assert_eq!(
+        seen,
+        (0..DEEP).collect::<Vec<_>>(),
+        "the chained pages are the whole channel in order, no gap, no dup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Card ddbab098 — attach path (subscribe_with_lag) bounded-work proof, the
+// sibling of #1389's resume_from_cursor bound. The deep leg must page in
+// DEEP_REPLAY_PAGE-row chunks instead of one `usize::MAX` query, and still
+// deliver every event exactly once across the deep->ring seam — including
+// when whole pages are filtered out (the raw cursor advances past them).
+
+/// Mirrors the router's private `DEEP_REPLAY_PAGE`; a test that passed with a
+/// larger bound would not prove the router is bounded.
+const ATTACH_DEEP_REPLAY_PAGE: usize = 1024;
+
+async fn wait_persisted(sink: &Arc<CountingSink>, id: u128) {
+    for _ in 0..6_000 {
+        // ~30s at 5ms ticks
+        if sink.contains(EventId::from_u128(id)).await.unwrap_or(false) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("write-behind never persisted the marker event (id {})", id);
+}
+
+/// Attach from zero over a 5,000-event room: every event arrives exactly once,
+/// in order, across the deep->ring seam, and no sink page ever requests more
+/// than DEEP_REPLAY_PAGE rows.
+#[tokio::test]
+async fn attach_deep_leg_pages_bounded_and_delivers_every_event_once() {
+    const DEEP: u128 = 5_000;
+
+    let (router, sink) = counted_router(64); // small ring: deep history lives in the sink
+    let channel = RoomId::from_u128(0xa77a);
+
+    for n in 0..DEEP {
+        router
+            .publish(event(channel, n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await; // let write-behind drain
+        }
+    }
+    wait_persisted(&sink, DEEP).await; // last marker is DEEP-1 -> event_id DEEP
+    sink.reset();
+
+    let (stream, _lag) = router.subscribe_with_lag(airc_bus::Filter::channel(channel), None);
+    futures::pin_mut!(stream);
+    for expected in 0..DEEP {
+        let env = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("attach replay stalled — deep leg looped or deadlocked")
+            .expect("live tail ended mid-replay");
+        assert_eq!(
+            env.event_id.0.as_u128() - 1,
+            expected,
+            "gap or duplicate at marker {expected}"
+        );
+    }
+
+    // Ring holds the last 64 events, so the deep leg walked ~4,937 rows: five
+    // pages of 1024 — never one unbounded query.
+    assert!(
+        sink.page_calls() >= 5,
+        "deep leg should have paged at least 5 times, got {}",
+        sink.page_calls()
+    );
+    assert!(
+        sink.max_page_limit() <= ATTACH_DEEP_REPLAY_PAGE,
+        "attach deep leg requested an unbounded page: limit {}",
+        sink.max_page_limit()
+    );
+}
+
+/// A kinds filter that drops ~4 full pages must not stall the raw cursor:
+/// filtered rows advance the paging cursor (no infinite loop), and accepted
+/// rows still arrive exactly once through to the ring boundary.
+#[tokio::test]
+async fn attach_deep_leg_advances_past_filtered_pages() {
+    const EVENTS: u128 = 5_000; // all Kind::Event — filtered out by the subscription
+    const MESSAGES: u128 = 1_000; // tail is Messages; the ring boundary sits inside it
+
+    let (router, sink) = counted_router(64);
+    let channel = RoomId::from_u128(0xa77b);
+
+    for n in 0..EVENTS {
+        router
+            .publish(kinded_event(
+                channel,
+                n,
+                Kind::Event,
+                DeliveryClass::Durable,
+            ))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    for n in 0..MESSAGES {
+        router
+            .publish(event(channel, EVENTS + n, DeliveryClass::Durable))
+            .await
+            .expect("publish");
+        if n % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    wait_persisted(&sink, EVENTS + MESSAGES).await;
+    sink.reset();
+
+    let filter = airc_bus::Filter::channel(channel).with_kinds(vec![Kind::Message]);
+    let (stream, _lag) = router.subscribe_with_lag(filter, None);
+    futures::pin_mut!(stream);
+    for expected in 0..MESSAGES {
+        let env = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("attach replay stalled — raw cursor must advance past filtered rows")
+            .expect("live tail ended mid-replay");
+        assert_eq!(
+            env.event_id.0.as_u128() - 1,
+            EVENTS + expected,
+            "gap or duplicate at message {expected}"
+        );
+    }
+
+    // The deep leg walked ~5,936 raw rows — four-plus full filtered pages plus
+    // the partial page holding accepted messages — before the ring boundary.
+    assert!(
+        sink.page_calls() >= 6,
+        "filtered pages must still be paged past, got {}",
+        sink.page_calls()
+    );
+    assert!(sink.max_page_limit() <= ATTACH_DEEP_REPLAY_PAGE);
 }

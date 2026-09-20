@@ -1,0 +1,45 @@
+[package]
+name = "airc-acp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# airc as an ACP CLIENT — one bridge, every agent that speaks the Agent Client
+# Protocol. See docs/architecture/ACP-CLIENT-BRIDGE.md.
+#
+# This slice owns the DECISIONS (who may prompt, which tools may run, how a
+# refusal reaches the room) as pure, testable logic with no I/O. The transport —
+# spawning the agent and driving Initialize/NewSession/Prompt over
+# `agent-client-protocol` — lands next, against this contract. Splitting it this
+# way means the security-relevant rule is unit-tested before a subprocess exists,
+# rather than being an `if` buried in an async callback.
+
+[features]
+# Test fixtures. Per CLAUDE.md's test discipline, fixtures live behind a cargo
+# feature so a production build physically cannot link them.
+test-fixtures = []
+
+# A real ACP agent over real stdio, so the SUBPROCESS path (spawn + JSON-RPC
+# framing) is covered by a deterministic test rather than only by a live run.
+# That path is where Windows historically fails silently — a child that never
+# starts looks exactly like an agent with nothing to say.
+[[bin]]
+name = "acp-echo-agent"
+path = "src/bin/acp_echo_agent.rs"
+required-features = ["test-fixtures"]
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-client-protocol = "2"
+agent-client-protocol-tokio = "0.11"
+# The ToolKind → toolsAllow key is derived from the type's serde repr (see
+# `kind_key` in transport.rs) rather than a `_`-wildcard match the non-exhaustive
+# enum forces and the no-silent-fallback clippy gate forbids. Already in the lock.
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["process", "rt", "macros", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "macros", "rt-multi-thread"] }

@@ -138,6 +138,24 @@ pub trait GhClient: Send + Sync {
         &self,
         args: BranchCheckRollupArgs,
     ) -> Result<Vec<GhCheck>, GhError>;
+
+    /// `gh issue view <number> --repo <owner/name> --json number,title,body,state`.
+    ///
+    /// Card #356 — the queue-card closer needs the issue BODY to verify
+    /// the `airc-queue-card-v1` envelope and to apply the status-log
+    /// mutation before closing. Every verb above operates on pull
+    /// requests and none of them reads a body, so this is the first
+    /// ISSUE verb on the trait and the first that treats free-form
+    /// content as the payload.
+    ///
+    /// That makes it the deliberate outlier-B check on this trait's
+    /// shape (CLAUDE.md's methodical process): if `GhClient` only fit
+    /// PR-shaped operations, this is where it would have to be forced.
+    /// It is not forced — issues reuse `repo` + `number` addressing and
+    /// the same `GhError` classification — so the remaining closer
+    /// verbs (`issue_edit_body`, `issue_close`) are the same pattern
+    /// and are deliberately NOT built until a caller needs them.
+    async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError>;
 }
 
 #[derive(Debug, Clone)]
@@ -172,11 +190,68 @@ pub struct PrEditBaseArgs {
     pub base: String,
 }
 
+/// Address an issue the same way the PR verbs address a PR: `repo` +
+/// `number`. No `cwd` field — unlike `pr_create`, nothing here resolves
+/// a remote from a worktree, so offering one would be a lie.
+#[derive(Debug, Clone)]
+pub struct IssueViewArgs {
+    pub repo: String,
+    pub number: u64,
+}
+
+/// An issue as the queue-card closer needs it. `body` is the payload:
+/// the `airc-queue-card-v1` envelope lives there, and the closer both
+/// VERIFIES it (skip anything that isn't a queue card) and MUTATES it
+/// (status=merged + a status-log line) before closing.
+///
+/// `state` is the idempotence guard — a card already `CLOSED` is a
+/// silent skip, which is what makes the workflow safe to re-run.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueView {
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    /// An issue with no body serializes as JSON `null` on the REST API
+    /// (and as `""` from the gh CLI). Both mean "no envelope here,
+    /// skip this card", so both must deserialize — a bare
+    /// `#[serde(default)]` covers the MISSING key but still errors on
+    /// an explicit null, which would abort the workflow on the most
+    /// ordinary input there is.
+    #[serde(default, deserialize_with = "null_to_empty_string")]
+    pub body: String,
+    /// NORMALIZED UPPERCASE by every implementation. The gh CLI reports
+    /// `OPEN`/`CLOSED` (GraphQL-backed) while REST reports
+    /// `open`/`closed`; leaving that divergence in place would make the
+    /// closer's idempotence check silently implementation-dependent.
+    /// The trait's contract is the uppercase form.
+    #[serde(default, deserialize_with = "upper_state")]
+    pub state: String,
+}
+
+fn null_to_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn upper_state<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .to_uppercase())
+}
+
 #[derive(Debug, Clone)]
 pub struct BranchCheckRollupArgs {
     pub repo: String,
-    /// Branch name (e.g. `"rust-rewrite"`). Resolved by gh against
-    /// `repos/{owner}/{repo}/commits/{branch}/check-runs`. Card d5b7b07d.
+    /// Git ref or object id, resolved against
+    /// `repos/{owner}/{repo}/commits/{branch}/check-runs`. Merge gates use
+    /// the PR's immutable base object id, so a moving branch cannot change
+    /// the baseline between the PR read and the check lookup.
     pub branch: String,
 }
 
@@ -197,6 +272,12 @@ pub struct PrView {
     /// an already-merged PR.
     #[serde(default, rename = "mergedAt")]
     pub merged_at: Option<String>,
+    /// Actual target from the live PR, not the possibly stale work-card link.
+    #[serde(default, rename = "baseRefName")]
+    pub base_ref_name: Option<String>,
+    /// Target revision observed in the same PR response.
+    #[serde(default, rename = "baseRefOid")]
+    pub base_ref_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -234,49 +315,221 @@ pub struct MergeReceipt {
 /// Pure — synthetic JSON in, typed value out. The merger and the
 /// close-guard both depend on this shape, so this is where the
 /// schema round-trip is pinned in tests.
+///
+/// Alias for [`PrView::from_graphql`]; the constructor is the boundary
+/// (card fc483e57) and this name is kept for existing callers.
 pub fn parse_pr_view(json: &[u8]) -> Result<PrView, GhError> {
+    PrView::from_graphql(json)
+}
+
+/// THE DIALECT BOUNDARY (card fc483e57).
+///
+/// GitHub speaks two dialects for the same facts: GraphQL (what
+/// `gh pr view --json` emits — `MERGED`, `SUCCESS`, `COMPLETED`,
+/// `mergedAt`) and REST (what `/repos/../pulls/N` emits — `closed` +
+/// `merged_at`, `success`, `completed`, `started_at`). Consumers —
+/// above all the merger's `evaluate_gh_view` — read ONE vocabulary and
+/// must never branch on which client produced the value.
+///
+/// Both bugs behind card c03bb62f were dialect leaking past this line
+/// at two different places: a merged PR read as `CLOSED` (so the
+/// reconcile never fired and cards sat at Review forever), and green
+/// checks read as in-flight (so the production merger could only ever
+/// merge through the pending-timeout bypass). Patching each site
+/// separately would have meant a third patch for the third difference.
+///
+/// So: [`PrView`] and [`GhCheck`] are constructed HERE, through
+/// `from_graphql` / `from_rest`, and both emit the canonical
+/// (GraphQL) vocabulary. Add a new dialect difference to
+/// `canonicalize`, never to a consumer.
+impl PrView {
+    /// `gh pr view --json state,mergeable,statusCheckRollup,mergedAt`.
+    /// Already canonical on the wire; canonicalized anyway so the two
+    /// constructors are interchangeable by contract, not by luck.
+    pub fn from_graphql(json: &[u8]) -> Result<PrView, GhError> {
+        let mut view: PrView = serde_json::from_slice(json)?;
+        view.canonicalize();
+        Ok(view)
+    }
+
+    /// REST `/repos/{owner}/{repo}/pulls/{n}` plus the separately
+    /// fetched check-runs for its head SHA (REST has no rollup field).
+    pub fn from_rest(pr_json: &serde_json::Value, checks: Vec<GhCheck>) -> PrView {
+        // GitHub's REST `mergeable` is tri-state: null (still
+        // computing), true, false. GraphQL names those states.
+        let mergeable = match pr_json.get("mergeable") {
+            Some(serde_json::Value::Bool(true)) => "MERGEABLE",
+            Some(serde_json::Value::Bool(false)) => "CONFLICTING",
+            _ => "UNKNOWN",
+        }
+        .to_string();
+        let mut view = PrView {
+            state: pr_json
+                .get("state")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            mergeable,
+            status_check_rollup: Some(checks),
+            merged_at: pr_json
+                .get("merged_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            base_ref_name: pr_json
+                .pointer("/base/ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            base_ref_oid: pr_json
+                .pointer("/base/sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+        view.canonicalize();
+        view
+    }
+
+    /// The whole dialect translation, in one place.
+    fn canonicalize(&mut self) {
+        self.state = self.state.to_ascii_uppercase();
+        self.mergeable = self.mergeable.to_ascii_uppercase();
+        // A merged PR is `closed` in REST and `MERGED` in GraphQL. The
+        // fact is `merged_at`; the state string follows it.
+        if self.merged_at.is_some() {
+            self.state = "MERGED".to_string();
+        }
+        for check in self.status_check_rollup.iter_mut().flatten() {
+            check.canonicalize();
+        }
+    }
+}
+
+impl GhCheck {
+    /// REST spells conclusions/statuses in lowercase (`success`,
+    /// `completed`); GraphQL — and every consumer — in UPPERCASE.
+    fn canonicalize(&mut self) {
+        if let Some(c) = self.conclusion.as_mut() {
+            c.make_ascii_uppercase();
+        }
+        if let Some(s) = self.status.as_mut() {
+            s.make_ascii_uppercase();
+        }
+    }
+}
+
+/// Decode `gh issue view --json number,title,body,state`. Pure — JSON
+/// in, typed value out — so the closer's envelope/idempotence logic is
+/// unit-testable without a network or a `gh` binary. Card #356.
+///
+/// Every field is `#[serde(default)]` on [`IssueView`]: gh omits keys
+/// it has no value for, and an issue with an empty body is ordinary
+/// (a card whose envelope was stripped), not a parse failure. Failing
+/// there would turn a skippable non-card into a workflow abort.
+pub fn parse_issue_view(json: &[u8]) -> Result<IssueView, GhError> {
     Ok(serde_json::from_slice(json)?)
 }
 
-/// Decode `gh api /repos/.../check-runs` (REST shape) into the same
-/// [`GhCheck`] type the merger uses for PR rollups. Pure — synthetic
-/// JSON in, typed values out. The REST endpoint wraps results in
-/// `{total_count, check_runs: [...]}`; we project to just the run
-/// list since the merger doesn't care about pagination metadata.
-/// Card d5b7b07d.
-///
-/// REST `started_at` uses the snake_case field name (the REST API
-/// differs from the GraphQL `startedAt` here); we accept both via a
-/// custom Deserialize because [`GhCheck`] is the one struct shared
-/// across both code paths.
+/// GitHub's maximum requested page size; shared by both HTTP adapters.
+pub const CHECK_RUN_PAGE_SIZE: usize = 100;
+/// Bound work per rollup to 100 pages. Larger rollups are unverifiable by
+/// this reader and fail closed; they are never silently truncated to green.
+const MAX_CHECK_RUNS: usize = 10_000;
+
+/// A required REST envelope. Error JSON or missing pagination metadata must
+/// not deserialize to an apparently successful empty check list (045083e8).
+#[derive(Deserialize)]
+pub struct CheckRunsPage {
+    total_count: usize,
+    check_runs: Vec<RestCheckRun>,
+}
+
+#[derive(Deserialize)]
+struct RestCheckRun {
+    id: u64,
+    #[serde(default)]
+    conclusion: Option<String>,
+    status: String,
+    name: String,
+    #[serde(default, alias = "startedAt")]
+    started_at: Option<String>,
+}
+
+/// Accumulates one bounded, complete check rollup. Run IDs detect duplicate
+/// or overlapping pages; a changed total or short page requires a fresh read.
+/// Values move into the canonical projection without re-serialization.
+#[derive(Default)]
+pub struct CheckRunRollup {
+    expected: Option<usize>,
+    seen: std::collections::HashSet<u64>,
+    checks: Vec<GhCheck>,
+}
+
+impl CheckRunRollup {
+    pub fn push_page(&mut self, page: CheckRunsPage) -> Result<bool, GhError> {
+        if page.total_count > MAX_CHECK_RUNS {
+            return Err(GhError::OutputParse(format!(
+                "check rollup reports {} runs, exceeding reader bound {MAX_CHECK_RUNS}",
+                page.total_count
+            )));
+        }
+        if let Some(expected) = self.expected {
+            if expected != page.total_count || self.checks.len() == expected {
+                return Err(GhError::OutputParse(
+                    "check rollup total changed or another page followed completion".into(),
+                ));
+            }
+        }
+        let remaining = page.total_count.saturating_sub(self.checks.len());
+        if page.check_runs.len() != remaining.min(CHECK_RUN_PAGE_SIZE) {
+            return Err(GhError::OutputParse(format!(
+                "incomplete check page: received {}, expected {} of {} remaining runs",
+                page.check_runs.len(),
+                remaining.min(CHECK_RUN_PAGE_SIZE),
+                remaining
+            )));
+        }
+        self.expected = Some(page.total_count);
+        for run in page.check_runs {
+            if !self.seen.insert(run.id) {
+                return Err(GhError::OutputParse(format!(
+                    "check rollup repeated run id {}",
+                    run.id
+                )));
+            }
+            let mut check = GhCheck {
+                conclusion: run.conclusion,
+                status: Some(run.status),
+                name: Some(run.name),
+                started_at: run.started_at,
+            };
+            check.canonicalize();
+            if check.status.as_deref() == Some("COMPLETED") && check.conclusion.is_none() {
+                return Err(GhError::OutputParse(
+                    "completed check run is missing its conclusion".into(),
+                ));
+            }
+            self.checks.push(check);
+        }
+        Ok(self.checks.len() == page.total_count)
+    }
+
+    pub fn into_checks(self) -> Result<Vec<GhCheck>, GhError> {
+        if self.expected != Some(self.checks.len()) {
+            return Err(GhError::OutputParse(
+                "check rollup ended before all pages arrived".into(),
+            ));
+        }
+        Ok(self.checks)
+    }
+}
+
+/// Decode a complete REST envelope or gh's concatenated `--paginate` page
+/// stream. Missing/error envelopes and incomplete streams fail closed.
 pub fn parse_check_runs(json: &[u8]) -> Result<Vec<GhCheck>, GhError> {
-    #[derive(Deserialize)]
-    struct RestRun {
-        #[serde(default)]
-        conclusion: Option<String>,
-        #[serde(default)]
-        status: Option<String>,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        started_at: Option<String>,
+    let mut rollup = CheckRunRollup::default();
+    for page in serde_json::Deserializer::from_slice(json).into_iter::<CheckRunsPage>() {
+        rollup.push_page(page?)?;
     }
-    #[derive(Deserialize)]
-    struct Envelope {
-        #[serde(default)]
-        check_runs: Vec<RestRun>,
-    }
-    let env: Envelope = serde_json::from_slice(json)?;
-    Ok(env
-        .check_runs
-        .into_iter()
-        .map(|r| GhCheck {
-            conclusion: r.conclusion,
-            status: r.status,
-            name: r.name,
-            started_at: r.started_at,
-        })
-        .collect())
+    rollup.into_checks()
 }
 
 /// Card 7ed1ac4f — parse an ISO-8601 timestamp gh returns (e.g.
@@ -369,6 +622,40 @@ pub fn parse_pr_url(stdout: &str) -> Result<PrCreated, GhError> {
 mod tests {
     use super::*;
 
+    /// what this catches (#356): the two `GhClient` impls read the SAME
+    /// issue from DIFFERENT APIs — gh's CLI is GraphQL-backed and
+    /// reports `OPEN`/`CLOSED`, REST reports `open`/`closed`. The
+    /// closer's idempotence check ("already closed? skip") would then
+    /// silently depend on which backend was configured. The trait's
+    /// contract is the uppercase form; this pins it for both shapes.
+    #[test]
+    fn issue_view_state_is_normalized_uppercase_across_backends() {
+        let rest = parse_issue_view(br#"{"number":7,"title":"t","body":"b","state":"closed"}"#)
+            .expect("rest shape parses");
+        let cli = parse_issue_view(br#"{"number":7,"title":"t","body":"b","state":"CLOSED"}"#)
+            .expect("cli shape parses");
+        assert_eq!(rest.state, "CLOSED");
+        assert_eq!(cli.state, "CLOSED");
+        assert_eq!(rest, cli, "both backends must yield an identical IssueView");
+    }
+
+    /// what this catches (#356): REST sends `"body": null` for an issue
+    /// with no description, and a bare `#[serde(default)]` covers a
+    /// MISSING key but still errors on an explicit null. That would
+    /// abort the whole close-merged run on the most ordinary input
+    /// there is — an issue that simply has no body (hence no
+    /// queue-card envelope, hence a card the closer should SKIP).
+    #[test]
+    fn issue_view_tolerates_null_and_missing_body() {
+        let null_body = parse_issue_view(br#"{"number":1,"title":"t","body":null,"state":"open"}"#)
+            .expect("null body must parse, not abort the run");
+        assert_eq!(null_body.body, "");
+
+        let missing_body = parse_issue_view(br#"{"number":1,"title":"t","state":"open"}"#)
+            .expect("missing body parses");
+        assert_eq!(missing_body.body, "");
+    }
+
     #[test]
     fn parse_pr_view_decodes_all_fields() {
         let json = br#"{
@@ -398,6 +685,8 @@ mod tests {
         assert!(view.state.is_empty());
         assert!(view.mergeable.is_empty());
         assert!(view.status_check_rollup.is_none());
+        assert!(view.base_ref_name.is_none());
+        assert!(view.base_ref_oid.is_none());
     }
 
     #[test]
@@ -490,6 +779,78 @@ mod tests {
         assert_eq!(parsed.status.as_deref(), Some("IN_PROGRESS"));
     }
 
+    // what this catches: REST check-runs are lowercase (`success`/`completed`)
+    // and the merge gate matches GraphQL's `SUCCESS`/`COMPLETED`; passed
+    // through verbatim, five green checks read as "5 check(s) still
+    // running" (card c03bb62f, 2026-09-04: continuum #3693/#3696/#3699
+    // all-green on GitHub, `airc work merge` refusing). GhCheck must be
+    // GraphQL-cased regardless of which client produced it.
+    #[test]
+    fn parse_check_runs_normalizes_rest_lowercase_to_graphql_case() {
+        let json = br#"{"total_count":2,"check_runs":[
+            {"id":1,"name":"cargo test","status":"completed","conclusion":"success","started_at":"2026-09-04T17:36:00Z"},
+            {"id":2,"name":"cargo check","status":"in_progress","conclusion":null}
+        ]}"#;
+        let runs = parse_check_runs(json).expect("parse");
+        assert_eq!(runs[0].status.as_deref(), Some("COMPLETED"));
+        assert_eq!(runs[0].conclusion.as_deref(), Some("SUCCESS"));
+        assert_eq!(runs[1].status.as_deref(), Some("IN_PROGRESS"));
+        assert_eq!(runs[1].conclusion, None);
+    }
+
+    // what this catches: the dialect boundary must make the two
+    // constructors interchangeable — a merged PR is `closed` + merged_at in
+    // REST and `MERGED` in GraphQL, and checks are lowercase in REST. Both
+    // must land on the canonical vocabulary the merge gate matches, or the
+    // gate silently misreads (card c03bb62f: merged PRs left cards at
+    // Review; green checks read as in-flight). Card fc483e57.
+    #[test]
+    fn from_rest_and_from_graphql_agree_on_the_canonical_vocabulary() {
+        let rest_pr = serde_json::json!({
+            "state": "closed",
+            "mergeable": true,
+            "merged_at": "2026-09-04T18:01:58Z",
+            "base": {"ref": "release/topic", "sha": "0123456789abcdef0123456789abcdef01234567"}
+        });
+        let rest_checks = parse_check_runs(
+            br#"{"total_count":1,"check_runs":[{"id":1,"name":"cargo test","status":"completed","conclusion":"success"}]}"#,
+        )
+        .expect("rest checks parse");
+        let from_rest = PrView::from_rest(&rest_pr, rest_checks);
+
+        let from_graphql = PrView::from_graphql(
+            br#"{"state":"MERGED","mergeable":"MERGEABLE","mergedAt":"2026-09-04T18:01:58Z",
+                 "baseRefName":"release/topic","baseRefOid":"0123456789abcdef0123456789abcdef01234567",
+                 "statusCheckRollup":[{"name":"cargo test","status":"COMPLETED","conclusion":"SUCCESS"}]}"#,
+        )
+        .expect("graphql parses");
+
+        assert_eq!(from_rest, from_graphql, "the dialects must converge");
+        assert_eq!(from_rest.state, "MERGED");
+        assert_eq!(from_rest.mergeable, "MERGEABLE");
+        assert_eq!(from_rest.base_ref_name.as_deref(), Some("release/topic"));
+        assert_eq!(
+            from_rest.base_ref_oid.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        let check = &from_rest.status_check_rollup.as_ref().unwrap()[0];
+        assert_eq!(check.status.as_deref(), Some("COMPLETED"));
+        assert_eq!(check.conclusion.as_deref(), Some("SUCCESS"));
+    }
+
+    // what this catches: a PR closed WITHOUT merging keeps its real state —
+    // the boundary normalizes vocabulary, it must not invent the merge fact.
+    #[test]
+    fn from_rest_keeps_closed_when_never_merged() {
+        let view = PrView::from_rest(
+            &serde_json::json!({"state": "closed", "mergeable": false}),
+            Vec::new(),
+        );
+        assert_eq!(view.state, "CLOSED");
+        assert_eq!(view.mergeable, "CONFLICTING");
+        assert_eq!(view.merged_at, None);
+    }
+
     #[test]
     fn parse_check_runs_extracts_rest_started_at() {
         // The REST endpoint uses snake_case `started_at` (different
@@ -501,6 +862,7 @@ mod tests {
             "total_count": 1,
             "check_runs": [
                 {
+                    "id": 1,
                     "name": "cargo test (windows-latest)",
                     "status": "in_progress",
                     "conclusion": null,
@@ -511,6 +873,57 @@ mod tests {
         let runs = parse_check_runs(json.to_string().as_bytes()).expect("REST envelope decodes");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].started_at.as_deref(), Some("2026-05-29T03:29:46Z"));
+    }
+
+    // What this catches (045083e8): error-shaped, missing, oversized,
+    // truncated, duplicate, or changing pages cannot form a complete proof.
+    #[test]
+    fn parse_check_runs_requires_complete_consistent_pages() {
+        for invalid in [
+            "",
+            r#"{"message":"Not Found"}"#,
+            r#"{"check_runs":[]}"#,
+            r#"{"total_count":0}"#,
+            r#"{"total_count":1,"check_runs":[]}"#,
+            r#"{"total_count":10001,"check_runs":[]}"#,
+            r#"{"total_count":1,"check_runs":[{"name":"missing id"}]}"#,
+            r#"{"total_count":1,"check_runs":[{"id":1,"name":"missing status","conclusion":"success"}]}"#,
+            r#"{"total_count":1,"check_runs":[{"id":1,"name":"missing verdict","status":"completed","conclusion":null}]}"#,
+        ] {
+            assert!(parse_check_runs(invalid.as_bytes()).is_err(), "{invalid}");
+        }
+        let first = serde_json::json!({
+            "total_count":101,
+            "check_runs": (1..=100).map(|id| serde_json::json!({
+                "id":id, "name":format!("check-{id}"), "status":"completed", "conclusion":"success"
+            })).collect::<Vec<_>>()
+        })
+        .to_string();
+        assert!(
+            parse_check_runs(first.as_bytes()).is_err(),
+            "first page is incomplete"
+        );
+        for (total, id) in [(101, 1), (102, 101)] {
+            let last = serde_json::json!({
+                "total_count":total,
+                "check_runs":[{"id":id,"name":"last","status":"completed","conclusion":"failure"}]
+            });
+            assert!(parse_check_runs(format!("{first}\n{last}").as_bytes()).is_err());
+        }
+        let complete = format!(
+            "{first}\n{}",
+            serde_json::json!({
+                "total_count":101,
+                "check_runs":[{"id":101,"name":"last","status":"completed","conclusion":"failure"}]
+            })
+        );
+        let checks = parse_check_runs(complete.as_bytes()).unwrap();
+        assert_eq!(checks.len(), 101);
+        assert_eq!(checks[100].conclusion.as_deref(), Some("FAILURE"));
+        assert!(parse_check_runs(
+            format!("{complete}\n{{\"total_count\":0,\"check_runs\":[]}}").as_bytes()
+        )
+        .is_err());
     }
 }
 
@@ -554,8 +967,8 @@ pub mod mock {
     use async_trait::async_trait;
 
     use super::{
-        BranchCheckRollupArgs, GhCheck, GhClient, GhError, MergeReceipt, PrCreateArgs, PrCreated,
-        PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+        BranchCheckRollupArgs, GhCheck, GhClient, GhError, IssueView, IssueViewArgs, MergeReceipt,
+        PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
     };
 
     /// Per-method response queue + per-method call record. All state
@@ -568,12 +981,14 @@ pub mod mock {
         pr_merge_queue: Mutex<VecDeque<Result<MergeReceipt, GhError>>>,
         pr_edit_base_queue: Mutex<VecDeque<Result<(), GhError>>>,
         branch_check_rollup_queue: Mutex<VecDeque<Result<Vec<GhCheck>, GhError>>>,
+        issue_view_queue: Mutex<VecDeque<Result<IssueView, GhError>>>,
 
         pr_view_calls: Mutex<Vec<PrViewArgs>>,
         pr_create_calls: Mutex<Vec<PrCreateArgs>>,
         pr_merge_calls: Mutex<Vec<PrMergeArgs>>,
         pr_edit_base_calls: Mutex<Vec<PrEditBaseArgs>>,
         branch_check_rollup_calls: Mutex<Vec<BranchCheckRollupArgs>>,
+        issue_view_calls: Mutex<Vec<IssueViewArgs>>,
     }
 
     impl MockGhClient {
@@ -605,6 +1020,11 @@ pub mod mock {
                 .lock()
                 .unwrap()
                 .push_back(result);
+        }
+
+        /// Queue the next [`GhClient::issue_view`] outcome. FIFO. Card #356.
+        pub fn queue_issue_view(&self, result: Result<IssueView, GhError>) {
+            self.issue_view_queue.lock().unwrap().push_back(result);
         }
 
         // --- call records ---
@@ -642,6 +1062,9 @@ pub mod mock {
         }
         pub fn received_branch_check_rollup_calls(&self) -> Vec<BranchCheckRollupArgs> {
             self.branch_check_rollup_calls.lock().unwrap().clone()
+        }
+        pub fn received_issue_view_calls(&self) -> Vec<IssueViewArgs> {
+            self.issue_view_calls.lock().unwrap().clone()
         }
     }
 
@@ -704,6 +1127,15 @@ pub mod mock {
                 .pop_front()
                 .unwrap_or_else(|| Err(unqueued("branch_check_rollup")))
         }
+
+        async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError> {
+            self.issue_view_calls.lock().unwrap().push(args);
+            self.issue_view_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(unqueued("issue_view")))
+        }
     }
 
     #[cfg(test)]
@@ -724,6 +1156,8 @@ pub mod mock {
                 mergeable: "MERGEABLE".to_string(),
                 status_check_rollup: Some(Vec::new()),
                 merged_at: None,
+                base_ref_name: None,
+                base_ref_oid: None,
             }
         }
 
