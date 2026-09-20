@@ -374,6 +374,22 @@ airc update
 
 `airc update` (aliases `airc upgrade`, `airc pull`) fast-forwards the installed source checkout on its current branch and refreshes the binary and skills. Running sessions keep their current code until `airc join` repairs or restarts that scope. There is no `--channel` flag; channel selection is the install checkout's git branch, switched manually outside the CLI.
 
+## Branches: main tracks canary on a cadence
+
+`main` is the front door — the installer above points at it. Work lands on
+`canary` first (`enforce-canary-staging` blocks other sources). On
+2026-09-20 main was found six weeks behind canary; nobody had thought to
+promote. Promotion is now a mechanism: `.github/workflows/promote-main.yml`
+runs daily (10:17 UTC) and on `workflow_dispatch`, and only when canary's
+tip is green on its own push checks. The recipe (main's history has diverged
+from canary's, so a plain canary→main PR conflicts): `git checkout -B
+promote/main-<date>-<tip> origin/canary && git merge -s ours origin/main`
+— main's history recorded, canary's tree byte for byte — push, PR against
+`main`, squash-merge. The squash commit carries `Promoted-Canary-Sha:`, the
+anchor the next run lists its commits from. If main ever gains protection
+with required checks, set the `PROMOTE_TOKEN` repo secret (fine-grained PAT,
+contents + pull-requests: write) so the promote PR's checks can run.
+
 ## Requirements
 
 - GitHub account with gist scope through `gh`

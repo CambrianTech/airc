@@ -35,6 +35,15 @@ jobs:
             exit 0
           fi
 
+          # The cadence promote (promote-main.yml, card 7c0990b0) opens its PR from
+          # `promote/main-<date>-<tip>`: canary's tree byte for byte, with main's
+          # history recorded via `merge -s ours`. It IS canary, by construction.
+          case "$HEAD_REF" in
+            promote/main-*)
+              echo "✓ PR source is a promote-main branch (canary's tree) — staging policy satisfied."
+              exit 0 ;;
+          esac
+
           # Title-based bypass — case-insensitive match against:
           #   - 'hotfix' anywhere (urgent escape hatch)
           #   - 'docs' / 'doc' / 'skills' as conventional-commits prefix
