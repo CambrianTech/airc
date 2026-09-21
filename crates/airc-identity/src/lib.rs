@@ -572,14 +572,29 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(path, bytes)?;
+    // Identity creation must never replace existing key material. In a legacy
+    // named-agent home, identity.key still belongs to that agent: adding the
+    // default identity must refuse rather than silently rotate the original.
+    // create_new also closes the check-then-write race between concurrent mints.
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            std::io::Error::new(error.kind(), format!(
+                "refusing to overwrite existing identity key {}; select the existing named agent or use a separate home",
+                path.display()
+            ))
+        } else {
+            error
+        }
+    })?;
+    file.write_all(bytes)?;
     Ok(())
 }
 
@@ -631,17 +646,23 @@ mod tests {
         assert_eq!(second.peer_id, identity.peer_id);
         assert_eq!(second.agent_name, "codex");
 
-        let default = LocalIdentity::load_or_generate(home.path()).await.unwrap();
-        assert_eq!(default.agent_name, airc_store::DEFAULT_AGENT_NAME);
-        assert_ne!(default.peer_id, identity.peer_id);
-        // #402: this assertion used to demand the OPPOSITE — that the two
-        // agents share one secret. Paired with the assert_ne! above it pinned
-        // the contradiction itself (distinct peer_ids, identical key), which
-        // is unrepresentable downstream: find_peer maps a pubkey to exactly
-        // one peer. Distinct identities carry distinct key material.
-        assert_ne!(
-            default.keypair.secret_bytes(),
-            identity.keypair.secret_bytes()
+        // A default CLI read of a legacy named home used to overwrite its key;
+        // the running citizen survived until restart, then failed peer trust.
+        let error = match LocalIdentity::load_or_generate_as(home.path(), "default").await {
+            Err(error) => error,
+            Ok(_) => panic!("the existing key must not be overwritten"),
+        };
+        assert!(
+            matches!(error, IdentityError::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert!(store.load_local_identity().await.unwrap().is_none());
+        let resumed = LocalIdentity::load_or_generate_as(home.path(), "codex")
+            .await
+            .unwrap();
+        assert_eq!(resumed.peer_id, identity.peer_id);
+        assert_eq!(
+            resumed.keypair.public_bytes(),
+            identity.keypair.public_bytes()
         );
     }
 
