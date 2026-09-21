@@ -578,10 +578,23 @@ impl Airc {
         Ok(claim_id)
     }
 
-    /// Release this peer's work claim.
+    /// Release this peer's work claim in the current room — the current-room
+    /// projection of [`Airc::release_work_claim_in`].
     pub async fn release_work_claim(&self, request: ReleaseWorkClaim) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.release_work_claim_in(&room, request).await
+    }
+
+    /// Release this peer's work claim on a card in a SPECIFIC room, without
+    /// touching the current-room pointer — the lifecycle sibling of
+    /// [`Airc::change_work_card_state_in`]. Same guard, room-parameterized:
+    /// the card must be on THIS room's board.
+    pub async fn release_work_claim_in(
+        &self,
+        room: &Room,
+        request: ReleaseWorkClaim,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::ClaimReleased(ClaimReleased {
             card_id: request.card_id,
             claim_id: request.claim_id,
@@ -589,7 +602,7 @@ impl Airc {
             reason: request.reason,
             released_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -740,9 +753,28 @@ impl Airc {
     /// Extend this peer's claim lease for a work card. Agents should
     /// heartbeat long-running work so stale claims become visible when
     /// a tab goes idle or dies instead of locking a lane indefinitely.
+    ///
+    /// Current-room projection of [`Airc::heartbeat_work_claim_in`].
     pub async fn heartbeat_work_claim(&self, request: HeartbeatWorkClaim) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.heartbeat_work_claim_in(&room, request).await
+    }
+
+    /// Extend this peer's claim lease on a card in a SPECIFIC room, without
+    /// touching the current-room pointer. A citizen holds cards across every
+    /// room she is in (her board reads already fold all of them), and her
+    /// renewals were pinned to `current_room()`: Kimi's minute-by-minute
+    /// renew of a card in her bench room failed "not in current room" every
+    /// minute while she stood in the project room, until the lease lapsed and
+    /// the card was re-granted to another peer with her patch finished
+    /// (continuum, 2026-09-21). The guard is unchanged in strength: the card
+    /// must be on THIS room's board.
+    pub async fn heartbeat_work_claim_in(
+        &self,
+        room: &Room,
+        request: HeartbeatWorkClaim,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
             card_id: request.card_id,
             claim_id: request.claim_id,
@@ -750,7 +782,7 @@ impl Airc {
             ttl_ms: request.ttl_ms,
             heartbeat_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
