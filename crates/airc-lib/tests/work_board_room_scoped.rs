@@ -42,6 +42,71 @@ fn titles(board: &airc_lib::WorkBoardProjection) -> Vec<String> {
     titles
 }
 
+// Regression: a reviewer standing elsewhere must publish the sibling and merge
+// into the parent's room, without redirecting their next unscoped command.
+#[tokio::test]
+async fn review_and_merge_keep_the_selected_room_without_changing_default() {
+    let machine = Machine::boot().await;
+    let alice = machine.attach("alice").await;
+    let target = alice.join("target-room").await.unwrap();
+    let parent = alice
+        .create_work_card(CreateWorkCard::new(
+            RepoId::new("test-org/test-repo").unwrap(),
+            "parent",
+            Priority::P1,
+        ))
+        .await
+        .unwrap();
+    let home = alice.join("home-room").await.unwrap();
+    let review = alice
+        .create_work_card_in(
+            &target,
+            CreateWorkCard::new(
+                RepoId::new("test-org/test-repo").unwrap(),
+                "review",
+                Priority::P1,
+            )
+            .reviewing(parent),
+        )
+        .await
+        .unwrap();
+    let request = airc_lib::MarkPullRequestMerged {
+        card_id: parent,
+        pull_request: airc_work::PullRequestRef {
+            repo: RepoId::new("test-org/test-repo").unwrap(),
+            number: 1,
+            head: airc_work::BranchName::new("feature").unwrap(),
+            base: airc_work::BranchName::new("canary").unwrap(),
+        },
+        merged_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    };
+    assert!(alice
+        .mark_pull_request_merged(request.clone())
+        .await
+        .is_err());
+    alice
+        .mark_pull_request_merged_in(&target, request)
+        .await
+        .unwrap();
+    let board = alice.work_board_in(&target).await.unwrap();
+    assert_eq!(board.card(review).unwrap().reviews, Some(parent));
+    assert_eq!(
+        board.card(parent).unwrap().state,
+        airc_work::CardState::Merged
+    );
+    assert!(alice
+        .work_board_in(&home)
+        .await
+        .unwrap()
+        .snapshot()
+        .cards
+        .is_empty());
+    assert_eq!(alice.current_room().await.unwrap().channel, home.channel);
+}
+
 #[tokio::test]
 async fn a_board_read_for_a_named_room_returns_that_rooms_cards_not_the_current_rooms() {
     let machine = Machine::boot().await;

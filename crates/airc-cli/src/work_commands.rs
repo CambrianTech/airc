@@ -101,6 +101,7 @@ pub async fn run_seed(
 ///     `--body` content (if any) follows.
 pub async fn run_review(
     home: &Path,
+    room: Option<String>,
     parent_id: String,
     pr: Option<String>,
     priority: Option<CliPriority>,
@@ -109,15 +110,21 @@ pub async fn run_review(
     let parent_card_id = parse_work_card_id(&parent_id)?;
     let airc = crate::commands::attached_airc(home).await?;
 
-    // Resolve the parent off the current room's board. Refusing on
-    // "no parent" is more useful than spawning an orphan review.
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    // Resolve once: parent lookup and sibling publication must share a room,
+    // even if another client changes this scope's default during the command.
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "review work in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    let board = airc.work_board_in(&room).await?;
     let parent = board.card(parent_card_id).ok_or_else(|| {
         format!(
-            "parent card {parent_card_id} not found in the current room's board; \
-             switch to the room that owns it, or pass the correct id"
+            "parent card {parent_card_id} not found in room {}; \
+             pass --room with the owning room, or the correct card id",
+            room.name
         )
     })?;
 
@@ -154,7 +161,7 @@ pub async fn run_review(
         ..request
     };
 
-    let review_card_id = airc.create_work_card(request).await?;
+    let review_card_id = airc.create_work_card_in(&room, request).await?;
     println!("review_card_id: {review_card_id} parent_card_id: {parent_card_id}");
     Ok(())
 }
@@ -571,16 +578,20 @@ pub async fn run_state(
 /// cleanup) breaks at compile-time, not at "disk full mid-session."
 pub(crate) async fn mark_merged_and_reclaim(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
     pull_request: airc_work::model::PullRequestRef,
     merged_at_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_lib::MarkPullRequestMerged;
-    airc.mark_pull_request_merged(MarkPullRequestMerged {
-        card_id,
-        pull_request,
-        merged_at_ms,
-    })
+    airc.mark_pull_request_merged_in(
+        room,
+        MarkPullRequestMerged {
+            card_id,
+            pull_request,
+            merged_at_ms,
+        },
+    )
     .await?;
     tracing::info!(
         target: "airc::work::merge::reclaim",
@@ -1717,6 +1728,7 @@ fn parse_pr_spec(input: &str) -> Result<u64, Box<dyn std::error::Error>> {
 /// stops.
 pub async fn run_merge(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     dry_run: bool,
     pending_timeout_secs: u64,
@@ -1726,12 +1738,17 @@ pub async fn run_merge(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
 
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
-    let card = board.card(card_uuid).ok_or_else(|| {
-        format!("card {card_uuid} not visible in current room's board projection")
-    })?;
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "merge work in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    let board = airc.work_board_in(&room).await?;
+    let card = board
+        .card(card_uuid)
+        .ok_or_else(|| format!("card {card_uuid} not visible in room {}", room.name))?;
 
     if card.state != CardState::Review {
         return Err(format!(
@@ -1787,7 +1804,7 @@ pub async fn run_merge(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            mark_merged_and_reclaim(&airc, card_uuid, pr.clone(), now_ms).await?;
+            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), now_ms).await?;
             println!(
                 "merged: card={card_uuid} pr=#{n} repo={r}",
                 n = pr.number,
@@ -1809,7 +1826,7 @@ pub async fn run_merge(
                 );
                 return Ok(());
             }
-            mark_merged_and_reclaim(&airc, card_uuid, pr.clone(), merged_at_ms).await?;
+            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), merged_at_ms).await?;
             println!(
                 "reconciled: card={card_uuid} pr=#{n} repo={r} (PR was already merged on GitHub)",
                 n = pr.number,
@@ -3976,14 +3993,13 @@ mod tests {
         let merger_prod = production_only(include_str!("merger.rs"));
 
         // Count direct method-call invocations — the
-        // `.mark_pull_request_merged(` form catches both
-        // `airc.mark_pull_request_merged(` and any chained
-        // access. Doc-comments use backticks around the bare
+        // The method prefix catches both current-room and explicit-room
+        // forms, including chained access. Doc-comments use the bare
         // name (`mark_pull_request_merged`) so they don't match.
         let total = work_commands_prod
-            .matches(".mark_pull_request_merged(")
+            .matches(".mark_pull_request_merged")
             .count()
-            + merger_prod.matches(".mark_pull_request_merged(").count();
+            + merger_prod.matches(".mark_pull_request_merged").count();
 
         assert_eq!(
             total, 1,
