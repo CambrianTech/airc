@@ -848,10 +848,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 body,
                 priority,
             } => work_commands::run_update(&home, card_id, title, body, priority).await,
-            WorkAction::State { card_id, state } => {
-                work_commands::run_state(&home, card_id, state).await
+            WorkAction::State {
+                room,
+                card_id,
+                state,
+            } => work_commands::run_state(&home, room, card_id, state).await,
+            WorkAction::Close { room, card_id } => {
+                work_commands::run_close(&home, room, card_id).await
             }
-            WorkAction::Close { card_id } => work_commands::run_close(&home, card_id).await,
             WorkAction::Cleanup { dry_run, force } => {
                 work_commands::run_cleanup(&home, dry_run, force).await
             }
