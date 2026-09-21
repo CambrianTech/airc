@@ -682,15 +682,27 @@ impl Airc {
         &self,
         request: LinkCardPullRequest,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.link_card_pull_request_in(&room, request).await
+    }
+
+    /// [`Self::link_card_pull_request`] against an EXPLICIT room, so a caller that
+    /// already resolved one binds the validation and the publication to the SAME room
+    /// (#1447). The un-scoped form above is this one against the current room, so the
+    /// two can never drift.
+    pub async fn link_card_pull_request_in(
+        &self,
+        room: &Room,
+        request: LinkCardPullRequest,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::PullRequestLinked(airc_work::event::PullRequestLinked {
             card_id: request.card_id,
             pull_request: request.pull_request,
             linked_by: self.peer_id(),
             linked_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 

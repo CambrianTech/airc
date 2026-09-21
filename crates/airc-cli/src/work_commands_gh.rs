@@ -25,13 +25,14 @@ use crate::lease;
 /// transition.
 pub(crate) async fn open_pr_and_link(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_work::model::{BranchName, PullRequestRef};
 
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    // The caller resolved this room once; the lookup, the link and the review sibling
+    // it spawns all bind to THAT room (#1447 extended to the review-transition path).
+    let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
@@ -124,10 +125,13 @@ pub(crate) async fn open_pr_and_link(
         head: BranchName::new(head_branch)?,
         base: BranchName::new(base_branch)?,
     };
-    airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
-        card_id,
-        pull_request,
-    })
+    airc.link_card_pull_request_in(
+        room,
+        airc_lib::LinkCardPullRequest {
+            card_id,
+            pull_request,
+        },
+    )
     .await?;
 
     println!("pull_request: {pr_url}");
@@ -138,7 +142,9 @@ pub(crate) async fn open_pr_and_link(
     // here must not undo the state transition or the PR link, and
     // re-running `state review` on a card whose review card already
     // exists is a no-op.
-    if let Err(error) = crate::work_commands::auto_spawn_review_card(airc, card_id, pr_url).await {
+    if let Err(error) =
+        crate::work_commands::auto_spawn_review_card(airc, room, card_id, pr_url).await
+    {
         eprintln!("airc: review card auto-spawn skipped — {error}");
     }
 

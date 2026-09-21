@@ -127,6 +127,9 @@ pub enum WorkAction {
     },
     /// Change a work card's lifecycle state.
     State {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
         /// New lifecycle state.
@@ -135,6 +138,9 @@ pub enum WorkAction {
     },
     /// Mark a work card closed so it no longer appears as claimable.
     Close {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
     },
