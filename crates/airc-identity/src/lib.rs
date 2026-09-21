@@ -648,10 +648,10 @@ mod tests {
 
         // A default CLI read of a legacy named home used to overwrite its key;
         // the running citizen survived until restart, then failed peer trust.
-        let error = LocalIdentity::load_or_generate_as(home.path(), "default")
-            .await
-            .err()
-            .expect("the existing key must not be overwritten");
+        let error = match LocalIdentity::load_or_generate_as(home.path(), "default").await {
+            Err(error) => error,
+            Ok(_) => panic!("the existing key must not be overwritten"),
+        };
         assert!(
             matches!(error, IdentityError::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists)
         );
