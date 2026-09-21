@@ -625,8 +625,9 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
         .expect("airc-core command must spawn");
     assert!(
         output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
+        "airc-core {:?} failed: status={} stdout={} stderr={}",
         args,
+        output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
