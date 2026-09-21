@@ -55,6 +55,7 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
 
     let prepared =
         crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
+    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
 
     // What the OPERATOR is holding, read before we replace it. `before`/`after`
     // above describe the git checkout; this describes the tool. They are
@@ -367,6 +368,7 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
 
     let prepared =
         crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
+    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
 
     // Back up the live binary BEFORE stopping the daemon — this is the rollback
     // anchor. Copying a running exe for read is allowed on every platform.
