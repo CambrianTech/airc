@@ -909,11 +909,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await
             }
             WorkAction::Review {
+                room,
                 parent_id,
                 pr,
                 priority,
                 body,
-            } => work_commands::run_review(&home, parent_id, pr, priority, body).await,
+            } => work_commands::run_review(&home, room, parent_id, pr, priority, body).await,
             WorkAction::Availability {
                 repo,
                 state,
@@ -934,10 +935,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             WorkAction::Merge {
+                room,
                 card_id,
                 dry_run,
                 pending_timeout_secs,
-            } => work_commands::run_merge(&home, card_id, dry_run, pending_timeout_secs).await,
+            } => {
+                work_commands::run_merge(&home, room, card_id, dry_run, pending_timeout_secs).await
+            }
             WorkAction::Link { card_id, pr } => work_commands::run_link(&home, card_id, pr).await,
             WorkAction::Relink { card_id, pr } => {
                 work_commands::run_relink(&home, card_id, pr).await

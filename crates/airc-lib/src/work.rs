@@ -738,15 +738,24 @@ impl Airc {
         &self,
         request: MarkPullRequestMerged,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.mark_pull_request_merged_in(&room, request).await
+    }
+
+    /// Attest a merge in the card's room without changing the caller's default.
+    pub async fn mark_pull_request_merged_in(
+        &self,
+        room: &Room,
+        request: MarkPullRequestMerged,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::PullRequestMerged(airc_work::event::PullRequestMerged {
             card_id: request.card_id,
             pull_request: request.pull_request,
             merged_by: self.peer_id(),
             merged_at_ms: request.merged_at_ms,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
