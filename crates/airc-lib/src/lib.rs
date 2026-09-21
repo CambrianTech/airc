@@ -45,6 +45,7 @@ pub mod capability_registry;
 pub mod command_bus;
 pub mod coordinator;
 mod daemon;
+pub mod daemon_lifecycle;
 pub mod delivery_ack;
 pub mod diagnostic_event_sink;
 pub mod error;

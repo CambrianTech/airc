@@ -395,6 +395,7 @@ pub async fn ensure_daemon_running(
     socket: PathBuf,
     _peers: Vec<PeerSpec>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let _lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::autostart(home)?;
     // 1. Fast path: home-resolved socket already has a current daemon.
     let client = DaemonClient::new(socket.clone());
     if let Ok(status) = client.status_with_timeout(Duration::from_millis(250)).await {
