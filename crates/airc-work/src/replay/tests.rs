@@ -63,6 +63,35 @@ fn transcript_work_event_decode_preserves_cursor() {
     assert_eq!(item.event, event);
     assert_eq!(item.cursor.lamport, 7);
     assert_eq!(item.cursor.event_id, EventId::from_u128(99));
+    let owner = PeerId::from_u128(2);
+    let update = crate::CardUpdated {
+        card_id: WorkCardId::from_u128(10),
+        title: Some("independent".into()),
+        body: None,
+        priority: None,
+        updated_by: owner,
+        updated_at_ms: 1100,
+        claim_selection: Some(crate::event::ClaimSelection {
+            claim_id: crate::ClaimId::from_u128(20),
+            owner,
+            selected_at_ms: 1100,
+        }),
+    };
+    let mut selection = self::transcript(100, 8, &WorkEvent::CardUpdated(update.clone()));
+    assert_eq!(
+        decode_transcript_work_event(&selection).unwrap().event,
+        WorkEvent::CardUpdated(update)
+    );
+    selection.peer_id = PeerId::from_u128(999);
+    let WorkEvent::CardUpdated(decoded) = decode_transcript_work_event(&selection).unwrap().event
+    else {
+        panic!("same event family")
+    };
+    assert!(
+        decoded.claim_selection.is_none(),
+        "publisher cannot select another owner's claim"
+    );
+    assert_eq!(decoded.title.as_deref(), Some("independent"));
 }
 
 #[test]

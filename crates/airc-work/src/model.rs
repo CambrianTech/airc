@@ -214,6 +214,10 @@ pub struct WorkCard {
     pub state: CardState,
     pub owner: Option<PeerId>,
     pub claim_id: Option<ClaimId>,
+    /// Provenance of the current claim, replaced only by an accepted claim
+    /// event and cleared on release. A legacy snapshot may not contain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_provenance: Option<ClaimProvenance>,
     pub claim_expires_at_ms: Option<u64>,
     pub last_heartbeat_at_ms: Option<u64>,
     pub pull_request: Option<PullRequestRef>,
@@ -234,6 +238,13 @@ pub struct WorkCard {
     /// A rejected submission is visible without poisoning the rest of replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_submission_rejection: Option<crate::event::RejectedSubmission>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimProvenance {
+    pub origin: crate::event::ClaimOrigin,
+    /// Decision time, preserved through automatic lease recovery.
+    pub selected_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

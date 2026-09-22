@@ -204,6 +204,7 @@ impl WorkBoardProjection {
             state: CardState::Open,
             owner: None,
             claim_id: None,
+            claim_provenance: None,
             claim_expires_at_ms: None,
             last_heartbeat_at_ms: None,
             pull_request: None,
@@ -234,6 +235,10 @@ impl WorkBoardProjection {
         card.state = CardState::Claimed;
         card.owner = Some(e.owner);
         card.claim_id = Some(e.claim_id);
+        card.claim_provenance = Some(crate::ClaimProvenance {
+            origin: e.origin,
+            selected_at_ms: e.selected_at_ms.unwrap_or(e.claimed_at_ms),
+        });
         card.claim_expires_at_ms = Some(e.claimed_at_ms + e.ttl_ms);
         card.last_heartbeat_at_ms = Some(e.claimed_at_ms);
         card.updated_at_ms = e.claimed_at_ms;
@@ -308,6 +313,7 @@ impl WorkBoardProjection {
         };
         card.owner = None;
         card.claim_id = None;
+        card.claim_provenance = None;
         card.claim_expires_at_ms = None;
         card.updated_at_ms = e.released_at_ms;
         Ok(())
@@ -328,6 +334,25 @@ impl WorkBoardProjection {
     /// already do.
     fn apply_card_updated(&mut self, e: &CardUpdated) -> Result<(), ProjectionError> {
         let card = self.card_mut(e.card_id)?;
+        if let Some(selection) = &e.claim_selection {
+            if card.claim_id == Some(selection.claim_id)
+                && card.owner == Some(selection.owner)
+                && e.updated_by == selection.owner
+                && card
+                    .claim_expires_at_ms
+                    .is_some_and(|end| end > selection.selected_at_ms)
+                && !card.state.is_settled()
+                && card
+                    .claim_provenance
+                    .as_ref()
+                    .is_none_or(|p| p.selected_at_ms <= selection.selected_at_ms)
+            {
+                card.claim_provenance = Some(crate::ClaimProvenance {
+                    origin: crate::ClaimOrigin::Explicit,
+                    selected_at_ms: selection.selected_at_ms,
+                });
+            }
+        }
         if let Some(ref title) = e.title {
             card.title = title.clone();
         }

@@ -97,6 +97,14 @@ pub fn decode_transcript_work_event(
                 }
             }
         })?;
+    if let WorkEvent::CardUpdated(update) = &mut work_event {
+        if update.claim_selection.as_ref().is_some_and(|choice| {
+            choice.owner != event.peer_id || update.updated_by != event.peer_id
+        }) {
+            // Ignore unauthenticated intent without poisoning independent amendments.
+            update.claim_selection = None;
+        }
+    }
     if let WorkEvent::WorkSubmitted(submission) = &work_event {
         let reason = if submission.publisher != event.peer_id {
             Some(crate::event::SubmissionRejectionReason::PublisherMismatch)
