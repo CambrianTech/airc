@@ -34,8 +34,8 @@ pub use drain_policy::{
 };
 pub use event::{
     AgentAvailabilityReported, CardCreated, CardStateChanged, CardUpdated, ClaimHeartbeat,
-    ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded,
-    LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
+    ClaimOrigin, ClaimReleased, GitBranchMoved, GitCommitObserved, GitDirtyStateChanged,
+    HygieneReportRecorded, LaneCreated, LaneStateChanged, ManagerHatClaimed, ManagerHatReleased,
     PullRequestCheckSuiteChanged, PullRequestLinked, PullRequestMergeStateChanged,
     PullRequestMerged, PullRequestRelinked, PullRequestReviewSubmitted, RejectedSubmission,
     RejectedWorkReview, SubmissionRejectionReason, WorkCardClaimed, WorkEvent, WorkReviewOutcome,
@@ -55,7 +55,7 @@ pub use local_git::{
     LocalGitSnapshot, LocalGitWorkspace,
 };
 pub use model::{
-    AgentAvailabilityState, BranchName, CardState, DirtyState, DrainCandidate,
+    AgentAvailabilityState, BranchName, CardState, ClaimProvenance, DirtyState, DrainCandidate,
     DrainCandidateCategory, DrainOutcome, GitObjectId, HygieneReport, LaneState, PrCheckState,
     PrMergeState, PrReviewState, PressureLevel, Priority, PullRequestRef, WorkCard, WorkspaceLease,
     WorkspaceStatus,

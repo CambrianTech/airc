@@ -333,11 +333,13 @@ async fn drain_sequence_through_store_replays_into_projection_state() {
 
 fn card_claimed(card_id: WorkCardId, claim: u128, owner: u128, claimed_at_ms: u64) -> WorkEvent {
     WorkEvent::CardClaimed(airc_work::WorkCardClaimed {
+        selected_at_ms: None,
         card_id,
         claim_id: airc_work::ClaimId::from_u128(claim),
         owner: PeerId::from_u128(owner),
         ttl_ms: 600_000,
         claimed_at_ms,
+        origin: airc_work::ClaimOrigin::Unknown,
     })
 }
 

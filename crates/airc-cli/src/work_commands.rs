@@ -259,10 +259,13 @@ pub async fn run_claim(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let claim_id = airc
-        .claim_work_card(ClaimWorkCard {
-            card_id: card_uuid,
-            ttl_ms,
-        })
+        .claim_work_card_with_origin(
+            ClaimWorkCard {
+                card_id: card_uuid,
+                ttl_ms,
+            },
+            airc_work::ClaimOrigin::Explicit,
+        )
         .await?;
     println!("claim_id: {claim_id}");
 
@@ -3465,6 +3468,7 @@ mod tests {
             state,
             owner,
             claim_id,
+            claim_provenance: None,
             claim_expires_at_ms,
             last_heartbeat_at_ms: None,
             pull_request: None,

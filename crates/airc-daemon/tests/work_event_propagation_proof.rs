@@ -260,11 +260,13 @@ async fn card_state_transitions_propagate_to_all_attached_peers() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id,
             owner,
             ttl_ms: 60_000,
             claimed_at_ms: 2,
+            origin: airc_work::ClaimOrigin::Unknown,
         }),
         WorkEvent::CardStateChanged(CardStateChanged {
             card_id,

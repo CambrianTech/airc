@@ -457,6 +457,9 @@ pub struct CardCreated {
 ///     reassignment is its own concern).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardUpdated {
+    /// Explicit choice of an already-held claim, without changing its lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_selection: Option<ClaimSelection>,
     pub card_id: WorkCardId,
     /// New title, if changing. `None` leaves the existing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -475,12 +478,42 @@ pub struct CardUpdated {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimSelection {
+    pub claim_id: ClaimId,
+    pub owner: PeerId,
+    pub selected_at_ms: u64,
+}
+
+/// Why the owner took this lease. Old events remain unknown, never inferred
+/// from the owner's identity or the card's title.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimOrigin {
+    Explicit,
+    Automatic,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl ClaimOrigin {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkCardClaimed {
+    /// Original decision time when recovering the same owner's lapsed choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_at_ms: Option<u64>,
     pub card_id: WorkCardId,
     pub claim_id: ClaimId,
     pub owner: PeerId,
     pub ttl_ms: u64,
     pub claimed_at_ms: u64,
+    #[serde(default, skip_serializing_if = "ClaimOrigin::is_unknown")]
+    pub origin: ClaimOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

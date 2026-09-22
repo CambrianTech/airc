@@ -150,6 +150,14 @@ pub enum AircError {
         room_id: airc_core::RoomId,
     },
 
+    #[error(
+        "work card {card_id} claim {claim_id} is not a live current claim owned by this caller"
+    )]
+    WorkClaimNotCurrent {
+        card_id: airc_work::WorkCardId,
+        claim_id: airc_work::ClaimId,
+    },
+
     /// Caller attempted to create a second active claim for a card
     /// that already has one. Claims are leases; duplicate active
     /// claims make manager/persona training data ambiguous.
