@@ -44,11 +44,20 @@ pub(crate) fn render_feed_line(event: &TranscriptEvent) -> Option<String> {
     // become a visible pilcrow so structure stays readable while the line
     // contract holds.
     let detail = detail.replace('\n', " ¶ ");
+    // The line's width is a budget, so the ids are 8-hex and not full UUIDs: a full
+    // sender + room is 87 characters of prefix before a single character of what was
+    // said, versus 31 short. Identity here is "which peer", not "which UUID" — `short`
+    // is already this file's convention. The bound is pinned by the test below.
+    //
+    // MEASURED, not assumed (2026-09-21): a Claude Code monitor cuts the rendered line
+    // at exactly 500 characters INCLUDING this prefix — four truncated notifications
+    // all landed at 500/87/413 total/header/body. So the prefix is charged against the
+    // message, and shortening it moves surviving body from 413 to 469, +56 chars.
     Some(format!(
         "[{kind:?}] {sender} → {channel}: {detail}",
         kind = event.kind,
-        sender = event.peer_id,
-        channel = event.room_id,
+        sender = short(&event.peer_id),
+        channel = short(&event.room_id),
     ))
 }
 
@@ -309,6 +318,67 @@ mod tests {
         assert!(
             line.contains("NVMe") && line.contains("Layer split"),
             "content survives flattening: {line}"
+        );
+    }
+
+    // what this catches (card d61513e4): the feed line spending its width on full
+    // UUIDs. A Claude Code monitor surfaces ONE line per event and cuts it at 500
+    // characters INCLUDING the prefix (measured: four truncated notifications all at
+    // exactly 500). A full sender + room is 87 of those before any content — 17% of
+    // the reader's view spent on two identifiers nobody reads digit-by-digit, and the
+    // shortening moves surviving message from 413 characters to 469.
+    //
+    // Reader-dependent: a peer on a different runtime reported all markers of a
+    // 1,661-char probe visible, so her cut is far wider. Nobody is made worse off by a
+    // shorter prefix, which is why this lands on its own merits; the line's STRUCTURE
+    // should not be redesigned around one reader's budget.
+    //
+    // Why it matters, measured 2026-09-21: a 922-char peer message whose ASK began at
+    // char 830 was truncated three separate times and the answer never reached the
+    // person who asked. Everyone writes context first and the request last, so a
+    // prefix tax is paid precisely in the half that carries the point.
+    //
+    // Mutation check: restoring `event.peer_id` / `event.room_id` fails the bound.
+    #[test]
+    fn the_feed_line_prefix_stays_short_so_the_message_survives_a_cut() {
+        use airc_core::{
+            ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
+        };
+        let event = TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: RoomId::new(),
+            peer_id: PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::Message,
+            occurred_at_ms: 0,
+            lamport: 0,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            body: Some(Body::text("the ask lives at the end of a long message")),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+        let line = render_feed_line(&event).expect("message renders");
+
+        let prefix = line
+            .find("the ask lives")
+            .expect("the body is present in the line");
+        assert!(
+            prefix <= 40,
+            "the prefix before the message is {prefix} chars; it must stay short so a \
+             truncating reader still sees what was said: {line}"
+        );
+
+        // The ids are still there — shortened, not dropped. A reader must be able to
+        // tell two peers apart in the feed; they just do not need 36 characters to.
+        let sender = event.peer_id.to_string();
+        let room = event.room_id.to_string();
+        assert!(line.contains(&sender[..8]), "sender is identified: {line}");
+        assert!(line.contains(&room[..8]), "room is identified: {line}");
+        assert!(
+            !line.contains(&sender) && !line.contains(&room),
+            "no full UUID belongs in a width-budgeted line: {line}"
         );
     }
 
