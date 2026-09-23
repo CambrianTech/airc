@@ -339,7 +339,9 @@ impl WorkSubmission {
         {
             return Err(Reason::WrongClaim);
         }
-        if card.state.is_settled() {
+        // Review settles scheduling, not immutable submission history: the current
+        // holder must still be able to publish a corrected candidate for review.
+        if matches!(card.state, CardState::Merged | CardState::Closed) {
             return Err(Reason::SettledCard);
         }
         if card
@@ -784,6 +786,124 @@ pub struct AgentAvailabilityReported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_accepts_corrected_submission_without_relaxing_claim_or_terminal_guards() {
+        let card_id = WorkCardId::from_u128(1);
+        let owner = PeerId::from_u128(2);
+        let claim_id = ClaimId::from_u128(3);
+        let mut board = crate::WorkBoardProjection::new();
+        board
+            .apply(&WorkEvent::CardCreated(CardCreated {
+                card_id,
+                repo: RepoId::new("CambrianTech/airc").unwrap(),
+                title: "correct a submitted patch".into(),
+                body: None,
+                priority: Priority::P1,
+                lane_id: None,
+                created_by: owner,
+                created_at_ms: 10,
+                reviews: None,
+                origin: None,
+            }))
+            .unwrap();
+        board
+            .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+                card_id,
+                claim_id,
+                owner,
+                ttl_ms: 1000,
+                claimed_at_ms: 20,
+                origin: ClaimOrigin::Automatic,
+                selected_at_ms: None,
+            }))
+            .unwrap();
+        let original = WorkSubmission {
+            submission_id: crate::SubmissionId::from_u128(4),
+            card_id,
+            claim_id,
+            instance: "card".into(),
+            base_sha: GitObjectId::new("a".repeat(40)).unwrap(),
+            artifact: airc_blobs::MediaRef {
+                hash: airc_blobs::ContentHash::from_bytes(b"corrected submission fixture"),
+                size_bytes: 100,
+                mime: Some("text/x-patch".into()),
+            },
+            publisher: owner,
+            submitted_at_ms: 30,
+        };
+        board
+            .apply(&WorkEvent::WorkSubmitted(original.clone()))
+            .unwrap();
+        board
+            .apply(&WorkEvent::CardStateChanged(CardStateChanged {
+                card_id,
+                state: CardState::Review,
+                changed_by: owner,
+                changed_at_ms: 40,
+            }))
+            .unwrap();
+        let corrected = WorkSubmission {
+            submission_id: crate::SubmissionId::from_u128(5),
+            base_sha: GitObjectId::new("c".repeat(40)).unwrap(),
+            submitted_at_ms: 50,
+            ..original.clone()
+        };
+        board
+            .apply(&WorkEvent::WorkSubmitted(corrected.clone()))
+            .unwrap();
+        let card = board.card(card_id).unwrap();
+        assert_eq!(card.submissions.len(), 2);
+        assert_eq!(card.submissions[0].submission_id, corrected.submission_id);
+        assert_eq!(card.state, CardState::Review);
+        assert_eq!(card.owner, Some(owner));
+        assert_eq!(card.claim_id, Some(claim_id));
+
+        let fresh = WorkSubmission {
+            submission_id: crate::SubmissionId::from_u128(6),
+            ..corrected.clone()
+        };
+        for state in [CardState::Merged, CardState::Closed] {
+            let mut terminal = card.clone();
+            terminal.state = state;
+            assert_eq!(
+                fresh.validate_for_card(&terminal),
+                Err(SubmissionRejectionReason::SettledCard)
+            );
+        }
+        let expired = WorkSubmission {
+            submitted_at_ms: 1020,
+            ..fresh.clone()
+        };
+        assert_eq!(
+            expired.validate_for_card(card),
+            Err(SubmissionRejectionReason::ExpiredClaim)
+        );
+        let foreign = WorkSubmission {
+            publisher: PeerId::from_u128(9),
+            ..fresh.clone()
+        };
+        assert_eq!(
+            foreign.validate_for_card(card),
+            Err(SubmissionRejectionReason::WrongClaim)
+        );
+        let stale = WorkSubmission {
+            claim_id: ClaimId::from_u128(9),
+            ..fresh
+        };
+        assert_eq!(
+            stale.validate_for_card(card),
+            Err(SubmissionRejectionReason::WrongClaim)
+        );
+        let conflict = WorkSubmission {
+            submission_id: original.submission_id,
+            ..corrected
+        };
+        assert_eq!(
+            conflict.validate_for_card(card),
+            Err(SubmissionRejectionReason::ConflictingId)
+        );
+    }
 
     #[test]
     fn work_event_serializes_with_kind_tag() {
