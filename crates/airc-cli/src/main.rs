@@ -749,6 +749,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::CodexHook(args) => match args.action {
+            CodexHookAction::ConfigureInstaller {
+                codex_home,
+                token_stdin,
+                command_rules,
+            } => integrations::codex::install::configure_installer(
+                codex_home,
+                token_stdin,
+                command_rules,
+            ),
             CodexHookAction::InstallHooks { codex_home } => {
                 integrations::codex::install::run_install_hooks(codex_home).await
             }

@@ -4,6 +4,30 @@ use std::path::PathBuf;
 
 use super::{config, hooks_json};
 
+pub fn configure_installer(
+    codex_home: Option<PathBuf>,
+    token_stdin: bool,
+    command_rules: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut token = String::new();
+    if token_stdin {
+        std::io::stdin().read_to_string(&mut token)?;
+    }
+    let token = token.trim();
+    if token_stdin && token.is_empty() {
+        return Err("empty token; configuration left unchanged".into());
+    }
+    config::configure_installer_at(
+        &codex_home
+            .unwrap_or_else(default_codex_home)
+            .join("config.toml"),
+        token_stdin.then_some(token),
+        command_rules,
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub struct HookInstallReport {
     pub lines: Vec<String>,
@@ -76,6 +100,13 @@ pub async fn run_uninstall_hooks(
     let codex_home = codex_home.unwrap_or_else(default_codex_home);
     let config = codex_home.join("config.toml");
     let hooks_json = codex_home.join("hooks.json");
+
+    if config::remove_installer_config(&config)? {
+        println!(
+            "removed AIRC-owned installer settings from {}",
+            config.display()
+        );
+    }
 
     if config::disable_managed_hooks_feature(&config)? {
         println!(

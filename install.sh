@@ -1288,31 +1288,20 @@ _install_airc_codex_gh_token() {
   local token; token=$(gh auth token 2>/dev/null) || return 0
   [ -z "$token" ] && return 0
 
-  local marker_start='# AIRC-GH-TOKEN-START — managed by install.sh; airc update refreshes the token; remove this section through AIRC-GH-TOKEN-END to opt out'
-  local marker_end='# AIRC-GH-TOKEN-END'
-
-  # Strip any prior airc-managed block (handles token rotation across
-  # install.sh runs). sed range-delete from start marker through end
-  # marker, inclusive.
-  if grep -qF "AIRC-GH-TOKEN-START" "$config" 2>/dev/null; then
-    local _tmp; _tmp=$(mktemp)
-    sed '/^# AIRC-GH-TOKEN-START/,/^# AIRC-GH-TOKEN-END/d' "$config" > "$_tmp"
-    mv "$_tmp" "$config"
+  local _airc=""
+  if [ -x "$BIN_DIR/airc.exe" ]; then
+    _airc="$BIN_DIR/airc.exe"
+  elif [ -x "$BIN_DIR/airc" ]; then
+    _airc="$BIN_DIR/airc"
+  else
+    warn "Cannot update Codex token: parser-capable airc binary unavailable"
+    return 0
   fi
-
-  # Append fresh block. Uses [shell_environment_policy.set] sub-table
-  # rather than inline `set = { ... }` syntax so it composes with any
-  # user-defined [shell_environment_policy] keys at the parent level
-  # (e.g. inherit, include_only) without conflict.
-  cat >> "$config" <<TOML
-
-$marker_start
-[shell_environment_policy.set]
-GH_TOKEN = "$token"
-$marker_end
-TOML
-
-  ok "Codex GH_TOKEN injection refreshed in ~/.codex/config.toml (gh's current token; restart Codex to apply)"
+  if printf '%s' "$token" | "$_airc" codex-hook configure-installer --codex-home "$HOME/.codex" --token-stdin; then
+    ok "Codex token configuration updated through the TOML parser"
+  else
+    warn "Codex token configuration was not updated; no append fallback"
+  fi
 }
 
 if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
@@ -1342,25 +1331,20 @@ _install_airc_codex_command_rules() {
   local config="$HOME/.codex/config.toml"
   [ "${AIRC_SKIP_CODEX_RULES:-0}" = "1" ] && return 0
   [ -f "$config" ] || return 0
-  if grep -qF 'AIRC-COMMAND-RULES-START' "$config" 2>/dev/null; then
+  local _airc=""
+  if [ -x "$BIN_DIR/airc.exe" ]; then
+    _airc="$BIN_DIR/airc.exe"
+  elif [ -x "$BIN_DIR/airc" ]; then
+    _airc="$BIN_DIR/airc"
+  else
+    warn "Cannot configure Codex rules: parser-capable airc binary unavailable"
     return 0
   fi
-  cat >> "$config" <<'TOML'
-
-# AIRC-COMMAND-RULES-START — managed by install.sh; pre-approves all
-# `airc *` commands so they aren't blocked by Codex's per-command approval
-# gate (which also restricts network access for un-approved commands).
-# Without this, only commands the user has manually approved-with-always
-# can reach the gist substrate; airc msg / airc status / etc would
-# silently fail in the sandbox until first-time approval. Remove this
-# block through AIRC-COMMAND-RULES-END to opt out.
-[rules]
-prefix_rules = [
-  { pattern = [{ token = "airc" }], decision = "allow" }
-]
-# AIRC-COMMAND-RULES-END
-TOML
-  ok "Codex airc-command pre-approval rule added to ~/.codex/config.toml — restart Codex to activate (no per-command approval prompts for airc verbs)"
+  if "$_airc" codex-hook configure-installer --codex-home "$HOME/.codex" --command-rules; then
+    ok "Codex rules configuration checked; existing user rules preserved"
+  else
+    warn "Codex rules configuration was not updated; no append fallback"
+  fi
 }
 
 if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
