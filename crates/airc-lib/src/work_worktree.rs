@@ -40,6 +40,39 @@ pub const LEASE_ZONE_RELATIVE: &str = ".airc/worktrees";
 /// the directory by eye.
 pub const SHORT_ID_LEN: usize = 8;
 
+/// Git keeps refs/worktree/* private to each linked worktree. This immutable
+/// creation anchor survives branch movement and keeps its commit reachable.
+pub const CREATION_BASE_REF: &str = "refs/worktree/airc-creation-base";
+
+/// Read only the recorded creation base. Legacy worktrees have no anchor: callers
+/// must ask for an explicit base rather than infer one from HEAD or a remote.
+pub fn creation_base(worktree: &Path) -> Result<String, String> {
+    resolve_commit(worktree, CREATION_BASE_REF).map_err(|error| {
+        format!("worktree creation base is unavailable; pass base_sha explicitly: {error}")
+    })
+}
+
+fn resolve_commit(repo: &Path, revision: &str) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{revision}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|e| format!("resolve commit in {}: {e}", repo.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "resolve commit {revision} in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
 /// `~/.airc/worktrees`, or `None` when neither `$HOME` nor `$USERPROFILE` is
 /// set. Environment, not cwd — a citizen has a home even with no checkout.
 pub fn worktree_root() -> Option<PathBuf> {
@@ -107,13 +140,14 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
     std::fs::create_dir_all(root)
         .map_err(|e| format!("create lease zone {}: {e}", root.display()))?;
 
+    // Resolve once before creation and give Git the immutable object, so a branch
+    // moving concurrently cannot make the recorded base differ from the new tree.
+    let base = resolve_commit(spec.clone_path, spec.start_point.unwrap_or("HEAD"))?;
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(spec.clone_path)
         .args(["worktree", "add", "-b", spec.branch])
-        .arg(path.as_os_str());
-    if let Some(start) = spec.start_point {
-        cmd.arg(start);
-    }
+        .arg(path.as_os_str())
+        .arg(&base);
     let out = cmd
         .output()
         .map_err(|e| format!("spawn git worktree add: {e}"))?;
@@ -122,6 +156,20 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
             "git worktree add failed in {}: {}",
             spec.clone_path.display(),
             String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Empty old-value means create-only: never overwrite an existing anchor.
+    // Record before submodule initialization, whose failure leaves the tree reusable.
+    let recorded = std::process::Command::new("git")
+        .current_dir(&path)
+        .args(["update-ref", CREATION_BASE_REF, &base, ""])
+        .output()
+        .map_err(|e| format!("record creation base in {}: {e}", path.display()))?;
+    if !recorded.status.success() {
+        return Err(format!(
+            "worktree {} was created but recording its creation base failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&recorded.stderr).trim()
         ));
     }
     init_submodules(&path)?;
@@ -266,6 +314,69 @@ mod tests {
         std::fs::write(dir.join("README"), b"root\n").expect("write README");
         git(dir, &["add", "."]);
         git(dir, &["commit", "-qm", "root"]);
+    }
+
+    // what this catches: moving the integration branch or committing work must not
+    // change an omitted submission base; reuse cannot invent a legacy base either.
+    #[test]
+    fn creation_base_is_pinned_per_worktree_and_never_inferred_on_reuse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let original = resolve_commit(&repo, "HEAD").unwrap();
+        temp_env::with_var("HOME", Some(&home), || {
+            let spec = WorktreeSpec {
+                card_id: card_id(),
+                clone_path: &repo,
+                branch: "first",
+                start_point: Some("main"),
+            };
+            let first = ensure_worktree(&spec).unwrap().path().to_owned();
+            assert_eq!(creation_base(&first).unwrap(), original);
+            git(
+                &repo,
+                &["commit", "--allow-empty", "-qm", "integration moved"],
+            );
+            let advanced = resolve_commit(&repo, "HEAD").unwrap();
+            assert_ne!(advanced, original);
+            let second_spec = WorktreeSpec {
+                card_id: WorkCardId::from_uuid(uuid::Uuid::new_v4()),
+                branch: "second",
+                ..spec.clone()
+            };
+            let second = ensure_worktree(&second_spec).unwrap().path().to_owned();
+            assert_eq!(creation_base(&second).unwrap(), advanced);
+            assert_eq!(
+                creation_base(&first).unwrap(),
+                original,
+                "anchors are worktree-local"
+            );
+            git(
+                &first,
+                &["commit", "--allow-empty", "-qm", "work committed"],
+            );
+            assert_eq!(
+                ensure_worktree(&spec).unwrap(),
+                WorktreeOutcome::Reused(first.clone())
+            );
+            assert_eq!(creation_base(&first).unwrap(), original);
+            assert!(
+                creation_base(&repo).is_err(),
+                "main checkout must not inherit linked anchor"
+            );
+            git(&first, &["update-ref", "-d", CREATION_BASE_REF]);
+            assert!(matches!(
+                ensure_worktree(&spec).unwrap(),
+                WorktreeOutcome::Reused(_)
+            ));
+            assert!(
+                creation_base(&first).unwrap_err().contains("pass base_sha"),
+                "reusing a legacy tree must not record its changed HEAD as the base"
+            );
+        });
     }
 
     // what this catches: `git worktree add` leaving submodules EMPTY, so a lease
