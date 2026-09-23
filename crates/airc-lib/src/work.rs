@@ -1659,6 +1659,48 @@ mod tests {
             )
             .await
             .unwrap();
+        // Regression for #1454: a v3 reader can advance its cursor while
+        // rejecting a Review-state correction. Upgrade must replay that event.
+        airc.publish_work_event_in(
+            &room,
+            &WorkEvent::CardStateChanged(CardStateChanged {
+                card_id: parent,
+                state: CardState::Review,
+                changed_by: airc.peer_id(),
+                changed_at_ms: now_ms().unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+        let corrected = airc
+            .submit_work_in(
+                &room,
+                SubmitWork {
+                    submission_id: airc_work::SubmissionId::new(),
+                    card_id: parent,
+                    claim_id: claim,
+                    instance: "ordinary-task".into(),
+                    base_sha: airc_work::GitObjectId::new("c".repeat(40)).unwrap(),
+                    artifact: artifact.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let current = airc.work_board_in(&room).await.unwrap();
+        assert_eq!(current.card(parent).unwrap().submissions[0], corrected);
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        legacy["version"] = 3.into();
+        legacy["projection"]["cards"][parent.to_string()]["submissions"] =
+            serde_json::json!([submission.clone()]);
+        std::fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let rebuilt = airc.work_board_in(&room).await.unwrap();
+        let rebuilt_card = rebuilt.card(parent).unwrap();
+        assert_eq!(rebuilt_card.submissions[0], corrected);
+        assert_eq!(rebuilt_card.submissions.len(), 2);
+        assert_eq!(rebuilt_card.state, CardState::Review);
+        assert_eq!(rebuilt_card.claim_id, Some(claim));
         let review_card = airc
             .create_work_card(
                 CreateWorkCard::new(repo, "review exact artifact", Priority::P1).reviewing(parent),
