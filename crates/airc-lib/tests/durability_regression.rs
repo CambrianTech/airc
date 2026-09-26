@@ -85,3 +85,77 @@ async fn a_message_survives_the_process_that_heard_it() {
         history.len()
     );
 }
+
+/// what this catches (2026-09-26): the MIRROR of the test above. Durability is
+/// for history, and only history. A backfill reply is stamped
+/// `request_response` — a whole page of forwarded frames, up to 8 MB — and the
+/// transcript persisted it anyway: 51,012 of 51,864 `events` rows (1,182 MB) on
+/// the IntelMac, 1,238 MB on the M5, the store that starved the 5090's daemon.
+///
+/// Both directions in one session so neither can be satisfied by breaking the
+/// other: the durable line must still survive the reopen, the request/response
+/// line must still be DELIVERED live, and only the durable one may be history.
+#[tokio::test]
+async fn a_request_response_is_delivered_live_but_never_becomes_history() {
+    use airc_core::Headers;
+    use airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS;
+    use futures::StreamExt;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join(".airc");
+    let durable = "the room must remember this line";
+    let exchange = "a recovery exchange is not history";
+
+    {
+        let airc = Airc::open(&home).await.expect("open");
+        airc.join("general").await.expect("join general");
+        let mut live = airc.subscribe().await.expect("subscribe");
+
+        airc.say(durable).await.expect("say durable");
+        let mut headers = Headers::new();
+        headers.insert(
+            HEADER_AIRC_DELIVERY_CLASS.to_string(),
+            "request_response".to_string(),
+        );
+        airc.say_with_headers(exchange, headers)
+            .await
+            .expect("say request_response");
+
+        // Live delivery first: the gate must drop PERSISTENCE, never delivery.
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), live.next())
+                .await
+                .expect("live delivery timed out — the gate dropped delivery, not just persistence")
+                .expect("stream ended")
+                .expect("live lag");
+            if let Some(text) = event.body.as_ref().and_then(airc_core::Body::as_text) {
+                seen.push(text.to_string());
+            }
+        }
+        assert!(
+            seen.iter().any(|t| t == durable),
+            "durable line not delivered live: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|t| t == exchange),
+            "request/response line not delivered live: {seen:?}"
+        );
+    }
+
+    let reopened = Airc::open(&home).await.expect("reopen same scope");
+    let history = reopened.page_recent(32).await.expect("page after reopen");
+    let texts: Vec<&str> = history
+        .iter()
+        .filter_map(|e| e.body.as_ref().and_then(airc_core::Body::as_text))
+        .collect();
+    assert!(
+        texts.contains(&durable),
+        "the durable line was forgotten: {texts:?}"
+    );
+    assert!(
+        !texts.contains(&exchange),
+        "a request_response frame became transcript history — the 1.2 GB of \
+         backfill replies measured on the IntelMac and the M5: {texts:?}"
+    );
+}

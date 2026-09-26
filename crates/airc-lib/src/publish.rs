@@ -234,9 +234,57 @@ pub(crate) fn delivery_class_from_header(value: Option<&str>) -> Result<Delivery
     }
 }
 
+/// Does this event belong in the local transcript (`events`) as HISTORY?
+///
+/// Decided from the delivery-class HEADER alone, never the body: the bodies this
+/// refuses are the large ones (a backfill reply is a whole page of forwarded
+/// frames, up to 8 MB), so the answer must not cost a decode. Only `durable` —
+/// or a missing header, which is legacy durable traffic — is history. Every
+/// other class is "routed live, not persisted by default" (`airc_bus::DeliveryClass`),
+/// and an unknown class must not become history either (`delivery_class_from_header`).
+///
+/// The bus store already honours this through `DeliveryClass::is_durable`; the
+/// transcript append sites did not. Measured 2026-09-26: request/response
+/// backfill replies were 51,012 of 51,864 transcript rows (1,182 MB) on the
+/// IntelMac and 1,238 MB on the M5 — the store that starved the 5090's daemon.
+pub(crate) fn is_transcript_history(headers: &Headers) -> bool {
+    delivery_class_from_header(headers.get(HEADER_AIRC_DELIVERY_CLASS).map(String::as_str))
+        .is_ok_and(DeliveryClass::is_durable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (2026-09-26, card 6781d7e9's source): request/response
+    // backfill replies persisted into the transcript as history — 98% of the
+    // IntelMac `events` rows. Only durable (or legacy header-less) traffic is
+    // history; every non-durable class and an unknown class are not.
+    #[test]
+    fn only_durable_or_headerless_events_are_transcript_history() {
+        let with = |v: &str| {
+            let mut h = Headers::new();
+            h.insert(HEADER_AIRC_DELIVERY_CLASS.to_string(), v.to_string());
+            h
+        };
+        assert!(
+            is_transcript_history(&Headers::new()),
+            "no header = legacy durable"
+        );
+        assert!(is_transcript_history(&with("durable")));
+        for not_history in [
+            "request_response",
+            "stream_chunk",
+            "ephemeral_latest",
+            "ephemeral_window",
+            "bogus",
+        ] {
+            assert!(
+                !is_transcript_history(&with(not_history)),
+                "{not_history} must not become history"
+            );
+        }
+    }
 
     // what this catches: the wire spelling of a delivery class going wrong
     // silently. Subscribers filter the presence plane by comparing this

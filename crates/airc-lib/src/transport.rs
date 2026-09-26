@@ -484,6 +484,18 @@ impl Airc {
             }
             return;
         }
+        // Routed live, never history — decided from the header, before any
+        // store work (mirror of `append_sent_frame`). A non-durable frame is
+        // delivered the moment it reaches live subscribers, so its receipt
+        // fires here rather than after a commit that must not happen.
+        if !crate::publish::is_transcript_history(&event.headers) {
+            let _ = self.inner.live_tx.send(Arc::new(event));
+            if ack_requested {
+                self.conclude_delivery_ack(ack_origin, event_id, frame_channel, frame_cursor)
+                    .await;
+            }
+            return;
+        }
         match self.inner.store.append(event.clone()).await {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {
                 // Record an observed peer identity card into the durable
