@@ -209,6 +209,13 @@ impl SqliteEventStore {
         Ok(row.try_get_by_index(0)?)
     }
 
+    /// Whether the file has LEFT `auto_vacuum = NONE` (0): `INCREMENTAL` (2) returns any
+    /// freelist through the bounded steps, and `FULL` (1) shrinks itself on every commit
+    /// (Fable on #1462). Either way a full VACUUM is never needed again.
+    pub async fn is_incremental(&self) -> Result<bool, StoreError> {
+        Ok(self.pragma_u64("auto_vacuum").await? != 0)
+    }
+
     async fn pragma_u64(&self, name: &str) -> Result<u64, StoreError> {
         let row = self
             .connection()
