@@ -35,11 +35,19 @@ pub const FULL_RECLAIM_AT_FREE_PERCENT: u64 = 25;
 /// gigabytes of dead file forever.
 pub const FULL_RECLAIM_REGARDLESS_AT_FREE_PERCENT: u64 = 60;
 
-/// PURE: which reclaim a pass should run, from the footprint and the idle signal.
-/// `None` when the freelist is not worth a transaction at all.
-pub fn reclaim_for(after: StoreFootprint, is_idle: bool) -> Option<Reclaim> {
+/// PURE: which reclaim a pass should run, from the footprint, the file's vacuum mode
+/// and the idle signal. `None` when the freelist is not worth a transaction at all.
+///
+/// A full VACUUM is needed exactly ONCE per file: to leave `auto_vacuum=0` (card
+/// d0d5a927, the #1461 follow-up). Once the file is `INCREMENTAL`, any freelist, 60% or
+/// 90%, comes back through bounded `incremental_vacuum` steps, so a full rebuild of an
+/// incremental file is a whole-file rewrite on the single connection for nothing.
+pub fn reclaim_for(after: StoreFootprint, incremental: bool, is_idle: bool) -> Option<Reclaim> {
     if after.free_bytes == 0 {
         return None;
+    }
+    if incremental {
+        return Some(Reclaim::Incremental);
     }
     let free = after.free_percent();
     if free >= FULL_RECLAIM_REGARDLESS_AT_FREE_PERCENT
@@ -63,7 +71,10 @@ pub async fn pass(store: &SqliteEventStore, is_idle: bool) {
             return;
         }
     };
-    let reclaim = reclaim_for(report.after, is_idle);
+    // Unknown mode reads as NOT incremental: the worst case is the one-time full pass
+    // this file would have needed anyway.
+    let incremental = store.is_incremental().await.unwrap_or(false); // unwrap_or: an unreadable pragma falls to the pre-follow-up behaviour, never to skipping a reclaim
+    let reclaim = reclaim_for(report.after, incremental, is_idle);
     let footprint = match reclaim {
         Some(mode) => match store.reclaim(mode).await {
             Ok(footprint) => footprint,
@@ -114,6 +125,13 @@ mod tests {
     // busy mesh would hold every send behind a rebuild; skipping reclaim entirely
     // below the threshold would let the freelist ride forever; reclaiming an
     // empty freelist is a transaction for nothing.
+    fn air_of() -> StoreFootprint {
+        StoreFootprint {
+            file_bytes: 2_917_000_000,
+            free_bytes: 2_026_000_000,
+        }
+    }
+
     #[test]
     fn a_full_reclaim_needs_both_a_worthwhile_freelist_and_a_quiet_mesh() {
         let heavy = StoreFootprint {
@@ -128,18 +146,29 @@ mod tests {
             file_bytes: 2_700_000_000,
             free_bytes: 0,
         };
-        assert_eq!(reclaim_for(heavy, true), Some(Reclaim::Full));
+        assert_eq!(reclaim_for(heavy, false, true), Some(Reclaim::Full));
         assert_eq!(
-            reclaim_for(heavy, false),
+            reclaim_for(heavy, false, false),
             Some(Reclaim::Incremental),
             "busy: never the rebuild"
         );
         assert_eq!(
-            reclaim_for(light, true),
+            reclaim_for(light, false, true),
             Some(Reclaim::Incremental),
             "not worth the lock"
         );
-        assert_eq!(reclaim_for(clean, true), None, "nothing to give back");
+        assert_eq!(
+            reclaim_for(clean, false, true),
+            None,
+            "nothing to give back"
+        );
+        // card d0d5a927: an INCREMENTAL file never takes the full rebuild, however much
+        // is free, because the bounded steps return it all.
+        assert_eq!(reclaim_for(heavy, true, true), Some(Reclaim::Incremental));
+        assert_eq!(
+            reclaim_for(air_of(), true, false),
+            Some(Reclaim::Incremental)
+        );
         // card 4de825ce: BigMama's first pass, 2,026 MB of 2,917 free, on a mesh that is
         // never quiet — the rebuild runs anyway, or the file stays dead weight forever.
         let air = StoreFootprint {
@@ -147,7 +176,7 @@ mod tests {
             free_bytes: 2_026_000_000,
         };
         assert_eq!(
-            reclaim_for(air, false),
+            reclaim_for(air, false, false),
             Some(Reclaim::Full),
             "mostly air: quiet or not"
         );
