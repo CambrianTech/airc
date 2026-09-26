@@ -171,6 +171,12 @@ impl SqliteEventStore {
                 db.execute_unprepared("PRAGMA auto_vacuum = INCREMENTAL")
                     .await?;
                 db.execute_unprepared("VACUUM").await?;
+                // In WAL mode the vacuumed image lands in the log, and the OS file keeps
+                // its old length until a checkpoint truncates it (BigMama, 2026-09-26:
+                // page accounting said 789 MB while the file was 2.92 GB plus a 1.6 GB
+                // WAL). The doctor line reads the file, so the reclaim finishes the job.
+                db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .await?;
             }
             Reclaim::Incremental => {
                 // Bounded steps, yielding between them. A step that frees nothing
@@ -425,6 +431,13 @@ mod tests {
         assert!(
             after.file_bytes < before.file_bytes,
             "the file shrank: {before:?} -> {after:?}"
+        );
+        // …and the OS file followed, not just the page accounting (WAL checkpointed).
+        let on_disk = std::fs::metadata(&path).expect("test: db file").len();
+        assert!(
+            on_disk <= after.file_bytes + 65_536,
+            "the file on disk is the page accounting: {on_disk} vs {}",
+            after.file_bytes
         );
         // Incremental reclaim is now live: rows deleted from here on come back
         // without a full vacuum.

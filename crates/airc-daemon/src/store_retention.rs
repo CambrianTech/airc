@@ -27,6 +27,13 @@ pub const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// A full vacuum is worth its lock when at least this share of the file is
 /// freelist. Below it, the incremental pass on every tick is enough.
 pub const FULL_RECLAIM_AT_FREE_PERCENT: u64 = 25;
+/// Past this share the file is mostly air and the full vacuum runs whether the mesh
+/// is quiet or not (card 4de825ce): on BigMama the first pass after #1459 left
+/// 2,026 MB of 2,917 on the freelist and the quiet gate never opened — a serving
+/// node is never quiet — so nothing came back until an operator ran VACUUM by hand
+/// (6.8 s of held writes for 2.9 GB). A minute of held writes is cheaper than two
+/// gigabytes of dead file forever.
+pub const FULL_RECLAIM_REGARDLESS_AT_FREE_PERCENT: u64 = 60;
 
 /// PURE: which reclaim a pass should run, from the footprint and the idle signal.
 /// `None` when the freelist is not worth a transaction at all.
@@ -34,7 +41,10 @@ pub fn reclaim_for(after: StoreFootprint, is_idle: bool) -> Option<Reclaim> {
     if after.free_bytes == 0 {
         return None;
     }
-    if after.free_percent() >= FULL_RECLAIM_AT_FREE_PERCENT && is_idle {
+    let free = after.free_percent();
+    if free >= FULL_RECLAIM_REGARDLESS_AT_FREE_PERCENT
+        || (free >= FULL_RECLAIM_AT_FREE_PERCENT && is_idle)
+    {
         Some(Reclaim::Full)
     } else {
         Some(Reclaim::Incremental)
@@ -130,5 +140,16 @@ mod tests {
             "not worth the lock"
         );
         assert_eq!(reclaim_for(clean, true), None, "nothing to give back");
+        // card 4de825ce: BigMama's first pass, 2,026 MB of 2,917 free, on a mesh that is
+        // never quiet — the rebuild runs anyway, or the file stays dead weight forever.
+        let air = StoreFootprint {
+            file_bytes: 2_917_000_000,
+            free_bytes: 2_026_000_000,
+        };
+        assert_eq!(
+            reclaim_for(air, false),
+            Some(Reclaim::Full),
+            "mostly air: quiet or not"
+        );
     }
 }
