@@ -205,3 +205,47 @@ async fn attached_subscribed_resume_merges_rooms_by_full_cursor_before_limit() {
         assert_eq!(cursor, page.events.last().unwrap().cursor());
     }
 }
+
+/// what this catches (2026-09-26): `daemon_send_frame` PINNED every attached
+/// structured send to `Durable`, ignoring the frame's own `airc.delivery_class`
+/// header — while `daemon_publish` beside it had already been fixed (#1341). So on
+/// an attached node a backfill reply stamped `request_response` (up to 8 MB), and
+/// every heartbeat, became a durable router row: 78% of durable writes on the M5.
+///
+/// The discriminator is the durable TIP: a non-durable frame sent after a durable
+/// one must not become the room's newest durable event. If the pin comes back, the
+/// tip is the request/response frame and this fails.
+#[tokio::test]
+async fn attached_structured_send_keeps_its_declared_class_not_a_durable_pin() {
+    use airc_core::{Body, Headers};
+    use airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS;
+
+    let machine = Machine::boot().await;
+    let (alice, bob) = machine.pair_in("class-not-pinned").await;
+
+    let durable = alice
+        .send(Body::text("history"), Headers::new())
+        .await
+        .expect("durable structured send");
+    let mut exchange = Headers::new();
+    exchange.insert(
+        HEADER_AIRC_DELIVERY_CLASS.to_string(),
+        "request_response".to_string(),
+    );
+    let reply = alice
+        .send(Body::text("a recovery exchange is not history"), exchange)
+        .await
+        .expect("request_response structured send");
+    assert_ne!(durable, reply);
+
+    let tip = bob
+        .latest_cursor()
+        .await
+        .expect("latest_cursor")
+        .expect("the durable send is the room's history");
+    assert_eq!(
+        tip.event_id, durable,
+        "a request_response frame became the durable tip — daemon_send_frame is \
+         pinning Durable again instead of honouring the frame's declared class"
+    );
+}
