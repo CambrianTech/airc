@@ -50,6 +50,7 @@ mod delivery;
 mod diagnostics;
 mod health;
 mod identity;
+mod store;
 
 use std::path::Path;
 
@@ -219,6 +220,7 @@ fn registry() -> Vec<Box<dyn Check>> {
     vec![
         Box::new(identity::IdentityCheck),
         Box::new(daemon::DaemonLivenessCheck),
+        Box::new(store::StoreFootprintCheck),
         Box::new(binary::BinaryFreshnessCheck),
         Box::new(diagnostics::DiagnosticsCheck),
         Box::new(daemon::DaemonBuildCheck),
