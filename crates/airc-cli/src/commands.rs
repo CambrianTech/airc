@@ -1808,32 +1808,50 @@ pub async fn run_daemon(
     //
     // Note the resolved TODO this carries: a connected-but-quiet node CAN now
     // update, which is the whole point. Exits on the shared shutdown notifier.
+    /// The mesh-idle predicate the periodic loops share (auto-update, the store
+    /// drain): quiet delivery stats, read without blocking the tick.
+    fn mesh_quiet_now(daemon_state: &airc_daemon::state::DaemonState) -> bool {
+        // try_read, NOT blocking_read: this predicate is called from
+        // inside the async tick, and tokio's RwLock::blocking_read
+        // panics in an async context — it would have taken the daemon
+        // down on the first tick.
+        match daemon_state.delivery_stats.try_read() {
+            Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
+                stats
+                    .peers
+                    .iter()
+                    .map(|s| (s.attempts_since_ack, s.suspect)),
+            ),
+            Err(_) => {
+                // Contended write (stats being refreshed). Skip THIS
+                // tick and retry next interval — never guess "quiet"
+                // from a lock we couldn't read. Loud, because a
+                // permanently-contended lock would silently become a
+                // node that never self-updates again, which is the
+                // exact failure class this whole path exists to kill.
+                eprintln!("airc auto-update: delivery stats busy — skipping this check");
+                false
+            }
+        }
+    }
+
     let auto_update_task = {
         let daemon_state = state.clone();
         tokio::spawn(async move {
-            airc_daemon::auto_update::run(&daemon_state.shutdown, || {
-                // try_read, NOT blocking_read: this predicate is called from
-                // inside the async tick, and tokio's RwLock::blocking_read
-                // panics in an async context — it would have taken the daemon
-                // down on the first tick.
-                match daemon_state.delivery_stats.try_read() {
-                    Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
-                        stats
-                            .peers
-                            .iter()
-                            .map(|s| (s.attempts_since_ack, s.suspect)),
-                    ),
-                    Err(_) => {
-                        // Contended write (stats being refreshed). Skip THIS
-                        // tick and retry next interval — never guess "quiet"
-                        // from a lock we couldn't read. Loud, because a
-                        // permanently-contended lock would silently become a
-                        // node that never self-updates again, which is the
-                        // exact failure class this whole path exists to kill.
-                        eprintln!("airc auto-update: delivery stats busy — skipping this check");
-                        false
-                    }
-                }
+            airc_daemon::auto_update::run(&daemon_state.shutdown, || mesh_quiet_now(&daemon_state))
+                .await;
+        })
+    };
+    // The drain (card 6781d7e9): the daemon that writes events.sqlite is the one
+    // that keeps it bounded — 2.65 GB of heartbeat rows and paging frames is what
+    // slowed this daemon past the core's patience on 2026-09-26. Same lifecycle
+    // as the auto-update loop; the full vacuum shares its quiet-mesh gate.
+    let store_retention_task = {
+        let daemon_state = state.clone();
+        let store = machine_store.clone();
+        tokio::spawn(async move {
+            airc_daemon::store_retention::run(&daemon_state.shutdown, store, || {
+                mesh_quiet_now(&daemon_state)
             })
             .await;
         })
@@ -2102,6 +2120,7 @@ pub async fn run_daemon(
     // abort is the same listener-error backstop. (The detached updater it may
     // have spawned is independent and intentionally outlives this process.)
     auto_update_task.abort();
+    store_retention_task.abort();
     // Server returned ⇒ shutdown fired ⇒ the registry loop's shutdown
     // waiter was woken by the same `notify_waiters()`. Await its clean
     // exit so the process doesn't drop an in-flight gist write
