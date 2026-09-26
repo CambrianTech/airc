@@ -297,6 +297,7 @@ impl Airc {
         // subscriber reads it, the store says DuplicateEventId
         // because the sender already persisted, but our local
         // subscribers haven't seen it).
+        self.observe_presence(&frame);
         let event = frame.into_transcript_event();
         let event_id = event.event_id;
         // Routed live, never history: a non-durable class (a backfill reply is

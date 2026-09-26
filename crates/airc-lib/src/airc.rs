@@ -383,6 +383,12 @@ pub(crate) struct AircInner {
     /// share it and the equality check would (incorrectly) suppress
     /// the cross-process peer's frames as "our own."
     pub(crate) recently_broadcast: std::sync::Mutex<BroadcastDeduper>,
+    /// Live presence per channel for a scope NOT attached to a daemon — the same
+    /// `airc_bus::EphemeralCache` the daemon's router keeps, fed from the two
+    /// in-process ingress points (airc#1341). An attached scope reads the
+    /// daemon's instead; this stays empty there.
+    pub(crate) presence:
+        std::sync::Mutex<std::collections::HashMap<airc_core::RoomId, airc_bus::EphemeralCache>>,
     /// Card 39d37629: in-process fan-out of delivery-ack responses.
     /// Ack frames are intercepted by `append_received_frame` BEFORE
     /// persistence (they are receipts, not transcript content) and
@@ -729,6 +735,7 @@ impl Airc {
                 recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                     RECENTLY_BROADCAST_CAPACITY,
                 )),
+                presence: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ack_tx: broadcast::channel(ACK_BROADCAST_CAPACITY).0,
                 diag_sink: std::sync::RwLock::new(Arc::new(
                     airc_diagnostics::StderrJsonDiagnosticSink,
@@ -1661,6 +1668,7 @@ impl Airc {
             recently_broadcast: std::sync::Mutex::new(BroadcastDeduper::with_capacity(
                 RECENTLY_BROADCAST_CAPACITY,
             )),
+            presence: std::sync::Mutex::new(std::collections::HashMap::new()),
             ack_tx: self.inner.ack_tx.clone(),
             diag_sink: std::sync::RwLock::new(self.diag_sink()),
             inbound_sink: std::sync::RwLock::new(self.inbound_frame_sink()),
