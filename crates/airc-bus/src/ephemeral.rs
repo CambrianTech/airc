@@ -16,11 +16,19 @@ use std::sync::Arc;
 
 use crate::envelope::Envelope;
 
-/// One coalesced entry: the latest envelope for its key, with the wall-clock
-/// time it landed (for TTL).
+/// Header an `EphemeralLatest` envelope may carry to set ITS OWN time-to-live in
+/// milliseconds, overriding the cache default. Read once, at coalesce, from the
+/// header — never the payload. Presence needs it: agent heartbeats beat every
+/// 60 s against a 30 s router default, so without it a live peer would expire
+/// between beats (airc#1341). A malformed value is ignored (the default stands).
+pub const HEADER_EPHEMERAL_TTL_MS: &str = "airc.ephemeral_ttl_ms";
+
+/// One coalesced entry: the latest envelope for its key, the wall-clock time it
+/// landed, and the TTL it lives by (its own header's, else the cache default).
 struct Entry {
     env: Arc<Envelope>,
     stored_at_ms: u64,
+    ttl_ms: u64,
 }
 
 /// Latest-wins ephemeral cache for one channel, keyed by `coalesce_key`.
@@ -48,11 +56,17 @@ impl EphemeralCache {
             .coalesce_key
             .clone()
             .unwrap_or_else(|| env.event_id.to_string());
+        let ttl_ms = env
+            .headers
+            .get(HEADER_EPHEMERAL_TTL_MS)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(self.ttl_ms); // JUSTIFIED unwrap_or: no (or malformed) per-envelope TTL = the cache default
         self.latest.insert(
             key,
             Entry {
                 env,
                 stored_at_ms: now_ms,
+                ttl_ms,
             },
         );
     }
@@ -73,9 +87,8 @@ impl EphemeralCache {
     /// sweep is never observable.
     pub fn sweep(&mut self, now_ms: u64) -> usize {
         let before = self.latest.len();
-        let ttl_ms = self.ttl_ms;
         self.latest
-            .retain(|_, e| !Self::is_expired(ttl_ms, e.stored_at_ms, now_ms));
+            .retain(|_, e| !Self::is_expired(e.ttl_ms, e.stored_at_ms, now_ms));
         before - self.latest.len()
     }
 
@@ -99,7 +112,7 @@ impl EphemeralCache {
     }
 
     fn expired(&self, e: &Entry, now_ms: u64) -> bool {
-        Self::is_expired(self.ttl_ms, e.stored_at_ms, now_ms)
+        Self::is_expired(e.ttl_ms, e.stored_at_ms, now_ms)
     }
 
     fn is_expired(ttl_ms: u64, stored_at_ms: u64, now_ms: u64) -> bool {
@@ -151,6 +164,53 @@ mod tests {
         );
         let removed = cache.sweep(1050);
         assert_eq!(removed, 1);
+    }
+
+    // what this catches (airc#1341): presence beats every 60 s against the router's
+    // 30 s default TTL, so a live peer would drop out of the snapshot between beats
+    // and every roster would flicker empty. An envelope's own TTL header must
+    // govern ITS entry, and must not stretch a neighbour's that did not ask.
+    #[test]
+    fn an_envelope_ttl_header_governs_its_own_entry_only() {
+        let mut cache = EphemeralCache::new(30_000);
+        let mut beat = presence(1, "presence:alice");
+        beat.headers
+            .insert(HEADER_EPHEMERAL_TTL_MS.to_string(), "180000".to_string());
+        cache.coalesce(Arc::new(beat), 0);
+        cache.coalesce(Arc::new(presence(2, "typing:bob")), 0);
+        let live = |at| {
+            let mut keys: Vec<_> = cache
+                .snapshot(at)
+                .iter()
+                .filter_map(|e| e.coalesce_key.clone())
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            live(60_000),
+            vec!["presence:alice"],
+            "past the default, only the long-lived entry survives"
+        );
+        assert_eq!(
+            cache.sweep(60_000),
+            1,
+            "sweep honours the per-entry TTL too"
+        );
+        assert!(cache.get("presence:alice", 179_999).is_some());
+        assert!(
+            cache.get("presence:alice", 180_000).is_none(),
+            "its own TTL still ends it"
+        );
+        // A malformed header is ignored, never a crash or an immortal entry.
+        let mut odd = presence(3, "presence:carol");
+        odd.headers
+            .insert(HEADER_EPHEMERAL_TTL_MS.to_string(), "soon".to_string());
+        cache.coalesce(Arc::new(odd), 0);
+        assert!(
+            cache.get("presence:carol", 30_000).is_none(),
+            "malformed TTL falls back to the default"
+        );
     }
 
     #[test]

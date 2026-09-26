@@ -119,7 +119,7 @@ fn target_to_mention(target: &Target) -> MentionTarget {
 }
 
 /// Project a decoded owner-core envelope to the SDK transcript shape.
-fn project(env: &Envelope) -> TranscriptEvent {
+pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
     TranscriptEvent {
         event_id: env.event_id,
         room_id: env.channel,
@@ -213,7 +213,7 @@ impl Airc {
                 delivery: ipc_delivery(delivery),
                 target: target.into(),
                 correlation_id: None,
-                coalesce_key: None,
+                coalesce_key: coalesce_key_of(&headers),
                 payload: body.to_payload(),
                 headers,
             })
@@ -250,7 +250,7 @@ impl Airc {
                 delivery: ipc_delivery(delivery),
                 target: IpcTarget::All,
                 correlation_id: None,
-                coalesce_key: None,
+                coalesce_key: coalesce_key_of(&headers),
                 // The consumer's `Body` is encoded to opaque payload
                 // bytes here; the daemon routes them without parsing.
                 payload: body.to_payload(),
@@ -279,6 +279,23 @@ impl Airc {
                 limit: Some(limit),
                 kinds: None,
             })
+            .await?;
+        response
+            .envelopes
+            .into_iter()
+            .map(decode_wire_event)
+            .collect()
+    }
+
+    /// airc#1341: the channel's live presence from the daemon's router
+    /// (its ephemeral latest-per-coalesce-key snapshot), not a log page.
+    pub(crate) async fn daemon_presence(
+        &self,
+        channel: RoomId,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .presence(airc_ipc::PresenceRequest { channel })
             .await?;
         response
             .envelopes
@@ -746,6 +763,13 @@ fn cursor_after(event: &TranscriptEvent) -> IpcCursor {
         counter,
         event_id: event.event_id,
     }
+}
+
+/// The coalesce key a frame declares in its header (airc#1341), if any.
+pub(crate) fn coalesce_key_of(headers: &airc_core::Headers) -> Option<String> {
+    headers
+        .get(airc_protocol::headers_keys::HEADER_AIRC_COALESCE_KEY)
+        .cloned()
 }
 
 /// `DeliveryClass` → the IPC spelling. One mapping for every daemon send, so a

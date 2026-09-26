@@ -448,6 +448,7 @@ impl Airc {
             return;
         }
 
+        self.observe_presence(&frame);
         let event = frame.into_transcript_event();
         let event_id = event.event_id;
         // The store dedups persistence by event_id —
