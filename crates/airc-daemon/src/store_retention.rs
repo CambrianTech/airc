@@ -65,9 +65,9 @@ pub async fn pass(store: &SqliteEventStore, is_idle: bool) {
         None => report.after,
     };
     eprintln!(
-        "airc store retention: removed {} heartbeat rows and {} paging frames; reclaim {:?}; file {} MB, free {} MB ({}%)",
+        "airc store retention: removed {} heartbeat rows and {} non-durable event rows; reclaim {:?}; file {} MB, free {} MB ({}%)",
         report.heartbeat_rows,
-        report.paging_rows,
+        report.non_durable_rows,
         reclaim,
         footprint.file_bytes / 1_000_000,
         footprint.free_bytes / 1_000_000,

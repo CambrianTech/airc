@@ -30,12 +30,28 @@ use crate::sqlite::SqliteEventStore;
 
 /// `bus_events` rows that were heartbeats: the header every heartbeat carries.
 /// Quoted because the key has dots in it.
-const DELETE_HEARTBEATS: &str =
-    r#"DELETE FROM bus_events WHERE json_type(headers, '$."airc.heartbeat.kind"') IS NOT NULL"#;
-/// `events` rows that were cursor-paging frames (backfill requests and replies):
-/// their body is `{"kind":"json","value":{...,"cursor_paging":true,...}}`.
-const DELETE_PAGING_FRAMES: &str =
-    "DELETE FROM events WHERE json_type(body, '$.value.cursor_paging') IS NOT NULL";
+const HEARTBEAT_ROW: &str = r#"json_type(headers, '$."airc.heartbeat.kind"') IS NOT NULL"#;
+/// `events` rows of any NON-DURABLE class — decided by the header, never the body
+/// (the header rule: classify at ingress from headers, never decode payloads). After
+/// #1457 no non-durable frame is transcript history, so every such row is dead:
+/// cursor-paging requests and replies (stamped `request_response` by the backfill
+/// exchange, up to 8 MB each) and any other class that predates the gate. A missing
+/// header means durable, exactly as `delivery_class_from_header` reads it.
+const NON_DURABLE_ROW: &str =
+    r#"coalesce(json_extract(headers, '$."airc.delivery_class"'), 'durable') <> 'durable'"#;
+
+/// Rows of rowid space one DELETE statement covers. The pools are
+/// `max_connections(1)` and SQLite has one writer: a single statement over a
+/// multi-GB backlog held both for its whole run — at boot, while peers backfill —
+/// which is the >2 s acquire stall that darkened a node for 7 h on 2026-09-26. A
+/// rowid WINDOW bounds each statement's work by the b-tree range it walks, not by
+/// how many rows match, so the first pass over a 1.4M-row table is ~140 short
+/// transactions with the connection and the write lock released between them.
+const DRAIN_WINDOW_ROWS: i64 = 10_000;
+
+/// Freelist pages one `incremental_vacuum` step returns (8 MB at 4 KiB pages):
+/// the same bound on the reclaim that the window is on the delete.
+const RECLAIM_STEP_PAGES: u64 = 2_048;
 
 /// The file as SQLite accounts for it: what it occupies and how much of that is
 /// freelist (dead pages a `DELETE` left behind, reclaimable by a vacuum).
@@ -59,7 +75,8 @@ impl StoreFootprint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrainReport {
     pub heartbeat_rows: u64,
-    pub paging_rows: u64,
+    /// `events` rows of a non-durable class (backfill frames above all).
+    pub non_durable_rows: u64,
     pub after: StoreFootprint,
 }
 
@@ -71,32 +88,66 @@ pub enum Reclaim {
     /// shrink an `auto_vacuum=0` file, and it also switches the file to
     /// `auto_vacuum=INCREMENTAL`, after which [`Reclaim::Incremental`] works.
     Full,
-    /// `PRAGMA incremental_vacuum`: returns freelist pages in short write
-    /// transactions a live daemon can afford on every tick. A no-op on a file
-    /// that has never had a full vacuum since the mode was set.
+    /// `PRAGMA incremental_vacuum(N)` in bounded steps: returns freelist pages in
+    /// short write transactions a live daemon can afford on every tick. A no-op on
+    /// a file that has never had a full vacuum since the mode was set.
     Incremental,
 }
 
 impl SqliteEventStore {
     /// Delete the two dead classes and report the footprint after.
     pub async fn drain_dead_rows(&self) -> Result<DrainReport, StoreError> {
-        let db = self.connection();
-        let heartbeat_rows = db
-            .execute(Statement::from_string(DbBackend::Sqlite, DELETE_HEARTBEATS))
-            .await?
-            .rows_affected();
-        let paging_rows = db
-            .execute(Statement::from_string(
-                DbBackend::Sqlite,
-                DELETE_PAGING_FRAMES,
-            ))
-            .await?
-            .rows_affected();
+        self.drain_dead_rows_windowed(DRAIN_WINDOW_ROWS).await
+    }
+
+    pub(crate) async fn drain_dead_rows_windowed(
+        &self,
+        window: i64,
+    ) -> Result<DrainReport, StoreError> {
+        let heartbeat_rows = self
+            .delete_in_windows("bus_events", HEARTBEAT_ROW, window)
+            .await?;
+        let non_durable_rows = self
+            .delete_in_windows("events", NON_DURABLE_ROW, window)
+            .await?;
         Ok(DrainReport {
             heartbeat_rows,
-            paging_rows,
+            non_durable_rows,
             after: self.footprint().await?,
         })
+    }
+
+    /// `DELETE … WHERE <predicate>` one rowid window at a time, yielding between
+    /// windows so queued appends and reads take the connection and the write lock
+    /// ([`DRAIN_WINDOW_ROWS`]). Bounded by the table's max rowid at the start: rows
+    /// written during the pass are the next pass's.
+    async fn delete_in_windows(
+        &self,
+        table: &str,
+        predicate: &str,
+        window: i64,
+    ) -> Result<u64, StoreError> {
+        let db = self.connection();
+        let max_rowid = self
+            .scalar_i64(&format!("SELECT coalesce(max(rowid), 0) FROM {table}"))
+            .await?;
+        let sql = format!("DELETE FROM {table} WHERE rowid > ? AND rowid <= ? AND {predicate}");
+        let mut low = 0i64;
+        let mut removed = 0u64;
+        while low < max_rowid {
+            let high = low.saturating_add(window.max(1));
+            removed += db
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    &sql,
+                    [low.into(), high.into()],
+                ))
+                .await?
+                .rows_affected();
+            low = high;
+            tokio::task::yield_now().await;
+        }
+        Ok(removed)
     }
 
     /// `page_size × page_count` and `page_size × freelist_count`, from SQLite
@@ -122,10 +173,34 @@ impl SqliteEventStore {
                 db.execute_unprepared("VACUUM").await?;
             }
             Reclaim::Incremental => {
-                db.execute_unprepared("PRAGMA incremental_vacuum").await?;
+                // Bounded steps, yielding between them. A step that frees nothing
+                // ends the loop: an `auto_vacuum=0` file ignores the pragma, and
+                // waiting on its freelist to shrink would never end.
+                let mut free = self.pragma_u64("freelist_count").await?;
+                while free > 0 {
+                    db.execute_unprepared(&format!(
+                        "PRAGMA incremental_vacuum({RECLAIM_STEP_PAGES})"
+                    ))
+                    .await?;
+                    let now = self.pragma_u64("freelist_count").await?;
+                    if now >= free {
+                        break;
+                    }
+                    free = now;
+                    tokio::task::yield_now().await;
+                }
             }
         }
         self.footprint().await
+    }
+
+    async fn scalar_i64(&self, sql: &str) -> Result<i64, StoreError> {
+        let row = self
+            .connection()
+            .query_one(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
+            .await?
+            .ok_or_else(|| StoreError::Migration(format!("`{sql}` returned no row")))?;
+        Ok(row.try_get_by_index(0)?)
     }
 
     async fn pragma_u64(&self, name: &str) -> Result<u64, StoreError> {
@@ -173,6 +248,19 @@ mod tests {
     }
 
     fn transcript_event(room: RoomId, lamport: u64, body: serde_json::Value) -> TranscriptEvent {
+        transcript_event_with(room, lamport, body, &[])
+    }
+
+    fn transcript_event_with(
+        room: RoomId,
+        lamport: u64,
+        body: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> TranscriptEvent {
+        let mut h = Headers::new();
+        for (k, v) in headers {
+            h.insert((*k).to_owned(), (*v).to_owned());
+        }
         TranscriptEvent {
             event_id: EventId::new(),
             room_id: room,
@@ -182,7 +270,7 @@ mod tests {
             occurred_at_ms: 1_700_000_000_000 + lamport,
             lamport,
             target: MentionTarget::All,
-            headers: Headers::new(),
+            headers: h,
             body: Some(Body::Json(body)),
             attachment: None,
             receipt: None,
@@ -194,7 +282,10 @@ mod tests {
     // acquires > 2 s, node dark 7 h behind it).
     // what this catches: the drain removes exactly the two dead classes — a
     // heartbeat row and a paging frame go, a durable event and a message with a
-    // body stay — and reports a footprint the file's length cannot lie about.
+    // body stay — and reports a footprint the file's length cannot lie about. The
+    // paging frame is picked by its HEADER class (`request_response`, as the
+    // backfill exchange stamps it), and a message stamped `durable` explicitly
+    // stays beside a header-less one: absent means durable.
     #[tokio::test]
     async fn the_drain_removes_the_two_dead_classes_and_nothing_else() {
         let dir = tempfile::tempdir().expect("test: tempdir");
@@ -221,10 +312,11 @@ mod tests {
             .await
             .expect("test: durable row");
         store
-            .append(transcript_event(
+            .append(transcript_event_with(
                 ch,
                 1,
                 serde_json::json!({"before": null, "channel": ch.to_string(), "cursor_paging": true, "limit": 200}),
+                &[("airc.delivery_class", "request_response")],
             ))
             .await
             .expect("test: paging frame");
@@ -236,11 +328,31 @@ mod tests {
             ))
             .await
             .expect("test: message");
+        store
+            .append(transcript_event_with(
+                ch,
+                3,
+                serde_json::json!({"text": "an explicitly durable message"}),
+                &[("airc.delivery_class", "durable")],
+            ))
+            .await
+            .expect("test: explicit durable message");
+        // A non-durable row that is NOT a paging frame: only the header class can
+        // tell it is dead (a body test for `cursor_paging` would keep it forever).
+        store
+            .append(transcript_event_with(
+                ch,
+                4,
+                serde_json::json!({"typing": true}),
+                &[("airc.delivery_class", "ephemeral_latest")],
+            ))
+            .await
+            .expect("test: pre-gate ephemeral row");
 
         let report = store.drain_dead_rows().await.expect("test: drain");
         assert_eq!(
-            (report.heartbeat_rows, report.paging_rows),
-            (1, 1),
+            (report.heartbeat_rows, report.non_durable_rows),
+            (1, 2),
             "exactly the dead classes"
         );
         assert!(
@@ -258,15 +370,17 @@ mod tests {
             .page_recent(Some(ch), 100)
             .await
             .expect("test: recent");
-        assert_eq!(events_left.len(), 1, "the message stays");
+        assert_eq!(events_left.len(), 2, "both durable messages stay");
         assert!(
-            matches!(&events_left[0].body, Some(Body::Json(v)) if v["text"] == "a real message"),
-            "the message stays intact"
+            events_left
+                .iter()
+                .any(|e| matches!(&e.body, Some(Body::Json(v)) if v["text"] == "a real message")),
+            "the header-less message stays intact"
         );
 
         // A second pass finds nothing: the drain is idempotent.
         let again = store.drain_dead_rows().await.expect("test: drain again");
-        assert_eq!((again.heartbeat_rows, again.paging_rows), (0, 0));
+        assert_eq!((again.heartbeat_rows, again.non_durable_rows), (0, 0));
     }
 
     // what this catches: the part a DELETE cannot do. The freelist a drain leaves
@@ -290,7 +404,12 @@ mod tests {
                 .expect("test: heartbeat row");
         }
         let before = store.footprint().await.expect("test: footprint");
-        let drained = store.drain_dead_rows().await.expect("test: drain");
+        // A window far below the row count: the drain must cover every window, not
+        // just the first one (the batched pass that keeps the connection free).
+        let drained = store
+            .drain_dead_rows_windowed(64)
+            .await
+            .expect("test: drain");
         assert_eq!(drained.heartbeat_rows, 2_000);
         assert!(
             drained.after.free_bytes > 0,
