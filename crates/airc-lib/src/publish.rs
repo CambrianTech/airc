@@ -248,8 +248,14 @@ pub(crate) fn delivery_class_from_header(value: Option<&str>) -> Result<Delivery
 /// backfill replies were 51,012 of 51,864 transcript rows (1,182 MB) on the
 /// IntelMac and 1,238 MB on the M5 — the store that starved the 5090's daemon.
 pub(crate) fn is_transcript_history(headers: &Headers) -> bool {
+    delivery_class_of(headers).is_ok_and(DeliveryClass::is_durable)
+}
+
+/// The delivery class a frame's own header declares — the ONE read every
+/// ingress uses, so the transcript gate and the router hand-off cannot disagree
+/// about what a frame is. Header-only; never touches the body.
+pub(crate) fn delivery_class_of(headers: &Headers) -> Result<DeliveryClass, String> {
     delivery_class_from_header(headers.get(HEADER_AIRC_DELIVERY_CLASS).map(String::as_str))
-        .is_ok_and(DeliveryClass::is_durable)
 }
 
 #[cfg(test)]
