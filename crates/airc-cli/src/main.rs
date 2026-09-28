@@ -21,6 +21,7 @@
 //! is the only policy used in CLI paths — no `AllowUnsigned` opt-in.
 
 mod build_info;
+mod card_mirror;
 mod channel_gist_cli;
 mod channel_gist_commands;
 mod cli;
@@ -934,6 +935,23 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 note,
                 ttl_ms,
             } => work_commands::run_availability(&home, repo, state, note, ttl_ms).await,
+            WorkAction::Mirror { action } => match action {
+                work_cli::MirrorAction::Run {
+                    repo,
+                    room,
+                    interval_secs,
+                    dry_run,
+                } => {
+                    card_mirror::run(
+                        &home,
+                        room,
+                        repo,
+                        std::time::Duration::from_secs(interval_secs),
+                        dry_run,
+                    )
+                    .await
+                }
+            },
             WorkAction::Merger { action } => match action {
                 work_cli::MergerAction::Run {
                     interval_secs,

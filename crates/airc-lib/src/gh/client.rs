@@ -1142,8 +1142,9 @@ pub mod mock {
     use async_trait::async_trait;
 
     use super::{
-        BranchCheckRollupArgs, GhCheck, GhClient, GhError, IssueView, IssueViewArgs, MergeReceipt,
-        PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+        BranchCheckRollupArgs, GhCheck, GhClient, GhError, IssueCreateArgs, IssueEditArgs,
+        IssueListArgs, IssueRecord, IssueView, IssueViewArgs, MergeReceipt, PrCreateArgs,
+        PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
     };
 
     /// Per-method response queue + per-method call record. All state

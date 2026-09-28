@@ -330,6 +330,13 @@ pub enum WorkAction {
         #[command(subcommand)]
         action: MergerAction,
     },
+    /// Card 9681e5b5: mirror a room's board onto GitHub issues of one repo, so the project's
+    /// cards, and who did what, are visible on GitHub. Only work created after the repo opts
+    /// in (its first run) is mirrored; existing issues are imported one at a time.
+    Mirror {
+        #[command(subcommand)]
+        action: MirrorAction,
+    },
     /// Card a399b342: merge a Review-state card's PR if CI is green.
     ///
     /// The same gate the auto-merger (`airc work merger run`) uses —
@@ -391,6 +398,25 @@ pub enum WorkAction {
         /// (e.g. https://github.com/CambrianTech/airc/pull/1137).
         #[arg(long)]
         pr: String,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum MirrorAction {
+    /// Start the card mirror loop for one repo.
+    Run {
+        /// The repo the cards mirror to (owner/name); only cards of this repo are mirrored.
+        #[arg(long)]
+        repo: String,
+        /// Subscribed room whose board to mirror; the current room when omitted.
+        #[arg(long)]
+        room: Option<String>,
+        /// Poll interval in seconds (default: 60).
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+        /// Log what WOULD be written to GitHub instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

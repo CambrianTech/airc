@@ -656,9 +656,18 @@ async fn perform_merge(
 /// Returns the held file handle (drop = release). A second launch in
 /// the same scope exits with a clear error instead of racing.
 fn acquire_singleton_lock(home: &Path) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    acquire_named_lock(home, "merger")
+}
+
+/// Acquire a non-blocking exclusive lock at `<home>/<name>.lock`: ONE process of a kind per
+/// scope (the merger, the card mirror). The held file is the lock; dropping it releases.
+pub(crate) fn acquire_named_lock(
+    home: &Path,
+    name: &str,
+) -> Result<std::fs::File, Box<dyn std::error::Error>> {
     use fs2::FileExt;
     std::fs::create_dir_all(home)?;
-    let path = home.join("merger.lock");
+    let path = home.join(format!("{name}.lock"));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -666,8 +675,8 @@ fn acquire_singleton_lock(home: &Path) -> Result<std::fs::File, Box<dyn std::err
         .open(&path)?;
     file.try_lock_exclusive().map_err(|e| {
         format!(
-            "another airc-merger is already running for {} ({}). \
-             only one merger per scope at a time — kill the other or wait.",
+            "another airc {name} is already running for {} ({}). \
+             only one per scope at a time — stop the other or wait.",
             home.display(),
             e
         )
