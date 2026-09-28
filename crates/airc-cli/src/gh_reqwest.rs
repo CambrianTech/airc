@@ -491,6 +491,54 @@ impl GhClient for ReqwestGhClient {
     ) -> Result<Vec<GhCheck>, GhError> {
         self.read_check_rollup(&args.repo, &args.branch).await
     }
+
+    /// Card 9681e5b5. `POST /repos/{owner}/{repo}/issues`, the body from the shared
+    /// [`airc_lib::gh::client::issue_create_payload`] so both backends send the same thing.
+    async fn issue_create(
+        &self,
+        args: airc_lib::gh::client::IssueCreateArgs,
+    ) -> Result<u64, GhError> {
+        let url = format!("{}/repos/{}/issues", self.api_base, args.repo);
+        let body = airc_lib::gh::client::issue_create_payload(&args);
+        let response = self
+            .send_authed(reqwest::Method::POST, &url, Some(&body))
+            .await?;
+        let json = handle_response(response).await?;
+        airc_lib::gh::client::parse_issue_number(&serde_json::to_vec(&json)?)
+    }
+
+    /// `PATCH /repos/{owner}/{repo}/issues/{number}` with only the changed fields.
+    async fn issue_edit(&self, args: airc_lib::gh::client::IssueEditArgs) -> Result<(), GhError> {
+        let url = format!(
+            "{}/repos/{}/issues/{}",
+            self.api_base, args.repo, args.number
+        );
+        let body = airc_lib::gh::client::issue_edit_payload(&args);
+        let response = self
+            .send_authed(reqwest::Method::PATCH, &url, Some(&body))
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(map_http_error_status(response.status(), response).await)
+        }
+    }
+
+    /// `GET /repos/{owner}/{repo}/issues?labels=<label>&state=all&per_page=100`.
+    async fn issue_list_by_label(
+        &self,
+        args: airc_lib::gh::client::IssueListArgs,
+    ) -> Result<Vec<airc_lib::gh::client::IssueRecord>, GhError> {
+        let url = format!(
+            "{}/repos/{}/issues?labels={}&state=all&per_page=100",
+            self.api_base, args.repo, args.label
+        );
+        let response = self
+            .send_authed(reqwest::Method::GET, &url, NO_BODY)
+            .await?;
+        let json = handle_response(response).await?;
+        airc_lib::gh::client::parse_issue_records(&serde_json::to_vec(&json)?)
+    }
 }
 
 // ============================================================================
