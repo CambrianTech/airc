@@ -156,6 +156,20 @@ pub trait GhClient: Send + Sync {
     /// verbs (`issue_edit_body`, `issue_close`) are the same pattern
     /// and are deliberately NOT built until a caller needs them.
     async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError>;
+
+    /// `POST /repos/{owner}/{repo}/issues`. Card 9681e5b5: the card mirror creates the
+    /// issue a work card projects to. Returns the new issue's number.
+    async fn issue_create(&self, args: IssueCreateArgs) -> Result<u64, GhError>;
+
+    /// `PATCH /repos/{owner}/{repo}/issues/{number}`, changing ONLY the fields given.
+    /// `labels`, when given, replaces the issue's label set (the mirror passes people's
+    /// labels through untouched; see `airc_work::issue_mirror::next_action`).
+    async fn issue_edit(&self, args: IssueEditArgs) -> Result<(), GhError>;
+
+    /// `GET /repos/{owner}/{repo}/issues?labels=<label>&state=all`: the issues carrying one
+    /// label, open or closed, pull requests excluded. The mirror finds a card's issue by its
+    /// `airc-card:<id>` label, so a create that timed out is found rather than duplicated.
+    async fn issue_list_by_label(&self, args: IssueListArgs) -> Result<Vec<IssueRecord>, GhError>;
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +442,126 @@ pub fn parse_issue_view(json: &[u8]) -> Result<IssueView, GhError> {
     Ok(serde_json::from_slice(json)?)
 }
 
+/// An issue to create (card 9681e5b5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueCreateArgs {
+    pub repo: String,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+}
+
+/// An issue's open or closed state on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueWireState {
+    Open,
+    Closed,
+}
+
+impl IssueWireState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueWireState::Open => "open",
+            IssueWireState::Closed => "closed",
+        }
+    }
+}
+
+/// An edit to an existing issue: only the `Some` fields change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueEditArgs {
+    pub repo: String,
+    pub number: u64,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub state: Option<IssueWireState>,
+    pub labels: Option<Vec<String>>,
+}
+
+/// Issues carrying one label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueListArgs {
+    pub repo: String,
+    pub label: String,
+}
+
+/// An issue with its labels, as the card mirror reads it. `state` is normalized
+/// uppercase, the same contract as [`IssueView`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRecord {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub labels: Vec<String>,
+}
+
+/// The JSON body both backends send to create an issue (one construction, so they
+/// cannot drift).
+pub fn issue_create_payload(args: &IssueCreateArgs) -> serde_json::Value {
+    serde_json::json!({ "title": args.title, "body": args.body, "labels": args.labels })
+}
+
+/// The JSON body both backends send to edit an issue: only the fields being changed.
+pub fn issue_edit_payload(args: &IssueEditArgs) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(title) = &args.title {
+        body.insert("title".into(), serde_json::Value::String(title.clone()));
+    }
+    if let Some(text) = &args.body {
+        body.insert("body".into(), serde_json::Value::String(text.clone()));
+    }
+    if let Some(state) = args.state {
+        body.insert(
+            "state".into(),
+            serde_json::Value::String(state.as_str().into()),
+        );
+    }
+    if let Some(labels) = &args.labels {
+        body.insert("labels".into(), serde_json::json!(labels));
+    }
+    serde_json::Value::Object(body)
+}
+
+/// The number of a created issue, from the REST reply.
+pub fn parse_issue_number(json: &[u8]) -> Result<u64, GhError> {
+    #[derive(Deserialize)]
+    struct Created {
+        number: u64,
+    }
+    Ok(serde_json::from_slice::<Created>(json)?.number)
+}
+
+/// Issues from a REST list reply, pull requests dropped (the issues endpoint returns
+/// both), bodies and states normalized as [`IssueView`] does.
+pub fn parse_issue_records(json: &[u8]) -> Result<Vec<IssueRecord>, GhError> {
+    #[derive(Deserialize)]
+    struct Label {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Item {
+        #[serde(flatten)]
+        view: IssueView,
+        #[serde(default)]
+        labels: Vec<Label>,
+        #[serde(default)]
+        pull_request: Option<serde_json::Value>,
+    }
+    let items: Vec<Item> = serde_json::from_slice(json)?;
+    Ok(items
+        .into_iter()
+        .filter(|item| item.pull_request.is_none())
+        .map(|item| IssueRecord {
+            number: item.view.number,
+            title: item.view.title,
+            body: item.view.body,
+            state: item.view.state,
+            labels: item.labels.into_iter().map(|l| l.name).collect(),
+        })
+        .collect())
+}
+
 /// GitHub's maximum requested page size; shared by both HTTP adapters.
 pub const CHECK_RUN_PAGE_SIZE: usize = 100;
 /// Bound work per rollup to 100 pages. Larger rollups are unverifiable by
@@ -654,6 +788,47 @@ mod tests {
         let missing_body = parse_issue_view(br#"{"number":1,"title":"t","state":"open"}"#)
             .expect("missing body parses");
         assert_eq!(missing_body.body, "");
+    }
+
+    // what this catches (card 9681e5b5): the card mirror finding a pull request as a
+    // card's issue (the issues endpoint returns both), or losing the labels it keys on.
+    // One edit sends only the fields being changed, so it can never blank a field.
+    #[test]
+    fn issue_records_keep_labels_and_drop_pull_requests() {
+        let records = parse_issue_records(
+            br#"[
+                {"number":7,"title":"t","body":null,"state":"open","labels":[{"name":"airc:state/open"},{"name":"good first issue"}]},
+                {"number":8,"title":"a pr","body":"b","state":"open","labels":[],"pull_request":{"url":"x"}}
+            ]"#,
+        )
+        .expect("a list reply parses");
+        assert_eq!(records.len(), 1, "the pull request is not an issue");
+        assert_eq!(records[0].number, 7);
+        assert_eq!(records[0].state, "OPEN");
+        assert_eq!(records[0].body, "");
+        assert_eq!(
+            records[0].labels,
+            vec![
+                "airc:state/open".to_string(),
+                "good first issue".to_string()
+            ]
+        );
+        let edit = issue_edit_payload(&IssueEditArgs {
+            repo: "o/r".into(),
+            number: 7,
+            title: None,
+            body: Some("new".into()),
+            state: Some(IssueWireState::Closed),
+            labels: None,
+        });
+        assert_eq!(
+            edit,
+            serde_json::json!({ "body": "new", "state": "closed" })
+        );
+        assert_eq!(
+            parse_issue_number(br#"{"number":42,"title":"x"}"#).expect("number"),
+            42
+        );
     }
 
     #[test]
@@ -967,8 +1142,9 @@ pub mod mock {
     use async_trait::async_trait;
 
     use super::{
-        BranchCheckRollupArgs, GhCheck, GhClient, GhError, IssueView, IssueViewArgs, MergeReceipt,
-        PrCreateArgs, PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
+        BranchCheckRollupArgs, GhCheck, GhClient, GhError, IssueCreateArgs, IssueEditArgs,
+        IssueListArgs, IssueRecord, IssueView, IssueViewArgs, MergeReceipt, PrCreateArgs,
+        PrCreated, PrEditBaseArgs, PrMergeArgs, PrView, PrViewArgs,
     };
 
     /// Per-method response queue + per-method call record. All state
@@ -989,6 +1165,12 @@ pub mod mock {
         pr_edit_base_calls: Mutex<Vec<PrEditBaseArgs>>,
         branch_check_rollup_calls: Mutex<Vec<BranchCheckRollupArgs>>,
         issue_view_calls: Mutex<Vec<IssueViewArgs>>,
+        issue_create_queue: Mutex<VecDeque<Result<u64, GhError>>>,
+        issue_edit_queue: Mutex<VecDeque<Result<(), GhError>>>,
+        issue_list_queue: Mutex<VecDeque<Result<Vec<IssueRecord>, GhError>>>,
+        issue_create_calls: Mutex<Vec<IssueCreateArgs>>,
+        issue_edit_calls: Mutex<Vec<IssueEditArgs>>,
+        issue_list_calls: Mutex<Vec<IssueListArgs>>,
     }
 
     impl MockGhClient {
@@ -1025,6 +1207,31 @@ pub mod mock {
         /// Queue the next [`GhClient::issue_view`] outcome. FIFO. Card #356.
         pub fn queue_issue_view(&self, result: Result<IssueView, GhError>) {
             self.issue_view_queue.lock().unwrap().push_back(result);
+        }
+
+        /// Queue the next [`GhClient::issue_create`] outcome. FIFO. Card 9681e5b5.
+        pub fn queue_issue_create(&self, result: Result<u64, GhError>) {
+            self.issue_create_queue.lock().unwrap().push_back(result);
+        }
+
+        /// Queue the next [`GhClient::issue_edit`] outcome. FIFO.
+        pub fn queue_issue_edit(&self, result: Result<(), GhError>) {
+            self.issue_edit_queue.lock().unwrap().push_back(result);
+        }
+
+        /// Queue the next [`GhClient::issue_list_by_label`] outcome. FIFO.
+        pub fn queue_issue_list(&self, result: Result<Vec<IssueRecord>, GhError>) {
+            self.issue_list_queue.lock().unwrap().push_back(result);
+        }
+
+        /// Every issue create the mock received, in order.
+        pub fn issue_create_calls(&self) -> Vec<IssueCreateArgs> {
+            self.issue_create_calls.lock().unwrap().clone()
+        }
+
+        /// Every issue edit the mock received, in order.
+        pub fn issue_edit_calls(&self) -> Vec<IssueEditArgs> {
+            self.issue_edit_calls.lock().unwrap().clone()
         }
 
         // --- call records ---
@@ -1135,6 +1342,36 @@ pub mod mock {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Err(unqueued("issue_view")))
+        }
+
+        async fn issue_create(&self, args: IssueCreateArgs) -> Result<u64, GhError> {
+            self.issue_create_calls.lock().unwrap().push(args);
+            self.issue_create_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(unqueued("issue_create")))
+        }
+
+        async fn issue_edit(&self, args: IssueEditArgs) -> Result<(), GhError> {
+            self.issue_edit_calls.lock().unwrap().push(args);
+            self.issue_edit_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(unqueued("issue_edit")))
+        }
+
+        async fn issue_list_by_label(
+            &self,
+            args: IssueListArgs,
+        ) -> Result<Vec<IssueRecord>, GhError> {
+            self.issue_list_calls.lock().unwrap().push(args);
+            self.issue_list_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(unqueued("issue_list_by_label")))
         }
     }
 

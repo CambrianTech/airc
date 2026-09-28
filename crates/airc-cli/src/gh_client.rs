@@ -188,6 +188,70 @@ impl GhClient for ShellGhClient {
         }
         parse_issue_view(&output.stdout)
     }
+
+    /// Card 9681e5b5. `gh api -X POST repos/{repo}/issues --input -`, the body from the
+    /// shared payload builder (JSON on stdin, so no field ever needs shell escaping).
+    async fn issue_create(
+        &self,
+        args: airc_lib::gh::client::IssueCreateArgs,
+    ) -> Result<u64, GhError> {
+        let path = format!("repos/{}/issues", args.repo);
+        let body = airc_lib::gh::client::issue_create_payload(&args);
+        let stdout = gh_api_json("POST", &path, Some(&body)).await?;
+        airc_lib::gh::client::parse_issue_number(&stdout)
+    }
+
+    async fn issue_edit(&self, args: airc_lib::gh::client::IssueEditArgs) -> Result<(), GhError> {
+        let path = format!("repos/{}/issues/{}", args.repo, args.number);
+        let body = airc_lib::gh::client::issue_edit_payload(&args);
+        gh_api_json("PATCH", &path, Some(&body)).await.map(|_| ())
+    }
+
+    async fn issue_list_by_label(
+        &self,
+        args: airc_lib::gh::client::IssueListArgs,
+    ) -> Result<Vec<airc_lib::gh::client::IssueRecord>, GhError> {
+        let path = format!(
+            "repos/{}/issues?labels={}&state=all&per_page=100",
+            args.repo, args.label
+        );
+        let stdout = gh_api_json("GET", &path, None).await?;
+        airc_lib::gh::client::parse_issue_records(&stdout)
+    }
+}
+
+/// One `gh api` call, with an optional JSON body on stdin. The one spawn shape the
+/// issue verbs share.
+async fn gh_api_json(
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<Vec<u8>, GhError> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut command = Command::new("gh");
+    command.args(["api", "-X", method, path]);
+    if body.is_some() {
+        command.args(["--input", "-"]);
+    }
+    command
+        .stdin(if body.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(map_spawn_error)?;
+    if let (Some(body), Some(mut stdin)) = (body, child.stdin.take()) {
+        let bytes = serde_json::to_vec(body)?;
+        stdin.write_all(&bytes).await.map_err(map_spawn_error)?;
+    }
+    let output = child.wait_with_output().await.map_err(map_spawn_error)?;
+    if !output.status.success() {
+        return Err(classify_gh_failure(&output));
+    }
+    Ok(output.stdout)
 }
 
 /// Classify a non-zero `gh` exit. Substrings are matched against
