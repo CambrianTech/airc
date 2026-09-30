@@ -35,11 +35,15 @@ try {
 $AircPath = (Resolve-Path -LiteralPath $AircPath -ErrorAction Stop).ProviderPath
 $runner = Join-Path (Split-Path $AircPath) 'airc-join-hidden.ps1'
 $source = Join-Path $PSScriptRoot 'run-join-hidden.ps1'
+$windowlessRunner = Join-Path (Split-Path $AircPath) 'airc-join-hidden.vbs'
+$windowlessSource = Join-Path $PSScriptRoot 'run-join-hidden.vbs'
 $runnerChanged = -not (Test-Path -LiteralPath $runner) -or
-    (Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $runner).Hash
+    (Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $runner).Hash -or
+    -not (Test-Path -LiteralPath $windowlessRunner) -or
+    (Get-FileHash -LiteralPath $windowlessSource).Hash -ne (Get-FileHash -LiteralPath $windowlessRunner).Hash
 $pending = $runner + '.restart-required'
 $logs = Join-Path $UserHome '.airc\logs'
-$shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$shell = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $existing = Get-AircStartupTask
 if ($ExistingOnly -and -not $existing) { return }
 if ($existing) {
@@ -55,8 +59,7 @@ if ($existing -and $existing.Actions[0].WorkingDirectory) {
     $workingDirectory = $existing.Actions[0].WorkingDirectory
 }
 $action = New-ScheduledTaskAction -Execute $shell -WorkingDirectory $workingDirectory `
-    -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "' +
-        $runner + '" -AircPath "' + $AircPath + '" -LogDirectory "' + $logs + '"')
+    -Argument ('//B //Nologo "' + $windowlessRunner + '" "' + $AircPath + '" "' + $logs + '"')
 $unchanged = $existing -and @($existing.Actions).Count -eq 1 -and
     $existing.Actions[0].Execute -eq $action.Execute -and
     $existing.Actions[0].Arguments -ceq $action.Arguments -and
@@ -64,7 +67,10 @@ $unchanged = $existing -and @($existing.Actions).Count -eq 1 -and
 $restart = $restart -or ($existing -and $existing.State -eq 'Running' -and
     (-not $unchanged -or $runnerChanged -or (Test-Path -LiteralPath $pending)))
 if ($unchanged -and -not $runnerChanged -and -not $restart) { return }
-if ($runnerChanged) { Copy-Item -LiteralPath $source -Destination $runner -Force }
+if ($runnerChanged) {
+    Copy-Item -LiteralPath $source -Destination $runner -Force
+    Copy-Item -LiteralPath $windowlessSource -Destination $windowlessRunner -Force
+}
 if ($restart) { Set-Content -LiteralPath $pending -Value 'running supervisor needs updated action' }
 if (-not $unchanged -and $existing) {
     # Retain the user's principal, triggers, restart policy and other settings.
