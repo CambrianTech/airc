@@ -14,6 +14,151 @@ fn airc_core() -> &'static str {
 }
 
 #[test]
+fn configure_installer_merges_config_and_rotates_token_without_duplicate_tables() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let path = codex_home.join("config.toml");
+    std::fs::write(
+        &path,
+        "[shell_environment_policy.set]\nKEEP = 'yes'\n[rules]\nkeep = true\n",
+    )
+    .unwrap();
+    let args = [
+        "codex-hook",
+        "configure-installer",
+        "--codex-home",
+        codex_home.to_str().unwrap(),
+        "--token-stdin",
+        "--command-rules",
+    ];
+    for token in ["synthetic-first", "synthetic-second", "synthetic-second"] {
+        let output = run_hook(&home, &args, token);
+        assert!(!output.contains(token));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc["shell_environment_policy"]["set"]["GH_TOKEN"].as_str(),
+            Some(token)
+        );
+        assert_eq!(
+            doc["shell_environment_policy"]["set"]["KEEP"].as_str(),
+            Some("yes")
+        );
+        assert_eq!(doc["rules"]["keep"].as_bool(), Some(true));
+    }
+}
+
+#[test]
+fn configure_installer_refuses_invalid_config_without_writing_or_echoing_it() {
+    let workspace = common::daemon_tempdir();
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let path = codex_home.join("config.toml");
+    let original = "secret = 'PRIVATE-SYNTHETIC'\nsecret = 'PRIVATE-SYNTHETIC'\n";
+    std::fs::write(&path, original).unwrap();
+    let output = command_for_home(&workspace.path().join("agent"))
+        .args(["codex-hook", "configure-installer", "--codex-home"])
+        .arg(&codex_home)
+        .arg("--command-rules")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE-SYNTHETIC"));
+}
+
+#[test]
+fn configure_installer_uninstall_removes_owned_values_but_preserves_siblings() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    let codex_home = workspace.path().join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let path = codex_home.join("config.toml");
+    std::fs::write(
+        &path,
+        "shell_environment_policy = { set = { KEEP = 'yes' } }\n",
+    )
+    .unwrap();
+    run_hook(
+        &home,
+        &[
+            "codex-hook",
+            "configure-installer",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+            "--token-stdin",
+            "--command-rules",
+        ],
+        "synthetic-token",
+    );
+    // A user can add settings after install; uninstall must remove only owned keys.
+    let mut doc = std::fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    doc["rules"]["keep"] = toml_edit::value(true);
+    std::fs::write(&path, doc.to_string()).unwrap();
+    run_ok(
+        &home,
+        &[
+            "codex-hook",
+            "uninstall-hooks",
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ],
+    );
+    let doc = std::fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert!(doc["shell_environment_policy"]["set"]
+        .get("GH_TOKEN")
+        .is_none());
+    assert_eq!(
+        doc["shell_environment_policy"]["set"]["KEEP"].as_str(),
+        Some("yes")
+    );
+    assert!(doc["rules"].get("prefix_rules").is_none());
+    assert_eq!(doc["rules"]["keep"].as_bool(), Some(true));
+
+    // With no user siblings the empty owned table must disappear, so reinstall works.
+    std::fs::write(&path, "").unwrap();
+    for _ in 0..2 {
+        run_ok(
+            &home,
+            &[
+                "codex-hook",
+                "configure-installer",
+                "--codex-home",
+                codex_home.to_str().unwrap(),
+                "--command-rules",
+            ],
+        );
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(doc["rules"].get("prefix_rules").is_some());
+        run_ok(
+            &home,
+            &[
+                "codex-hook",
+                "uninstall-hooks",
+                "--codex-home",
+                codex_home.to_str().unwrap(),
+            ],
+        );
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(!doc.contains_key("rules"));
+    }
+}
+
+#[test]
 fn codex_hook_emits_context_and_advances_cursor() {
     let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");

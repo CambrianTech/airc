@@ -38,6 +38,7 @@ pub(crate) mod reclaim;
 pub mod route_refresh;
 pub mod server;
 pub mod state;
+pub mod store_retention;
 pub mod trust_refresh;
 
 pub use server::{run, DaemonError};

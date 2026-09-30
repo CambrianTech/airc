@@ -127,6 +127,9 @@ pub enum WorkAction {
     },
     /// Change a work card's lifecycle state.
     State {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
         /// New lifecycle state.
@@ -135,6 +138,9 @@ pub enum WorkAction {
     },
     /// Mark a work card closed so it no longer appears as claimable.
     Close {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
     },
@@ -279,6 +285,9 @@ pub enum WorkAction {
     /// (atomic claim arbitrates *who works each*, not whether reviews
     /// exist).
     Review {
+        /// Subscribed room containing the parent; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Parent card UUID being reviewed.
         parent_id: String,
         /// Optional pull-request URL the reviewer should consult. The
@@ -335,6 +344,9 @@ pub enum WorkAction {
     /// `MarkPullRequestMerged` event so the projection transitions
     /// the card consistently with the auto-merger path.
     Merge {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
         /// Print the gate decision (Green / NotReady reason) without

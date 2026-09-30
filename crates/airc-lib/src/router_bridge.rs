@@ -519,7 +519,9 @@ impl InboundFrameSink for RouterInboundBridge {
 /// [`EventRouter::publish_if_new`] and the identity the delivery ack
 /// (`ack.for_event`) refers to. `seq`/`occurred_at_ms` are owner-
 /// stamped at publish, exactly like local sends.
-fn bus_envelope_for_inbound(frame: &Frame) -> Result<airc_bus::envelope::Envelope, String> {
+pub(crate) fn bus_envelope_for_inbound(
+    frame: &Frame,
+) -> Result<airc_bus::envelope::Envelope, String> {
     let delivery = crate::publish::delivery_class_from_header(
         frame
             .envelope
@@ -555,6 +557,7 @@ fn bus_envelope_for_inbound(frame: &Frame) -> Result<airc_bus::envelope::Envelop
         MentionTarget::Room(room) => Target::Endpoint(format!("room:{}", room.as_uuid())),
     };
     env.correlation_id = frame.envelope.reply_to.map(|id| id.as_uuid());
+    env.coalesce_key = crate::daemon::coalesce_key_of(&frame.envelope.headers);
     env.headers = frame.envelope.headers.clone();
     Ok(env)
 }

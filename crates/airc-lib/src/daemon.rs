@@ -119,7 +119,7 @@ fn target_to_mention(target: &Target) -> MentionTarget {
 }
 
 /// Project a decoded owner-core envelope to the SDK transcript shape.
-fn project(env: &Envelope) -> TranscriptEvent {
+pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
     TranscriptEvent {
         event_id: env.event_id,
         room_id: env.channel,
@@ -196,6 +196,13 @@ impl Airc {
         mut headers: airc_core::Headers,
     ) -> Result<crate::messaging::SendFrameResult, AircError> {
         room.stamp_name_header(&mut headers);
+        // The FRAME's class, read from its own header — never a pin. This was
+        // hardcoded `Durable` while `daemon_publish` beside it had already been
+        // fixed (#1341), so every attached structured send became a durable
+        // router row whatever it declared: backfill replies stamped
+        // `request_response`, and heartbeats — 78% of durable writes on the M5,
+        // 2026-09-26. An unknown explicit class is refused, never guessed.
+        let delivery = crate::publish::delivery_class_of(&headers).map_err(AircError::Transport)?;
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
@@ -203,10 +210,10 @@ impl Airc {
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
                 kind: kind.into(),
-                delivery: IpcDelivery::Durable,
+                delivery: ipc_delivery(delivery),
                 target: target.into(),
                 correlation_id: None,
-                coalesce_key: None,
+                coalesce_key: coalesce_key_of(&headers),
                 payload: body.to_payload(),
                 headers,
             })
@@ -240,16 +247,10 @@ impl Airc {
                 // then had to be read past by recall, RAG, and every
                 // digest forever. Presence is state, not an event (#1341).
                 // `publish` still passes Durable, so chat is unchanged.
-                delivery: match delivery {
-                    airc_bus::DeliveryClass::Durable => IpcDelivery::Durable,
-                    airc_bus::DeliveryClass::EphemeralLatest => IpcDelivery::EphemeralLatest,
-                    airc_bus::DeliveryClass::EphemeralWindow => IpcDelivery::EphemeralWindow,
-                    airc_bus::DeliveryClass::RequestResponse => IpcDelivery::RequestResponse,
-                    airc_bus::DeliveryClass::StreamChunk => IpcDelivery::StreamChunk,
-                },
+                delivery: ipc_delivery(delivery),
                 target: IpcTarget::All,
                 correlation_id: None,
-                coalesce_key: None,
+                coalesce_key: coalesce_key_of(&headers),
                 // The consumer's `Body` is encoded to opaque payload
                 // bytes here; the daemon routes them without parsing.
                 payload: body.to_payload(),
@@ -278,6 +279,23 @@ impl Airc {
                 limit: Some(limit),
                 kinds: None,
             })
+            .await?;
+        response
+            .envelopes
+            .into_iter()
+            .map(decode_wire_event)
+            .collect()
+    }
+
+    /// airc#1341: the channel's live presence from the daemon's router
+    /// (its ephemeral latest-per-coalesce-key snapshot), not a log page.
+    pub(crate) async fn daemon_presence(
+        &self,
+        channel: RoomId,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let response = self
+            .require_daemon_client()?
+            .presence(airc_ipc::PresenceRequest { channel })
             .await?;
         response
             .envelopes
@@ -744,6 +762,25 @@ fn cursor_after(event: &TranscriptEvent) -> IpcCursor {
         epoch,
         counter,
         event_id: event.event_id,
+    }
+}
+
+/// The coalesce key a frame declares in its header (airc#1341), if any.
+pub(crate) fn coalesce_key_of(headers: &airc_core::Headers) -> Option<String> {
+    headers
+        .get(airc_protocol::headers_keys::HEADER_AIRC_COALESCE_KEY)
+        .cloned()
+}
+
+/// `DeliveryClass` → the IPC spelling. One mapping for every daemon send, so a
+/// path cannot pin a class the frame did not declare.
+fn ipc_delivery(delivery: airc_bus::DeliveryClass) -> IpcDelivery {
+    match delivery {
+        airc_bus::DeliveryClass::Durable => IpcDelivery::Durable,
+        airc_bus::DeliveryClass::EphemeralLatest => IpcDelivery::EphemeralLatest,
+        airc_bus::DeliveryClass::EphemeralWindow => IpcDelivery::EphemeralWindow,
+        airc_bus::DeliveryClass::RequestResponse => IpcDelivery::RequestResponse,
+        airc_bus::DeliveryClass::StreamChunk => IpcDelivery::StreamChunk,
     }
 }
 

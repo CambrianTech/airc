@@ -495,6 +495,7 @@ mod tests {
             state: CardState::Open,
             owner: None,
             claim_id: None,
+            claim_provenance: None,
             claim_expires_at_ms: None,
             last_heartbeat_at_ms: None,
             pull_request: None,

@@ -563,25 +563,105 @@ impl Airc {
     /// Claim a work card for this peer. Returns the UUIDv4 claim id
     /// generated locally for the lease.
     pub async fn claim_work_card(&self, request: ClaimWorkCard) -> Result<ClaimId, AircError> {
+        self.claim_work_card_with_origin(request, airc_work::ClaimOrigin::Unknown)
+            .await
+    }
+
+    /// Claim through the same lease owner while recording the caller's known
+    /// decision source. Automatic pullers must identify themselves at their
+    /// call boundary; the shared claim verb cannot infer that from identity.
+    pub async fn claim_work_card_with_origin(
+        &self,
+        request: ClaimWorkCard,
+        origin: airc_work::ClaimOrigin,
+    ) -> Result<ClaimId, AircError> {
+        self.claim_work_card_with_provenance(request, origin, None)
+            .await
+    }
+
+    /// Recover a known decision without making automatic recovery a new choice.
+    pub async fn claim_work_card_with_provenance(
+        &self,
+        request: ClaimWorkCard,
+        origin: airc_work::ClaimOrigin,
+        selected_at_ms: Option<u64>,
+    ) -> Result<ClaimId, AircError> {
         self.ensure_work_card_in_current_room(request.card_id)
             .await?;
         self.ensure_work_card_unclaimed(request.card_id).await?;
         let claim_id = ClaimId::new();
         let event = WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms,
             card_id: request.card_id,
             claim_id,
             owner: self.peer_id(),
             ttl_ms: request.ttl_ms,
             claimed_at_ms: now_ms()?,
+            origin,
         });
         self.publish_work_event(&event).await?;
         Ok(claim_id)
     }
 
-    /// Release this peer's work claim.
-    pub async fn release_work_claim(&self, request: ReleaseWorkClaim) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
+    /// Record an explicit selection of a live claim already owned by this peer.
+    /// This updates intent only: no lease renewal, staging, or dispatch.
+    pub async fn select_work_claim(
+        &self,
+        card_id: WorkCardId,
+        claim_id: ClaimId,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_current_room(card_id).await?;
+        let room = self.current_room().await?;
+        let board = self
+            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
             .await?;
+        let at = now_ms()?;
+        let valid = board.card(card_id).is_some_and(|card| {
+            card.owner == Some(self.peer_id())
+                && card.claim_id == Some(claim_id)
+                && card.claim_expires_at_ms.is_some_and(|end| end > at)
+                && !card.state.is_settled()
+        });
+        if !valid {
+            return Err(AircError::WorkClaimNotCurrent { card_id, claim_id });
+        }
+        self.publish_work_event_in(
+            &room,
+            &WorkEvent::CardUpdated(airc_work::CardUpdated {
+                card_id,
+                title: None,
+                body: None,
+                priority: None,
+                updated_by: self.peer_id(),
+                updated_at_ms: at,
+                claim_selection: Some(airc_work::event::ClaimSelection {
+                    claim_id,
+                    owner: self.peer_id(),
+                    selected_at_ms: at,
+                }),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Release this peer's work claim in the current room — the current-room
+    /// projection of [`Airc::release_work_claim_in`].
+    pub async fn release_work_claim(&self, request: ReleaseWorkClaim) -> Result<(), AircError> {
+        let room = self.current_room().await?;
+        self.release_work_claim_in(&room, request).await
+    }
+
+    /// Release this peer's work claim on a card in a SPECIFIC room, without
+    /// touching the current-room pointer — the lifecycle sibling of
+    /// [`Airc::change_work_card_state_in`]. Same guard, room-parameterized:
+    /// the card must be on THIS room's board.
+    pub async fn release_work_claim_in(
+        &self,
+        room: &Room,
+        request: ReleaseWorkClaim,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::ClaimReleased(ClaimReleased {
             card_id: request.card_id,
             claim_id: request.claim_id,
@@ -589,7 +669,7 @@ impl Airc {
             reason: request.reason,
             released_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -611,6 +691,7 @@ impl Airc {
         self.ensure_work_card_in_current_room(request.card_id)
             .await?;
         let event = WorkEvent::CardUpdated(airc_work::event::CardUpdated {
+            claim_selection: None,
             card_id: request.card_id,
             title: request.title,
             body: request.body,
@@ -669,15 +750,27 @@ impl Airc {
         &self,
         request: LinkCardPullRequest,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.link_card_pull_request_in(&room, request).await
+    }
+
+    /// [`Self::link_card_pull_request`] against an EXPLICIT room, so a caller that
+    /// already resolved one binds the validation and the publication to the SAME room
+    /// (#1447). The un-scoped form above is this one against the current room, so the
+    /// two can never drift.
+    pub async fn link_card_pull_request_in(
+        &self,
+        room: &Room,
+        request: LinkCardPullRequest,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::PullRequestLinked(airc_work::event::PullRequestLinked {
             card_id: request.card_id,
             pull_request: request.pull_request,
             linked_by: self.peer_id(),
             linked_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -725,24 +818,52 @@ impl Airc {
         &self,
         request: MarkPullRequestMerged,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.mark_pull_request_merged_in(&room, request).await
+    }
+
+    /// Attest a merge in the card's room without changing the caller's default.
+    pub async fn mark_pull_request_merged_in(
+        &self,
+        room: &Room,
+        request: MarkPullRequestMerged,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::PullRequestMerged(airc_work::event::PullRequestMerged {
             card_id: request.card_id,
             pull_request: request.pull_request,
             merged_by: self.peer_id(),
             merged_at_ms: request.merged_at_ms,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
     /// Extend this peer's claim lease for a work card. Agents should
     /// heartbeat long-running work so stale claims become visible when
     /// a tab goes idle or dies instead of locking a lane indefinitely.
+    ///
+    /// Current-room projection of [`Airc::heartbeat_work_claim_in`].
     pub async fn heartbeat_work_claim(&self, request: HeartbeatWorkClaim) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.heartbeat_work_claim_in(&room, request).await
+    }
+
+    /// Extend this peer's claim lease on a card in a SPECIFIC room, without
+    /// touching the current-room pointer. A citizen holds cards across every
+    /// room she is in (her board reads already fold all of them), and her
+    /// renewals were pinned to `current_room()`: Kimi's minute-by-minute
+    /// renew of a card in her bench room failed "not in current room" every
+    /// minute while she stood in the project room, until the lease lapsed and
+    /// the card was re-granted to another peer with her patch finished
+    /// (continuum, 2026-09-21). The guard is unchanged in strength: the card
+    /// must be on THIS room's board.
+    pub async fn heartbeat_work_claim_in(
+        &self,
+        room: &Room,
+        request: HeartbeatWorkClaim,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
             card_id: request.card_id,
             claim_id: request.claim_id,
@@ -750,7 +871,7 @@ impl Airc {
             ttl_ms: request.ttl_ms,
             heartbeat_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -1493,12 +1614,33 @@ mod tests {
             .await
             .unwrap();
         let claim = airc
-            .claim_work_card(ClaimWorkCard {
-                card_id: parent,
-                ttl_ms: 600_000,
-            })
+            .claim_work_card_with_origin(
+                ClaimWorkCard {
+                    card_id: parent,
+                    ttl_ms: 600_000,
+                },
+                airc_work::ClaimOrigin::Explicit,
+            )
             .await
             .unwrap();
+        let board = airc.work_board().await.unwrap();
+        let parent_card = board.card(parent).unwrap();
+        assert_eq!(parent_card.claim_id, Some(claim));
+        assert_eq!(
+            parent_card.claim_provenance.as_ref().unwrap().origin,
+            airc_work::ClaimOrigin::Explicit
+        );
+        let before = parent_card.clone();
+        airc.select_work_claim(parent, claim).await.unwrap();
+        let board = airc.work_board().await.unwrap();
+        let selected = board.card(parent).unwrap();
+        assert_eq!(selected.claim_id, before.claim_id);
+        assert_eq!(selected.claim_expires_at_ms, before.claim_expires_at_ms);
+        assert_eq!(selected.last_heartbeat_at_ms, before.last_heartbeat_at_ms);
+        assert!(
+            selected.claim_provenance.as_ref().unwrap().selected_at_ms
+                >= before.claim_provenance.as_ref().unwrap().selected_at_ms
+        );
         let artifact: airc_work::SubmissionArtifact = serde_json::from_value(serde_json::json!({
             "hash": "b".repeat(64), "size_bytes": 5, "mime": "text/x-diff"
         }))
@@ -1517,6 +1659,48 @@ mod tests {
             )
             .await
             .unwrap();
+        // Regression for #1454: a v3 reader can advance its cursor while
+        // rejecting a Review-state correction. Upgrade must replay that event.
+        airc.publish_work_event_in(
+            &room,
+            &WorkEvent::CardStateChanged(CardStateChanged {
+                card_id: parent,
+                state: CardState::Review,
+                changed_by: airc.peer_id(),
+                changed_at_ms: now_ms().unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+        let corrected = airc
+            .submit_work_in(
+                &room,
+                SubmitWork {
+                    submission_id: airc_work::SubmissionId::new(),
+                    card_id: parent,
+                    claim_id: claim,
+                    instance: "ordinary-task".into(),
+                    base_sha: airc_work::GitObjectId::new("c".repeat(40)).unwrap(),
+                    artifact: artifact.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let current = airc.work_board_in(&room).await.unwrap();
+        assert_eq!(current.card(parent).unwrap().submissions[0], corrected);
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        legacy["version"] = 3.into();
+        legacy["projection"]["cards"][parent.to_string()]["submissions"] =
+            serde_json::json!([submission.clone()]);
+        std::fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let rebuilt = airc.work_board_in(&room).await.unwrap();
+        let rebuilt_card = rebuilt.card(parent).unwrap();
+        assert_eq!(rebuilt_card.submissions[0], corrected);
+        assert_eq!(rebuilt_card.submissions.len(), 2);
+        assert_eq!(rebuilt_card.state, CardState::Review);
+        assert_eq!(rebuilt_card.claim_id, Some(claim));
         let review_card = airc
             .create_work_card(
                 CreateWorkCard::new(repo, "review exact artifact", Priority::P1).reviewing(parent),
@@ -1686,6 +1870,7 @@ mod tests {
             state,
             owner: None,
             claim_id: None,
+            claim_provenance: None,
             claim_expires_at_ms: None,
             last_heartbeat_at_ms: None,
             pull_request,

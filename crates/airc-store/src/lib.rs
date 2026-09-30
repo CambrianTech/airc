@@ -48,6 +48,7 @@ pub mod mesh_identity;
 pub mod migration;
 pub mod peer_trust;
 pub mod refresh_lock;
+pub mod retention;
 pub mod scoped_state;
 pub mod sqlite;
 pub mod store;
