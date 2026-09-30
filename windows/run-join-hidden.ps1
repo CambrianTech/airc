@@ -27,7 +27,9 @@ try {
     $stdout = $process.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
     $stderr = $process.StandardError.BaseStream.CopyToAsync($errorLog)
     $process.WaitForExit()
-    [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdout, $stderr))
+    # A detached descendant may inherit the pipe writers. Its lifetime must not
+    # delay reporting join's exit to Task Scheduler. Allow only a bounded flush.
+    $null = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdout, $stderr), 250)
     exit $process.ExitCode
 } catch {
     Write-Error $_

@@ -77,7 +77,7 @@ public class JoinFixture {
     $hostProcess.Dispose()
     $descendant = Get-Process -Id ([int](Get-Content -LiteralPath ($binary + '.pid')))
     if ($descendant.HasExited) { throw 'Join supervisor killed its detached descendant' }
-    if ((Get-Content -LiteralPath ($binary + '.console') -Raw) -ne 'visible=False;tty=True') { throw 'Join child was visible or lost its terminal/streaming runtime' }
+    if ((Get-Content -LiteralPath ($binary + '.console') -Raw) -ne 'visible=False;tty=False') { throw 'Join child was visible or retained a console-bound output stream' }
     if ((Get-Content (Join-Path $logs 'join.err.log') -Raw).Trim() -ne 'failure receipt') { throw 'Join stderr was lost' }
     # Compile the real runtime classifier without linking the daemon. Clear
     # agent/harness markers so this proves plain user-logon behavior, not Codex.
@@ -99,7 +99,7 @@ fn main() {
         }
     }
     let context = runtime_context::RuntimeContext::current();
-    std::process::exit(if context.runtime_label() == "interactive" && context.should_stream_join() { 7 } else { 99 });
+    std::process::exit(if context.runtime_label() == "supervisor" && context.should_stream_join() { 7 } else { 99 });
 }
 '@
     [IO.File]::WriteAllText($runtimeSource, $rust.Replace('@@CLASSIFIER@@', $classifier))
@@ -177,7 +177,7 @@ fn main() {
     $registrar = Join-Path $repo 'windows\register-autostart.ps1'
     & $registrar -AircPath $binary
     if (-not $global:aircStartupFixture.updated -or $global:aircStartupFixture.registered -or $global:aircStartupFixture.updated.WorkingDirectory -ne $scratch) { throw 'Existing task was replaced or its working directory changed' }
-    if ($global:aircStartupFixture.updated.Arguments -notlike '*-WindowStyle Hidden -ExecutionPolicy RemoteSigned -File*' -or $global:aircStartupFixture.updated.Arguments -notlike ('*-AircPath "' + $binary + '"*')) { throw 'Task action lost hidden runner or exact binary path' }
+    if ($global:aircStartupFixture.updated.Execute -ne (Join-Path $env:SystemRoot 'System32\wscript.exe') -or $global:aircStartupFixture.updated.Arguments -notlike '//B //Nologo *' -or $global:aircStartupFixture.updated.Arguments -notlike ('*"' + $binary + '"*')) { throw 'Task action lost windowless runner or exact binary path' }
     $global:aircStartupFixture.events=@()
     & $registrar -AircPath $binary
     if ($global:aircStartupFixture.events.Count -ne 0) { throw 'Unchanged task was touched' }
