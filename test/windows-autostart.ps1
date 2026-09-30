@@ -66,11 +66,12 @@ public class JoinFixture {
     $logs = Join-Path $scratch 'logs'
     $runner = Join-Path $repo 'windows\run-join-hidden.ps1'
     $elapsed = [Diagnostics.Stopwatch]::StartNew()
-    # Match Task Scheduler: the PowerShell host gets its own hidden console.
-    # Calling it directly from this test's redirected CI stdout is a different
-    # runtime and would make a child inherit the CI pipe instead of a console.
-    $hostProcess = Start-Process -FilePath $shell -WindowStyle Hidden -PassThru `
-        -ArgumentList @('-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'RemoteSigned', '-File', ('"' + $runner + '"'), '-AircPath', ('"' + $binary + '"'), '-LogDirectory', ('"' + $logs + '"'))
+    # Exercise the exact windowless task entry and its installed sibling path.
+    Copy-Item -LiteralPath $runner -Destination (Join-Path $scratch 'airc-join-hidden.ps1')
+    $entry = Join-Path $scratch 'airc-join-hidden.vbs'
+    Copy-Item -LiteralPath (Join-Path $repo 'windows/run-join-hidden.vbs') -Destination $entry
+    $hostProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32/wscript.exe') -WindowStyle Hidden -PassThru `
+        -ArgumentList @('//B', '//Nologo', ('"' + $entry + '"'), ('"' + $binary + '"'), ('"' + $logs + '"'))
     $null = $hostProcess.Handle
     $hostProcess.WaitForExit()
     if ($hostProcess.ExitCode -ne 7 -or $elapsed.Elapsed.TotalSeconds -ge 5) { throw 'Join supervisor lost exit code or waited for detached daemon' }
