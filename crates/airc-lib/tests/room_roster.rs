@@ -266,3 +266,48 @@ async fn room_roster_cards_carries_the_full_identity_and_agrees_with_peer_alias(
          reads — one name source, no drift"
     );
 }
+
+#[tokio::test]
+async fn presence_is_state_one_entry_per_agent_and_never_history() {
+    // what this catches (airc#1341): heartbeats persisted as durable rows —
+    // 701,803 of them on one node, 59% of bus_events — and a roster that
+    // could only read presence by paging that log. A beat must reach the
+    // roster, coalesce latest-wins per (peer, client), and never land in
+    // the room's history beside the chat line that shares its channel.
+    let machine = Machine::boot().await;
+    machine.pin_identity("roster-presence-is-state-test").await;
+    let airc = machine.solo("general").await;
+
+    for runtime in ["first", "latest"] {
+        airc.emit_agent_heartbeat(HeartbeatKind::Alive, runtime, None)
+            .await
+            .expect("emit heartbeat");
+    }
+    airc.say("a durable line").await.expect("say");
+
+    let roster = airc
+        .room_roster(Duration::from_secs(120), 200)
+        .await
+        .expect("room_roster");
+    let mine: Vec<_> = roster
+        .iter()
+        .filter(|member| member.peer_id == airc.peer_id())
+        .collect();
+    assert_eq!(mine.len(), 1, "one presence entry per agent: {roster:?}");
+    assert_eq!(mine[0].runtime, "latest", "the latest beat wins");
+
+    let history = airc.page_recent(200).await.expect("page_recent");
+    assert!(
+        history
+            .iter()
+            .any(|event| event.body.as_ref().and_then(|body| body.as_text())
+                == Some("a durable line")),
+        "the durable chat line is history: {history:?}"
+    );
+    assert!(
+        history
+            .iter()
+            .all(|event| !event.headers.contains_key(airc_lib::HEADER_HEARTBEAT_KIND)),
+        "no heartbeat is history: {history:?}"
+    );
+}

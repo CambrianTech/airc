@@ -266,20 +266,24 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: alice_claim,
             owner: alice,
             ttl_ms: alice_ttl_ms,
             claimed_at_ms: alice_claim_at,
+            origin: airc_work::ClaimOrigin::Unknown,
         }),
         // ... Alice goes dark here. No heartbeat, no release.
         // Time advances past `alice_expires_at`. Bob reclaims.
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: bob_claim,
             owner: bob,
             ttl_ms: bob_ttl_ms,
             claimed_at_ms: bob_claim_at,
+            origin: airc_work::ClaimOrigin::Unknown,
         }),
         WorkEvent::CardStateChanged(CardStateChanged {
             card_id,

@@ -37,11 +37,13 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
         .unwrap();
     projection
         .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id,
             owner,
             ttl_ms: 100,
             claimed_at_ms: 110,
+            origin: ClaimOrigin::Automatic,
         }))
         .unwrap();
 
@@ -62,6 +64,179 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
         .unwrap();
     assert!(projection.stale_claims(299).is_empty());
     assert_eq!(projection.stale_claims(300)[0].claim_id, claim_id);
+
+    // d6e8b4cd: heartbeat/card recency cannot turn a pulled lease into a
+    // chosen lease. A losing explicit claim cannot overwrite its provenance.
+    let chosen = WorkCardClaimed {
+        selected_at_ms: None,
+        card_id,
+        claim_id: ClaimId::from_u128(20),
+        owner,
+        ttl_ms: 100,
+        claimed_at_ms: 201,
+        origin: ClaimOrigin::Explicit,
+    };
+    projection
+        .apply(&WorkEvent::CardClaimed(chosen.clone()))
+        .unwrap();
+    let provenance = projection
+        .card(card_id)
+        .unwrap()
+        .claim_provenance
+        .as_ref()
+        .unwrap();
+    assert_eq!(provenance.origin, ClaimOrigin::Automatic);
+    assert_eq!(provenance.selected_at_ms, 110);
+    let wire = serde_json::to_vec(&projection).unwrap();
+    let mut restored: WorkBoardProjection = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(
+        restored.card(card_id).unwrap(),
+        projection.card(card_id).unwrap()
+    );
+
+    restored
+        .apply(&WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id,
+            owner,
+            reason: None,
+            released_at_ms: 202,
+        }))
+        .unwrap();
+    assert!(restored.card(card_id).unwrap().claim_provenance.is_none());
+    let chosen = WorkCardClaimed {
+        claimed_at_ms: 203,
+        ..chosen
+    };
+    restored
+        .apply(&WorkEvent::CardClaimed(chosen.clone()))
+        .unwrap();
+    // A delayed release from the old lease must not erase the new choice.
+    restored
+        .apply(&WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id,
+            owner,
+            reason: None,
+            released_at_ms: 204,
+        }))
+        .unwrap();
+    assert_eq!(
+        restored.card(card_id).unwrap().claim_id,
+        Some(chosen.claim_id)
+    );
+    assert_eq!(
+        restored
+            .card(card_id)
+            .unwrap()
+            .claim_provenance
+            .as_ref()
+            .unwrap()
+            .origin,
+        ClaimOrigin::Explicit
+    );
+
+    // Explicitly selecting the same accepted claim changes intent only.
+    let before = restored.card(card_id).unwrap().clone();
+    let selection = CardUpdated {
+        card_id,
+        title: None,
+        body: None,
+        priority: None,
+        updated_by: owner,
+        updated_at_ms: 205,
+        claim_selection: Some(ClaimSelection {
+            claim_id: chosen.claim_id,
+            owner,
+            selected_at_ms: 205,
+        }),
+    };
+    restored
+        .apply(&WorkEvent::CardUpdated(selection.clone()))
+        .unwrap();
+    let selected = restored.card(card_id).unwrap();
+    assert_eq!(
+        selected.claim_provenance.as_ref().unwrap().selected_at_ms,
+        205
+    );
+    assert_eq!(selected.claim_id, before.claim_id);
+    assert_eq!(selected.claim_expires_at_ms, before.claim_expires_at_ms);
+    assert_eq!(selected.last_heartbeat_at_ms, before.last_heartbeat_at_ms);
+    assert_eq!(selected.state, before.state);
+    for (id, who, at) in [
+        (claim_id, owner, 206),
+        (chosen.claim_id, peer(99), 207),
+        (chosen.claim_id, owner, 500),
+    ] {
+        let mut invalid = selection.clone();
+        invalid.claim_selection = Some(ClaimSelection {
+            claim_id: id,
+            owner: who,
+            selected_at_ms: at,
+        });
+        invalid.title = Some("independent amendment".into());
+        restored.apply(&WorkEvent::CardUpdated(invalid)).unwrap();
+        assert_eq!(
+            restored
+                .card(card_id)
+                .unwrap()
+                .claim_provenance
+                .as_ref()
+                .unwrap()
+                .selected_at_ms,
+            205
+        );
+        assert_eq!(
+            restored.card(card_id).unwrap().title,
+            "independent amendment"
+        );
+    }
+    // Automatic recovery retains the decision's age instead of becoming a new choice.
+    restored
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id: ClaimId::from_u128(21),
+            owner,
+            ttl_ms: 100,
+            claimed_at_ms: 501,
+            origin: ClaimOrigin::Explicit,
+            selected_at_ms: Some(205),
+        }))
+        .unwrap();
+    assert_eq!(
+        restored
+            .card(card_id)
+            .unwrap()
+            .claim_provenance
+            .as_ref()
+            .unwrap()
+            .selected_at_ms,
+        205
+    );
+
+    // Old event/snapshot wires have no origin. Unknown must stay unknown;
+    // recovering history must never fabricate an explicit decision.
+    let mut legacy = serde_json::to_value(&chosen).unwrap();
+    legacy.as_object_mut().unwrap().remove("origin");
+    assert_eq!(
+        serde_json::from_value::<WorkCardClaimed>(legacy.clone())
+            .unwrap()
+            .origin,
+        ClaimOrigin::Unknown
+    );
+    legacy["origin"] = serde_json::json!("future_origin");
+    assert_eq!(
+        serde_json::from_value::<WorkCardClaimed>(legacy)
+            .unwrap()
+            .origin,
+        ClaimOrigin::Unknown
+    );
+    let mut old_card = serde_json::to_value(restored.card(card_id).unwrap()).unwrap();
+    old_card.as_object_mut().unwrap().remove("claim_provenance");
+    assert!(serde_json::from_value::<WorkCard>(old_card)
+        .unwrap()
+        .claim_provenance
+        .is_none());
 }
 
 #[test]
@@ -86,11 +261,13 @@ fn terminal_cards_do_not_surface_stale_claims() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id: merged_card,
             claim_id: merged_claim,
             owner,
             ttl_ms: 10,
             claimed_at_ms: 110,
+            origin: crate::ClaimOrigin::Unknown,
         }),
         WorkEvent::CardStateChanged(CardStateChanged {
             card_id: merged_card,
@@ -111,11 +288,13 @@ fn terminal_cards_do_not_surface_stale_claims() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id: closed_card,
             claim_id: closed_claim,
             owner,
             ttl_ms: 10,
             claimed_at_ms: 110,
+            origin: crate::ClaimOrigin::Unknown,
         }),
         WorkEvent::CardStateChanged(CardStateChanged {
             card_id: closed_card,
@@ -149,11 +328,13 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id,
             owner,
             ttl_ms: 100,
             claimed_at_ms: 110,
+            origin: crate::ClaimOrigin::Unknown,
         }),
         WorkEvent::CardStateChanged(CardStateChanged {
             card_id,
@@ -197,11 +378,13 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id,
             owner,
             ttl_ms: 100,
             claimed_at_ms: 110,
+            origin: crate::ClaimOrigin::Unknown,
         }),
         WorkEvent::ClaimReleased(ClaimReleased {
             card_id,
@@ -248,18 +431,22 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: first_claim,
             owner: first_owner,
             ttl_ms: 100,
             claimed_at_ms: 110,
+            origin: crate::ClaimOrigin::Unknown,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: second_claim,
             owner: second_owner,
             ttl_ms: 100,
             claimed_at_ms: 120,
+            origin: crate::ClaimOrigin::Unknown,
         }),
         WorkEvent::ClaimReleased(ClaimReleased {
             card_id,
@@ -298,18 +485,22 @@ fn expired_claim_can_be_superseded_by_new_claim() {
             origin: None,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: expired_claim,
             owner: expired_owner,
             ttl_ms: 100,
             claimed_at_ms: 110,
+            origin: crate::ClaimOrigin::Unknown,
         }),
         WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: new_claim,
             owner: new_owner,
             ttl_ms: 100,
             claimed_at_ms: 210,
+            origin: crate::ClaimOrigin::Unknown,
         }),
     ])
     .unwrap();
@@ -760,21 +951,25 @@ fn release_for_superseded_claim_does_not_poison_projection() {
         .unwrap();
     projection
         .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: claim_a,
             owner: owner_a,
             ttl_ms: 60_000,
             claimed_at_ms: 2,
+            origin: crate::ClaimOrigin::Unknown,
         }))
         .unwrap();
     // Second claim — silently ignored by first-write-wins.
     projection
         .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id: claim_b,
             owner: owner_b,
             ttl_ms: 60_000,
             claimed_at_ms: 3,
+            origin: crate::ClaimOrigin::Unknown,
         }))
         .unwrap();
     // The losing claimant later emits a release for *their* claim
@@ -1160,6 +1355,7 @@ fn card_updated_title_only_preserves_body_and_priority() {
 
     projection
         .apply(&WorkEvent::CardUpdated(CardUpdated {
+            claim_selection: None,
             card_id,
             title: Some("amended title".into()),
             body: None,
@@ -1212,6 +1408,7 @@ fn card_updated_body_leave_alone_vs_set_vs_empty_string_clear() {
     // `body: None` — leave alone. Body stays.
     projection
         .apply(&WorkEvent::CardUpdated(CardUpdated {
+            claim_selection: None,
             card_id,
             title: None,
             body: None,
@@ -1229,6 +1426,7 @@ fn card_updated_body_leave_alone_vs_set_vs_empty_string_clear() {
     // `body: Some("new")` — set to the new value.
     projection
         .apply(&WorkEvent::CardUpdated(CardUpdated {
+            claim_selection: None,
             card_id,
             title: None,
             body: Some("amended body".into()),
@@ -1247,6 +1445,7 @@ fn card_updated_body_leave_alone_vs_set_vs_empty_string_clear() {
     // and None as "no body" identically.
     projection
         .apply(&WorkEvent::CardUpdated(CardUpdated {
+            claim_selection: None,
             card_id,
             title: None,
             body: Some(String::new()),
@@ -1270,6 +1469,7 @@ fn card_updated_priority_only_rewrites_priority() {
 
     projection
         .apply(&WorkEvent::CardUpdated(CardUpdated {
+            claim_selection: None,
             card_id,
             title: None,
             body: None,
@@ -1303,6 +1503,7 @@ fn card_updated_all_none_bumps_updated_at_only() {
 
     projection
         .apply(&WorkEvent::CardUpdated(CardUpdated {
+            claim_selection: None,
             card_id,
             title: None,
             body: None,
@@ -1336,6 +1537,7 @@ fn card_updated_for_unknown_card_surfaces_error() {
     let mut projection = WorkBoardProjection::new();
     let err = projection
         .apply(&WorkEvent::CardUpdated(CardUpdated {
+            claim_selection: None,
             card_id: WorkCardId::new(),
             title: Some("would silently fail".into()),
             body: None,
@@ -1358,6 +1560,7 @@ fn card_updated_round_trips_through_serde_with_skip_on_none() {
     // PeerId::new() / WorkCardId::new() (uuid v4) — no hand-rolled
     // UUID strings in tests.
     let amend = CardUpdated {
+        claim_selection: None,
         card_id: WorkCardId::new(),
         title: Some("only title".into()),
         body: None,
@@ -1384,6 +1587,7 @@ fn card_updated_round_trips_through_serde_with_skip_on_none() {
     // the canonical "clear" idiom — observers that render the body
     // treat empty string and None identically (no body).
     let clear = CardUpdated {
+        claim_selection: None,
         card_id: WorkCardId::new(),
         title: None,
         body: Some(String::new()),
@@ -1435,11 +1639,13 @@ fn build_realistic_event_log(n_cards: u32, mutations_per_card: u32) -> Vec<WorkE
             origin: None,
         }));
         events.push(WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
             card_id,
             claim_id,
             owner,
             ttl_ms: 600_000,
             claimed_at_ms: 2_000 + u64::from(i),
+            origin: crate::ClaimOrigin::Unknown,
         }));
         for h in 0..mutations_per_card {
             events.push(WorkEvent::ClaimHeartbeat(ClaimHeartbeat {

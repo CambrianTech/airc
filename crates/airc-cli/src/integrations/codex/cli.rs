@@ -12,6 +12,17 @@ pub struct CodexHookArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CodexHookAction {
+    /// Update installer-owned configuration through the TOML parser.
+    ConfigureInstaller {
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        /// Read the GitHub token from stdin, never from command-line arguments.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Preserve any existing rules configuration; install the legacy default only if absent.
+        #[arg(long)]
+        command_rules: bool,
+    },
     /// Install the Rust prompt and post-tool hooks into Codex config.
     InstallHooks {
         /// Codex home directory. Defaults to `$HOME/.codex`.

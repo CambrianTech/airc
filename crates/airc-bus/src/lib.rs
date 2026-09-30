@@ -48,7 +48,7 @@ mod subscriber_index;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use envelope::{Cursor, DeliveryClass, Envelope, Kind, Seq, Target};
-pub use ephemeral::EphemeralCache;
+pub use ephemeral::{EphemeralCache, HEADER_EPHEMERAL_TTL_MS};
 pub use error::{BusError, Result};
 pub use filter::Filter;
 pub use ring::HotRing;

@@ -152,6 +152,13 @@ pub const HEADER_AIRC_CAPABILITY_GRANT: &str = "airc.capability_grant";
 /// fail ingress. Subscriber filtering can inspect this without a body decode.
 pub const HEADER_AIRC_DELIVERY_CLASS: &str = "airc.delivery_class";
 
+/// Coalesce key for an `ephemeral_latest` frame: the router keeps ONE latest
+/// value per `(channel, key)`. Carried as a header so it survives every hop
+/// unchanged — the daemon IPC publish, the signed routed forward, and the
+/// receiving bridge — without a wire-schema change. Presence uses
+/// `presence:<peer>:<client>` (airc#1341).
+pub const HEADER_AIRC_COALESCE_KEY: &str = "airc.coalesce_key";
+
 #[cfg(test)]
 mod tests {
     use super::*;

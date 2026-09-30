@@ -101,6 +101,7 @@ pub async fn run_seed(
 ///     `--body` content (if any) follows.
 pub async fn run_review(
     home: &Path,
+    room: Option<String>,
     parent_id: String,
     pr: Option<String>,
     priority: Option<CliPriority>,
@@ -109,15 +110,21 @@ pub async fn run_review(
     let parent_card_id = parse_work_card_id(&parent_id)?;
     let airc = crate::commands::attached_airc(home).await?;
 
-    // Resolve the parent off the current room's board. Refusing on
-    // "no parent" is more useful than spawning an orphan review.
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    // Resolve once: parent lookup and sibling publication must share a room,
+    // even if another client changes this scope's default during the command.
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "review work in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    let board = airc.work_board_in(&room).await?;
     let parent = board.card(parent_card_id).ok_or_else(|| {
         format!(
-            "parent card {parent_card_id} not found in the current room's board; \
-             switch to the room that owns it, or pass the correct id"
+            "parent card {parent_card_id} not found in room {}; \
+             pass --room with the owning room, or the correct card id",
+            room.name
         )
     })?;
 
@@ -154,7 +161,7 @@ pub async fn run_review(
         ..request
     };
 
-    let review_card_id = airc.create_work_card(request).await?;
+    let review_card_id = airc.create_work_card_in(&room, request).await?;
     println!("review_card_id: {review_card_id} parent_card_id: {parent_card_id}");
     Ok(())
 }
@@ -252,10 +259,13 @@ pub async fn run_claim(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let claim_id = airc
-        .claim_work_card(ClaimWorkCard {
-            card_id: card_uuid,
-            ttl_ms,
-        })
+        .claim_work_card_with_origin(
+            ClaimWorkCard {
+                card_id: card_uuid,
+                ttl_ms,
+            },
+            airc_work::ClaimOrigin::Explicit,
+        )
         .await?;
     println!("claim_id: {claim_id}");
 
@@ -430,12 +440,24 @@ pub async fn run_update(
 
 pub async fn run_state(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     state: CliCardState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let card_state = CardState::from(state);
+
+    // Resolve ONCE, like `run_review` and `run_merge` (#1447): the close-gate board
+    // read, the state change, the PR link and the review sibling all bind to THIS
+    // room — even if another client moves this scope's default mid-command.
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "change work state in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
 
     // Card a1bc62b3 (substrate-target gate): refuse direct CLI writes
     // to states that should only come from substrate observers (e.g.
@@ -456,11 +478,13 @@ pub async fn run_state(
     // self-attesting Merged; this one refuses agents from
     // self-attesting Closed without a Merged predecessor.
     if card_state == CardState::Closed {
-        let board = airc
-            .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-            .await?;
+        let board = airc.work_board_in(&room).await?;
         let card = board.card(card_uuid).ok_or_else(|| {
-            format!("card {card_uuid} not visible in current room's board projection")
+            format!(
+                "card {card_uuid} not visible in room {}; pass --room with the owning \
+                 room, or the correct card id",
+                room.name
+            )
         })?;
         if !close_transition_allowed_from_card(card) {
             // Card fae3c28e: tailor the refusal so review-only cards
@@ -501,10 +525,13 @@ pub async fn run_state(
         }
     }
 
-    airc.change_work_card_state(ChangeWorkCardState {
-        card_id: card_uuid,
-        state: card_state,
-    })
+    airc.change_work_card_state_in(
+        &room,
+        ChangeWorkCardState {
+            card_id: card_uuid,
+            state: card_state,
+        },
+    )
     .await?;
     println!("card_state_changed: card_id={card_uuid} state={card_state:?}");
 
@@ -518,7 +545,8 @@ pub async fn run_state(
     // auto-spawn review card, board renderers) read one source of
     // truth.
     if card_state == CardState::Review {
-        if let Err(error) = crate::work_commands_gh::open_pr_and_link(&airc, card_uuid).await {
+        if let Err(error) = crate::work_commands_gh::open_pr_and_link(&airc, &room, card_uuid).await
+        {
             eprintln!("airc: gh pr create skipped — {error}");
         }
     }
@@ -571,16 +599,20 @@ pub async fn run_state(
 /// cleanup) breaks at compile-time, not at "disk full mid-session."
 pub(crate) async fn mark_merged_and_reclaim(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
     pull_request: airc_work::model::PullRequestRef,
     merged_at_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_lib::MarkPullRequestMerged;
-    airc.mark_pull_request_merged(MarkPullRequestMerged {
-        card_id,
-        pull_request,
-        merged_at_ms,
-    })
+    airc.mark_pull_request_merged_in(
+        room,
+        MarkPullRequestMerged {
+            card_id,
+            pull_request,
+            merged_at_ms,
+        },
+    )
     .await?;
     tracing::info!(
         target: "airc::work::merge::reclaim",
@@ -778,12 +810,16 @@ pub(crate) async fn cleanup_card_worktree(
 /// emit.
 pub(crate) async fn auto_spawn_review_card(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     parent_id: airc_lib::WorkCardId,
     pr_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    // PARENT AND SIBLING MUST SHARE A ROOM (#1447 for `run_review`; this is the same
+    // seam on the AUTO path). Read un-scoped, this looked the parent up on whatever
+    // room the scope happened to sit in and minted the review card there — so a card
+    // transitioned from another room got a sibling on a board its parent is not on,
+    // and the review bound to nothing. That is the `reviews []` shape (2026-09-21).
+    let board = airc.work_board_in(room).await?;
     let parent = board
         .card(parent_id)
         .ok_or_else(|| format!("parent card {parent_id} no longer in board projection"))?;
@@ -813,7 +849,7 @@ pub(crate) async fn auto_spawn_review_card(
         body: Some(body),
         ..request
     };
-    let review_card_id = airc.create_work_card(request).await?;
+    let review_card_id = airc.create_work_card_in(room, request).await?;
     println!("review_card_id: {review_card_id} parent_card_id: {parent_id} (auto-spawned)");
     Ok(())
 }
@@ -874,8 +910,14 @@ fn refusal_message(card_uuid: airc_lib::WorkCardId, target: CardState) -> String
     }
 }
 
-pub async fn run_close(home: &Path, card_id: String) -> Result<(), Box<dyn std::error::Error>> {
-    run_state(home, card_id, CliCardState::Closed).await
+/// `close` is `state … closed`, so it inherits the room resolution rather than
+/// keeping a second, un-scoped path to the same transition.
+pub async fn run_close(
+    home: &Path,
+    room: Option<String>,
+    card_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_state(home, room, card_id, CliCardState::Closed).await
 }
 
 /// Card c9b28925: prune worktrees whose card has reached a terminal
@@ -1717,6 +1759,7 @@ fn parse_pr_spec(input: &str) -> Result<u64, Box<dyn std::error::Error>> {
 /// stops.
 pub async fn run_merge(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     dry_run: bool,
     pending_timeout_secs: u64,
@@ -1726,12 +1769,17 @@ pub async fn run_merge(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
 
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
-    let card = board.card(card_uuid).ok_or_else(|| {
-        format!("card {card_uuid} not visible in current room's board projection")
-    })?;
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "merge work in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    let board = airc.work_board_in(&room).await?;
+    let card = board
+        .card(card_uuid)
+        .ok_or_else(|| format!("card {card_uuid} not visible in room {}", room.name))?;
 
     if card.state != CardState::Review {
         return Err(format!(
@@ -1787,7 +1835,7 @@ pub async fn run_merge(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            mark_merged_and_reclaim(&airc, card_uuid, pr.clone(), now_ms).await?;
+            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), now_ms).await?;
             println!(
                 "merged: card={card_uuid} pr=#{n} repo={r}",
                 n = pr.number,
@@ -1809,7 +1857,7 @@ pub async fn run_merge(
                 );
                 return Ok(());
             }
-            mark_merged_and_reclaim(&airc, card_uuid, pr.clone(), merged_at_ms).await?;
+            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), merged_at_ms).await?;
             println!(
                 "reconciled: card={card_uuid} pr=#{n} repo={r} (PR was already merged on GitHub)",
                 n = pr.number,
@@ -3420,6 +3468,7 @@ mod tests {
             state,
             owner,
             claim_id,
+            claim_provenance: None,
             claim_expires_at_ms,
             last_heartbeat_at_ms: None,
             pull_request: None,
@@ -3962,6 +4011,49 @@ mod tests {
     /// `mark_pull_request_merged` call drops this count to >1 and
     /// breaks the test until they route through the helper —
     /// which automatically wires cleanup.
+    /// Sibling of [`every_merge_site_routes_through_helper`], for the OTHER half of
+    /// the room seam (#1447, then the review-transition path).
+    ///
+    /// A card and the review sibling spawned for it MUST land on the same board. Read
+    /// or written un-scoped, both follow whatever room the scope happens to sit in —
+    /// so a card transitioned from another room gets a sibling its parent cannot see,
+    /// and the review binds to nothing. That is the `reviews []` shape measured
+    /// 2026-09-21: two peers had reviewed a citizen's submission and the board showed
+    /// zero, because the verdict never reached the card.
+    ///
+    /// EXACTLY ONE un-scoped `.create_work_card(` is legitimate: `run_create`, where
+    /// "make a card in the room I am standing in" IS the intent. Every other creation
+    /// carries a resolved room. A maintainer who adds a second drops this to >1 and
+    /// breaks the test until they either pass a room or justify the exception here.
+    #[test]
+    fn a_review_sibling_is_never_created_into_an_unresolved_room() {
+        fn production_only(src: &str) -> &str {
+            src.split_once("#[cfg(test)]")
+                .map(|(prod, _)| prod)
+                .unwrap_or(src)
+        }
+        // The trailing paren is load-bearing: it excludes `create_work_card_in(`,
+        // which is the scoped form this test exists to push people toward.
+        let total = production_only(include_str!("work_commands.rs"))
+            .matches(".create_work_card(")
+            .count()
+            + production_only(include_str!("work_commands_gh.rs"))
+                .matches(".create_work_card(")
+                .count();
+
+        assert_eq!(
+            total, 1,
+            "Found {total} un-scoped `.create_work_card(` calls in production across \
+             work_commands.rs + work_commands_gh.rs. Exactly one is allowed — \
+             `run_create`, where the current room is the intent.\n\n\
+             If you added a card-creation path: resolve the room ONCE in the command \
+             and call `create_work_card_in(&room, request)`, the way `run_review` and \
+             `auto_spawn_review_card` do. A sibling minted into a room its parent is \
+             not on is invisible to the review that must bind to it — and that failure \
+             is silent, which is why it needs a test rather than a convention."
+        );
+    }
+
     #[test]
     fn every_merge_site_routes_through_helper() {
         // Scan production code only — strip the `#[cfg(test)]`
@@ -3976,14 +4068,13 @@ mod tests {
         let merger_prod = production_only(include_str!("merger.rs"));
 
         // Count direct method-call invocations — the
-        // `.mark_pull_request_merged(` form catches both
-        // `airc.mark_pull_request_merged(` and any chained
-        // access. Doc-comments use backticks around the bare
+        // The method prefix catches both current-room and explicit-room
+        // forms, including chained access. Doc-comments use the bare
         // name (`mark_pull_request_merged`) so they don't match.
         let total = work_commands_prod
-            .matches(".mark_pull_request_merged(")
+            .matches(".mark_pull_request_merged")
             .count()
-            + merger_prod.matches(".mark_pull_request_merged(").count();
+            + merger_prod.matches(".mark_pull_request_merged").count();
 
         assert_eq!(
             total, 1,

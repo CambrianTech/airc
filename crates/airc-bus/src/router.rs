@@ -1309,6 +1309,19 @@ impl EventRouter {
             .and_then(|s| s.ephemeral.get(key, now).map(Arc::clone))
     }
 
+    /// Every live coalesced ephemeral value on `channel` — the channel's current
+    /// STATE (presence, pose), one entry per `coalesce_key`, never a log. Presence
+    /// reads this instead of paging durable history (airc#1341). Each handle is an
+    /// [`Arc::clone`]; nothing is decoded here.
+    pub fn ephemeral_snapshot(&self, channel: RoomId) -> Vec<Arc<Envelope>> {
+        let now = self.inner.clock.now_ms();
+        let shard = self.shard_for(channel);
+        let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&channel.0.as_u128())
+            .map(|s| s.ephemeral.snapshot(now))
+            .unwrap_or_default() // JUSTIFIED unwrap_or_default: a channel with no state has no presence
+    }
+
     /// Number of distinct channels that have ever had state allocated. The
     /// many-rooms test uses this as the allocation/wakeup proxy: idle channels
     /// that were merely *named* (never published/subscribed) cost nothing.

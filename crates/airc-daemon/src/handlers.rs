@@ -19,12 +19,12 @@ use airc_core::scoped_state::{ScopeRef, PEER_IDENTITY_STATE_KEY};
 use airc_core::{Body, ClientId, PeerId, RoomId};
 use airc_ipc::request::{
     AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
-    PeerIdentityCardRequest, PublishRequest, RemovePeerRequest, Request, RoomTipRequest,
-    SendRequest,
+    PeerIdentityCardRequest, PresenceRequest, PublishRequest, RemovePeerRequest, Request,
+    RoomTipRequest, SendRequest,
 };
 use airc_ipc::response::{
     InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry, PeerIdentityCardResponse,
-    PeersResponse, PublishResponse, Response, RoomTipResponse, RoomsResponse,
+    PeersResponse, PresenceResponse, PublishResponse, Response, RoomTipResponse, RoomsResponse,
     RouteEndpointsResponse, StatusResponse,
 };
 use bytes::Bytes;
@@ -60,6 +60,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::RoomTip(tip) => handle_room_tip(state, tip).await,
+        Request::Presence(request) => handle_presence(&state, request),
         Request::PeerIdentityCard(req) => handle_peer_identity_card(state, req).await,
         Request::Attach(_) => Response::Error {
             message: "attach is a streaming request handled by the server".to_string(),
@@ -367,6 +368,20 @@ async fn handle_room_tip(state: Arc<DaemonState>, request: RoomTipRequest) -> Re
             message: format!("room_tip: {error}"),
         },
     }
+}
+
+/// airc#1341: the channel's live presence, straight from the router's
+/// ephemeral cache — one entry per `coalesce_key`, TTL-expired entries already
+/// gone. Presence is state: no durable read, no replay, nothing decoded here.
+fn handle_presence(state: &DaemonState, request: PresenceRequest) -> Response {
+    Response::Presence(PresenceResponse {
+        envelopes: state
+            .router
+            .ephemeral_snapshot(request.channel)
+            .iter()
+            .map(|env| airc_wire::encode(env).to_vec())
+            .collect(),
+    })
 }
 
 /// Resolve one peer's durable identity card from the daemon's owner-core

@@ -44,11 +44,28 @@ pub(crate) fn render_feed_line(event: &TranscriptEvent) -> Option<String> {
     // become a visible pilcrow so structure stays readable while the line
     // contract holds.
     let detail = detail.replace('\n', " ¶ ");
+    // The line's width is a budget, so the ids are 8-hex and not full UUIDs: a full
+    // sender + room is 87 characters of prefix before a single character of what was
+    // said, versus 31 short. Identity here is "which peer", not "which UUID" — `short`
+    // is already this file's convention. The bound is pinned by the test below.
+    //
+    // MEASURED, not assumed (2026-09-21): a Claude Code monitor cuts the rendered line
+    // at exactly 500 characters INCLUDING this prefix — four truncated notifications
+    // all landed at 500/87/413 total/header/body. So the prefix is charged against the
+    // message, and shortening it moves surviving body from 413 to 469, +56 chars.
+    //
+    // And the prefix ends with e=<8-hex of the event id>, BEFORE the body (card d61513e4).
+    // A reader cut at 300, 400 or 500 rendered chars still holds that handle and can
+    // fetch the full text by it from the stream/inbox. Truncation is acceptable;
+    // unrecoverable truncation is not - so the one thing a cut must never remove is the
+    // pointer back to what was said. It costs 11 chars of budget against a measured
+    // cut of 500, and the bound below is pinned at 48 for it.
     Some(format!(
-        "[{kind:?}] {sender} → {channel}: {detail}",
+        "[{kind:?}] {sender} → {channel} e={handle}: {detail}",
         kind = event.kind,
-        sender = event.peer_id,
-        channel = event.room_id,
+        sender = short(&event.peer_id),
+        channel = short(&event.room_id),
+        handle = short(&event.event_id),
     ))
 }
 
@@ -309,6 +326,117 @@ mod tests {
         assert!(
             line.contains("NVMe") && line.contains("Layer split"),
             "content survives flattening: {line}"
+        );
+    }
+
+    // what this catches (card d61513e4): the feed line spending its width on full
+    // UUIDs. A Claude Code monitor surfaces ONE line per event and cuts it at 500
+    // characters INCLUDING the prefix (measured: four truncated notifications all at
+    // exactly 500). A full sender + room is 87 of those before any content — 17% of
+    // the reader's view spent on two identifiers nobody reads digit-by-digit, and the
+    // shortening moves surviving message from 413 characters to 469.
+    //
+    // Reader-dependent: a peer on a different runtime reported all markers of a
+    // 1,661-char probe visible, so her cut is far wider. Nobody is made worse off by a
+    // shorter prefix, which is why this lands on its own merits; the line's STRUCTURE
+    // should not be redesigned around one reader's budget.
+    //
+    // Why it matters, measured 2026-09-21: a 922-char peer message whose ASK began at
+    // char 830 was truncated three separate times and the answer never reached the
+    // person who asked. Everyone writes context first and the request last, so a
+    // prefix tax is paid precisely in the half that carries the point.
+    //
+    // Mutation check: restoring `event.peer_id` / `event.room_id` fails the bound.
+    #[test]
+    fn the_feed_line_prefix_stays_short_so_the_message_survives_a_cut() {
+        use airc_core::{
+            ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
+        };
+        let event = TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: RoomId::new(),
+            peer_id: PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::Message,
+            occurred_at_ms: 0,
+            lamport: 0,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            body: Some(Body::text("the ask lives at the end of a long message")),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+        let line = render_feed_line(&event).expect("message renders");
+
+        let prefix = line
+            .find("the ask lives")
+            .expect("the body is present in the line");
+        assert!(
+            prefix <= 48,
+            "the prefix before the message is {prefix} chars; it must stay short so a \
+             truncating reader still sees what was said: {line}"
+        );
+
+        // The ids are still there — shortened, not dropped. A reader must be able to
+        // tell two peers apart in the feed; they just do not need 36 characters to.
+        let sender = event.peer_id.to_string();
+        let room = event.room_id.to_string();
+        assert!(line.contains(&sender[..8]), "sender is identified: {line}");
+        assert!(line.contains(&room[..8]), "room is identified: {line}");
+        assert!(
+            !line.contains(&sender) && !line.contains(&room),
+            "no full UUID belongs in a width-budgeted line: {line}"
+        );
+    }
+
+    // Card d61513e4, second half: wherever a reader cuts this line, the handle must already
+    // be in hand. The bound above keeps the whole prefix under the measured 500-char cut;
+    // this pins that the handle sits INSIDE that prefix - before the first character of what
+    // was said - so a notification truncated to 300 or 400 chars still names how to fetch
+    // the rest.
+    #[test]
+    fn truncated_line_keeps_its_event_handle() {
+        use airc_core::{
+            ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
+        };
+        let event = TranscriptEvent {
+            // Deterministic id whose first 8 hex chars are "0badcafe".
+            event_id: EventId::from_u128(0x0bad_cafe_0000_0000_dead_beef_0000_0000),
+            room_id: RoomId::new(),
+            peer_id: PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::Message,
+            occurred_at_ms: 0,
+            lamport: 0,
+            target: MentionTarget::All,
+            headers: Headers::new(),
+            body: Some(Body::text("the ask lives at the end of a long message")),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+        let line = render_feed_line(&event).expect("message renders");
+        let body_start = line
+            .find("the ask lives")
+            .expect("body present in the line");
+
+        // The handle is before the body - a cut anywhere in the message leaves it intact.
+        let prefix = &line[..body_start];
+        assert!(
+            prefix.contains("e=0badcafe"),
+            "handle precedes the body: {line}"
+        );
+
+        // And it stays short-form: no full UUID belongs in a width-budgeted line.
+        let full = event.event_id.to_string();
+        assert!(
+            !line.contains(&full),
+            "no full event id in the line: {line}"
+        );
+        assert!(
+            prefix.len() <= 48,
+            "prefix with handle stays under the cut: {prefix}"
         );
     }
 
