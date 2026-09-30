@@ -66,18 +66,19 @@ public class JoinFixture {
     $logs = Join-Path $scratch 'logs'
     $runner = Join-Path $repo 'windows\run-join-hidden.ps1'
     $elapsed = [Diagnostics.Stopwatch]::StartNew()
-    # Match Task Scheduler: the PowerShell host gets its own hidden console.
-    # Calling it directly from this test's redirected CI stdout is a different
-    # runtime and would make a child inherit the CI pipe instead of a console.
-    $hostProcess = Start-Process -FilePath $shell -WindowStyle Hidden -PassThru `
-        -ArgumentList @('-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'RemoteSigned', '-File', ('"' + $runner + '"'), '-AircPath', ('"' + $binary + '"'), '-LogDirectory', ('"' + $logs + '"'))
+    # Exercise the exact windowless task entry and its installed sibling path.
+    Copy-Item -LiteralPath $runner -Destination (Join-Path $scratch 'airc-join-hidden.ps1')
+    $entry = Join-Path $scratch 'airc-join-hidden.vbs'
+    Copy-Item -LiteralPath (Join-Path $repo 'windows/run-join-hidden.vbs') -Destination $entry
+    $hostProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32/wscript.exe') -WindowStyle Hidden -PassThru `
+        -ArgumentList @('//B', '//Nologo', ('"' + $entry + '"'), ('"' + $binary + '"'), ('"' + $logs + '"'))
     $null = $hostProcess.Handle
     $hostProcess.WaitForExit()
     if ($hostProcess.ExitCode -ne 7 -or $elapsed.Elapsed.TotalSeconds -ge 5) { throw 'Join supervisor lost exit code or waited for detached daemon' }
     $hostProcess.Dispose()
     $descendant = Get-Process -Id ([int](Get-Content -LiteralPath ($binary + '.pid')))
     if ($descendant.HasExited) { throw 'Join supervisor killed its detached descendant' }
-    if ((Get-Content -LiteralPath ($binary + '.console') -Raw) -ne 'visible=False;tty=True') { throw 'Join child was visible or lost its terminal/streaming runtime' }
+    if ((Get-Content -LiteralPath ($binary + '.console') -Raw) -ne 'visible=False;tty=False') { throw 'Join child was visible or retained a console-bound output stream' }
     if ((Get-Content (Join-Path $logs 'join.err.log') -Raw).Trim() -ne 'failure receipt') { throw 'Join stderr was lost' }
     # Compile the real runtime classifier without linking the daemon. Clear
     # agent/harness markers so this proves plain user-logon behavior, not Codex.
@@ -99,7 +100,7 @@ fn main() {
         }
     }
     let context = runtime_context::RuntimeContext::current();
-    std::process::exit(if context.runtime_label() == "interactive" && context.should_stream_join() { 7 } else { 99 });
+    std::process::exit(if context.runtime_label() == "supervisor" && context.should_stream_join() { 7 } else { 99 });
 }
 '@
     [IO.File]::WriteAllText($runtimeSource, $rust.Replace('@@CLASSIFIER@@', $classifier))
@@ -177,7 +178,7 @@ fn main() {
     $registrar = Join-Path $repo 'windows\register-autostart.ps1'
     & $registrar -AircPath $binary
     if (-not $global:aircStartupFixture.updated -or $global:aircStartupFixture.registered -or $global:aircStartupFixture.updated.WorkingDirectory -ne $scratch) { throw 'Existing task was replaced or its working directory changed' }
-    if ($global:aircStartupFixture.updated.Arguments -notlike '*-WindowStyle Hidden -ExecutionPolicy RemoteSigned -File*' -or $global:aircStartupFixture.updated.Arguments -notlike ('*-AircPath "' + $binary + '"*')) { throw 'Task action lost hidden runner or exact binary path' }
+    if ($global:aircStartupFixture.updated.Execute -ne (Join-Path $env:SystemRoot 'System32\wscript.exe') -or $global:aircStartupFixture.updated.Arguments -notlike '//B //Nologo *' -or $global:aircStartupFixture.updated.Arguments -notlike ('*"' + $binary + '"*')) { throw 'Task action lost windowless runner or exact binary path' }
     $global:aircStartupFixture.events=@()
     & $registrar -AircPath $binary
     if ($global:aircStartupFixture.events.Count -ne 0) { throw 'Unchanged task was touched' }

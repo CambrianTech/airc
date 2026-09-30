@@ -15,6 +15,7 @@ pub enum AgentRuntimeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeContext {
     InteractiveTerminal,
+    Supervisor,
     Agent {
         kind: AgentRuntimeKind,
         client_id: Option<String>,
@@ -41,12 +42,16 @@ impl RuntimeContext {
     }
 
     pub fn should_stream_join(&self) -> bool {
-        matches!(self, Self::InteractiveTerminal | Self::Agent { .. })
+        matches!(
+            self,
+            Self::InteractiveTerminal | Self::Supervisor | Self::Agent { .. }
+        )
     }
 
     pub fn runtime_label(&self) -> &'static str {
         match self {
             Self::InteractiveTerminal => "interactive",
+            Self::Supervisor => "supervisor",
             Self::Agent { kind, .. } => kind.label(),
             Self::Automation => "automation",
             Self::TestHarness => "test",
@@ -56,7 +61,9 @@ impl RuntimeContext {
     pub fn client_id(&self) -> Option<&str> {
         match self {
             Self::Agent { client_id, .. } => client_id.as_deref(),
-            Self::InteractiveTerminal | Self::Automation | Self::TestHarness => None,
+            Self::InteractiveTerminal | Self::Supervisor | Self::Automation | Self::TestHarness => {
+                None
+            }
         }
     }
 }
@@ -79,11 +86,13 @@ where
 {
     let mut saw_opt_out = false;
     let mut saw_cargo_context = false;
+    let mut saw_supervisor = false;
     let mut agent_marker = None;
 
     for (key, _value) in env {
         match key.as_ref() {
             "AIRC_NO_ATTACH" => saw_opt_out = true,
+            "AIRC_SUPERVISOR" => saw_supervisor = true,
             "CARGO_PKG_NAME" => saw_cargo_context = true,
             "CLAUDECODE" | "CLAUDE_CODE_SESSION_ID" => {
                 agent_marker.get_or_insert(AgentRuntimeKind::Claude);
@@ -109,6 +118,9 @@ where
     }
     if saw_cargo_context {
         return RuntimeContext::TestHarness;
+    }
+    if saw_supervisor {
+        return RuntimeContext::Supervisor;
     }
     if let Some(kind) = agent_marker {
         return RuntimeContext::Agent {
@@ -188,6 +200,14 @@ mod tests {
         let context = classify_for_test(std::iter::empty::<(&str, &str)>(), true, None);
         assert_eq!(context, RuntimeContext::InteractiveTerminal);
         assert!(context.should_stream_join());
+    }
+
+    #[test]
+    fn windowless_startup_supervisor_keeps_the_join_feed_alive() {
+        let context = classify_for_test([("AIRC_SUPERVISOR", "1")], false, None);
+        assert_eq!(context, RuntimeContext::Supervisor);
+        assert!(context.should_stream_join());
+        assert_eq!(context.runtime_label(), "supervisor");
     }
 
     #[test]
