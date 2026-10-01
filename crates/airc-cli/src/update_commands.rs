@@ -22,6 +22,7 @@ fn adopt_installed_with_executable(
     if daemon_is_running(airc_exe, home, socket)? {
         if daemon_build_matches(airc_exe, home, socket, &expected) {
             println!("daemon: installed build already running.");
+            retire_legacy_endpoints(airc_exe, home, socket, &expected)?;
             return Ok(());
         }
         stop_daemon(airc_exe, home, socket)?;
@@ -29,8 +30,25 @@ fn adopt_installed_with_executable(
     restart_daemon(airc_exe, home, socket)?;
     wait_daemon_ready(airc_exe, home, socket)?;
     verify_daemon_build(airc_exe, home, socket, &expected)?;
+    retire_legacy_endpoints(airc_exe, home, socket, &expected)?;
     println!("daemon: adopted installed build {expected} (verified).");
     Ok(())
+}
+
+fn retire_legacy_endpoints(
+    airc_exe: &Path,
+    home: &Path,
+    canonical: &Path,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for endpoint in crate::update_legacy::verified_endpoints(home, canonical)? {
+        stop_daemon(airc_exe, home, &endpoint)?;
+        println!(
+            "daemon: retired verified legacy endpoint {}",
+            endpoint.display()
+        );
+    }
+    verify_daemon_build(airc_exe, home, canonical, expected)
 }
 
 pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {

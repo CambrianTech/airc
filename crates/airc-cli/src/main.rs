@@ -87,6 +87,7 @@ mod transport_cli;
 mod transport_commands;
 mod update_artifact;
 mod update_commands;
+mod update_legacy;
 mod update_shutdown;
 mod work_cli;
 mod work_commands;

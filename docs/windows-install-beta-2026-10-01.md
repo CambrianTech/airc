@@ -55,13 +55,13 @@ OPEN row blocks claiming that fresh onboarding is fixed.
 | Stale agent process could not see installed tools/Rust homes | Bridge refreshes PATH; adapter reads persisted Rust homes | **OPEN:** process-boundary fixture needed; manual environment refresh used only for local fmt check, not installer acceptance |
 | Older source bypasses updated coordinator | Native bridge and shared installer acquire a compatible sibling checkout for older installer-owned source and preserve explicit developer trees | **PARTIAL:** native-entry and shared downloaded-entry fixtures pass; live downloaded-entry acceptance remains open |
 | Public canary entry cloned main without helpers | Fresh source defaults to canary; bootstrap acquires missing helper stages | **PARTIAL:** `test/setup-source-acquisition.sh` exercises the downloaded entry with older managed source; live published entry remains unproven |
-| Existing airc executable caused bootstrap to skip repaired setup | Both public bootstraps unconditionally reconcile through the installer | **PARTIAL:** third live public run reused prerequisites and reached the repaired firewall stage; successful end-to-end repeat remains open |
+| Existing airc executable caused bootstrap to skip repaired setup | Both public bootstraps unconditionally reconcile through the installer | **VERIFIED:** ordinary install.ps1 rerun on 98502ba reconciled existing installation, exited 0 and verified the running build |
 | Health checked before join; join feed never returned | Both bootstraps use AIRC_NO_ATTACH for provisioning then doctor health | **OPEN:** final installed-binary join/health and peer acknowledgement pending |
-| Firewall verification failure was suppressed and install continued | `windows/configure-firewall.ps1` captures elevated exit and verifies state; coordinator now fails on failure | **PARTIAL:** real repeated bootstrap correctly returned exit 1 on Windows cancellation; actual approval + verified rule remains unresolved |
-| Firewall elevation lost argument boundaries for paths with spaces | File-based firewall adapter with quoted native argv | **PARTIAL:** `test/windows-firewall-process.ps1` passes actual child-process argument boundaries, including spaces and apostrophes; live consent remains open |
-| Fresh-space reserve rejected an already-installed rerun | Windows adapter uses Cargo's effective target and remaining-work reserves, including system-only installs without a relocation marker | **PARTIAL:** secondary-volume, system-volume first-install/rerun, configured-cache and exhausted-cache fixtures pass; live final rerun remains required |
+| Firewall verification failure was suppressed and install continued | `windows/configure-firewall.ps1` captures elevated exit and verifies state; coordinator now fails on failure | **VERIFIED:** cancellation returned exit 1; approved public rerun verified effective TCP/UDP rules and completed |
+| Firewall elevation lost argument boundaries for paths with spaces | File-based firewall adapter with quoted native argv | **VERIFIED:** process-boundary fixture passed; approved normal entry completed effective-policy verification |
+| Fresh-space reserve rejected an already-installed rerun | Windows adapter uses Cargo's effective target and remaining-work reserves, including system-only installs without a relocation marker | **VERIFIED for rerun:** fixtures pass; normal entry automatically selected D: and completed with under 2 GB available on C:; fresh toolchain acquisition remains separately open |
 | Existing daemon may retain an old PATH after prerequisites change | Installation must reconcile daemon lifecycle using the supported startup/join path | **OPEN investigation:** portable gh is absent from runtime fallback paths; inspect daemon registry diagnostics and process age before attributing missing enrollment |
-| Health command passed while no same-account peers were enrolled | Record explicit account-registry enrollment and two-way peer acknowledgement as mesh acceptance evidence | **OPEN:** zero enrolled peers observed; doctor exit 0 is not proof of the requested connection |
+| Health command passed while no same-account peers were enrolled | Record explicit account-registry enrollment and two-way peer acknowledgement as mesh acceptance evidence | **VERIFIED:** 19 enrolled records include same-account LAN peers; public AIRC challenge and independent Bigmama return event observed after normal installation |
 | Windows startup registration failure can remain a warning | Review native startup failure propagation in the shared coordinator | **OPEN audit:** verify promised startup behavior and ensure failure cannot be reported as successful installation |
 | Local Rust 1.99 Clippy gate fails in dependency-generated code | Integrate and validate the narrow upstream compiler-compatibility fixes | **VERIFIED locally:** applied Bigmama PR #1469's async-trait 0.1.92 lockfile and doctor closure changes (24b88d0 / 34829dc); fmt and clippy --all-targets -- -D warnings pass on Rust 1.99; CI still required |
 | Initial wrong branch | Repair branch is based on origin/canary | Corrected; draft PR #1470 tracks the changes and unresolved acceptance work |
@@ -69,9 +69,9 @@ OPEN row blocks claiming that fresh onboarding is fixed.
 | Firewall verifier rejected Enforced plus ProfileInactive | Accept effective enforcement on an active profile with inactive alternative profiles; still reject policy/address failures | **PARTIAL:** reproduced by actual Windows CI provider; regression passes; corrected real-provider and installer CI rerun required |
 | AIRC requests elevation separately from Continuum's existing elevation session | Integrate with manifest-driven machine-scope stages and existing Ensure-Elevated / Invoke-Elevated / Clear-Elevation lifecycle | **OPEN:** located Continuum install-manifest.toml, generated projection, and install-common.ps1; do not add manual gsudo installation or another unrelated privilege mechanism |
 | Continuum skips AIRC reconciliation when an executable exists and maintains its own firewall policy | Have the consumer invoke the supported AIRC reconciliation and shared firewall acceptance through its owned elevation session | **OPEN:** Mod-Airc and Mod-AircFirewall inspected; existing manifest source points at main; source/channel compatibility and generated projections need coordinated repair |
-| Agent suggested manually selecting firewall profile checkboxes | Installer owns application-specific TCP and UDP local-subnet rules and effective-policy verification | **PARTIAL:** policy/process regressions pass; public bootstrap rerun reached its own Windows consent stage; live result pending |
-| Firewall helper allowed only TCP although LAN presence uses UDP | Shared installer invokes the Windows helper before startup; helper reconciles both protocols | **PARTIAL:** missing/legacy/blocked rules, Public profile, idempotence and unrelated-rule preservation fixtures pass; mesh proof pending |
-| Unelevated firewall reads fail with Access Denied on this machine | Helper distinguishes read restriction with exit 4; elevated application verifies ActiveStore policy before success | **PARTIAL:** restricted-read process fixture passes; live elevated result pending |
+| Agent suggested manually selecting firewall profile checkboxes | Installer owns application-specific TCP and UDP local-subnet rules and effective-policy verification | **VERIFIED:** approved public installer configured and verified TCP/UDP LocalSubnet policy on the existing network profile |
+| Firewall helper allowed only TCP although LAN presence uses UDP | Shared installer invokes the Windows helper before startup; helper reconciles both protocols | **VERIFIED:** fixtures pass; real public install verified both protocols and subsequent two-way Bigmama event exchange succeeded |
+| Unelevated firewall reads fail with Access Denied on this machine | Helper distinguishes read restriction with exit 4; elevated application verifies ActiveStore policy before success | **VERIFIED:** real unelevated read returned restricted access; the same installer administrator child verified effective policy before success |
 | Enabled firewall rules can still be unenforced | Verification requires Full EnforcementStatus as well as matching application, protocol and local-subnet filters | **PARTIAL:** managed-policy and address-resolution rejection fixtures pass; no organization settings changed |
 
 User clarified the visible dialog was Defender Firewall's application prompt,
@@ -359,3 +359,37 @@ public entry recovers an interrupted handoff. Ordinary update retains its
 previously-stopped policy. Regression coverage exercises distinct process
 ownership and missing/current/retry adoption. These remain OPEN pending the
 next full public run and peer event evidence.
+
+### 2026-10-01 19:07 UTC — public installation and two-way bus verified
+
+Joel identified the prior gsudo cancellation as a timeout. A following run was
+interrupted before approval at his request, then the ordinary install.ps1 entry
+was rerun after he said he was ready. It built/installed 98502ba and completed
+firewall, startup and daemon adoption with exit 0. Independent status reported
+CLI and canonical daemon 98502ba81cf7. The newly spawned daemon PID 7800 had no
+window handle; Joel confirmed the previously visible airc.exe window had closed.
+Startup uses the installed windowless wscript launcher. No manual daemon repair
+or prerequisite/build skip was used; existing authorization/toolchains were reused.
+
+The ordinary cambriantech send produced event e5edb496-a5ad-43e9-971b-48faf8fc0318.
+Bigmama returned event bf805d03-a8f6-40d6-9cc9-298c3aec28a2, echoing the AIRC-only
+challenge and supplying a fresh return token. This machine read that event through
+the canonical daemon's public inbox and echoed the return token through public
+msg. No challenge token was conveyed over the SOS gist. This is two-way event
+evidence following public installation, beyond registry/address-book discovery.
+
+Remaining OPEN: the legacy daemon PID 18484 still serves the same machine identity
+on the historical parent-directory daemon-v5.sock endpoint using a3e04c6. It was
+not killed manually. The installer must retire verified same-account legacy
+endpoints while preserving foreign/isolated scopes and the healthy canonical
+daemon. Clean hosted tests passed for Windows (including PowerShell 5), Linux and
+macOS on 98502ba; that does not erase the live legacy-migration defect.
+
+The migration repair normalizes machine-account path comparisons before socket
+selection. Public adoption inspects only the two historical account endpoints,
+requires the verified canonical identity and current IPC protocol, and stops each
+matching endpoint through its own pinned process handle. Foreign identities are
+left untouched; uncertain inspection errors stop setup. Canonical build is checked
+again afterward. Real IPC responders cover same-owner, foreign and missing
+endpoints; path-alias and isolated-scope regressions cover candidate selection.
+Live migration acceptance remains OPEN until the normal installer exercises it.
