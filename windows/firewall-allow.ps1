@@ -34,6 +34,12 @@ function Test-AircFirewallOk {
   param([string]$Program)
   $rules = @(Get-AircFirewallRules -Program $Program)
   if ($rules | Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' }) { return $false }
+  # Canonical rules do not cancel a legacy broad allow. Continuum's former
+  # program rule can coexist with them and still expose this app beyond LAN.
+  foreach ($rule in @($rules | Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' })) {
+    $address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
+    if (@($address.RemoteAddress).Count -ne 1 -or $address.RemoteAddress -ne 'LocalSubnet') { return $false }
+  }
   foreach ($protocol in @('TCP', 'UDP')) {
     $found = $false
     foreach ($rule in $rules) {

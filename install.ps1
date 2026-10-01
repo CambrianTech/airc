@@ -2,8 +2,14 @@
 # bridge acquires Git/Bash and a source tree before handing it that lifecycle.
 # Runs on stock Windows PowerShell 5.1. No PowerShell 7 or WSL required.
 [CmdletBinding()]
-param()
+param(
+    [switch]$FirewallOnly,
+    [string]$AircPath
+)
 $ErrorActionPreference = 'Stop'
+if ($FirewallOnly -and (-not $AircPath -or -not (Test-Path -LiteralPath $AircPath -PathType Leaf))) {
+    throw 'Firewall-only setup requires the installed AIRC executable via -AircPath.'
+}
 function Refresh-Path {
     $env:PATH = [Environment]::GetEnvironmentVariable('PATH','User') + ';' +
         [Environment]::GetEnvironmentVariable('PATH','Machine') + ';' + $env:PATH
@@ -84,6 +90,15 @@ try {
     . (Join-Path $source 'windows\shared-setup.ps1')
     $elevationReady = $true
     Initialize-ElevationSession
+    $env:PSModulePath = $null
+    if ($FirewallOnly) {
+        # The same public source acquisition and owner serve standalone and
+        # Continuum callers. Only AIRC owns the effective firewall policy.
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        & $powershell -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $source 'windows\configure-firewall.ps1') -AircPath $AircPath
+        if ($LASTEXITCODE -ne 0) { throw "AIRC firewall setup failed (exit $LASTEXITCODE)." }
+        return
+    }
     $env:AIRC_DIR = $source
     if ($env:BIN_TARGET) { $env:BIN_DIR = $env:BIN_TARGET }
     elseif (-not $env:BIN_DIR) { $env:BIN_DIR = Join-Path $env:LOCALAPPDATA 'Programs\airc' }

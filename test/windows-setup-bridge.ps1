@@ -15,6 +15,7 @@ function New-Source($directory) {
         [IO.File]::WriteAllText($path,'fixture')
     }
     [IO.File]::WriteAllText((Join-Path $directory 'windows/shared-setup.ps1'), 'function Initialize-ElevationSession { }; function Clear-Elevation { }')
+    [IO.File]::WriteAllText((Join-Path $directory 'windows/configure-firewall.ps1'), 'param([string]$AircPath) Add-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Value (''firewall|'' + $AircPath); if ($env:AIRC_FIXTURE_FIREWALL_FAIL) { exit 73 }; exit 0')
 }
 try {
     $gitRoot = Join-Path $fixture 'git'
@@ -67,6 +68,19 @@ public static class SetupBridgeFixture {
     Assert-True ($calls -match "O'Brien") 'Path containing spaces/apostrophe was lost'
     Assert-True ($calls -match 'bash\|--noprofile\|--norc\|') 'Shared coordinator was not invoked'
     Assert-True ($calls -notmatch 'winget') 'Working Git was unnecessarily reinstalled'
+
+    $installedBinary = Join-Path $fixture "installed airc O'Brien.exe"
+    [IO.File]::WriteAllText($installedBinary,'fixture')
+    [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
+    & (Join-Path $entry 'install.ps1') -FirewallOnly -AircPath $installedBinary
+    $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
+    Assert-True ($calls.Trim() -eq ('firewall|' + $installedBinary)) 'Firewall-only public entry rebuilt or lost the installed path'
+    $env:AIRC_FIXTURE_FIREWALL_FAIL = '1'
+    try {
+        $rejected = $false
+        try { & (Join-Path $entry 'install.ps1') -FirewallOnly -AircPath $installedBinary } catch { $rejected = $_.Exception.Message -match 'exit 73' }
+        Assert-True $rejected 'Firewall-only public entry hid failed policy verification'
+    } finally { $env:AIRC_FIXTURE_FIREWALL_FAIL = $null }
 
     # Simulate an older installed source. It must never run its old coordinator.
     Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.airc/src/windows/install-session.ps1')

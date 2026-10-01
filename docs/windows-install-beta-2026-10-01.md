@@ -270,3 +270,24 @@ An autostart fixture launch initially used a stale shell's unconfigured Rust hom
 the diagnostic was rerun with the previously established D-drive toolchain env.
 No Rust default or local installer state was manually changed. CI and live public
 entry acceptance remain OPEN; firewall delegation waits behind this failure fix.
+
+### 2026-10-01 17:47 UTC — one firewall owner across both public installers
+
+The native public entry now accepts `-FirewallOnly -AircPath` for an existing
+executable, uses its usual compatible-source acquisition and elevation lifecycle,
+and delegates to the same canonical firewall adapter. It does not enter the build,
+auth or startup lifecycle. The existing bridge fixture verifies literal paths,
+absence of a build handoff and propagation of policy failure. Continuum PR #4649
+uses this public mode through its existing AIRC manifest source, now aligned with
+canary; its separate broad firewall-rule creator has been removed. Its service
+suite passes with coverage for manifest URL, inherited owner, paths and failure.
+Merge ordering requires this AIRC entry to land before the Continuum consumer.
+No local firewall rules were changed; live public-entry acceptance remains OPEN.
+
+Adversarial review found a migration defect before publication: both canonical
+rules could coexist with Continuum's old Any-remote allowance and pass check-only.
+Canonical AIRC verification now rejects enabled exact-program inbound allowances
+outside LocalSubnet, triggering its existing scoped reconciliation. The policy
+fixture covers coexistence and convergence; unrelated program/outbound policy
+remains preserved. An unchangeable managed allowance still prevents a false
+success receipt. This was a repository/fixture repair, not a local rule change.

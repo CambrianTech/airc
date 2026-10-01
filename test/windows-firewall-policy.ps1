@@ -51,6 +51,11 @@ $binary="C:\fixture O'Brien\airc.exe"
 if (Test-AircFirewallOk $binary) { throw 'Missing rules accepted' }
 Set-AircFirewallPolicy $binary
 if (-not (Test-AircFirewallOk $binary) -or $state.rules.Count -ne 2) { throw 'Fresh setup did not produce TCP and UDP rules' }
+# A broad Continuum legacy allow must not hide beside both canonical rules.
+New-NetFirewallRule -DisplayName 'airc daemon inbound (continuum grid)' -Program $binary -Direction Inbound -Action Allow -Enabled True -Profile Any -Protocol Any -RemoteAddress Any -EdgeTraversalPolicy Block -PolicyStore PersistentStore
+if (Test-AircFirewallOk $binary) { throw 'Canonical rules masked the legacy broad Continuum allowance' }
+Set-AircFirewallPolicy $binary
+if (-not (Test-AircFirewallOk $binary) -or $state.rules.Count -ne 2) { throw 'Coexisting legacy rule did not converge to canonical policy' }
 # The old helper's TCP-only / all-remote-address policy must not pass.
 $state.rules=@($state.rules | Where-Object Protocol -eq 'TCP')
 $state.rules[0].RemoteAddress='Any'
