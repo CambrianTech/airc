@@ -291,3 +291,20 @@ outside LocalSubnet, triggering its existing scoped reconciliation. The policy
 fixture covers coexistence and convergence; unrelated program/outbound policy
 remains preserved. An unchangeable managed allowance still prevents a false
 success receipt. This was a repository/fixture repair, not a local rule change.
+
+### 2026-10-01 17:58 UTC — native status shadowing in Windows entry
+
+CI exposed a bridge regression after the deliberate firewall failure test. A
+stronger local reproduction showed that a caller-scoped LASTEXITCODE can shadow
+the global automatic value written by native processes. The native public entry
+now reads the global native result explicitly at Git, package, source, firewall
+and coordinator boundaries. The fixture uses a native Git executable instead of
+a PowerShell script pretending to update native status; it seeds a stale failure
+for successful setup and stale success for an actual failing firewall child.
+Both cases pass while preserving developer-source refusal. This is a product
+fix as well as a fixture correction, not a bypass of the CI failure.
+
+Bigmama reports normal public update to 9fdb8c1 completed locally with matching
+CLI/daemon revisions and the corrected project peer projection. That is Bigmama's
+receipt, not this machine's public-entry or reverse-event acceptance. Joel must
+be present for any required local consent; no unattended approval is assumed.

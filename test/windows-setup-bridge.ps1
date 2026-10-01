@@ -28,8 +28,7 @@ try {
     $env:AIRC_CHANNEL = $null
     $env:AIRC_FIXTURE_LOG = Join-Path $fixture 'calls.txt'
     $env:AIRC_FIXTURE_GIT_EXEC = Join-Path $gitRoot 'exec'
-    $fakeGit = Join-Path $gitRoot 'cmd/git.ps1'
-    [IO.File]::WriteAllText($fakeGit,'$global:LASTEXITCODE = 0; Write-Output $env:AIRC_FIXTURE_GIT_EXEC')
+    $fakeGit = Join-Path $gitRoot 'cmd/git.exe'
     [IO.File]::WriteAllText((Join-Path $gitRoot 'exec/git-remote-https.exe'),'fixture')
     # A tiny process fixture checks actual Windows argv/path/env handoff. It is
     # deliberately not a shell and cannot execute installer or package commands.
@@ -38,11 +37,18 @@ using System;
 using System.IO;
 public static class SetupBridgeFixture {
   public static void Main(string[] args) {
+    if (args.Length == 1 && args[0] == "--exec-path") {
+      Console.WriteLine(Environment.GetEnvironmentVariable("AIRC_FIXTURE_GIT_EXEC"));
+      return;
+    }
     File.AppendAllText(Environment.GetEnvironmentVariable("AIRC_FIXTURE_LOG"),
       "bash|" + string.Join("|", args) + "|source=" + Environment.GetEnvironmentVariable("AIRC_DIR") + "\n");
   }
 }
 '@
+    # A script setting global:LASTEXITCODE cannot emulate a native command when
+    # an enclosing scope has its own value (e.g. the deliberate exit-73 case).
+    Copy-Item -LiteralPath (Join-Path $gitRoot 'bin/bash.exe') -Destination $fakeGit
     function Get-Command {
         param([string]$Name, $ErrorAction)
         if ($Name -eq 'git.exe') { return [pscustomobject]@{Source=$fakeGit} }
@@ -62,6 +68,9 @@ public static class SetupBridgeFixture {
         $global:LASTEXITCODE = 0
     }
 
+    # Native processes update the global automatic status. A caller-local value
+    # must neither invent failure nor hide a subsequent real child failure.
+    $LASTEXITCODE = 73
     & (Join-Path $entry 'install.ps1')
     $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
     Assert-True ($calls -match 'git\|clone\|--quiet\|--branch\|canary\|') 'Fresh public source did not use matching channel'
@@ -76,11 +85,12 @@ public static class SetupBridgeFixture {
     $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
     Assert-True ($calls.Trim() -eq ('firewall|' + $installedBinary)) 'Firewall-only public entry rebuilt or lost the installed path'
     $env:AIRC_FIXTURE_FIREWALL_FAIL = '1'
+    $LASTEXITCODE = 0
     try {
         $rejected = $false
         try { & (Join-Path $entry 'install.ps1') -FirewallOnly -AircPath $installedBinary } catch { $rejected = $_.Exception.Message -match 'exit 73' }
         Assert-True $rejected 'Firewall-only public entry hid failed policy verification'
-    } finally { $env:AIRC_FIXTURE_FIREWALL_FAIL = $null }
+    } finally { $env:AIRC_FIXTURE_FIREWALL_FAIL = $null; $LASTEXITCODE = 73 }
 
     # Simulate an older installed source. It must never run its old coordinator.
     Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.airc/src/windows/install-session.ps1')

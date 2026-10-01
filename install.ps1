@@ -18,7 +18,7 @@ function Find-GitBash {
     $git = Get-Command git.exe -ErrorAction SilentlyContinue
     if ($git) {
         $execPath = & $git.Source --exec-path
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $execPath 'git-remote-https.exe'))) { return $null }
+        if ($global:LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $execPath 'git-remote-https.exe'))) { return $null }
         $root = Split-Path (Split-Path $git.Source -Parent) -Parent
         foreach ($relative in @('bin\bash.exe','usr\bin\bash.exe')) {
             $candidate = Join-Path $root $relative
@@ -35,7 +35,7 @@ if (-not $bash) {
     }
     Write-Host 'Installing Git for Windows. If Windows requests consent, setup waits for you to approve it.'
     & winget install --id Git.Git --source winget --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-    $installExit = $LASTEXITCODE
+    $installExit = $global:LASTEXITCODE
     Refresh-Path
     $bash = Find-GitBash
     if (-not $bash) { throw "Git for Windows is unavailable after installation (exit $installExit). Rerun AIRC setup to resume." }
@@ -76,7 +76,7 @@ if (-not (Test-Path (Join-Path $source 'Cargo.toml'))) {
     $cloneArgs += @('--branch',$channel)
     $cloneArgs += @('https://github.com/CambrianTech/airc.git',$source)
     & git @cloneArgs
-    if ($LASTEXITCODE -ne 0) { throw 'AIRC source acquisition failed. Rerun setup to resume.' }
+    if ($global:LASTEXITCODE -ne 0) { throw 'AIRC source acquisition failed. Rerun setup to resume.' }
 }
 if (-not (Test-SetupLayout $source)) { throw 'Selected source does not contain this setup version. Installation stopped before invoking an incompatible coordinator.' }
 $source = (Resolve-Path -LiteralPath $source).Path
@@ -96,7 +96,7 @@ try {
         # Continuum callers. Only AIRC owns the effective firewall policy.
         $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         & $powershell -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $source 'windows\configure-firewall.ps1') -AircPath $AircPath
-        if ($LASTEXITCODE -ne 0) { throw "AIRC firewall setup failed (exit $LASTEXITCODE)." }
+        if ($global:LASTEXITCODE -ne 0) { throw "AIRC firewall setup failed (exit $global:LASTEXITCODE)." }
         return
     }
     $env:AIRC_DIR = $source
@@ -105,7 +105,7 @@ try {
     $env:AIRC_WINDOWS_NATIVE = '1'
     $env:PSModulePath = $null
     & $bash --noprofile --norc ((Join-Path $source 'install.sh') -replace '\\','/')
-    $result = $LASTEXITCODE
+    $result = $global:LASTEXITCODE
 } finally {
     try { if ($elevationReady) { Clear-Elevation } }
     finally {
