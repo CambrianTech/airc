@@ -330,3 +330,12 @@ visible terminal source unproved. No manual kill. Received real ordinary event
 e5edb496-a5ad-43e9-971b-48faf8fc0318 from BIGGIEDESK with fresh challenge. Replied
 AIRC-only bf805d03-a8f6-40d6-9cc9-298c3aec28a2 with echo and fresh return token.
 No token copied to SOS. Reverse echo pending; Continuum remote command unproved.
+
+19:05 run final LIVE two-way acceptance: locally received peer event
+8732316c-7c8c-49ae-8657-8c3c66ef0217, which names our return eventbf805d03 and
+matches fresh token supplied ONLY via ordinary AIRC. Peer challengee5edb496 ->
+our echobf805d03 -> peer return8732316c closes ordinary bidirectional delivery
+for these installed runtimes/room. Confirmed back on AIRC; no tokens on SOS.
+This does not close legacy daemon/window migration or Continuum command/result.
+SOS lifetime repair PR1474 cea3ae9 pendingCI; not installed. App attachment rejected
+at100identitylimit, normal PR URL retained; no task attachments removed.
