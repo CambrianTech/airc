@@ -249,3 +249,24 @@ its own hosted run, fresh gsudo acquisition and the normal local public-entry
 consent/idempotency test. Continuum's canonical-firewall delegation and two-way
 ordinary peer delivery remain OPEN. No live installer, UAC, firewall mutation,
 task repair or manual peer enrollment was performed for this checkpoint.
+
+### 2026-10-01 17:40 UTC — full Windows owner chain regression
+
+Hosted 944440f Windows/PS5 clean installs stopped at shared-owner validation:
+"Cannot resolve installer ancestry." The shortened PS7/adapter/PS5 fixture had
+passed but omitted the coordinator's additional Bash-to-Bash process launch.
+The full existing windows-setup-path fixture now imports the real pinned helper
+inside its prerequisite child and requires borrowed ownership. This reproduced
+the CI failure locally. Keeping only the launcher alive was insufficient; MSYS
+could still leave a native parent ID pointing at an exited intermediate Bash.
+
+The coordinator now sources its PowerShell launcher inside a waiting subshell,
+and the launcher invokes PowerShell without exec/env process replacement. This
+preserves environment isolation, child status and the live ancestry chain without
+weakening owner validation. The full fixture passes with real owner/reentry and
+borrowed context; package acquisition and real cache operations remain disabled
+in the fixture. Its older synthetic source also now contains the required layout.
+An autostart fixture launch initially used a stale shell's unconfigured Rust home;
+the diagnostic was rerun with the previously established D-drive toolchain env.
+No Rust default or local installer state was manually changed. CI and live public
+entry acceptance remain OPEN; firewall delegation waits behind this failure fix.

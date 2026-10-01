@@ -10,6 +10,11 @@ source_dir="$fixture/source with spaces"
 mkdir -p "$source_dir/windows" "$source_dir/setup" "$source_dir/.git" "$fixture/home" "$fixture/wsl-first"
 cp "$repo/install.sh" "$source_dir/install.sh"
 cp "$repo/windows/run-powershell.sh" "$source_dir/windows/run-powershell.sh"
+cp "$repo/windows/install-session.ps1" "$repo/windows/shared-setup.ps1" "$repo/windows/setup-artifacts.lock.json" "$source_dir/windows/"
+# Exercise the real owner/context code without probing or closing any real cache.
+printf '\nfunction Test-IsAdmin { $true }\n' >> "$source_dir/windows/shared-setup.ps1"
+# These stages are not reached because the fixture has no compiled binary.
+touch "$source_dir/windows/register-bin-path.ps1" "$source_dir/windows/configure-firewall.ps1"
 cp "$repo/setup/github-auth.sh" "$source_dir/setup/github-auth.sh"
 printf 'fixture\n' > "$source_dir/Cargo.toml"
 cat > "$fixture/wsl-first/bash" <<'BAD'
@@ -20,11 +25,17 @@ BAD
 chmod +x "$fixture/wsl-first/bash"
 cat > "$source_dir/windows/install-prereqs.ps1" <<'PS'
 param([string]$SourceDirectory,[string]$EnvironmentFile)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'shared-setup.ps1')
+Initialize-ElevationSession
+if (-not $script:InstallElevationSession.Borrowed) { throw 'Prerequisite child lost its installer owner' }
 $value = $env:AIRC_FIXTURE_BAD_BIN + ';' + $env:PATH
 [IO.File]::WriteAllText($EnvironmentFile, ('PATH' + [char]0 + $value + [char]0), (New-Object Text.UTF8Encoding($false)))
+Clear-Elevation
 PS
 export AIRC_FIXTURE_BAD_BIN="$(cygpath -w "$fixture/wsl-first")"
 export HOME="$fixture/home" AIRC_DIR="$source_dir" BIN_DIR="$fixture/bin"
+export LOCALAPPDATA="$(cygpath -w "$fixture/local")"
 export SKILLS_TARGET="$fixture/skills" AIRC_INSTALL_NO_PULL=1 AIRC_SKIP_AUTH=1 AIRC_SKIP_RUST_BUILD=1
 export AIRC_SKIP_CODEX_CONFIG=1 AIRC_SKIP_CODEX_INSTRUCTIONS=1 AIRC_SKIP_CODEX_HOOKS=1
 export AIRC_SKIP_CODEX_TOKEN=1 AIRC_SKIP_CODEX_RULES=1 AIRC_SKIP_GIT_HOOKS=1

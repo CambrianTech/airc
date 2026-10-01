@@ -549,6 +549,8 @@ case "$(uname -s)" in
     # A native owner must outlive all prerequisite/build/firewall/startup
     # children. Native entry and Continuum already supply this context; direct
     # Git Bash/update callers re-enter the same coordinator under one owner.
+    # Source the launcher in a waiting subshell: MSYS Bash-to-Bash exec can
+    # leave native parent IDs pointing at an exited process, breaking ownership.
     if [ -z "${CAMBRIAN_INSTALL_ELEVATION:-}" ]; then
       session_args=(-NoProfile -ExecutionPolicy RemoteSigned
         -File "$(_to_win_path "$CLONE_DIR/windows/install-session.ps1")"
@@ -556,13 +558,15 @@ case "$(uname -s)" in
       [ -z "$PREPARE_ARTIFACT" ] || session_args+=(-PrepareArtifact "$(_to_win_path "$PREPARE_ARTIFACT")")
       [ -z "$PREBUILT_ARTIFACT" ] || session_args+=(-PrebuiltArtifact "$(_to_win_path "$PREBUILT_ARTIFACT")")
       [ -z "$EXPECTED_BUILD" ] || session_args+=(-ExpectedBuild "$EXPECTED_BUILD")
-      exec bash "$CLONE_DIR/windows/run-powershell.sh" "${session_args[@]}"
+      result=0
+      ( source "$CLONE_DIR/windows/run-powershell.sh" "${session_args[@]}" ) || result=$?
+      exit "$result"
     fi
     if [ -z "$PREBUILT_ARTIFACT" ] && [ "${AIRC_SKIP_PREREQS:-0}" != 1 ]; then
       environment_file="$(mktemp)"
-      if ! bash "$CLONE_DIR/windows/run-powershell.sh" -NoProfile -ExecutionPolicy RemoteSigned \
+      if ! ( source "$CLONE_DIR/windows/run-powershell.sh" -NoProfile -ExecutionPolicy RemoteSigned \
           -File "$(_to_win_path "$CLONE_DIR/windows/install-prereqs.ps1")" \
-          -SourceDirectory "$(_to_win_path "$CLONE_DIR")" -EnvironmentFile "$(_to_win_path "$environment_file")"; then
+          -SourceDirectory "$(_to_win_path "$CLONE_DIR")" -EnvironmentFile "$(_to_win_path "$environment_file")" ); then
         rm -f "$environment_file"
         fail 'Windows prerequisites did not complete. Rerun this setup to resume.'
       fi
@@ -779,7 +783,7 @@ _airc_target_dir() {
 # firewall != SmartScreen), so we CHECK first (read-only, no prompt) and only
 # UAC-prompt when a fix is actually needed — every later update stays silent.
 _windows_powershell() {
-  bash "$CLONE_DIR/windows/run-powershell.sh" "$@"
+  ( source "$CLONE_DIR/windows/run-powershell.sh" "$@" )
 }
 
 _setup_windows_firewall() {
