@@ -13,6 +13,9 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/CambrianTech/airc.git"
+# Public source setup is distributed from canary. Keep fresh source acquisition
+# on that ref unless explicitly configured; never switch an existing checkout.
+AIRC_CHANNEL="${AIRC_CHANNEL:-canary}"
 
 _default_clone_dir() {
   local script="${BASH_SOURCE[0]:-}"
@@ -98,6 +101,25 @@ _to_bash_path() {
 }
 
 CLONE_DIR="$(_to_bash_path "$CLONE_DIR")"
+BIN_DIR="$(_to_bash_path "$BIN_DIR")"
+SKILLS_TARGET="$(_to_bash_path "$SKILLS_TARGET")"
+
+# A downloaded newer entry must not run against an older managed source layout.
+# Preserve that checkout, which may contain local work, and acquire a compatible
+# channel beside it. Explicit developer trees are never switched or overwritten.
+if [ -z "$EXPECTED_BUILD" ] && [ -f "$CLONE_DIR/Cargo.toml" ] &&
+   [ ! -f "$CLONE_DIR/setup/github-auth.sh" ]; then
+  if [ -n "${AIRC_DIR:-}" ] || [ "$CLONE_DIR" != "$HOME/.airc/src" ]; then
+    fail 'Explicit source has an older setup layout. Update that checkout before running this installer; developer work was preserved.'
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    setup_hash="$(printf '%s' "$AIRC_CHANNEL" | sha256sum | cut -c1-12)"
+  else
+    setup_hash="$(printf '%s' "$AIRC_CHANNEL" | shasum -a 256 | cut -c1-12)"
+  fi
+  CLONE_DIR="$HOME/.airc/setup-source-$setup_hash"
+  info "Acquiring compatible $AIRC_CHANNEL setup at $CLONE_DIR; preserving the older checkout"
+fi
 
 # ── Prereq auto-install ─────────────────────────────────────────────────
 # Mirrors the Windows install.ps1 winget path: detect what's missing,
@@ -206,80 +228,6 @@ install_with_pkgmgr() {
 
 
 
-# Windows (Git Bash / MSYS / Cygwin): rustup's default target is
-# x86_64-pc-windows-msvc, which CANNOT LINK without the Visual Studio C++
-# build tools — `cargo build` dies with a per-crate wall of
-# `error: linking with link.exe failed: exit code: 1` and no guidance.
-# Validated live on a fresh Windows 11 box (2026-06-10). The windows-gnu
-# toolchain is NOT a viable fallback for airc: windows-sys raw-dylib
-# import libs hit the upstream bundled-dlltool bug (rust-lang/rust#103939)
-# and `ring` needs a real C compiler regardless. So when we're on Windows
-# with winget available, probe for the VC.Tools component via vswhere and
-# auto-install the (license-free) VS 2022 Build Tools C++ workload.
-_ensure_windows_msvc_toolchain() {
-  local mgr="$1"
-  case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*|CYGWIN*) ;;
-    *) return 0 ;;
-  esac
-
-  # %ProgramFiles(x86)% can't be read as a bash variable (parens are
-  # invalid in names) — ask cmd for it, fall back to the standard path.
-  local pf86
-  pf86=$(cmd //c 'echo %ProgramFiles(x86)%' 2>/dev/null | tr -d '\r')
-  [ -z "$pf86" ] || [ "$pf86" = '%ProgramFiles(x86)%' ] && pf86='C:\Program Files (x86)'
-  local vswhere
-  vswhere="$(_to_bash_path "$pf86")/Microsoft Visual Studio/Installer/vswhere.exe"
-  [ -x "$vswhere" ] || vswhere=""
-
-  if [ -n "$vswhere" ]; then
-    local vs_path
-    vs_path=$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null || true)
-    if [ -n "$vs_path" ]; then
-      ok "MSVC C++ build tools already installed"
-      return 0
-    fi
-  fi
-
-  if [ "$mgr" != "winget" ]; then
-    warn "MSVC C++ build tools not found and winget unavailable — cargo cannot link on Windows without them."
-    warn "  Install 'Visual Studio 2022 Build Tools' with the 'Desktop development with C++' workload, then re-run."
-    return 0
-  fi
-
-  info "Installing Visual Studio 2022 Build Tools + C++ workload (required to link Rust on Windows; ~2 GB, several minutes)..."
-  local wbin; wbin=$(command -v winget.exe 2>/dev/null || command -v winget 2>/dev/null || true)
-  [ -z "$wbin" ] && return 0
-  "$wbin" install --id Microsoft.VisualStudio.2022.BuildTools --exact --silent \
-    --accept-source-agreements --accept-package-agreements --disable-interactivity \
-    --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" \
-    || warn "winget BuildTools install returned non-zero; probing anyway"
-
-  # Re-probe: vswhere ships with Build Tools, so it exists now if the
-  # install worked even when it didn't exist before. Reuse the resolved
-  # pf86 (not a hardcoded /c/...) so Cygwin (/cygdrive/c) and relocated
-  # ProgramFiles(x86) do not false-fail after a successful install.
-  vswhere="$(_to_bash_path "$pf86")/Microsoft Visual Studio/Installer/vswhere.exe"
-  if [ -x "$vswhere" ] && [ -n "$("$vswhere" -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null)" ]; then
-    ok "MSVC C++ build tools installed"
-  else
-    # Most likely: a VS/BuildTools product exists but lacks the C++
-    # workload, and winget won't modify an existing install.
-    fail "MSVC C++ build tools still missing after install attempt.
-       Open 'Visual Studio Installer' -> Modify -> check 'Desktop development with C++' -> Install.
-       Then re-run install.sh. (Without it, cargo cannot link on Windows.)"
-  fi
-}
-
-# macOS: cargo needs a working C toolchain to link (ring, candle, etc.). Two
-# failure modes seen on fresh/changed Macs:
-#   1. No Command Line Tools at all -> `xcode-select --install`.
-#   2. A full Xcode.app is the ACTIVE toolchain but its license isn't
-#      accepted -> cc fails with "You have not agreed to the Xcode license"
-#      and EVERY cargo + git op dies. Fix: switch to the (license-free) CLT,
-#      or accept the license.
-# We TELL the user before each privileged step (the sudo password prompt is
-# the "press enter to proceed"); never silently mutate their toolchain.
 _ensure_macos_build_toolchain() {
   [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
 
@@ -457,7 +405,6 @@ ensure_prereqs() {
     fi
   fi
 
-  _ensure_windows_msvc_toolchain "$mgr"
   _ensure_macos_build_toolchain
 
   # Identity gen + signing live in Rust — there is no crypto bootstrap to
@@ -472,112 +419,20 @@ ensure_prereqs() {
   # comment so a reader who finds 'sshd' in old git history sees why
   # it's not here anymore.
 
-  # gh auth: required for the gist substrate. We CAN drive the login
-  # interactively when stdin is a TTY (Joel 2026-04-29: 'thought that'd
-  # be in setup or at least doctor (then claude could always do it for
-  # them)'). The browser/device-code flow needs a real user to click
-  # but doesn't need them to remember the command. Falls back to the
-  # warning path for non-interactive installs (curl|bash piped without
-  # a TTY, CI, etc).
-  if command -v gh >/dev/null 2>&1; then
-    if ! gh auth status >/dev/null 2>&1; then
-      # Skip the interactive auth path under sudo/root: gh stores the token
-      # for the calling user (root's keyring), but airc runs as the real
-      # user and reads the real user's token. Authing as root silently
-      # produces a working-as-root / broken-as-user state. Joel 2026-04-29:
-      # 'detect and if not, open it if it isnt sudo'.
-      _running_as_root=0
-      if [ "${EUID:-$(id -u 2>/dev/null || echo 1000)}" = "0" ] || [ -n "${SUDO_USER:-}" ]; then
-        _running_as_root=1
-      fi
-      if [ "$_running_as_root" = "1" ]; then
-        warn "gh is not authenticated, and install is running as root/sudo."
-        warn "  Don't auth gh as root — re-run as your normal user, or run once after install:"
-        warn "    gh auth login -h github.com -s gist"
-      elif [ -t 0 ] && [ -t 1 ]; then
-        # Pause-with-Enter before handing the user off to gh's device-code
-        # flow. Without this break, the gh prompt + browser popup arrives
-        # mid-install-output and looks like the script hung — the user
-        # has no signal that "you're now in a different tool". Match
-        # Claude Code's installer convention: bold green "==>" headline,
-        # bold action line, explicit "Press Enter / Ctrl+C" prompt.
-        # Honor AIRC_INSTALL_YES=1 for power users who curl|bash often.
-        printf '\n  \033[1;32m==>\033[0m GitHub authentication required for the gist substrate.\n'
-        printf '      About to launch: \033[1mgh auth login -h github.com -s gist\033[0m\n'
-        printf '      A browser will open; the device code shown in the terminal must be pasted there.\n'
-        if [ "${AIRC_INSTALL_YES:-0}" != "1" ]; then
-          printf '      Press Enter to continue, Ctrl+C to abort: '
-          read -r _ || true
-          printf '\n'
-        fi
-        if gh auth login -h github.com -s gist; then
-          ok "gh auth complete"
-          # Re-run setup-git so the just-acquired token gets wired.
-          gh auth setup-git 2>/dev/null && info "  gh token wired into git credential helper" || true
-        else
-          warn "gh auth login did not complete — re-run when ready:"
-          warn "    gh auth login -h github.com -s gist"
-        fi
-      else
-        warn "gh CLI is not authenticated. Run once before 'airc join':"
-        warn "    gh auth login -h github.com -s gist"
-        warn "  (interactive; can't run from a non-TTY install)"
-      fi
-    else
-      # Wire gh's token into git's credential helper. Without this,
-      # every git-over-HTTPS op (gist fetch/push -- airc's substrate
-      # hot path) prompts the user for a password, repeatedly. gh ships
-      # with `gh auth git-credential` for exactly this purpose; the
-      # `gh auth setup-git` one-liner registers it in ~/.gitconfig.
-      # Idempotent (no-op if already configured), safe to always run.
-      # Joel hit this on 2026-04-28 — Windows install where gh was
-      # auth'd-in-keyring but git itself didn't know. Resulted in a
-      # GUI password popup every airc operation that touched a gist.
-      if ! git config --global --get-all credential.https://github.com.helper 2>/dev/null | grep -q 'gh auth git-credential'; then
-        if gh auth setup-git 2>/dev/null; then
-          info "  gh token wired into git credential helper (no more password popups for gist ops)"
-        fi
-      fi
-    fi
-  fi
-
-  # Git author identity. Agents in this substrate commit and open PRs,
-  # and a fresh machine has no global user.name/user.email — the first
-  # commit then dies with "Author identity unknown" (caught live on a
-  # clean Windows box 2026-06-13). Derive it from the authenticated gh
-  # account when unset; never clobber an identity the user already set.
-  # Email prefers the account's public email, falling back to the GitHub
-  # noreply alias (<id>+<login>@users.noreply.github.com), which always
-  # matches the account and avoids leaking a private address.
-  if command -v gh >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    _need_name=0; _need_email=0
-    if [ -z "$(git config --global user.name 2>/dev/null || true)" ]; then _need_name=1; fi
-    if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then _need_email=1; fi
-    if [ "$_need_name" = 1 ] || [ "$_need_email" = 1 ]; then
-      _gh_login="$(gh api user --jq '.login' 2>/dev/null || true)"
-      _gh_name="$(gh api user --jq '.name // .login' 2>/dev/null || true)"
-      _gh_id="$(gh api user --jq '.id' 2>/dev/null || true)"
-      _gh_email="$(gh api user --jq '.email // empty' 2>/dev/null || true)"
-      if [ -z "$_gh_email" ] && [ -n "$_gh_id" ] && [ -n "$_gh_login" ]; then
-        _gh_email="${_gh_id}+${_gh_login}@users.noreply.github.com"
-      fi
-      if [ "$_need_name" = 1 ] && [ -n "$_gh_name" ]; then
-        git config --global user.name "$_gh_name"
-        info "git user.name set from gh: $_gh_name (override: git config --global user.name ...)"
-      fi
-      if [ "$_need_email" = 1 ] && [ -n "$_gh_email" ]; then
-        git config --global user.email "$_gh_email"
-        info "git user.email set from gh: $_gh_email (override: git config --global user.email ...)"
-      fi
-    fi
-  fi
 }
 
-if [ -z "$PREBUILT_ARTIFACT" ]; then ensure_prereqs; fi
+# Windows already has Git (the Bash runtime). Acquire the source adapter before
+# applying Windows packages; other platforms retain their package-manager path.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *) if [ -z "$PREBUILT_ARTIFACT" ]; then ensure_prereqs; fi ;;
+esac
 
 # ── Clone or update ─────────────────────────────────────────────────────
 
-if [ -d "$CLONE_DIR/.git" ] || [ -f "$CLONE_DIR/.git" ]; then
+if [ -f "$CLONE_DIR/Cargo.toml" ] && [ ! -e "$CLONE_DIR/.git" ]; then
+  info "Installing supplied source tree (no Git metadata to update)"
+elif [ -d "$CLONE_DIR/.git" ] || [ -f "$CLONE_DIR/.git" ]; then
   # AIRC_INSTALL_NO_PULL=1: trust CLONE_DIR's checked-out tree exactly
   # as-is — no branch switch, no pull. CI uses this when it has already
   # staged the PR's tree at $CLONE_DIR via `cp -r .` and wants the
@@ -672,6 +527,35 @@ else
   fi
 fi
 
+# Windows adapts package application and paths, not the install lifecycle.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [ -z "$PREBUILT_ARTIFACT" ] && [ "${AIRC_SKIP_PREREQS:-0}" != 1 ]; then
+      environment_file="$(mktemp)"
+      if ! bash "$CLONE_DIR/windows/run-powershell.sh" -NoProfile -ExecutionPolicy RemoteSigned \
+          -File "$(_to_win_path "$CLONE_DIR/windows/install-prereqs.ps1")" \
+          -SourceDirectory "$(_to_win_path "$CLONE_DIR")" -EnvironmentFile "$(_to_win_path "$environment_file")"; then
+        rm -f "$environment_file"
+        fail 'Windows prerequisites did not complete. Rerun this setup to resume.'
+      fi
+      while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+        case "$key" in
+          # System32 also ships bash.exe (WSL). Keep the running Git Bash
+          # runtime first when importing Windows registry PATH after installs.
+          PATH) export PATH="$(dirname "$BASH"):$(cygpath -p -u "$value")" ;;
+          CARGO_HOME|RUSTUP_HOME|CARGO_TARGET_DIR|TEMP|TMP) export "$key=$value" ;;
+          *) rm -f "$environment_file"; fail "Unexpected Windows environment field: $key" ;;
+        esac
+      done < "$environment_file"
+      rm -f "$environment_file"
+    fi ;;
+esac
+
+# One consent/identity stage for native Windows and POSIX installers.
+# Artifact handoffs operate on an already-running installation, without login.
+if [ -z "$EXPECTED_BUILD" ]; then
+  bash "$CLONE_DIR/setup/github-auth.sh"
+fi
 if [ -n "$EXPECTED_BUILD" ]; then
   checkout_build="$(git -C "$CLONE_DIR" rev-parse HEAD)" || fail 'Cannot verify handoff checkout'
   [[ "$checkout_build" == "$EXPECTED_BUILD"* ]] || fail "Checkout $checkout_build does not match $EXPECTED_BUILD"
@@ -857,48 +741,21 @@ _windows_powershell() {
 }
 
 _setup_windows_firewall() {
-  local ps1="$CLONE_DIR/windows/firewall-allow.ps1"
-  [ -f "$ps1" ] || return 0   # tolerate older checkouts
-  local airc_win ps1_win
-  airc_win="$(_to_win_path "$BIN_DIR/airc.exe")"
-  ps1_win="$(_to_win_path "$ps1")"
-  # Read-only state check — no admin, no prompt.
-  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-       -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
-    ok "Windows Firewall: airc inbound already allowed"
-    return 0
+  if ! _windows_powershell -NoProfile -ExecutionPolicy RemoteSigned \
+      -File "$(_to_win_path "$CLONE_DIR/windows/configure-firewall.ps1")" \
+      -AircPath "$(_to_win_path "$BIN_DIR/airc.exe")"; then
+    fail 'Windows firewall setup or verification failed. Setup is incomplete; rerun the same installer to resume.'
   fi
-  # Tell the user WHAT we're about to do and WHY before the UAC prompt pops —
-  # same spirit as an app asking for notification permission. Then it's an
-  # informed click, not a mystery elevation request.
-  info ""
-  info "Windows Firewall — one-time setup (needs your approval):"
-  info "  WHAT: add a single rule allowing inbound TCP to this airc binary."
-  info "  WHY:  Windows blocks inbound connections from unknown programs by"
-  info "        default, so other machines on your LAN can't reach this node"
-  info "        until the rule exists. This is the airc grid's front door."
-  info "  HOW:  Windows will show ONE UAC prompt — click Yes to allow it."
-  info "        (Updates stay silent afterward; nothing to re-approve.)"
-  _windows_powershell -NoProfile -Command \
-    "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$ps1_win','-AircPath','$airc_win')" \
-    >/dev/null 2>&1 || true
-  if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-       -File "$ps1_win" -AircPath "$airc_win" -CheckOnly >/dev/null 2>&1; then
-    ok "Windows Firewall: airc inbound allowed — LAN peers can now reach this node."
-  else
-    warn "Windows Firewall rule was NOT set (UAC declined or cancelled)."
-    warn "  ⚠️  LAN connectivity will NOT work — other machines can't reach this"
-    warn "      node inbound, so the grid can't form over your local network."
-    warn "  Fix it any time by re-running setup, or as admin:"
-    warn "      powershell -ExecutionPolicy Bypass -File '$ps1_win' -AircPath '$airc_win'"
-  fi
+  ok "Windows Firewall: verified inbound allowance for the installed binary"
 }
-
 _setup_windows_autostart() {
   local registrar="$CLONE_DIR/windows/register-autostart.ps1"
+  local flags=()
+  # Preserve the existing native install opt-in; Git Bash repairs existing only.
+  [ "${AIRC_WINDOWS_NATIVE:-0}" = 1 ] || flags+=(-ExistingOnly)
   if _windows_powershell -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned \
-       -File "$(_to_win_path "$registrar")" -AircPath "$(_to_win_path "$BIN_DIR/airc.exe")" -ExistingOnly; then
-    ok "Windows mesh autostart checked (existing tasks repaired; no new opt-in)"
+       -File "$(_to_win_path "$registrar")" -AircPath "$(_to_win_path "$BIN_DIR/airc.exe")" "${flags[@]}"; then
+    ok "Windows mesh autostart checked"
   else
     warn "Could not repair Windows mesh autostart; rerun this installer from a normal Windows session."
   fi
@@ -943,13 +800,18 @@ _install_airc_binary() {
   mkdir -p "$BIN_DIR"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      cp -f "$built" "$BIN_DIR/airc.exe"
+      if ! cmp -s "$built" "$BIN_DIR/airc.exe"; then
+        cp -f "$built" "$BIN_DIR/airc.exe"
+      fi
+      "$BIN_DIR/airc.exe" --version >/dev/null || fail 'Installed Windows binary cannot run'
       if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$BIN_DIR/airc.exe"; fi
       ok "Installed airc: $BIN_DIR/airc.exe"
       # Reachable-inbound on a typical Windows box (idempotent; prompts for
       # elevation only when the firewall rule is missing/broken).
       _setup_windows_firewall
       _setup_windows_autostart
+      _windows_powershell -NoProfile -ExecutionPolicy RemoteSigned \
+        -File "$(_to_win_path "$CLONE_DIR/windows/register-bin-path.ps1")" -BinDirectory "$(_to_win_path "$BIN_DIR")"
       ;;
     *)
       local tmp="$BIN_DIR/.airc.tmp.$$"
