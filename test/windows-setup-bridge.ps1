@@ -9,11 +9,12 @@ foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','AIRC_DIR','AIRC_CHANNEL
 }
 function Assert-True($condition,$message) { if (-not $condition) { throw $message } }
 function New-Source($directory) {
-    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1')) {
+    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1')) {
         $path = Join-Path $directory $relative
         New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
         [IO.File]::WriteAllText($path,'fixture')
     }
+    [IO.File]::WriteAllText((Join-Path $directory 'windows/shared-setup.ps1'), 'function Initialize-ElevationSession { }; function Clear-Elevation { }')
 }
 try {
     $gitRoot = Join-Path $fixture 'git'
@@ -54,6 +55,7 @@ public static class SetupBridgeFixture {
         $global:LASTEXITCODE = 0
     }
     function winget {
+        if (($args -join ' ') -notmatch '--scope user') { throw 'Bootstrap Git acquisition must use user scope' }
         Add-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Value 'winget'
         [IO.File]::WriteAllText((Join-Path $gitRoot 'exec/git-remote-https.exe'),'fixture')
         $global:LASTEXITCODE = 0
@@ -67,12 +69,21 @@ public static class SetupBridgeFixture {
     Assert-True ($calls -notmatch 'winget') 'Working Git was unnecessarily reinstalled'
 
     # Simulate an older installed source. It must never run its old coordinator.
-    Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.airc/src/setup/github-auth.sh')
+    Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.airc/src/windows/install-session.ps1')
     [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
     & (Join-Path $entry 'install.ps1')
     $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
     Assert-True ($calls -match 'setup-source-') 'Old default source bypassed compatible acquisition'
     Assert-True (Test-Path (Join-Path $env:USERPROFILE '.airc/src/Cargo.toml')) 'Old checkout was destroyed'
+
+    $fallback = Get-ChildItem (Join-Path $env:USERPROFILE '.airc') -Directory -Filter 'setup-source-*' | Select-Object -First 1
+    Remove-Item -LiteralPath (Join-Path $fallback.FullName 'windows/install-session.ps1')
+    [IO.File]::WriteAllText((Join-Path $fallback.FullName 'local-work.txt'),'preserve me')
+    [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
+    & (Join-Path $entry 'install.ps1')
+    $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
+    Assert-True ($calls -match 'git\|clone' -and $calls -match 'setup-source-[a-f0-9]+-1') 'Stale managed fallback was not replaced by compatible acquisition'
+    Assert-True ((Get-Content (Join-Path $fallback.FullName 'local-work.txt')) -eq 'preserve me') 'Managed fallback user work was changed'
 
     # Explicit developer sources are never silently replaced or switched.
     $env:AIRC_DIR = Join-Path $env:USERPROFILE '.airc/src'
@@ -87,6 +98,49 @@ public static class SetupBridgeFixture {
     Remove-Item -LiteralPath (Join-Path $gitRoot 'exec/git-remote-https.exe')
     & (Join-Path $entry 'install.ps1')
     Assert-True ((Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw) -match 'winget') 'Broken Git transport bypassed acquisition'
+
+    # Exercise the actual pinned loader with controlled artifact bytes. Cached
+    # or downloaded content must match before it can be dot-sourced.
+    & {
+        $artifactSource = Join-Path $fixture 'artifact source'
+        New-Item -ItemType Directory -Path $artifactSource | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repository 'windows/shared-setup.ps1') -Destination $artifactSource
+        $manifestText = '$script:ContinuumManifest = @{gsudo=@{source=@{type=''winget'';id=''fixture-package'';scope=''user''}}}'
+        $helperText = 'param($GsudoSource) if ($GsudoSource.id -ne ''fixture-package'') { throw ''Manifest descriptor missing'' }; function Initialize-ElevationSession { }; function Clear-Elevation { }'
+        $utf8 = New-Object Text.UTF8Encoding($false)
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $manifestHash = [BitConverter]::ToString($hasher.ComputeHash($utf8.GetBytes($manifestText))).Replace('-','').ToLowerInvariant()
+            $helperHash = [BitConverter]::ToString($hasher.ComputeHash($utf8.GetBytes($helperText))).Replace('-','').ToLowerInvariant()
+        } finally { $hasher.Dispose() }
+        $revision = 'a' * 40
+        @{schemaVersion=1;continuumRevision=$revision;elevationSha256=$helperHash;manifestSha256=$manifestHash} |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $artifactSource 'setup-artifacts.lock.json')
+        $downloadState = @{count=0;corrupt=$false}
+        function Invoke-WebRequest {
+            param($Uri,[switch]$UseBasicParsing,$OutFile)
+            if ($Uri -notlike ('https://raw.githubusercontent.com/CambrianTech/continuum/' + $revision + '/*')) { throw 'Artifact URL is not pinned' }
+            $downloadState.count++
+            $body = if ($downloadState.corrupt) { 'throw "unverified artifact executed"' }
+                elseif ($Uri.EndsWith('/manifest.windows.ps1')) { $manifestText } else { $helperText }
+            [IO.File]::WriteAllText($OutFile,$body,$utf8)
+        }
+        . (Join-Path $artifactSource 'shared-setup.ps1')
+        Assert-True ($downloadState.count -eq 2) 'Fresh loader did not acquire both verified artifacts'
+        . (Join-Path $artifactSource 'shared-setup.ps1')
+        Assert-True ($downloadState.count -eq 2) 'Verified cached artifacts were downloaded again'
+        $cachedManifest = Join-Path $env:LOCALAPPDATA ("airc/setup-artifacts/$revision/manifest.windows.ps1")
+        [IO.File]::WriteAllText($cachedManifest,'throw "unverified cache executed"')
+        . (Join-Path $artifactSource 'shared-setup.ps1')
+        Assert-True ($downloadState.count -eq 3) 'Corrupted cache was reused instead of repaired'
+        [IO.File]::WriteAllText($cachedManifest,'throw "unverified cache executed"')
+        $downloadState.corrupt = $true
+        $rejected = $false
+        try { . (Join-Path $artifactSource 'shared-setup.ps1') } catch { $rejected = $_.Exception.Message -match 'checksum mismatch' }
+        Assert-True $rejected 'Unverified artifact was executed or silently accepted'
+        Assert-True (-not (Get-ChildItem -LiteralPath (Split-Path $cachedManifest) -Filter '*.download')) 'Failed download left staging files'
+        Write-Host 'PASS: immutable artifact acquisition, verified cache reuse/repair, mismatch refusal, shared manifest descriptor'
+    }
     Write-Host 'PASS: fresh source, old-source upgrade, developer-tree preservation, broken Git, Windows path handoff'
 } finally {
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }

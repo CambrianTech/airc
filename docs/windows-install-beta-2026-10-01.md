@@ -216,3 +216,36 @@ resolution and reading the explicit machine home; both belong to joelteply.
 No manual enrollment, dial, identity change or restart was done. The nonce was
 sent only through AIRC; an ordinary peer echo is still required before claiming
 delivery. Neither discovery nor a publish receipt closes mesh acceptance.
+
+### 2026-10-01 17:29 UTC — standalone consumer of the shared elevation owner
+
+AIRC now acquires the generated Windows dependency manifest and small elevation
+helper from immutable Continuum commit 0aad524a004cc1a95e1509a3170449cff2e76a89.
+Both artifacts must match repository-pinned SHA256 values before either executes;
+verified cache reuse, corrupt-cache repair and download mismatch rejection have
+regression coverage. This does not install the Continuum application. The gsudo
+package descriptor comes from the existing canonical manifest.
+
+Native setup owns the session through completion. Direct Git Bash setup re-enters
+the same coordinator under a native process owner; Continuum callers retain their
+outer owner. MSVC, firewall and fallback startup registration use that shared
+helper, with original child failures preserved and cleanup in finally blocks.
+Git and Rust acquisition explicitly select ordinary-user package scope.
+
+Independent review found an upgrade defect: the previous source layout contains
+the auth helper but lacks the new session adapter. Both entry points now validate
+the required Windows layout and select another managed sibling when a cached
+fallback is obsolete, preserving older trees and their local work. Native and
+Bash regression fixtures exercise both preceding-release and stale-fallback cases.
+The bridge, firewall process, storage and autostart suites pass. The autostart
+suite also runs the real pinned helper through AIRC's exact PS7 / Git Bash / PS5
+adapter and verifies borrowed ownership without package installation or elevation.
+One initial diagnostic PS5 test launch hit the shell execution policy; rerunning
+the fixture with process-only ExecutionPolicy Bypass passed, with no policy change.
+
+The adversarial reviewer approves this scope subject to CI. Prior head ad9e408
+passed all four hosted clean-install platforms. This new consumer still needs
+its own hosted run, fresh gsudo acquisition and the normal local public-entry
+consent/idempotency test. Continuum's canonical-firewall delegation and two-way
+ordinary peer delivery remain OPEN. No live installer, UAC, firewall mutation,
+task repair or manual peer enrollment was performed for this checkpoint.

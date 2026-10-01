@@ -28,7 +28,7 @@ if (-not $bash) {
         throw 'Git for Windows and winget are unavailable. Install Windows App Installer, then rerun AIRC setup.'
     }
     Write-Host 'Installing Git for Windows. If Windows requests consent, setup waits for you to approve it.'
-    & winget install --id Git.Git --source winget --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+    & winget install --id Git.Git --source winget --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
     $installExit = $LASTEXITCODE
     Refresh-Path
     $bash = Find-GitBash
@@ -40,7 +40,7 @@ $source = if ($env:AIRC_DIR) { $env:AIRC_DIR } elseif ($PSScriptRoot -and (Test-
 } else { Join-Path $env:USERPROFILE '.airc\src' }
 $channel = if ($env:AIRC_CHANNEL) { $env:AIRC_CHANNEL } else { 'canary' }
 function Test-SetupLayout([string]$Directory) {
-    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1')) {
+    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Directory $relative))) { return $false }
     }
     return $true
@@ -55,6 +55,12 @@ if ((Test-Path (Join-Path $source 'Cargo.toml')) -and -not (Test-SetupLayout $so
     try { $suffix = ([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($channel))) -replace '-','').Substring(0,12).ToLowerInvariant() }
     finally { $hash.Dispose() }
     $source = Join-Path $env:USERPROFILE ('.airc\setup-source-' + $suffix)
+    $sourceBase = $source
+    $attempt = 0
+    while ((Test-Path -LiteralPath $source) -and -not (Test-SetupLayout $source)) {
+        $attempt++
+        $source = $sourceBase + '-' + $attempt
+    }
     Write-Host "Acquiring compatible $channel setup in $source; preserving the older checkout."
 }
 if (-not (Test-Path (Join-Path $source 'Cargo.toml'))) {
@@ -73,7 +79,11 @@ $source = (Resolve-Path -LiteralPath $source).Path
 $names = @('AIRC_DIR','BIN_DIR','AIRC_WINDOWS_NATIVE','PSModulePath')
 $saved = @{}
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+$elevationReady = $false
 try {
+    . (Join-Path $source 'windows\shared-setup.ps1')
+    $elevationReady = $true
+    Initialize-ElevationSession
     $env:AIRC_DIR = $source
     if ($env:BIN_TARGET) { $env:BIN_DIR = $env:BIN_TARGET }
     elseif (-not $env:BIN_DIR) { $env:BIN_DIR = Join-Path $env:LOCALAPPDATA 'Programs\airc' }
@@ -82,8 +92,11 @@ try {
     & $bash --noprofile --norc ((Join-Path $source 'install.sh') -replace '\\','/')
     $result = $LASTEXITCODE
 } finally {
-    foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
-    Refresh-Path
+    try { if ($elevationReady) { Clear-Elevation } }
+    finally {
+        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
+        Refresh-Path
+    }
 }
 if ($result -ne 0) { throw "AIRC setup failed (exit $result). Rerun the same setup to resume." }
 $global:LASTEXITCODE = 0

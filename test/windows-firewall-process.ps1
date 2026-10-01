@@ -1,5 +1,5 @@
 # Exercise the real elevation adapter's argument boundary with a harmless helper.
-# Start-Process is redirected to a normal child; no firewall/UAC changes occur.
+# Invoke-Elevated is redirected to a normal child; no firewall/UAC changes occur.
 $ErrorActionPreference='Stop'
 $repository=Split-Path $PSScriptRoot -Parent
 $fixture=Join-Path ([IO.Path]::GetTempPath()) ("airc firewall O'Brien " + [guid]::NewGuid().ToString('N'))
@@ -8,6 +8,7 @@ $savedReadDenied=$env:AIRC_FIXTURE_FIREWALL_READ_DENIED
 try {
     New-Item -ItemType Directory -Path $fixture | Out-Null
     Copy-Item (Join-Path $repository 'windows/configure-firewall.ps1') (Join-Path $fixture 'configure-firewall.ps1')
+    [IO.File]::WriteAllText((Join-Path $fixture 'shared-setup.ps1'), 'function Initialize-ElevationSession { }; function Clear-Elevation { }')
     $binary=Join-Path $fixture 'installed airc.exe'
     [IO.File]::WriteAllText($binary,'fixture')
     $env:AIRC_FIXTURE_EXPECTED_PATH=$binary
@@ -23,12 +24,13 @@ if ($CheckOnly) {
 exit 0
 '@)
     $testState=@{requests=0;deny=$false}
-    function Start-Process {
-        param([string]$FilePath,[string]$Verb,[string]$WindowStyle,[string]$ArgumentList,[switch]$PassThru)
-        if ($Verb -ne 'RunAs' -or $WindowStyle -ne 'Hidden') { throw 'Incorrect consent process configuration' }
+    function Invoke-Elevated {
+        param([string]$Reason,[string[]]$CommandLine)
+        if ($Reason -notmatch 'AIRC TCP/UDP') { throw 'Missing elevation reason' }
         $testState.requests++
         if ($testState.deny) { throw 'fixture: consent denied' }
-        Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -WindowStyle Hidden -ArgumentList $ArgumentList -PassThru
+        $arguments = @($CommandLine | Select-Object -Skip 1)
+        & $CommandLine[0] @arguments
     }
     & (Join-Path $fixture 'configure-firewall.ps1') -AircPath $binary
     if (-not (Test-Path (Join-Path $fixture 'applied'))) { throw 'Apply child did not receive the literal path' }

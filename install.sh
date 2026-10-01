@@ -107,8 +107,18 @@ SKILLS_TARGET="$(_to_bash_path "$SKILLS_TARGET")"
 # A downloaded newer entry must not run against an older managed source layout.
 # Preserve that checkout, which may contain local work, and acquire a compatible
 # channel beside it. Explicit developer trees are never switched or overwritten.
+_compatible_setup_layout() {
+  local directory="$1" relative
+  [ -f "$directory/setup/github-auth.sh" ] || return 1
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1; do
+        [ -f "$directory/windows/$relative" ] || return 1
+      done ;;
+  esac
+}
 if [ -z "$EXPECTED_BUILD" ] && [ -f "$CLONE_DIR/Cargo.toml" ] &&
-   [ ! -f "$CLONE_DIR/setup/github-auth.sh" ]; then
+   ! _compatible_setup_layout "$CLONE_DIR"; then
   if [ -n "${AIRC_DIR:-}" ] || [ "$CLONE_DIR" != "$HOME/.airc/src" ]; then
     fail 'Explicit source has an older setup layout. Update that checkout before running this installer; developer work was preserved.'
   fi
@@ -118,6 +128,12 @@ if [ -z "$EXPECTED_BUILD" ] && [ -f "$CLONE_DIR/Cargo.toml" ] &&
     setup_hash="$(printf '%s' "$AIRC_CHANNEL" | shasum -a 256 | cut -c1-12)"
   fi
   CLONE_DIR="$HOME/.airc/setup-source-$setup_hash"
+  setup_base="$CLONE_DIR"
+  setup_attempt=0
+  while [ -e "$CLONE_DIR" ] && ! _compatible_setup_layout "$CLONE_DIR"; do
+    setup_attempt=$((setup_attempt + 1))
+    CLONE_DIR="$setup_base-$setup_attempt"
+  done
   info "Acquiring compatible $AIRC_CHANNEL setup at $CLONE_DIR; preserving the older checkout"
 fi
 
@@ -530,6 +546,18 @@ fi
 # Windows adapts package application and paths, not the install lifecycle.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
+    # A native owner must outlive all prerequisite/build/firewall/startup
+    # children. Native entry and Continuum already supply this context; direct
+    # Git Bash/update callers re-enter the same coordinator under one owner.
+    if [ -z "${CAMBRIAN_INSTALL_ELEVATION:-}" ]; then
+      session_args=(-NoProfile -ExecutionPolicy RemoteSigned
+        -File "$(_to_win_path "$CLONE_DIR/windows/install-session.ps1")"
+        -SourceDirectory "$(_to_win_path "$CLONE_DIR")" -BashPath "$(_to_win_path "$BASH")")
+      [ -z "$PREPARE_ARTIFACT" ] || session_args+=(-PrepareArtifact "$(_to_win_path "$PREPARE_ARTIFACT")")
+      [ -z "$PREBUILT_ARTIFACT" ] || session_args+=(-PrebuiltArtifact "$(_to_win_path "$PREBUILT_ARTIFACT")")
+      [ -z "$EXPECTED_BUILD" ] || session_args+=(-ExpectedBuild "$EXPECTED_BUILD")
+      exec bash "$CLONE_DIR/windows/run-powershell.sh" "${session_args[@]}"
+    fi
     if [ -z "$PREBUILT_ARTIFACT" ] && [ "${AIRC_SKIP_PREREQS:-0}" != 1 ]; then
       environment_file="$(mktemp)"
       if ! bash "$CLONE_DIR/windows/run-powershell.sh" -NoProfile -ExecutionPolicy RemoteSigned \

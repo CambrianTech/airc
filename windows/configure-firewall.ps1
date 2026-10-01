@@ -8,24 +8,14 @@ $helper = Join-Path $PSScriptRoot 'firewall-allow.ps1'
 & $powershell -NoProfile -ExecutionPolicy RemoteSigned -File $helper -AircPath $AircPath -CheckOnly
 if ($LASTEXITCODE -eq 0) { exit 0 }
 Write-Host 'AIRC setup will configure TCP and UDP access for this app from the local subnet.'
-Write-Host 'Windows may ask administrator consent for PowerShell. Setup waits; no firewall profile checkboxes need to be configured manually.'
-$logPath = [IO.Path]::GetTempFileName()
-$arguments = '-NoProfile -ExecutionPolicy RemoteSigned -File "{0}" -AircPath "{1}" -LogPath "{2}"' -f $helper,$AircPath,$logPath
+Write-Host 'Setup uses its shared administrator session and waits for consent when needed.'
+. (Join-Path $PSScriptRoot 'shared-setup.ps1')
 try {
-    $process = Start-Process -FilePath $powershell -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments -PassThru
-    $null = $process.Handle
-    $process.WaitForExit()
-    $result = $process.ExitCode
-    $process.Dispose()
-} catch { throw "Windows firewall consent failed: $($_.Exception.Message). Rerun AIRC setup to resume." }
-finally {
-    # RunAs cannot redirect stdout. Preserve elevated diagnostics in setup's
-    # visible output instead of losing them with the hidden child window.
-    if (Test-Path -LiteralPath $logPath) {
-        Get-Content -LiteralPath $logPath | ForEach-Object { Write-Host $_ }
-        Remove-Item -LiteralPath $logPath -Force
-    }
-}
+    Initialize-ElevationSession
+    Invoke-Elevated -Reason 'configuring AIRC TCP/UDP local-subnet firewall policy' -CommandLine @(
+        $powershell, '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $helper, '-AircPath', $AircPath)
+    $result = $LASTEXITCODE
+} finally { Clear-Elevation }
 if ($result -ne 0) { throw "Windows firewall setup failed (exit $result). Rerun AIRC setup to resume." }
 & $powershell -NoProfile -ExecutionPolicy RemoteSigned -File $helper -AircPath $AircPath -CheckOnly
 if ($LASTEXITCODE -eq 4) {

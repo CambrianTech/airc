@@ -21,6 +21,47 @@ if ($BoundaryParent) {
     & $bash $launcher -NoProfile -NonInteractive -Command 'exit 37'
     if ($LASTEXITCODE -ne 37) { throw 'Bash launcher lost the PowerShell exit status' }
     if ($env:PSModulePath -cne $inheritedModulePath) { throw 'Failed child changed its parent module path' }
+    # Load the real pinned shared artifacts into a disposable cache, then prove
+    # ownership through AIRC's exact PS7 -> Bash adapter -> PS5 path. Only context
+    # handling runs: no package install, cache acquisition, task or firewall call.
+    $boundaryCache = Join-Path ([IO.Path]::GetTempPath()) ('airc-elevation-boundary-' + [guid]::NewGuid().ToString('N'))
+    $savedLocalAppData = $env:LOCALAPPDATA
+    $savedElevationContext = $env:CAMBRIAN_INSTALL_ELEVATION
+    $loadedElevation = $false
+    try {
+        $env:LOCALAPPDATA = $boundaryCache
+        $env:CAMBRIAN_INSTALL_ELEVATION = $null
+        . (Join-Path $repo 'windows/shared-setup.ps1')
+        $loadedElevation = $true
+        function Test-IsAdmin { $true } # prohibit real gsudo probes/cleanup
+        Initialize-ElevationSession
+        $loader = (Join-Path $repo 'windows/shared-setup.ps1').Replace("'", "''")
+        $probe = @"
+`$ErrorActionPreference = 'Stop'
+try {
+    . '$loader'
+    Initialize-ElevationSession
+    if (-not `$script:InstallElevationSession.Borrowed -or `$script:InstallElevationSession.OwnerPid -ne $PID) { throw 'AIRC adapter lost the outer installer owner.' }
+    Clear-Elevation
+    if (-not `$env:CAMBRIAN_INSTALL_ELEVATION) { throw 'AIRC child removed the outer context.' }
+    Write-Output 'fixture AIRC borrowed owner verified'
+} catch { Write-Output `$_.Exception.Message; exit 1 }
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+        $output = @(& $bash $launcher -NoProfile -NonInteractive -EncodedCommand $encoded) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $output -notmatch 'fixture AIRC borrowed owner verified') { throw "AIRC shared owner boundary failed: $output" }
+        Write-Output 'PASS: pinned shared helper borrows the same owner through the actual AIRC shell adapter'
+    } finally {
+        try { if ($loadedElevation) { Clear-Elevation } }
+        finally {
+            $env:LOCALAPPDATA = $savedLocalAppData
+            $env:CAMBRIAN_INSTALL_ELEVATION = $savedElevationContext
+            $resolved = [IO.Path]::GetFullPath($boundaryCache)
+            $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+            if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $resolved -Leaf) -notlike 'airc-elevation-boundary-*') { throw 'Unsafe boundary cache cleanup' }
+            if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
+        }
+    }
     Write-Output 'PASS: PS7 -> Git Bash -> PS5 registrar, unchanged parent environment, and exit 37'
     exit 0
 }
@@ -175,7 +216,13 @@ fn main() {
         if ($RestartCount -ne 999 -or $RestartInterval.TotalMinutes -ne 2 -or $ExecutionTimeLimit -ne [TimeSpan]::Zero -or $MultipleInstances -ne 'IgnoreNew') { throw 'New-task recovery policy changed' }
         'expected-settings'
     }
-    $registrar = Join-Path $repo 'windows\register-autostart.ps1'
+    $registrarSource = Join-Path $scratch 'startup source'
+    New-Item -ItemType Directory -Path $registrarSource | Out-Null
+    foreach ($name in @('register-autostart.ps1','run-join-hidden.ps1','run-join-hidden.vbs')) {
+        Copy-Item -LiteralPath (Join-Path $repo "windows\$name") -Destination $registrarSource
+    }
+    [IO.File]::WriteAllText((Join-Path $registrarSource 'shared-setup.ps1'), 'function Initialize-ElevationSession { }; function Clear-Elevation { }')
+    $registrar = Join-Path $registrarSource 'register-autostart.ps1'
     & $registrar -AircPath $binary
     if (-not $global:aircStartupFixture.updated -or $global:aircStartupFixture.registered -or $global:aircStartupFixture.updated.WorkingDirectory -ne $scratch) { throw 'Existing task was replaced or its working directory changed' }
     if ($global:aircStartupFixture.updated.Execute -ne (Join-Path $env:SystemRoot 'System32\wscript.exe') -or $global:aircStartupFixture.updated.Arguments -notlike '//B //Nologo *' -or $global:aircStartupFixture.updated.Arguments -notlike ('*"' + $binary + '"*')) { throw 'Task action lost windowless runner or exact binary path' }
@@ -210,23 +257,20 @@ fn main() {
     if (($global:aircStartupFixture.events -join ',') -ne 'disable,stop,instances,enable,start') { throw 'Pending changed-action restart was forgotten on retry' }
 
     # Elevation is mocked: no UAC/task operation occurs in this regression.
-    function Start-Process { param($FilePath, $Verb, $WindowStyle, $ArgumentList, [switch]$PassThru, $ErrorAction)
-        if ($Verb -ne 'RunAs' -or $WindowStyle -ne 'Hidden') { throw 'Unexpected elevation request' }
-        $global:aircStartupFixture.elevation=$ArgumentList
+    function Invoke-Elevated { param($Reason, $CommandLine)
+        if ($Reason -notmatch 'original user') { throw 'Unexpected elevation request' }
+        $global:aircStartupFixture.elevation=$CommandLine
         if ($global:aircStartupFixture.rejectElevation) { throw 'fixture UAC cancelled' }
-        $result=[pscustomobject]@{Handle=1;ExitCode=0}
-        $result | Add-Member ScriptMethod WaitForExit {}
-        $result | Add-Member ScriptMethod Dispose {}
-        $result
+        $global:LASTEXITCODE=0
     }
     $global:aircStartupFixture.existing.Actions[0].Arguments='old'
     $global:aircStartupFixture.deny=$true
     & $registrar -AircPath $binary -UserHome $scratch -ExistingOnly
     $elevation=$global:aircStartupFixture.elevation -join ' '
-    if ($elevation -notlike ('*-UserSid ' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value + '*') -or $elevation -notlike ('*-UserHome "' + $scratch + '"*') -or $elevation -notlike '*-Elevated*' -or $elevation -notlike '*-ExistingOnly*') { throw 'Elevation lost original identity/home or widened installer scope' }
+    if ($elevation -notlike ('*-UserSid ' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value + '*') -or $global:aircStartupFixture.elevation -notcontains $scratch -or $elevation -notlike '*-Elevated*' -or $elevation -notlike '*-ExistingOnly*') { throw 'Elevation lost original identity/home or widened installer scope' }
     $global:aircStartupFixture.rejectElevation=$true
     $failed=$false
-    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'cancelled or rejected' }
+    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'fixture UAC cancelled' }
     if (-not $failed) { throw 'Rejected UAC was not reported clearly' }
     $global:aircStartupFixture.deny=$false
     $global:aircStartupFixture.existing = $null

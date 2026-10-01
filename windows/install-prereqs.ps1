@@ -5,6 +5,9 @@ param(
     [Parameter(Mandatory=$true)][string]$EnvironmentFile
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'shared-setup.ps1')
+try {
+Initialize-ElevationSession
 
 # Paths. AIRC_DIR controls where the source lives; BIN_TARGET is where
 # airc.exe lands (added to user PATH); SKILLS_TARGET is where
@@ -219,6 +222,7 @@ function Install-IfMissing {
     $wingetArgs = @(
         'install', '--id', $WingetId, '--source', 'winget',
         '--exact',
+        '--scope', 'user',
         '--silent',
         '--accept-package-agreements',
         '--accept-source-agreements',
@@ -366,7 +370,7 @@ if (Test-MsvcToolchain) {
         $btArgs[-1] += ' --path shared="' + (Join-Path $vsRoot 'Shared') + '"'
     }
     Write-Host '  Windows may request administrator consent for the C++ tools. Setup waits for that operation to finish.'
-    & winget @btArgs
+    Invoke-Elevated -Reason 'installing the MSVC C++ build tools for AIRC' -CommandLine (@('winget') + $btArgs)
     $buildToolsExit = $LASTEXITCODE
     if (Test-MsvcToolchain) {
         Write-Ok 'MSVC C++ build tools installed'
@@ -397,3 +401,4 @@ foreach ($name in @('PATH','CARGO_HOME','RUSTUP_HOME','CARGO_TARGET_DIR','TEMP',
     if ($value) { $values.Add($name); $values.Add($value) }
 }
 [IO.File]::WriteAllText($EnvironmentFile, (($values -join [char]0) + [char]0), (New-Object Text.UTF8Encoding($false)))
+} finally { Clear-Elevation }
