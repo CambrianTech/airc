@@ -320,11 +320,18 @@ pub async fn run_loop<S>(
             // spam). `Notify` stores one permit if the nudge lands during
             // a tick, so the wakeup is never lost.
             _ = resync.notified() => {
-                honor(gated_tick(&gate, &airc, &store, &sink).await, route_wake).await;
             }
             _ = ticker.tick() => {
-                honor(gated_tick(&gate, &airc, &store, &sink).await, route_wake).await;
             }
+        }
+        // Finish an admitted registry write before exiting. Backoff, however,
+        // owns no write: waiting out a 60s denial during shutdown exceeds the
+        // updater's process-exit deadline and leaves service stopped.
+        let outcome = gated_tick(&gate, &airc, &store, &sink).await;
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = honor(outcome, route_wake) => {}
         }
     }
 }
@@ -821,6 +828,79 @@ exit 1
             .await
             .expect("loop must exit promptly on shutdown")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_registry_backoff_without_retrying() {
+        use crate::account_registry::{AccountRegistryDocument, AccountRegistryError};
+        use crate::subscriptions::MeshIdentity;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DeniedStore {
+            attempts: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl AccountRegistryStore for DeniedStore {
+            async fn publish(
+                &self,
+                _: &AccountRegistryDocument,
+            ) -> Result<(), AccountRegistryError> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                Err(AccountRegistryError::RateLimited {
+                    retry_after_secs: 60,
+                    reason: "test registry window exhausted".into(),
+                })
+            }
+
+            async fn refresh(
+                &self,
+                _: &MeshIdentity,
+            ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+                panic!("a denied publish must not proceed to refresh")
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wire = dir.path().join("wire");
+        write_identity(&wire).await;
+        let airc = Airc::open_with_wire_root_for_test(&dir.path().join("machine/.airc"), &wire)
+            .await
+            .unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let store = DeniedStore {
+            attempts: attempts.clone(),
+            entered: entered.clone(),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            run_loop(
+                airc,
+                store,
+                RegistryRefreshGate::Always,
+                RegistryRefreshConfig {
+                    first_tick: Duration::ZERO,
+                    cadence: Duration::from_secs(3600),
+                },
+                &tokio::sync::Notify::new(),
+                &tokio::sync::Notify::new(),
+                async {
+                    let _ = rx.await;
+                },
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("registry publish must run");
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("shutdown must not wait for the 60s retry window")
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     /// what this catches: the starvation half of the 2026-08-04 M5 ghost —
