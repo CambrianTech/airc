@@ -79,6 +79,14 @@ function Initialize-AircBuildStorage {
         throw "The Windows system volume has insufficient space for remaining setup work ($([math]::Round($systemReserve / 1MB)) MB reserve). Setup stopped before installing packages."
     }
     $stateFile = Join-Path $DEFAULT_AIRC_ROOT 'build-storage.json'
+    $defaultTarget = Join-Path $SourceDirectory 'target'
+    $effectiveTarget = if (Get-Command cargo -ErrorAction SilentlyContinue) {
+        Get-AircTargetDirectory -SourceDirectory $SourceDirectory
+    } elseif ($env:CARGO_TARGET_DIR) {
+        if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR }
+        else { Join-Path $SourceDirectory $env:CARGO_TARGET_DIR }
+    } else { $defaultTarget }
+    $completedBuild = (Test-MsvcToolchain) -and (Test-Path (Join-Path $effectiveTarget 'release\airc.exe'))
     $storageRoot = $null
     if (Test-Path -LiteralPath $stateFile) {
         $storageRoot = (Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json).root
@@ -88,7 +96,7 @@ function Initialize-AircBuildStorage {
     } else {
         $systemRoot = [IO.Path]::GetPathRoot($env:SystemRoot)
         $systemDrive = Get-AircDriveInfo $systemRoot
-        if ($systemDrive.AvailableFreeSpace -lt 20GB) {
+        if ($systemDrive.AvailableFreeSpace -lt 20GB -and -not $completedBuild) {
             $candidate = Get-AircFixedVolumes | Where-Object {
                 $_.IsReady -and $_.DriveType -eq 'Fixed' -and
                 $_.RootDirectory.FullName -ne $systemRoot -and $_.AvailableFreeSpace -ge 20GB
@@ -99,14 +107,20 @@ function Initialize-AircBuildStorage {
             @{ root = $storageRoot } | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8
         }
     }
-    if (-not $storageRoot) { return }
-    $buildDrive = Get-AircDriveInfo ([IO.Path]::GetPathRoot($storageRoot))
     # Completed source builds need incremental headroom, not the full initial
     # download/toolchain reserve again. Check the selected cache, not merely an
     # installed binary that may have come from another machine or checkout.
-    $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $storageRoot 'target' }
+    $target = $effectiveTarget
+    if ($storageRoot -and -not $env:CARGO_TARGET_DIR -and
+        [IO.Path]::GetFullPath($effectiveTarget) -eq [IO.Path]::GetFullPath($defaultTarget)) {
+        $target = Join-Path $storageRoot 'target'
+    }
+    # An explicit or Cargo-configured cache may live on a different volume
+    # from toolchain storage. Budget the volume where Cargo will actually write.
+    $buildDrive = Get-AircDriveInfo ([IO.Path]::GetPathRoot($target))
     $buildReserve = if ((Test-MsvcToolchain) -and (Test-Path (Join-Path $target 'release\airc.exe'))) { 2GB } else { 20GB }
     if ($buildDrive.AvailableFreeSpace -lt $buildReserve) { throw "Build-storage volume $($buildDrive.Name) lacks the $($buildReserve / 1GB) GB reserve for remaining source-build work." }
+    if (-not $storageRoot) { return }
     New-Item -ItemType Directory -Force -Path $storageRoot | Out-Null
     Write-Step "Build storage: $storageRoot (automatically selected; existing toolchains are preserved)"
     foreach ($setting in @(@('RUSTUP_HOME','rustup','.rustup'), @('CARGO_HOME','cargo','.cargo'))) {

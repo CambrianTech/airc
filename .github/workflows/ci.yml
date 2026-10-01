@@ -199,11 +199,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          ./test/windows-setup-bridge.ps1
-          ./test/windows-storage-plan.ps1
-          ./test/windows-gh-acquisition.ps1
-          ./test/windows-firewall-process.ps1
-          ./test/windows-firewall-policy.ps1
+          # Isolate deliberate native failure cases and function mocks. The
+          # runner otherwise exits with a cancellation fixture's LASTEXITCODE.
+          foreach ($test in @('windows-setup-bridge', 'windows-storage-plan', 'windows-gh-acquisition', 'windows-firewall-process', 'windows-firewall-policy')) {
+            & powershell -NoProfile -ExecutionPolicy RemoteSigned -File "test/$test.ps1"
+            if ($LASTEXITCODE -ne 0) { throw "$test failed (exit $LASTEXITCODE)" }
+          }
       - name: Windows PATH boundary through shared installer
         if: runner.os == 'Windows'
         shell: bash
@@ -218,6 +219,9 @@ jobs:
         shell: pwsh
         run: |
           $env:AIRC_DIR = "$env:USERPROFILE\.airc\src"
+          # Install this PR's detached checkout, as the Unix jobs do. Do not
+          # switch channels or pull a different revision during acceptance.
+          $env:AIRC_INSTALL_NO_PULL = '1'
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
           # install.ps1 must work from default Windows PowerShell 5.1
@@ -264,6 +268,7 @@ jobs:
         shell: powershell
         run: |
           $env:AIRC_DIR = "$env:USERPROFILE\.airc\src-ps5"
+          $env:AIRC_INSTALL_NO_PULL = '1'
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
           & "$env:AIRC_DIR\install.ps1"

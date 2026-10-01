@@ -15,6 +15,8 @@ try {
     . ([scriptblock]::Create($planner.Extent.Text))
     function Write-Step($message) { }
     function Test-MsvcToolchain { return $script:msvcInstalled }
+    function Get-Command { param($Name,$ErrorAction) if ($Name -eq 'cargo') { return @{ Name='fixture-cargo' } } }
+    function Get-AircTargetDirectory { param($SourceDirectory) return $script:configuredTarget }
     function Get-AircDriveInfo([string]$Root) {
         $script:probeCount++
         if ($script:probeCount -eq 1 -or -not (Test-Path (Join-Path $DEFAULT_AIRC_ROOT 'build-storage.json'))) {
@@ -27,6 +29,8 @@ try {
     }
     New-Item -ItemType Directory -Path $fixture | Out-Null
     $DEFAULT_AIRC_ROOT = Join-Path $fixture 'state'
+    $SourceDirectory = Join-Path $fixture 'source'
+    $script:configuredTarget = Join-Path $SourceDirectory 'target'
     # Existing explicit homes avoid touching real persisted user settings.
     $env:CARGO_HOME = Join-Path $fixture 'cargo'
     $env:RUSTUP_HOME = Join-Path $fixture 'rustup'
@@ -57,6 +61,26 @@ try {
     $rejected=$false
     try { Initialize-AircBuildStorage } catch { $rejected=$_.Exception.Message -match 'remaining source-build work' }
     if (-not $rejected) { throw 'Exhausted build volume was allowed' }
+    # A first install on a roomy system volume writes no relocation marker.
+    # Its successful rerun must recognize the existing build after consumption.
+    $DEFAULT_AIRC_ROOT = Join-Path $fixture 'system-only-state'
+    $script:systemFree=25GB; $script:msvcInstalled=$false; $script:probeCount=0
+    Initialize-AircBuildStorage
+    if (Test-Path (Join-Path $DEFAULT_AIRC_ROOT 'build-storage.json')) { throw 'Roomy system drive was unnecessarily relocated' }
+    New-Item -ItemType Directory -Path (Join-Path $script:configuredTarget 'release') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $script:configuredTarget 'release/airc.exe'),'fixture')
+    $script:systemFree=8GB; $script:msvcInstalled=$true; $script:probeCount=0
+    Initialize-AircBuildStorage
+    # Cargo metadata can resolve a configured cache rather than source/target.
+    $script:configuredTarget=Join-Path $fixture 'configured-cache'
+    New-Item -ItemType Directory -Path (Join-Path $script:configuredTarget 'release') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $script:configuredTarget 'release/airc.exe'),'fixture')
+    $script:probeCount=0
+    Initialize-AircBuildStorage
+    $script:systemFree=1GB; $script:probeCount=0
+    $rejected=$false
+    try { Initialize-AircBuildStorage } catch { $rejected=$_.Exception.Message -match 'remaining source-build work' }
+    if (-not $rejected) { throw 'Configured cache volume capacity was ignored' }
     Write-Host 'PASS: fresh storage selection, remaining-work rerun, system-volume and build-volume rejection'
 } finally {
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
