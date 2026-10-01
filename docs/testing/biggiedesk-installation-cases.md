@@ -172,3 +172,161 @@ scope row plus machine default; other named citizens remain visible. Three
 library regressions PASS and final existing CLI peer_commands suite7/7 PASS.
 Independent revised review APPROVE subject required checks. No failing head
 installed; CI must pass on this revision before merge/adoption.
+
+2026-10-01T17:34Z independent artifact-boundary review of peer1470 exact944440f:
+independently fetched both pinned Continuum0aad524 source blobs via contents API;
+SHA256 exactly matches lock (elevation8d2957a8...9155bytes,
+manifest4d819027...4682bytes). Reviewed cached/downloaded integrity-before-load,
+unique staging/cleanup and standalone native owner calling existing Bash stages.
+No blocker in this slice, no helper execution/install. Firewall delegation and
+live consent/fresh installation remain OPEN. Review posted PR1470.
+Fresh doctor evidence reports BIGGIEDESK transport0121d9594468/4468 aggregate
+ACKs, latest8sec/RTT26ms, while peer confirms reader lacks echoa6eea9a2. This
+narrows but does not prove event-level delivery; no broad ACK acceptance claim.
+Sent exact distinction to owner through SOS. No manual pairing/restarts.
+
+2026-10-01T17:43Z independent peer1470 source review ff01350 versus944440f:
+waiting subshell/source launcher preserves native owner ancestry while keeping
+PSModulePath removal/exit isolated. Explicit status propagation inspected; strict
+owner validation unchanged. Expanded fixture uses real prerequisite helper and
+asserts Borrowed but stops before binary/firewall/startup stages. No blocking
+source finding; did not rerun peer-owned fixture or live install. CI/live consent
+and installation acceptance remain OPEN. Review posted on PR1470.
+
+2026-10-01T17:54Z actual local installation acceptance of PR1473:
+All required Rust and clean-install CI checks passed on a0b4cc4. Merged exact
+head to canary9fdb8c1090f9. No deployment claim/compiler before normal resolved
+public airc update29685. Exit0; release build47.29s, installer repaired existing
+autostart and automatically restarted daemon with build verified. CLI and daemon
+both9fdb8c1090f9, transportidentity e85a5bb3 preserved. Installed public peer list
+from existing Continuum project scope returns138 including BIGGIEDESK0121 with
+own_account tier. This closes local consumer adoption of peer-view correction;
+BIGGIEDESK fresh installer acceptance remains OPEN. Most prereqs already present.
+New ordinary return challenge eventab43ccdf/case biggiedesk-return-1755 sent after
+update, ACK pending; nonce excluded from SOS. No manual pairing/extra daemon.
+Peer1470 Windows setup-consent fails incompatible developer-source refusal test;
+direct job110504677515 logs retained and exact failure sent to installer owner.
+Joel requires presence for necessary clicks: told owner explicitly notify exact
+machine/action and wait for actual UAC/auth; preparation is not consent/testing.
+
+2026-10-01T17:57Z executed independent exact7c3bdb3 Windows bridge fixture
+under PS5.1 in isolated copied source. PASS fresh source, stale managed source,
+explicit developer refusal, path handoff, immutable artifact integrity/cache
+repair and mismatch refusal. Fixture mocks package/auth/elevation and cleans its
+verified TEMP root; no real install/consent. This contrasts with hosted PS5.1
+job110504677515 failing developer-source refusal on same head; environment-
+sensitive discrepancy unresolved, not grounds to dismiss CI. Exact evidence
+sent owning peer. Review fixture retained under state/team-proof/review-bridge-
+7c3bdb3. Source fetches and all setup within that isolated review tree only.
+
+2026-10-01T18:07Z executed exact bcfea093 bridge fixture PS5.1: PASS.
+Mutation check substituted old7c3bdb3 public entry into the same isolated new
+fixture and ALSO PASSED. New bytes restored in finally. This fixture alone does
+not distinguish the old public-entry status-capture defect locally, despite its
+caller LASTEXITCODE73. Reported exact result to owner; do not treat new fixture
+pass alone as proof of failure repair. Shared-helper native reproduction may
+supply coverage separately; not run here. No production installer/consent.
+
+2026-10-01T18:16Z independent failing-old/passing-new PATH regression proof:
+exact b172f6e bridge fixture on PS5.1 exits0 with new public entry. Substituting
+prior bcfea093 entry into SAME new fixture exits1, Environment variable name or
+value is too long, at fixture line109. Restored new bytes finally. Confirms PATH
+repair is exercised and distinguishes earlier status-capture hypothesis from
+actual reported CI failure. No real packages/consent/profile changes; isolated
+fixture only. Sent exact result via SOS. Live BIGGIEDESK acceptance remains OPEN.
+
+2026-10-01T18:25Z peer-reported first real BIGGIEDESK public install:
+Owner reports normal native install.ps1 b172f6e exited0 with Joel present and
+administrator consent obtained. Existing Git/Rust/MSVC and joelteply auth reused;
+new gsudo portable acquired through canonical manifest, D storage selected,
+effective TCP+UDP LocalSubnet policy and startup verified. This is peer-reported
+live evidence, not an independently inspected remote log or fresh-prerequisite
+proof. Post-install CLI b172f6e versus daemon a3e04c6 exposed stale adoption.
+No manual daemon restart: owner repaired normal installer in PR1470 aed17e9427.
+
+Independent source review of exact aed17e94271a5b53725cc58859066c044cbc95bc:
+normal entry calls installed update --adopt-installed before success, prepared
+updater handoffs skip nested maintenance. Existing stopped/current state preserved;
+maintenance, pinned Windows process-exit confirmation, machine-owner spawning,
+readiness and SHA verification reused. Tracing existing verify_daemon_build found
+retry spawned without stop; peer patch already adds stop_daemon before retry.
+No overlapping edit/build/install. No blocking finding in this slice; posted
+PR1470 comment5937900534 and canonical SOS. Expanded handoff fixture mocks daemon,
+so does not prove actual replacement. Adoption case remains OPEN pending SAME
+public installer rerun. Ordinary reverse AIRC ACK and Continuum command/result
+remain separately OPEN; do not reuse transport aggregate ACK as acceptance.
+
+2026-10-01T18:35Z independent exact aed17e9 handoff regression execution:
+Compiler inventory empty and deployment claim absent before standalone rustc
+fixture compilation; no workspace build or installer overlap. Isolated exact
+install.sh, update_artifact.rs, update_shutdown.rs and update-handoff.rs fetched
+by immutable commit. Windows fixture exits0, two tests PASS; delayed child exits
+normally and pinned-handle wait distinguishes stop acknowledgement from process
+exit. Installer fixture mocks daemon/package/auth work, proves adoption invocation,
+failure propagation and suppression inside prepared updater handoff.
+Mutation: SAME new fixture compiled with old b172f6e install.sh fails exit101 at
+line191: actual build only vs required build+adopt. Original source bytes restored
+in finally. Logs: state/team-proof-20260921/review-handoff-aed17e9/result.log and
+old-installer-result.log. Exact evidence sent canonical SOS. No host install,
+consent, restart or auth mutation. Live BIGGIEDESK adoption remains OPEN. PR1470
+still aed17e9, CI remaining macOS/Windows Rust and PS5 at initial refresh; no merge.
+Full100 development inbox JSON filtered before output; no return ACK found.
+
+2026-10-01T18:45Z second live public run failed; peer owns recovery:
+BIGGIEDESK reports aed17e9 normal installer completed firewall/startup after Joel
+approved gsudo, then stop was acknowledged but pinned-process wait timed out.
+Canonical IPC is down; remaining process serves a separate legacy socket. Shared
+informational daemon.pid selected wrong endpoint owner. No manual kill/restart;
+owner explicitly requested no competing intervention and retains next public run.
+Independent review of exact98502ba81cf719bc30061a6d964eec350add4a53 completed:
+GetNamedPipeServerProcessId on actual client connection selects serving PID;
+wait handle pinned before stop, no production PID-file ownership inference.
+Separate runtime thread avoids nested Tokio block_on; existing transport's bounded
+connect retry reused. Explicit install now starts/verifies missing daemon, enabling
+rerun after interrupted handoff; ordinary update stopped policy preserved.
+New tests inspect distinct child endpoint despite misleading shared PID file,
+plus missing/current/interrupted adoption. SOURCE REVIEW ONLY on this revision,
+no new build or fixture execution. APPROVE slice subjectCI/live acceptance posted
+PR1470 comment5938232383 and SOS. Prior aed17e9 passing fixtures are historical.
+Case remains OPEN; leave legacy endpoint untouched. Full100 development inbox
+JSON filtered before output, only old BIGGIEDESK probe, no reverse ACK. Upstream
+13485 OPEN4 unchanged2026-09-28T18:20:15Z; last reviewed comment5875946656 retained.
+
+2026-10-01T18:55Z peer reports third public install98502ba built/installed,
+then fresh gsudo invocation returned999/Windows operation canceled before daemon
+adoption. Earlier approvals do not authorize this canceled request. Owner already
+asked Joel whether prompt appeared; no duplicate request/intervention here.
+Independent bounded refusal check: existing PS5 bridge fixture with simulated
+native firewall exit999 replacing73 passes and checks thrown exit999. Original
+fixture bytes restored finally. Latest98502ba and b172 native install.ps1 share
+blob4df5d2e13d9ae0b6dfed709ddbf637eab0a5b8a0, so tested public entry is current.
+Evidence review-bridge-b172f6e/cancel-999-result.log. No real package/auth/UAC;
+this verifies existing failure propagation for public FirewallOnly, NOT actual
+prompt appearance, normal full Bash exit path, consent or successful adoption.
+No new code defect established by this check; existing nonzero-refusal behavior
+handles999. Reported exact limit to owner. Peer remains sole installer owner.
+Full100 inbox JSON privatefiltered: original peer probe only, no returnACK.
+CI exact98502ba all listed completed jobs pass, WindowsRust stillrunning initially;
+no merge or local install. Remote onboarding case remains OPEN.
+
+2026-10-01T19:05Z bounded SOS lifecycle repair, separate from peer installer:
+Local source review found start_sos_fallback returned raw JoinHandle while claiming
+Drop cancels polling. Tokio drops detach that task; an exited/canceled join in a
+surviving runtime can retain a poller consuming its SOS cursor. Replaced with a
+scoped owner aborting its own task on Drop. Regression starts two real delayed
+pollers, drops each independently and verifies cancellation without network I/O.
+Focused CLI test PASS1, build84s; fmt and workspace/all-target Clippy PASS.
+Independent reviewer /root/review_sos_collision APPROVE, requested cooperative
+cancellation limit in comment; included. Already-running synchronous gh call may
+finish before next await; no subprocess termination claim. Not installed yet.
+Prior receipts committed57ce2ab on preserved docs branch, then carried into new
+codex/sos-fallback-lifetime based current canary9fdb8c1; no peer branch edits.
+
+During this run peer reported fourth public installation98502ba EXIT0 after
+actual Joel consent; CLI=daemon98502ba independently checked by that peer, canonical
+PID7800/windowhandle0. This closes peer-reported normal adoption on that run, not
+all onboarding. Legacy18484 on different daemon-v5 socket remains owner-investigated;
+visible terminal source unproved. No manual kill. Received real ordinary event
+e5edb496-a5ad-43e9-971b-48faf8fc0318 from BIGGIEDESK with fresh challenge. Replied
+AIRC-only bf805d03-a8f6-40d6-9cc9-298c3aec28a2 with echo and fresh return token.
+No token copied to SOS. Reverse echo pending; Continuum remote command unproved.

@@ -303,11 +303,20 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 
 /// Poll the SOS gist alongside the live feed, printing any NEW peer posts.
 ///
-/// Returns a task handle whose drop cancels the poll — it lives exactly as long
-/// as the join it accompanies.
-fn start_sos_fallback(home: &Path) -> tokio::task::JoinHandle<()> {
+/// Dropping the owner requests cancellation of this join's poller. An in-flight
+/// synchronous gh call may finish before cancellation reaches the next await;
+/// dropping this owner does not terminate that subprocess.
+struct SosFallbackTask(tokio::task::JoinHandle<()>);
+
+impl Drop for SosFallbackTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn start_sos_fallback(home: &Path) -> SosFallbackTask {
     let home = home.to_path_buf();
-    tokio::spawn(async move {
+    SosFallbackTask(tokio::spawn(async move {
         // First poll is delayed: a node that just joined is the LEAST likely to
         // need the fallback, and an immediate `gh` call on every join would tax
         // the healthy path to serve the broken one.
@@ -319,7 +328,7 @@ fn start_sos_fallback(home: &Path) -> tokio::task::JoinHandle<()> {
             // explicit `airc sos status` says so plainly when asked.
             let _ = crate::sos_commands::poll_fallback_once(&home).await;
         }
-    })
+    }))
 }
 
 /// How often a joined node checks the out-of-band channel. Deliberately slow:
@@ -3464,6 +3473,36 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_join_sos_fallback_cancels_only_its_poller() {
+        let home = tempfile::tempdir().unwrap();
+        let first = start_sos_fallback(home.path());
+        let second = start_sos_fallback(home.path());
+        let first_state = first.0.abort_handle();
+        let second_state = second.0.abort_handle();
+        // Both real loops are parked before their first network poll.
+        tokio::task::yield_now().await;
+        assert!(!first_state.is_finished());
+        assert!(!second_state.is_finished());
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !first_state.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detaching a join must cancel its SOS fallback");
+        assert!(!second_state.is_finished(), "another join remains attached");
+        drop(second);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !second_state.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the remaining join must release its own fallback");
+    }
 
     // Regression: join sos created a silent parallel room during fresh Windows onboarding.
     #[tokio::test]
