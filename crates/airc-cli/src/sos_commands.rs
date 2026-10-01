@@ -382,10 +382,9 @@ fn parse_comments(raw: &str) -> Result<Vec<SosComment>, Box<dyn Error>> {
 /// peer comments printed.
 /// One SOS poll for the ALWAYS-ON fallback that rides along with `airc join`.
 ///
-/// Same cursor and same self-filter as `airc sos watch`, on purpose: the
-/// automatic path and the manual one must not disagree about what has already
-/// been seen, or an operator who runs `watch` after a join would be shown
-/// nothing and conclude the channel is empty.
+/// A separate delivery cursor from `airc sos watch`: join output may be
+/// redirected or belong to another consumer. Printing there is not proof the
+/// foreground recovery reader received the message. Both use the same filter.
 ///
 /// Prints peer posts under a marker, because a message arriving here means the
 /// LIVE WIRE did not carry it — the reader needs to know which channel they are
@@ -399,7 +398,7 @@ pub(crate) async fn poll_fallback_once(home: &Path) -> Result<usize, Box<dyn Err
     let Some(gist_id) = find_sos_gist()? else {
         return Ok(0);
     };
-    let cursor_path = watch_cursor_path(home);
+    let cursor_path = join_cursor_path(home);
     let printed = poll_once(&gist_id, &label, &cursor_path)?;
     if printed > 0 {
         eprintln!(
@@ -412,10 +411,19 @@ pub(crate) async fn poll_fallback_once(home: &Path) -> Result<usize, Box<dyn Err
 
 fn poll_once(gist_id: &str, my_label: &str, cursor_path: &Path) -> Result<usize, Box<dyn Error>> {
     let comments = fetch_comments(gist_id)?;
+    deliver_comments(&comments, my_label, cursor_path, |body| println!("{body}"))
+}
+
+fn deliver_comments(
+    comments: &[SosComment],
+    my_label: &str,
+    cursor_path: &Path,
+    mut deliver: impl FnMut(&str),
+) -> Result<usize, Box<dyn Error>> {
     let cursor = read_cursor(cursor_path);
     let mut printed = 0usize;
     let mut high_water = cursor;
-    for comment in &comments {
+    for comment in comments {
         high_water = high_water.max(comment.id);
         if comment.id <= cursor {
             continue;
@@ -423,7 +431,7 @@ fn poll_once(gist_id: &str, my_label: &str, cursor_path: &Path) -> Result<usize,
         if is_self_comment(&comment.body, my_label) {
             continue;
         }
-        println!("{}", comment.body);
+        deliver(&comment.body);
         printed += 1;
     }
     if high_water > cursor {
@@ -593,6 +601,10 @@ fn watch_cursor_path(home: &Path) -> PathBuf {
     home.join("sos-watch-cursor")
 }
 
+fn join_cursor_path(home: &Path) -> PathBuf {
+    home.join("sos-join-cursor")
+}
+
 fn read_cursor(path: &Path) -> u64 {
     std::fs::read_to_string(path)
         .ok()
@@ -682,6 +694,45 @@ mod tests {
         assert!(is_self_comment("[BIGMAMA] restarting daemon", "BIGMAMA"));
         assert!(!is_self_comment("[M5] on it", "BIGMAMA"));
         assert!(!is_self_comment("unlabelled note", "BIGMAMA"));
+    }
+
+    #[test]
+    fn background_join_does_not_consume_foreground_watch_delivery() {
+        let home = tempfile::tempdir().unwrap();
+        let comments = parse_comments(
+            r#"[{"id":10,"body":"[BIGGIEDESK] installer review ready"},
+                {"id":11,"body":"[BIGMAMA] own reply"}]"#,
+        )
+        .unwrap();
+        let mut background = Vec::new();
+        let mut foreground = Vec::new();
+        let join = join_cursor_path(home.path());
+        let watch = watch_cursor_path(home.path());
+        deliver_comments(&comments, "BIGMAMA", &join, |s| {
+            background.push(s.to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            read_cursor(&watch),
+            0,
+            "background output is not foreground acknowledgement"
+        );
+        deliver_comments(&comments, "BIGMAMA", &watch, |s| {
+            foreground.push(s.to_owned())
+        })
+        .unwrap();
+        assert_eq!(foreground, vec!["[BIGGIEDESK] installer review ready"]);
+        assert_eq!(background, foreground);
+        for cursor in [&join, &watch] {
+            assert_eq!(read_cursor(cursor), 11);
+            assert_eq!(
+                deliver_comments(&comments, "BIGMAMA", cursor, |_| panic!(
+                    "duplicate delivery"
+                ))
+                .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]
