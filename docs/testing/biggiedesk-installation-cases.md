@@ -127,3 +127,21 @@ Borrowed-cache lifetime and standalone AIRC consumer integration remain OPEN,
 owned by BIGGIEDESK. Review comment5936259507 in Continuum records exact limits.
 An initial comparison used origin/main rather than the PR's canary base and
 failed before producing evidence; corrected to the API-reported base above.
+
+2026-10-01T17:12Z BIGGIEDESK live peer projection investigation (OPEN):
+- Peer reported daemon0121d959, project author d4ad790b, peers0 versus publish17.
+  Both owners independently traced IDs to intentional machine/project scopes;
+  no identity corruption established and no keys/scopes changed.
+- Ordinary event08c65378 received here; nonce echoed only on ordinary AIRC as
+  eventa6eea9a2. Reverse receipt remains unproved; no SOS echo used as acceptance.
+- Source root cause for misleading peer list: run_peer_list loaded only scope
+  while Airc::peers loads scope plus machine. Codex added shared library
+  peer_trust_snapshot and thin CLI consumer, preserving full trust metadata,
+  stable scope precedence, existing JSON shape, and local enrollment visibility.
+- Regression proves machine-only enrollment visible from empty project scope,
+  deduplication, scope key precedence, same-home handling and absence of both
+  identity.key and SQLite local identity. PASS. cargo check airc-cli PASS.
+  Two initial compile errors (PeerId ordering; test DB constant/borrow) corrected;
+  focused test rerun PASS. Independent review APPROVE; human footer corrected.
+- This is source/test evidence only. Installer adoption and BIGGIEDESK normal
+  peers command acceptance remain OPEN. No daemon restart/manual pairing.
