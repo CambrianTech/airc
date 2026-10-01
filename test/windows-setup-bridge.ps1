@@ -113,8 +113,12 @@ public static class SetupBridgeFixture {
     $env:AIRC_DIR = Join-Path $env:USERPROFILE '.airc/src'
     [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
     $rejected = $false
-    try { & (Join-Path $entry 'install.ps1') } catch { $rejected = $_.Exception.Message -match 'explicitly selected source' }
-    Assert-True $rejected 'Incompatible developer source was not rejected'
+    $refusalDetail = 'Installer returned successfully'
+    try { & (Join-Path $entry 'install.ps1') } catch {
+        $refusalDetail = $_.ToString() + ' at ' + $_.ScriptStackTrace
+        $rejected = $_.Exception.Message -match 'explicitly selected source'
+    }
+    Assert-True $rejected ("Incompatible developer source was not rejected: $refusalDetail")
     Assert-True (-not (Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw)) 'Rejected developer source launched a process'
 
     # Git present without HTTPS transport is repaired through the same entry.
