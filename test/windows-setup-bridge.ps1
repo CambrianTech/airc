@@ -71,6 +71,8 @@ public static class SetupBridgeFixture {
     # Native processes update the global automatic status. A caller-local value
     # must neither invent failure nor hide a subsequent real child failure.
     $LASTEXITCODE = 73
+    # Repeated setup must not grow a long inherited PATH past Windows' limit.
+    $env:PATH = 'C:\airc PATH fixture;' * 1200
     & (Join-Path $entry 'install.ps1')
     $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
     Assert-True ($calls -match 'git\|clone\|--quiet\|--branch\|canary\|') 'Fresh public source did not use matching channel'

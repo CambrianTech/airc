@@ -308,3 +308,16 @@ Bigmama reports normal public update to 9fdb8c1 completed locally with matching
 CLI/daemon revisions and the corrected project peer projection. That is Bigmama's
 receipt, not this machine's public-entry or reverse-event acceptance. Joel must
 be present for any required local consent; no unattended approval is assumed.
+
+### 2026-10-01 18:07 UTC — confirmed CI PATH overflow
+
+The exit-code repair did not resolve the hosted developer-source fixture failure.
+Exact diagnostics in bcfea09 revealed "Environment variable name or value is too
+long." Native Refresh-Path appended registry paths on every entry/finally, so
+repeated installs exceeded the Windows limit on CI's longer PATH. A long inherited
+PATH reproduced the failure locally. Refresh now deduplicates case-insensitively
+while preserving User, Machine and session precedence. The existing bridge suite
+seeds 24 KB of repeated entries and passes all cases. This preserves session-only
+paths and does not modify registry PATH. Independent review approves the repair;
+hosted rerun remains required. No live installer has started while Joel's presence
+for protected Windows consent remains unconfirmed.

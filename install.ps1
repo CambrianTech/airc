@@ -11,8 +11,15 @@ if ($FirewallOnly -and (-not $AircPath -or -not (Test-Path -LiteralPath $AircPat
     throw 'Firewall-only setup requires the installed AIRC executable via -AircPath.'
 }
 function Refresh-Path {
-    $env:PATH = [Environment]::GetEnvironmentVariable('PATH','User') + ';' +
-        [Environment]::GetEnvironmentVariable('PATH','Machine') + ';' + $env:PATH
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $paths = [Collections.Generic.List[string]]::new()
+    foreach ($value in @([Environment]::GetEnvironmentVariable('PATH','User'),
+                        [Environment]::GetEnvironmentVariable('PATH','Machine'), $env:PATH)) {
+        foreach ($entry in @($value -split ';')) {
+            if ($entry -and $seen.Add($entry.Trim())) { $paths.Add($entry.Trim()) }
+        }
+    }
+    $env:PATH = $paths -join ';'
 }
 function Find-GitBash {
     $git = Get-Command git.exe -ErrorAction SilentlyContinue
