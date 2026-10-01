@@ -18,7 +18,7 @@
 //!     (`AIRC_GH_BIN` override, captured stdout/stderr), but SOS fails
 //!     LOUD — every failure returns a specific `Err`, never a silent
 //!     cache fallthrough, because a broken SOS channel must be visible.
-//!   - the gh governor (`gh_state::reserve_guarded_request` +
+//!   - the gh governor (`gh_state::reserve_recovery_request` +
 //!     `record_backoff`) is honored so SOS shares the machine-wide gh
 //!     budget with the registry loop rather than racing it.
 //!   - the find-or-create-gist-by-marker + local-sentinel shape mirrors
@@ -34,7 +34,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::gh_state::{now_seconds, record_backoff, reserve_guarded_request, wait_seconds};
+use crate::gh_state::{now_seconds, record_backoff, reserve_recovery_request, wait_seconds};
 
 /// Stable gist `description` marker identifying the account's SOS gist.
 /// The find path filters the account's gists by exact match on this.
@@ -512,7 +512,7 @@ fn parse_comment_label(body: &str) -> Option<&str> {
 fn gh_capture(args: &[&str], stdin: Option<&str>) -> Result<String, Box<dyn Error>> {
     let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
     let now = now_seconds();
-    let (allowed, reason) = reserve_guarded_request(&owned, now)?;
+    let (allowed, reason) = reserve_recovery_request(&owned, now)?;
     if !allowed {
         // `reason` already carries WHEN this clears — the local sliding
         // window's own next-free, or GitHub's backoff. Appending
