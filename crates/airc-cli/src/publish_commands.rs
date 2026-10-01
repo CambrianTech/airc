@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::Path;
 
 use airc_core::{Body, Headers};
-use airc_lib::PublishTarget;
+
 use airc_protocol::FrameKind;
 
 use crate::cli::PublishFrameKind;
@@ -27,12 +27,8 @@ pub async fn run_publish(
     crate::commands::reject_recovery_room(room.as_deref())?;
     let body = load_body(body_text, body_json, stdin)?;
     let parsed_headers = parse_headers(&headers)?;
-    let target = match room {
-        Some(name) => PublishTarget::RoomByName(name),
-        None => PublishTarget::CurrentRoom,
-    };
-
     let airc = crate::commands::attached_airc(home).await?;
+    let target = crate::commands::mesh_publish_target(&airc, room.as_deref()).await?;
     let receipt = airc
         .publish(target, frame_kind_from(kind), body, parsed_headers)
         .await?;

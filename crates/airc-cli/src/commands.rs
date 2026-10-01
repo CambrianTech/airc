@@ -70,6 +70,21 @@ pub(crate) fn reject_recovery_room(name: Option<&str>) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Resolve once and pin the validated target, including legacy defaults and IDs.
+pub(crate) async fn mesh_publish_target(
+    airc: &Airc,
+    name: Option<&str>,
+) -> Result<airc_lib::PublishTarget, Box<dyn std::error::Error>> {
+    let room = match name {
+        Some(name) => airc.room_by_name_or_channel(name, "publish to").await?,
+        None => airc.current_room().await?,
+    };
+    reject_recovery_room(Some(&room.name))?;
+    Ok(airc_lib::PublishTarget::RoomByName(
+        room.channel.to_string(),
+    ))
+}
+
 /// `room` — print current room. `room <name>` — switch to a
 /// deterministic room derived from `<name>`.
 pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1232,24 +1247,16 @@ pub async fn run_send(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room + runtime
     // headers" path runs unchanged.
-    let (channel_name, channel) = match room {
-        Some(name) => {
-            let receipt = airc
-                .publish(
-                    airc_lib::PublishTarget::RoomByName(name.to_string()),
-                    airc_protocol::FrameKind::Message,
-                    airc_core::Body::text(text),
-                    runtime_headers()?,
-                )
-                .await?;
-            (receipt.channel_name, receipt.channel_id)
-        }
-        None => {
-            let current = airc.current_room().await?;
-            airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel)
-        }
-    };
+    let target = mesh_publish_target(&airc, room).await?;
+    let receipt = airc
+        .publish(
+            target,
+            airc_protocol::FrameKind::Message,
+            airc_core::Body::text(text),
+            runtime_headers()?,
+        )
+        .await?;
+    let (channel_name, channel) = (receipt.channel_name, receipt.channel_id);
     let channel_id = channel.to_string();
     // `peers()` is the enrolled-remote-peer address book, NOT a
     // delivery count — see `format_send_receipt` for why the receipt
@@ -2594,24 +2601,16 @@ pub async fn run_msg(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room" path runs
     // unchanged.
-    let (channel_name, channel) = match room {
-        Some(name) => {
-            let receipt = airc
-                .publish(
-                    airc_lib::PublishTarget::RoomByName(name.to_string()),
-                    airc_protocol::FrameKind::Message,
-                    airc_core::Body::text(text),
-                    runtime_headers()?,
-                )
-                .await?;
-            (receipt.channel_name, receipt.channel_id)
-        }
-        None => {
-            let current = airc.current_room().await?;
-            airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel)
-        }
-    };
+    let target = mesh_publish_target(&airc, room).await?;
+    let receipt = airc
+        .publish(
+            target,
+            airc_protocol::FrameKind::Message,
+            airc_core::Body::text(text),
+            runtime_headers()?,
+        )
+        .await?;
+    let (channel_name, channel) = (receipt.channel_name, receipt.channel_id);
     let channel_id = channel.to_string();
     // Same enrolled-vs-delivered honesty fix as run_send, for the
     // daemon-attached send path. `peers()` is the address book, not a
@@ -3467,6 +3466,26 @@ mod tests {
     use super::*;
 
     // Regression: join sos created a silent parallel room during fresh Windows onboarding.
+    #[tokio::test]
+    async fn sos_room_persisted_default_and_id_cannot_be_publish_targets() {
+        let home = tempfile::tempdir().expect("test directory");
+        let legacy = Airc::open(home.path()).await.unwrap();
+        let sos = legacy.join("sos").await.unwrap();
+        drop(legacy);
+        let airc = Airc::open(home.path()).await.unwrap();
+        for name in [None, Some("sos"), Some(sos.channel.to_string().as_str())] {
+            let error = mesh_publish_target(&airc, name).await.unwrap_err();
+            assert!(error.to_string().contains("airc sos watch"));
+        }
+        // History remains addressable; validation never removes the subscription.
+        assert!(airc.room_by_channel(sos.channel).await.unwrap().is_some());
+        let general = airc.join("general").await.unwrap();
+        assert!(matches!(
+            mesh_publish_target(&airc, None).await.unwrap(),
+            airc_lib::PublishTarget::RoomByName(id) if id == general.channel.to_string()
+        ));
+    }
+
     #[tokio::test]
     async fn sos_room_is_rejected_before_any_bootstrap_side_effect() {
         let parent = tempfile::tempdir().expect("test directory");
