@@ -179,3 +179,21 @@ contains the in-progress extraction of its existing elevation helper; AIRC does
 not consume that artifact yet. No new live install or machine repair was run.
 Standalone acquisition, one owned elevation session, public-entry local retest,
 idempotent rerun and same-account peer discovery remain OPEN.
+
+### 2026-10-01 16:57 UTC — shared elevation implementation ready for consumers
+
+Continuum draft PR #4649 head 78cf0366b now exports a validated process-owner
+context, supports child-first elevation and outer-only cleanup, invokes native
+gsudo.exe, and preserves pre-existing caller caches. Review found and resolved
+a no-work cleanup regression that could close a caller's existing cache. The
+existing Windows service/installer suite passes, including real PowerShell and
+Git Bash child ancestry, borrowed cleanup, stale context and external-cache expiry.
+Independent review approves the helper scope subject to CI, which is pending.
+
+AIRC does not consume this helper yet. Pinned/integrity-checked standalone
+acquisition, all AIRC privileged stages, its exact shell adapter, and Continuum's
+canonical-firewall delegation remain OPEN. No new local installer, consent,
+firewall write or peer-connection verification was performed. AIRC head 627bf3a
+also incorporates Bigmama's foreground/background SOS cursor repair; its Windows,
+Linux and macOS clean-install CI passed, with the PS5 job still pending at this
+checkpoint. The documentation and helper fixtures do not close live acceptance.
