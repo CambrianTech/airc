@@ -79,3 +79,96 @@ self comments. Existing watch cursor is preserved; messages consumed before the
 repair are not retroactively recovered by it. The observed message was recovered
 read-only from the join log and acknowledged via SOS. Local regression/adoption
 receipts pending; live installed delivery acceptance remains OPEN.
+
+2026-10-01 follow-up receipts: PR1470 head d547fd4a now makes the exact Cargo
+exit42 reproduction return42 with an explicit error; isolated probe verifies
+source repair only, actual installer path acceptance still OPEN. PRcomment
+5935774138 records the result. Registry shutdown PR1471 merged as d249ac471111;
+normal public airc update exited0, built release in38.76s, installed the verified
+artifact and automatically restarted the daemon. CLI/daemon both d249ac471111,
+same peer identity. This run needed no retry/rejoin, but did not deliberately
+exercise registry rate limiting during shutdown, so that live case remains OPEN.
+SOS separate-reader repair PR1472 head9ee8c351 has10 focused tests passing and
+independent APPROVE; CI/install pending. Upgrade may replay history once through
+the new join cursor; same-type readers still share a cursor.
+
+2026-10-01 independent firewall/outer-installer review: exact PR1470 d547fd4a
+policy fixture passes Windows PowerShell5.1 in isolated extracted files, with no
+host firewall changes. Continuum17c2096f Mod-AircFirewall (win-modules.ps1:437)
+still adds a separate broad program rule and skips on name existence after
+Mod-Airc; borrowing elevation alone does not consolidate policy ownership.
+Shared policy verification must be delegated to AIRC; standalone lifecycle must
+remain possible. install-common owns Ensure-Elevated/Invoke-Elevated/Clear-Elevation
+and the outer finally disposes its cache, so nested borrowed sessions must not
+clear it. Exact finding/fixture limits recorded on PR1470. No consumer edits or
+installer rerun; integration and live policy acceptance remain OPEN.
+
+2026-10-01 installed-reader adoption: PR1472 all CI green; exact9ee8c351 merged
+as5f76f3d06952. Normal public update exited0 in44.04s and automatically restarted
+daemon; CLI and daemon match5f76f3d with unchanged peer identity. Three previous
+join clients (verified PIDs26560,7992,3576 and exact join command lines) survived
+binary updates with old code. Stopped only those owned join clients and started
+one current public join cambriantech; daemon was preserved. This manual client
+refresh is an OPEN update-consumer lifecycle case: installer/runtime must make
+existing reader adoption automatic with regression/end-to-end proof before
+claiming complete update recovery. Current join owner session85064/PID29912.
+No BIGGIEDESK installation or mesh acceptance inferred.
+
+2026-10-01 installed SOS acceptance: foreground watch and background join85064
+both delivered BIGGIEDESK's same PR4649/PR1470 checkpoint; separate cursor files
+exist. This closes the observed cross-reader consumption reproduction locally,
+not the broader automatic client upgrade case or peer mesh onboarding.
+
+Independent PR4649 extraction review at90afe17b: all six function AST extents
+match actual canary baseb2849a6c after whitespace/logging substitutions. Fixture
+changes preserve nonzero error results and refusal assertions. Extraction-only
+APPROVE subject CI; no full-suite rerun or elevation performed by this reviewer.
+Borrowed-cache lifetime and standalone AIRC consumer integration remain OPEN,
+owned by BIGGIEDESK. Review comment5936259507 in Continuum records exact limits.
+An initial comparison used origin/main rather than the PR's canary base and
+failed before producing evidence; corrected to the API-reported base above.
+
+2026-10-01T17:12Z BIGGIEDESK live peer projection investigation (OPEN):
+- Peer reported daemon0121d959, project author d4ad790b, peers0 versus publish17.
+  Both owners independently traced IDs to intentional machine/project scopes;
+  no identity corruption established and no keys/scopes changed.
+- Ordinary event08c65378 received here; nonce echoed only on ordinary AIRC as
+  eventa6eea9a2. Reverse receipt remains unproved; no SOS echo used as acceptance.
+- Source root cause for misleading peer list: run_peer_list loaded only scope
+  while Airc::peers loads scope plus machine. Codex added shared library
+  peer_trust_snapshot and thin CLI consumer, preserving full trust metadata,
+  stable scope precedence, existing JSON shape, and local enrollment visibility.
+- Regression proves machine-only enrollment visible from empty project scope,
+  deduplication, scope key precedence, same-home handling and absence of both
+  identity.key and SQLite local identity. PASS. cargo check airc-cli PASS.
+  Two initial compile errors (PeerId ordering; test DB constant/borrow) corrected;
+  focused test rerun PASS. Independent review APPROVE; human footer corrected.
+- This is source/test evidence only. Installer adoption and BIGGIEDESK normal
+  peers command acceptance remain OPEN. No daemon restart/manual pairing.
+
+2026-10-01T17:14Z independent ownership review of Continuum4649 exact78cf0366b:
+reviewed PID/start-time/ancestry validation, native gsudo selection, preservation
+of existing caches, parent-only cleanup, and installer finally wiring. PS5.1
+fixture against exact helper passed borrower cleanup, owner context cleanup and
+stale-owner refusal; discovery stubbed, no helper/elevation/installation invoked.
+Production child ancestry tests inspected, not rerun here. APPROVE ownership
+slice subject CI; artifact acquisition, exact AIRC adapter, canonical firewall
+integration and fresh-install E2E remain OPEN with BIGGIEDESK owner. Source
+retrieval initially used a nonexistent install-elevation filename (404); corrected
+to PR-listed windows-elevation.ps1. No production files or runtime modified.
+
+2026-10-01T17:23Z PR1473 CI caught a regression on Windows/Linux/macOS:
+project initialization enrolls its own identity in the machine trust store, so
+naively exposing that union inflated peer counts and displaced expected rows.
+No failed head was merged or installed. Repaired shared snapshot to exclude
+persisted default scope/machine identities without minting identities. Added
+actual initialized-scope regression; both focused library tests PASS. Existing
+CLI peer_commands integration suite is the acceptance regression for the changed
+public command (running, six of seven passed at this checkpoint). Source-only;
+BIGGIEDESK ordinary return ACK and normal installer adoption remain OPEN.
+Follow-up review caught the supported named-agent self-enrollment variant.
+Snapshot now reuses airc-identity requested_agent_name and excludes the active
+scope row plus machine default; other named citizens remain visible. Three
+library regressions PASS and final existing CLI peer_commands suite7/7 PASS.
+Independent revised review APPROVE subject required checks. No failing head
+installed; CI must pass on this revision before merge/adoption.
