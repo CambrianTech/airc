@@ -161,3 +161,21 @@ many prerequisites; they alone do not prove first-time package acquisition.
 - Verify Linux/macOS regression jobs and obtain independent adversarial review.
 - Integrate Continuum's consumer ordering separately; do not assume moving its
   cold-storage module alone relocates prerequisite downloads or fixed SDK files.
+
+### 2026-10-01 16:38 UTC — hosted installer gates green
+
+PR #1470 head d547fd4a passed run 36892134133: public clean-install jobs on
+Windows, Windows PowerShell 5.1, Linux and macOS; setup-consent fixtures on all
+three platforms; and the real elevated Windows firewall provider regression.
+The shell guard run also passed. Rust-only CI was path-filtered; local fmt and
+clippy checks were run before push. This verifies the mixed enforcement-status
+repair on the hosted Windows provider, not this machine's completed setup.
+
+Bigmama independently reproduced the firewall policy fixture on PS5.1 and
+confirmed the metadata-failure regression is resolved. Review still identifies
+Continuum's separate broad firewall rule and borrowed-cache ownership as open
+integration work. Continuum branch codex/shared-windows-install-elevation now
+contains the in-progress extraction of its existing elevation helper; AIRC does
+not consume that artifact yet. No new live install or machine repair was run.
+Standalone acquisition, one owned elevation session, public-entry local retest,
+idempotent rerun and same-account peer discovery remain OPEN.
