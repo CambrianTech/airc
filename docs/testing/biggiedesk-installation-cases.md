@@ -79,3 +79,51 @@ self comments. Existing watch cursor is preserved; messages consumed before the
 repair are not retroactively recovered by it. The observed message was recovered
 read-only from the join log and acknowledged via SOS. Local regression/adoption
 receipts pending; live installed delivery acceptance remains OPEN.
+
+2026-10-01 follow-up receipts: PR1470 head d547fd4a now makes the exact Cargo
+exit42 reproduction return42 with an explicit error; isolated probe verifies
+source repair only, actual installer path acceptance still OPEN. PRcomment
+5935774138 records the result. Registry shutdown PR1471 merged as d249ac471111;
+normal public airc update exited0, built release in38.76s, installed the verified
+artifact and automatically restarted the daemon. CLI/daemon both d249ac471111,
+same peer identity. This run needed no retry/rejoin, but did not deliberately
+exercise registry rate limiting during shutdown, so that live case remains OPEN.
+SOS separate-reader repair PR1472 head9ee8c351 has10 focused tests passing and
+independent APPROVE; CI/install pending. Upgrade may replay history once through
+the new join cursor; same-type readers still share a cursor.
+
+2026-10-01 independent firewall/outer-installer review: exact PR1470 d547fd4a
+policy fixture passes Windows PowerShell5.1 in isolated extracted files, with no
+host firewall changes. Continuum17c2096f Mod-AircFirewall (win-modules.ps1:437)
+still adds a separate broad program rule and skips on name existence after
+Mod-Airc; borrowing elevation alone does not consolidate policy ownership.
+Shared policy verification must be delegated to AIRC; standalone lifecycle must
+remain possible. install-common owns Ensure-Elevated/Invoke-Elevated/Clear-Elevation
+and the outer finally disposes its cache, so nested borrowed sessions must not
+clear it. Exact finding/fixture limits recorded on PR1470. No consumer edits or
+installer rerun; integration and live policy acceptance remain OPEN.
+
+2026-10-01 installed-reader adoption: PR1472 all CI green; exact9ee8c351 merged
+as5f76f3d06952. Normal public update exited0 in44.04s and automatically restarted
+daemon; CLI and daemon match5f76f3d with unchanged peer identity. Three previous
+join clients (verified PIDs26560,7992,3576 and exact join command lines) survived
+binary updates with old code. Stopped only those owned join clients and started
+one current public join cambriantech; daemon was preserved. This manual client
+refresh is an OPEN update-consumer lifecycle case: installer/runtime must make
+existing reader adoption automatic with regression/end-to-end proof before
+claiming complete update recovery. Current join owner session85064/PID29912.
+No BIGGIEDESK installation or mesh acceptance inferred.
+
+2026-10-01 installed SOS acceptance: foreground watch and background join85064
+both delivered BIGGIEDESK's same PR4649/PR1470 checkpoint; separate cursor files
+exist. This closes the observed cross-reader consumption reproduction locally,
+not the broader automatic client upgrade case or peer mesh onboarding.
+
+Independent PR4649 extraction review at90afe17b: all six function AST extents
+match actual canary baseb2849a6c after whitespace/logging substitutions. Fixture
+changes preserve nonzero error results and refusal assertions. Extraction-only
+APPROVE subject CI; no full-suite rerun or elevation performed by this reviewer.
+Borrowed-cache lifetime and standalone AIRC consumer integration remain OPEN,
+owned by BIGGIEDESK. Review comment5936259507 in Continuum records exact limits.
+An initial comparison used origin/main rather than the PR's canary base and
+failed before producing evidence; corrected to the API-reported base above.
