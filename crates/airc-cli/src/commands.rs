@@ -59,9 +59,21 @@ pub async fn run_init(
     Ok(())
 }
 
+/// SOS is the account recovery transport, never an ordinary mesh room.
+/// Validate before opening the store or starting a daemon: bootstrap may be broken.
+pub(crate) fn reject_recovery_room(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(name) = name {
+        if airc_lib::ChannelName::new(name)?.as_str() == "sos" {
+            return Err("SOS is the account recovery gist, not a mesh room. Use `airc sos status` to read it, `airc sos watch` for new peer messages, or `airc sos send <message>` to post. No room was created or switched.".into());
+        }
+    }
+    Ok(())
+}
+
 /// `room` — print current room. `room <name>` — switch to a
 /// deterministic room derived from `<name>`.
 pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(name.as_deref())?;
     let airc = Airc::open(home).await?;
     match name {
         Some(name) => {
@@ -181,6 +193,7 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
 pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(room.as_deref())?;
     // Start the machine-singular daemon and attach: join, heartbeat, and
     // the live feed all route through the daemon's router (one path).
     let socket = crate::cli::default_socket_path_in(home);
@@ -1202,6 +1215,7 @@ pub async fn run_send(
     room: Option<&str>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(room)?;
     let airc = attached_airc(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
@@ -2571,6 +2585,7 @@ pub async fn run_msg(
     room: Option<&str>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(room)?;
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     let airc = Airc::attach(home, socket).await?;
@@ -3450,6 +3465,45 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression: join sos created a silent parallel room during fresh Windows onboarding.
+    #[tokio::test]
+    async fn sos_room_is_rejected_before_any_bootstrap_side_effect() {
+        let parent = tempfile::tempdir().expect("test directory");
+        let home = parent.path().join("not-created");
+        for name in ["sos", "#sos", " SOS ", " #SoS "] {
+            for result in [
+                run_join(&home, Some(name.into())).await,
+                run_room(&home, Some(name.into())).await,
+                run_send(&home, Vec::new(), Some(name), "must not publish").await,
+                run_msg(
+                    &home,
+                    home.join("missing.sock"),
+                    Some(name),
+                    "must not publish",
+                )
+                .await,
+                crate::publish_commands::run_publish(
+                    &home,
+                    Some(name.into()),
+                    Some("must not publish".into()),
+                    None,
+                    false,
+                    Vec::new(),
+                    crate::cli::PublishFrameKind::Message,
+                )
+                .await,
+            ] {
+                let error = result
+                    .expect_err("recovery name must not create a mesh room")
+                    .to_string();
+                assert!(error.contains("airc sos watch"));
+                assert!(!home.exists(), "rejection must precede daemon/store setup");
+            }
+        }
+        assert!(reject_recovery_room(Some("sos-development")).is_ok());
+        assert!(reject_recovery_room(None).is_ok());
+    }
 
     /// what this catches (live 2026-08-12): the @mention parse feeding the
     /// deaf-room warning. `@name` at the start of a body is an addressing

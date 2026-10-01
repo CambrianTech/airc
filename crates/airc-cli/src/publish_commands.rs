@@ -24,6 +24,7 @@ pub async fn run_publish(
     headers: Vec<String>,
     kind: PublishFrameKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::commands::reject_recovery_room(room.as_deref())?;
     let body = load_body(body_text, body_json, stdin)?;
     let parsed_headers = parse_headers(&headers)?;
     let target = match room {
