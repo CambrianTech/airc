@@ -145,3 +145,30 @@ failed before producing evidence; corrected to the API-reported base above.
   focused test rerun PASS. Independent review APPROVE; human footer corrected.
 - This is source/test evidence only. Installer adoption and BIGGIEDESK normal
   peers command acceptance remain OPEN. No daemon restart/manual pairing.
+
+2026-10-01T17:14Z independent ownership review of Continuum4649 exact78cf0366b:
+reviewed PID/start-time/ancestry validation, native gsudo selection, preservation
+of existing caches, parent-only cleanup, and installer finally wiring. PS5.1
+fixture against exact helper passed borrower cleanup, owner context cleanup and
+stale-owner refusal; discovery stubbed, no helper/elevation/installation invoked.
+Production child ancestry tests inspected, not rerun here. APPROVE ownership
+slice subject CI; artifact acquisition, exact AIRC adapter, canonical firewall
+integration and fresh-install E2E remain OPEN with BIGGIEDESK owner. Source
+retrieval initially used a nonexistent install-elevation filename (404); corrected
+to PR-listed windows-elevation.ps1. No production files or runtime modified.
+
+2026-10-01T17:23Z PR1473 CI caught a regression on Windows/Linux/macOS:
+project initialization enrolls its own identity in the machine trust store, so
+naively exposing that union inflated peer counts and displaced expected rows.
+No failed head was merged or installed. Repaired shared snapshot to exclude
+persisted default scope/machine identities without minting identities. Added
+actual initialized-scope regression; both focused library tests PASS. Existing
+CLI peer_commands integration suite is the acceptance regression for the changed
+public command (running, six of seven passed at this checkpoint). Source-only;
+BIGGIEDESK ordinary return ACK and normal installer adoption remain OPEN.
+Follow-up review caught the supported named-agent self-enrollment variant.
+Snapshot now reuses airc-identity requested_agent_name and excludes the active
+scope row plus machine default; other named citizens remain visible. Three
+library regressions PASS and final existing CLI peer_commands suite7/7 PASS.
+Independent revised review APPROVE subject required checks. No failing head
+installed; CI must pass on this revision before merge/adoption.
