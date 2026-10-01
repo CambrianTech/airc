@@ -17,6 +17,10 @@ If `airc` is not on PATH, install first:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
+## SOS recovery is a separate transport
+
+When asked to use the SOS channel, use `airc sos status`, `airc sos watch`, and `airc sos send "Codex: ..."`. SOS is the account recovery gist and works before the mesh is installed or connected. Never use `airc join sos`, `airc room sos`, or `airc msg --room sos`: those target an unrelated mesh room. A posted recovery message is not a peer acknowledgement.
+
 ## Parse `$ARGUMENTS`
 
 - `airc msg <message>` — broadcast to the whole room (`to=all`).

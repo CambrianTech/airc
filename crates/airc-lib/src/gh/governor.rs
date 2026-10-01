@@ -15,7 +15,7 @@
 //!
 //! - **Counter / budget:** a sliding 60s window of request timestamps
 //!   (`budget.jsonl`). `reserve` refuses once the window hits
-//!   `max_requests_per_min` (default 30) and arms a local backoff.
+//!   class allowance within `max_requests_per_min` (default 30).
 //! - **Backoff:** a shared `backoff-until` epoch (`note_rate_limit`
 //!   parses GitHub's own headers — `retry-after`,
 //!   `x-ratelimit-remaining`/`reset` — so the governor honors GitHub's
@@ -38,9 +38,6 @@ use fs2::FileExt;
 /// `AIRC_GH_MAX_REQUESTS_PER_MIN` for operators with larger fleets.
 pub const DEFAULT_MAX_REQUESTS_PER_MIN: usize = 30;
 
-/// How long to self-throttle after blowing the local per-minute budget.
-const LOCAL_THROTTLE_BACKOFF_SEC: f64 = 60.0;
-
 /// How many of the per-minute slots are RESERVED for [`GhClass::Registry`]
 /// traffic — beacons may never consume into this floor. Sized so a full
 /// registry cycle (refresh + publish) always fits even under beacon storm
@@ -48,6 +45,25 @@ const LOCAL_THROTTLE_BACKOFF_SEC: f64 = 60.0;
 /// the registry logged 33k failures, converged never, and undialable peers
 /// took the mesh down).
 pub const REGISTRY_FLOOR: usize = 6;
+
+/// Recovery must remain reachable when background registry traffic is saturated.
+pub const RECOVERY_FLOOR: usize = 6;
+
+/// Nested allowances within one absolute budget. Small budgets reserve no floors.
+pub fn request_limit_for(class: GhClass, limit: usize) -> usize {
+    let recovery = if limit > REGISTRY_FLOOR + RECOVERY_FLOOR {
+        RECOVERY_FLOOR
+    } else {
+        0
+    };
+    match class {
+        GhClass::Recovery => limit,
+        GhClass::Registry => limit.saturating_sub(recovery),
+        GhClass::Beacon | GhClass::Interactive => {
+            limit.saturating_sub(recovery + registry_floor_for(limit))
+        }
+    }
+}
 
 /// The part of `limit` held back from every non-registry class. Zero when the
 /// window is too small to hold a floor at all (a test budget of 3).
@@ -63,15 +79,17 @@ pub fn registry_floor_for(limit: usize) -> usize {
 /// load-bearing convergence traffic alive under polling pressure. One
 /// budget, one window, but the classes drain it asymmetrically:
 ///
-/// - `Beacon` may use at most `limit - REGISTRY_FLOOR` of the window.
-/// - `Registry` and `Interactive` may use the whole window, including the
-///   floor beacons can't touch.
+/// - `Beacon` and `Interactive` leave registry and recovery capacity untouched.
+/// - `Registry` can use its floor but leaves recovery capacity untouched.
+/// - `Recovery` can use the remaining capacity, within the absolute limit.
 ///
 /// GitHub's OWN limits (the shared backoff armed by [`GhBudget::note_rate_limit`])
 /// remain absolute for every class — prioritization never overrides the
 /// upstream throttle, only arbitrates OUR local one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GhClass {
+    /// Explicit out-of-band SOS operations; still bound by GitHub backoff.
+    Recovery,
     /// Account-registry refresh/publish — the mesh's convergence data.
     /// Starving this makes same-owner peers undialable grid-wide.
     Registry,
@@ -137,7 +155,7 @@ impl GhBudget {
     /// deliberate changes from the classless behavior:
     ///
     /// 1. **The registry floor.** `Beacon` reservations are denied once the
-    ///    window reaches `limit - REGISTRY_FLOOR`, so registry convergence
+    ///    window reaches the Beacon allowance, so registry convergence
     ///    always finds budget no matter how hot the polling is.
     /// 2. **Local exceed no longer arms the SHARED backoff.** The old path
     ///    let one noisy beacon blowing the local window lock out EVERY
@@ -173,17 +191,12 @@ impl GhBudget {
         // never re-learned, and a whole node fell off the grid while GitHub
         // itself sat at 5000/5000. A refresh is how the mesh learns where its
         // peers ARE; nothing discretionary may starve it — and prioritisation
-        // never mints budget: the registry stops at the absolute limit, the
-        // others stop REGISTRY_FLOOR short of it. A window too small to hold a
-        // floor (test budgets of 3) reserves nothing.
-        let floor = registry_floor_for(limit);
-        let class_limit = match class {
-            GhClass::Registry => limit,
-            GhClass::Beacon | GhClass::Interactive => limit.saturating_sub(floor),
-        };
+        // never mints budget. Recovery also needs capacity background registry
+        // traffic cannot consume; both CLI and library use this single policy.
+        let class_limit = request_limit_for(class, limit);
         if count >= class_limit {
             return Ok(Reservation::Denied {
-                retry_after_secs: LOCAL_THROTTLE_BACKOFF_SEC as i64,
+                retry_after_secs: self.local_window_frees_in(now)?,
                 reason: format!(
                     "gh request budget exceeded for {class:?} ({count}/{class_limit} of {limit} in 60s)"
                 ),
@@ -277,6 +290,19 @@ impl GhBudget {
     }
 
     // --- internals (file-locked state under `dir`) ---
+
+    fn local_window_frees_in(&self, now: f64) -> std::io::Result<i64> {
+        let oldest = fs::read_to_string(self.dir.join("budget.jsonl"))?
+            .lines()
+            .filter_map(|line| line.trim().parse::<f64>().ok())
+            .filter(|ts| *ts >= now - 60.0)
+            .fold(f64::INFINITY, f64::min);
+        Ok(if oldest.is_finite() {
+            ((oldest + 60.0 - now).ceil() as i64).max(1)
+        } else {
+            1
+        })
+    }
 
     fn lock(&self) -> std::io::Result<GuardLock> {
         fs::create_dir_all(&self.dir)?;
@@ -441,9 +467,50 @@ mod tests {
         vec!["api".into(), "/gists/x".into()]
     }
 
+    #[test]
+    fn recovery_survives_registry_saturation_without_bypassing_upstream_backoff() {
+        let _env = env_guard();
+        let dir = tempfile::tempdir().expect("tmp");
+        let background = budget(dir.path());
+        let recovery = budget(dir.path());
+        let now = 1_000_000.0;
+        let limit = max_requests_per_min();
+        let registry_cap = request_limit_for(GhClass::Registry, limit);
+        for _ in 0..registry_cap {
+            assert!(background
+                .reserve_class(&gist_args(), now, GhClass::Registry)
+                .unwrap()
+                .allowed());
+        }
+        assert!(!background
+            .reserve_class(&gist_args(), now, GhClass::Registry)
+            .unwrap()
+            .allowed());
+        for _ in registry_cap..limit {
+            assert!(recovery
+                .reserve_class(&gist_args(), now, GhClass::Recovery)
+                .unwrap()
+                .allowed());
+        }
+        assert!(!recovery
+            .reserve_class(&gist_args(), now, GhClass::Recovery)
+            .unwrap()
+            .allowed());
+        assert_eq!(recovery.snapshot(now).unwrap().0, limit);
+        assert!(recovery
+            .reserve_class(&gist_args(), now + 61.0, GhClass::Recovery)
+            .unwrap()
+            .allowed());
+        fs::write(dir.path().join("backoff-until"), (now + 90.0).to_string()).unwrap();
+        assert!(!recovery
+            .reserve_class(&gist_args(), now + 62.0, GhClass::Recovery)
+            .unwrap()
+            .allowed());
+    }
+
     /// what this catches (#288 starvation fix): the registry floor —
-    /// once beacons fill the window to `limit - REGISTRY_FLOOR`, further
-    /// Beacon reservations are DENIED while Registry (and Interactive)
+    /// once beacons fill their allowance, further
+    /// Beacon reservations are DENIED while Registry
     /// still reserve into the floor. This is the invariant whose absence
     /// let polling hold all 30 slots for days while registry convergence
     /// logged 33k failures and never completed.
@@ -458,7 +525,7 @@ mod tests {
         // via AIRC_GH_MAX_REQUESTS_PER_MIN; the invariants below hold for
         // ANY limit (cap saturates to 0 → the first beacon is denied and
         // registry gets the whole window).
-        let beacon_cap = limit.saturating_sub(REGISTRY_FLOOR);
+        let beacon_cap = request_limit_for(GhClass::Beacon, limit);
         for i in 0..beacon_cap {
             assert!(
                 b.reserve_class(&gist_args(), now, GhClass::Beacon)
@@ -473,7 +540,7 @@ mod tests {
                 .allowed(),
             "beacon at cap must be denied — the floor is reserved"
         );
-        let floor_available = limit - beacon_cap; // min(REGISTRY_FLOOR, limit)
+        let floor_available = request_limit_for(GhClass::Registry, limit) - beacon_cap;
         for i in 0..floor_available {
             assert!(
                 b.reserve_class(&gist_args(), now, GhClass::Registry)
@@ -508,7 +575,7 @@ mod tests {
         let b = budget(dir.path());
         let now = 1_700_000_000.0;
         let limit = max_requests_per_min();
-        for _ in 0..limit - registry_floor_for(limit) {
+        for _ in 0..request_limit_for(GhClass::Interactive, limit) {
             assert!(b
                 .reserve_class(&gist_args(), now, GhClass::Interactive)
                 .expect("reserve")
@@ -536,7 +603,7 @@ mod tests {
         let b = budget(dir.path());
         let now = 2_000_000.0;
         let limit = max_requests_per_min();
-        for _ in 0..limit.saturating_sub(REGISTRY_FLOOR) {
+        for _ in 0..request_limit_for(GhClass::Beacon, limit) {
             assert!(b
                 .reserve_class(&gist_args(), now, GhClass::Beacon)
                 .expect("io")
@@ -558,15 +625,15 @@ mod tests {
     }
 
     /// what this catches: back-compat — the classless `reserve` is
-    /// Interactive (full window), so existing callers keep their exact
-    /// prior allowance.
+    /// Interactive (fenced allowance), so existing callers keep their
+    /// traffic classification.
     #[test]
     fn classless_reserve_stops_short_of_the_registry_floor() {
         let _env = env_guard();
         let dir = tempfile::tempdir().expect("tmp");
         let b = budget(dir.path());
         let now = 3_000_000.0;
-        let fenced = max_requests_per_min() - registry_floor_for(max_requests_per_min());
+        let fenced = request_limit_for(GhClass::Interactive, max_requests_per_min());
         for i in 0..fenced {
             assert!(
                 b.reserve(&gist_args(), now).expect("io").allowed(),

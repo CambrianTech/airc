@@ -158,7 +158,7 @@ fn delivery_findings(
                      connection presumed half-open, route refresh is re-dialing",
                     peer.peer_id,
                     peer.attempts_since_ack,
-                    last.map(&age).unwrap_or_else(|| "never confirmed".into()),
+                    last.map(age).unwrap_or_else(|| "never confirmed".into()),
                 ),
                 "watch `airc transport health` for the suspect-drop + re-dial",
             )),
