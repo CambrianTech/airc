@@ -235,6 +235,48 @@ fn main() {
     if ($global:aircStartupFixture.registered) { throw 'Bash install opted into new autostart' }
     & $registrar -AircPath $binary
     if (-not $global:aircStartupFixture.registered -or $global:aircStartupFixture.registered.TaskPath -ne '\' -or $global:aircStartupFixture.registered.Principal -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'New task did not preserve current user identity/root task path' }
+    # A failed registrar used to become a warning in the shared coordinator,
+    # allowing setup to report success. Execute that exact Bash stage with a
+    # controlled registrar exit; no task or elevation operation is performed.
+    $installer = [IO.File]::ReadAllText((Join-Path $repo 'install.sh'))
+    $stage = [regex]::Match($installer, '(?ms)^_setup_windows_autostart\(\) \{.*?^\}')
+    if (-not $stage.Success) { throw 'Shared autostart stage was not found' }
+    $stageFixture = Join-Path $scratch 'autostart-stage.sh'
+    $prefix = @'
+CLONE_DIR=fixture-source
+BIN_DIR=fixture-bin
+_to_win_path() { printf '%s\n' "$1"; }
+ok() { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*"; }
+fail() { printf '%s\n' "$*"; exit 1; }
+'@
+    # Override the process boundary only; the installer's branching and flags
+    # remain unchanged. Arguments choose success/failure and native/Bash mode.
+    $suffix = @'
+registrar_exit="$1"
+export AIRC_WINDOWS_NATIVE="$2"
+_windows_powershell() { printf '%s\n' "$*"; return "$registrar_exit"; }
+_setup_windows_autostart
+printf 'fixture install continued\n'
+'@
+    [IO.File]::WriteAllText($stageFixture, ($prefix + "`n" + $stage.Value + "`n" + $suffix).Replace("`r`n", "`n"))
+    $gitDirectory = [IO.DirectoryInfo]((& git --exec-path).Trim())
+    while ($gitDirectory -and -not (Test-Path -LiteralPath (Join-Path $gitDirectory.FullName 'bin/bash.exe'))) { $gitDirectory = $gitDirectory.Parent }
+    if (-not $gitDirectory) { throw 'Git Bash is required for the shared autostart regression' }
+    foreach ($nativeMode in @('0', '1')) {
+        foreach ($registrarExit in @('0', '73')) {
+            $output = @(& (Join-Path $gitDirectory.FullName 'bin/bash.exe') --noprofile --norc $stageFixture $registrarExit $nativeMode) -join "`n"
+            $code = $LASTEXITCODE
+            if ($nativeMode -eq '0' -and $output -notmatch '-ExistingOnly') { throw 'Bash repair widened startup scope' }
+            if ($nativeMode -eq '1' -and $output -match '-ExistingOnly') { throw 'Native setup lost startup registration' }
+            if ($registrarExit -eq '0') {
+                if ($code -ne 0 -or $output -notmatch 'fixture install continued') { throw 'Successful startup stage stopped setup' }
+            } elseif ($code -eq 0 -or $output -match 'fixture install continued' -or $output -notmatch 'Setup is incomplete') {
+                throw 'Shared installer suppressed startup failure'
+            }
+        }
+    }
+    Write-Output 'PASS: shared installer stops on startup failure in native and existing-only modes'
     Write-Output 'PASS: hidden join, logs, exit 7, surviving descendant, missing executable, and shared task registration'
 } finally {
     if ($descendant -and -not $descendant.HasExited) { $descendant.Kill(); $descendant.WaitForExit(); $descendant.Dispose() }

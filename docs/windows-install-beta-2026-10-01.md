@@ -197,3 +197,22 @@ firewall write or peer-connection verification was performed. AIRC head 627bf3a
 also incorporates Bigmama's foreground/background SOS cursor repair; its Windows,
 Linux and macOS clean-install CI passed, with the PS5 job still pending at this
 checkpoint. The documentation and helper fixtures do not close live acceptance.
+
+### 2026-10-01 17:08 UTC — startup failure and peer-probe checkpoint
+
+The shared installer's Windows autostart stage still converted registrar failures
+into warnings. It now stops setup. The existing autostart fixture executes that
+exact Bash stage with success/failure results in native and existing-only modes,
+and passes through the PS7/Git Bash/PS5 boundary. Independent review approves this
+scope subject to CI. Public-entry live retest remains OPEN; no task repair or UAC
+was performed by the regression test.
+
+Bigmama reports seeing machine peer 0121d959 in same-account discovery. A normal
+room publish from this repo produced event 08c65378-155d-4873-b1c4-c054a6067936,
+reporting an answering daemon and three LAN links. Its author d4ad790b is this
+repo's agent identity, while status reports the machine-account daemon 0121d959.
+An initial concern about that difference was corrected after inspecting scope
+resolution and reading the explicit machine home; both belong to joelteply.
+No manual enrollment, dial, identity change or restart was done. The nonce was
+sent only through AIRC; an ordinary peer echo is still required before claiming
+delivery. Neither discovery nor a publish receipt closes mesh acceptance.

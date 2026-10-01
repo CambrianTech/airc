@@ -771,7 +771,7 @@ _setup_windows_autostart() {
        -File "$(_to_win_path "$registrar")" -AircPath "$(_to_win_path "$BIN_DIR/airc.exe")" "${flags[@]}"; then
     ok "Windows mesh autostart checked"
   else
-    warn "Could not repair Windows mesh autostart; rerun this installer from a normal Windows session."
+    fail "Windows mesh autostart registration or verification failed. Setup is incomplete; rerun the same installer to resume."
   fi
 }
 
