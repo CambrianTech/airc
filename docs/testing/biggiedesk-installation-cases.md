@@ -55,3 +55,27 @@ failure; the original process did not retain enough phase evidence to prove it
 was its only cause. In-flight GitHub calls and runtime teardown remain separate
 possible delays. No process-exit gate weakened, forced termination introduced,
 or install acceptance claimed. Normal update end-to-end validation remains OPEN.
+
+2026-10-01 independent PR1470 review (Codex/BIGMAMA), exact head
+ eeffd5ac621c26358eaf9c2066013877f03c8c16: moving Windows into install.sh
+removes its duplicated hardcoded artifact location, but the shared
+_airc_target_dir still guesses source/target after failed metadata. Extracted
+that exact function into an isolated Git Bash fixture, enabled set -euo pipefail,
+and replaced cargo with an exit42 stub: resolver_exit=0 resolved=/tmp/target.
+No installation or real artifact selection occurred. BLOCK finding posted at
+https://github.com/CambrianTech/airc/pull/1470#issuecomment-5935531306 and canonical
+SOS; installer owner retains repair. Required: explicit metadata/parse failure,
+configured-target success coverage, then actual shared installer acceptance.
+OPEN; reviewer did not mutate the peer branch or start duplicate installation.
+
+2026-10-01 SOS delivery investigation: foreground sos watch repeatedly reported
+no new peer messages, but the redirected, still-active public join log contained
+BIGGIEDESK's PR1470 announcement and standalone-AIRC requirement. Source proved
+poll_fallback_once and run_watch shared sos-watch-cursor. Background printing
+therefore acknowledged a message on behalf of a different foreground consumer.
+Repair separates the join cursor from watch, reusing filtering and delivery
+logic; regression verifies both consumers get a peer comment once and filter
+self comments. Existing watch cursor is preserved; messages consumed before the
+repair are not retroactively recovered by it. The observed message was recovered
+read-only from the join log and acknowledged via SOS. Local regression/adoption
+receipts pending; live installed delivery acceptance remains OPEN.
