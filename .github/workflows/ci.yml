@@ -209,6 +209,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: bash test/windows-setup-path.sh
+      - name: Actual Windows firewall provider acceptance
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./test/windows-firewall-live.ps1
   clean-install-windows:
     runs-on: windows-latest
     steps:

@@ -69,6 +69,7 @@ function Get-AircFixedVolumes { return [IO.DriveInfo]::GetDrives() }
 # existing choices; on a small system disk, use a roomy fixed secondary volume.
 # This is install state, not machine-specific advice or a hardcoded drive letter.
 function Initialize-AircBuildStorage {
+    param([switch]$RequireCargoMetadata)
     $systemDrive = Get-AircDriveInfo ([IO.Path]::GetPathRoot($env:SystemRoot))
     Write-Step ('System volume {0}: {1:N1} GB available' -f $systemDrive.Name, ($systemDrive.AvailableFreeSpace / 1GB))
     # VS retains installer/system components here even with relocated packages.
@@ -80,12 +81,17 @@ function Initialize-AircBuildStorage {
     }
     $stateFile = Join-Path $DEFAULT_AIRC_ROOT 'build-storage.json'
     $defaultTarget = Join-Path $SourceDirectory 'target'
-    $effectiveTarget = if (Get-Command cargo -ErrorAction SilentlyContinue) {
-        Get-AircTargetDirectory -SourceDirectory $SourceDirectory
-    } elseif ($env:CARGO_TARGET_DIR) {
+    $effectiveTarget = if ($env:CARGO_TARGET_DIR) {
         if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR }
         else { Join-Path $SourceDirectory $env:CARGO_TARGET_DIR }
     } else { $defaultTarget }
+    if (Get-Command cargo -ErrorAction SilentlyContinue) {
+        try { $effectiveTarget = Get-AircTargetDirectory -SourceDirectory $SourceDirectory }
+        catch {
+            if ($RequireCargoMetadata) { throw }
+            Write-Warn2 'Cargo metadata is not available yet. Storage selection is provisional and will be checked again after Rust setup.'
+        }
+    } elseif ($RequireCargoMetadata) { throw 'Cargo remains unavailable after Rust setup.' }
     $completedBuild = (Test-MsvcToolchain) -and (Test-Path (Join-Path $effectiveTarget 'release\airc.exe'))
     $storageRoot = $null
     if (Test-Path -LiteralPath $stateFile) {
@@ -301,6 +307,19 @@ Install-GitHubCli -SourceDirectory $SourceDirectory
 # rustup-init, which installs the stable-msvc toolchain and adds
 # %USERPROFILE%\.cargo\bin to the User PATH; Update-SessionPath inside
 # Install-IfMissing makes it visible to THIS session.
+if ((Get-Command cargo -ErrorAction SilentlyContinue) -and (Get-Command rustup -ErrorAction SilentlyContinue)) {
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & cargo --version 2>$null | Out-Null
+        $cargoAvailable = $LASTEXITCODE -eq 0
+    } finally { $ErrorActionPreference = $savedPreference }
+    if (-not $cargoAvailable) {
+        Write-Step 'Repairing the existing Rust toolchain before resolving build storage ...'
+        & rustup default stable
+        if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain repair failed. Setup is incomplete.' }
+    }
+}
 Install-IfMissing -Name 'Rust (rustup)'      -WingetId 'Rustlang.Rustup'     -TestCmd { Get-Command cargo -ErrorAction SilentlyContinue }
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     # rustup installed but cargo not resolving: a fresh rustup-init may
@@ -313,6 +332,10 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         Update-SessionPath
     }
 }
+
+# Resolve Cargo configuration now that the prerequisite is usable. Never
+# silently override a configured cache based on provisional preflight evidence.
+Initialize-AircBuildStorage -RequireCargoMetadata
 
 # -- MSVC C++ build tools ------------------------------------------------
 # Validated live on a fresh Windows 11 box (2026-06-10): rustup's default

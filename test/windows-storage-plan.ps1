@@ -14,9 +14,14 @@ try {
     $planner = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Initialize-AircBuildStorage'},$true)
     . ([scriptblock]::Create($planner.Extent.Text))
     function Write-Step($message) { }
+    function Write-Warn2($message) { }
     function Test-MsvcToolchain { return $script:msvcInstalled }
     function Get-Command { param($Name,$ErrorAction) if ($Name -eq 'cargo') { return @{ Name='fixture-cargo' } } }
-    function Get-AircTargetDirectory { param($SourceDirectory) return $script:configuredTarget }
+    function Get-AircTargetDirectory {
+        param($SourceDirectory)
+        if ($script:metadataUnavailable) { throw 'fixture: no default Rust toolchain' }
+        return $script:configuredTarget
+    }
     function Get-AircDriveInfo([string]$Root) {
         $script:probeCount++
         if ($script:probeCount -eq 1 -or -not (Test-Path (Join-Path $DEFAULT_AIRC_ROOT 'build-storage.json'))) {
@@ -81,6 +86,15 @@ try {
     $rejected=$false
     try { Initialize-AircBuildStorage } catch { $rejected=$_.Exception.Message -match 'remaining source-build work' }
     if (-not $rejected) { throw 'Configured cache volume capacity was ignored' }
+    # A rustup shim can exist before its default toolchain is provisioned.
+    # Early planning must allow repair; final planning must fail closed.
+    $script:metadataUnavailable=$true; $script:systemFree=25GB; $script:probeCount=0
+    Initialize-AircBuildStorage
+    $rejected=$false; $script:probeCount=0
+    try { Initialize-AircBuildStorage -RequireCargoMetadata } catch { $rejected=$_.Exception.Message -match 'no default Rust toolchain' }
+    if (-not $rejected) { throw 'Post-provision planning ignored unresolved Cargo configuration' }
+    $script:metadataUnavailable=$false; $script:probeCount=0
+    Initialize-AircBuildStorage -RequireCargoMetadata
     Write-Host 'PASS: fresh storage selection, remaining-work rerun, system-volume and build-volume rejection'
 } finally {
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name,$saved[$name],'Process') }
