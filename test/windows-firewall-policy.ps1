@@ -78,6 +78,13 @@ $rejected=$false
 try { Set-AircFirewallPolicy $binary } catch { $rejected=$_.Exception.Message -match 'Effective firewall policy' }
 if (-not $rejected) { throw 'Ineffective policy reported as successful' }
 $state.ineffective=$false
+$state.enforcement=@('ProfileInactive','Enforced')
+Set-AircFirewallPolicy $binary
+if (-not (Test-AircFirewallOk $binary)) { throw 'Enforced active profile with inactive alternate profiles rejected' }
+$state.enforcement=@('Enforced','LocalFirewallRulesDisallowed')
+$rejected=$false
+try { Set-AircFirewallPolicy $binary } catch { $rejected=$_.Exception.Message -match 'Effective firewall policy' }
+if (-not $rejected) { throw 'Enforced status masked a policy prohibition' }
 foreach ($status in @('NotApplicable','LocalFirewallRulesDisallowed','CategoryOff','RemoteAddressResolutionEmpty')) {
     $state.enforcement=$status
     $rejected=$false

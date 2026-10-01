@@ -717,14 +717,28 @@ ensure_cargo_recent() {
 # precedence the build used), so we always look where the binary actually
 # is. JSON backslash-escapes / Windows backslashes are normalized to
 # forward slashes so the path is usable in this (MSYS/git-bash) shell;
-# falls back to the historical default if `cargo metadata` is unavailable.
+# Fail closed if Cargo cannot report its output location; never guess a cache.
 _airc_target_dir() {
-  local dir
-  dir="$( (cd "$CLONE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null) \
-          | grep -o '"target_directory":"[^"]*"' | head -1 \
-          | sed 's/^"target_directory":"//; s/"$//' )"
+  local dir metadata status
+  if metadata="$(cd "$CLONE_DIR" && cargo metadata --format-version 1 --no-deps)"; then
+    :
+  else
+    status=$?
+    printf 'AIRC setup: cargo metadata failed (exit %s); cannot resolve build output.\n' "$status" >&2
+    return "$status"
+  fi
+  case "$metadata" in
+    \{*\}) ;;
+    *) printf 'AIRC setup: malformed cargo metadata.\n' >&2; return 1 ;;
+  esac
+  dir="$(printf '%s\n' "$metadata" | grep -o '"target_directory"[[:space:]]*:[[:space:]]*"[^"]*"' \
+          | sed 's/^"target_directory"[[:space:]]*:[[:space:]]*"//; s/"$//')" || return 1
+  if [ -z "$dir" ] || [[ "$dir" == *$'\n'* ]]; then
+    printf 'AIRC setup: cargo metadata must report one nonempty target_directory.\n' >&2
+    return 1
+  fi
   dir="$(printf '%s' "$dir" | sed 's#\\\\#/#g; s#\\#/#g')"
-  if [ -n "$dir" ]; then printf '%s\n' "$dir"; else printf '%s\n' "$CLONE_DIR/target"; fi
+  printf '%s\n' "$dir"
 }
 
 # user surface. Copy the built binary into BIN_DIR so PATH never points
@@ -781,7 +795,7 @@ _install_airc_binary() {
 
   # Where cargo ACTUALLY put it (honors CARGO_TARGET_DIR + cargo config),
   # not the assumed "$CLONE_DIR/target" — see `_airc_target_dir`.
-  target_dir="$(_airc_target_dir)"
+  target_dir="$(_airc_target_dir)" || fail 'Cannot resolve Cargo build output; nothing was installed.'
   built="$target_dir/release/airc"
   case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) built="$built.exe" ;; esac
   [ -x "$built" ] || fail "airc build completed but binary is missing: $built"
@@ -999,7 +1013,7 @@ _install_airc_codex_hooks() {
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
   local _airc=""
-  local _tdir; _tdir="$(_airc_target_dir)"
+  local _tdir; _tdir="$(_airc_target_dir)" || fail 'Cannot resolve Cargo output for bridge installation.'
   if [ -x "$_tdir/release/airc" ]; then
     _airc="$_tdir/release/airc"
   elif [ -x "$_tdir/debug/airc" ]; then

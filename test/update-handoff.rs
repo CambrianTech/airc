@@ -46,7 +46,17 @@ fn public_handoff_builds_once_before_stop_and_rejects_bad_preparations() {
 [ ! -f "$AIRC_FIXTURE_ROOT/stopped" ] || { echo 'CARGO DURING OUTAGE' >&2; exit 88; }
 case "$1" in
   --version) echo 'cargo 1.95.0' ;;
-  metadata) printf '{"target_directory":"%s/target"}\n' "$AIRC_FIXTURE_ROOT" ;;
+  metadata)
+    if [ -f "$AIRC_FIXTURE_ROOT/metadata-case" ]; then
+      case "$(cat "$AIRC_FIXTURE_ROOT/metadata-case")" in
+        failure) exit 42 ;;
+        malformed) echo 'not-json'; exit 0 ;;
+        missing) echo '{}'; exit 0 ;;
+        empty) echo '{"target_directory":""}'; exit 0 ;;
+      esac
+    fi
+    printf '{"target_directory":"%s/target"}\n' "$AIRC_FIXTURE_ROOT"
+    ;;
   build)
     echo build >> "$AIRC_FIXTURE_ROOT/events"
     [ ! -f "$AIRC_FIXTURE_ROOT/fail-build" ] || exit 42
@@ -85,6 +95,26 @@ esac
             std::env::set_var(key, "1");
         }
         std::env::remove_var("AIRC_SKIP_RUST_BUILD");
+        // Regression: failed/malformed metadata must not guess source/target,
+        // even when that directory contains a valid stale build.
+        std::fs::create_dir_all(source.join("target/release")).unwrap();
+        write(&source.join("target/release/airc"), good);
+        for case in ["failure", "malformed", "missing", "empty"] {
+            write(&root.join("metadata-case"), case);
+            assert!(
+                update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890")
+                    .is_err(),
+                "metadata case {case} used a guessed build directory"
+            );
+            assert!(!root.join("stopped").exists());
+        }
+        std::fs::remove_file(root.join("metadata-case")).unwrap();
+        // The normal path must use Cargo's configured target, not the default.
+        write(
+            &source.join("target/release/airc"),
+            "#!/bin/sh\necho 'build: deadbee'\n",
+        );
+        std::fs::remove_file(root.join("events")).unwrap();
         let prepared =
             update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890").unwrap();
         // Prove install uses its owned snapshot, even if a different build has

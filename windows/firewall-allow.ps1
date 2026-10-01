@@ -42,7 +42,11 @@ function Test-AircFirewallOk {
       # Enabled is configuration, not proof that Windows enforces the rule.
       $enforcement = @($rule.EnforcementStatus)
       # NetSecurity formats CIM's Full (1) as "Enforced" in PowerShell.
-      if ($enforcement.Count -ne 1 -or [string]$enforcement[0] -notin @('Enforced', 'Full', '1')) { continue }
+      $enforced = @($enforcement | Where-Object { [string]$_ -in @('Enforced', 'Full', '1') })
+      $failures = @($enforcement | Where-Object { [string]$_ -notin @('Enforced', 'Full', '1', 'ProfileInactive', 'InactiveProfile', '5') })
+      # A rule spanning all profiles can be enforced on the active profile
+      # while the remaining profiles are inactive. Actual CI provider receipt.
+      if ($enforced.Count -eq 0 -or $failures.Count -ne 0) { continue }
       $port = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
       $address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
       if ($port.Protocol -eq $protocol -and $port.LocalPort -eq 'Any' -and
