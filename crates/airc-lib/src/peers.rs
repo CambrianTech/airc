@@ -7,6 +7,46 @@ use crate::error::AircError;
 use crate::registry::PeerSpec;
 use crate::{Airc, TrustTier};
 
+/// Read the trust records available to a scope, including its machine account.
+/// This does not open a client, mint an identity, or start a daemon. Scope rows
+/// precede machine rows, matching the registry-loading order used by `Airc`.
+/// The active scope and machine default identities are excluded.
+pub async fn peer_trust_snapshot(
+    home: &std::path::Path,
+) -> Result<Vec<peers_store::StoredPeer>, AircError> {
+    let wire_root = crate::machine_account_home(home);
+    let agent_name = airc_identity::requested_agent_name(None)?;
+    peer_trust_snapshot_for_agent(home, &wire_root, &agent_name).await
+}
+
+#[cfg(test)]
+async fn peer_trust_snapshot_in(
+    home: &std::path::Path,
+    wire_root: &std::path::Path,
+) -> Result<Vec<peers_store::StoredPeer>, AircError> {
+    peer_trust_snapshot_for_agent(home, wire_root, airc_store::DEFAULT_AGENT_NAME).await
+}
+
+async fn peer_trust_snapshot_for_agent(
+    home: &std::path::Path,
+    wire_root: &std::path::Path,
+    agent_name: &str,
+) -> Result<Vec<peers_store::StoredPeer>, AircError> {
+    let mut peers = crate::airc::load_peer_registries(home, wire_root).await?;
+    for (root, name) in [
+        (home, agent_name),
+        (wire_root, airc_store::DEFAULT_AGENT_NAME),
+    ] {
+        let store = airc_store::SqliteEventStore::open_path(&root.join("events.sqlite")).await?;
+        if let Some(identity) = store.load_local_identity_by_agent_name(name).await? {
+            peers.retain(|peer| peer.peer_id != identity.peer_id);
+        }
+    }
+    peers.sort_by_key(|peer| peer.peer_id.as_uuid());
+    peers.dedup_by_key(|peer| peer.peer_id);
+    Ok(peers)
+}
+
 /// One row in `Airc::peers`. Mirrors the daemon's `PeerEntry`
 /// without forcing consumers to pull the daemon crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,8 +315,86 @@ impl Airc {
 
 #[cfg(test)]
 mod tests {
+    use super::peers_store;
     use crate::Airc;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn trust_snapshot_excludes_named_scope_identity() {
+        let scope = tempdir().unwrap();
+        let machine = tempdir().unwrap();
+        let identity = airc_identity::LocalIdentity::load_or_generate_as(scope.path(), "Ivar")
+            .await
+            .unwrap();
+        peers_store::add(
+            machine.path(),
+            identity.peer_id,
+            identity.keypair.public_bytes(),
+        )
+        .await
+        .unwrap();
+        let rows = super::peer_trust_snapshot_for_agent(scope.path(), machine.path(), "Ivar")
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        let rows = super::peer_trust_snapshot_for_agent(scope.path(), machine.path(), "Other")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "another named citizen must remain visible");
+    }
+
+    #[tokio::test]
+    async fn trust_snapshot_excludes_scope_identity_enrolled_in_machine_store() {
+        let scope = tempdir().unwrap();
+        let machine = tempdir().unwrap();
+        let handle = Airc::open_with_wire_root_for_test(scope.path(), machine.path())
+            .await
+            .unwrap();
+        let remote = airc_core::PeerId::from_u128(43);
+        peers_store::add(machine.path(), remote, [9; 32])
+            .await
+            .unwrap();
+        let rows = super::peer_trust_snapshot_in(scope.path(), machine.path())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].peer_id, remote);
+        assert_ne!(rows[0].peer_id, handle.peer_id());
+    }
+
+    #[tokio::test]
+    async fn trust_snapshot_includes_machine_peers_without_creating_scope_identity() {
+        let scope = tempdir().unwrap();
+        let machine = tempdir().unwrap();
+        let peer = airc_core::PeerId::from_u128(42);
+        peers_store::add(machine.path(), peer, [7; 32])
+            .await
+            .unwrap();
+        let rows = super::peer_trust_snapshot_in(scope.path(), machine.path())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].peer_id, peer);
+        assert!(!scope.path().join("identity.key").exists());
+        let store = airc_store::SqliteEventStore::open_path(&scope.path().join("events.sqlite"))
+            .await
+            .unwrap();
+        assert!(store.load_local_identity().await.unwrap().is_none());
+
+        // Duplicate enrollment must not inflate the administrative count;
+        // preserve the scope record rather than silently replacing its key.
+        peers_store::add(scope.path(), peer, [8; 32]).await.unwrap();
+        let rows = super::peer_trust_snapshot_in(scope.path(), machine.path())
+            .await
+            .unwrap();
+        let local = peers_store::load(scope.path()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pubkey_b64, local[0].pubkey_b64);
+        let rows = super::peer_trust_snapshot_in(machine.path(), machine.path())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
 
     // what this catches: `peer prune` must evict ONLY peers that are
     // Untrusted AND absent from the fresh registry AND stale past the

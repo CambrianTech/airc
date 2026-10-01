@@ -519,7 +519,8 @@ async fn migrate_legacy_identity_json(
     Ok(Some(stored))
 }
 
-fn requested_agent_name(explicit: Option<&str>) -> Result<String, IdentityError> {
+/// Resolve the active identity name without loading or creating identity state.
+pub fn requested_agent_name(explicit: Option<&str>) -> Result<String, IdentityError> {
     if let Some(value) = explicit {
         return normalise_agent_name(value);
     }

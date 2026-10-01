@@ -3219,12 +3219,12 @@ pub async fn run_peer_set_tier(
     Ok(())
 }
 
-/// `peer list` — print enroled peers via `Airc::peers`. The daemon
-/// writes the same trust store, so this view stays consistent
+/// `peer list` — print scope and machine trust records. The daemon
+/// writes the machine trust store, so this view stays consistent
 /// whether the daemon is running or not. `--json` produces the
 /// machine-readable shape consumers (bridge, router) read off of.
 pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let peers = airc_trust::load(home).await?;
+    let peers = airc_lib::peer_trust_snapshot(home).await?;
     if json {
         // Card 34942ec1 Sub-C V4: JSON shape is the contract
         // consumers read. Pin the field names + the tier wire
@@ -3263,7 +3263,7 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
 /// [`run_peer_list`] so the output **shape** is a pinnable contract:
 /// the tier-aware line format and the trust-store-not-files source are
 /// asserted by unit tests, rather than only surfacing as a downstream
-/// script break. Reads exactly the [`airc_trust::load`] view — never a
+/// script break. Reads the shared scope/machine trust snapshot — never a
 /// `<home>/peers/*.json` file — which is the entire point of seam #2.
 fn render_peer_list_lines(peers: &[airc_trust::StoredPeer], home: &Path) -> Vec<String> {
     if peers.is_empty() {
@@ -3297,7 +3297,7 @@ fn render_peer_list_lines(peers: &[airc_trust::StoredPeer], home: &Path) -> Vec<
     }
     lines.push(String::new());
     lines.push(format!(
-        "{} peer(s) enroled at {}",
+        "{} peer(s) enroled across scope/machine stores for {}",
         peers.len(),
         home.display()
     ));
