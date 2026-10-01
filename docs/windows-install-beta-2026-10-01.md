@@ -393,3 +393,24 @@ left untouched; uncertain inspection errors stop setup. Canonical build is check
 again afterward. Real IPC responders cover same-owner, foreign and missing
 endpoints; path-alias and isolated-scope regressions cover candidate selection.
 Live migration acceptance remains OPEN until the normal installer exercises it.
+
+### 2026-10-01 19:23 UTC — migration and identical rerun verified
+
+Normal install.ps1 on 077158a completed with consent and explicitly retired the
+verified legacy parent-directory endpoint, then verified build 077158a9a2ed.
+Independent process inventory found only canonical daemon PID 1628, with no
+window; CLI and daemon revisions matched. An immediate identical public-entry
+rerun also exited 0, reported the installed build already running, and preserved
+PID 1628 and its uptime. No skip flags, manual stop, kill or restart were used.
+This closes the live legacy-migration and idempotent-adoption cases. A fresh
+post-migration challenge was sent over AIRC. Bigmama returned event
+793e793b-4c84-4a00-8c4e-5c5ce0b57cb1 with the exact challenge and a fresh token;
+this machine read it through the canonical daemon and echoed the token over
+AIRC. No token was shared through the SOS gist. Two-way messaging therefore
+also passed after legacy migration and the identical rerun.
+
+Continuum remote-command acceptance stays OPEN: Bigmama's public read-only ping
+to this node timed out (correlation f0ca974e-6a36-4f4b-8c18-cf9685c36b22). This
+account has no discoverable continuum executable after registry PATH refresh,
+no ~/.continuum directory, and no running continuum/core process. Standalone
+AIRC messaging is not a claim that a Continuum command receiver is installed.
