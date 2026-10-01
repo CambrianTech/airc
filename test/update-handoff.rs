@@ -65,7 +65,17 @@ case "$1" in
 esac
 "#,
         );
-        let good = "#!/bin/sh\ncase \"$1\" in version) echo 'build: abcdef1234567890' ;; --version) echo 'airc 0.1.0' ;; esac\n";
+        let good = r#"#!/bin/sh
+case "$1" in
+  version) echo 'build: abcdef1234567890' ;;
+  --version) echo 'airc 0.1.0' ;;
+  update)
+    [ "$2" = '--adopt-installed' ] || exit 92
+    echo adopt >> "$AIRC_FIXTURE_ROOT/events"
+    [ ! -f "$AIRC_FIXTURE_ROOT/fail-adopt" ] || exit 73
+    ;;
+esac
+"#;
         write(&target.join("release/airc"), good);
         let bash = std::env::var_os("AIRC_TEST_BASH").unwrap_or_else(|| "bash".into());
         let old_path = std::env::var_os("PATH").unwrap();
@@ -131,7 +141,8 @@ esac
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("events")).unwrap(),
-            "build\n"
+            "build\n",
+            "prepare/prebuilt handoff must not adopt inside the updater's maintenance lease"
         );
         assert_eq!(
             std::fs::read_to_string(home.join("bin/airc")).unwrap(),
@@ -157,6 +168,36 @@ esac
             std::fs::read_to_string(root.join("events")).unwrap(),
             before
         );
+        // A normal public install adopts through the installed binary exactly
+        // once. Failed adoption must prevent the final installation receipt.
+        std::fs::remove_file(root.join("fail-build")).unwrap();
+        write(&target.join("release/airc"), good);
+        std::fs::create_dir_all(source.join("setup")).unwrap();
+        write(&source.join("setup/github-auth.sh"), "#!/bin/sh\nexit 0\n");
+        for fails in [false, true] {
+            write(&root.join("events"), "");
+            if fails {
+                write(&root.join("fail-adopt"), "fail");
+            }
+            let output = std::process::Command::new(&bash)
+                .arg(source.join("install.sh"))
+                .env("AIRC_DIR", &source)
+                .env("AIRC_INSTALL_NO_PULL", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), !fails, "{stdout}\n{stderr}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("events")).unwrap(),
+                "build\nadopt\n",
+                "normal installation must build before adopting exactly once"
+            );
+            assert_eq!(stdout.contains("Installed."), !fails);
+            if fails {
+                assert!(stderr.contains("Setup is incomplete"), "{stderr}");
+            }
+        }
     });
     std::fs::remove_dir_all(&root).unwrap();
     result.unwrap();

@@ -3,6 +3,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// Public setup already built and installed the binary. Reuse the updater's
+/// guarded shutdown/start/verification instead of leaving an old daemon alive.
+/// Fresh or deliberately stopped installations remain stopped.
+pub fn adopt_installed(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let airc_exe = env::current_exe()?;
+    let expected = installed_binary_sha(&airc_exe).ok_or("Cannot verify installed AIRC build")?;
+    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    if !daemon_is_running(&airc_exe, home, &socket)? {
+        println!("daemon: not running; stopped state preserved.");
+        return Ok(());
+    }
+    if daemon_build_matches(&airc_exe, home, &socket, &expected) {
+        println!("daemon: installed build already running.");
+        return Ok(());
+    }
+    stop_daemon(&airc_exe, home, &socket)?;
+    restart_daemon(&airc_exe, home, &socket)?;
+    wait_daemon_ready(&airc_exe, home, &socket)?;
+    verify_daemon_build(&airc_exe, home, &socket, &expected)?;
+    println!("daemon: adopted installed build {expected} (verified).");
+    Ok(())
+}
+
 pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
@@ -797,6 +820,7 @@ fn verify_daemon_build(
          once more before reporting anything (a process that survived the stop \
          answers IPC just fine)."
     );
+    stop_daemon(airc_exe, home, socket)?;
     restart_daemon(airc_exe, home, socket)?;
     wait_daemon_ready(airc_exe, home, socket)?;
 

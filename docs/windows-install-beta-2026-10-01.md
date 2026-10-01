@@ -321,3 +321,23 @@ seeds 24 KB of repeated entries and passes all cases. This preserves session-onl
 paths and does not modify registry PATH. Independent review approves the repair;
 hosted rerun remains required. No live installer has started while Joel's presence
 for protected Windows consent remains unconfirmed.
+
+### 2026-10-01 — first completed BIGGIEDESK public-entry run
+
+With Joel available, stock Windows PowerShell ran the repository's normal
+`install.ps1` with no prerequisite/build/auth skip flags or diagnostic toolchain
+overrides. It automatically selected D-drive build storage, reused existing
+Git/Rust/MSVC and joelteply authorization, built b172f6e, and acquired gsudo 2.6.1
+portable for this user through the shared manifest. The administrator step then
+verified effective TCP/UDP LocalSubnet rules; startup registration and agent
+integrations completed, and the installer exited 0. Toolchains/auth were reused,
+not a fresh-install proof; gsudo acquisition and firewall application were live.
+
+Post-install verification found CLI b172f6e but daemon a3e04c6. No manual restart
+was performed. Normal setup now invokes `update --adopt-installed`, reusing the
+updater's maintenance lock, pinned-process shutdown wait, detached restart and
+build verification. Stopped/current daemons remain untouched. Prepare/prebuilt
+handoffs skip this inner step because their updater already owns maintenance.
+The retry verifier now stops before spawning a replacement. The existing handoff
+fixture covers normal adoption, failure preventing success, and nested-handoff
+skip. This case stays OPEN until the same public entry proves daemon adoption.

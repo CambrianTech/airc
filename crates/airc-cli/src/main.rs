@@ -637,9 +637,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
-        Command::Update { auto } => {
+        Command::Update {
+            auto,
+            adopt_installed,
+        } => {
             let socket = cli::default_socket_path_in(&home);
-            if auto {
+            if adopt_installed {
+                update_commands::adopt_installed(&home, socket)
+            } else if auto {
                 update_commands::run_update_auto(&home, socket)
             } else {
                 update_commands::run_update(&home, socket)

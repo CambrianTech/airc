@@ -1273,6 +1273,14 @@ fi
 
 # ── Done ────────────────────────────────────────────────────────────────
 
+# The updater's artifact handoff owns its own maintenance lease and restart.
+# Direct installation must also adopt the new build in any existing daemon.
+if [ -z "$EXPECTED_BUILD" ] && [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ]; then
+  installed_airc="$BIN_DIR/airc"
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) installed_airc="$BIN_DIR/airc.exe" ;; esac
+  "$installed_airc" update --adopt-installed || fail 'Installed binary was not adopted by the running daemon. Setup is incomplete.'
+fi
+
 echo ""
 ok "Installed."
 echo ""
