@@ -341,3 +341,21 @@ handoffs skip this inner step because their updater already owns maintenance.
 The retry verifier now stops before spawning a replacement. The existing handoff
 fixture covers normal adoption, failure preventing success, and nested-handoff
 skip. This case stays OPEN until the same public entry proves daemon adoption.
+
+### Second public run — endpoint ownership and interrupted adoption (OPEN)
+
+The ordinary entry built and installed aed17e9, reused prerequisites/auth, and
+completed firewall/startup after Joel approved gsudo. Adoption failed honestly:
+the stop response arrived, but the process-handle wait timed out. Canonical IPC
+was then unavailable; the remaining process used a different legacy socket.
+The updater had trusted the shared, informational machine-home daemon.pid file,
+which is not endpoint ownership evidence when legacy and canonical sockets
+coexist. No process was manually killed or restarted.
+
+The Windows transport now obtains the serving process ID from the actual named
+pipe connection and pins that process's wait handle before requesting shutdown.
+Explicit installation also starts/verifies a missing daemon, so rerunning the
+public entry recovers an interrupted handoff. Ordinary update retains its
+previously-stopped policy. Regression coverage exercises distinct process
+ownership and missing/current/retry adoption. These remain OPEN pending the
+next full public run and peer event evidence.

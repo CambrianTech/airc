@@ -5,23 +5,30 @@ use std::time::{Duration, Instant};
 
 /// Public setup already built and installed the binary. Reuse the updater's
 /// guarded shutdown/start/verification instead of leaving an old daemon alive.
-/// Fresh or deliberately stopped installations remain stopped.
+/// Explicit installation starts the service, including recovery from an
+/// interrupted adoption. Ordinary `update` retains its stopped-state policy.
 pub fn adopt_installed(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let airc_exe = env::current_exe()?;
-    let expected = installed_binary_sha(&airc_exe).ok_or("Cannot verify installed AIRC build")?;
+    adopt_installed_with_executable(home, &socket, &airc_exe)
+}
+
+fn adopt_installed_with_executable(
+    home: &Path,
+    socket: &Path,
+    airc_exe: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = installed_binary_sha(airc_exe).ok_or("Cannot verify installed AIRC build")?;
     let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
-    if !daemon_is_running(&airc_exe, home, &socket)? {
-        println!("daemon: not running; stopped state preserved.");
-        return Ok(());
+    if daemon_is_running(airc_exe, home, socket)? {
+        if daemon_build_matches(airc_exe, home, socket, &expected) {
+            println!("daemon: installed build already running.");
+            return Ok(());
+        }
+        stop_daemon(airc_exe, home, socket)?;
     }
-    if daemon_build_matches(&airc_exe, home, &socket, &expected) {
-        println!("daemon: installed build already running.");
-        return Ok(());
-    }
-    stop_daemon(&airc_exe, home, &socket)?;
-    restart_daemon(&airc_exe, home, &socket)?;
-    wait_daemon_ready(&airc_exe, home, &socket)?;
-    verify_daemon_build(&airc_exe, home, &socket, &expected)?;
+    restart_daemon(airc_exe, home, socket)?;
+    wait_daemon_ready(airc_exe, home, socket)?;
+    verify_daemon_build(airc_exe, home, socket, &expected)?;
     println!("daemon: adopted installed build {expected} (verified).");
     Ok(())
 }
@@ -616,12 +623,29 @@ fn stop_daemon(
     home: &Path,
     socket: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Capture before requesting stop: the PID file is removed during graceful
-    // shutdown, and an open process handle avoids PID-reuse races on Windows.
+    // Bind the wait handle to this endpoint before stop. A shared informational
+    // PID file can refer to a legacy daemon listening on a different endpoint.
     #[cfg(windows)]
-    let exiting = crate::update_shutdown::DaemonExit::capture(
-        &airc_lib::machine_account_home(home).join("daemon.pid"),
-    )?;
+    let exiting = {
+        let endpoint = socket.to_path_buf();
+        // The synchronous updater is itself called inside Tokio. A short-lived
+        // thread owns this connection runtime rather than nesting block_on.
+        std::thread::spawn(
+            move || -> std::io::Result<crate::update_shutdown::DaemonExit> {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let connection = airc_ipc::transport::IpcStream::connect(&endpoint).await?;
+                        crate::update_shutdown::DaemonExit::capture_process(
+                            connection.server_process_id()?,
+                        )
+                    })
+            },
+        )
+        .join()
+        .map_err(|_| std::io::Error::other("daemon endpoint capture thread failed"))??
+    };
     let mut command = daemon_command(airc_exe, home, "stop", socket);
     let stop_result = run_checked(&mut command, "airc stop before update");
     #[cfg(not(windows))]
@@ -938,6 +962,60 @@ fn command_error(label: &str, output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_install_starts_missing_daemon_and_reuses_verified_build() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("fixture.rs");
+        let executable = home
+            .path()
+            .join(format!("fixture{}", env::consts::EXE_SUFFIX));
+        let socket = home.path().join("fixture.sock");
+        std::fs::write(
+            &source,
+            r#"
+use std::{env, fs, process};
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args[1] == "version" { println!("build: 1234abcd"); return; }
+    let socket = std::path::Path::new(&args[5]);
+    match args[3].as_str() {
+        "ping" => if !socket.exists() { process::exit(1); },
+        "status" => println!("build: {}", fs::read_to_string(socket).unwrap()),
+        "daemon" => {
+            let count = socket.with_extension("starts");
+            let n = fs::read_to_string(&count).unwrap_or_default().parse::<u32>().unwrap_or(0);
+            fs::write(count, (n + 1).to_string()).unwrap();
+            fs::write(socket, "1234abcd").unwrap();
+        },
+        _ => process::exit(91),
+    }
+}
+"#,
+        )
+        .unwrap();
+        assert!(Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap()
+            .success());
+        // A fresh install and a retry after interrupted shutdown both have
+        // no daemon. Exercise the actual adoption command/verification path.
+        adopt_installed_with_executable(home.path(), &socket, &executable).unwrap();
+        adopt_installed_with_executable(home.path(), &socket, &executable).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(socket.with_extension("starts")).unwrap(),
+            "1"
+        );
+        std::fs::remove_file(&socket).unwrap();
+        adopt_installed_with_executable(home.path(), &socket, &executable).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(socket.with_extension("starts")).unwrap(),
+            "2"
+        );
+    }
 
     // Regression for 2ec5d74f: a successful update exited, but its Windows daemon
     // inherited captured pipe writers and kept the caller waiting for EOF.

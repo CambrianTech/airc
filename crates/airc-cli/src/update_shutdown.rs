@@ -12,12 +12,17 @@ extern "system" {
 
 #[cfg(windows)]
 impl DaemonExit {
+    #[cfg(test)]
     pub fn capture(pid_file: &std::path::Path) -> std::io::Result<Self> {
-        use std::os::windows::io::FromRawHandle;
         let pid: u32 = std::fs::read_to_string(pid_file)?
             .trim()
             .parse()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        Self::capture_process(pid)
+    }
+
+    pub fn capture_process(pid: u32) -> std::io::Result<Self> {
+        use std::os::windows::io::FromRawHandle;
         if pid == 0 || pid == std::process::id() {
             return Err(std::io::Error::other(
                 "invalid daemon PID; refusing update stop",
