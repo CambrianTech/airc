@@ -120,17 +120,16 @@ Remove-Item -LiteralPath $pending -ErrorAction SilentlyContinue
     if (-not $accessDenied -or $Elevated) { throw }
     Write-Host 'Windows requires elevation to repair the existing AIRC startup task. Only startup repair will run elevated.'
     $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'RemoteSigned', '-File',
-        ('"' + $PSCommandPath + '"'), '-AircPath', ('"' + $AircPath + '"'),
-        '-UserSid', $UserSid, '-UserHome', ('"' + $UserHome + '"'), '-Elevated')
+        $PSCommandPath, '-AircPath', $AircPath,
+        '-UserSid', $UserSid, '-UserHome', $UserHome, '-Elevated')
     if ($restart) { $arguments += '-RestartRequired' }
     if ($ExistingOnly) { $arguments += '-ExistingOnly' }
+    . (Join-Path $PSScriptRoot 'shared-setup.ps1')
     try {
-        $repair = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-            -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments -PassThru -ErrorAction Stop
-    } catch { throw 'AIRC startup repair elevation was cancelled or rejected; rerun install.ps1 to retry startup registration. An already-current airc update skips installation.' }
-    $null = $repair.Handle
-    $repair.WaitForExit()
-    $code = $repair.ExitCode
-    $repair.Dispose()
+        Initialize-ElevationSession
+        Invoke-Elevated -Reason 'registering AIRC startup for the original user' -CommandLine (
+            @((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')) + $arguments)
+        $code = $LASTEXITCODE
+    } finally { Clear-Elevation }
     if ($code -ne 0) { throw 'Elevated AIRC startup repair failed; rerun install.ps1 to retry startup registration. An already-current airc update skips installation.' }
 }

@@ -642,6 +642,10 @@ pub enum Command {
         /// run unattended (e.g. when a peer detects it's stale).
         #[arg(long)]
         auto: bool,
+        /// Start and verify an already-installed binary, or replace a stale
+        /// daemon through the maintenance handoff, without rebuilding.
+        #[arg(long, conflicts_with = "auto")]
+        adopt_installed: bool,
     },
 
     /// Self-diagnose the airc install + scope state.

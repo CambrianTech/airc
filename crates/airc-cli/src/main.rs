@@ -87,6 +87,7 @@ mod transport_cli;
 mod transport_commands;
 mod update_artifact;
 mod update_commands;
+mod update_legacy;
 mod update_shutdown;
 mod work_cli;
 mod work_commands;
@@ -637,9 +638,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
-        Command::Update { auto } => {
+        Command::Update {
+            auto,
+            adopt_installed,
+        } => {
             let socket = cli::default_socket_path_in(&home);
-            if auto {
+            if adopt_installed {
+                update_commands::adopt_installed(&home, socket)
+            } else if auto {
                 update_commands::run_update_auto(&home, socket)
             } else {
                 update_commands::run_update(&home, socket)

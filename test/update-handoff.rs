@@ -46,7 +46,17 @@ fn public_handoff_builds_once_before_stop_and_rejects_bad_preparations() {
 [ ! -f "$AIRC_FIXTURE_ROOT/stopped" ] || { echo 'CARGO DURING OUTAGE' >&2; exit 88; }
 case "$1" in
   --version) echo 'cargo 1.95.0' ;;
-  metadata) printf '{"target_directory":"%s/target"}\n' "$AIRC_FIXTURE_ROOT" ;;
+  metadata)
+    if [ -f "$AIRC_FIXTURE_ROOT/metadata-case" ]; then
+      case "$(cat "$AIRC_FIXTURE_ROOT/metadata-case")" in
+        failure) exit 42 ;;
+        malformed) echo 'not-json'; exit 0 ;;
+        missing) echo '{}'; exit 0 ;;
+        empty) echo '{"target_directory":""}'; exit 0 ;;
+      esac
+    fi
+    printf '{"target_directory":"%s/target"}\n' "$AIRC_FIXTURE_ROOT"
+    ;;
   build)
     echo build >> "$AIRC_FIXTURE_ROOT/events"
     [ ! -f "$AIRC_FIXTURE_ROOT/fail-build" ] || exit 42
@@ -55,7 +65,17 @@ case "$1" in
 esac
 "#,
         );
-        let good = "#!/bin/sh\ncase \"$1\" in version) echo 'build: abcdef1234567890' ;; --version) echo 'airc 0.1.0' ;; esac\n";
+        let good = r#"#!/bin/sh
+case "$1" in
+  version) echo 'build: abcdef1234567890' ;;
+  --version) echo 'airc 0.1.0' ;;
+  update)
+    [ "$2" = '--adopt-installed' ] || exit 92
+    echo adopt >> "$AIRC_FIXTURE_ROOT/events"
+    [ ! -f "$AIRC_FIXTURE_ROOT/fail-adopt" ] || exit 73
+    ;;
+esac
+"#;
         write(&target.join("release/airc"), good);
         let bash = std::env::var_os("AIRC_TEST_BASH").unwrap_or_else(|| "bash".into());
         let old_path = std::env::var_os("PATH").unwrap();
@@ -85,6 +105,26 @@ esac
             std::env::set_var(key, "1");
         }
         std::env::remove_var("AIRC_SKIP_RUST_BUILD");
+        // Regression: failed/malformed metadata must not guess source/target,
+        // even when that directory contains a valid stale build.
+        std::fs::create_dir_all(source.join("target/release")).unwrap();
+        write(&source.join("target/release/airc"), good);
+        for case in ["failure", "malformed", "missing", "empty"] {
+            write(&root.join("metadata-case"), case);
+            assert!(
+                update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890")
+                    .is_err(),
+                "metadata case {case} used a guessed build directory"
+            );
+            assert!(!root.join("stopped").exists());
+        }
+        std::fs::remove_file(root.join("metadata-case")).unwrap();
+        // The normal path must use Cargo's configured target, not the default.
+        write(
+            &source.join("target/release/airc"),
+            "#!/bin/sh\necho 'build: deadbee'\n",
+        );
+        std::fs::remove_file(root.join("events")).unwrap();
         let prepared =
             update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890").unwrap();
         // Prove install uses its owned snapshot, even if a different build has
@@ -101,7 +141,8 @@ esac
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("events")).unwrap(),
-            "build\n"
+            "build\n",
+            "prepare/prebuilt handoff must not adopt inside the updater's maintenance lease"
         );
         assert_eq!(
             std::fs::read_to_string(home.join("bin/airc")).unwrap(),
@@ -127,6 +168,36 @@ esac
             std::fs::read_to_string(root.join("events")).unwrap(),
             before
         );
+        // A normal public install adopts through the installed binary exactly
+        // once. Failed adoption must prevent the final installation receipt.
+        std::fs::remove_file(root.join("fail-build")).unwrap();
+        write(&target.join("release/airc"), good);
+        std::fs::create_dir_all(source.join("setup")).unwrap();
+        write(&source.join("setup/github-auth.sh"), "#!/bin/sh\nexit 0\n");
+        for fails in [false, true] {
+            write(&root.join("events"), "");
+            if fails {
+                write(&root.join("fail-adopt"), "fail");
+            }
+            let output = std::process::Command::new(&bash)
+                .arg(source.join("install.sh"))
+                .env("AIRC_DIR", &source)
+                .env("AIRC_INSTALL_NO_PULL", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), !fails, "{stdout}\n{stderr}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("events")).unwrap(),
+                "build\nadopt\n",
+                "normal installation must build before adopting exactly once"
+            );
+            assert_eq!(stdout.contains("Installed."), !fails);
+            if fails {
+                assert!(stderr.contains("Setup is incomplete"), "{stderr}");
+            }
+        }
     });
     std::fs::remove_dir_all(&root).unwrap();
     result.unwrap();
