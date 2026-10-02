@@ -342,6 +342,21 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Failed update with a verified restored transport owner. Only an internal
+/// owned session may use this typed outcome to preserve children on failure.
+#[derive(Debug)]
+struct RecoveredUpdateFailure(String);
+impl std::fmt::Display for RecoveredUpdateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for RecoveredUpdateFailure {}
+#[cfg(any(windows, test))]
+pub(crate) fn restored_runtime_verified(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.downcast_ref::<RecoveredUpdateFailure>().is_some()
+}
+
 /// Both public update modes publish the same verified artifact transaction.
 /// Preparation remains outside the maintenance window; intentionally stopped
 /// daemons stay stopped. A failed publication restores and verifies the owned
@@ -381,6 +396,9 @@ fn install_prepared_update(
                 wait_daemon_ready(airc_exe, home, socket)
                     .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
                     .map_err(|error| format!("update failed before displacement ({failure}); original daemon recovery verification failed: {error}"))?;
+                return Err(Box::new(RecoveredUpdateFailure(format!(
+                    "update failed before displacement ({failure}); original daemon restored and verified"
+                ))));
             }
         }
         installed?;
@@ -412,6 +430,9 @@ fn install_prepared_update(
             wait_daemon_ready(airc_exe, home, socket)
                 .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
                 .map_err(|error| format!("update failed ({failure}); original build restored, but daemon recovery verification failed: {error}"))?;
+            return Err(Box::new(RecoveredUpdateFailure(format!(
+                "update failed ({failure}); previous binary {previous_build} and daemon restored and verified"
+            ))));
         }
         return Err(format!(
             "update failed ({failure}); previous binary {previous_build} restored and verified"
@@ -933,6 +954,19 @@ fn command_error(label: &str, output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restored_owner_handoff_requires_typed_verified_failure() {
+        let error =
+            super::RecoveredUpdateFailure("installer failed; daemon restored and verified".into());
+        assert!(super::restored_runtime_verified(&error));
+        assert_eq!(
+            error.to_string(),
+            "installer failed; daemon restored and verified"
+        );
+        let unverified: Box<dyn std::error::Error> = "daemon restored and verified".into();
+        assert!(!super::restored_runtime_verified(unverified.as_ref()));
+    }
+
     use super::*;
 
     #[test]
