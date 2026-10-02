@@ -771,3 +771,19 @@ Actual isolated PS5 shared-entry tests exercise pinned acquisition, checksum
 cache reuse/mismatch refusal and native handoff; no live UAC or provisioning
 was performed. Actual live reacquisition and installed binary acceptance remain
 OPEN. The separate pending owner-recovery PR is unchanged by this pin.
+
+## Heartbeat recovery after timer delay (2026-10-02)
+
+The agent heartbeat used Tokio's default missed-tick burst behavior. After a
+long executor pause or resume that advances the timer clock, it could replay
+hours of obsolete beats, repeating claim queries and presence publication.
+Heartbeat ticks now skip missed intervals: one current beat becomes due, then
+the configured cadence resumes. This changes neither liveness TTL nor transport
+trust/reconnect policy. A paused-clock regression advances eight hours plus
+seven seconds and checks one due tick, no backlog and the next normal deadline.
+Actual OS sleep/resume and cross-node delivery remain separate acceptance work.
+
+The route-refresh clock already spaces work from completion and bounds wake
+nudges. Existing delivery accounting also purges connections after repeated
+unacknowledged sends; idle TCP keepalive/reconnect behavior is a separate audit
+owned alongside transport work, not claimed repaired by heartbeat scheduling.
