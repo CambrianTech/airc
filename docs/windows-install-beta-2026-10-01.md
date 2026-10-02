@@ -636,3 +636,31 @@ registry isolation policy. No bypass environment or disabled test is added.
 The unchanged real-daemon stored-endpoint regression passed locally, alongside
 all three updater binary fixtures, both policy-clock tests, and full Clippy.
 Fresh rebased-head CI and public deployment remain required.
+
+
+## Auto-update rollback of an executing Windows binary (2026-10-02)
+
+OPEN until the supported updater is deployed and exercised. Bigmama reported
+installer failure after candidate publication (gsudo exit 999, cause unknown),
+then rollback failure with Windows error 32. Source inspection found rollback
+first renamed the original back and then copied a backup over that same mapped
+executable. Restored old-version output is consistent with the first restoration
+succeeding before the redundant copy failed.
+
+The repair retains the original file object in a unique owned transaction
+folder, checks original and candidate fingerprints, moves only the verified
+candidate aside, and restores the original without overwriting it. Unknown
+contents or destination collisions refuse safely and retain recovery artifacts.
+The installer error remains visible alongside rollback and daemon recovery
+outcomes. Windows uses no-overwrite MoveFileW; Unix uses same-volume hard-link
+then unlink, with both paths explicitly retained/reported if unlink fails.
+Filesystems without hard-link support are refused before candidate installation.
+Retained transaction artifact lifecycle/retention is an explicit follow-up;
+this repair does not delete previous update artifacts or unrelated files.
+
+Local Windows native binary regression passed with the original executable
+still running during displacement and rollback, and verified that the restored
+executable runs afterward. Unknown candidate, collision, and absent candidate
+cases passed. These isolated fixtures do not establish live installation success
+or explain the original elevation failure. Fresh-head gates and public updater
+acceptance remain required.

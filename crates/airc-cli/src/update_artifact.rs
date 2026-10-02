@@ -49,6 +49,10 @@ impl PreparedInstall {
         self.run("--prebuilt")
     }
 
+    pub(crate) fn artifact(&self) -> &Path {
+        &self.artifact
+    }
+
     fn run(&self, mode: &str) -> Result<(), Error> {
         let status = Command::new(&self.shell)
             .arg(self.source.join("install.sh"))
