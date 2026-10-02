@@ -60,7 +60,9 @@ const _: () = assert!(NO_RTT_GRACE_MS <= 2_000 * RTT_GRACE_MULTIPLE);
 async fn own_account_peers(
     home: &Path,
 ) -> Result<std::collections::HashSet<airc_core::PeerId>, String> {
-    airc_trust::load(home)
+    // Match `airc peers`: account enrollment can live in the machine store,
+    // and this scope's own identity must not count as a remote acknowledgement.
+    airc_lib::peer_trust_snapshot(home)
         .await
         .map(|peers| {
             peers
@@ -277,6 +279,34 @@ fn delivery_findings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The diagnostic must use the administrative peer snapshot, including its
+    // self-identity exclusion, rather than count every OwnAccount trust row.
+    #[tokio::test]
+    async fn own_account_snapshot_excludes_self_and_other_trust_tiers() {
+        let home = tempfile::tempdir().unwrap();
+        let identity = airc_identity::LocalIdentity::load_or_generate(home.path())
+            .await
+            .unwrap();
+        let remote = airc_core::PeerId::from_u128(42);
+        let other = airc_core::PeerId::from_u128(43);
+        for (peer, key) in [
+            (identity.peer_id, identity.keypair.public_bytes()),
+            (remote, [7; 32]),
+            (other, [8; 32]),
+        ] {
+            airc_trust::add(home.path(), peer, key).await.unwrap();
+        }
+        for peer in [identity.peer_id, remote] {
+            airc_trust::set_tier(home.path(), peer, airc_store::TrustTier::OwnAccount)
+                .await
+                .unwrap()
+                .expect("fixture peer is enrolled");
+        }
+
+        let own = own_account_peers(home.path()).await.unwrap();
+        assert_eq!(own, std::collections::HashSet::from([remote]));
+    }
 
     /// what this catches: THE 10-HOUR LIE. On 2026-08-05 `airc doctor` printed
     /// `[ok] delivery truth: <peer>: last confirmed delivery 10h ago` on a route

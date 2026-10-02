@@ -440,6 +440,7 @@ Release repinning, final CI/review and public live acceptance remain OPEN.
 
 Released-helper validation: Continuum PR #4658 merged after all required CI and independent review at c40cc9cc6d3ba086d83ac25c330116def24b80ed. The standalone artifact lock now pins that released revision; generated bootstrap drift check and all five PS5 setup/firewall/storage/acquisition regression suites pass. Actual public installation and consent acceptance of this change remain open.
 
+
 ### 2026-10-02 — inherited PowerShell module recovery
 
 A real Continuum public entry under Windows PowerShell 5 inherited PowerShell 7
@@ -481,3 +482,22 @@ even though the foreign hash command was initially selected; its intervening
 module-loading behavior is not a reliable control. The first-command fixture
 avoids that later boundary and tests autoload directly, with no pre-import of
 the foreign module. The same initializer removal remains the negative control.
+
+### 2026-10-02 — doctor account-trust snapshot (OPEN)
+
+Live diagnostics reported zero OwnAccount peers while `airc peers` reported
+three. The delivery check read only the scope trust store; the peers command
+already uses the canonical merged scope/machine snapshot. The repair makes
+doctor use that same reader, including deduplication and local-identity
+exclusion. No live enrollment, trust tier, or daemon was changed.
+
+The CLI regression uses isolated temporary trust records to check remote
+OwnAccount inclusion, other-tier exclusion, and local-identity exclusion.
+Existing library snapshot regressions cover machine-only enrollment and scope
+precedence. The new CLI regression passed (1/1), existing canonical snapshot
+tests passed (3/3), and `cargo clippy --all-targets -- -D warnings` passed.
+Formatting and diff checks passed. Independent parent review approved the
+implementation. Validation used the shared hidden launcher, two compiler jobs,
+and D: build/temp paths; C: remained at 7.5 GiB free and RAM above 39 GiB free.
+Live installed diagnostic reconciliation remains OPEN.
+
