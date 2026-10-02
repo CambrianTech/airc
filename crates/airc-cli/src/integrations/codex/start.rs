@@ -23,7 +23,7 @@ pub async fn run(
     let stdout = OpenOptions::new().create(true).append(true).open(log)?;
     let stderr = stdout.try_clone()?;
 
-    let mut command = Command::new(airc);
+    let mut command = airc_core::process::background(airc);
     command
         .arg("join")
         .args(normalize_join_args(join_args))
@@ -66,11 +66,7 @@ fn detach(command: &mut Command) {
 
 #[cfg(windows)]
 fn detach(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-
-    const DETACHED_PROCESS: u32 = 0x00000008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    airc_core::process::configure_detached(command);
 }
 
 #[cfg(test)]
