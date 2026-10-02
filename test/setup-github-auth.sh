@@ -2,6 +2,13 @@
 # Exercise the public shared stage with an isolated HOME and fake GitHub.
 # No credentials/network, keyring mutation, or package installs in these tests.
 set -euo pipefail
+case "${1:-all}" in
+  all) adapter_only=0 ;;
+  --native-adapter)
+    case "$(uname -s)" in Darwin|MINGW*|MSYS*|CYGWIN*) ;; *) echo 'Native auth adapter requires macOS or Git Bash' >&2; exit 2 ;; esac
+    adapter_only=1 ;;
+  *) echo 'Usage: setup-github-auth.sh [--native-adapter]' >&2; exit 2 ;;
+esac
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -45,9 +52,12 @@ else
   printf '%s' "$4" > "$TEST_STATE/$3"
 fi
 GIT
-# Allows CI to run as root while testing a Windows-user login scenario.
-printf '#!/usr/bin/env bash\nprintf "MINGW64_NT-fixture\\n"\n' > "$tmp/bin/uname"
-chmod +x "$tmp/bin/gh" "$tmp/bin/git" "$tmp/bin/uname"
+# Generic policy can run as root; native adapter coverage keeps the real OS.
+if [ "$adapter_only" = 0 ]; then
+  printf '#!/usr/bin/env bash\nprintf "MINGW64_NT-fixture\\n"\n' > "$tmp/bin/uname"
+  chmod +x "$tmp/bin/uname"
+fi
+chmod +x "$tmp/bin/gh" "$tmp/bin/git"
 stage="$repo/setup/github-auth.sh"
 
 # Fresh login must expose the code and await the actual approval operation.
@@ -61,7 +71,7 @@ for ((i=0; i<100; i++)); do
 done
 test -f "$tmp/ready"
 # Deliberately longer than the rushed five-second login window from the report.
-sleep 6
+[ "$adapter_only" = 1 ] || sleep 6
 kill -0 "$stage_pid"
 ! grep -q 'auth setup-git' "$tmp/calls"
 grep -q 'DEVICE-CODE-FIXTURE' "$tmp/output"
@@ -79,6 +89,13 @@ printf 'Keep My Name' > "$tmp/user.name"
 bash "$stage" > "$tmp/output" 2>&1
 ! grep -qE 'auth (login|refresh)' "$tmp/calls"
 test "$(cat "$tmp/user.name")" = 'Keep My Name'
+
+# Linux owns the full policy matrix below. The native adapter has exercised
+# fresh consent output/waiting, CRLF scope parsing, identity and approval reuse.
+if [ "$adapter_only" = 1 ]; then
+  echo 'PASS: native shell auth consent and approval reuse'
+  exit 0
+fi
 
 # Insufficient scopes use the same device approval, not replacement credentials.
 rm "$tmp/gist"

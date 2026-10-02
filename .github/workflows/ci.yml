@@ -191,11 +191,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shared GitHub authorization behavior
         shell: bash
-        run: bash test/setup-github-auth.sh
+        run: |
+          # One policy lifecycle; the other hosts retain actual shell adapters.
+          case "$RUNNER_OS" in
+            Linux) bash test/setup-github-auth.sh ;;
+            *) bash test/setup-github-auth.sh --native-adapter ;;
+          esac
       - name: Downloaded setup source compatibility
         shell: bash
         run: |
-          bash test/setup-source-acquisition.sh
+          case "$RUNNER_OS" in
+            Linux) bash test/setup-source-acquisition.sh ;;
+            macOS) bash test/setup-source-acquisition.sh --posix-adapter ;;
+            # Keep direct Git Bash entry coverage as well as the native PS bridge.
+            Windows) bash test/setup-source-acquisition.sh ;;
+          esac
           bash test/install-bin-directory.sh
       - name: Native setup acquisition and remaining-work storage planning
         if: runner.os == 'Windows'
