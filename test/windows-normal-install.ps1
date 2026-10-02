@@ -61,6 +61,7 @@ if($Child){
     New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
     Get-ChildItem -LiteralPath $root -Force | Copy-Item -Destination $env:AIRC_DIR -Recurse -Force
     $installed=Join-Path $env:LOCALAPPDATA 'Programs/airc/airc.exe'
+    $installFailure=$null
     try {
         & (Join-Path $env:AIRC_DIR 'install.ps1')
         if($LASTEXITCODE -ne 0){throw "Public installation failed with $LASTEXITCODE"}
@@ -71,8 +72,12 @@ if($Child){
         $daemon=[AircDaemonDiagnostics]::Inspect([string]$endpoint[0])
         if($daemon.tokenElevated -ne $false -or $daemon.tokenIntegritySid -ne 'S-1-16-8192' -or $daemon.tokenUserSid -ne $OriginalSid){throw ('Installed daemon token is not normal: '+($daemon|ConvertTo-Json -Compress))}
         Write-Host ('PASS: real public install and doctor under normal token; daemon receipt '+($daemon|ConvertTo-Json -Compress))
-    } finally {
-        if(Test-Path -LiteralPath $installed){Invoke-InstallerProcess -OwnProcessTree $installed @('stop');if($LASTEXITCODE -ne 0){throw 'Owned installed test daemon cleanup failed'}}
+    } catch { $installFailure=$_;throw } finally {
+        try {
+            if(Test-Path -LiteralPath $installed){Invoke-InstallerProcess -OwnProcessTree $installed @('stop');if($LASTEXITCODE -ne 0){throw 'Owned installed test daemon cleanup failed'}}
+        } catch {
+            if($installFailure){Write-Warning ('Cleanup after failed installation: '+$_.Exception.Message)}else{throw}
+        }
     }
     exit 0
 }

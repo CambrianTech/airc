@@ -34,7 +34,8 @@ public static class FakeGsudo {
     if ($LASTEXITCODE -ne 0) { throw 'Synthetic gsudo compile failed.' }
     $phase=Join-Path $scratch 'phase.ps1'
     @'
-param($Windows)
+param($Windows,[string]$AircPath)
+if($AircPath){$Windows=$env:AIRC_SESSION_TEST_WINDOWS}
 $ErrorActionPreference='Stop'
 . (Join-Path $Windows 'shared-setup.ps1')
 Invoke-InstallerEntryPoint {
@@ -57,7 +58,17 @@ Invoke-InstallerEntryPoint {
         $env:AIRC_SESSION_TEST_WINDOWS=$windows.Replace('\','/')
         $env:AIRC_SESSION_TEST_PHASE=$phase.Replace('\','/')
         $env:AIRC_SESSION_TEST_BASH_SCRIPT=Join-Path $scratch 'borrow.sh'
-        'source "$AIRC_SESSION_TEST_BRIDGE" -NoProfile -ExecutionPolicy RemoteSigned -File "$AIRC_SESSION_TEST_PHASE" "$AIRC_SESSION_TEST_WINDOWS"' | Set-Content $env:AIRC_SESSION_TEST_BASH_SCRIPT -Encoding ASCII
+        # Exercise the actual public adoption callsite, not a hand-written
+        # substitute which could hide a direct-shebang ancestry regression.
+        Copy-Item $env:AIRC_SESSION_TEST_BRIDGE (Join-Path $windows 'run-powershell.sh')
+        Copy-Item $phase (Join-Path $windows 'adopt-installed.ps1')
+        $public=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../install.sh')).Replace("`r`n","`n")
+        $function=[regex]::Match($public,'(?ms)^_windows_powershell\(\) \{.*?^\}')
+        $adoption=[regex]::Match($public.Substring($public.IndexOf('# Direct installation starts/verifies')), '(?ms)^  case "\$\(uname -s\)" in\n    MINGW.*?^  esac')
+        if(-not $function.Success -or -not $adoption.Success){throw 'Public adoption shell boundary is missing'}
+        $script='set -e'+"`n"+'CLONE_DIR="$AIRC_SESSION_TEST_WINDOWS/.."'+"`n"+'installed_airc="$AIRC_SESSION_TEST_WINDOWS/fake-gsudo.exe"'+"`n"+'fail() { echo "$*" >&2; exit 1; }'+"`n"+$function.Value+"`n"+$adoption.Value
+        [IO.File]::WriteAllText($env:AIRC_SESSION_TEST_BASH_SCRIPT,$script)
+
     }
     @'
 using System; using System.IO; using System.Diagnostics;
