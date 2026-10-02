@@ -3,7 +3,10 @@
 # session's supervisor from login, and start it again if it exits. The POSIX
 # twin of windows/register-autostart.ps1 (Task Scheduler `airc-join`).
 #
-#   register-autostart.sh <airc-path> [--existing-only] [--remove]
+#   register-autostart.sh <airc-path> [--existing-only] [--remove] [--check]
+#
+# --check changes nothing: exit 0 when the supervisor is registered, current and
+# loaded for <airc-path>; otherwise it names the drift and exits 1.
 #
 # macOS: a per-user LaunchAgent. Linux: a systemd user unit. Both run in the
 # account's home so `airc join` resolves the machine-account scope, never the
@@ -71,9 +74,22 @@ UNITFILE
 }
 
 _register_launchd() {
-  local airc="$1" existing_only="$2" remove="$3"
+  local airc="$1" existing_only="$2" remove="$3" check="$4"
   local agents="$HOME/Library/LaunchAgents" target="gui/$(id -u)/$LABEL"
   local plist="$agents/$LABEL.plist"
+  if [ "$check" = 1 ]; then
+    [ -f "$plist" ] || { printf 'AIRC autostart: %s is not registered\n' "$target" >&2; return 1; }
+    # Compare against the PATH it was registered with: the checker's own PATH (a
+    # service, another shell) is not the supervisor's and is not drift.
+    local registered_path
+    registered_path="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:PATH' "$plist" 2>/dev/null || true)"
+    cmp -s <(autostart_plist "$airc" "$HOME" "$registered_path") "$plist" ||
+      { printf 'AIRC autostart: %s runs a different command than %s\n' "$target" "$airc" >&2; return 1; }
+    launchctl print "$target" >/dev/null 2>&1 ||
+      { printf 'AIRC autostart: %s is not loaded\n' "$target" >&2; return 1; }
+    printf 'AIRC autostart converged (%s)\n' "$target"
+    return 0
+  fi
   if [ "$remove" = 1 ]; then
     launchctl bootout "$target" >/dev/null 2>&1 || true
     rm -f "$plist"
@@ -99,9 +115,20 @@ _register_launchd() {
 }
 
 _register_systemd() {
-  local airc="$1" existing_only="$2" remove="$3"
+  local airc="$1" existing_only="$2" remove="$3" check="$4"
   local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" unit
   unit="$dir/$UNIT"
+  if [ "$check" = 1 ]; then
+    [ -f "$unit" ] || { printf 'AIRC autostart: %s is not registered\n' "$UNIT" >&2; return 1; }
+    local registered_path
+    registered_path="$(sed -n 's/^Environment="PATH=\(.*\)"$/\1/p' "$unit")"
+    [ "$(cat "$unit")" = "$(autostart_unit "$airc" "$registered_path")" ] ||
+      { printf 'AIRC autostart: %s runs a different command than %s\n' "$UNIT" "$airc" >&2; return 1; }
+    systemctl --user is-enabled --quiet "$UNIT" 2>/dev/null ||
+      { printf 'AIRC autostart: %s is not enabled\n' "$UNIT" >&2; return 1; }
+    printf 'AIRC autostart converged (%s)\n' "$UNIT"
+    return 0
+  fi
   if [ "$remove" = 1 ]; then
     systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
     rm -f "$unit"
@@ -131,24 +158,25 @@ _register_systemd() {
 }
 
 main() {
-  local airc="" existing_only=0 remove=0
+  local airc="" existing_only=0 remove=0 check=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --existing-only) existing_only=1 ;;
       --remove) remove=1 ;;
+      --check) check=1 ;;
       -*) die "unknown option $1" ;;
       *) airc="$1" ;;
     esac
     shift
   done
-  [ "$remove" = 1 ] || [ -n "$airc" ] || die "usage: register-autostart.sh <airc-path> [--existing-only] [--remove]"
+  [ "$remove" = 1 ] || [ -n "$airc" ] || die "usage: register-autostart.sh <airc-path> [--existing-only] [--remove] [--check]"
   if [ -n "$airc" ]; then
     [ -x "$airc" ] || die "$airc is not an executable"
     airc="$(cd "$(dirname "$airc")" && pwd -P)/$(basename "$airc")"
   fi
   case "$(uname -s)" in
-    Darwin) _register_launchd "$airc" "$existing_only" "$remove" ;;
-    Linux) _register_systemd "$airc" "$existing_only" "$remove" ;;
+    Darwin) _register_launchd "$airc" "$existing_only" "$remove" "$check" ;;
+    Linux) _register_systemd "$airc" "$existing_only" "$remove" "$check" ;;
     *) die "unsupported platform $(uname -s); Windows registers through windows/register-autostart.ps1" ;;
   esac
 }
