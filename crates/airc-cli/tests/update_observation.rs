@@ -97,6 +97,7 @@ struct Fixture {
 struct RestoredOwner {
     runtime: tokio::runtime::Runtime,
     stream: IpcStream,
+    socket: PathBuf,
 }
 impl RestoredOwner {
     fn connect(socket: &Path) -> Self {
@@ -105,17 +106,34 @@ impl RestoredOwner {
             .build()
             .unwrap();
         let stream = runtime
-            .block_on(IpcStream::connect(socket))
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), IpcStream::connect(socket))
+                    .await
+                    .expect("restored owner connection timed out")
+            })
             .expect("restored owner must already exist; no spawn/ensure command is used");
-        Self { runtime, stream }
+        Self {
+            runtime,
+            stream,
+            socket: socket.to_owned(),
+        }
     }
     fn status(&mut self) -> StatusResponse {
         self.runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
-                write_frame(&mut self.stream, &Request::Status)
+                // The protocol serves one request per connection. Retain the
+                // first connection for Drop, and prove this status connection
+                // belongs to the same native owner before consuming it.
+                let mut status_stream = IpcStream::connect(&self.socket).await.unwrap();
+                #[cfg(windows)]
+                assert_eq!(
+                    status_stream.server_process_id().unwrap(),
+                    self.stream.server_process_id().unwrap()
+                );
+                write_frame(&mut status_stream, &Request::Status)
                     .await
                     .unwrap();
-                match read_frame::<_, Response>(&mut self.stream).await.unwrap() {
+                match read_frame::<_, Response>(&mut status_stream).await.unwrap() {
                     Some(Response::Status(status)) => status,
                     other => panic!("unexpected direct owner response: {other:?}"),
                 }
