@@ -2,7 +2,7 @@
 //! finish before the caller may enter its daemon maintenance window.
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -54,7 +54,7 @@ impl PreparedInstall {
     }
 
     fn run(&self, mode: &str) -> Result<(), Error> {
-        let status = Command::new(&self.shell)
+        let status = airc_core::process::background(&self.shell)
             .arg(self.source.join("install.sh"))
             .args([mode])
             .arg(&self.artifact)

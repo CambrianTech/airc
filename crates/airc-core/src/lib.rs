@@ -39,6 +39,7 @@ pub mod humanhash;
 pub mod identity;
 pub mod ids;
 pub mod persona;
+pub mod process;
 pub mod receipt;
 pub mod scoped_state;
 pub mod temp_home;

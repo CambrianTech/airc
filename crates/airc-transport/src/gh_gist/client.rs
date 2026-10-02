@@ -46,7 +46,7 @@ impl Default for GhCliClient {
 #[async_trait]
 impl GistClient for GhCliClient {
     async fn get_file(&self, gist_id: &str, filename: &str) -> Result<Option<String>, GhGistError> {
-        let output = Command::new(&self.gh_bin)
+        let output = Command::from(airc_core::process::background(&self.gh_bin))
             .args(["api", &format!("gists/{gist_id}")])
             .output()
             .await
@@ -78,7 +78,7 @@ impl GistClient for GhCliClient {
                 }
             }
         });
-        let mut child = Command::new(&self.gh_bin)
+        let mut child = Command::from(airc_core::process::background(&self.gh_bin))
             .args([
                 "api",
                 "--method",

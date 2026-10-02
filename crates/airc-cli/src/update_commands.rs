@@ -265,7 +265,7 @@ fn prepare_build_source(
     channel: &str,
 ) -> Result<(PathBuf, String, String), Box<dyn std::error::Error>> {
     run_checked(
-        Command::new("git")
+        airc_core::process::background("git")
             .arg("-C")
             .arg(source)
             .args(["fetch", "--quiet", "origin", channel]),
@@ -296,12 +296,10 @@ fn prepare_build_source(
         // bare pull was repeating it.
         let origin_ref = format!("origin/{channel}");
         run_checked(
-            Command::new("git").arg("-C").arg(source).args([
-                "merge",
-                "--ff-only",
-                "--quiet",
-                &origin_ref,
-            ]),
+            airc_core::process::background("git")
+                .arg("-C")
+                .arg(source)
+                .args(["merge", "--ff-only", "--quiet", &origin_ref]),
             "git merge --ff-only (channel)",
         )?;
         let after = git_text(source, ["rev-parse", "--short", "HEAD"])?;
@@ -317,7 +315,7 @@ fn prepare_build_source(
         // auto path's no-op compare stays meaningful across runs.
         let before = git_text(&wt, ["rev-parse", "--short", "HEAD"]).unwrap_or_default();
         run_checked(
-            Command::new("git")
+            airc_core::process::background("git")
                 .arg("-C")
                 .arg(&wt)
                 .args(["reset", "--hard", &origin_ref]),
@@ -331,7 +329,7 @@ fn prepare_build_source(
             // registration so `worktree add` can't refuse.
             std::fs::remove_dir_all(&wt)?;
         }
-        let _ = Command::new("git")
+        let _ = airc_core::process::background("git")
             .arg("-C")
             .arg(source)
             .args(["worktree", "prune"])
@@ -341,13 +339,10 @@ fn prepare_build_source(
             .ok_or("update worktree path is not valid UTF-8")?
             .to_string();
         run_checked(
-            Command::new("git").arg("-C").arg(source).args([
-                "worktree",
-                "add",
-                "--detach",
-                &wt_str,
-                &origin_ref,
-            ]),
+            airc_core::process::background("git")
+                .arg("-C")
+                .arg(source)
+                .args(["worktree", "add", "--detach", &wt_str, &origin_ref]),
             "git worktree add (update worktree)",
         )?;
         let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
@@ -500,7 +495,10 @@ fn nothing_to_install(
 /// and is the build we intended. Any failure (won't run, wrong/old SHA,
 /// unparseable) returns false → the caller rolls back.
 fn smoke_test_new_binary(airc_exe: &Path, expected_short: &str) -> bool {
-    let Ok(output) = Command::new(airc_exe).arg("version").output() else {
+    let Ok(output) = airc_core::process::background(airc_exe)
+        .arg("version")
+        .output()
+    else {
         return false;
     };
     if !output.status.success() {
@@ -518,7 +516,10 @@ fn smoke_test_new_binary(airc_exe: &Path, expected_short: &str) -> bool {
 /// exactly the case where an update matters most, so callers must treat `None`
 /// as "unknown", never as "unchanged".
 fn installed_binary_sha(airc_exe: &Path) -> Option<String> {
-    let output = Command::new(airc_exe).arg("version").output().ok()?;
+    let output = airc_core::process::background(airc_exe)
+        .arg("version")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -918,7 +919,10 @@ fn installer_shell() -> std::ffi::OsString {
 }
 
 fn git_bundled_bash() -> Option<PathBuf> {
-    let output = Command::new("git").arg("--exec-path").output().ok()?;
+    let output = airc_core::process::background("git")
+        .arg("--exec-path")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -942,7 +946,7 @@ fn git_text<const N: usize>(
     source: &Path,
     args: [&str; N],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
+    let output = airc_core::process::background("git")
         .arg("-C")
         .arg(source)
         .args(args)
@@ -1054,7 +1058,7 @@ mod tests {
         }
 
         if env::var(MODE).as_deref() == Ok("launcher") {
-            let mut command = Command::new(env::current_exe().unwrap());
+            let mut command = airc_core::process::background(env::current_exe().unwrap());
             command
                 .args(["--exact", TEST, "--nocapture"])
                 .env(MODE, "daemon");
@@ -1067,7 +1071,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut launcher = Command::new(env::current_exe().unwrap());
+        let mut launcher = airc_core::process::background(env::current_exe().unwrap());
         launcher
             .args(["--exact", TEST, "--nocapture"])
             .env(MODE, "launcher")
@@ -1076,11 +1080,6 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            launcher.creation_flags(0x08000000); // CREATE_NO_WINDOW for the fixture caller.
-        }
         let child = launcher.spawn().unwrap();
         let (output_tx, output_rx) = mpsc::channel();
         let collector = std::thread::spawn(move || {

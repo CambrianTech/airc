@@ -1025,13 +1025,7 @@ fn extract_gist_id(stdout: &str) -> Option<String> {
 /// No-op off Windows.
 #[inline]
 fn gh_no_window(cmd: &mut Command) {
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = cmd;
+    airc_core::process::configure_background(cmd.as_std_mut());
 }
 
 /// Budget for the `gh auth status` probe in [`gh_auth_ready`] (and the
