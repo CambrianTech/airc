@@ -34,7 +34,6 @@ CLONE_DIR="${AIRC_DIR:-$(_default_clone_dir)}"
 # BIN_DIR holds the installed Rust binary copied from CLONE_DIR.
 # PATH points at this stable binary, not at mutable source-tree build
 # artifacts and not at a shell wrapper.
-BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILLS_TARGET="${SKILLS_TARGET:-$HOME/.claude/skills}"
 
 info()  { printf '  \033[1;34m->\033[0m %s\n' "$*"; }
@@ -101,7 +100,58 @@ _to_bash_path() {
 }
 
 CLONE_DIR="$(_to_bash_path "$CLONE_DIR")"
-BIN_DIR="$(_to_bash_path "$BIN_DIR")"
+
+# All entrypoints use this selection; the native bridge must not invent another
+# default. Explicit update/install destinations win over PATH discovery.
+_select_bin_dir() {
+  if [ -n "${BIN_TARGET:-${BIN_DIR:-}}" ]; then
+    _to_bash_path "${BIN_TARGET:-$BIN_DIR}"
+    return
+  fi
+  local platform candidate directory magic target_root source_target candidate_key target_key source_key selected=""
+  platform="$(uname -s)"
+  target_root="$(_to_bash_path "${CARGO_TARGET_DIR:-$CLONE_DIR/target}")"
+  # Cargo runs from CLONE_DIR later; its relative target override is rooted there.
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    case "$target_root" in /*) ;; *) target_root="$CLONE_DIR/$target_root" ;; esac
+  fi
+  source_target="$CLONE_DIR/target"
+  [ ! -d "$target_root" ] || target_root="$(cd "$target_root" && pwd -P)"
+  [ ! -d "$source_target" ] || source_target="$(cd "$source_target" && pwd -P)"
+  while IFS= read -r candidate; do
+    [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ] || continue
+    directory="$(cd "$(dirname "$candidate")" && pwd -P)" || continue
+    candidate="$directory/$(basename "$candidate")"
+    candidate_key="$candidate"; target_key="$target_root"; source_key="$source_target"
+    case "$platform" in MINGW*|MSYS*|CYGWIN*)
+      candidate_key="$(printf '%s' "$candidate_key" | tr '[:upper:]' '[:lower:]')"
+      target_key="$(printf '%s' "$target_key" | tr '[:upper:]' '[:lower:]')"
+      source_key="$(printf '%s' "$source_key" | tr '[:upper:]' '[:lower:]')" ;;
+    esac
+    case "$candidate_key" in "$source_key/"*|"$target_key/"*) continue ;; esac
+    magic="$(od -An -tx1 -N4 "$candidate" | tr -d ' \r\n')"
+    case "$platform:$magic" in
+      MINGW*:4d5a*|MSYS*:4d5a*|CYGWIN*:4d5a*|Linux:7f454c46|Darwin:feedface|Darwin:cefaedfe|Darwin:feedfacf|Darwin:cffaedfe|Darwin:cafebabe|Darwin:bebafeca)
+        if [ -z "$selected" ]; then selected="$directory"
+        elif [ "$directory" != "$selected" ]; then
+          info "Preserving alternate PATH executable $candidate; installation uses $selected" >&2
+        fi ;;
+    esac
+  done < <(type -aP airc 2>/dev/null || true)
+  if [ -n "$selected" ]; then
+    info "Using existing AIRC installation directory: $selected" >&2
+    printf '%s\n' "$selected"
+    return
+  fi
+  case "$platform" in
+    MINGW*|MSYS*|CYGWIN*)
+      [ -n "${LOCALAPPDATA:-}" ] || fail 'LOCALAPPDATA is required to select a fresh Windows installation'
+      _to_bash_path "$LOCALAPPDATA/Programs/airc" ;;
+    *) printf '%s\n' "$HOME/.local/bin" ;;
+  esac
+}
+BIN_DIR="$(_select_bin_dir)"
+export BIN_DIR
 SKILLS_TARGET="$(_to_bash_path "$SKILLS_TARGET")"
 
 # A downloaded newer entry must not run against an older managed source layout.
@@ -665,12 +715,16 @@ _add_path_entry() {
   fi
   printf 'export PATH="%s:$PATH"  # airc\n' "$path_entry" >> "$rc_target"
   ok "Added $path_entry to PATH in $(basename "$rc_target")"
-  # Only export into current env if not already there. Avoids
-  # gratuitously prepending duplicate PATH segments when the operator
-  # has already sourced their rc.
-  if ! echo "$PATH" | tr ':' '\n' | grep -qx "$path_entry"; then
-    export PATH="$path_entry:$PATH"
-  fi
+  # A selected entry already later in PATH must still become authoritative.
+  # Preserve other tools and remove exact duplicate selected entries on reruns.
+  local entry rebuilt="$path_entry"
+  local -a path_parts
+  IFS=: read -r -a path_parts <<< "$PATH"
+  for entry in "${path_parts[@]}"; do
+    [ "$entry" = "$path_entry" ] || rebuilt="$rebuilt:$entry"
+  done
+  export PATH="$rebuilt"
+  hash -r
 }
 
 # Minimum cargo version that can build this tree. Tracks Cargo.lock's

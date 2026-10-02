@@ -103,7 +103,7 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     }
 
     let prepared =
-        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
+        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after, &airc_exe)?;
     let (binary_before, _) = install_prepared_update(
         &prepared,
         &airc_exe,
@@ -326,7 +326,7 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     }
 
     let prepared =
-        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
+        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after, &airc_exe)?;
     let (previous_build, previous_path) = install_prepared_update(
         &prepared,
         &airc_exe,

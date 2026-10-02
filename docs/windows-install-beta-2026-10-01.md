@@ -692,3 +692,40 @@ checkout whose installer fails after publication. It checks exact build
 provenance, original error visibility, restored executable contents/version,
 and absence of an unintentionally started daemon. Fixture and fresh-head gates
 are pending; no live update success is claimed.
+### OPEN: native setup and the existing PATH installation diverged
+
+Bigmama's public native setup published a fresh executable under the Windows
+Programs directory while the existing user PATH still selected the older
+`.local/bin` installation. The setup also failed later with gsudo exit 999;
+path divergence is a separate concrete defect, not a claim about that failure's
+cause. Investigation read the existing selection/registration code; no manual
+binary move, PATH repair, daemon stop or firewall mutation was performed.
+
+The shared Bash coordinator now owns destination selection for all entrypoints:
+explicit BIN_TARGET/BIN_DIR, then a native installed PATH executable excluding
+known source/configured Cargo output trees, then the platform's fresh default.
+The native bridge no longer imposes its own conflicting fallback. One selected
+destination drives publication, firewall, startup and daemon adoption. Historical
+alternate binaries are reported and preserved. Both updater paths pass their
+executing binary explicitly into PreparedInstall, which binds prepare/prebuilt
+BIN_DIR and BIN_TARGET to that directory instead of inherited defaults.
+
+Registration promotes the selected directory within User PATH and the installer
+process/Bash path, with repeatable deduplication. It does not change machine PATH
+or claim to override arbitrary machine-level shadows in fresh Windows processes.
+Synthetic fixtures cover competing user directories, explicit overrides, native
+versus script/function lookup, known Cargo outputs, literal spaces/apostrophes,
+case-insensitive Windows PATH registration, and repeated ordering. Actual public
+installation, installed/current PATH agreement and running-daemon build evidence
+remain OPEN; this patch alone does not close the reported outage or consent error.
+Validation: actual PS5 public bridge and isolated registrar ordering fixture
+passed (14458); shared Bash selection, downloaded-source compatibility, and
+native PATH-return fixtures passed (46525). The tiny Rust/Bash handoff fixture
+passed (10439), verifying that hostile inherited BIN_DIR and BIN_TARGET cannot
+redirect prepare/prebuilt publication away from the executing installation.
+Workspace Clippy passed with warnings denied (68384) in the dedicated
+D:/airc-build/doria/path-convergence-target cache; formatting/diff checks passed.
+No real installer, daemon, task or firewall operation was run for these checks.
+Independent parent review approved the shared selection/PATH change, and the
+updater reviewer independently approved the explicit executing-file handoff.
+The additional relative Cargo-target exclusion fixture passed (70059).
