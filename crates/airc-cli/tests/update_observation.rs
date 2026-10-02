@@ -656,6 +656,36 @@ esac
                     "internal recovery code escaped public wrapper"
                 );
                 drop(restored_owner);
+                #[cfg(unix)]
+                {
+                    // Stop acknowledges shutdown before the detached process
+                    // necessarily exits. Prove its original executable inode
+                    // is no longer mapped before the next case copies to it.
+                    // Opening writable without truncate/write changes no bytes.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match std::fs::OpenOptions::new().write(true).open(&current) {
+                            Ok(file) => {
+                                drop(file);
+                                break;
+                            }
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                            {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "test-owned restored executable still running after Stop: {}: {error}",
+                                    current.display()
+                                );
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(error) => panic!(
+                                "cannot verify restored executable shutdown: {}: {error}",
+                                current.display()
+                            ),
+                        }
+                    }
+                }
                 #[cfg(windows)]
                 assert!(
                     common::wait_pid_gone(restored_pid, Duration::from_secs(5)),
