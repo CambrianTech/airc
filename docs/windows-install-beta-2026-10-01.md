@@ -852,3 +852,21 @@ contracts in 29.05s (11253). Independent peer review approved the preserved
 contracts and shared process policy. Runtime savings are not claimed from source
 counts; hosted cross-platform coverage remains required.
 
+
+## Sharing-refusal fixture diagnosis (2026-10-02)
+
+Hosted Windows job 111057304285 refused MoveFileW with sharing violation 32
+before publication in the public updater rollback fixture. The updater retained
+the original artifact and restored its daemon; the handle denying deletion is
+UNKNOWN. One unchanged local four-case public binary run passed at c0c2f66
+(45079, 124.12s), which does not resolve or waive the hosted failure.
+
+The fixture now acquires its recovered scoped-daemon cleanup guard before
+checking expected diagnostics, so an unexpected refusal cannot strand that
+recovered fixture process. Case labels identify ordinary/automatic and stopped/
+running cases. A Windows test holds a known deny-delete file handle and checks
+that displacement fails before installation, preserves both files, and leaves
+no transaction directory. A separate later transaction succeeds after releasing
+that known handle. This controlled OS refusal does not identify the CI holder.
+No production retries, process termination, failure acceptance or live machine
+changes are introduced. Root-cause diagnosis remains OPEN.
