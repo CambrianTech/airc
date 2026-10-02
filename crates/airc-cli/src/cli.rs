@@ -630,6 +630,19 @@ pub enum Command {
     /// var — airc owns the path, callers ask for it. Resolves the path
     /// only; does NOT require the daemon to be running (callers probe
     /// liveness separately via `status`/`ping`).
+    #[cfg(windows)]
+    #[command(hide = true)]
+    SetupRecoverElevatedOwner {
+        #[arg(long)]
+        probe: bool,
+        #[arg(long)]
+        endpoint: PathBuf,
+        #[arg(long)]
+        caller_sid: String,
+        #[arg(long)]
+        installed_binary: PathBuf,
+    },
+
     IpcEndpoint {
         /// Print the OS transport endpoint (Windows named pipe; Unix socket).
         #[arg(long)]

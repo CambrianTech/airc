@@ -31,6 +31,8 @@ mod collaboration_peers;
 mod commands;
 mod discovery;
 mod doctor;
+#[cfg(windows)]
+mod elevated_owner;
 mod envelope_cli;
 mod event_render;
 mod events_cli;
@@ -89,6 +91,8 @@ mod update_artifact;
 mod update_commands;
 mod update_legacy;
 mod update_rollback;
+#[cfg(windows)]
+mod update_session;
 mod update_shutdown;
 mod work_cli;
 mod work_commands;
@@ -204,6 +208,10 @@ async fn async_main() -> ExitCode {
                 return ExitCode::from(code);
             }
             if let Some(code) = identity_commands::command_exit_code(error.as_ref()) {
+                return ExitCode::from(code);
+            }
+            #[cfg(windows)]
+            if let Some(code) = update_session::exit_code(error.as_ref()) {
                 return ExitCode::from(code);
             }
             eprintln!("airc: {error}");
@@ -630,6 +638,23 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Version => commands::run_version(),
 
+        #[cfg(windows)]
+        Command::SetupRecoverElevatedOwner {
+            probe,
+            endpoint,
+            caller_sid,
+            installed_binary,
+        } => {
+            if probe {
+                if elevated_owner::access_denied(&endpoint).await? {
+                    std::process::exit(5);
+                }
+                Ok(())
+            } else {
+                elevated_owner::recover(&endpoint, &caller_sid, &installed_binary).await
+            }
+        }
+
         Command::IpcEndpoint { native } => {
             // Resolve-only: print the canonical socket path airc would
             // bind for this scope. No daemon required (callers probe
@@ -651,10 +676,19 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let socket = cli::default_socket_path_in(&home);
             if adopt_installed {
                 update_commands::adopt_installed(&home, socket)
-            } else if auto {
-                update_commands::run_update_auto(&home, socket)
             } else {
-                update_commands::run_update(&home, socket)
+                #[cfg(windows)]
+                {
+                    update_session::run(&home, auto)
+                }
+                #[cfg(not(windows))]
+                {
+                    if auto {
+                        update_commands::run_update_auto(&home, socket)
+                    } else {
+                        update_commands::run_update(&home, socket)
+                    }
+                }
             }
         }
 

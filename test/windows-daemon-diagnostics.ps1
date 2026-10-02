@@ -53,17 +53,31 @@ try {
 # Exercise the public diagnostic branch with only the external process boundary
 # mocked. It must return before source acquisition, prerequisites or installation.
 $entry = [IO.File]::ReadAllText((Join-Path $root 'install.ps1'))
-$start = $entry.IndexOf('if ($DiagnoseDaemon) {', [StringComparison]::Ordinal)
-$end = $entry.IndexOf('if ($FirewallOnly -and', $start, [StringComparison]::Ordinal)
-$action = [scriptblock]::Create($entry.Substring($start, $end - $start) + "`nthrow 'Diagnostic mode fell through into installer mutation.'")
+function Get-DiagnosticAction([string]$source) {
+    $tokens=$null; $errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+    Assert ($errors.Count -eq 0) 'Public installer must parse before extracting its diagnostic branch.'
+    $branches=@($ast.FindAll({param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -eq '$DiagnoseDaemon -or $RecoverElevatedDaemon'
+    },$true))
+    Assert ($branches.Count -eq 1) 'Expected exactly one combined public diagnostic/recovery branch.'
+    [scriptblock]::Create($branches[0].Extent.Text + "`nthrow 'Diagnostic mode fell through into installer mutation.'")
+}
+$action=Get-DiagnosticAction $entry
+$negativeFailed=$false
+try { Get-DiagnosticAction ($entry.Replace('if ($DiagnoseDaemon -or $RecoverElevatedDaemon)', 'if ($false)')) | Out-Null }
+catch { $negativeFailed=$_.ToString() -like '*exactly one combined*' }
+Assert $negativeFailed 'Missing public branch must fail clearly, never extract another installer section.'
 $script:elevations = 0
 $script:clears = 0
 $script:resolverFails = $false
 function Initialize-ElevationSession { }
 function Clear-Elevation { $script:clears++ }
+function Get-AircInstallerHome { 'C:\fixture\account\.airc' }
 function Invoke-InstallerProcess {
     param([switch]$OwnProcessTree, [Parameter(Position=0)]$Executable, [Parameter(Position=1)]$Arguments)
-    Assert (($Arguments -join ' ') -eq 'ipc-endpoint --native') 'Must use canonical resolver before elevation.'
+    Assert (($Arguments -join ' ') -eq '--home C:\fixture\account\.airc ipc-endpoint --native') 'Must use canonical resolver with explicit installer scope before elevation.'
     $global:LASTEXITCODE = if ($script:resolverFails) { 2 } else { 0 }
     if (-not $script:resolverFails) { $endpoint }
 }
@@ -78,6 +92,7 @@ $savedSource = $env:AIRC_DIR
 try {
     $env:AIRC_DIR = $root
     $DiagnoseDaemon = $true
+    $RecoverElevatedDaemon = $false
     $FirewallOnly = $false
     $AircPath = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path $AircPath)) { $AircPath = Join-Path $PSHOME 'pwsh.exe' }

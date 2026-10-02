@@ -70,6 +70,17 @@ if [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT$EXPECTED_BUILD" ]; then
   [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ] || fail 'Handoff cannot skip artifact validation'
 fi
 
+# BEGIN GENERATED WINDOWS TOKEN CHECK
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*)
+  powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command 'function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+if (Test-IsAdmin) { [Console]::Error.WriteLine("AIRC full setup requires a normal user terminal; rerun normally for scoped consent. No installation started."); exit 1 }; exit 0' || exit $? ;;
+esac
+# END GENERATED WINDOWS TOKEN CHECK
+
 _verify_artifact() {
   local binary="$1" output actual
   [ -f "$binary" ] && [ -x "$binary" ] || fail "Artifact missing or not executable: $binary"
@@ -162,7 +173,7 @@ _compatible_setup_layout() {
   [ -f "$directory/setup/github-auth.sh" ] || return 1
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-      for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 sync-bootstrap.ps1 setup-entrypoint.ps1; do
+      for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 adopt-installed.ps1 sync-bootstrap.ps1 setup-entrypoint.ps1; do
         [ -f "$directory/windows/$relative" ] || return 1
       done ;;
   esac
@@ -1332,8 +1343,15 @@ fi
 # interrupted adoption whose old daemon stopped before replacement was started.
 if [ -z "$EXPECTED_BUILD" ] && [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ]; then
   installed_airc="$BIN_DIR/airc"
+  # Installation targets the account service, independent of the source cwd.
+  # Preserve the documented explicit scope override for isolated installations.
+  installer_home="${AIRC_HOME:-$HOME/.airc}"
   case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) installed_airc="$BIN_DIR/airc.exe" ;; esac
-  "$installed_airc" update --adopt-installed || fail 'Installed daemon could not be started and verified. Setup is incomplete; rerun this installer to resume.'
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      _windows_powershell -NoProfile -ExecutionPolicy RemoteSigned -File "$(cygpath -w "$CLONE_DIR/windows/adopt-installed.ps1")" -AircPath "$(cygpath -w "$installed_airc")" -ScopeHome "$(cygpath -w "$installer_home")" || fail 'Installed daemon could not be adopted safely; rerun setup to resume.' ;;
+    *) "$installed_airc" --home "$installer_home" update --adopt-installed || fail 'Installed daemon could not be started and verified. Setup is incomplete; rerun this installer to resume.' ;;
+  esac
 fi
 
 echo ""

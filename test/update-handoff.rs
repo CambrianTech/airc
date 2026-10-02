@@ -69,14 +69,22 @@ esac
 "#,
         );
         let good = r#"#!/bin/sh
+selected_scope=0
+if [ "$1" = '--home' ]; then
+  [ "$2" = "${AIRC_HOME:-$HOME/.airc}" ] || exit 93
+  selected_scope=1
+  shift 2
+fi
 case "$1" in
   version) echo 'build: abcdef1234567890' ;;
   --version) echo 'airc 0.1.0' ;;
   update)
+    [ "$selected_scope" = 1 ] || exit 94
     [ "$2" = '--adopt-installed' ] || exit 92
     echo adopt >> "$AIRC_FIXTURE_ROOT/events"
     [ ! -f "$AIRC_FIXTURE_ROOT/fail-adopt" ] || exit 73
     ;;
+  *) exit 95 ;;
 esac
 "#;
         write(&target.join("release/airc"), good);
