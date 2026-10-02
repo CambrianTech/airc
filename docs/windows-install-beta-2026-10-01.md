@@ -597,3 +597,42 @@ current canonical migration, all 8 inventory Blocks surviving, all 47 entries
 remaining where 45 lack ownership proof, refusal of current Block without writes,
 healthy-rerun unresolved counts, literal paths, original SID handoff and failures.
 No admin/UAC, live rules, daemon or build was exercised.
+### 2026-10-02 - updater IPC uncertainty and running-build freshness (OPEN)
+
+Bigmama reported a supported update returning success with installed build
+834d1cd while the running owner was inaccessible. The updater reduced every
+failed subprocess ping to false, and its no-op path checked only source and
+installed-file revisions. Permission failures could therefore mean stopped,
+and a reachable old daemon could survive an already-current file indefinitely.
+
+The repair uses the normal typed IPC status client and the existing legacy
+endpoint absence predicate. Only connect NotFound/ConnectionRefused count as
+absence; permission errors, RPC timeout, incomplete response and protocol errors
+remain failures. Both manual and automatic no-op update paths take the existing
+maintenance guard, preserve an absent or matching owner, and use the existing
+verified stop/start lifecycle for a reachable stale owner. Explicit installation
+retains its start-if-absent policy. No pipe ACL, trust, account, firewall rule or
+live daemon was changed by this repair.
+
+A fresh CLI binary passed all three Windows integration tests: real
+AccessDenied (an outbound-only fixture pipe, no ACL modification), timeout and
+unexpected response fail without installing or spawning; manual/automatic
+updates preserve stopped state and matching owner PID; stale owners adopt the
+newly built real binary; explicit install starts a missing owner and repeats
+successfully. Test daemons use isolated homes. Both the explicit registry gate
+and temp-home-only gate were exercised; each emitted its route-isolation receipt
+and Windows netstat showed no sockets owned by that daemon PID. Two focused
+route-refresh tests preserve the immediate peer-refresh clock for both ordinary
+and isolated daemons while allowing automatic listener acquisition only for
+ordinary daemons. Full workspace Clippy passed. This binary evidence does
+not close public deployment or Bigmama's live outage, which remain OPEN.
+
+CI caught a boundary regression before merge: the first isolation guard stopped
+the entire route-refresh task, also disabling intentional stored-loopback peer
+reconnection. The correction keeps the immediate/periodic refresh clock, stored
+endpoint dialing and delivery snapshots active, while gating only automatic
+advertised-endpoint acquisition and relay self-election with the existing
+registry isolation policy. No bypass environment or disabled test is added.
+The unchanged real-daemon stored-endpoint regression passed locally, alongside
+all three updater binary fixtures, both policy-clock tests, and full Clippy.
+Fresh rebased-head CI and public deployment remain required.

@@ -201,9 +201,12 @@ fn reap_pid(pid: u32) {
 
 #[cfg(windows)]
 fn reap_pid(pid: u32) {
+    use std::os::windows::process::CommandExt;
+
     // Best-effort forced kill; `taskkill` is present on every
     // supported Windows. /T takes the daemon's children with it.
     let _ = std::process::Command::new("taskkill")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output();
 }
@@ -239,7 +242,10 @@ pub fn pid_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub fn pid_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+
     std::process::Command::new("tasklist")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))

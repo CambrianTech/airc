@@ -20,7 +20,7 @@ fn adopt_installed_with_executable(
     let expected = installed_binary_sha(airc_exe).ok_or("Cannot verify installed AIRC build")?;
     let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
     if daemon_is_running(airc_exe, home, socket)? {
-        if daemon_build_matches(airc_exe, home, socket, &expected) {
+        if daemon_build_matches(airc_exe, home, socket, &expected)? {
             println!("daemon: installed build already running.");
             retire_legacy_endpoints(airc_exe, home, socket, &expected)?;
             return Ok(());
@@ -97,7 +97,8 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     // test is what makes skipping safe — unchanged source AND a binary that
     // already reports it means there is genuinely nothing to do.
     if nothing_to_install(&before, &after, || smoke_test_new_binary(&airc_exe, &after)) {
-        println!("Already at {after} on channel {channel} — daemon left running.");
+        reconcile_current_daemon(&airc_exe, home, &socket, &after)?;
+        println!("Already at {after} on channel {channel}; installed and daemon state verified.");
         return Ok(());
     }
 
@@ -362,19 +363,16 @@ fn prepare_build_source(
 /// the backup if the new build is broken. So an auto-update can never
 /// leave a peer with a binary that compiles-but-doesn't-run.
 ///
-/// Flow: fetch + ff-pull the channel → if HEAD unchanged, nothing to do
-/// (the daemon is NEVER touched — see below) → else prepare a verified artifact,
-/// back up the installed binary to `airc.prev`, stop and install, smoke-test
-/// (the new binary's `version` reports the pulled SHA), and on failure
-/// restore `airc.prev`.
+/// Flow: fetch the channel; if source and installed binary are current, leave
+/// a stopped daemon stopped or verify the running revision. A reachable stale
+/// owner adopts the installed binary without rebuilding. Otherwise prepare a
+/// verified artifact, back up the installed binary, stop/install/restart, and
+/// smoke-test. Failed artifact verification restores the backup.
 ///
-/// The no-op path must not restart the daemon: `git fetch`/`pull` only
-/// touch the source checkout, never the running binary, so only the
-/// rebuild+swap needs the daemon down. The pre-fix shape stopped the
-/// daemon BEFORE the SHA compare, which killed the transport owner every
-/// hourly "nothing to auto-update" tick — wiping in-process room state
-/// and blinding every subscribed client for the restart window
-/// (continuum blind-room incidents #2/#3, 2026-07-11/12).
+/// A matching-current daemon must not restart on a no-op update. The old
+/// stop-before-compare ordering caused recurring transport blackouts even when
+/// nothing changed. Running-build reconciliation is necessary too: a replaced
+/// file does not prove an already-running process adopted that file.
 ///
 /// Platform note: on Windows the live `airc.exe` is locked while this
 /// process runs, so the in-place reinstall (and thus the swap) inherits
@@ -401,11 +399,10 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     // and left the stale daemon running on every cadence. The smoke test asks
     // the binary on disk what it is; only its answer makes skipping safe.
     if nothing_to_install(&before, &after, || smoke_test_new_binary(&airc_exe, &after)) {
-        // Nothing pulled AND the installed binary reports it → nothing to
-        // rebuild → the daemon was never stopped and MUST NOT be restarted.
-        // Restart-on-no-op is the bug this ordering exists to prevent (hourly
-        // transport-owner death).
-        println!("Already at {after} on channel {channel} — nothing to auto-update.");
+        // The installed file is current; preserve a matching or stopped owner
+        // and adopt only a reachable stale owner under maintenance.
+        reconcile_current_daemon(&airc_exe, home, &socket, &after)?;
+        println!("Already at {after} on channel {channel}; installed and daemon state verified.");
         return Ok(());
     }
     if before == after {
@@ -625,15 +622,61 @@ fn smoke_sha_matches(installed_sha: &str, expected_short: &str) -> bool {
         && (installed_sha.starts_with(expected_short) || expected_short.starts_with(installed_sha))
 }
 
+/// A failed observation is not evidence that the owner is absent. In particular,
+/// AccessDenied on a Windows pipe must not authorize a second owner or success.
+fn daemon_status(
+    socket: &Path,
+) -> Result<Option<airc_ipc::response::StatusResponse>, Box<dyn std::error::Error>> {
+    let endpoint = socket.to_path_buf();
+    let result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(airc_ipc::client::ClientError::Io)?;
+        runtime.block_on(airc_ipc::client::DaemonClient::new(endpoint).status())
+    })
+    .join()
+    .map_err(|_| std::io::Error::other("daemon observation thread failed"))?;
+    classify_daemon_status(result).map_err(|error| {
+        format!("Cannot establish daemon state at {}: {error}; refusing to treat an unknown owner as absent", socket.display()).into()
+    })
+}
+
+fn classify_daemon_status(
+    result: Result<airc_ipc::response::StatusResponse, airc_ipc::client::ClientError>,
+) -> Result<Option<airc_ipc::response::StatusResponse>, airc_ipc::client::ClientError> {
+    match result {
+        Ok(status) => Ok(Some(status)),
+        Err(error) if crate::update_legacy::endpoint_absent(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn daemon_is_running(
+    _airc_exe: &Path,
+    _home: &Path,
+    socket: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(daemon_status(socket)?.is_some())
+}
+
+/// A current installed file can coexist with an older running owner. Observe
+/// again under maintenance before acting; a deliberately stopped owner stays
+/// stopped, and a matching owner never pays a restart blackout.
+fn reconcile_current_daemon(
     airc_exe: &Path,
     home: &Path,
     socket: &Path,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    Ok(daemon_command(airc_exe, home, "ping", socket)
-        .output()?
-        .status
-        .success())
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    if !daemon_is_running(airc_exe, home, socket)? {
+        println!("daemon: stopped (left stopped).");
+        return Ok(());
+    }
+    verify_daemon_build(airc_exe, home, socket, expected)?;
+    println!("daemon: running build {expected} verified.");
+    Ok(())
 }
 
 fn stop_daemon(
@@ -853,7 +896,7 @@ fn verify_daemon_build(
     socket: &Path,
     expected: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if daemon_build_matches(airc_exe, home, socket, expected) {
+    if daemon_build_matches(airc_exe, home, socket, expected)? {
         return Ok(());
     }
 
@@ -866,7 +909,7 @@ fn verify_daemon_build(
     restart_daemon(airc_exe, home, socket)?;
     wait_daemon_ready(airc_exe, home, socket)?;
 
-    if daemon_build_matches(airc_exe, home, socket, expected) {
+    if daemon_build_matches(airc_exe, home, socket, expected)? {
         eprintln!("✓ self-healed: the daemon is now running {expected}.");
         return Ok(());
     }
@@ -882,23 +925,21 @@ fn verify_daemon_build(
     .into())
 }
 
-/// Whether the daemon reachable on `socket` reports `expected` as its build.
-///
-/// `false` when it cannot be asked or reports nothing — an unverifiable daemon
-/// is not a verified one, and this is the predicate a heal decision hangs off,
-/// so "I don't know" must never read as "fine".
-fn daemon_build_matches(airc_exe: &Path, home: &Path, socket: &Path, expected: &str) -> bool {
-    let Ok(output) = daemon_command(airc_exe, home, "status", socket).output() else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    match parse_build_sha(&stdout) {
-        Some(sha) => smoke_sha_matches(&sha, expected),
-        None => false,
-    }
+/// IPC observation failures are errors, not stale-build signals authorizing
+/// a restart. A reachable owner predating revision metadata needs adoption.
+fn daemon_build_matches(
+    _airc_exe: &Path,
+    _home: &Path,
+    socket: &Path,
+    expected: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let status = daemon_status(socket)?.ok_or("daemon disappeared during build verification")?;
+    // Older reachable daemons predate build metadata. They need adoption too;
+    // unlike an IPC failure, a valid status response proves an owner exists.
+    Ok(status
+        .build_commit
+        .as_deref()
+        .is_some_and(|sha| smoke_sha_matches(sha, expected)))
 }
 
 /// The shell used to run install.sh during `airc update`.
@@ -982,61 +1023,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_install_starts_missing_daemon_and_reuses_verified_build() {
-        let home = tempfile::tempdir().unwrap();
-        let source = home.path().join("fixture.rs");
-        let executable = home
-            .path()
-            .join(format!("fixture{}", env::consts::EXE_SUFFIX));
-        let socket = home.path().join("fixture.sock");
-        std::fs::write(
-            &source,
-            r#"
-use std::{env, fs, process};
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args[1] == "version" { println!("build: 1234abcd"); return; }
-    let socket = std::path::Path::new(&args[5]);
-    match args[3].as_str() {
-        "ping" => if !socket.exists() { process::exit(1); },
-        "status" => println!("build: {}", fs::read_to_string(socket).unwrap()),
-        "daemon" => {
-            let count = socket.with_extension("starts");
-            let n = fs::read_to_string(&count).unwrap_or_default().parse::<u32>().unwrap_or(0);
-            fs::write(count, (n + 1).to_string()).unwrap();
-            fs::write(socket, "1234abcd").unwrap();
-        },
-        _ => process::exit(91),
-    }
-}
-"#,
-        )
-        .unwrap();
-        assert!(Command::new("rustc")
-            .arg(&source)
-            .arg("-o")
-            .arg(&executable)
-            .status()
-            .unwrap()
-            .success());
-        // A fresh install and a retry after interrupted shutdown both have
-        // no daemon. Exercise the actual adoption command/verification path.
-        adopt_installed_with_executable(home.path(), &socket, &executable).unwrap();
-        adopt_installed_with_executable(home.path(), &socket, &executable).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(socket.with_extension("starts")).unwrap(),
-            "1"
-        );
-        std::fs::remove_file(&socket).unwrap();
-        adopt_installed_with_executable(home.path(), &socket, &executable).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(socket.with_extension("starts")).unwrap(),
-            "2"
+    fn only_missing_or_refused_connection_is_absence() {
+        use airc_ipc::client::ClientError;
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            assert!(
+                classify_daemon_status(Err(ClientError::NotConnected(Error::from(kind))))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                classify_daemon_status(Err(ClientError::Io(Error::from(kind)))).is_err(),
+                "a connection that failed after opening is not absence"
+            );
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                classify_daemon_status(Err(ClientError::NotConnected(Error::from(kind)))).is_err()
+            );
+        }
+        assert!(classify_daemon_status(Err(ClientError::Timeout)).is_err());
+        assert!(
+            classify_daemon_status(Err(ClientError::UnexpectedResponse(Box::new(
+                airc_ipc::response::Response::Pong
+            ))))
+            .is_err()
         );
     }
 
-    // Regression for 2ec5d74f: a successful update exited, but its Windows daemon
-    // inherited captured pipe writers and kept the caller waiting for EOF.
     #[test]
     fn restarted_daemon_does_not_hold_updater_output_open() {
         use std::io::{Read, Write};

@@ -10,7 +10,7 @@ fn same_owner(canonical: &airc_ipc::StatusResponse, legacy: &airc_ipc::StatusRes
         && canonical.peer_id == legacy.peer_id
 }
 
-fn endpoint_absent(error: &airc_ipc::ClientError) -> bool {
+pub(crate) fn endpoint_absent(error: &airc_ipc::ClientError) -> bool {
     matches!(error, airc_ipc::ClientError::NotConnected(io)
         if matches!(io.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused))
 }
