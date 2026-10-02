@@ -52,6 +52,11 @@ mod ownership_tests {
             include_str!("../../airc-daemon/src/reclaim.rs"),
             include_str!("../../airc-work/src/local_git.rs"),
             include_str!("../../airc-work/src/pull_requests/gh.rs"),
+            include_str!("../../airc-cli/src/cli.rs"),
+            include_str!("../../airc-cli/src/work_commands.rs"),
+            include_str!("../../airc-lib/src/work_worktree.rs"),
+            include_str!("../../airc-lib/src/mesh_identity.rs"),
+            include_str!("../../airc-cli/src/monitor/formatter.rs"),
         ] {
             assert!(
                 !source.contains("Command::new("),

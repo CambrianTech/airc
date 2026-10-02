@@ -143,7 +143,7 @@ fn default_home_dir_for_with(
 }
 
 fn git_main_working_tree(cwd: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(cwd)
         .output()
@@ -168,7 +168,7 @@ fn git_main_working_tree(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
