@@ -127,12 +127,14 @@ public static class SetupBridgeFixture {
     $probe = Join-Path $fixture 'public-module-probe.ps1'
     @'
 param($Entry, $Binary, $ForeignModules)
+[Console]::WriteLine('module probe entered')
 # Windows PowerShell may reorder inherited module paths during startup; establish
 # the deliberately incompatible fixture before either public entry executes.
 $env:PSModulePath = $ForeignModules + ';' + $env:PSModulePath
 # Some PS5 hosts preload Security before running a -File script. Model the
 # incompatible selection explicitly so the control cannot pass by host luck.
 Import-Module (Join-Path $ForeignModules 'Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -Global -Force
+[Console]::WriteLine('selected hash command: ' + (Get-Command Get-FileHash).Module.Path)
 $before = $env:PSModulePath
 try {
     & $Entry -FirewallOnly -AircPath $Binary
@@ -145,7 +147,7 @@ try {
         $env:AIRC_DIR = $env:AIRC_FIXTURE_SOURCE
         [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
         $control = @(Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,$controlEntry,$installedBinary,$foreign) 2>&1)
-        Assert-True ($global:LASTEXITCODE -ne 0 -and ($control -join "`n") -match 'FOREIGN SECURITY MODULE') "Unfixed public-entry control did not select the hostile module: $($control -join [Environment]::NewLine)"
+        Assert-True ($global:LASTEXITCODE -ne 0 -and ($control -join "`n") -match 'FOREIGN SECURITY MODULE') "Unfixed public-entry control did not select the hostile module (exit $global:LASTEXITCODE): $($control -join [Environment]::NewLine)"
         Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,(Join-Path $entry 'install.ps1'),$installedBinary,$foreign)
         Assert-True ($global:LASTEXITCODE -eq 0) 'Fresh PS5 public entry selected an incompatible inherited module'
         Assert-True ((Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw).Trim() -eq ('firewall|' + $installedBinary)) 'Foreign-module regression did not reach the public firewall boundary'
