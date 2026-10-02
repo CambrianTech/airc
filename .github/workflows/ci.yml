@@ -207,7 +207,9 @@ jobs:
             Windows) bash test/setup-source-acquisition.sh ;;
           esac
           bash test/install-bin-directory.sh
-          bash test/unix-autostart.sh
+          # Renderer contract, platform-independent: once, on the lane whose
+          # plutil also lints the rendered LaunchAgent.
+          if [ "$RUNNER_OS" = macOS ]; then bash test/unix-autostart.sh; fi
       - name: Native setup acquisition and remaining-work storage planning
         if: runner.os == 'Windows'
         shell: powershell
