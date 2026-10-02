@@ -13,13 +13,10 @@ use std::{
 };
 
 fn hidden(command: &mut Command) -> &mut Command {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    airc_core::process::configure_background(command);
     command
 }
+
 fn cli(account: &Path, source: &Path, args: &[&str]) -> Output {
     cli_with_isolation(account, source, args, true)
 }
