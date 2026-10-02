@@ -34,7 +34,7 @@ foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','BIN_DIR','BIN_TARGET','
 }
 function Assert-True($condition,$message) { if (-not $condition) { throw $message } }
 function New-Source($directory) {
-    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1','windows/sync-bootstrap.ps1','windows/setup-entrypoint.ps1')) {
+    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1','windows/adopt-installed.ps1','windows/sync-bootstrap.ps1','windows/setup-entrypoint.ps1')) {
         $path = Join-Path $directory $relative
         New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
         [IO.File]::WriteAllText($path,'fixture')
