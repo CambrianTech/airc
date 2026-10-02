@@ -60,3 +60,20 @@ that token before installation. The replacement uses a real disposable standard
 account; it also requires captured-child cancellation to close its owned native
 descendant before attempting full installation. Account/profile cleanup waits
 for the exact test user's processes to exit and validates the profile path.
+# Installer scope is independent of the invoking checkout
+
+Public installation selects `AIRC_HOME` when explicitly set, otherwise the
+invoking account's `HOME/.airc` (`USERPROFILE` fallback on native Windows).
+It passes that explicit home to both endpoint resolution and installed-daemon
+adoption. Running setup beneath another account's `.airc/worktrees` must never
+select that ancestor or open its event database. Ordinary CLI project scope,
+`--home`, and `--here` behavior remains unchanged. Bash-to-Windows paths use the
+existing `cygpath` adapter before the PowerShell adoption entry.
+
+The `installer_scope` binary regression executes the public adoption adapter
+from a foreign `.airc/worktrees` directory with isolated `HOME`, then repeats
+with explicit `AIRC_HOME`; it checks the selected database/socket, live daemon,
+and unchanged foreign database. Hosted Linux/macOS execute the actual extracted
+POSIX callsite; Windows extracts the actual scope/adoption callsite from
+`windows/adopt-installed.ps1` (full normal-token entry is exercised separately
+by the hosted standard-account public installation).

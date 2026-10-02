@@ -34,7 +34,7 @@ public static class FakeGsudo {
     if ($LASTEXITCODE -ne 0) { throw 'Synthetic gsudo compile failed.' }
     $phase=Join-Path $scratch 'phase.ps1'
     @'
-param($Windows,[string]$AircPath)
+param($Windows,[string]$AircPath,[string]$ScopeHome)
 if($AircPath){$Windows=$env:AIRC_SESSION_TEST_WINDOWS}
 $ErrorActionPreference='Stop'
 . (Join-Path $Windows 'shared-setup.ps1')

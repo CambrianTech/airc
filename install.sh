@@ -1343,11 +1343,14 @@ fi
 # interrupted adoption whose old daemon stopped before replacement was started.
 if [ -z "$EXPECTED_BUILD" ] && [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ]; then
   installed_airc="$BIN_DIR/airc"
+  # Installation targets the account service, independent of the source cwd.
+  # Preserve the documented explicit scope override for isolated installations.
+  installer_home="${AIRC_HOME:-$HOME/.airc}"
   case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) installed_airc="$BIN_DIR/airc.exe" ;; esac
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-      _windows_powershell -NoProfile -ExecutionPolicy RemoteSigned -File "$(cygpath -w "$CLONE_DIR/windows/adopt-installed.ps1")" -AircPath "$(cygpath -w "$installed_airc")" || fail 'Installed daemon could not be adopted safely; rerun setup to resume.' ;;
-    *) "$installed_airc" update --adopt-installed || fail 'Installed daemon could not be started and verified. Setup is incomplete; rerun this installer to resume.' ;;
+      _windows_powershell -NoProfile -ExecutionPolicy RemoteSigned -File "$(cygpath -w "$CLONE_DIR/windows/adopt-installed.ps1")" -AircPath "$(cygpath -w "$installed_airc")" -ScopeHome "$(cygpath -w "$installer_home")" || fail 'Installed daemon could not be adopted safely; rerun setup to resume.' ;;
+    *) "$installed_airc" --home "$installer_home" update --adopt-installed || fail 'Installed daemon could not be started and verified. Setup is incomplete; rerun this installer to resume.' ;;
   esac
 fi
 

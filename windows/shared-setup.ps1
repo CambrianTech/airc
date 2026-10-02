@@ -80,3 +80,27 @@ $aircSetupManifest = Get-AircSetupArtifact 'tools/scripts/generated/manifest.win
 $aircSetupElevation = Get-AircSetupArtifact 'tools/scripts/lib/windows-elevation.ps1' $aircSetupLock.elevationSha256
 . $aircSetupManifest
 . $aircSetupElevation -GsudoSource $script:ContinuumManifest['gsudo'].source
+
+# Installation owns the account service, not the checkout's ambient scope.
+# Explicit AIRC_HOME remains supported; never walk the invoking cwd for .airc.
+function Get-AircInstallerHome {
+    param([string]$ScopeHome)
+    if (-not $ScopeHome) {
+        if ($env:AIRC_HOME) { $ScopeHome = $env:AIRC_HOME }
+        else {
+            $accountRoot = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+            if (-not $accountRoot) { throw 'Installer adoption requires HOME or USERPROFILE, or explicit AIRC_HOME.' }
+            $ScopeHome = $accountRoot.TrimEnd('/','\') + '/.airc'
+        }
+    }
+    # Bash passes cygpath-normalized input. A direct PS entry may inherit MSYS
+    # HOME; use the same existing converter rather than guessing drive syntax.
+    if ($ScopeHome.StartsWith('/') -and -not $ScopeHome.StartsWith('//')) {
+        $converter = Get-Command cygpath.exe -ErrorAction SilentlyContinue
+        if (-not $converter) { throw 'MSYS scope path requires cygpath; run the supported Bash entry or provide a native AIRC_HOME.' }
+        $converted = @(Invoke-InstallerProcess -OwnProcessTree $converter.Source @('-w', $ScopeHome))
+        if ($LASTEXITCODE -ne 0 -or $converted.Count -ne 1) { throw 'Could not normalize installer scope with cygpath.' }
+        $ScopeHome = [string]$converted[0]
+    }
+    return [IO.Path]::GetFullPath($ScopeHome)
+}
