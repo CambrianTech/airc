@@ -38,3 +38,6 @@ function Invoke-Elevated {
     if(-not $resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()),[StringComparison]::OrdinalIgnoreCase)){throw 'Scratch cleanup outside temporary root'}
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
+# Expected refusal cases intentionally leave a native failure status. Only
+# completed assertions and cleanup make this standalone test successful.
+exit 0

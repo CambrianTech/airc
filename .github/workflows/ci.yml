@@ -268,7 +268,7 @@ jobs:
 
       - name: Elevated owner recovery adoption boundaries
         shell: powershell
-        run: ./test/windows-elevated-recovery.ps1
+        run: ./test/windows-recovery-test-contract.ps1
 
       - name: Update artifact handoff through Git Bash
         shell: powershell
