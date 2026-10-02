@@ -45,6 +45,7 @@ pub mod capability_registry;
 pub mod command_bus;
 pub mod coordinator;
 mod daemon;
+pub mod daemon_lifecycle;
 pub mod delivery_ack;
 pub mod diagnostic_event_sink;
 pub mod error;
@@ -172,7 +173,7 @@ pub use mesh_identity::{
     Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
 pub use peers::{
-    classify_peer_prune, EnrolledPeer, PeerPruneAction, PeerPruneVerdict,
+    classify_peer_prune, peer_trust_snapshot, EnrolledPeer, PeerPruneAction, PeerPruneVerdict,
     DEFAULT_PEER_STALE_AFTER_MS,
 };
 pub use publish::{PublishReceipt, PublishTarget};

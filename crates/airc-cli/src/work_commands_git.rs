@@ -58,7 +58,7 @@ pub(crate) async fn spawn_claim_worktree(
 
     // Resolve repo root from cwd (the user's checkout). git itself
     // handles the worktree-add — we don't reimplement.
-    let repo_root_out = std::process::Command::new("git")
+    let repo_root_out = airc_core::process::background("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
     if !repo_root_out.status.success() {
@@ -117,7 +117,7 @@ pub(crate) async fn spawn_claim_worktree(
 /// degrade. Parses both `https://github.com/owner/repo[.git]` and
 /// `git@github.com:owner/repo[.git]` shapes.
 pub(crate) fn cwd_github_repo_id(repo_root: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .args(["-C", repo_root, "remote", "get-url", "origin"])
         .output()
         .ok()?;
@@ -174,7 +174,7 @@ pub(crate) fn slugify(title: &str, max_len: usize) -> String {
     out
 }
 pub(crate) fn git_rev_parse_branch(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .args(["-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()?;
     if !out.status.success() {
@@ -196,7 +196,7 @@ pub(crate) fn git_show_format(
     worktree: &str,
     format: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .args([
             "-C",
             worktree,
@@ -282,6 +282,7 @@ mod tests {
             state: CardState::Open,
             owner: None,
             claim_id: None,
+            claim_provenance: None,
             claim_expires_at_ms: None,
             last_heartbeat_at_ms: None,
             pull_request: pr,

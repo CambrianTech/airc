@@ -97,6 +97,18 @@ pub const HEADER_HEARTBEAT_CLIENT: &str = "airc.heartbeat.client";
 /// noise low on a busy inbox.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long one beat keeps a peer present: five intervals. It must exceed the
+/// beat cadence (the router's 30 s default would drop a live peer between beats)
+/// and must not narrow any liveness window a reader already asks for — rosters
+/// ask up to 300 s. Readers still apply their own `within` cutoff on top.
+pub const PRESENCE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The coalesce key for one agent's presence: latest-wins per (peer, client), the
+/// same identity [`AgentHeartbeatKey`] folds on.
+fn presence_key(peer: PeerId, client_id: Option<&str>) -> String {
+    format!("presence:{peer}:{}", client_id.unwrap_or(""))
+}
+
 /// What the heartbeat is asserting. Reserved space for future kinds
 /// (`Leaving`, `Degraded`) so observers can switch on this string
 /// rather than parsing free-text.
@@ -339,6 +351,14 @@ impl Drop for HeartbeatTask {
     }
 }
 
+fn heartbeat_ticker(interval: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(interval);
+    // Presence is latest-state information. After an executor pause or a
+    // resume that advances its clock, emit once now, not every missed beat.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
+}
+
 impl Airc {
     /// Emit a single heartbeat. Useful for ad-hoc beats (e.g.
     /// `Leaving` on graceful shutdown) outside the periodic task.
@@ -408,6 +428,23 @@ impl Airc {
             kind.header_value().to_string(),
         );
         headers.insert(HEADER_HEARTBEAT_RUNTIME.into(), runtime);
+        // PRESENCE IS STATE, NOT AN EVENT (airc#1341). One live value per
+        // (peer, client), coalesced latest-wins by the router and gone when its
+        // TTL lapses — never a durable row. Measured 2026-09-26 on the IntelMac:
+        // 701,803 beat rows (333 MB, 59% of bus_events), +29,600 a day.
+        headers.insert(
+            airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.into(),
+            crate::publish::delivery_class_header_value(airc_bus::DeliveryClass::EphemeralLatest)
+                .into(),
+        );
+        headers.insert(
+            airc_protocol::headers_keys::HEADER_AIRC_COALESCE_KEY.into(),
+            presence_key(self.peer_id(), client_id.as_deref()),
+        );
+        headers.insert(
+            airc_bus::HEADER_EPHEMERAL_TTL_MS.into(),
+            PRESENCE_TTL.as_millis().to_string(),
+        );
         if let Some(client_id) = client_id {
             headers.insert(HEADER_HEARTBEAT_CLIENT.into(), client_id);
         }
@@ -499,7 +536,7 @@ impl Airc {
 
         let airc = self.clone();
         let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            let mut ticker = heartbeat_ticker(interval);
             // Skip the first tick since we already emitted above.
             ticker.tick().await;
             loop {
@@ -568,11 +605,11 @@ impl Airc {
     ) -> Result<Vec<AgentLiveness>, AircError> {
         let now = now_ms()?;
         let cutoff = now.saturating_sub(within.as_millis() as u64);
-        let filter = crate::EventFilter {
-            channel: room,
-            ..Default::default()
-        };
-        let recent = self.page_recent_filtered(filter, window).await?;
+        // `window` bounded a page of durable history back when presence was
+        // read out of the log. Presence is now the channel's live state
+        // (airc#1341) — O(present agents), no page to bound.
+        let _ = window;
+        let recent = self.presence_events(room).await?;
         let mut latest: std::collections::HashMap<AgentHeartbeatKey, AgentHeartbeat> =
             std::collections::HashMap::new();
         for event in &recent {
@@ -745,6 +782,79 @@ impl AgentHeartbeatKey {
     }
 }
 
+impl crate::Airc {
+    /// The channel's live presence as transcript events (airc#1341): the
+    /// daemon's router snapshot when attached, this scope's own cache when not.
+    /// Either way one entry per present (peer, client) — never a log page.
+    async fn presence_events(
+        &self,
+        room: Option<airc_core::RoomId>,
+    ) -> Result<Vec<TranscriptEvent>, crate::AircError> {
+        let channel = match room {
+            Some(channel) => channel,
+            None => self.current_room().await?.channel,
+        };
+        if self.is_daemon_attached() {
+            return self.daemon_presence(channel).await;
+        }
+        let now = now_ms()?;
+        let map = self
+            .inner
+            .presence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(map
+            .get(&channel)
+            .map(|cache| {
+                cache
+                    .snapshot(now)
+                    .iter()
+                    .map(|env| crate::daemon::project(env))
+                    .collect()
+            })
+            .unwrap_or_default()) // JUSTIFIED unwrap_or_default: a channel nobody has beaten into has no presence
+    }
+
+    /// Record an in-process `ephemeral_latest` frame into this scope's presence
+    /// cache (airc#1341). Header-only gate: anything else returns at once. A no-op
+    /// on an attached scope's in-process path, which the daemon's router covers.
+    pub(crate) fn observe_presence(&self, frame: &airc_protocol::Frame) {
+        let headers = &frame.envelope.headers;
+        if !matches!(
+            crate::publish::delivery_class_of(headers),
+            Ok(airc_bus::DeliveryClass::EphemeralLatest)
+        ) {
+            // A beat with no class header is a pre-#1341 emitter: absent means
+            // durable, so it becomes a log row no roster reads any more. Made
+            // visible until the last emitter migrates, then this goes.
+            if headers.contains_key(HEADER_HEARTBEAT_KIND)
+                && !headers.contains_key(airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS)
+            {
+                crate::probe!(
+                    class = crate::probe::class::DECISION,
+                    sender = %frame.envelope.sender,
+                    "unclassed heartbeat stored durable, invisible to rosters"
+                );
+            }
+            return;
+        }
+        let (Ok(env), Ok(now)) = (
+            crate::router_bridge::bus_envelope_for_inbound(frame),
+            now_ms(),
+        ) else {
+            return;
+        };
+        let mut map = self
+            .inner
+            .presence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(env.channel)
+            .or_insert_with(|| airc_bus::EphemeralCache::new(PRESENCE_TTL.as_millis() as u64))
+            .coalesce(Arc::new(env), now);
+    }
+}
+
 fn parse_heartbeat(event: &TranscriptEvent) -> Option<AgentHeartbeat> {
     let _ = event.headers.get(HEADER_HEARTBEAT_KIND)?;
     let body = event.body.as_ref()?;
@@ -791,6 +901,35 @@ async fn refresh_coordination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_heartbeat_emits_once_then_returns_to_cadence() {
+        use futures::FutureExt;
+
+        let mut ticker = heartbeat_ticker(DEFAULT_HEARTBEAT_INTERVAL);
+        let started = ticker.tick().await; // immediate beat is already emitted
+        tokio::time::advance(Duration::from_secs(8 * 60 * 60 + 7)).await;
+
+        assert!(
+            ticker.tick().now_or_never().is_some(),
+            "resume owes one current beat"
+        );
+        assert!(
+            ticker.tick().now_or_never().is_none(),
+            "missed beats must not burst on resume"
+        );
+        tokio::time::advance(Duration::from_secs(52)).await;
+        assert!(
+            ticker.tick().now_or_never().is_none(),
+            "normal cadence must not fire early"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            ticker.tick().now_or_never(),
+            Some(started + Duration::from_secs(8 * 60 * 60 + 60)),
+            "the next beat retains the configured cadence"
+        );
+    }
 
     // what this catches: a question about room B being answered with room A's
     // roster. That is what every default-scoped presence read does today, and it

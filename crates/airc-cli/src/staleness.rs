@@ -130,7 +130,7 @@ fn airc_repo_root() -> Option<PathBuf> {
     }
     // Fallback: cwd-based discovery (a dev working inside a clone with no
     // install-source marker set).
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
@@ -158,7 +158,7 @@ fn count_commits_behind(repo_root: &Path, current_commit: &str) -> Option<usize>
     // fetched). The whole staleness check is cache-gated (CACHE_TTL), so
     // this fetch runs at most once per TTL. Quiet + ignore failure
     // (offline is fine — we just compare against the last-known tip).
-    let _ = std::process::Command::new("git")
+    let _ = airc_core::process::background("git")
         .arg("-C")
         .arg(repo_root)
         .args(["fetch", "--quiet", "origin", "canary"])
@@ -188,7 +188,7 @@ fn count_commits_behind(repo_root: &Path, current_commit: &str) -> Option<usize>
     for p in &paths {
         args.push((*p).to_string());
     }
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .arg("-C")
         .arg(repo_root)
         .args(&args)

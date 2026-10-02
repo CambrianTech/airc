@@ -87,6 +87,8 @@ mod transport_cli;
 mod transport_commands;
 mod update_artifact;
 mod update_commands;
+mod update_legacy;
+mod update_rollback;
 mod update_shutdown;
 mod work_cli;
 mod work_commands;
@@ -628,18 +630,28 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Version => commands::run_version(),
 
-        Command::IpcEndpoint => {
+        Command::IpcEndpoint { native } => {
             // Resolve-only: print the canonical socket path airc would
             // bind for this scope. No daemon required (callers probe
             // liveness via `status`/`ping`). This is the contract
             // Continuum's airc discovery depends on.
-            println!("{}", cli::default_socket_path_in(&home).display());
+            let path = cli::default_socket_path_in(&home);
+            if native {
+                println!("{}", airc_ipc::transport::native_endpoint(&path));
+            } else {
+                println!("{}", path.display());
+            }
             Ok(())
         }
 
-        Command::Update { auto } => {
+        Command::Update {
+            auto,
+            adopt_installed,
+        } => {
             let socket = cli::default_socket_path_in(&home);
-            if auto {
+            if adopt_installed {
+                update_commands::adopt_installed(&home, socket)
+            } else if auto {
                 update_commands::run_update_auto(&home, socket)
             } else {
                 update_commands::run_update(&home, socket)
@@ -749,6 +761,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::CodexHook(args) => match args.action {
+            CodexHookAction::ConfigureInstaller {
+                codex_home,
+                token_stdin,
+                command_rules,
+            } => integrations::codex::install::configure_installer(
+                codex_home,
+                token_stdin,
+                command_rules,
+            ),
             CodexHookAction::InstallHooks { codex_home } => {
                 integrations::codex::install::run_install_hooks(codex_home).await
             }
@@ -848,10 +869,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 body,
                 priority,
             } => work_commands::run_update(&home, card_id, title, body, priority).await,
-            WorkAction::State { card_id, state } => {
-                work_commands::run_state(&home, card_id, state).await
+            WorkAction::State {
+                room,
+                card_id,
+                state,
+            } => work_commands::run_state(&home, room, card_id, state).await,
+            WorkAction::Close { room, card_id } => {
+                work_commands::run_close(&home, room, card_id).await
             }
-            WorkAction::Close { card_id } => work_commands::run_close(&home, card_id).await,
             WorkAction::Cleanup { dry_run, force } => {
                 work_commands::run_cleanup(&home, dry_run, force).await
             }
@@ -909,11 +934,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await
             }
             WorkAction::Review {
+                room,
                 parent_id,
                 pr,
                 priority,
                 body,
-            } => work_commands::run_review(&home, parent_id, pr, priority, body).await,
+            } => work_commands::run_review(&home, room, parent_id, pr, priority, body).await,
             WorkAction::Availability {
                 repo,
                 state,
@@ -934,10 +960,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             WorkAction::Merge {
+                room,
                 card_id,
                 dry_run,
                 pending_timeout_secs,
-            } => work_commands::run_merge(&home, card_id, dry_run, pending_timeout_secs).await,
+            } => {
+                work_commands::run_merge(&home, room, card_id, dry_run, pending_timeout_secs).await
+            }
             WorkAction::Link { card_id, pr } => work_commands::run_link(&home, card_id, pr).await,
             WorkAction::Relink { card_id, pr } => {
                 work_commands::run_relink(&home, card_id, pr).await

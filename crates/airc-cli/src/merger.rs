@@ -121,9 +121,8 @@ async fn tick_once(
     // documented surface for scheduling code, and with the persistent
     // projection cache each tick costs one incremental resume from
     // the last-applied cursor instead of a full event-log replay.
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    let room = airc.current_room().await?;
+    let board = airc.work_board_in(&room).await?;
     let snapshot = board.snapshot();
 
     // Card 045083e8: a room can contain cards from multiple repositories
@@ -153,7 +152,7 @@ async fn tick_once(
                     );
                     continue;
                 }
-                match perform_merge(gh, card, &pr, airc).await {
+                match perform_merge(gh, card, &pr, airc, &room).await {
                     Ok(()) => eprintln!(
                         "airc-merger: merged card={} pr=#{} ({})",
                         card.card_id, pr.number, pr.repo
@@ -172,7 +171,7 @@ async fn tick_once(
                     );
                     continue;
                 }
-                match perform_reconcile(card, &pr, merged_at_ms, airc).await {
+                match perform_reconcile(card, &pr, merged_at_ms, airc, &room).await {
                     Ok(()) => eprintln!(
                         "airc-merger: reconciled already-merged card={} pr=#{} ({})",
                         card.card_id, pr.number, pr.repo
@@ -201,13 +200,20 @@ async fn perform_reconcile(
     pr: &airc_work::model::PullRequestRef,
     merged_at_ms: u64,
     airc: &Airc,
+    room: &airc_lib::Room,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Card edf3670c: every "PR merged" terminal path routes
     // through `mark_merged_and_reclaim`. Eliminates the hand-paired
     // `mark_pull_request_merged + cleanup_card_worktree` duplication
     // and pins both wires at one site.
-    crate::work_commands::mark_merged_and_reclaim(airc, card.card_id, pr.clone(), merged_at_ms)
-        .await
+    crate::work_commands::mark_merged_and_reclaim(
+        airc,
+        room,
+        card.card_id,
+        pr.clone(),
+        merged_at_ms,
+    )
+    .await
 }
 
 enum MergeDecision {
@@ -625,6 +631,7 @@ async fn perform_merge(
     card: &WorkCard,
     pr: &airc_work::model::PullRequestRef,
     airc: &Airc,
+    room: &airc_lib::Room,
 ) -> Result<(), Box<dyn std::error::Error>> {
     gh.pr_merge(crate::gh_client::PrMergeArgs {
         repo: pr.repo.as_str().to_string(),
@@ -641,7 +648,8 @@ async fn perform_merge(
     // CLI's two terminal paths all agree. Before extraction, four
     // sites duplicated this pair and the CLI half forgot the cleanup
     // wire — recurring disk-full crash.
-    crate::work_commands::mark_merged_and_reclaim(airc, card.card_id, pr.clone(), now_ms).await
+    crate::work_commands::mark_merged_and_reclaim(airc, room, card.card_id, pr.clone(), now_ms)
+        .await
 }
 
 /// Acquire a non-blocking exclusive lock at `<home>/merger.lock`.

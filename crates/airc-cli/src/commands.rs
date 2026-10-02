@@ -59,9 +59,36 @@ pub async fn run_init(
     Ok(())
 }
 
+/// SOS is the account recovery transport, never an ordinary mesh room.
+/// Validate before opening the store or starting a daemon: bootstrap may be broken.
+pub(crate) fn reject_recovery_room(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(name) = name {
+        if airc_lib::ChannelName::new(name)?.as_str() == "sos" {
+            return Err("SOS is the account recovery gist, not a mesh room. Use `airc sos status` to read it, `airc sos watch` for new peer messages, or `airc sos send <message>` to post. No room was created or switched.".into());
+        }
+    }
+    Ok(())
+}
+
+/// Resolve once and pin the validated target, including legacy defaults and IDs.
+pub(crate) async fn mesh_publish_target(
+    airc: &Airc,
+    name: Option<&str>,
+) -> Result<airc_lib::PublishTarget, Box<dyn std::error::Error>> {
+    let room = match name {
+        Some(name) => airc.room_by_name_or_channel(name, "publish to").await?,
+        None => airc.current_room().await?,
+    };
+    reject_recovery_room(Some(&room.name))?;
+    Ok(airc_lib::PublishTarget::RoomByName(
+        room.channel.to_string(),
+    ))
+}
+
 /// `room` — print current room. `room <name>` — switch to a
 /// deterministic room derived from `<name>`.
 pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(name.as_deref())?;
     let airc = Airc::open(home).await?;
     match name {
         Some(name) => {
@@ -118,7 +145,7 @@ pub async fn run_doctrine_publish(
     let path = match from_file {
         Some(p) => p,
         None => {
-            let repo_root = std::process::Command::new("git")
+            let repo_root = airc_core::process::background("git")
                 .args(["rev-parse", "--show-toplevel"])
                 .output()?;
             if !repo_root.status.success() {
@@ -181,6 +208,7 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
 pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(room.as_deref())?;
     // Start the machine-singular daemon and attach: join, heartbeat, and
     // the live feed all route through the daemon's router (one path).
     let socket = crate::cli::default_socket_path_in(home);
@@ -275,11 +303,20 @@ pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 
 /// Poll the SOS gist alongside the live feed, printing any NEW peer posts.
 ///
-/// Returns a task handle whose drop cancels the poll — it lives exactly as long
-/// as the join it accompanies.
-fn start_sos_fallback(home: &Path) -> tokio::task::JoinHandle<()> {
+/// Dropping the owner requests cancellation of this join's poller. An in-flight
+/// synchronous gh call may finish before cancellation reaches the next await;
+/// dropping this owner does not terminate that subprocess.
+struct SosFallbackTask(tokio::task::JoinHandle<()>);
+
+impl Drop for SosFallbackTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn start_sos_fallback(home: &Path) -> SosFallbackTask {
     let home = home.to_path_buf();
-    tokio::spawn(async move {
+    SosFallbackTask(tokio::spawn(async move {
         // First poll is delayed: a node that just joined is the LEAST likely to
         // need the fallback, and an immediate `gh` call on every join would tax
         // the healthy path to serve the broken one.
@@ -291,7 +328,7 @@ fn start_sos_fallback(home: &Path) -> tokio::task::JoinHandle<()> {
             // explicit `airc sos status` says so plainly when asked.
             let _ = crate::sos_commands::poll_fallback_once(&home).await;
         }
-    })
+    }))
 }
 
 /// How often a joined node checks the out-of-band channel. Deliberately slow:
@@ -395,6 +432,7 @@ pub async fn ensure_daemon_running(
     socket: PathBuf,
     _peers: Vec<PeerSpec>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let _lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::autostart(home)?;
     // 1. Fast path: home-resolved socket already has a current daemon.
     let client = DaemonClient::new(socket.clone());
     if let Ok(status) = client.status_with_timeout(Duration::from_millis(250)).await {
@@ -684,7 +722,7 @@ fn resolve_gh_token_with(override_bin: Option<std::path::PathBuf>) -> Option<Str
         None => default_gh_candidates(),
     };
     for bin in candidates {
-        let Ok(output) = std::process::Command::new(&bin)
+        let Ok(output) = airc_core::process::background(&bin)
             .args(["auth", "token"])
             .output()
         else {
@@ -738,7 +776,10 @@ fn resolve_gh_bin_with(override_bin: Option<std::path::PathBuf>) -> Option<std::
         return Some(bin);
     }
     for bin in default_gh_candidates() {
-        if let Ok(output) = std::process::Command::new(&bin).arg("--version").output() {
+        if let Ok(output) = airc_core::process::background(&bin)
+            .arg("--version")
+            .output()
+        {
             if output.status.success() {
                 return Some(bin);
             }
@@ -764,10 +805,7 @@ pub(crate) fn detach_daemon(command: &mut Command) {
 
 #[cfg(windows)]
 pub(crate) fn detach_daemon(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x00000008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    airc_core::process::configure_detached(command);
 
     // Stop the detached daemon from inheriting THIS process's standard
     // handles. When `airc` is itself launched with piped stdio — every
@@ -1201,6 +1239,7 @@ pub async fn run_send(
     room: Option<&str>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(room)?;
     let airc = attached_airc(home).await?;
     for peer in &peers {
         airc.enrol_volatile_peer(peer)?;
@@ -1217,24 +1256,16 @@ pub async fn run_send(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room + runtime
     // headers" path runs unchanged.
-    let (channel_name, channel) = match room {
-        Some(name) => {
-            let receipt = airc
-                .publish(
-                    airc_lib::PublishTarget::RoomByName(name.to_string()),
-                    airc_protocol::FrameKind::Message,
-                    airc_core::Body::text(text),
-                    runtime_headers()?,
-                )
-                .await?;
-            (receipt.channel_name, receipt.channel_id)
-        }
-        None => {
-            let current = airc.current_room().await?;
-            airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel)
-        }
-    };
+    let target = mesh_publish_target(&airc, room).await?;
+    let receipt = airc
+        .publish(
+            target,
+            airc_protocol::FrameKind::Message,
+            airc_core::Body::text(text),
+            runtime_headers()?,
+        )
+        .await?;
+    let (channel_name, channel) = (receipt.channel_name, receipt.channel_id);
     let channel_id = channel.to_string();
     // `peers()` is the enrolled-remote-peer address book, NOT a
     // delivery count — see `format_send_receipt` for why the receipt
@@ -1807,32 +1838,50 @@ pub async fn run_daemon(
     //
     // Note the resolved TODO this carries: a connected-but-quiet node CAN now
     // update, which is the whole point. Exits on the shared shutdown notifier.
+    /// The mesh-idle predicate the periodic loops share (auto-update, the store
+    /// drain): quiet delivery stats, read without blocking the tick.
+    fn mesh_quiet_now(daemon_state: &airc_daemon::state::DaemonState) -> bool {
+        // try_read, NOT blocking_read: this predicate is called from
+        // inside the async tick, and tokio's RwLock::blocking_read
+        // panics in an async context — it would have taken the daemon
+        // down on the first tick.
+        match daemon_state.delivery_stats.try_read() {
+            Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
+                stats
+                    .peers
+                    .iter()
+                    .map(|s| (s.attempts_since_ack, s.suspect)),
+            ),
+            Err(_) => {
+                // Contended write (stats being refreshed). Skip THIS
+                // tick and retry next interval — never guess "quiet"
+                // from a lock we couldn't read. Loud, because a
+                // permanently-contended lock would silently become a
+                // node that never self-updates again, which is the
+                // exact failure class this whole path exists to kill.
+                eprintln!("airc auto-update: delivery stats busy — skipping this check");
+                false
+            }
+        }
+    }
+
     let auto_update_task = {
         let daemon_state = state.clone();
         tokio::spawn(async move {
-            airc_daemon::auto_update::run(&daemon_state.shutdown, || {
-                // try_read, NOT blocking_read: this predicate is called from
-                // inside the async tick, and tokio's RwLock::blocking_read
-                // panics in an async context — it would have taken the daemon
-                // down on the first tick.
-                match daemon_state.delivery_stats.try_read() {
-                    Ok(stats) => airc_daemon::auto_update::mesh_is_quiet(
-                        stats
-                            .peers
-                            .iter()
-                            .map(|s| (s.attempts_since_ack, s.suspect)),
-                    ),
-                    Err(_) => {
-                        // Contended write (stats being refreshed). Skip THIS
-                        // tick and retry next interval — never guess "quiet"
-                        // from a lock we couldn't read. Loud, because a
-                        // permanently-contended lock would silently become a
-                        // node that never self-updates again, which is the
-                        // exact failure class this whole path exists to kill.
-                        eprintln!("airc auto-update: delivery stats busy — skipping this check");
-                        false
-                    }
-                }
+            airc_daemon::auto_update::run(&daemon_state.shutdown, || mesh_quiet_now(&daemon_state))
+                .await;
+        })
+    };
+    // The drain (card 6781d7e9): the daemon that writes events.sqlite is the one
+    // that keeps it bounded — 2.65 GB of heartbeat rows and paging frames is what
+    // slowed this daemon past the core's patience on 2026-09-26. Same lifecycle
+    // as the auto-update loop; the full vacuum shares its quiet-mesh gate.
+    let store_retention_task = {
+        let daemon_state = state.clone();
+        let store = machine_store.clone();
+        tokio::spawn(async move {
+            airc_daemon::store_retention::run(&daemon_state.shutdown, store, || {
+                mesh_quiet_now(&daemon_state)
             })
             .await;
         })
@@ -2101,6 +2150,7 @@ pub async fn run_daemon(
     // abort is the same listener-error backstop. (The detached updater it may
     // have spawned is independent and intentionally outlives this process.)
     auto_update_task.abort();
+    store_retention_task.abort();
     // Server returned ⇒ shutdown fired ⇒ the registry loop's shutdown
     // waiter was woken by the same `notify_waiters()`. Await its clean
     // exit so the process doesn't drop an in-flight gist write
@@ -2148,21 +2198,44 @@ fn spawn_route_refresh(
     let delivery_stats = state.delivery_stats.clone();
     let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
-        airc_daemon::route_refresh::run_periodic_refresh(
+        // The registry task applies this same isolation policy before starting
+        // automatic listeners. Keep the refresh clock and stored peer dials
+        // active, while preventing endpoint refresh/relay election from
+        // acquiring wildcard listeners in an isolated scope.
+        run_route_refresh_with_advertising_policy(
+            airc_lib::account_registry_block(&state.home),
             &state.shutdown,
             &state.route_wake,
-            || {
+            |allow_advertising| {
                 refresh_routes_once(
                     &airc,
                     &connected,
                     &delivery_stats,
                     &endpoint_resync,
                     &rendezvous,
+                    allow_advertising,
                 )
             },
         )
         .await;
     })
+}
+
+async fn run_route_refresh_with_advertising_policy<F, Fut>(
+    block: Option<airc_lib::AccountRegistryBlock>,
+    shutdown: &tokio::sync::Notify,
+    wake: &tokio::sync::Notify,
+    mut refresh: F,
+) where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let allow_advertising = block.is_none();
+    if let Some(block) = block {
+        eprintln!("airc daemon: automatic listener acquisition disabled: {block}; stored peer refresh remains active");
+    }
+    airc_daemon::route_refresh::run_periodic_refresh(shutdown, wake, || refresh(allow_advertising))
+        .await;
 }
 
 /// One periodic route refresh: run discovery on the shared daemon handle
@@ -2176,6 +2249,7 @@ async fn refresh_routes_once(
     delivery_stats: &tokio::sync::RwLock<airc_ipc::DeliveryStatsResponse>,
     endpoint_resync: &tokio::sync::Notify,
     rendezvous: &SharedRendezvousSlot,
+    allow_advertising: bool,
 ) {
     // Adaptable-router reflex: re-detect this node's own routable LAN +
     // Tailscale IPv4 every tick (cheap, local — no network) and re-advertise
@@ -2184,37 +2258,45 @@ async fn refresh_routes_once(
     // changes IP keeps advertising a stale, undialable address until it is
     // manually restarted. Reused below for relay self-election so detection
     // happens exactly once per tick.
-    let lan_ip = crate::network_commands::advertise_lan_ip();
-    let tailscale_ip = crate::network_commands::detect_tailscale_ip();
-    match airc
-        .refresh_advertised_endpoints(lan_ip, tailscale_ip)
-        .await
-    {
-        Ok(true) => {
-            // Changed → nudge the registry loop to republish the corrected
-            // card NOW (edge-triggered; steady-state stays on cadence, so
-            // no spam). Loud: a reachability-affecting change is not silent.
-            let summary = airc
-                .route_endpoints()
-                .map(|endpoints| {
-                    endpoints
-                        .iter()
-                        .map(|endpoint| format!("{endpoint:?}"))
-                        .collect::<Vec<_>>()
-                        .join(" + ")
-                })
-                .unwrap_or_else(|_| "<unreadable>".to_string());
-            eprintln!(
-                "airc daemon: advertised endpoint changed (LAN/Tailscale IP moved) — \
+    let (lan_ip, tailscale_ip) = if allow_advertising {
+        (
+            crate::network_commands::advertise_lan_ip(),
+            crate::network_commands::detect_tailscale_ip(),
+        )
+    } else {
+        (None, None)
+    };
+    if allow_advertising {
+        match airc
+            .refresh_advertised_endpoints(lan_ip, tailscale_ip)
+            .await
+        {
+            Ok(true) => {
+                // Changed → nudge the registry loop to republish the corrected
+                // card NOW (edge-triggered; steady-state stays on cadence, so
+                // no spam). Loud: a reachability-affecting change is not silent.
+                let summary = airc
+                    .route_endpoints()
+                    .map(|endpoints| {
+                        endpoints
+                            .iter()
+                            .map(|endpoint| format!("{endpoint:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    })
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                eprintln!(
+                    "airc daemon: advertised endpoint changed (LAN/Tailscale IP moved) — \
                  now advertising [{summary}]; resyncing the account-registry card"
-            );
-            endpoint_resync.notify_one();
-        }
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!(
-                "airc daemon: advertised-endpoint refresh failed ({error}); retrying next tick"
-            );
+                );
+                endpoint_resync.notify_one();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!(
+                    "airc daemon: advertised-endpoint refresh failed ({error}); retrying next tick"
+                );
+            }
         }
     }
     match airc.refresh_route_discovery().await {
@@ -2339,8 +2421,10 @@ async fn refresh_routes_once(
             // role record: re-assume it on every tick unconditionally
             // (become_relay is idempotent — already-relaying is a cheap
             // re-advertise).
-            let has_relay_role = read_persisted_relay_port().is_some();
-            if snapshot.should_self_elect_as_relay(enrolled) || has_relay_role {
+            let has_relay_role = allow_advertising && read_persisted_relay_port().is_some();
+            if allow_advertising
+                && (snapshot.should_self_elect_as_relay(enrolled) || has_relay_role)
+            {
                 // Slice 4c: advertise the relay under our ROUTABLE IP(s)
                 // (LAN + Tailscale), never the 0.0.0.0 bind — peers can't
                 // dial a wildcard. Reuses the IPs detected once at the top
@@ -2551,6 +2635,7 @@ pub async fn run_msg(
     room: Option<&str>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    reject_recovery_room(room)?;
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
     sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     let airc = Airc::attach(home, socket).await?;
@@ -2559,24 +2644,16 @@ pub async fn run_msg(
     // scope's default-room pointer. Same shape as `airc publish`.
     // Without `--room`, the historical "current room" path runs
     // unchanged.
-    let (channel_name, channel) = match room {
-        Some(name) => {
-            let receipt = airc
-                .publish(
-                    airc_lib::PublishTarget::RoomByName(name.to_string()),
-                    airc_protocol::FrameKind::Message,
-                    airc_core::Body::text(text),
-                    runtime_headers()?,
-                )
-                .await?;
-            (receipt.channel_name, receipt.channel_id)
-        }
-        None => {
-            let current = airc.current_room().await?;
-            airc.say_with_headers(text, runtime_headers()?).await?;
-            (current.name, current.channel)
-        }
-    };
+    let target = mesh_publish_target(&airc, room).await?;
+    let receipt = airc
+        .publish(
+            target,
+            airc_protocol::FrameKind::Message,
+            airc_core::Body::text(text),
+            runtime_headers()?,
+        )
+        .await?;
+    let (channel_name, channel) = (receipt.channel_name, receipt.channel_id);
     let channel_id = channel.to_string();
     // Same enrolled-vs-delivered honesty fix as run_send, for the
     // daemon-attached send path. `peers()` is the address book, not a
@@ -3185,12 +3262,12 @@ pub async fn run_peer_set_tier(
     Ok(())
 }
 
-/// `peer list` — print enroled peers via `Airc::peers`. The daemon
-/// writes the same trust store, so this view stays consistent
+/// `peer list` — print scope and machine trust records. The daemon
+/// writes the machine trust store, so this view stays consistent
 /// whether the daemon is running or not. `--json` produces the
 /// machine-readable shape consumers (bridge, router) read off of.
 pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let peers = airc_trust::load(home).await?;
+    let peers = airc_lib::peer_trust_snapshot(home).await?;
     if json {
         // Card 34942ec1 Sub-C V4: JSON shape is the contract
         // consumers read. Pin the field names + the tier wire
@@ -3229,7 +3306,7 @@ pub async fn run_peer_list(home: &Path, json: bool) -> Result<(), Box<dyn std::e
 /// [`run_peer_list`] so the output **shape** is a pinnable contract:
 /// the tier-aware line format and the trust-store-not-files source are
 /// asserted by unit tests, rather than only surfacing as a downstream
-/// script break. Reads exactly the [`airc_trust::load`] view — never a
+/// script break. Reads the shared scope/machine trust snapshot — never a
 /// `<home>/peers/*.json` file — which is the entire point of seam #2.
 fn render_peer_list_lines(peers: &[airc_trust::StoredPeer], home: &Path) -> Vec<String> {
     if peers.is_empty() {
@@ -3263,7 +3340,7 @@ fn render_peer_list_lines(peers: &[airc_trust::StoredPeer], home: &Path) -> Vec<
     }
     lines.push(String::new());
     lines.push(format!(
-        "{} peer(s) enroled at {}",
+        "{} peer(s) enroled across scope/machine stores for {}",
         peers.len(),
         home.display()
     ));
@@ -3430,6 +3507,157 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn isolated_route_refresh_keeps_peer_clock_without_advertising() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let temp_block = airc_lib::account_registry_block(home.path());
+        assert!(temp_block.is_some(), "temporary daemon must be isolated");
+        for block in [
+            temp_block,
+            Some(airc_lib::AccountRegistryBlock::DisabledByEnv),
+        ] {
+            let shutdown = tokio::sync::Notify::new();
+            let wake = tokio::sync::Notify::new();
+            let ticks = std::sync::atomic::AtomicUsize::new(0);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                run_route_refresh_with_advertising_policy(
+                    block,
+                    &shutdown,
+                    &wake,
+                    |allow_advertising| {
+                        assert!(
+                            !allow_advertising,
+                            "isolated tick must not acquire listeners"
+                        );
+                        ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        shutdown.notify_waiters();
+                        async {}
+                    },
+                ),
+            )
+            .await
+            .expect("isolated peer refresh must still start immediately");
+            assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_route_refresh_keeps_the_immediate_production_tick() {
+        let shutdown = tokio::sync::Notify::new();
+        let wake = tokio::sync::Notify::new();
+        let ticks = std::sync::atomic::AtomicUsize::new(0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_route_refresh_with_advertising_policy(
+                None,
+                &shutdown,
+                &wake,
+                |allow_advertising| {
+                    assert!(
+                        allow_advertising,
+                        "ordinary production tick must retain advertising"
+                    );
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    shutdown.notify_waiters();
+                    async {}
+                },
+            ),
+        )
+        .await
+        .expect("production refresh must start immediately and honor shutdown");
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_join_sos_fallback_cancels_only_its_poller() {
+        let home = tempfile::tempdir().unwrap();
+        let first = start_sos_fallback(home.path());
+        let second = start_sos_fallback(home.path());
+        let first_state = first.0.abort_handle();
+        let second_state = second.0.abort_handle();
+        // Both real loops are parked before their first network poll.
+        tokio::task::yield_now().await;
+        assert!(!first_state.is_finished());
+        assert!(!second_state.is_finished());
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !first_state.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detaching a join must cancel its SOS fallback");
+        assert!(!second_state.is_finished(), "another join remains attached");
+        drop(second);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !second_state.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the remaining join must release its own fallback");
+    }
+
+    // Regression: join sos created a silent parallel room during fresh Windows onboarding.
+    #[tokio::test]
+    async fn sos_room_persisted_default_and_id_cannot_be_publish_targets() {
+        let home = tempfile::tempdir().expect("test directory");
+        let legacy = Airc::open(home.path()).await.unwrap();
+        let sos = legacy.join("sos").await.unwrap();
+        drop(legacy);
+        let airc = Airc::open(home.path()).await.unwrap();
+        for name in [None, Some("sos"), Some(sos.channel.to_string().as_str())] {
+            let error = mesh_publish_target(&airc, name).await.unwrap_err();
+            assert!(error.to_string().contains("airc sos watch"));
+        }
+        // History remains addressable; validation never removes the subscription.
+        assert!(airc.room_by_channel(sos.channel).await.unwrap().is_some());
+        let general = airc.join("general").await.unwrap();
+        assert!(matches!(
+            mesh_publish_target(&airc, None).await.unwrap(),
+            airc_lib::PublishTarget::RoomByName(id) if id == general.channel.to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn sos_room_is_rejected_before_any_bootstrap_side_effect() {
+        let parent = tempfile::tempdir().expect("test directory");
+        let home = parent.path().join("not-created");
+        for name in ["sos", "#sos", " SOS ", " #SoS "] {
+            for result in [
+                run_join(&home, Some(name.into())).await,
+                run_room(&home, Some(name.into())).await,
+                run_send(&home, Vec::new(), Some(name), "must not publish").await,
+                run_msg(
+                    &home,
+                    home.join("missing.sock"),
+                    Some(name),
+                    "must not publish",
+                )
+                .await,
+                crate::publish_commands::run_publish(
+                    &home,
+                    Some(name.into()),
+                    Some("must not publish".into()),
+                    None,
+                    false,
+                    Vec::new(),
+                    crate::cli::PublishFrameKind::Message,
+                )
+                .await,
+            ] {
+                let error = result
+                    .expect_err("recovery name must not create a mesh room")
+                    .to_string();
+                assert!(error.contains("airc sos watch"));
+                assert!(!home.exists(), "rejection must precede daemon/store setup");
+            }
+        }
+        assert!(reject_recovery_room(Some("sos-development")).is_ok());
+        assert!(reject_recovery_room(None).is_ok());
+    }
 
     /// what this catches (live 2026-08-12): the @mention parse feeding the
     /// deaf-room warning. `@name` at the start of a body is an addressing

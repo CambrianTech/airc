@@ -161,7 +161,7 @@ impl ReqwestGhClient {
         }
         // gh-auth-token spawn. Same shape as ShellGhClient's subprocess
         // pattern; this is the only gh process spawn we do.
-        let output = Command::new("gh")
+        let output = Command::from(airc_core::process::background("gh"))
             .args(["auth", "token"])
             .output()
             .await
@@ -1021,7 +1021,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let dir = temp.path().to_string_lossy().to_string();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .arg("-C")
                 .arg(&dir)
                 .args(args)

@@ -1,106 +1,44 @@
 use std::env;
 use std::error::Error;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
+use airc_lib::gh::governor::{GhBudget, GhClass, Reservation};
 use serde_json::Value;
-
-const DEFAULT_MAX_REQUESTS_PER_MIN: usize = 30;
 
 pub(crate) fn reserve_guarded_request(
     args: &[String],
     now: f64,
 ) -> Result<(bool, String), Box<dyn Error>> {
-    let _lock = GuardLock::acquire()?;
-    let until = backoff_until();
-    if now < until {
-        return Ok((
-            false,
-            format!("shared backoff active for {}s", (until - now) as i64),
-        ));
+    reserve_request(args, now, GhClass::Beacon)
+}
+
+pub(crate) fn reserve_recovery_request(
+    args: &[String],
+    now: f64,
+) -> Result<(bool, String), Box<dyn Error>> {
+    reserve_request(args, now, GhClass::Recovery)
+}
+
+fn reserve_request(
+    args: &[String],
+    now: f64,
+    class: GhClass,
+) -> Result<(bool, String), Box<dyn Error>> {
+    match GhBudget::account_default().reserve_class(args, now, class)? {
+        Reservation::Allowed => Ok((true, "allowed".into())),
+        Reservation::Denied {
+            retry_after_secs,
+            reason,
+        } => Ok((false, format!("{reason}; retry in {retry_after_secs}s"))),
     }
-    let count = recent_request_count(now)?;
-    let limit = max_requests_per_min();
-    // Starvation fix (task #288, 2026-08-01), mirroring
-    // airc-lib::gh::governor::reserve_class — this CLI path hosts the
-    // BEACON/channel polling traffic, so it is capped below the shared
-    // limit to leave airc-lib's REGISTRY_FLOOR untouchable: registry
-    // convergence must always find budget no matter how hot polling
-    // runs (the 33k-error empty-registry incident). And a LOCAL exceed
-    // no longer arms the SHARED backoff — that let one noisy poller
-    // lock out every caller (registry included) for 60s repeatedly;
-    // the sliding window is already self-limiting, and the shared
-    // backoff stays exclusively GitHub's own voice (note_rate_limit).
-    // Eventual single owner: delegate this whole fn to the lib
-    // governor (two implementations over one budget file is the
-    // registry_bridge smell).
-    let cap = limit.saturating_sub(airc_lib::gh::governor::REGISTRY_FLOOR);
-    // SOS is the channel of last resort: it is what a human or agent
-    // reaches for precisely when the wire is down and the poller is hot.
-    // Starving it behind the same bucket as beacon/channel polling meant
-    // "airc sos watch" answered "budget exceeded" during the exact
-    // incident it exists to coordinate — observed live 2026-08-13, and
-    // it is why an operator concluded the emergency channel was dead.
-    // It gets its own reserve above the poller cap, mirroring the
-    // REGISTRY_FLOOR carve-out one tier down.
-    let effective_cap = if is_sos_request(args) {
-        cap + SOS_RESERVE
-    } else {
-        cap
-    };
-    if count >= effective_cap {
-        // Report when the LOCAL window actually frees, not the shared
-        // backoff. `wait_seconds` reads GitHub's voice, which is 0 here —
-        // so the old message told the caller "retry in 0s" while refusing
-        // them, and a retry loop honoring it would spin at full speed
-        // against the very limiter that just said no.
-        return Ok((
-            false,
-            format!(
-                "local request budget exceeded ({count}/{effective_cap} of {limit} in 60s); \
-                 window frees in {}s",
-                local_window_frees_in(now)?
-            ),
-        ));
-    }
-    if guarded_command(args) {
-        record_request(now)?;
-    }
-    Ok((true, "allowed".to_string()))
 }
 
 pub(crate) fn budget_snapshot(now: f64) -> Result<(usize, usize), Box<dyn Error>> {
-    let _lock = GuardLock::acquire()?;
-    Ok((recent_request_count(now)?, max_requests_per_min()))
+    Ok(GhBudget::account_default().snapshot(now)?)
 }
-
-struct GuardLock(File);
-
-impl GuardLock {
-    fn acquire() -> Result<Self, Box<dyn Error>> {
-        let path = lock_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(path)?;
-        file.lock_exclusive()?;
-        Ok(Self(file))
-    }
-}
-
-impl Drop for GuardLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 pub(crate) fn wait_seconds(now: f64) -> i64 {
     (backoff_until() - now).max(0.0) as i64
 }
@@ -159,70 +97,6 @@ fn write_backoff(until: f64) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&tmp, format!("{}", until as i64))?;
     fs::rename(tmp, path)
-}
-
-/// Extra 60s-window slots reserved for `airc sos`, ON TOP of the poller
-/// cap. Small on purpose: SOS is low-rate human/agent coordination, not a
-/// poller, so a handful of slots is the difference between "the emergency
-/// channel answers" and "the emergency channel is dead".
-const SOS_RESERVE: usize = 6;
-
-/// True when this gh invocation is SOS traffic (the gist-comment channel
-/// of last resort). Matched on the request itself rather than threaded
-/// through as a flag so no future caller can forget to mark it.
-fn is_sos_request(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg.contains("/comments") || arg == "rate_limit")
-}
-
-/// Seconds until the OLDEST request in the sliding window ages out — i.e.
-/// when a slot actually frees. Returns 1 rather than 0 when the window is
-/// somehow empty, because a refusal must never advertise "retry now".
-fn local_window_frees_in(now: f64) -> std::io::Result<i64> {
-    let oldest = fs::read_to_string(budget_path())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<f64>().ok())
-        .filter(|ts| *ts >= now - 60.0)
-        .fold(f64::INFINITY, f64::min);
-    if !oldest.is_finite() {
-        return Ok(1);
-    }
-    Ok(((oldest + 60.0 - now).ceil() as i64).max(1))
-}
-
-fn recent_request_count(now: f64) -> std::io::Result<usize> {
-    let path = budget_path();
-    let cutoff = now - 60.0;
-    let kept: Vec<f64> = fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<f64>().ok())
-        .filter(|ts| *ts >= cutoff)
-        .collect();
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut file = File::create(&tmp)?;
-    for ts in &kept {
-        writeln!(file, "{ts:.3}")?;
-    }
-    fs::rename(tmp, path)?;
-    Ok(kept.len())
-}
-
-fn record_request(now: f64) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(budget_path())?;
-    writeln!(file, "{now:.3}")
-}
-
-fn max_requests_per_min() -> usize {
-    env::var("AIRC_GH_MAX_REQUESTS_PER_MIN")
-        .ok()
-        .and_then(|raw| raw.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MAX_REQUESTS_PER_MIN)
 }
 
 pub(crate) fn guarded_command(args: &[String]) -> bool {
@@ -370,10 +244,6 @@ pub(crate) fn audit_path() -> PathBuf {
     env::var_os("AIRC_GH_AUDIT_LOG")
         .map(PathBuf::from)
         .unwrap_or_else(|| gh_state_dir().join("requests.jsonl"))
-}
-
-fn lock_path() -> PathBuf {
-    gh_state_dir().join("guard.lock")
 }
 
 #[cfg(test)]

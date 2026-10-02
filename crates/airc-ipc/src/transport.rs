@@ -41,6 +41,33 @@ pub enum IpcStream {
 }
 
 impl IpcStream {
+    /// The Windows process serving this exact connected endpoint. Unlike an
+    /// informational PID file, this cannot select a daemon on another socket.
+    #[cfg(windows)]
+    pub fn server_process_id(&self) -> std::io::Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetNamedPipeServerProcessId(
+                pipe: *mut std::ffi::c_void,
+                process_id: *mut u32,
+            ) -> i32;
+        }
+        let Self::WindowsClient(client) = self else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "server PID requires a connected client pipe",
+            ));
+        };
+        let mut pid = 0;
+        // SAFETY: the client owns a live pipe handle; pid is writable for the
+        // duration of the synchronous Windows API call.
+        if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle(), &mut pid) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pid)
+    }
+
     /// Dial the daemon at the given path.
     pub async fn connect(path: &Path) -> std::io::Result<Self> {
         #[cfg(unix)]
@@ -415,11 +442,35 @@ fn canonicalize_for_hash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
+/// Resolve the endpoint used by the native transport without connecting.
+/// Install diagnostics use this rather than duplicating the Windows pipe hash.
+pub fn native_endpoint(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        resolve_pipe_name(path)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_diagnostic_endpoint_matches_transport_resolution() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("diagnostic.sock");
+        #[cfg(windows)]
+        assert_eq!(native_endpoint(&path), resolve_pipe_name(&path));
+        #[cfg(not(windows))]
+        assert_eq!(native_endpoint(&path), path.to_string_lossy());
+        assert!(!path.exists(), "resolution must not create a listener");
+    }
 
     #[test]
     fn pipe_names_differ_across_homes() {
@@ -486,6 +537,77 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore]
+    async fn windows_pipe_server_process_fixture() {
+        use tokio::io::AsyncReadExt;
+        let Some(path) = std::env::var_os("AIRC_PIPE_PID_FIXTURE") else {
+            return;
+        };
+        let listener = IpcListener::bind(Path::new(&path)).await.unwrap();
+        let mut stream = listener.accept().await.unwrap();
+        let mut finish = [0];
+        stream.read_exact(&mut finish).await.unwrap();
+        assert_eq!(finish, [1]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_server_pid_belongs_to_connected_endpoint_not_shared_pid_file() {
+        use std::os::windows::process::CommandExt;
+        use tokio::io::AsyncWriteExt;
+        struct FixtureChild(std::process::Child);
+        impl Drop for FixtureChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        // A separate legacy endpoint can overwrite this informational file.
+        std::fs::write(
+            dir.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let mut child = FixtureChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transport::tests::windows_pipe_server_process_fixture",
+                    "--ignored",
+                ])
+                .env("AIRC_PIPE_PID_FIXTURE", &socket)
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut client = loop {
+            match IpcStream::connect(&socket).await {
+                Ok(client) => break client,
+                Err(error) => {
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "fixture exited: {error}"
+                    );
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "fixture unavailable: {error}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+        assert_eq!(client.server_process_id().unwrap(), child.0.id());
+        assert_ne!(client.server_process_id().unwrap(), std::process::id());
+        client.write_all(&[1]).await.unwrap();
+        drop(client);
+        assert!(child.0.wait().unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn windows_two_homes_round_trip_concurrently() {
         // The defensible Windows runtime proof per grievance §4 /
         // Windows Gaps "Runtime named-pipe IPC test on Windows":
@@ -535,12 +657,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut client_a = IpcStream::connect(&sock_a).await.unwrap();
+        assert_eq!(client_a.server_process_id().unwrap(), std::process::id());
         client_a.write_all(b"PING-A").await.unwrap();
         client_a.flush().await.unwrap();
         let mut reply_a = [0u8; 6];
         client_a.read_exact(&mut reply_a).await.unwrap();
 
         let mut client_b = IpcStream::connect(&sock_b).await.unwrap();
+        assert_eq!(client_b.server_process_id().unwrap(), std::process::id());
         client_b.write_all(b"PING-B").await.unwrap();
         client_b.flush().await.unwrap();
         let mut reply_b = [0u8; 6];

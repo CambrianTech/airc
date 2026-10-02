@@ -40,6 +40,10 @@ pub enum Response {
     /// daemon answers from its owner-core `scoped_state` index, never by
     /// replaying the room.
     PeerIdentityCard(PeerIdentityCardResponse),
+    /// **airc#1341.** Response to `Presence` — the channel's live ephemeral
+    /// entries, each an `airc_wire::encode(&Envelope)` buffer (the `Inbox`
+    /// encoding, so one client decoder serves both).
+    Presence(PresenceResponse),
     /// **#270/#241.** Response to `ListRooms` — the scope's durable
     /// subscribed-room registry (parted rooms excluded). Answered from
     /// the coordinator store's subscriptions table, never inferred from
@@ -254,6 +258,14 @@ pub struct RoomTipResponse {
     /// absent on the wire) when the room has no durable events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip: Option<IpcCursor>,
+}
+
+/// Result of a `Presence` read (airc#1341): one wire-encoded envelope per live
+/// coalesced entry on the channel. Empty when nobody is present.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PresenceResponse {
+    /// Each an `airc_wire::encode(&Envelope)` buffer.
+    pub envelopes: Vec<Vec<u8>>,
 }
 
 /// Result of a `PeerIdentityCard` resolve: the peer's durable

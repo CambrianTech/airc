@@ -30,6 +30,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  AIRC_SKIP_AUTH: '1'
+
 jobs:
   clean-install-linux:
     runs-on: ubuntu-latest
@@ -179,6 +182,40 @@ jobs:
           fi
           echo "✓ airc stop clean"
 
+  setup-consent:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shared GitHub authorization behavior
+        shell: bash
+        run: bash test/setup-github-auth.sh
+      - name: Downloaded setup source compatibility
+        shell: bash
+        run: |
+          bash test/setup-source-acquisition.sh
+          bash test/install-bin-directory.sh
+      - name: Native setup acquisition and remaining-work storage planning
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./windows/sync-bootstrap.ps1 -Check
+          # Isolate deliberate native failure cases and function mocks. The
+          # runner otherwise exits with a cancellation fixture's LASTEXITCODE.
+          foreach ($test in @('windows-setup-bridge', 'windows-storage-plan', 'windows-gh-acquisition', 'windows-firewall-process', 'windows-firewall-policy', 'windows-daemon-diagnostics')) {
+            & powershell -NoProfile -ExecutionPolicy RemoteSigned -File "test/$test.ps1"
+            if ($LASTEXITCODE -ne 0) { throw "$test failed (exit $LASTEXITCODE)" }
+          }
+      - name: Windows PATH boundary through shared installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash test/windows-setup-path.sh
+      - name: Actual Windows firewall provider acceptance
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./test/windows-firewall-live.ps1
   clean-install-windows:
     runs-on: windows-latest
     steps:
@@ -189,6 +226,9 @@ jobs:
         shell: pwsh
         run: |
           $env:AIRC_DIR = "$env:USERPROFILE\.airc\src"
+          # Install this PR's detached checkout, as the Unix jobs do. Do not
+          # switch channels or pull a different revision during acceptance.
+          $env:AIRC_INSTALL_NO_PULL = '1'
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
           # install.ps1 must work from default Windows PowerShell 5.1
@@ -235,6 +275,7 @@ jobs:
         shell: powershell
         run: |
           $env:AIRC_DIR = "$env:USERPROFILE\.airc\src-ps5"
+          $env:AIRC_INSTALL_NO_PULL = '1'
           New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
           Copy-Item -Recurse -Force * $env:AIRC_DIR
           & "$env:AIRC_DIR\install.ps1"

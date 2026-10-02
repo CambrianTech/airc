@@ -9,6 +9,9 @@ param(
     [switch]$ExistingOnly,
     [switch]$RestartRequired
 )
+. (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
+Invoke-InstallerEntryPoint {
+Initialize-InstallerPowerShell
 $ErrorActionPreference = 'Stop'
 function Get-AircStartupTask {
     try { Get-ScheduledTask -TaskName 'airc-join' -TaskPath '\' -ErrorAction Stop }
@@ -19,6 +22,22 @@ function Get-AircStartupInstances {
     $service.Connect()
     $instances = $service.GetFolder('\').GetTask('airc-join').GetInstances(0)
     for ($index = 1; $index -le $instances.Count; $index++) { $instances.Item($index).InstanceGuid }
+}
+function Get-AircStartupOwnerSid {
+    param($Task)
+    $owner = $Task.Principal.UserId
+    if (-not $owner) { throw 'Cannot verify the existing AIRC startup task owner; no task changes were made.' }
+    if ($owner -match '^S-1-') { return $owner }
+    return (New-Object Security.Principal.NTAccount($owner)).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+function Test-AircStartupToken {
+    param($Task)
+    # Runtime always belongs to the original user's interactive, limited token.
+    # A legacy same-SID Highest/S4U task is not equivalent: its daemon can deny
+    # IPC access to normal desktop clients. Elevation repairs registration only.
+    return $Task -and (Get-AircStartupOwnerSid $Task) -eq $UserSid -and
+        [string]$Task.Principal.LogonType -in @('Interactive', '3') -and
+        [string]$Task.Principal.RunLevel -in @('Limited', '0')
 }
 function Assert-NoAircDaemon {
     # Console detach does not break Windows Job membership. A missing parent PID
@@ -35,19 +54,19 @@ try {
 $AircPath = (Resolve-Path -LiteralPath $AircPath -ErrorAction Stop).ProviderPath
 $runner = Join-Path (Split-Path $AircPath) 'airc-join-hidden.ps1'
 $source = Join-Path $PSScriptRoot 'run-join-hidden.ps1'
+$windowlessRunner = Join-Path (Split-Path $AircPath) 'airc-join-hidden.vbs'
+$windowlessSource = Join-Path $PSScriptRoot 'run-join-hidden.vbs'
 $runnerChanged = -not (Test-Path -LiteralPath $runner) -or
-    (Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $runner).Hash
+    (Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $runner).Hash -or
+    -not (Test-Path -LiteralPath $windowlessRunner) -or
+    (Get-FileHash -LiteralPath $windowlessSource).Hash -ne (Get-FileHash -LiteralPath $windowlessRunner).Hash
 $pending = $runner + '.restart-required'
 $logs = Join-Path $UserHome '.airc\logs'
-$shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$shell = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $existing = Get-AircStartupTask
 if ($ExistingOnly -and -not $existing) { return }
 if ($existing) {
-    $owner = $existing.Principal.UserId
-    if (-not $owner) { throw 'Cannot verify the existing AIRC startup task owner; no task changes were made.' }
-    $ownerSid = if ($owner -match '^S-1-') { $owner } else {
-        (New-Object Security.Principal.NTAccount($owner)).Translate([Security.Principal.SecurityIdentifier]).Value
-    }
+    $ownerSid = Get-AircStartupOwnerSid $existing
     if ($ownerSid -ne $UserSid) { throw 'The existing airc-join task belongs to another Windows account; no task changes were made.' }
 }
 $workingDirectory = $UserHome
@@ -55,20 +74,24 @@ if ($existing -and $existing.Actions[0].WorkingDirectory) {
     $workingDirectory = $existing.Actions[0].WorkingDirectory
 }
 $action = New-ScheduledTaskAction -Execute $shell -WorkingDirectory $workingDirectory `
-    -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "' +
-        $runner + '" -AircPath "' + $AircPath + '" -LogDirectory "' + $logs + '"')
-$unchanged = $existing -and @($existing.Actions).Count -eq 1 -and
+    -Argument ('//B //Nologo "' + $windowlessRunner + '" "' + $AircPath + '" "' + $logs + '"')
+$unchanged = (Test-AircStartupToken $existing) -and @($existing.Actions).Count -eq 1 -and
     $existing.Actions[0].Execute -eq $action.Execute -and
     $existing.Actions[0].Arguments -ceq $action.Arguments -and
     $existing.Actions[0].WorkingDirectory -eq $action.WorkingDirectory
 $restart = $restart -or ($existing -and $existing.State -eq 'Running' -and
     (-not $unchanged -or $runnerChanged -or (Test-Path -LiteralPath $pending)))
 if ($unchanged -and -not $runnerChanged -and -not $restart) { return }
-if ($runnerChanged) { Copy-Item -LiteralPath $source -Destination $runner -Force }
+if ($runnerChanged) {
+    Copy-Item -LiteralPath $source -Destination $runner -Force
+    Copy-Item -LiteralPath $windowlessSource -Destination $windowlessRunner -Force
+}
 if ($restart) { Set-Content -LiteralPath $pending -Value 'running supervisor needs updated action' }
 if (-not $unchanged -and $existing) {
-    # Retain the user's principal, triggers, restart policy and other settings.
-    Set-ScheduledTask -TaskName 'airc-join' -TaskPath '\' -Action $action -ErrorAction Stop | Out-Null
+    # Preserve triggers/settings, but migrate legacy elevated/noninteractive
+    # principals to the same account's normal desktop token.
+    $principal = New-ScheduledTaskPrincipal -UserId $UserSid -LogonType Interactive -RunLevel Limited
+    Set-ScheduledTask -TaskName 'airc-join' -TaskPath '\' -Action $action -Principal $principal -ErrorAction Stop | Out-Null
 } elseif (-not $existing) {
     $sid = New-Object Security.Principal.SecurityIdentifier($UserSid)
     $userName = $sid.Translate([Security.Principal.NTAccount]).Value
@@ -83,9 +106,9 @@ if (-not $unchanged -and $existing) {
         -Description 'Keep this node on the airc mesh: start the scope daemon at logon, restart it if it dies.' | Out-Null
 }
 $verified = Get-AircStartupTask
-if (-not $verified -or @($verified.Actions).Count -ne 1 -or
+if (-not (Test-AircStartupToken $verified) -or @($verified.Actions).Count -ne 1 -or
     $verified.Actions[0].Execute -ne $action.Execute -or $verified.Actions[0].Arguments -cne $action.Arguments -or
-    $verified.Actions[0].WorkingDirectory -ne $action.WorkingDirectory) { throw 'AIRC task action verification failed; the running task was not stopped.' }
+    $verified.Actions[0].WorkingDirectory -ne $action.WorkingDirectory) { throw 'AIRC task action/principal verification failed; the running task was not stopped.' }
 if ($restart) {
     if (-not $verified.Settings.Enabled) { throw 'Updated task is disabled; preserving its stopped/disabled policy instead of restarting it.' }
     # Suppress Task Scheduler's crash-restart race during the maintenance check.
@@ -114,17 +137,18 @@ Remove-Item -LiteralPath $pending -ErrorAction SilentlyContinue
     if (-not $accessDenied -or $Elevated) { throw }
     Write-Host 'Windows requires elevation to repair the existing AIRC startup task. Only startup repair will run elevated.'
     $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'RemoteSigned', '-File',
-        ('"' + $PSCommandPath + '"'), '-AircPath', ('"' + $AircPath + '"'),
-        '-UserSid', $UserSid, '-UserHome', ('"' + $UserHome + '"'), '-Elevated')
+        $PSCommandPath, '-AircPath', $AircPath,
+        '-UserSid', $UserSid, '-UserHome', $UserHome, '-Elevated')
     if ($restart) { $arguments += '-RestartRequired' }
     if ($ExistingOnly) { $arguments += '-ExistingOnly' }
+    . (Join-Path $PSScriptRoot 'shared-setup.ps1')
     try {
-        $repair = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-            -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments -PassThru -ErrorAction Stop
-    } catch { throw 'AIRC startup repair elevation was cancelled or rejected; rerun install.ps1 to retry startup registration. An already-current airc update skips installation.' }
-    $null = $repair.Handle
-    $repair.WaitForExit()
-    $code = $repair.ExitCode
-    $repair.Dispose()
+        Initialize-ElevationSession
+        Invoke-Elevated -Reason 'registering AIRC startup for the original user' -CommandLine (
+            @((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')) + $arguments)
+        $code = $LASTEXITCODE
+    } finally { Clear-Elevation }
     if ($code -ne 0) { throw 'Elevated AIRC startup repair failed; rerun install.ps1 to retry startup registration. An already-current airc update skips installation.' }
 }
+
+} # Installer diagnostic process boundary.

@@ -2,7 +2,6 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::Command;
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -208,7 +207,7 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 }
 
 fn query_gh_login() -> Option<String> {
-    let output = Command::new("gh")
+    let output = airc_core::process::background("gh")
         .args(["api", "user", "--jq", ".login"])
         .output()
         .ok()?;

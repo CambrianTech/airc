@@ -142,8 +142,9 @@ fn resolve_socket_path(
     // `ensure_daemon_running`'s build-mismatch path then stopped the
     // real daemon (bite 3 of card b0a81c31; flagged by the #1119
     // sentinel).
-    let is_machine_account_scope =
-        machine_home != home || user_home.map(|uh| machine_home == uh.join(".airc")) == Some(true);
+    let is_machine_account_scope = normalized_path(machine_home) != normalized_path(home)
+        || user_home.map(|uh| normalized_path(machine_home) == normalized_path(&uh.join(".airc")))
+            == Some(true);
     let legacy_fallback =
         machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
     if is_machine_account_scope {
@@ -271,6 +272,46 @@ fn read_user_home_from_env() -> Option<PathBuf> {
             }
         })
         .map(PathBuf::from)
+        .map(|path| normalized_path(&path))
+}
+
+fn normalized_path(path: &std::path::Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        match (
+            path.parent().and_then(|parent| parent.canonicalize().ok()),
+            path.file_name(),
+        ) {
+            (Some(parent), Some(name)) => parent.join(name),
+            _ => path.to_path_buf(),
+        }
+    })
+}
+
+/// Bounded historical endpoints for this actual machine account only. Isolated
+/// scopes never probe siblings or their parent account during migration.
+pub fn legacy_socket_paths_in(home: &std::path::Path, canonical: &std::path::Path) -> Vec<PathBuf> {
+    let Some(user_home) = read_user_home_from_env() else {
+        return Vec::new();
+    };
+    legacy_socket_paths_for(&crate::machine_account_home(home), &user_home)
+        .into_iter()
+        .filter(|candidate| normalized_path(candidate) != normalized_path(canonical))
+        .collect()
+}
+
+fn legacy_socket_paths_for(
+    machine_home: &std::path::Path,
+    user_home: &std::path::Path,
+) -> Vec<PathBuf> {
+    let account = normalized_path(&user_home.join(".airc"));
+    if normalized_path(machine_home) != account {
+        return Vec::new();
+    }
+    let filename = format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION);
+    vec![
+        account.join(&filename),
+        normalized_path(user_home).join(filename),
+    ]
 }
 
 /// 16-char hex prefix of SHA-256(canonical(path)). Used to namespace
@@ -295,6 +336,30 @@ fn machine_account_key(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_aliases_share_canonical_socket_and_bounded_legacy_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let account = root.path().join(".airc");
+        std::fs::create_dir(&account).unwrap();
+        let alias = root.path().join(".").join(".airc");
+        let machine = account.canonicalize().unwrap();
+        let runtime = root.path().join("runtime");
+        let socket = resolve_socket_path(&alias, &machine, Some(root.path()), Some(&runtime), None);
+        assert!(socket
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("airc-machine-"));
+        let candidates = legacy_socket_paths_for(&machine, root.path());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].parent().unwrap(), machine);
+        assert_eq!(
+            candidates[1].parent().unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+        assert!(legacy_socket_paths_for(&root.path().join("foreign"), root.path()).is_empty());
+    }
 
     #[test]
     fn default_socket_path_is_versioned_by_ipc_protocol() {

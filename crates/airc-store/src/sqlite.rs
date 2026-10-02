@@ -139,6 +139,11 @@ impl SqliteEventStore {
     pub async fn in_memory() -> Result<Self, StoreError> {
         Self::open("sqlite::memory:").await
     }
+    /// The one ORM, for the sibling modules of this crate that run statements the
+    /// entity API does not express (`retention`: JSON-predicate deletes, pragmas).
+    pub(crate) fn connection(&self) -> &DatabaseConnection {
+        &self.db
+    }
 
     pub async fn try_acquire_refresh_lock(
         &self,

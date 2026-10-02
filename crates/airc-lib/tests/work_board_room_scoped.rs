@@ -42,6 +42,71 @@ fn titles(board: &airc_lib::WorkBoardProjection) -> Vec<String> {
     titles
 }
 
+// Regression: a reviewer standing elsewhere must publish the sibling and merge
+// into the parent's room, without redirecting their next unscoped command.
+#[tokio::test]
+async fn review_and_merge_keep_the_selected_room_without_changing_default() {
+    let machine = Machine::boot().await;
+    let alice = machine.attach("alice").await;
+    let target = alice.join("target-room").await.unwrap();
+    let parent = alice
+        .create_work_card(CreateWorkCard::new(
+            RepoId::new("test-org/test-repo").unwrap(),
+            "parent",
+            Priority::P1,
+        ))
+        .await
+        .unwrap();
+    let home = alice.join("home-room").await.unwrap();
+    let review = alice
+        .create_work_card_in(
+            &target,
+            CreateWorkCard::new(
+                RepoId::new("test-org/test-repo").unwrap(),
+                "review",
+                Priority::P1,
+            )
+            .reviewing(parent),
+        )
+        .await
+        .unwrap();
+    let request = airc_lib::MarkPullRequestMerged {
+        card_id: parent,
+        pull_request: airc_work::PullRequestRef {
+            repo: RepoId::new("test-org/test-repo").unwrap(),
+            number: 1,
+            head: airc_work::BranchName::new("feature").unwrap(),
+            base: airc_work::BranchName::new("canary").unwrap(),
+        },
+        merged_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    };
+    assert!(alice
+        .mark_pull_request_merged(request.clone())
+        .await
+        .is_err());
+    alice
+        .mark_pull_request_merged_in(&target, request)
+        .await
+        .unwrap();
+    let board = alice.work_board_in(&target).await.unwrap();
+    assert_eq!(board.card(review).unwrap().reviews, Some(parent));
+    assert_eq!(
+        board.card(parent).unwrap().state,
+        airc_work::CardState::Merged
+    );
+    assert!(alice
+        .work_board_in(&home)
+        .await
+        .unwrap()
+        .snapshot()
+        .cards
+        .is_empty());
+    assert_eq!(alice.current_room().await.unwrap().channel, home.channel);
+}
+
 #[tokio::test]
 async fn a_board_read_for_a_named_room_returns_that_rooms_cards_not_the_current_rooms() {
     let machine = Machine::boot().await;
@@ -217,5 +282,143 @@ async fn a_state_change_for_a_named_room_lands_on_that_rooms_card() {
     assert_eq!(
         current.channel, home.channel,
         "BUG: a room-scoped mutate moved the default-room pointer"
+    );
+}
+
+// What this catches (continuum 2026-09-21, Kimi's lapsed lease): a claim's
+// heartbeat and release were pinned to `current_room()`, so a citizen renewing
+// a card she holds in a bench room while standing in the project room was
+// refused "not in current room" every minute until the lease lapsed and the card
+// was re-granted to another peer with her patch finished. The room-scoped
+// heartbeat lands the renewal on the board the card lives on and moves the
+// expiry; the current-room wrapper still refuses (the guard keeps its strength);
+// the room-scoped release clears the claim there; the current-room pointer
+// never moves.
+#[tokio::test]
+async fn a_claim_is_renewed_and_released_where_the_card_lives_not_where_she_stands() {
+    let machine = Machine::boot().await;
+    let alice = machine.attach("alice").await;
+
+    let bench = alice
+        .join("bench-room")
+        .await
+        .expect("alice joins bench-room");
+    create_card(&alice, "BENCH CARD").await;
+    let card_id = alice
+        .work_board()
+        .await
+        .expect("bench board")
+        .snapshot()
+        .cards[0]
+        .card_id;
+    let claim_id = alice
+        .claim_work_card(airc_lib::ClaimWorkCard {
+            card_id,
+            ttl_ms: 60_000,
+        })
+        .await
+        .expect("claim in the bench room");
+    let claimed_expiry = alice
+        .work_board_in(&bench)
+        .await
+        .expect("bench board")
+        .snapshot()
+        .cards
+        .into_iter()
+        .find(|c| c.card_id == card_id)
+        .expect("the claimed card")
+        .claim_expires_at_ms
+        .expect("a live lease");
+
+    // She stands in the project room now.
+    let project = alice
+        .join("project-room")
+        .await
+        .expect("alice joins project-room");
+
+    // The current-room heartbeat refuses — the exact refusal Kimi got every minute.
+    alice
+        .heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
+            card_id,
+            claim_id,
+            ttl_ms: 600_000,
+        })
+        .await
+        .expect_err("a heartbeat against the current room must refuse for a card elsewhere");
+
+    // The room-scoped heartbeat lands where the card lives and moves the expiry.
+    alice
+        .heartbeat_work_claim_in(
+            &bench,
+            airc_lib::HeartbeatWorkClaim {
+                card_id,
+                claim_id,
+                ttl_ms: 600_000,
+            },
+        )
+        .await
+        .expect("room-scoped heartbeat");
+    let renewed = alice
+        .work_board_in(&bench)
+        .await
+        .expect("bench board after heartbeat")
+        .snapshot()
+        .cards
+        .into_iter()
+        .find(|c| c.card_id == card_id)
+        .expect("the card is still hers");
+    assert_eq!(
+        renewed.owner,
+        Some(alice.peer_id()),
+        "the lease is still hers"
+    );
+    assert!(
+        renewed.claim_expires_at_ms.expect("a live lease") > claimed_expiry,
+        "BUG: the room-scoped heartbeat did not extend the lease on the named room's board"
+    );
+
+    // The guard is room-parameterized, not gone: the wrong room still refuses.
+    alice
+        .heartbeat_work_claim_in(
+            &project,
+            airc_lib::HeartbeatWorkClaim {
+                card_id,
+                claim_id,
+                ttl_ms: 600_000,
+            },
+        )
+        .await
+        .expect_err("a card not on the NAMED room's board must refuse");
+
+    // The room-scoped release clears the claim where the card lives.
+    alice
+        .release_work_claim_in(
+            &bench,
+            airc_lib::ReleaseWorkClaim {
+                card_id,
+                claim_id,
+                reason: Some("done".into()),
+            },
+        )
+        .await
+        .expect("room-scoped release");
+    let released = alice
+        .work_board_in(&bench)
+        .await
+        .expect("bench board after release")
+        .snapshot()
+        .cards
+        .into_iter()
+        .find(|c| c.card_id == card_id)
+        .expect("the card stays on the board");
+    assert_eq!(
+        released.claim_id, None,
+        "BUG: the room-scoped release did not clear the claim"
+    );
+
+    let current = alice.current_room().await.expect("current room");
+    assert_eq!(
+        current.channel, project.channel,
+        "BUG: a room-scoped lifecycle call moved the default-room pointer"
     );
 }

@@ -297,8 +297,17 @@ impl Airc {
         // subscriber reads it, the store says DuplicateEventId
         // because the sender already persisted, but our local
         // subscribers haven't seen it).
+        self.observe_presence(&frame);
         let event = frame.into_transcript_event();
         let event_id = event.event_id;
+        // Routed live, never history: a non-durable class (a backfill reply is
+        // a whole page of frames) fans out to live subscribers and stops there.
+        if !crate::publish::is_transcript_history(&event.headers) {
+            if self.mark_broadcast(event_id) {
+                let _ = self.inner.live_tx.send(Arc::new(event));
+            }
+            return Ok(());
+        }
         let persist_result = self.inner.store.append(event.clone()).await;
         match persist_result {
             Ok(()) | Err(airc_store::StoreError::DuplicateEventId(_)) => {

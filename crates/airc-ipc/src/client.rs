@@ -17,12 +17,13 @@ use crate::codec::{read_frame, write_frame};
 use crate::transport::IpcStream;
 
 use crate::request::{
-    AddPeerRequest, AttachRequest, InboxRequest, PeerIdentityCardRequest, PublishRequest,
-    RemovePeerRequest, Request, RoomTipRequest, SendRequest,
+    AddPeerRequest, AttachRequest, InboxRequest, PeerIdentityCardRequest, PresenceRequest,
+    PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 use crate::response::{
-    DeliveryStatsResponse, InboxResponse, PeerIdentityCardResponse, PeersResponse, PublishResponse,
-    Response, RoomTipResponse, RoomsResponse, RouteEndpointsResponse, StatusResponse,
+    DeliveryStatsResponse, InboxResponse, PeerIdentityCardResponse, PeersResponse,
+    PresenceResponse, PublishResponse, Response, RoomTipResponse, RoomsResponse,
+    RouteEndpointsResponse, StatusResponse,
 };
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -221,6 +222,17 @@ impl DaemonClient {
     /// event on a channel, without replaying the room. The cheap
     /// freshness/watermark query; pair the returned cursor with
     /// `inbox(since: tip)` or `AttachStart::After(tip)`.
+    /// airc#1341: the channel's live presence from the daemon's ephemeral cache.
+    pub async fn presence(
+        &self,
+        request: PresenceRequest,
+    ) -> Result<PresenceResponse, ClientError> {
+        match self.call(Request::Presence(request)).await? {
+            Response::Presence(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
+        }
+    }
+
     pub async fn room_tip(&self, request: RoomTipRequest) -> Result<RoomTipResponse, ClientError> {
         match self.call(Request::RoomTip(request)).await? {
             Response::RoomTip(response) => Ok(response),

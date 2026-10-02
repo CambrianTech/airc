@@ -48,7 +48,6 @@
 //! a fixed-string closure.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use airc_store::{EventStore, StoredMeshIdentity};
 use serde::{Deserialize, Serialize};
@@ -324,7 +323,7 @@ const RESOLVER_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// return None so the caller falls through to the next resolver.
 fn run_command(argv: &[&str]) -> Option<String> {
     let (program, args) = argv.split_first()?;
-    let mut child = Command::new(program)
+    let mut child = airc_core::process::background(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

@@ -143,7 +143,7 @@ fn default_home_dir_for_with(
 }
 
 fn git_main_working_tree(cwd: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(cwd)
         .output()
@@ -168,7 +168,7 @@ fn git_main_working_tree(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
@@ -630,7 +630,11 @@ pub enum Command {
     /// var — airc owns the path, callers ask for it. Resolves the path
     /// only; does NOT require the daemon to be running (callers probe
     /// liveness separately via `status`/`ping`).
-    IpcEndpoint,
+    IpcEndpoint {
+        /// Print the OS transport endpoint (Windows named pipe; Unix socket).
+        #[arg(long)]
+        native: bool,
+    },
 
     /// Fast-forward the installed source checkout and refresh the
     /// installed `airc` binary + skills from that source.
@@ -642,6 +646,10 @@ pub enum Command {
         /// run unattended (e.g. when a peer detects it's stale).
         #[arg(long)]
         auto: bool,
+        /// Start and verify an already-installed binary, or replace a stale
+        /// daemon through the maintenance handoff, without rebuilding.
+        #[arg(long, conflicts_with = "auto")]
+        adopt_installed: bool,
     },
 
     /// Self-diagnose the airc install + scope state.
@@ -824,10 +832,16 @@ mod tests {
         let parsed = Cli::try_parse_from(["airc", "ipc-endpoint"])
             .expect("`airc ipc-endpoint` must parse — Continuum discovery depends on it");
         assert!(
-            matches!(parsed.command, Command::IpcEndpoint),
+            matches!(parsed.command, Command::IpcEndpoint { native: false }),
             "ipc-endpoint must map to Command::IpcEndpoint, got {:?}",
             parsed.command
         );
+        let native = Cli::try_parse_from(["airc", "ipc-endpoint", "--native"])
+            .expect("native endpoint diagnostics must parse without a daemon");
+        assert!(matches!(
+            native.command,
+            Command::IpcEndpoint { native: true }
+        ));
     }
 
     // what this catches (self-healing join): the `airc dial HOST:PORT`

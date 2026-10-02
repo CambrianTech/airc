@@ -4,7 +4,6 @@ use std::error::Error;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -73,7 +72,9 @@ fn run_gh_with_input(gh_args: Vec<String>, input: Option<String>) -> Result<(), 
             "allowed": true,
             "reason": "interactive-auth",
         }));
-        let status = Command::new(&gh).args(&gh_args).status()?;
+        let status = airc_core::process::interactive(&gh)
+            .args(&gh_args)
+            .status()?;
         return if status.success() {
             Ok(())
         } else {
@@ -119,7 +120,7 @@ fn run_gh_with_input(gh_args: Vec<String>, input: Option<String>) -> Result<(), 
     }
 
     let output = if let Some(input) = input {
-        let mut child = Command::new(&gh)
+        let mut child = airc_core::process::background(&gh)
             .args(&gh_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -130,7 +131,9 @@ fn run_gh_with_input(gh_args: Vec<String>, input: Option<String>) -> Result<(), 
         }
         child.wait_with_output()?
     } else {
-        Command::new(&gh).args(&gh_args).output()?
+        airc_core::process::background(&gh)
+            .args(&gh_args)
+            .output()?
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

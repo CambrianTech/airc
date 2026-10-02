@@ -2,7 +2,7 @@
 //! finish before the caller may enter its daemon maintenance window.
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -12,10 +12,20 @@ pub struct PreparedInstall {
     source: PathBuf,
     shell: OsString,
     expected: String,
+    bin_directory: PathBuf,
 }
 
 impl PreparedInstall {
-    pub fn prepare(shell: &OsStr, source: &Path, expected: &str) -> Result<Self, Error> {
+    pub fn prepare(
+        shell: &OsStr,
+        source: &Path,
+        expected: &str,
+        executable: &Path,
+    ) -> Result<Self, Error> {
+        let bin_directory = executable
+            .parent()
+            .ok_or("executing updater has no installation directory")?
+            .to_path_buf();
         let directory = std::env::temp_dir().join(format!(
             "airc-update-{}-{}",
             std::process::id(),
@@ -30,6 +40,7 @@ impl PreparedInstall {
             source: source.to_path_buf(),
             shell: shell.to_os_string(),
             expected: expected.to_owned(),
+            bin_directory,
         };
         println!("Preparing and verifying the update while the daemon stays up…");
         prepared.run("--prepare-artifact")?;
@@ -49,8 +60,12 @@ impl PreparedInstall {
         self.run("--prebuilt")
     }
 
+    pub(crate) fn artifact(&self) -> &Path {
+        &self.artifact
+    }
+
     fn run(&self, mode: &str) -> Result<(), Error> {
-        let status = Command::new(&self.shell)
+        let status = airc_core::process::background(&self.shell)
             .arg(self.source.join("install.sh"))
             .args([mode])
             .arg(&self.artifact)
@@ -58,6 +73,10 @@ impl PreparedInstall {
             .arg(&self.expected)
             .env("AIRC_DIR", &self.source)
             .env("AIRC_INSTALL_NO_PULL", "1")
+            // The transaction displaces this executing installation. Never
+            // publish the replacement to another PATH entry or shell default.
+            .env("BIN_DIR", &self.bin_directory)
+            .env("BIN_TARGET", &self.bin_directory)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()?;

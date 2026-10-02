@@ -139,6 +139,11 @@ pub enum Request {
     /// daemon — the identity analog of `RoomTip` for the transcript. Returns
     /// `Response::PeerIdentityCard`.
     PeerIdentityCard(PeerIdentityCardRequest),
+    /// **airc#1341.** Current PRESENCE on a channel: the router's live
+    /// `EphemeralLatest` entries (one per `coalesce_key`), answered from the
+    /// in-memory ephemeral cache — never by paging durable history. Presence is
+    /// state, not an event. Returns `Response::Presence`.
+    Presence(PresenceRequest),
     /// **#270/#241.** The scope's durable subscribed-room registry
     /// (name + room id + joined-at + default flag, parted rooms
     /// excluded). The membership read that lets an attached client
@@ -200,6 +205,14 @@ pub struct InboxRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoomTipRequest {
     /// The channel (room) whose durable tip is being probed.
+    pub channel: airc_core::RoomId,
+}
+
+/// Parameters for `Presence` (airc#1341). The channel is mandatory: presence
+/// is a per-room property, like the tip.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PresenceRequest {
+    /// The channel (room) whose live presence is being read.
     pub channel: airc_core::RoomId,
 }
 
