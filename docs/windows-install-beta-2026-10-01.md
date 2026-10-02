@@ -816,3 +816,20 @@ within the existing deadline. Explicit errors/malformed frames/live process
 never count as recovery. Actual isolated native child tests pass acknowledgement,
 EOF and truncated EOF on exit, and refuse EOF-alive/protocol errors; the separate
 binary unverified-owner test proves no Stop is sent on failed ownership checks.
+
+### Explicit-scope acceptance follow-up (2026-10-02)
+
+At b3a0daa, Windows public installation and doctor completed, but the fixture's
+ambient-cwd endpoint/Stop queried a different scope after the installer correctly
+selected its explicit account home. The hosted fixture now passes that same
+resolved --home to doctor, endpoint receipt and graceful cleanup. Native token
+and captured-process-exit assertions remain mandatory.
+
+The unchanged long-root macOS binary regression exposed a real legacy candidate
+inspection defect: the canonical hashed short socket started, while connecting
+to a nonexistent historical home-private path exceeded SUN_LEN before absence
+could be observed. Unix legacy inspection now uses symlink_metadata and skips
+ONLY NotFound; present entries (including dangling symlinks), permission errors
+and all other uncertainty retain refusal. The long-root CLI regression is not
+shortened. Actual IPC tests add nonexistent long legacy paths plus present-file
+and dangling-symlink refusal; Unix execution remains pending hosted CI.

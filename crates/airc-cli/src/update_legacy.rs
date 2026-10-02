@@ -44,6 +44,22 @@ async fn inspect(canonical: PathBuf, candidates: Vec<PathBuf>) -> Result<Vec<Pat
         .map_err(|error| error.to_string())?;
     let mut verified = Vec::new();
     for candidate in candidates {
+        // Unix historical sockets require a filesystem entry. A deep account
+        // can use the canonical short hashed socket while its never-created
+        // legacy pathname exceeds SUN_LEN: connect rejects the pathname before
+        // it can report absence. Only observed NotFound permits skipping it.
+        // Existing entries and all uncertain filesystem errors remain guarded.
+        #[cfg(unix)]
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect legacy endpoint {}: {error}; no stop requested",
+                    candidate.display()
+                ));
+            }
+        }
         match airc_ipc::DaemonClient::new(candidate.clone())
             .status_with_timeout(Duration::from_millis(500))
             .await
@@ -136,13 +152,61 @@ mod tests {
         }
         let selected = inspect(
             canonical,
-            vec![legacy.clone(), foreign, root.path().join("missing.sock")],
+            vec![
+                legacy.clone(),
+                foreign,
+                root.path().join("missing.sock"),
+                root.path()
+                    .join("nonexistent".repeat(16))
+                    .join("legacy.sock"),
+            ],
         )
         .await
         .unwrap();
         assert_eq!(selected, vec![legacy]);
         for responder in responders {
             responder.await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn present_overlong_legacy_entries_remain_errors_including_dangling_symlinks() {
+        use airc_ipc::{
+            codec::{read_frame, write_frame},
+            transport::IpcListener,
+            Request, Response,
+        };
+        for symlink in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let canonical = root.path().join("canonical.sock");
+            let candidate = root.path().join("present".repeat(24));
+            if symlink {
+                std::os::unix::fs::symlink(root.path().join("missing-target"), &candidate).unwrap();
+            } else {
+                std::fs::write(&candidate, b"present unknown legacy entry").unwrap();
+            }
+            let listener = IpcListener::bind(&canonical).await.unwrap();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let request: Request = read_frame(&mut stream).await.unwrap().unwrap();
+                assert!(matches!(request, Request::Status), "inspection sent Stop");
+                write_frame(
+                    &mut stream,
+                    &Response::Status(status(
+                        "owner",
+                        Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION)),
+                    )),
+                )
+                .await
+                .unwrap();
+            });
+            let error = inspect(canonical, vec![candidate.clone()])
+                .await
+                .unwrap_err();
+            assert!(error.contains("Cannot verify legacy endpoint"), "{error}");
+            assert!(std::fs::symlink_metadata(&candidate).is_ok());
+            server.await.unwrap();
         }
     }
 }
