@@ -110,13 +110,13 @@ public static class SetupBridgeFixture {
     & (Join-Path $entry 'install.ps1') -FirewallOnly -AircPath $installedBinary
     $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
     Assert-True ($calls.Trim() -eq ('firewall|' + $installedBinary)) 'Firewall-only public entry rebuilt or lost the installed path'
-    # A fresh PS5 public-entry process must choose its own Security module even
+    # A fresh PS5 public-entry process must choose its own Utility module even
     # when the desktop host passes a foreign module path. No caller cleanup.
     $foreign = Join-Path $fixture 'foreign-modules'
-    $security = Join-Path $foreign 'Microsoft.PowerShell.Security'
-    New-Item -ItemType Directory -Path $security -Force | Out-Null
-    [IO.File]::WriteAllText((Join-Path $security 'Microsoft.PowerShell.Security.psm1'), 'function Get-FileHash { throw "FOREIGN SECURITY MODULE" }; Export-ModuleMember -Function Get-FileHash')
-    [IO.File]::WriteAllText((Join-Path $security 'Microsoft.PowerShell.Security.psd1'), "@{RootModule='Microsoft.PowerShell.Security.psm1';ModuleVersion='99.0';FunctionsToExport=@('Get-FileHash')}")
+    $utility = Join-Path $foreign 'Microsoft.PowerShell.Utility'
+    New-Item -ItemType Directory -Path $utility -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $utility 'Microsoft.PowerShell.Utility.psm1'), 'function ConvertFrom-Json { throw "FOREIGN UTILITY MODULE" }; Export-ModuleMember -Function ConvertFrom-Json')
+    [IO.File]::WriteAllText((Join-Path $utility 'Microsoft.PowerShell.Utility.psd1'), "@{RootModule='Microsoft.PowerShell.Utility.psm1';ModuleVersion='99.0';FunctionsToExport=@('ConvertFrom-Json')}")
     $modulePathBefore = $env:PSModulePath; $pathBefore = $env:PATH; $sourceBefore = $env:AIRC_DIR
     $controlEntry = Join-Path $entry 'control.ps1'
     $entryText = [IO.File]::ReadAllText((Join-Path $entry 'install.ps1'))
@@ -131,10 +131,7 @@ param($Entry, $Binary, $ForeignModules)
 # Windows PowerShell may reorder inherited module paths during startup; establish
 # the deliberately incompatible fixture before either public entry executes.
 $env:PSModulePath = $ForeignModules + ';' + $env:PSModulePath
-# Some PS5 hosts preload Security before running a -File script. Model the
-# incompatible selection explicitly so the control cannot pass by host luck.
-Import-Module (Join-Path $ForeignModules 'Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -Global -Force
-[Console]::WriteLine('selected hash command: ' + (Get-Command Get-FileHash).Module.Path)
+# ConvertFrom-Json is the first module-provided command in the generated loader.
 $before = $env:PSModulePath
 try {
     & $Entry -FirewallOnly -AircPath $Binary
@@ -147,7 +144,7 @@ try {
         $env:AIRC_DIR = $env:AIRC_FIXTURE_SOURCE
         [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
         $control = @(Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,$controlEntry,$installedBinary,$foreign) 2>&1)
-        Assert-True ($global:LASTEXITCODE -ne 0 -and ($control -join "`n") -match 'FOREIGN SECURITY MODULE') "Unfixed public-entry control did not select the hostile module (exit $global:LASTEXITCODE): $($control -join [Environment]::NewLine)"
+        Assert-True ($global:LASTEXITCODE -ne 0 -and ($control -join "`n") -match 'FOREIGN UTILITY MODULE') "Unfixed public-entry control did not select the hostile module (exit $global:LASTEXITCODE): $($control -join [Environment]::NewLine)"
         Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,(Join-Path $entry 'install.ps1'),$installedBinary,$foreign)
         Assert-True ($global:LASTEXITCODE -eq 0) 'Fresh PS5 public entry selected an incompatible inherited module'
         Assert-True ((Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw).Trim() -eq ('firewall|' + $installedBinary)) 'Foreign-module regression did not reach the public firewall boundary'

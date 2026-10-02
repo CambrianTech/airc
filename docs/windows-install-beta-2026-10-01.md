@@ -474,3 +474,10 @@ loads the same foreign Security module in both fresh child processes before the
 public entry. This proves recovery from an already selected incompatible module
 without depending on host autoload ordering. The fixed entry preserves module
 paths; removing its initializer fails. Independent review approved this delta.
+
+Final fixture targets Utility/ConvertFrom-Json, the generated loader's first
+module-provided command. CI diagnostics proved the Security control exited zero
+even though the foreign hash command was initially selected; its intervening
+module-loading behavior is not a reliable control. The first-command fixture
+avoids that later boundary and tests autoload directly, with no pre-import of
+the foreign module. The same initializer removal remains the negative control.
