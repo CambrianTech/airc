@@ -803,3 +803,16 @@ verifies isolated account state/socket/live daemon, repeats with explicit scope,
 and checks foreign bytes/timestamp/directory entries unchanged. Windows local
 normal-token public adapter passed; hosted extracted-callsite and complete
 public installation receipts for this new delta remain OPEN until fresh CI.
+
+### Legacy owner exit before Stop acknowledgement (2026-10-02)
+
+Bigmama's real recovery exposed two separate assumptions: a historical backup
+suffix was the checkout SHA, not necessarily the runtime SHA (peer fix5c35bc1,
+retained unchanged); then old owned daemon25236 exited before acknowledging
+Stop, leaving the installer with early EOF despite the process/pipe exiting.
+Recovery now treats only read EOF after successful Stop write as compatible
+with shutdown, and still requires the captured verified handle to signal exit
+within the existing deadline. Explicit errors/malformed frames/live process
+never count as recovery. Actual isolated native child tests pass acknowledgement,
+EOF and truncated EOF on exit, and refuse EOF-alive/protocol errors; the separate
+binary unverified-owner test proves no Stop is sent on failed ownership checks.

@@ -77,3 +77,19 @@ and unchanged foreign database. Hosted Linux/macOS execute the actual extracted
 POSIX callsite; Windows extracts the actual scope/adoption callsite from
 `windows/adopt-installed.ps1` (full normal-token entry is exercised separately
 by the hosted standard-account public installation).
+
+## Legacy backup labels and shutdown acknowledgements
+
+The legacy updater labeled airc.old-<revision> using its source checkout, which
+can differ from the displaced running binary. The filename remains validated
+as an owned backup under the installed directory, but its label is not compared
+to Status.build_commit. The held-pipe PID, same-SID high token, executable path,
+canonical protocol and valid observed runtime revision remain required.
+
+Some old daemons close their connection while exiting before the Stop reply is
+read. After a successful canonical Stop write, only an acknowledgement or
+shutdown-compatible EOF may proceed to the existing bounded wait on the held
+verified process handle. EOF while the process lives, explicit protocol errors,
+malformed replies, other I/O failures and timeout remain failures. No force
+termination is introduced. Native isolated child/IPC regressions cover these
+outcomes; live elevated recovery remains a separate installation receipt.

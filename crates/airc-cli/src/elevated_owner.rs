@@ -169,6 +169,35 @@ async fn verify_image_build(socket: &Path, pid: u32) -> Result<(), Error> {
     // installed directory above, never by equating these unrelated revisions.
     Ok(())
 }
+
+async fn stop_and_wait(pipe: &mut IpcStream, process: &Owned) -> Result<(), Error> {
+    // A failed write does not prove Stop was sent. Only the reply read may
+    // report shutdown-compatible EOF, after the canonical request was written.
+    write_frame(pipe, &Request::Stop).await?;
+    match read_frame::<_, Response>(pipe).await {
+        Ok(Some(Response::Ok)) | Ok(None) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(error) => return Err(error.into()),
+        Ok(Some(response)) => {
+            return Err(format!(
+                "Bound daemon rejected or misreported graceful Stop: {response:?}"
+            )
+            .into());
+        }
+    }
+    // Old owners can exit before replying. EOF alone is never success: this
+    // exact process handle was captured and verified while the pipe was held.
+    // The caller's existing recovery deadline bounds both reply and exit wait.
+    loop {
+        // SAFETY: caller retains the owned query/synchronize process handle.
+        match unsafe { WaitForSingleObject(process.0, 0) } {
+            0 => return Ok(()),
+            258 => tokio::time::sleep(Duration::from_millis(50)).await,
+            _ => return Err(std::io::Error::last_os_error().into()),
+        }
+    }
+}
+
 pub(crate) async fn recover(socket: &Path, caller: &str, installed: &Path) -> Result<(), Error> {
     tokio::time::timeout(Duration::from_secs(15),async {
         let mut pipe=IpcStream::connect(socket).await?;
@@ -191,17 +220,7 @@ pub(crate) async fn recover(socket: &Path, caller: &str, installed: &Path) -> Re
         if pipe.server_process_id()?!=pid || unsafe {WaitForSingleObject(process.0,0)}!=258 {return Err("Bound daemon changed or exited before recovery".into());}
         let owner = token(process.0)?;
         eligible(caller,&sid(&observer,1)?,&sid(&owner,1)?,information(&owner,20)?[0]&0xffffffff!=0,&sid(&owner,25)?)?;
-        write_frame(&mut pipe,&Request::Stop).await?;
-        let response:Option<Response>=read_frame(&mut pipe).await?;
-        if !matches!(response,Some(Response::Ok)){return Err("Bound daemon did not acknowledge graceful Stop".into());}
-        loop {
-            // SAFETY: process handle is held throughout the bounded asynchronous wait.
-            match unsafe {WaitForSingleObject(process.0,0)} {
-                0=>break,
-                258=>tokio::time::sleep(Duration::from_millis(50)).await,
-                _=>return Err(std::io::Error::last_os_error().into()),
-            }
-        }
+        stop_and_wait(&mut pipe,&process).await?;
         println!("Stopped same-account elevated AIRC endpoint owner {pid}; normal-token adoption may proceed");
         Ok::<(),Error>(())
     }).await.map_err(|_|"Elevated owner recovery timed out; no force termination was attempted")?
@@ -223,6 +242,135 @@ pub(crate) async fn access_denied(socket: &Path) -> Result<bool, Error> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stop_child_fixture() {
+        let Ok(mode) = std::env::var("AIRC_RECOVERY_STOP_FIXTURE") else {
+            return;
+        };
+        let socket =
+            std::path::PathBuf::from(std::env::var_os("AIRC_RECOVERY_STOP_SOCKET").unwrap());
+        let ready = std::path::PathBuf::from(std::env::var_os("AIRC_RECOVERY_STOP_READY").unwrap());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let listener = airc_ipc::transport::IpcListener::bind(&socket)
+                    .await
+                    .unwrap();
+                std::fs::write(&ready, b"ready").unwrap();
+                let mut pipe = listener.accept().await.unwrap();
+                let request: Option<super::Request> = super::read_frame(&mut pipe).await.unwrap();
+                assert!(matches!(request, Some(super::Request::Stop)));
+                std::fs::write(ready.with_extension("stop"), b"canonical Stop received").unwrap();
+                match mode.as_str() {
+                    "ack-exit" => super::write_frame(&mut pipe, &super::Response::Ok)
+                        .await
+                        .unwrap(),
+                    "error-exit" => super::write_frame(
+                        &mut pipe,
+                        &super::Response::Error {
+                            message: "refused".into(),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                    "malformed-exit" => pipe.write_all(&[0, 0, 0, 1, 0xff]).await.unwrap(),
+                    "truncated-exit" => pipe.write_all(&[0, 0, 0, 8, 0]).await.unwrap(),
+                    "eof-exit" | "eof-alive" => {}
+                    other => panic!("Unknown isolated fixture mode {other}"),
+                }
+                drop(pipe);
+                drop(listener);
+                if mode == "eof-alive" {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            });
+    }
+
+    #[tokio::test]
+    async fn stop_eof_requires_captured_process_exit_and_rejects_protocol_errors() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                // This is our exact spawned test child, never a daemon PID file.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for mode in [
+            "ack-exit",
+            "eof-exit",
+            "truncated-exit",
+            "eof-alive",
+            "error-exit",
+            "malformed-exit",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("recovery-fixture.sock");
+            let ready = temp.path().join("ready");
+            let mut command = airc_core::process::background(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "elevated_owner::tests::stop_child_fixture",
+                    "--nocapture",
+                ])
+                .env("AIRC_RECOVERY_STOP_FIXTURE", mode)
+                .env("AIRC_RECOVERY_STOP_SOCKET", &socket)
+                .env("AIRC_RECOVERY_STOP_READY", &ready)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut child = Child(command.spawn().unwrap());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "fixture exited before ready: {mode}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture did not bind: {mode}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let mut pipe = super::IpcStream::connect(&socket).await.unwrap();
+            assert_eq!(pipe.server_process_id().unwrap(), child.0.id());
+            // SAFETY: PID comes from held native pipe and matches our retained child.
+            let raw = unsafe { super::OpenProcess(0x1000 | 0x100000, 0, child.0.id()) };
+            assert!(!raw.is_null());
+            let process = super::Owned(raw);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(700),
+                super::stop_and_wait(&mut pipe, &process),
+            )
+            .await;
+            assert!(
+                ready.with_extension("stop").exists(),
+                "no canonical Stop delivered: {mode}"
+            );
+            match mode {
+                "ack-exit" | "eof-exit" | "truncated-exit" => {
+                    result.unwrap().unwrap();
+                    assert!(
+                        child.0.try_wait().unwrap().is_some(),
+                        "accepted live process: {mode}"
+                    );
+                }
+                "eof-alive" => {
+                    assert!(result.is_err(), "EOF was accepted without process exit");
+                    assert!(child.0.try_wait().unwrap().is_none());
+                }
+                "error-exit" | "malformed-exit" => assert!(
+                    result.unwrap().is_err(),
+                    "protocol failure accepted: {mode}"
+                ),
+                other => panic!("Unknown fixture mode {other}"),
+            }
+        }
+    }
+
     #[test]
     fn native_observer_token_and_install_provenance() {
         // SAFETY: no-argument current-process pseudo-handle API.
