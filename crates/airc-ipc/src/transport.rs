@@ -442,11 +442,35 @@ fn canonicalize_for_hash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
+/// Resolve the endpoint used by the native transport without connecting.
+/// Install diagnostics use this rather than duplicating the Windows pipe hash.
+pub fn native_endpoint(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        resolve_pipe_name(path)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_diagnostic_endpoint_matches_transport_resolution() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("diagnostic.sock");
+        #[cfg(windows)]
+        assert_eq!(native_endpoint(&path), resolve_pipe_name(&path));
+        #[cfg(not(windows))]
+        assert_eq!(native_endpoint(&path), path.to_string_lossy());
+        assert!(!path.exists(), "resolution must not create a listener");
+    }
 
     #[test]
     fn pipe_names_differ_across_homes() {

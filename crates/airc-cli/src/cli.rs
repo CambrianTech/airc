@@ -630,7 +630,11 @@ pub enum Command {
     /// var — airc owns the path, callers ask for it. Resolves the path
     /// only; does NOT require the daemon to be running (callers probe
     /// liveness separately via `status`/`ping`).
-    IpcEndpoint,
+    IpcEndpoint {
+        /// Print the OS transport endpoint (Windows named pipe; Unix socket).
+        #[arg(long)]
+        native: bool,
+    },
 
     /// Fast-forward the installed source checkout and refresh the
     /// installed `airc` binary + skills from that source.
@@ -828,10 +832,16 @@ mod tests {
         let parsed = Cli::try_parse_from(["airc", "ipc-endpoint"])
             .expect("`airc ipc-endpoint` must parse — Continuum discovery depends on it");
         assert!(
-            matches!(parsed.command, Command::IpcEndpoint),
+            matches!(parsed.command, Command::IpcEndpoint { native: false }),
             "ipc-endpoint must map to Command::IpcEndpoint, got {:?}",
             parsed.command
         );
+        let native = Cli::try_parse_from(["airc", "ipc-endpoint", "--native"])
+            .expect("native endpoint diagnostics must parse without a daemon");
+        assert!(matches!(
+            native.command,
+            Command::IpcEndpoint { native: true }
+        ));
     }
 
     // what this catches (self-healing join): the `airc dial HOST:PORT`

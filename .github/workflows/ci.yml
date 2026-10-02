@@ -202,7 +202,7 @@ jobs:
           ./windows/sync-bootstrap.ps1 -Check
           # Isolate deliberate native failure cases and function mocks. The
           # runner otherwise exits with a cancellation fixture's LASTEXITCODE.
-          foreach ($test in @('windows-setup-bridge', 'windows-storage-plan', 'windows-gh-acquisition', 'windows-firewall-process', 'windows-firewall-policy')) {
+          foreach ($test in @('windows-setup-bridge', 'windows-storage-plan', 'windows-gh-acquisition', 'windows-firewall-process', 'windows-firewall-policy', 'windows-daemon-diagnostics')) {
             & powershell -NoProfile -ExecutionPolicy RemoteSigned -File "test/$test.ps1"
             if ($LASTEXITCODE -ne 0) { throw "$test failed (exit $LASTEXITCODE)" }
           }
