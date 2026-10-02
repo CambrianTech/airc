@@ -11,7 +11,8 @@
 # when the registration already matches; a changed registration is reloaded.
 set -euo pipefail
 
-LABEL=com.cambriantech.airc-join
+# One name for the mesh supervisor on every OS: the Windows task is `airc-join` too.
+LABEL=airc-join
 UNIT=airc-join.service
 
 die() { printf 'AIRC autostart: %s\n' "$*" >&2; exit 1; }
