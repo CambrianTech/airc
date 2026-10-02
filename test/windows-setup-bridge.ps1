@@ -130,6 +130,9 @@ param($Entry, $Binary, $ForeignModules)
 # Windows PowerShell may reorder inherited module paths during startup; establish
 # the deliberately incompatible fixture before either public entry executes.
 $env:PSModulePath = $ForeignModules + ';' + $env:PSModulePath
+# Some PS5 hosts preload Security before running a -File script. Model the
+# incompatible selection explicitly so the control cannot pass by host luck.
+Import-Module (Join-Path $ForeignModules 'Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -Global -Force
 $before = $env:PSModulePath
 try {
     & $Entry -FirewallOnly -AircPath $Binary

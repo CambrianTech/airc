@@ -467,3 +467,10 @@ module path before invoking the actual public entry, then assert preservation
 of that exact baseline. The unfixed control fails and the repaired entry passes;
 full bridge regression passes locally. Independent review approved this delta.
 Final-head CI and public live acceptance remain OPEN.
+
+The second Windows CI control still did not select the foreign module; its
+host-specific autoload cause is not established. The fixture now explicitly
+loads the same foreign Security module in both fresh child processes before the
+public entry. This proves recovery from an already selected incompatible module
+without depending on host autoload ordering. The fixed entry preserves module
+paths; removing its initializer fails. Independent review approved this delta.
