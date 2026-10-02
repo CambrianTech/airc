@@ -8,6 +8,9 @@ param(
     [string]$PrebuiltArtifact,
     [string]$ExpectedBuild
 )
+. (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
+Invoke-InstallerEntryPoint {
+Initialize-InstallerPowerShell
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'shared-setup.ps1')
 try {
@@ -20,3 +23,5 @@ try {
     $result = $LASTEXITCODE
 } finally { Clear-Elevation }
 exit $result
+
+} # Installer diagnostic process boundary.

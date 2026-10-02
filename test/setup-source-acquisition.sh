@@ -18,7 +18,7 @@ printf 'new fixture source\n' > "$destination/Cargo.toml"
 printf '#!/usr/bin/env bash\necho compatible-auth-stage\n' > "$destination/setup/github-auth.sh"
 if [ "${AIRC_FIXTURE_WINDOWS:-0}" = 1 ]; then
   mkdir -p "$destination/windows"
-  for relative in install-prereqs.ps1 register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 sync-bootstrap.ps1; do
+  for relative in install-prereqs.ps1 register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 sync-bootstrap.ps1 setup-entrypoint.ps1; do
     printf 'fixture\n' > "$destination/windows/$relative"
   done
   printf '#!/usr/bin/env bash\necho compatible-windows-session\n' > "$destination/windows/run-powershell.sh"

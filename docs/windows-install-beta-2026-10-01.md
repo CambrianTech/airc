@@ -456,7 +456,7 @@ module first in PSModulePath; removing the generated initializer makes the same
 fixture fail with the foreign-module sentinel. The child asserts inherited paths
 are unchanged. The full setup bridge and the four storage/acquisition/firewall
 suites pass. These isolated fixtures do not modify the live firewall or daemon.
-The provisional helper revision depends on Continuum #4660; repinning to its
+The released helper revision depends on Continuum #4660; repinning to its
 released merge, CI, and live installation acceptance remain OPEN.
 
 Released dependency and CI fixture correction: Continuum #4660 merged all-green
@@ -501,3 +501,99 @@ implementation. Validation used the shared hidden launcher, two compiler jobs,
 and D: build/temp paths; C: remained at 7.5 GiB free and RAM above 39 GiB free.
 Live installed diagnostic reconciliation remains OPEN.
 
+
+### Hidden PowerShell diagnostic propagation (2026-10-02)
+
+OPEN until normal public installation exercises this integration. Continuum's
+public Windows build failed with Cargo 101 while its actual compiler stderr was
+lost at a hidden PS5 host boundary. Reproductions isolated unmerged ErrorRecord
+rendering; native pipe draining itself worked. AIRC uses the same nested host
+boundaries and now consumes the canonical entry serializer instead of inventing
+another launcher or output policy.
+
+The lock references released Continuum 10cd21d7781b55789cdc1563c1f96e1304a599fc
+with verified artifact hashes and regenerated entries. The generator projects verified runtime
+initialization and entry serialization definitions to setup-entrypoint.ps1 and
+the public entry. Native setup adapters reuse those definitions, including their
+loader failures; shared-setup.ps1 remains a dot-source library. Source acquisition
+requires the generated file, so an older incomplete checkout cannot be selected.
+
+Actual PS5 bridge PASS 60617 includes real install-session.ps1 -File execution
+with the existing harmless native stand-in: exactly one stderr diagnostic,
+stdout data unchanged, native exit 23 preserved. Public failure fixtures now
+verify exit 1 and the original message on stderr. Foreign-module negative control,
+source acquisition, cache integrity and developer-source refusal passed. Firewall
+process/policy and storage fixtures PASS 65204. Bash source acquisition and exact
+Windows setup-path tests PASS 29767. No installer, consent, credentials, firewall
+or live daemon action was performed. Startup fixture's first run could not find
+rustc in this stale shell; registered Rust homes/PATH were supplied only to the
+subsequent test process, not written to the installation or global environment.
+Final startup/autostart and GitHub acquisition PS5 fixtures PASS 19485 with
+registered toolchain paths. Bootstrap generator check and whitespace check pass.
+These synthetic receipts do not establish a repaired live AIRC transport or a
+new installed/running binary revision; those remain separate acceptance work.
+
+Released shared helper pin: Continuum #4664 merged all-green reviewed at 10cd21d7781b55789cdc1563c1f96e1304a599fc. Actual standalone PS5 bridge repeated at released pin (86377) PASS, including hidden native coordinator stderr/data/exit and public entry fixtures. Parent review APPROVE; full live installation remains OPEN.
+### Existing startup task token migration (2026-10-02)
+
+OPEN: Bigmama reported IPC Access denied (OS error 5) while an old AIRC daemon
+remained present but uninspectable to its normal user. Its actual scheduled-task
+principal is Interactive/Limited (peer receipt 6403107). This separate legacy
+migration defect does not explain that incident or repair the running process.
+
+Code inspection found a concrete setup defect: existing same-SID airc-join tasks
+preserved Principal verbatim, and the no-op guard/verification compared only the
+action. A matching legacy Highest or S4U task therefore survived normal install.
+Fresh tasks already use Interactive/Limited. Registration now applies that same
+runtime token contract to existing same-account tasks, verifies SID/logon/run
+level as well as action, and includes principal-only changes in pending restart.
+Triggers/settings remain intact; foreign-account or unverifiable ownership still
+refuses. Elevated setup can repair task registration but must not elevate runtime.
+
+Validation: existing startup fixture now covers Highest, S4U and combined legacy
+principals, unchanged reruns, refused/ignored principal writes, and a running
+legacy principal with uninspectable daemon. That case updates registration but
+refuses stop/start; its pending restart resumes only after observed daemon absence.
+Actual PS5 focused -BoundaryChild fixture PASS 81823. The initial complete run
+75470 passed the nested PS7/Bash/PS5 fixture but its outer registrar test hit the
+previously identified inherited-module Get-FileHash lookup issue. The focused
+rerun dot-loaded the existing shared initializer before the fixture; no machine
+module settings were changed. Separate diagnostic-entry work wraps registrar
+initialization; this integration now includes both repairs. No live task, daemon, UAC,
+firewall or heavy build was exercised. Public binary/runtime proof remains open.
+### Firewall ownership reconciliation (2026-10-02)
+
+OPEN live acceptance. A peer's sanitized inventory contained 47 candidate rules:
+39 Allow and 8 Block. None carried an installer/account ownership Group. Only the
+current executable's canonical TCP/UDP pair had the full installer description.
+Other entries included Windows Query User rules for build/test binaries and an
+ambiguous Program=Any allowance. Their names and paths do not establish ownership;
+setup must not remove all 47 or report that it did. The actual peer inventory is
+not committed; the regression reproduces its shape with synthetic paths.
+
+The existing helper removed every local inbound rule for the selected executable,
+including explicit Blocks. This is now refused before any rule writes when an
+active inbound Block applies; all Block rules and unrelated policy are preserved.
+New canonical rules receive a stable per-account Group. The normal coordinator
+passes its original SID through the existing elevated adapter. Obsolete Allow
+rules are removed only with matching account Group, full canonical signature and
+an absolute airc.exe path. Existing local inbound Allow policy migrates only at the explicitly
+selected current executable, including broad Windows prompt allowances. Foreign
+Group ownership at that exact executable refuses before writes. No ownership is
+inferred from an old build path,
+Query User name, or matching display name alone.
+
+Both CheckOnly and apply report owned/current legacy/unowned candidate counts and
+preserved rule metadata. The known inventory therefore retains 45 unresolved
+candidates while migrating the canonical pair; it is not a clean-inventory claim.
+The Program=Any legacy allowance remains an explicit investigation item until its
+origin and full port/address policy can be proven. Continuum continues through
+its existing AIRC FirewallOnly entry, using this same policy implementation.
+
+Validation: actual PS5 policy and native process adapter fixtures passed (52673
+before report-on-check additions; final 66041 includes inventory-shaped cases).
+Coverage includes obsolete account-owned path cleanup, other-account preservation,
+current canonical migration, all 8 inventory Blocks surviving, all 47 entries
+remaining where 45 lack ownership proof, refusal of current Block without writes,
+healthy-rerun unresolved counts, literal paths, original SID handoff and failures.
+No admin/UAC, live rules, daemon or build was exercised.
