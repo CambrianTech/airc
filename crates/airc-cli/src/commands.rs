@@ -2199,20 +2199,21 @@ fn spawn_route_refresh(
     let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
         // The registry task applies this same isolation policy before starting
-        // LAN discovery. Route refresh must honor it too: its immediate first
-        // tick can create a wildcard listener through endpoint refresh even
-        // when registry startup correctly refused a test/disabled scope.
-        run_allowed_route_refresh(
+        // automatic listeners. Keep the refresh clock and stored peer dials
+        // active, while preventing endpoint refresh/relay election from
+        // acquiring wildcard listeners in an isolated scope.
+        run_route_refresh_with_advertising_policy(
             airc_lib::account_registry_block(&state.home),
             &state.shutdown,
             &state.route_wake,
-            || {
+            |allow_advertising| {
                 refresh_routes_once(
                     &airc,
                     &connected,
                     &delivery_stats,
                     &endpoint_resync,
                     &rendezvous,
+                    allow_advertising,
                 )
             },
         )
@@ -2220,20 +2221,21 @@ fn spawn_route_refresh(
     })
 }
 
-async fn run_allowed_route_refresh<F, Fut>(
+async fn run_route_refresh_with_advertising_policy<F, Fut>(
     block: Option<airc_lib::AccountRegistryBlock>,
     shutdown: &tokio::sync::Notify,
     wake: &tokio::sync::Notify,
-    refresh: F,
+    mut refresh: F,
 ) where
-    F: FnMut() -> Fut,
+    F: FnMut(bool) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    let allow_advertising = block.is_none();
     if let Some(block) = block {
-        eprintln!("airc daemon: automatic route refresh disabled: {block}");
-        return;
+        eprintln!("airc daemon: automatic listener acquisition disabled: {block}; stored peer refresh remains active");
     }
-    airc_daemon::route_refresh::run_periodic_refresh(shutdown, wake, refresh).await;
+    airc_daemon::route_refresh::run_periodic_refresh(shutdown, wake, || refresh(allow_advertising))
+        .await;
 }
 
 /// One periodic route refresh: run discovery on the shared daemon handle
@@ -2247,6 +2249,7 @@ async fn refresh_routes_once(
     delivery_stats: &tokio::sync::RwLock<airc_ipc::DeliveryStatsResponse>,
     endpoint_resync: &tokio::sync::Notify,
     rendezvous: &SharedRendezvousSlot,
+    allow_advertising: bool,
 ) {
     // Adaptable-router reflex: re-detect this node's own routable LAN +
     // Tailscale IPv4 every tick (cheap, local — no network) and re-advertise
@@ -2255,37 +2258,45 @@ async fn refresh_routes_once(
     // changes IP keeps advertising a stale, undialable address until it is
     // manually restarted. Reused below for relay self-election so detection
     // happens exactly once per tick.
-    let lan_ip = crate::network_commands::advertise_lan_ip();
-    let tailscale_ip = crate::network_commands::detect_tailscale_ip();
-    match airc
-        .refresh_advertised_endpoints(lan_ip, tailscale_ip)
-        .await
-    {
-        Ok(true) => {
-            // Changed → nudge the registry loop to republish the corrected
-            // card NOW (edge-triggered; steady-state stays on cadence, so
-            // no spam). Loud: a reachability-affecting change is not silent.
-            let summary = airc
-                .route_endpoints()
-                .map(|endpoints| {
-                    endpoints
-                        .iter()
-                        .map(|endpoint| format!("{endpoint:?}"))
-                        .collect::<Vec<_>>()
-                        .join(" + ")
-                })
-                .unwrap_or_else(|_| "<unreadable>".to_string());
-            eprintln!(
-                "airc daemon: advertised endpoint changed (LAN/Tailscale IP moved) — \
+    let (lan_ip, tailscale_ip) = if allow_advertising {
+        (
+            crate::network_commands::advertise_lan_ip(),
+            crate::network_commands::detect_tailscale_ip(),
+        )
+    } else {
+        (None, None)
+    };
+    if allow_advertising {
+        match airc
+            .refresh_advertised_endpoints(lan_ip, tailscale_ip)
+            .await
+        {
+            Ok(true) => {
+                // Changed → nudge the registry loop to republish the corrected
+                // card NOW (edge-triggered; steady-state stays on cadence, so
+                // no spam). Loud: a reachability-affecting change is not silent.
+                let summary = airc
+                    .route_endpoints()
+                    .map(|endpoints| {
+                        endpoints
+                            .iter()
+                            .map(|endpoint| format!("{endpoint:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    })
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                eprintln!(
+                    "airc daemon: advertised endpoint changed (LAN/Tailscale IP moved) — \
                  now advertising [{summary}]; resyncing the account-registry card"
-            );
-            endpoint_resync.notify_one();
-        }
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!(
-                "airc daemon: advertised-endpoint refresh failed ({error}); retrying next tick"
-            );
+                );
+                endpoint_resync.notify_one();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!(
+                    "airc daemon: advertised-endpoint refresh failed ({error}); retrying next tick"
+                );
+            }
         }
     }
     match airc.refresh_route_discovery().await {
@@ -2410,8 +2421,10 @@ async fn refresh_routes_once(
             // role record: re-assume it on every tick unconditionally
             // (become_relay is idempotent — already-relaying is a cheap
             // re-advertise).
-            let has_relay_role = read_persisted_relay_port().is_some();
-            if snapshot.should_self_elect_as_relay(enrolled) || has_relay_role {
+            let has_relay_role = allow_advertising && read_persisted_relay_port().is_some();
+            if allow_advertising
+                && (snapshot.should_self_elect_as_relay(enrolled) || has_relay_role)
+            {
                 // Slice 4c: advertise the relay under our ROUTABLE IP(s)
                 // (LAN + Tailscale), never the 0.0.0.0 bind — peers can't
                 // dial a wildcard. Reuses the IPs detected once at the top
@@ -3496,7 +3509,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn isolated_route_refresh_never_runs_the_immediate_tick() {
+    async fn isolated_route_refresh_keeps_peer_clock_without_advertising() {
         let home = tempfile::tempdir().expect("isolated home");
         let temp_block = airc_lib::account_registry_block(home.path());
         assert!(temp_block.is_some(), "temporary daemon must be isolated");
@@ -3504,13 +3517,29 @@ mod tests {
             temp_block,
             Some(airc_lib::AccountRegistryBlock::DisabledByEnv),
         ] {
-            run_allowed_route_refresh(
-                block,
-                &tokio::sync::Notify::new(),
-                &tokio::sync::Notify::new(),
-                || async { panic!("isolated daemon must never refresh or open LAN") },
+            let shutdown = tokio::sync::Notify::new();
+            let wake = tokio::sync::Notify::new();
+            let ticks = std::sync::atomic::AtomicUsize::new(0);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                run_route_refresh_with_advertising_policy(
+                    block,
+                    &shutdown,
+                    &wake,
+                    |allow_advertising| {
+                        assert!(
+                            !allow_advertising,
+                            "isolated tick must not acquire listeners"
+                        );
+                        ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        shutdown.notify_waiters();
+                        async {}
+                    },
+                ),
             )
-            .await;
+            .await
+            .expect("isolated peer refresh must still start immediately");
+            assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
     }
 
@@ -3521,10 +3550,20 @@ mod tests {
         let ticks = std::sync::atomic::AtomicUsize::new(0);
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            run_allowed_route_refresh(None, &shutdown, &wake, || async {
-                ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                shutdown.notify_waiters();
-            }),
+            run_route_refresh_with_advertising_policy(
+                None,
+                &shutdown,
+                &wake,
+                |allow_advertising| {
+                    assert!(
+                        allow_advertising,
+                        "ordinary production tick must retain advertising"
+                    );
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    shutdown.notify_waiters();
+                    async {}
+                },
+            ),
         )
         .await
         .expect("production refresh must start immediately and honor shutdown");

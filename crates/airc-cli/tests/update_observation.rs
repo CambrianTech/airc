@@ -266,7 +266,7 @@ fn public_update_verifies_current_owner_and_preserves_stopped_state() {
             } else {
                 "temp-rooted"
             };
-            if log.contains("automatic route refresh disabled") && log.contains(reason) {
+            if log.contains("automatic listener acquisition disabled") && log.contains(reason) {
                 break;
             }
             assert!(

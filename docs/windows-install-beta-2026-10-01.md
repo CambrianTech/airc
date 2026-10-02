@@ -622,6 +622,17 @@ newly built real binary; explicit install starts a missing owner and repeats
 successfully. Test daemons use isolated homes. Both the explicit registry gate
 and temp-home-only gate were exercised; each emitted its route-isolation receipt
 and Windows netstat showed no sockets owned by that daemon PID. Two focused
-route-refresh tests preserve the ordinary immediate production tick while
-blocking isolated ticks. Full workspace Clippy passed. This binary evidence does
+route-refresh tests preserve the immediate peer-refresh clock for both ordinary
+and isolated daemons while allowing automatic listener acquisition only for
+ordinary daemons. Full workspace Clippy passed. This binary evidence does
 not close public deployment or Bigmama's live outage, which remain OPEN.
+
+CI caught a boundary regression before merge: the first isolation guard stopped
+the entire route-refresh task, also disabling intentional stored-loopback peer
+reconnection. The correction keeps the immediate/periodic refresh clock, stored
+endpoint dialing and delivery snapshots active, while gating only automatic
+advertised-endpoint acquisition and relay self-election with the existing
+registry isolation policy. No bypass environment or disabled test is added.
+The unchanged real-daemon stored-endpoint regression passed locally, alongside
+all three updater binary fixtures, both policy-clock tests, and full Clippy.
+Fresh rebased-head CI and public deployment remain required.
