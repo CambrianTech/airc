@@ -144,7 +144,7 @@ fn owned_image(image: &Path, installed: &Path) -> Result<(), Error> {
         Err("Pipe owner image is outside the installed AIRC binary/backup paths; publish the candidate through public setup before explicit recovery (a build-target binary is not the installed destination)".into())
     }
 }
-async fn verify_image_build(socket: &Path, pid: u32, image: &Path) -> Result<(), Error> {
+async fn verify_image_build(socket: &Path, pid: u32) -> Result<(), Error> {
     // Keep the original Stop connection held. Status uses a second connection
     // whose native server PID must match that held owner, never a PID file.
     let mut status = IpcStream::connect(socket).await?;
@@ -159,19 +159,14 @@ async fn verify_image_build(socket: &Path, pid: u32, image: &Path) -> Result<(),
     if status.ipc_protocol_version != Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION)) {
         return Err("Owner protocol is unknown or incompatible".into());
     }
-    let sha = status
+    let _sha = status
         .build_commit
         .filter(|sha| (7..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or("Owner build revision is unknown")?;
-    if let Some(legacy) = image
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix("airc.old-"))
-    {
-        if !sha.starts_with(legacy) && !legacy.starts_with(&sha) {
-            return Err("Legacy backup filename does not match its runtime build revision".into());
-        }
-    }
+    // Historical `before` was the checkout revision, not the displaced binary's
+    // build. A stale installed daemon can legitimately have a different SHA.
+    // Identity/provenance are established from the held pipe, process token and
+    // installed directory above, never by equating these unrelated revisions.
     Ok(())
 }
 pub(crate) async fn recover(socket: &Path, caller: &str, installed: &Path) -> Result<(), Error> {
@@ -191,7 +186,7 @@ pub(crate) async fn recover(socket: &Path, caller: &str, installed: &Path) -> Re
         unsafe {checked(QueryFullProcessImageNameW(process.0,0,image.as_mut_ptr(),&mut size))?;}
         let image=std::path::PathBuf::from(String::from_utf16(&image[..size as usize])?);
         owned_image(&image,installed)?;
-        verify_image_build(socket,pid,&image).await?;
+        verify_image_build(socket,pid).await?;
         // SAFETY: process owns a live query/synchronize handle for this endpoint owner.
         if pipe.server_process_id()?!=pid || unsafe {WaitForSingleObject(process.0,0)}!=258 {return Err("Bound daemon changed or exited before recovery".into());}
         let owner = token(process.0)?;
