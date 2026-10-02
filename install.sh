@@ -162,7 +162,7 @@ _compatible_setup_layout() {
   [ -f "$directory/setup/github-auth.sh" ] || return 1
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-      for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 sync-bootstrap.ps1 setup-entrypoint.ps1; do
+      for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 adopt-installed.ps1 sync-bootstrap.ps1 setup-entrypoint.ps1; do
         [ -f "$directory/windows/$relative" ] || return 1
       done ;;
   esac
@@ -1333,7 +1333,11 @@ fi
 if [ -z "$EXPECTED_BUILD" ] && [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ]; then
   installed_airc="$BIN_DIR/airc"
   case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) installed_airc="$BIN_DIR/airc.exe" ;; esac
-  "$installed_airc" update --adopt-installed || fail 'Installed daemon could not be started and verified. Setup is incomplete; rerun this installer to resume.'
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      "$CLONE_DIR/windows/run-powershell.sh" -NoProfile -ExecutionPolicy RemoteSigned -File "$(cygpath -w "$CLONE_DIR/windows/adopt-installed.ps1")" -AircPath "$(cygpath -w "$installed_airc")" || fail 'Installed daemon could not be adopted safely; rerun setup to resume.' ;;
+    *) "$installed_airc" update --adopt-installed || fail 'Installed daemon could not be started and verified. Setup is incomplete; rerun this installer to resume.' ;;
+  esac
 fi
 
 echo ""
