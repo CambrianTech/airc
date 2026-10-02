@@ -561,3 +561,39 @@ rerun dot-loaded the existing shared initializer before the fixture; no machine
 module settings were changed. Separate diagnostic-entry work wraps registrar
 initialization; this integration now includes both repairs. No live task, daemon, UAC,
 firewall or heavy build was exercised. Public binary/runtime proof remains open.
+### Firewall ownership reconciliation (2026-10-02)
+
+OPEN live acceptance. A peer's sanitized inventory contained 47 candidate rules:
+39 Allow and 8 Block. None carried an installer/account ownership Group. Only the
+current executable's canonical TCP/UDP pair had the full installer description.
+Other entries included Windows Query User rules for build/test binaries and an
+ambiguous Program=Any allowance. Their names and paths do not establish ownership;
+setup must not remove all 47 or report that it did. The actual peer inventory is
+not committed; the regression reproduces its shape with synthetic paths.
+
+The existing helper removed every local inbound rule for the selected executable,
+including explicit Blocks. This is now refused before any rule writes when an
+active inbound Block applies; all Block rules and unrelated policy are preserved.
+New canonical rules receive a stable per-account Group. The normal coordinator
+passes its original SID through the existing elevated adapter. Obsolete Allow
+rules are removed only with matching account Group, full canonical signature and
+an absolute airc.exe path. Existing local inbound Allow policy migrates only at the explicitly
+selected current executable, including broad Windows prompt allowances. Foreign
+Group ownership at that exact executable refuses before writes. No ownership is
+inferred from an old build path,
+Query User name, or matching display name alone.
+
+Both CheckOnly and apply report owned/current legacy/unowned candidate counts and
+preserved rule metadata. The known inventory therefore retains 45 unresolved
+candidates while migrating the canonical pair; it is not a clean-inventory claim.
+The Program=Any legacy allowance remains an explicit investigation item until its
+origin and full port/address policy can be proven. Continuum continues through
+its existing AIRC FirewallOnly entry, using this same policy implementation.
+
+Validation: actual PS5 policy and native process adapter fixtures passed (52673
+before report-on-check additions; final 66041 includes inventory-shaped cases).
+Coverage includes obsolete account-owned path cleanup, other-account preservation,
+current canonical migration, all 8 inventory Blocks surviving, all 47 entries
+remaining where 45 lack ownership proof, refusal of current Block without writes,
+healthy-rerun unresolved counts, literal paths, original SID handoff and failures.
+No admin/UAC, live rules, daemon or build was exercised.

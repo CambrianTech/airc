@@ -29,10 +29,11 @@ try {
     [IO.File]::WriteAllText($binary,'fixture')
     $env:AIRC_FIXTURE_EXPECTED_PATH=$binary
     [IO.File]::WriteAllText((Join-Path $fixture 'firewall-allow.ps1'), @'
-param([string]$AircPath,[switch]$CheckOnly,[string]$LogPath)
+param([string]$AircPath,[string]$OwnerSid,[switch]$CheckOnly,[string]$LogPath)
 Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'
 if ([ConsoleProbe]::GetConsoleWindow() -ne [IntPtr]::Zero) { exit 92 }
 if ($AircPath -ne $env:AIRC_FIXTURE_EXPECTED_PATH) { Write-Error 'Argument boundaries changed the binary path'; exit 91 }
+if ($OwnerSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { exit 93 }
 $state=Join-Path $PSScriptRoot 'applied'
 if ($CheckOnly) {
     if ($env:AIRC_FIXTURE_FIREWALL_READ_DENIED -eq '1') { exit 4 }
