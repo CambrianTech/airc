@@ -1,3 +1,15 @@
+# BEGIN GENERATED RUNTIME MODULES
+function Initialize-InstallerPowerShell {
+    # A PS7 desktop host may pass its PSModulePath to Windows PowerShell 5.
+    # Load the running engine's built-ins explicitly before autoload can select
+    # another engine's Security/Utility type data. Keep user module paths intact.
+    foreach ($name in @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security')) {
+        $manifest = [IO.Path]::Combine($PSHOME, 'Modules', $name, ($name + '.psd1'))
+        Import-Module $manifest -Global -ErrorAction Stop
+    }
+}
+Initialize-InstallerPowerShell
+# END GENERATED RUNTIME MODULES
 # Dot-source the same small setup artifacts used by Continuum. AIRC does not
 # install or require the Continuum application. Only immutable, verified bytes
 # are loaded; dependency choices remain in the generated canonical manifest.

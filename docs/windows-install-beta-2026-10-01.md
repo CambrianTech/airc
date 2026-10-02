@@ -439,3 +439,45 @@ The current helper pin is a review-branch dependency (Continuum 71fb9cc51).
 Release repinning, final CI/review and public live acceptance remain OPEN.
 
 Released-helper validation: Continuum PR #4658 merged after all required CI and independent review at c40cc9cc6d3ba086d83ac25c330116def24b80ed. The standalone artifact lock now pins that released revision; generated bootstrap drift check and all five PS5 setup/firewall/storage/acquisition regression suites pass. Actual public installation and consent acceptance of this change remain open.
+
+### 2026-10-02 — inherited PowerShell module recovery
+
+A real Continuum public entry under Windows PowerShell 5 inherited PowerShell 7
+module paths from its desktop host and failed while loading Security/Get-Acl.
+Standalone AIRC also uses Get-FileHash before importing the shared launcher.
+Its generated bootstrap now projects the runtime initializer from the same
+checksum-pinned helper before artifact verification or FirewallOnly validation.
+It imports the executing runtime's built-in modules without rewriting the
+caller's PSModulePath. No Continuum application installation is required.
+
+The actual fresh PS5 public-entry fixture passes with an incompatible Security
+module first in PSModulePath; removing the generated initializer makes the same
+fixture fail with the foreign-module sentinel. The child asserts inherited paths
+are unchanged. The full setup bridge and the four storage/acquisition/firewall
+suites pass. These isolated fixtures do not modify the live firewall or daemon.
+The provisional helper revision depends on Continuum #4660; repinning to its
+released merge, CI, and live installation acceptance remain OPEN.
+
+Released dependency and CI fixture correction: Continuum #4660 merged all-green
+at d2604d832da2b47f7ba3680761c5a46d6b23fc2b. The lock and generated entry now
+pin that released revision and retain the verified artifact hashes. Initial
+Windows CI showed that PS5 startup can reorder inherited module paths, defeating
+the negative control. Both fixture children now establish the identical foreign
+module path before invoking the actual public entry, then assert preservation
+of that exact baseline. The unfixed control fails and the repaired entry passes;
+full bridge regression passes locally. Independent review approved this delta.
+Final-head CI and public live acceptance remain OPEN.
+
+The second Windows CI control still did not select the foreign module; its
+host-specific autoload cause is not established. The fixture now explicitly
+loads the same foreign Security module in both fresh child processes before the
+public entry. This proves recovery from an already selected incompatible module
+without depending on host autoload ordering. The fixed entry preserves module
+paths; removing its initializer fails. Independent review approved this delta.
+
+Final fixture targets Utility/ConvertFrom-Json, the generated loader's first
+module-provided command. CI diagnostics proved the Security control exited zero
+even though the foreign hash command was initially selected; its intervening
+module-loading behavior is not a reliable control. The first-command fixture
+avoids that later boundary and tests autoload directly, with no pre-import of
+the foreign module. The same initializer removal remains the negative control.
