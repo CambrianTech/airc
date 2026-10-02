@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Downloaded-entry/older-source regression, with local Git acquisition fixtures.
 set -euo pipefail
+case "${1:-all}" in
+  all) adapter_only=0 ;;
+  --posix-adapter)
+    case "$(uname -s)" in Linux|Darwin) ;; *) echo 'POSIX source adapter requires Linux or macOS' >&2; exit 2 ;; esac
+    adapter_only=1 ;;
+  *) echo 'Usage: setup-source-acquisition.sh [--posix-adapter]' >&2; exit 2 ;;
+esac
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
@@ -24,8 +31,11 @@ if [ "${AIRC_FIXTURE_WINDOWS:-0}" = 1 ]; then
   printf '#!/usr/bin/env bash\necho compatible-windows-session\n' > "$destination/windows/run-powershell.sh"
 fi
 GIT
-printf '#!/bin/sh\necho Linux\n' > "$fixture/tools/uname"
-chmod +x "$fixture/tools/git" "$fixture/tools/uname"
+if [ "$adapter_only" = 0 ]; then
+  printf '#!/bin/sh\necho Linux\n' > "$fixture/tools/uname"
+  chmod +x "$fixture/tools/uname"
+fi
+chmod +x "$fixture/tools/git"
 export HOME="$fixture/home" PATH="$fixture/tools:$PATH" AIRC_FIXTURE_CALLS="$fixture/calls"
 export BIN_DIR="$fixture/bin" SKILLS_TARGET="$fixture/skills"
 export AIRC_SKIP_PREREQS=1 AIRC_SKIP_AUTH=1 AIRC_SKIP_RUST_BUILD=1 AIRC_INSTALL_NO_PULL=1
@@ -43,6 +53,14 @@ if AIRC_DIR="$HOME/.airc/src" bash "$fixture/entry/install.sh" > "$fixture/outpu
 fi
 grep -q 'developer work was preserved' "$fixture/output"
 [ ! -s "$fixture/calls" ]
+
+# The native macOS shell has exercised acquisition and developer preservation.
+# Simulated Windows layout policy stays in the full scenario. Git Bash retains
+# that direct-entry proof separately from windows-setup-bridge.ps1's native entry.
+if [ "$adapter_only" = 1 ]; then
+  echo 'PASS: native POSIX source acquisition and developer preservation'
+  exit 0
+fi
 
 # The immediately preceding Windows release has auth but no session adapter.
 # Its existing managed fallback must also survive while setup acquires a new one.

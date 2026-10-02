@@ -870,3 +870,31 @@ no transaction directory. A separate later transaction succeeds after releasing
 that known handle. This controlled OS refusal does not identify the CI holder.
 No production retries, process termination, failure acceptance or live machine
 changes are introduced. Root-cause diagnosis remains OPEN.
+
+## Shared setup policy versus native adapters (2026-10-02)
+
+The existing setup-consent matrix repeated the same mocked Windows authorization
+policy on Linux, macOS, and Git Bash. The four real public installation jobs set
+AIRC_SKIP_AUTH=1, so they cannot replace actual shell authorization coverage.
+The existing fixture now runs full policy on Linux and fresh approval plus reuse
+on each other host with its real uname: the code must be visible, the child must
+still await consent, CRLF scopes must parse, and configured identity must persist.
+Only the generic run retains the six-second wait and scope/refusal/cancellation
+policy cases. No new job or harness was introduced.
+
+Source acquisition retains first acquisition and incompatible explicit-source
+refusal on real macOS. Linux retains the full simulated-layout policy; Git Bash
+also retains the full source fixture until its direct shell entry differences
+from the native PowerShell bridge are mapped. Destination selection still runs
+on all three hosts; native PowerShell acquisition/session/firewall tests and all
+four real public installs are unchanged. This is a bounded reduction, not a
+claim that every source scenario now executes only once.
+
+Actual Git Bash full authorization, native-adapter authorization, and full
+source acquisition passed (35694). Real macOS adapter execution remains a hosted
+CI requirement. No provisioning, user credentials, or live daemon was involved.
+YAML coverage-map assertions, Bash syntax, unsupported-mode/host refusal, and
+diff checks passed (24391c, 41da91, 39d658). Parent and independent peer reviews
+approved this bounded coverage transfer. Local formatting and full workspace
+Clippy passed (14295, 1m55s) in this worktree's dedicated target. Hosted CI
+remains required before acceptance.
