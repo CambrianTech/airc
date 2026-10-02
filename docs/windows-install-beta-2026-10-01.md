@@ -679,3 +679,16 @@ and both exact advertisement/dial integration fixtures passed. Workspace
 Independent parent review approved the bounded change subject to these tests.
 This does not assert that all other packages' network tests are isolated; the
 broader installation/runtime acceptance remains OPEN.
+
+### Ordinary update publication shares the rollback transaction
+
+OPEN. Audit found ordinary `airc update` still wrote over its own running
+executable through the installer and lacked the auto mode displacement policy.
+Both public modes now call one prepared-artifact publication transaction;
+preparation stays outside maintenance, stopped daemons remain stopped, and
+failed installation restores the original file and preserves the failure.
+An isolated public-command fixture exercises both modes against a local Git
+checkout whose installer fails after publication. It checks exact build
+provenance, original error visibility, restored executable contents/version,
+and absence of an unintentionally started daemon. Fixture and fresh-head gates
+are pending; no live update success is claimed.

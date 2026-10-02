@@ -104,98 +104,19 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
 
     let prepared =
         crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
-    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
-
-    // What the OPERATOR is holding, read before we replace it. `before`/`after`
-    // above describe the git checkout; this describes the tool. They are
-    // independent, and the summary at the end has to speak about this one.
-    // (Canary's #1332 moved `prepare_build_source` before the no-op gate;
-    // this read only has to precede installation, which is what replaces
-    // the binary.)
-    let binary_before = installed_binary_sha(&airc_exe);
-
-    prepared.install_after(|| {
-        if daemon_was_running {
-            stop_daemon(&airc_exe, home, &socket)?;
-        }
-        Ok(())
-    })?;
-
-    // Prove the BINARY became `after` before claiming anything about it (#354).
-    //
-    // Everything above this line is a statement about a git checkout; the
-    // operator reads the lines below as statements about the tool they are
-    // holding. Those were allowed to disagree silently — and did, on a live
-    // peer node on 2026-08-07: `airc update` printed "Already at 1e2f424 …
-    // daemon: restarted." and `airc --version` on the very next line said
-    // *3 commits behind*. Both true, neither lying, describing different
-    // objects.
-    //
-    // The check itself was never missing. `run_auto_update` has smoke-tested
-    // since it was written (`smoke_test_new_binary`, with rollback). It was
-    // simply never wired into the MANUAL path — the one the staleness banner
-    // tells you to run, and therefore the one a human or an agent actually
-    // reaches for. Built, correct, and not called where it mattered.
-    //
-    // Deliberately NOT mirroring the auto path's rollback here: this path is
-    // entered on purpose by someone who can re-run it, and a rollback needs
-    // its own backup anchor + failure modes. Verification is what was missing;
-    // silently rolling back an operator's explicit action is a separate call.
-    //
-    // Nor does this SELF-HEAL, unlike the daemon check below — and the
-    // asymmetry is the point, not an oversight. Heal what has a known-safe
-    // idempotent remedy; report what needs a human decision. A stale daemon is
-    // the former: stop it, start it, done. A binary that did not land is
-    // usually the installer writing somewhere other than what the shell
-    // resolves, and re-running an installer that already did its job cannot fix
-    // a PATH. Retrying there would be theatre — it would burn minutes, change
-    // nothing, and teach the operator that the check is noise.
-    if !smoke_test_new_binary(&airc_exe, &after) {
-        return Err(format!(
-            "update did NOT take: the source reached {after}, but the binary at \
-             {} does not report it. Nothing verified this before, so this printed \
-             a success line instead. Check `which -a airc` — the installer may be \
-             writing somewhere other than the path your shell resolves.",
-            airc_exe.display()
-        )
-        .into());
-    }
-
-    // Report the BINARY's transition, not the checkout's (#354 follow-up).
-    //
-    // #354 made the update VERIFY the binary but left the summary branching on
-    // `before == after` — two git refs. Those describe the checkout, and the
-    // checkout can already be current while the binary is stale, so the two
-    // most different outcomes printed the SAME line:
-    //
-    //   nothing happened                     -> "Already at a08f3d3 on channel canary."
-    //   your binary was just replaced        -> "Already at a08f3d3 on channel canary."
-    //
-    // Measured on BigMama 2026-08-07, immediately after #354 landed: source was
-    // already at a08f3d3 (a manual pull had moved it), the installed binary was
-    // still 35d40b1, `airc update` rebuilt and installed a08f3d3 — and printed
-    // "Already at". The verification worked; the sentence describing it did not.
-    // An operator reading "Already at" reasonably concludes no work was done and
-    // does not restart anything that embeds the binary.
-    //
-    // Same defect as #354, one layer down: #354 fixed which object we CHECK,
-    // this fixes which object we TALK ABOUT. Both halves have to point at the
-    // tool the operator is holding.
+    let (binary_before, _) = install_prepared_update(
+        &prepared,
+        &airc_exe,
+        home,
+        &socket,
+        &after,
+        daemon_was_running,
+    )?;
     println!(
         "{}",
-        update_summary(binary_before.as_deref(), &before, &after, &channel)
+        update_summary(Some(&binary_before), &before, &after, &channel)
     );
     if daemon_was_running {
-        restart_daemon(&airc_exe, home, &socket)?;
-        wait_daemon_ready(&airc_exe, home, &socket)?;
-        // The NEXT link in the chain. `wait_daemon_ready` proves a daemon
-        // answers; it does not prove it is the daemon we just built. A stale
-        // process that survived `stop_daemon` answers IPC perfectly, so
-        // "daemon: restarted." was true and useless — the exact shape
-        // `check_daemon_build` in doctor.rs was written for after it went
-        // undetected on a live node for hours. That check only runs under
-        // `doctor --health`; update restarts the daemon and never asked.
-        verify_daemon_build(&airc_exe, home, &socket, &after)?;
         println!("daemon: restarted (build verified).");
     }
     Ok(())
@@ -406,19 +327,46 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
 
     let prepared =
         crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
+    let (previous_build, previous_path) = install_prepared_update(
+        &prepared,
+        &airc_exe,
+        home,
+        &socket,
+        &after,
+        daemon_was_running,
+    )?;
+    println!(
+        "Auto-updated: {previous_build} -> {after} (binary verified; previous file at {}).",
+        previous_path.display()
+    );
+    Ok(())
+}
+
+/// Both public update modes publish the same verified artifact transaction.
+/// Preparation remains outside the maintenance window; intentionally stopped
+/// daemons stay stopped. A failed publication restores and verifies the owned
+/// original before reporting the original installer failure.
+fn install_prepared_update(
+    prepared: &crate::update_artifact::PreparedInstall,
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+    expected: &str,
+    daemon_was_running: bool,
+) -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
     let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
 
-    let previous_build = installed_binary_sha(&airc_exe)
+    let previous_build = installed_binary_sha(airc_exe)
         .ok_or("cannot verify current binary before update; nothing displaced")?;
     let mut swap = None;
     let mut stopped = false;
     let installed = prepared.install_after(|| {
         if daemon_was_running {
-            stop_daemon(&airc_exe, home, &socket)?;
+            stop_daemon(airc_exe, home, socket)?;
             stopped = true;
         }
         swap = Some(crate::update_rollback::BinarySwap::displace(
-            &airc_exe,
+            airc_exe,
             prepared.artifact(),
         )?);
         Ok(())
@@ -428,53 +376,55 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         // overwrite the original with a backup or act on an unknown owner.
         if stopped {
             if let Err(ref failure) = installed {
-                restart_daemon(&airc_exe, home, &socket).map_err(|error|
+                restart_daemon(airc_exe, home, socket).map_err(|error|
                     format!("update failed before displacement ({failure}); original daemon restart failed: {error}"))?;
-                wait_daemon_ready(&airc_exe, home, &socket)
-                    .and_then(|()| verify_daemon_build(&airc_exe, home, &socket, &previous_build))
+                wait_daemon_ready(airc_exe, home, socket)
+                    .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
                     .map_err(|error| format!("update failed before displacement ({failure}); original daemon recovery verification failed: {error}"))?;
             }
         }
-        return installed;
+        installed?;
+        return Err("installer returned without an owned binary transaction".into());
     };
 
     let failure = match installed {
         Err(error) => Some(format!("installer failed: {error}")),
-        Ok(()) if !smoke_test_new_binary(&airc_exe, &after) => Some(format!(
-            "installed binary does not run and report expected build {after}"
+        Ok(()) if !smoke_test_new_binary(airc_exe, expected) => Some(format!(
+            "installed binary does not run and report expected build {expected}"
         )),
         Ok(()) => None,
     };
     if let Some(failure) = failure {
-        eprintln!("Auto-update failed ({failure}); restoring the owned previous binary.");
-        swap.rollback().map_err(|error| format!(
-            "auto-update failed ({failure}); rollback failed ({error}); previous binary retained at {}",
+        eprintln!("Update failed ({failure}); restoring the owned previous binary.");
+        swap.rollback().map_err(|error| {
+            format!(
+            "update failed ({failure}); rollback failed ({error}); previous binary retained at {}",
             swap.previous().display()
-        ))?;
-        if !smoke_test_new_binary(&airc_exe, &previous_build) {
-            return Err(format!("auto-update failed ({failure}); original file restored but build {previous_build} could not be verified").into());
+        )
+        })?;
+        if !smoke_test_new_binary(airc_exe, &previous_build) {
+            return Err(format!("update failed ({failure}); original file restored but build {previous_build} could not be verified").into());
         }
         if daemon_was_running {
-            restart_daemon(&airc_exe, home, &socket).map_err(|error| format!(
-                "auto-update failed ({failure}); original build restored, but daemon restart failed: {error}"
+            restart_daemon(airc_exe, home, socket).map_err(|error| format!(
+                "update failed ({failure}); original build restored, but daemon restart failed: {error}"
             ))?;
-            wait_daemon_ready(&airc_exe, home, &socket)
-                .and_then(|()| verify_daemon_build(&airc_exe, home, &socket, &previous_build))
-                .map_err(|error| format!("auto-update failed ({failure}); original build restored, but daemon recovery verification failed: {error}"))?;
+            wait_daemon_ready(airc_exe, home, socket)
+                .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
+                .map_err(|error| format!("update failed ({failure}); original build restored, but daemon recovery verification failed: {error}"))?;
         }
-        return Err(format!("auto-update failed ({failure}); previous binary {previous_build} restored and verified").into());
+        return Err(format!(
+            "update failed ({failure}); previous binary {previous_build} restored and verified"
+        )
+        .into());
     }
 
     if daemon_was_running {
-        restart_daemon(&airc_exe, home, &socket)?;
-        wait_daemon_ready(&airc_exe, home, &socket)?;
-        verify_daemon_build(&airc_exe, home, &socket, &after)?;
+        restart_daemon(airc_exe, home, socket)?;
+        wait_daemon_ready(airc_exe, home, socket)?;
+        verify_daemon_build(airc_exe, home, socket, expected)?;
     }
-    println!(
-        "Auto-updated: {previous_build} -> {after} (binary verified; previous file at {}).",
-        swap.previous().display()
-    );
-    Ok(())
+    Ok((previous_build, swap.previous().to_owned()))
 }
 
 /// THE skip rule, one place for `airc update` and `airc update --auto` (#354, and
