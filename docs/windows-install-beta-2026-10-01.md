@@ -664,3 +664,18 @@ executable runs afterward. Unknown candidate, collision, and absent candidate
 cases passed. These isolated fixtures do not establish live installation success
 or explain the original elevation failure. Fresh-head gates and public updater
 acceptance remain required.
+
+### OPEN: ordinary SDK fixtures exposed hashed test executables to the LAN
+
+The firewall inventory included hashed debug/test executables. SDK advertisement
+and stable-port fixtures bound wildcard listeners despite using temporary state.
+These tests now inject loopback binding through the same implementation while
+retaining advertised LAN/Tailscale addresses, retry, and dial-order assertions.
+Production entrypoints still select all-interface binding. A focused regression
+checks actual bound addresses for both preferred and fallback ports. No live
+firewall policy was changed or deleted. Windows focused LAN tests passed 9/9,
+and both exact advertisement/dial integration fixtures passed. Workspace
+`cargo clippy --all-targets -- -D warnings`, formatting, and diff checks passed.
+Independent parent review approved the bounded change subject to these tests.
+This does not assert that all other packages' network tests are isolated; the
+broader installation/runtime acceptance remains OPEN.
