@@ -34,6 +34,9 @@ try {
     $entry = Join-Path $fixture 'entry'
     New-Item -ItemType Directory -Force -Path (Join-Path $gitRoot 'cmd'),(Join-Path $gitRoot 'bin'),(Join-Path $gitRoot 'exec'),$entry | Out-Null
     Copy-Item (Join-Path $repository 'install.ps1') (Join-Path $entry 'install.ps1')
+    # Exercise Windows checkout line endings even when the author uses LF.
+    $fixtureEntry = Join-Path $entry 'install.ps1'
+    [IO.File]::WriteAllText($fixtureEntry, [IO.File]::ReadAllText($fixtureEntry).Replace("`r`n", "`n").Replace("`n", "`r`n"))
     $env:USERPROFILE = Join-Path $fixture 'profile'
     $env:LOCALAPPDATA = Join-Path $fixture 'local'
     $env:AIRC_DIR = $null
@@ -150,11 +153,13 @@ public static class SetupBridgeFixture {
     [IO.File]::WriteAllText((Join-Path $utility 'Microsoft.PowerShell.Utility.psd1'), "@{RootModule='Microsoft.PowerShell.Utility.psm1';ModuleVersion='99.0';FunctionsToExport=@('ConvertFrom-Json')}")
     $modulePathBefore = $env:PSModulePath; $pathBefore = $env:PATH; $sourceBefore = $env:AIRC_DIR
     $controlEntry = Join-Path $entry 'control.ps1'
-    $entryText = [IO.File]::ReadAllText((Join-Path $entry 'install.ps1'))
+    $entryText = [IO.File]::ReadAllText((Join-Path $entry 'install.ps1')).Replace("`r`n", "`n")
     $first = $entryText.IndexOf('# BEGIN GENERATED RUNTIME MODULES')
     $last = $entryText.IndexOf('# END GENERATED RUNTIME MODULES')
     Assert-True ($first -ge 0 -and $last -gt $first) 'Public runtime initialization region missing'
-    [IO.File]::WriteAllText($controlEntry, $entryText.Replace("`nInitialize-InstallerPowerShell`n", "`n"))
+    $controlText = $entryText.Replace("`nInitialize-InstallerPowerShell`n", "`n")
+    Assert-True ($controlText -cne $entryText) 'Negative control did not remove runtime initialization'
+    [IO.File]::WriteAllText($controlEntry, $controlText)
     $probe = Join-Path $fixture 'public-module-probe.ps1'
     @'
 param($Entry, $Binary, $ForeignModules)

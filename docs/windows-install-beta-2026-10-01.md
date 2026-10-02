@@ -511,9 +511,8 @@ rendering; native pipe draining itself worked. AIRC uses the same nested host
 boundaries and now consumes the canonical entry serializer instead of inventing
 another launcher or output policy.
 
-The lock temporarily references published Continuum 9c8e336233c043b8723fc8472b2cf44f37f411f7
-for development verification. MERGE GATE: repin to its released merged commit and
-verify hashes/regenerate before merge. The generator projects verified runtime
+The lock references released Continuum 10cd21d7781b55789cdc1563c1f96e1304a599fc
+with verified artifact hashes and regenerated entries. The generator projects verified runtime
 initialization and entry serialization definitions to setup-entrypoint.ps1 and
 the public entry. Native setup adapters reuse those definitions, including their
 loader failures; shared-setup.ps1 remains a dot-source library. Source acquisition
