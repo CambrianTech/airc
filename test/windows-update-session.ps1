@@ -47,7 +47,12 @@ Invoke-InstallerEntryPoint {
     $env:AIRC_SESSION_TEST_PHASE=$phase
     $env:AIRC_SESSION_TEST_BASH=$null
     if ($CheckBash) {
-        $env:AIRC_SESSION_TEST_BASH=(Get-Command bash.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+        $gitPath=@(Invoke-InstallerProcess -OwnProcessTree 'git' @('--exec-path'))
+        if($LASTEXITCODE -ne 0){throw 'Cannot resolve registered Git Bash for the hosted boundary test.'}
+        $gitDirectory=[IO.DirectoryInfo](($gitPath -join '').Trim())
+        while($gitDirectory -and -not (Test-Path -LiteralPath (Join-Path $gitDirectory.FullName 'bin/bash.exe'))) { $gitDirectory=$gitDirectory.Parent }
+        if(-not $gitDirectory){throw 'Git Bash is missing; refusing a WSL substitute.'}
+        $env:AIRC_SESSION_TEST_BASH=Join-Path $gitDirectory.FullName 'bin/bash.exe'
         $env:AIRC_SESSION_TEST_BRIDGE=[IO.Path]::GetFullPath("$PSScriptRoot/../windows/run-powershell.sh").Replace('\','/')
         $env:AIRC_SESSION_TEST_WINDOWS=$windows.Replace('\','/')
         $env:AIRC_SESSION_TEST_PHASE=$phase.Replace('\','/')
