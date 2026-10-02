@@ -437,3 +437,5 @@ response processing also stalled. These are repository changes, not local instal
 
 The current helper pin is a review-branch dependency (Continuum 71fb9cc51).
 Release repinning, final CI/review and public live acceptance remain OPEN.
+
+Released-helper validation: Continuum PR #4658 merged after all required CI and independent review at c40cc9cc6d3ba086d83ac25c330116def24b80ed. The standalone artifact lock now pins that released revision; generated bootstrap drift check and all five PS5 setup/firewall/storage/acquisition regression suites pass. Actual public installation and consent acceptance of this change remain open.

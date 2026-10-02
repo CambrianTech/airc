@@ -17,8 +17,8 @@ if ($FirewallOnly -and (-not $AircPath -or -not (Test-Path -LiteralPath $AircPat
 $aircSetupLock = @'
 {
   "schemaVersion": 1,
-  "continuumRevision": "71fb9cc510f65684440f81942a5dd2b88af15aa3",
-  "elevationSha256": "4c5a38198f0b18e7631c59e3e4cbed98a3b96c2f18ef958add6b913f84c6a3e3",
+  "continuumRevision": "c40cc9cc6d3ba086d83ac25c330116def24b80ed",
+  "elevationSha256": "c8f6cc943b7b8a63c1419aea8a74324d2d971ed527cbbe7b09562a522e0ab9da",
   "manifestSha256": "47892357d9f082a95a117b81ada399ccd8a213be75a975f4eed8483a2c3f28b9"
 }
 '@ | ConvertFrom-Json
