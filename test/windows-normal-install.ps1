@@ -1,9 +1,9 @@
 # Hosted-only real medium-token public installation. No token mocks or runtime policy overrides.
-param([ValidateSet('powershell','pwsh')][string]$Engine='powershell',[switch]$Child,[string]$Gate,[string]$ReadyPipe,[string]$OriginalSid)
+param([ValidateSet('powershell','pwsh')][string]$Engine='powershell',[switch]$Child,[string]$Gate,[string]$ReadyPipe,[string]$OriginalSid,[string]$GsudoDirectory,[switch]$CancellationOnly,[switch]$CancelProbe)
 $ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS -ne 'true'){throw 'Token-changing installation acceptance runs only on a disposable hosted runner.'}
 $root=Split-Path $PSScriptRoot -Parent
-. (Join-Path $root 'windows/shared-setup.ps1')
+. (Join-Path $root 'windows/setup-entrypoint.ps1')
 Add-Type -Path (Join-Path $root 'windows/daemon-diagnostics.cs')
 function Read-ChildLogs {
     param($OutputTask,$ErrorTask)
@@ -19,6 +19,16 @@ function Read-OwnToken {
 if($Child){
     $token=Read-OwnToken
     if((Test-IsAdmin) -or $token.tokenElevated -ne $false -or $token.tokenIntegritySid -ne 'S-1-16-8192' -or $token.tokenUserSid -ne $OriginalSid){throw ('Runner did not produce the required actual normal token: '+($token|ConvertTo-Json -Compress))}
+    # Restore actual credentialed user's profile paths, never the supervisor's.
+    $env:USERPROFILE=[Environment]::GetFolderPath('UserProfile')
+    $env:LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData')
+    $env:APPDATA=[Environment]::GetFolderPath('ApplicationData')
+    $env:HOME=$env:USERPROFILE
+    $env:TEMP=Join-Path $env:LOCALAPPDATA 'Temp';$env:TMP=$env:TEMP
+    New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+    $env:CARGO_HOME=$null;$env:RUSTUP_HOME=$null
+    $env:PATH=$GsudoDirectory+';'+$env:PATH
+    . (Join-Path $root 'windows/shared-setup.ps1')
     # A native pipe observation supplies authoritative PID/token evidence. The
     # child birth time additionally prevents a PID-reuse race when retaining it.
     $self=Get-Process -Id $PID
@@ -31,6 +41,10 @@ if($Child){
     } finally { $ready.Dispose() }
     $env:CAMBRIAN_INSTALL_ELEVATION=$null
     $env:AIRC_UPDATE_SESSION_OWNER=$null
+    if($CancelProbe){
+        Invoke-InstallerProcess -OwnProcessTree (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') @('-NoProfile','-File',(Join-Path (Split-Path $Gate -Parent) 'owned-descendant.ps1'),'-Receipt',($Gate+'.descendant'))
+        throw 'Cancellation fixture unexpectedly completed'
+    }
     $env:AIRC_DIR=Join-Path $env:USERPROFILE ('.airc/src-normal-'+$Engine)
     $env:AIRC_INSTALL_NO_PULL='1'
     New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
@@ -51,25 +65,52 @@ if($Child){
     }
     exit 0
 }
+. (Join-Path $root 'windows/shared-setup.ps1')
 if(-not (Test-IsAdmin)){throw 'Hosted supervisor must start elevated to grant explicit process-scoped test consent.'}
-$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+if(-not $CancellationOnly){
+    Invoke-InstallerProcess -OwnProcessTree (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$PSCommandPath,'-Engine',$Engine,'-CancellationOnly')
+    if($LASTEXITCODE -ne 0){throw 'Hosted credentialed child cancellation proof failed'}
+}
+$testUser='aircci'+[guid]::NewGuid().ToString('N').Substring(0,12)
+$secret=ConvertTo-SecureString ('aA9!'+[guid]::NewGuid().ToString('N')+[guid]::NewGuid().ToString('N')) -AsPlainText -Force
+$account=$null
 $scratch=Join-Path $env:RUNNER_TEMP ('airc-medium-install-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch | Out-Null
 $gate=Join-Path $scratch 'consent.ready'
 $pipe='\\.\pipe\airc-medium-ready-'+[guid]::NewGuid().ToString('N')
-$process=$null;$captured=$null;$cache=$false
+$process=$null;$captured=$null;$descendant=$null;$cache=$false
+[IO.File]::WriteAllText((Join-Path $scratch 'owned-descendant.ps1'),@'
+param([string]$Receipt)
+$owned=Get-Process -Id $PID
+[IO.File]::WriteAllText($Receipt,(@{pid=$PID;startTicks=$owned.StartTime.ToUniversalTime().Ticks}|ConvertTo-Json -Compress))
+while($true){Start-Sleep -Seconds 1}
+'@)
 try {
+    $account=New-LocalUser -Name $testUser -Password $secret -AccountNeverExpires -PasswordNeverExpires
+    $users=Get-LocalGroup -SID 'S-1-5-32-545'
+    Add-LocalGroupMember -Group $users -Member $account
+    $sid=$account.SID.Value
+    $acl=Get-Acl -LiteralPath $scratch
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid,'Modify','ContainerInherit,ObjectInherit','None','Allow')))
+    Set-Acl -LiteralPath $scratch -AclObject $acl
     Ensure-Gsudo
     $gsudo=Find-GsudoExecutable
+    $gsudoDirectory=Join-Path $scratch 'gsudo'
+    New-Item -ItemType Directory -Path $gsudoDirectory | Out-Null
+    Get-ChildItem -LiteralPath (Split-Path $gsudo -Parent) | Copy-Item -Destination $gsudoDirectory -Recurse -Force
+    $gsudo=Join-Path $gsudoDirectory ([IO.Path]::GetFileName($gsudo))
     Invoke-InstallerProcess -OwnProcessTree $gsudo @('--version') | Out-Host
     if($LASTEXITCODE -ne 0){throw 'Cannot inspect managed gsudo'}
     $enginePath=if($Engine -eq 'powershell'){Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'}else{(Get-Command pwsh.exe -CommandType Application).Source}
-    $arguments=@('--integrity','Medium','--direct','--wait',$enginePath,'-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$PSCommandPath,'-Child','-Engine',$Engine,'-Gate',$gate,'-ReadyPipe',$pipe,'-OriginalSid',$sid)
+    $arguments=@('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$PSCommandPath,'-Child','-Engine',$Engine,'-Gate',$gate,'-ReadyPipe',$pipe,'-OriginalSid',$sid,'-GsudoDirectory',$gsudoDirectory)
+    if($CancellationOnly){$arguments+='-CancelProbe'}
     $quoted=foreach($value in $arguments){if($value -notmatch '[\s"]'){$value}else{'"'+$value+'"'}}
     $start=New-Object Diagnostics.ProcessStartInfo
-    $start.FileName=$gsudo;$start.Arguments=$quoted -join ' ';$start.WorkingDirectory=$root
+    $start.FileName=$enginePath;$start.Arguments=$quoted -join ' ';$start.WorkingDirectory=$root
     $start.UseShellExecute=$false;$start.CreateNoWindow=$true
-    $process=[Continuum.Setup.OwnedProcessV2]::Start($start)
+    $start.UserName=$testUser;$start.Domain=$env:COMPUTERNAME;$start.Password=$secret;$start.LoadUserProfile=$true
+    $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+    $process=[Diagnostics.Process]::Start($start)
     $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
     $deadline=[DateTime]::UtcNow.AddMinutes(2)
     do {
@@ -87,6 +128,19 @@ try {
     $ancestor=[int]$receipt.serverPid;$seen=[Collections.Generic.HashSet[int]]::new()
     while($ancestor -ne $PID){if(-not $seen.Add($ancestor)){throw 'Invalid child ancestry'};$parent=Get-CimInstance Win32_Process -Filter "ProcessId=$ancestor" -ErrorAction Stop;if(-not $parent){throw 'Missing child ancestry'};$ancestor=[int]$parent.ParentProcessId}
     if($captured.HasExited){throw 'Observed child exited before scoped consent'}
+    if($CancellationOnly){
+        [IO.File]::WriteAllText($gate,'cancellation fixture gate')
+        $deadline=[DateTime]::UtcNow.AddSeconds(30)
+        while(-not (Test-Path -LiteralPath ($gate+'.descendant'))){if($process.HasExited -or [DateTime]::UtcNow -gt $deadline){throw 'No owned cancellation descendant'};Start-Sleep -Milliseconds 100}
+        $birth=Get-Content -LiteralPath ($gate+'.descendant') -Raw | ConvertFrom-Json
+        $descendant=Get-Process -Id ([int]$birth.pid)
+        $descendantHandle=$descendant.Handle
+        if($descendant.StartTime.ToUniversalTime().Ticks -ne [long]$birth.startTicks -or (Get-CimInstance Win32_Process -Filter "ProcessId=$($birth.pid)").ParentProcessId -ne $captured.Id){throw 'Cancellation descendant ownership changed'}
+        $process.Kill()
+        if(-not $process.WaitForExit(10000) -or -not $descendant.WaitForExit(10000)){throw 'Cancellation left an owned descendant alive'}
+        Read-ChildLogs $stdout $stderr
+        Write-Host 'PASS: actual standard-account cancellation closes inner owned descendant'
+    } else {
     Invoke-InstallerProcess $gsudo @('cache','on','-p',[string]$receipt.serverPid,'-d','-1')
     if($LASTEXITCODE -ne 0){throw 'Explicit hosted process-scoped consent failed'}
     $cache=$true
@@ -95,8 +149,30 @@ try {
     while(-not $process.WaitForExit(500)){if([DateTime]::UtcNow -gt $deadline.AddHours(1)){throw 'Installer coordinator exit was not observed'}}
     Read-ChildLogs $stdout $stderr
     if($process.ExitCode -ne 0){throw "Normal-token public install failed with exit $($process.ExitCode)"}
+    }
 } finally {
     try {if($cache){Invoke-InstallerProcess $gsudo @('cache','off','-p',[string]$receipt.serverPid);if($LASTEXITCODE -ne 0){throw 'Scoped CI cache cleanup failed'}}}
-    finally {if($process){$process.Dispose()};if($captured){$captured.Dispose()}}
+    finally {
+        try {
+            if($process -and -not $process.HasExited){$process.Kill();if(-not $process.WaitForExit(10000)){throw 'Owned fixture child did not exit; account retained'}}
+            if($captured -and -not $captured.HasExited){throw 'Captured fixture child remains alive; account retained'}
+            if($account){
+                $cleanupDeadline=[DateTime]::UtcNow.AddSeconds(15)
+                do {
+                    $owned=@(Get-CimInstance Win32_Process | Where-Object {try{(Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction Stop).Sid -eq $sid}catch{$false}})
+                    if(-not $owned.Count){break}
+                    if([DateTime]::UtcNow -gt $cleanupDeadline){throw 'Fixture user processes remain alive; account/profile retained'}
+                    Start-Sleep -Milliseconds 200
+                }while($true)
+                $profile=Get-CimInstance Win32_UserProfile -Filter "SID='$($account.SID.Value)'"
+                if($profile){
+                    $expected=[IO.Path]::GetFullPath((Join-Path $env:SystemDrive ('Users/'+$testUser)))
+                    if($profile.Loaded -or [IO.Path]::GetFullPath($profile.LocalPath) -ne $expected){throw 'Fixture profile still loaded or unexpected; retaining account/profile'}
+                    $profile | Remove-CimInstance
+                }
+                Remove-LocalUser -SID $account.SID
+            }
+        } finally {if($process){$process.Dispose()};if($captured){$captured.Dispose()};if($descendant){$descendant.Dispose()};$secret.Dispose()}
+    }
 }
 exit 0

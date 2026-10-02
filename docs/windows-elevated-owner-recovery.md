@@ -40,10 +40,10 @@ token. Explicit firewall-only and read-only diagnostic operations remain usable
 from an elevated observer. Both PowerShell and Windows Bash entries project the
 same canonical token check from the pinned shared helper.
 
-Hosted Windows acceptance starts an actual medium-integrity process of the same
-user via managed gsudo. A native named-pipe observation supplies its PID and
+Hosted Windows acceptance creates a disposable standard account and starts an actual
+medium-integrity process with its credentials. A native named-pipe observation supplies its PID and
 token, a retained process handle and birth time protect that observation, and
-ancestry must lead back to the test supervisor before process-scoped consent is
+ancestry must lead back to the test supervisor before managed gsudo process-scoped consent is
 granted. The unchanged public installer runs in that child, followed by doctor
 and a native check that its daemon is also normal-token. The disposable runner
 cleans up its owned daemon and scoped cache. No token-changing acceptance test
@@ -53,3 +53,10 @@ Local token-policy, source-acquisition and PATH fixtures pass; the hosted real
 medium-token installation remains OPEN until its CI receipt is available. A
 runner that cannot provide a real normal token fails explicitly; tests never
 mock normality for full installation.
+
+The built-in Administrator (RID 500) remained elevated even after gsudo lowered
+its integrity to Medium in the first hosted test. The fixture correctly refused
+that token before installation. The replacement uses a real disposable standard
+account; it also requires captured-child cancellation to close its owned native
+descendant before attempting full installation. Account/profile cleanup waits
+for the exact test user's processes to exit and validates the profile path.
