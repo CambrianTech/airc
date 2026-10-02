@@ -61,7 +61,7 @@ if($Child){
     New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
     Get-ChildItem -LiteralPath $root -Force | Copy-Item -Destination $env:AIRC_DIR -Recurse -Force
     $installed=Join-Path $env:LOCALAPPDATA 'Programs/airc/airc.exe'
-    $installFailure=$null
+    $installFailure=$null;$daemonOwner=$null
     try {
         & (Join-Path $env:AIRC_DIR 'install.ps1')
         if($LASTEXITCODE -ne 0){throw "Public installation failed with $LASTEXITCODE"}
@@ -71,13 +71,17 @@ if($Child){
         if($LASTEXITCODE -ne 0 -or $endpoint.Count -ne 1){throw 'Installed endpoint resolution failed'}
         $daemon=[AircDaemonDiagnostics]::Inspect([string]$endpoint[0])
         if($daemon.tokenElevated -ne $false -or $daemon.tokenIntegritySid -ne 'S-1-16-8192' -or $daemon.tokenUserSid -ne $OriginalSid){throw ('Installed daemon token is not normal: '+($daemon|ConvertTo-Json -Compress))}
+        $daemonOwner=Get-Process -Id ([int]$daemon.serverPid) -ErrorAction Stop
+        $daemonHandle=$daemonOwner.Handle
+        if($daemonOwner.HasExited){throw 'Verified installed daemon exited before cleanup capture'}
         Write-Host ('PASS: real public install and doctor under normal token; daemon receipt '+($daemon|ConvertTo-Json -Compress))
     } catch { $installFailure=$_;throw } finally {
         try {
             if(Test-Path -LiteralPath $installed){Invoke-InstallerProcess -OwnProcessTree $installed @('stop');if($LASTEXITCODE -ne 0){throw 'Owned installed test daemon cleanup failed'}}
+            if($daemonOwner -and -not $daemonOwner.WaitForExit(10000)){throw 'Captured installed daemon remained alive after Stop'}
         } catch {
             if($installFailure){Write-Warning ('Cleanup after failed installation: '+$_.Exception.Message)}else{throw}
-        }
+        } finally {if($daemonOwner){$daemonOwner.Dispose()}}
     }
     exit 0
 }
@@ -189,16 +193,26 @@ try {
                 do {
                     $owned=@(Get-CimInstance Win32_Process | Where-Object {try{(Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction Stop).Sid -eq $sid}catch{$false}})
                     if(-not $owned.Count){break}
-                    if([DateTime]::UtcNow -gt $cleanupDeadline){throw 'Fixture user processes remain alive; account/profile retained'}
+                    if([DateTime]::UtcNow -gt $cleanupDeadline){break}
                     Start-Sleep -Milliseconds 200
                 }while($true)
-                $profile=Get-CimInstance Win32_UserProfile -Filter "SID='$($account.SID.Value)'"
-                if($profile){
-                    $expected=[IO.Path]::GetFullPath((Join-Path $env:SystemDrive ('Users/'+$testUser)))
-                    if($profile.Loaded -or [IO.Path]::GetFullPath($profile.LocalPath) -ne $expected){throw 'Fixture profile still loaded or unexpected; retaining account/profile'}
-                    $profile | Remove-CimInstance
+                if($owned.Count){
+                    $inventory=$owned | Select-Object ProcessId,Name,ExecutablePath
+                    if(@($owned | Where-Object {-not $_.ExecutablePath -or $_.Name -like 'airc*'}).Count){throw ('AIRC or unobservable fixture process remains: '+($inventory|ConvertTo-Json -Compress))}
+                    # Compiler/COM services can intentionally outlive their caller.
+                    # Preserve their account/profile for disposable VM teardown;
+                    # do not kill them or turn fixture retention into install failure.
+                    Write-Warning ('Retaining disposable account/profile for remaining non-AIRC processes: '+($inventory|ConvertTo-Json -Compress))
+                }else{
+                    $profile=Get-CimInstance Win32_UserProfile -Filter "SID='$($account.SID.Value)'"
+                    if($profile){
+                        $expected=[IO.Path]::GetFullPath((Join-Path $env:SystemDrive ('Users/'+$testUser)))
+                        if([IO.Path]::GetFullPath($profile.LocalPath) -ne $expected){throw 'Unexpected fixture profile path; retaining account/profile'}
+                        if($profile.Loaded){throw 'Fixture profile remains loaded without observable process; retaining account/profile'}
+                        $profile | Remove-CimInstance
+                    }
+                    Remove-LocalUser -SID $account.SID
                 }
-                Remove-LocalUser -SID $account.SID
             }
         } finally {if($process){$process.Dispose()};if($captured){$captured.Dispose()};if($descendant){$descendant.Dispose()};$secret.Dispose()}
     }
