@@ -729,3 +729,13 @@ No real installer, daemon, task or firewall operation was run for these checks.
 Independent parent review approved the shared selection/PATH change, and the
 updater reviewer independently approved the explicit executing-file handoff.
 The additional relative Cargo-target exclusion fixture passed (70059).
+
+CI coverage correction: PR1491 head0aa1b95 had an incorrectly indented run block
+in ci.yml. GitHub rejected workflow run37038119381 before creating jobs, so the
+PR check rollup showed Rust/shell checks but omitted the public installer matrix.
+That is a failed gate, not passing installation coverage. The indentation is
+corrected; an isolated developer-only PyYAML6.0.2 validator in D: scratch checked
+syntax, all four clean-install jobs, the three-platform setup-consent matrix,
+and rejection of the original broken indentation. No runtime/setup dependency
+was added. Fresh Windows/PS5/Linux/macOS installer CI remains mandatory before
+acceptance; no missing-workflow waiver is permitted.
