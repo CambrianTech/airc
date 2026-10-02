@@ -788,6 +788,7 @@ nudges. Existing delivery accounting also purges connections after repeated
 unacknowledged sends; idle TCP keepalive/reconnect behavior is a separate audit
 owned alongside transport work, not claimed repaired by heartbeat scheduling.
 
+
 ### Foreign checkout scope during installation (2026-10-02)
 
 Fable's actual M5 install invoked adoption beneath another account's
@@ -833,3 +834,39 @@ ONLY NotFound; present entries (including dangling symlinks), permission errors
 and all other uncertainty retain refusal. The long-root CLI regression is not
 shortened. Actual IPC tests add nonexistent long legacy paths plus present-file
 and dangling-symlink refusal; Unix execution remains pending hosted CI.
+
+## Peer CLI fixture lifecycle consolidation (2026-10-02)
+
+The seven peer-command contracts previously initialized seven separate account
+scopes and ten temporary peer identities. They now share one isolated account
+and five distinct real peer identities: unknown-peer refusal before enrollment,
+default Untrusted enrollment, explicit Friend/JSON shape, persisted promotion,
+honest idempotence, and explicit round trips for all four tiers. Every former
+assertion remains covered; rows are matched by peer ID when multiple peers exist.
+The existing daemon_tempdir teardown owns the lifecycle; no new harness or CI
+job was added. Initialization falls from 17 calls to 6. Dedicated cold-start,
+restart and store key-rotation tests are unchanged. The three existing CLI launch
+helpers now use the canonical background constructor to avoid Windows consoles.
+Formatting and diff checks passed (23606); actual Windows execution passed all
+contracts in 29.05s (11253). Independent peer review approved the preserved
+contracts and shared process policy. Runtime savings are not claimed from source
+counts; hosted cross-platform coverage remains required.
+
+
+## Sharing-refusal fixture diagnosis (2026-10-02)
+
+Hosted Windows job 111057304285 refused MoveFileW with sharing violation 32
+before publication in the public updater rollback fixture. The updater retained
+the original artifact and restored its daemon; the handle denying deletion is
+UNKNOWN. One unchanged local four-case public binary run passed at c0c2f66
+(45079, 124.12s), which does not resolve or waive the hosted failure.
+
+The fixture now acquires its recovered scoped-daemon cleanup guard before
+checking expected diagnostics, so an unexpected refusal cannot strand that
+recovered fixture process. Case labels identify ordinary/automatic and stopped/
+running cases. A Windows test holds a known deny-delete file handle and checks
+that displacement fails before installation, preserves both files, and leaves
+no transaction directory. A separate later transaction succeeds after releasing
+that known handle. This controlled OS refusal does not identify the CI holder.
+No production retries, process termination, failure acceptance or live machine
+changes are introduced. Root-cause diagnosis remains OPEN.

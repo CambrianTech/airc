@@ -215,6 +215,40 @@ mod tests {
             .success());
     }
 
+    // Regression for hosted updater sharing violation (job111057304285).
+    // A known handle denying delete must fail before publication without losing
+    // either file. This reproduces the OS refusal, not the unknown CI holder.
+    #[cfg(windows)]
+    #[test]
+    fn displacement_refuses_a_known_deny_delete_handle_without_changing_files() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current.exe");
+        let candidate = temp.path().join("candidate.exe");
+        std::fs::write(&current, "original").unwrap();
+        std::fs::write(&candidate, "candidate").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ, deliberately no FILE_SHARE_DELETE.
+            .open(&current)
+            .unwrap();
+        let refusal = BinarySwap::displace(&current, &candidate)
+            .err()
+            .expect("deny-delete holder must refuse displacement");
+        assert!(refusal.to_string().contains("os error 32"), "{refusal}");
+        assert!(refusal.to_string().contains("installation was not started"));
+        assert_eq!(std::fs::read(&current).unwrap(), b"original");
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"candidate");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+        drop(held);
+        // An explicit later transaction can proceed after the known owner
+        // releases its handle; the failed operation never retries or kills it.
+        let swap = BinarySwap::displace(&current, &candidate).unwrap();
+        assert_eq!(std::fs::read(swap.previous()).unwrap(), b"original");
+        swap.rollback().unwrap();
+        assert_eq!(std::fs::read(&current).unwrap(), b"original");
+    }
+
     #[test]
     fn rollback_preserves_unknown_current_and_owned_destination_collisions() {
         for collision in [false, true] {

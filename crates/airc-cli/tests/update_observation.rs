@@ -585,6 +585,7 @@ esac
     let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
     for running in [false, true] {
         for args in [&["update"][..], &["update", "--auto"][..]] {
+            println!("Publication case: daemon_was_running={running}, args={args:?}");
             std::fs::copy(original, &current).unwrap();
             let ready = temp
                 .path()
@@ -610,6 +611,11 @@ esac
                 .env("UPDATE_TEST_CURRENT", &current)
                 .output()
                 .unwrap();
+            // Own the test-scoped recovered endpoint BEFORE assertions: an
+            // unexpected pre-publication failure may already have restored a
+            // daemon. A diagnostic assertion must not leak that owned process.
+            // This is a direct IPC connection, never an ensure/start command.
+            let mut recovered_owner = running.then(|| RestoredOwner::connect(&socket));
             let stderr = String::from_utf8_lossy(&result.stderr);
             assert!(
                 !result.status.success(),
@@ -636,7 +642,8 @@ esac
                     owner.child.try_wait().unwrap().is_some(),
                     "previous owner was not stopped"
                 );
-                let mut restored_owner = RestoredOwner::connect(&socket);
+                let mut restored_owner =
+                    recovered_owner.take().expect("running case owns recovery");
                 #[cfg(windows)]
                 let restored_pid = restored_owner.stream.server_process_id().unwrap();
                 #[cfg(windows)]
