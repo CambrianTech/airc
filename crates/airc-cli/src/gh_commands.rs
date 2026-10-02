@@ -72,7 +72,7 @@ fn run_gh_with_input(gh_args: Vec<String>, input: Option<String>) -> Result<(), 
             "allowed": true,
             "reason": "interactive-auth",
         }));
-        let status = airc_core::process::background(&gh)
+        let status = airc_core::process::interactive(&gh)
             .args(&gh_args)
             .status()?;
         return if status.success() {

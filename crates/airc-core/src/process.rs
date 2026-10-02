@@ -11,6 +11,11 @@ pub fn background(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Preserve terminal attachment for explicitly interactive user commands.
+pub fn interactive(program: impl AsRef<OsStr>) -> Command {
+    Command::new(program)
+}
+
 pub fn configure_background(command: &mut Command) {
     #[cfg(windows)]
     {
