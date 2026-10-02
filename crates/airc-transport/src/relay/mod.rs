@@ -18,7 +18,7 @@ pub mod adapter;
 pub mod config;
 pub mod error;
 
-pub use adapter::RelayAdapter;
+pub use adapter::{RelayAdapter, RelayDisconnectObserver};
 pub use config::RelayClientConfig;
 pub use error::RelayClientError;
 
