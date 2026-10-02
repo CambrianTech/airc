@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pure destination selection plus scratch shell PATH reconciliation. No install.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'printf "FAIL: install destination fixture line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
@@ -12,14 +13,26 @@ ok() { :; }
 info() { :; }
 fixture_platform="$(uname -s)"
 executable_name=airc
-case "$fixture_platform" in MINGW*|MSYS*|CYGWIN*) executable_name=airc.exe ;; esac
+native_windows_image=""
+case "$fixture_platform" in MINGW*|MSYS*|CYGWIN*)
+  executable_name=airc.exe
+  native_windows_image="$(_to_bash_path "${WINDIR:-${SystemRoot:?}}/System32/where.exe")" ;;
+esac
 uname() { printf '%s\n' "$fixture_platform"; }
 original_path="$PATH"
 export HOME="$fixture/home" LOCALAPPDATA="$fixture/local"
 CLONE_DIR="$fixture/source"
 mkdir -p "$HOME" "$fixture/first bin" "$fixture/second bin" "$CLONE_DIR/target/release" "$fixture/custom-target/debug"
 native() {
-  case "$fixture_platform" in MINGW*|MSYS*|CYGWIN*) printf MZfixture > "$1" ;; Darwin) printf '\317\372\355\376fixture' > "$1" ;; *) printf '\177ELFfixture' > "$1" ;; esac
+  case "$fixture_platform" in
+    MINGW*|MSYS*|CYGWIN*)
+      # MSYS executable discovery must see a real PE image, not truncated magic.
+      # This image is only inspected; the fixture never executes it.
+      if [ -n "$native_windows_image" ]; then cp "$native_windows_image" "$1"
+      else printf MZfixture > "$1"; fi ;;
+    Darwin) printf '\317\372\355\376fixture' > "$1" ;;
+    *) printf '\177ELFfixture' > "$1" ;;
+  esac
   chmod +x "$1"
 }
 native "$fixture/first bin/$executable_name"
@@ -57,7 +70,7 @@ fixture_platform=Linux
 [ "$(_select_bin_dir)" = "$HOME/.local/bin" ]
 fixture_platform=MINGW64_NT-10.0
 [ "$(_select_bin_dir)" = "$LOCALAPPDATA/Programs/airc" ]
-printf 'MZfixture' > "$fixture/second bin/$executable_name"
+native "$fixture/second bin/$executable_name"
 PATH="$fixture/first bin:$fixture/second bin:/usr/bin:/bin"
 [ "$(_select_bin_dir)" = "$fixture/second bin" ]
 # Reconcile an existing later PATH entry and retain every unrelated tool.

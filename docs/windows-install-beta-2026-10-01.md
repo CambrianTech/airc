@@ -739,3 +739,14 @@ syntax, all four clean-install jobs, the three-platform setup-consent matrix,
 and rejection of the original broken indentation. No runtime/setup dependency
 was added. Fresh Windows/PS5/Linux/macOS installer CI remains mandatory before
 acceptance; no missing-workflow waiver is permitted.
+
+The restored matrix at df14cd2 exposed a Windows setup-consent failure in the
+new destination fixture (run37039301690, job110945178210). Source compatibility
+passed first; the destination fixture exited1 without identifying its assertion.
+The cause is not yet established: the old fixture also passed locally. The
+fixture now reports failing line/command and uses an actual Windows PE image
+(System32/where.exe copied as airc.exe, never executed) for native autodiscovery,
+instead of a truncated MZ header. This exercises the production type-aP lookup,
+including .exe resolution, separately from the updater's explicit destination.
+The strengthened local Windows fixture passed (25256). Fresh CI, including the
+cancelled macOS consent leg, must pass; this is not a live installation receipt.
