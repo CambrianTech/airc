@@ -9,6 +9,9 @@ param(
     [switch]$ExistingOnly,
     [switch]$RestartRequired
 )
+. (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
+Invoke-InstallerEntryPoint {
+Initialize-InstallerPowerShell
 $ErrorActionPreference = 'Stop'
 function Get-AircStartupTask {
     try { Get-ScheduledTask -TaskName 'airc-join' -TaskPath '\' -ErrorAction Stop }
@@ -133,3 +136,5 @@ Remove-Item -LiteralPath $pending -ErrorAction SilentlyContinue
     } finally { Clear-Elevation }
     if ($code -ne 0) { throw 'Elevated AIRC startup repair failed; rerun install.ps1 to retry startup registration. An already-current airc update skips installation.' }
 }
+
+} # Installer diagnostic process boundary.

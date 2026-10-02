@@ -4,6 +4,9 @@ param(
     [Parameter(Mandatory=$true)][string]$SourceDirectory,
     [Parameter(Mandatory=$true)][string]$EnvironmentFile
 )
+. (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
+Invoke-InstallerEntryPoint {
+Initialize-InstallerPowerShell
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'shared-setup.ps1')
 try {
@@ -422,3 +425,5 @@ foreach ($name in @('PATH','CARGO_HOME','RUSTUP_HOME','CARGO_TARGET_DIR','TEMP',
 }
 [IO.File]::WriteAllText($EnvironmentFile, (($values -join [char]0) + [char]0), (New-Object Text.UTF8Encoding($false)))
 } finally { Clear-Elevation }
+
+} # Installer diagnostic process boundary.

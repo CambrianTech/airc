@@ -1,6 +1,18 @@
 # Executes the public native entry with isolated source/package fixtures. Never
 # installs packages, edits the real user profile, or changes GitHub credentials.
 $ErrorActionPreference = 'Stop'
+function Get-FixtureEntryFailure {
+    param([scriptblock]$Action)
+    $previous = [Console]::Error
+    $capture = New-Object IO.StringWriter
+    try {
+        [Console]::SetError($capture)
+        $global:LASTEXITCODE = 0
+        & $Action | Out-Null
+        if ($global:LASTEXITCODE -ne 1) { throw "Expected public entry exit 1, got $global:LASTEXITCODE" }
+        return $capture.ToString()
+    } finally { [Console]::SetError($previous); $capture.Dispose() }
+}
 $repository = Split-Path $PSScriptRoot -Parent
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ("airc setup O'Brien " + [guid]::NewGuid().ToString('N'))
 $saved = @{}
@@ -9,7 +21,7 @@ foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','AIRC_DIR','AIRC_CHANNEL
 }
 function Assert-True($condition,$message) { if (-not $condition) { throw $message } }
 function New-Source($directory) {
-    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1','windows/sync-bootstrap.ps1')) {
+    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1','windows/sync-bootstrap.ps1','windows/setup-entrypoint.ps1')) {
         $path = Join-Path $directory $relative
         New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
         [IO.File]::WriteAllText($path,'fixture')
@@ -47,6 +59,9 @@ public static class SetupBridgeFixture {
   }
   public static void Main(string[] args) {
     if (GetConsoleWindow()!=IntPtr.Zero) { Environment.Exit(91); }
+    if (Array.IndexOf(args,"diagnostic-fixture")>=0) {
+      Console.Out.WriteLine("FIXTURE DATA"); Console.Error.WriteLine("FIXTURE COMPILER ERROR"); Environment.Exit(23);
+    }
     if (args.Length>0 && args[0]=="clone") {
       File.AppendAllText(Environment.GetEnvironmentVariable("AIRC_FIXTURE_LOG"),"git|"+string.Join("|",args)+"\n");
       CopyTree(Environment.GetEnvironmentVariable("AIRC_FIXTURE_SOURCE"),args[args.Length-1]); return;
@@ -73,6 +88,22 @@ public static class SetupBridgeFixture {
     # Seed only this test's isolated, checksum-verified setup cache. This loads
     # the real shared launcher; native fixture programs cannot install anything.
     . (Join-Path $repository 'windows/shared-setup.ps1')
+    # Real nested native coordinator, with only its Bash executable replaced.
+    # Capture raw OS pipes: merging errors inside the child would hide the PS5 bug.
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $start.Arguments = '-NoProfile -ExecutionPolicy RemoteSigned -File "' + (Join-Path $repository 'windows/install-session.ps1') + '" -SourceDirectory "' + $repository + '" -BashPath "' + (Join-Path $gitRoot 'bin/bash.exe') + '" -ExpectedBuild diagnostic-fixture'
+    $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+    $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
+    $native = [Diagnostics.Process]::Start($start)
+    try {
+        $out = $native.StandardOutput.ReadToEndAsync(); $err = $native.StandardError.ReadToEndAsync()
+        if (-not $native.WaitForExit(30000)) { $native.Kill(); throw 'Nested coordinator diagnostic test timed out.' }
+        Assert-True ($native.ExitCode -eq 23) "Nested coordinator lost native failure: $($native.ExitCode); $($err.Result)"
+        Assert-True ($out.Result.Trim() -eq 'FIXTURE DATA') "Nested coordinator contaminated data: $($out.Result)"
+        Assert-True ([regex]::Matches($err.Result,'(?m)^FIXTURE COMPILER ERROR\s*$').Count -eq 1) "Missing or duplicated nested diagnostic: $($err.Result)"
+    } finally { $native.Dispose() }
+    Write-Host 'PASS: actual nested PS5 coordinator preserves diagnostic, data and exit status'
     function Get-Command {
         param([string]$Name, $ErrorAction, $CommandType)
         if ($Name -in @('git.exe','git')) { return [pscustomobject]@{Source=$fakeGit} }
@@ -123,7 +154,7 @@ public static class SetupBridgeFixture {
     $first = $entryText.IndexOf('# BEGIN GENERATED RUNTIME MODULES')
     $last = $entryText.IndexOf('# END GENERATED RUNTIME MODULES')
     Assert-True ($first -ge 0 -and $last -gt $first) 'Public runtime initialization region missing'
-    [IO.File]::WriteAllText($controlEntry, $entryText.Remove($first, $last + '# END GENERATED RUNTIME MODULES'.Length - $first))
+    [IO.File]::WriteAllText($controlEntry, $entryText.Replace("`nInitialize-InstallerPowerShell`n", "`n"))
     $probe = Join-Path $fixture 'public-module-probe.ps1'
     @'
 param($Entry, $Binary, $ForeignModules)
@@ -135,7 +166,7 @@ $env:PSModulePath = $ForeignModules + ';' + $env:PSModulePath
 $before = $env:PSModulePath
 try {
     & $Entry -FirewallOnly -AircPath $Binary
-    if ($env:PSModulePath -cne $before) { throw 'Public entry rewrote inherited module paths.' }
+    if ($global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE }; if ($env:PSModulePath -cne $before) { throw 'Public entry rewrote inherited module paths.' }
 } catch { [Console]::Error.WriteLine($_.Exception.ToString()); exit 1 }
 '@ | Set-Content -LiteralPath $probe -Encoding UTF8
     try {
@@ -154,7 +185,7 @@ try {
     $LASTEXITCODE = 0
     try {
         $rejected = $false
-        try { & (Join-Path $entry 'install.ps1') -FirewallOnly -AircPath $installedBinary } catch { $rejected = $_.Exception.Message -match 'exit 73' }
+        $rejected = (Get-FixtureEntryFailure { & (Join-Path $entry 'install.ps1') -FirewallOnly -AircPath $installedBinary }) -match 'exit 73'
         Assert-True $rejected 'Firewall-only public entry hid failed policy verification'
     } finally { $env:AIRC_FIXTURE_FIREWALL_FAIL = $null; $LASTEXITCODE = 73 }
 
@@ -180,10 +211,8 @@ try {
     [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
     $rejected = $false
     $refusalDetail = 'Installer returned successfully'
-    try { & (Join-Path $entry 'install.ps1') } catch {
-        $refusalDetail = $_.ToString() + ' at ' + $_.ScriptStackTrace
-        $rejected = $_.Exception.Message -match 'explicitly selected source'
-    }
+    $refusalDetail = Get-FixtureEntryFailure { & (Join-Path $entry 'install.ps1') }
+    $rejected = $refusalDetail -match 'explicitly selected source'
     Assert-True $rejected ("Incompatible developer source was not rejected: $refusalDetail")
     Assert-True (-not (Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw)) 'Rejected developer source launched a process'
 

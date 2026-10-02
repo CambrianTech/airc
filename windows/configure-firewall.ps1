@@ -2,6 +2,9 @@
 # in PowerShell source: -File preserves spaces, apostrophes and literal dollars.
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$AircPath)
+. (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
+Invoke-InstallerEntryPoint {
+Initialize-InstallerPowerShell
 $ErrorActionPreference = 'Stop'
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $helper = Join-Path $PSScriptRoot 'firewall-allow.ps1'
@@ -24,3 +27,5 @@ if ($LASTEXITCODE -eq 4) {
 } elseif ($LASTEXITCODE -ne 0) {
     throw 'Firewall verification failed after applying the rule. AIRC setup is incomplete.'
 }
+
+} # Installer diagnostic process boundary.

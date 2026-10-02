@@ -8,6 +8,20 @@ function Initialize-InstallerPowerShell {
         Import-Module $manifest -Global -ErrorAction Stop
     }
 }
+
+function Invoke-InstallerEntryPoint {
+    param([Parameter(Mandatory = $true)][scriptblock]$Action)
+    try {
+        & $Action 2>&1 | ForEach-Object {
+            if ($_ -is [Management.Automation.ErrorRecord]) {
+                [Console]::Error.WriteLine($_.ToString())
+            } else { Write-Output $_ }
+        }
+    } catch {
+        [Console]::Error.WriteLine($_.ToString())
+        exit 1
+    }
+}
 Initialize-InstallerPowerShell
 # END GENERATED RUNTIME MODULES
 # Dot-source the same small setup artifacts used by Continuum. AIRC does not

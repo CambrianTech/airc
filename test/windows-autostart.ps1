@@ -1,6 +1,18 @@
 # Public startup regression: no task registration or real AIRC process changes.
 param([switch]$BoundaryParent, [switch]$BoundaryChild)
 $ErrorActionPreference = 'Stop'
+function Get-FixtureEntryFailure {
+    param([scriptblock]$Action)
+    $previous = [Console]::Error
+    $capture = New-Object IO.StringWriter
+    try {
+        [Console]::SetError($capture)
+        $global:LASTEXITCODE = 0
+        & $Action | Out-Null
+        if ($global:LASTEXITCODE -ne 1) { throw "Expected public entry exit 1, got $global:LASTEXITCODE" }
+        return $capture.ToString()
+    } finally { [Console]::SetError($previous); $capture.Dispose() }
+}
 $repo = Split-Path $PSScriptRoot
 if ($BoundaryParent) {
     if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'Boundary parent must run in PowerShell 7' }
@@ -218,7 +230,7 @@ fn main() {
     }
     $registrarSource = Join-Path $scratch 'startup source'
     New-Item -ItemType Directory -Path $registrarSource | Out-Null
-    foreach ($name in @('register-autostart.ps1','run-join-hidden.ps1','run-join-hidden.vbs')) {
+    foreach ($name in @('setup-entrypoint.ps1','register-autostart.ps1','run-join-hidden.ps1','run-join-hidden.vbs')) {
         Copy-Item -LiteralPath (Join-Path $repo "windows\$name") -Destination $registrarSource
     }
     [IO.File]::WriteAllText((Join-Path $registrarSource 'shared-setup.ps1'), 'function Initialize-ElevationSession { }; function Clear-Elevation { }')
@@ -231,7 +243,7 @@ fn main() {
     if ($global:aircStartupFixture.events.Count -ne 0) { throw 'Unchanged task was touched' }
     $global:aircStartupFixture.existing.Principal.UserId='S-1-5-18'
     $failed=$false
-    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'another Windows account' }
+    $failed=(Get-FixtureEntryFailure { & $registrar -AircPath $binary }) -match 'another Windows account'
     if (-not $failed -or $global:aircStartupFixture.events.Count -ne 0) { throw 'Another account startup task was modified' }
     $global:aircStartupFixture.existing.Principal.UserId=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $global:aircStartupFixture.existing.State='Running'
@@ -244,12 +256,12 @@ fn main() {
     $global:aircStartupFixture.existing.Actions[0].Arguments='old'
     $global:aircStartupFixture.failRegistration=$true
     $failed=$false
-    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'fixture registration failure' }
+    $failed=(Get-FixtureEntryFailure { & $registrar -AircPath $binary }) -match 'fixture registration failure'
     if (-not $failed -or $global:aircStartupFixture.events.Count -ne 0) { throw 'Failed registration touched running task' }
     $global:aircStartupFixture.failRegistration=$false
     $global:aircStartupFixture.daemons=@([pscustomobject]@{CommandLine='airc.exe daemon'})
     $failed=$false
-    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'maintenance window' }
+    $failed=(Get-FixtureEntryFailure { & $registrar -AircPath $binary }) -match 'maintenance window'
     if (-not $failed -or ($global:aircStartupFixture.events -join ',') -ne 'register,disable,enable') { throw 'Live daemon was endangered by task restart' }
     $global:aircStartupFixture.daemons=@()
     $global:aircStartupFixture.events=@()
@@ -270,7 +282,7 @@ fn main() {
     if ($elevation -notlike ('*-UserSid ' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value + '*') -or $global:aircStartupFixture.elevation -notcontains $scratch -or $elevation -notlike '*-Elevated*' -or $elevation -notlike '*-ExistingOnly*') { throw 'Elevation lost original identity/home or widened installer scope' }
     $global:aircStartupFixture.rejectElevation=$true
     $failed=$false
-    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'fixture UAC cancelled' }
+    $failed=(Get-FixtureEntryFailure { & $registrar -AircPath $binary }) -match 'fixture UAC cancelled'
     if (-not $failed) { throw 'Rejected UAC was not reported clearly' }
     $global:aircStartupFixture.deny=$false
     $global:aircStartupFixture.existing = $null

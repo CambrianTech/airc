@@ -456,7 +456,7 @@ module first in PSModulePath; removing the generated initializer makes the same
 fixture fail with the foreign-module sentinel. The child asserts inherited paths
 are unchanged. The full setup bridge and the four storage/acquisition/firewall
 suites pass. These isolated fixtures do not modify the live firewall or daemon.
-The provisional helper revision depends on Continuum #4660; repinning to its
+The released helper revision depends on Continuum #4660; repinning to its
 released merge, CI, and live installation acceptance remain OPEN.
 
 Released dependency and CI fixture correction: Continuum #4660 merged all-green
@@ -501,3 +501,37 @@ implementation. Validation used the shared hidden launcher, two compiler jobs,
 and D: build/temp paths; C: remained at 7.5 GiB free and RAM above 39 GiB free.
 Live installed diagnostic reconciliation remains OPEN.
 
+
+### Hidden PowerShell diagnostic propagation (2026-10-02)
+
+OPEN until normal public installation exercises this integration. Continuum's
+public Windows build failed with Cargo 101 while its actual compiler stderr was
+lost at a hidden PS5 host boundary. Reproductions isolated unmerged ErrorRecord
+rendering; native pipe draining itself worked. AIRC uses the same nested host
+boundaries and now consumes the canonical entry serializer instead of inventing
+another launcher or output policy.
+
+The lock temporarily references published Continuum 9c8e336233c043b8723fc8472b2cf44f37f411f7
+for development verification. MERGE GATE: repin to its released merged commit and
+verify hashes/regenerate before merge. The generator projects verified runtime
+initialization and entry serialization definitions to setup-entrypoint.ps1 and
+the public entry. Native setup adapters reuse those definitions, including their
+loader failures; shared-setup.ps1 remains a dot-source library. Source acquisition
+requires the generated file, so an older incomplete checkout cannot be selected.
+
+Actual PS5 bridge PASS 60617 includes real install-session.ps1 -File execution
+with the existing harmless native stand-in: exactly one stderr diagnostic,
+stdout data unchanged, native exit 23 preserved. Public failure fixtures now
+verify exit 1 and the original message on stderr. Foreign-module negative control,
+source acquisition, cache integrity and developer-source refusal passed. Firewall
+process/policy and storage fixtures PASS 65204. Bash source acquisition and exact
+Windows setup-path tests PASS 29767. No installer, consent, credentials, firewall
+or live daemon action was performed. Startup fixture's first run could not find
+rustc in this stale shell; registered Rust homes/PATH were supplied only to the
+subsequent test process, not written to the installation or global environment.
+Final startup/autostart and GitHub acquisition PS5 fixtures PASS 19485 with
+registered toolchain paths. Bootstrap generator check and whitespace check pass.
+These synthetic receipts do not establish a repaired live AIRC transport or a
+new installed/running binary revision; those remain separate acceptance work.
+
+Released shared helper pin: Continuum #4664 merged all-green reviewed at 10cd21d7781b55789cdc1563c1f96e1304a599fc. Actual standalone PS5 bridge repeated at released pin (86377) PASS, including hidden native coordinator stderr/data/exit and public entry fixtures. Parent review APPROVE; full live installation remains OPEN.

@@ -18,6 +18,21 @@ function Initialize-InstallerPowerShell {
         Import-Module $manifest -Global -ErrorAction Stop
     }
 }
+
+function Invoke-InstallerEntryPoint {
+    param([Parameter(Mandatory = $true)][scriptblock]$Action)
+    try {
+        & $Action 2>&1 | ForEach-Object {
+            if ($_ -is [Management.Automation.ErrorRecord]) {
+                [Console]::Error.WriteLine($_.ToString())
+            } else { Write-Output $_ }
+        }
+    } catch {
+        [Console]::Error.WriteLine($_.ToString())
+        exit 1
+    }
+}
+Invoke-InstallerEntryPoint {
 Initialize-InstallerPowerShell
 # END GENERATED RUNTIME MODULES
 # Dot-source the same small setup artifacts used by Continuum. AIRC does not
@@ -26,8 +41,8 @@ Initialize-InstallerPowerShell
 $aircSetupLock = @'
 {
   "schemaVersion": 1,
-  "continuumRevision": "d2604d832da2b47f7ba3680761c5a46d6b23fc2b",
-  "elevationSha256": "58bec808c18cc1dfc3591c5cd3b6d872f4081e012dd80329eb20b4edddbb43b6",
+  "continuumRevision": "10cd21d7781b55789cdc1563c1f96e1304a599fc",
+  "elevationSha256": "49d5543bf52b5d296ca9fd6c766d0ba3b0f73c9a5b72688c23641be54131ae26",
   "manifestSha256": "116ae91fb1209b9c1ee5dee44734c913685b606e92cc4e959d61f015d7e28217"
 }
 '@ | ConvertFrom-Json
@@ -125,7 +140,7 @@ $source = if ($env:AIRC_DIR) { $env:AIRC_DIR } elseif ($PSScriptRoot -and (Test-
 } else { Join-Path $env:USERPROFILE '.airc\src' }
 $channel = if ($env:AIRC_CHANNEL) { $env:AIRC_CHANNEL } else { 'canary' }
 function Test-SetupLayout([string]$Directory) {
-    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1','windows\sync-bootstrap.ps1')) {
+    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1','windows\sync-bootstrap.ps1','windows\setup-entrypoint.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Directory $relative))) { return $false }
     }
     return $true
@@ -196,3 +211,5 @@ try {
 }
 if ($result -ne 0) { throw "AIRC setup failed (exit $result). Rerun the same setup to resume." }
 $global:LASTEXITCODE = 0
+
+} # Installer diagnostic process boundary.

@@ -1,6 +1,9 @@
 # Native process adapter only. GitHub onboarding policy lives in one shared stage.
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$SourceDirectory)
+. (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
+Invoke-InstallerEntryPoint {
+Initialize-InstallerPowerShell
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'shared-setup.ps1')
 $git = Get-Command git.exe -ErrorAction Stop
@@ -19,3 +22,5 @@ try {
     Invoke-InstallerProcess $bash @('--noprofile', '--norc', ($stage -replace '\\','/'))
     if ($LASTEXITCODE -ne 0) { throw "AIRC GitHub authorization failed (exit $LASTEXITCODE). Rerun setup to resume." }
 } finally { $env:PSModulePath = $previousModulePath }
+
+} # Installer diagnostic process boundary.

@@ -12,6 +12,9 @@ param(
   [switch]$CheckOnly,
   [string]$LogPath
 )
+. (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
+Invoke-InstallerEntryPoint {
+Initialize-InstallerPowerShell
 $ErrorActionPreference = 'Stop'
 if ($LogPath) { Start-Transcript -Path $LogPath -Force | Out-Null }
 
@@ -114,3 +117,5 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) { throw 'AIRC firewall setup requires Windows administrator consent.' }
 Set-AircFirewallPolicy -Program $AircPath
 Write-Host "airc: verified TCP and UDP local-subnet firewall rules for $AircPath"
+
+} # Installer diagnostic process boundary.

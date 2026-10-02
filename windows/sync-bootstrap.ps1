@@ -12,15 +12,20 @@ $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($aircSetupElevation, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'Pinned setup helper could not be parsed.' }
 $initializers = @($ast.FindAll({ param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Initialize-InstallerPowerShell'
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Initialize-InstallerPowerShell', 'Invoke-InstallerEntryPoint')
 }, $false))
-if ($initializers.Count -ne 1) { throw 'Pinned setup helper must supply exactly one runtime initializer.' }
+if ($initializers.Count -ne 2) { throw 'Pinned setup helper must supply the runtime initializer and entry serializer.' }
 $runtimeBegin = '# BEGIN GENERATED RUNTIME MODULES'
 $runtimeEnd = '# END GENERATED RUNTIME MODULES'
 $runtimeStart = $loader.IndexOf($runtimeBegin, [StringComparison]::Ordinal)
 $runtimeFinish = $loader.IndexOf($runtimeEnd, [StringComparison]::Ordinal)
 if ($runtimeStart -lt 0 -or $runtimeFinish -le $runtimeStart -or $loader.LastIndexOf($runtimeBegin) -ne $runtimeStart -or $loader.LastIndexOf($runtimeEnd) -ne $runtimeFinish) { throw 'Expected one generated runtime module region.' }
-$runtime = $initializers[0].Extent.Text.Replace("`r`n", "`n")
+$runtime = ($initializers | ForEach-Object { $_.Extent.Text.Replace("`r`n", "`n") }) -join "`n`n"
+$entryDefinitions = "# Generated from verified shared setup artifacts by windows/sync-bootstrap.ps1.`n" + $runtime + "`n"
+$entryDefinitionsPath = Join-Path $PSScriptRoot 'setup-entrypoint.ps1'
+if ($Check) {
+    if (-not (Test-Path -LiteralPath $entryDefinitionsPath) -or [IO.File]::ReadAllText($entryDefinitionsPath).Replace("`r`n", "`n") -cne $entryDefinitions) { throw 'Entry serializer drift: regenerate from the pinned shared helper.' }
+} else { [IO.File]::WriteAllText($entryDefinitionsPath, $entryDefinitions, (New-Object Text.UTF8Encoding($false))) }
 $projected = $loader.Substring(0, $runtimeStart) + $runtimeBegin + "`n" + $runtime + "`nInitialize-InstallerPowerShell`n" + $runtimeEnd + $loader.Substring($runtimeFinish + $runtimeEnd.Length)
 if ($Check) {
     if ($loader -cne $projected) { throw 'Runtime module drift: regenerate from the pinned shared helper.' }
@@ -28,6 +33,9 @@ if ($Check) {
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'shared-setup.ps1'), $projected, (New-Object Text.UTF8Encoding($false)))
 }
 $loader = $projected
+# Public entry owns serialization around both artifact acquisition and setup.
+# Dot-sourced shared-setup remains a library with ordinary exception semantics.
+$loader = $loader.Replace("`nInitialize-InstallerPowerShell`n", "`nInvoke-InstallerEntryPoint {`nInitialize-InstallerPowerShell`n")
 $assignment = '$aircSetupLock = Get-Content -LiteralPath (Join-Path $PSScriptRoot ''setup-artifacts.lock.json'') -Raw | ConvertFrom-Json'
 if (-not $loader.Contains($assignment)) { throw 'Shared loader lock boundary changed; update the bootstrap projection.' }
 $loader = $loader.Replace($assignment, ('$aircSetupLock = @' + "'`n" + $lock.Replace("`r`n", "`n") + "`n'@ | ConvertFrom-Json"))
