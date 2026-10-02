@@ -28,7 +28,7 @@
 use std::error::Error;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -470,7 +470,7 @@ fn raw_hostname() -> Option<String> {
             }
         }
     }
-    let output = Command::new("hostname").output().ok()?;
+    let output = airc_core::process::background("hostname").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -532,7 +532,7 @@ fn gh_capture(args: &[&str], stdin: Option<&str>) -> Result<String, Box<dyn Erro
     }
 
     let gh = std::env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
-    let mut command = Command::new(&gh);
+    let mut command = airc_core::process::background(&gh);
     command
         .args(args)
         .stdout(Stdio::piped())

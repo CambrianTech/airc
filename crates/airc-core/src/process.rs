@@ -32,6 +32,14 @@ mod ownership_tests {
             include_str!("../../airc-daemon/src/auto_update.rs"),
             include_str!("../../airc-cli/src/gh_client.rs"),
             include_str!("../../airc-transport/src/gh_gist/client.rs"),
+            include_str!("../../airc-cli/src/channel_gist_commands.rs"),
+            include_str!("../../airc-cli/src/client_id.rs"),
+            include_str!("../../airc-cli/src/doctor/binary.rs"),
+            include_str!("../../airc-cli/src/gh_commands.rs"),
+            include_str!("../../airc-cli/src/gh_reqwest.rs"),
+            include_str!("../../airc-cli/src/sos_commands.rs"),
+            include_str!("../../airc-cli/src/work_commands_gh.rs"),
+            include_str!("../../airc-cli/src/work_commands_git.rs"),
         ] {
             assert!(
                 !source.contains("Command::new("),
