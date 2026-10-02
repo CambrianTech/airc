@@ -144,6 +144,29 @@ impl Airc {
         lan_ip: Option<Ipv4Addr>,
         tailscale_ip: Option<Ipv4Addr>,
     ) -> Result<Vec<RouteEndpoint>, AircError> {
+        self.listen_lan_advertising_on(Ipv4Addr::UNSPECIFIED, lan_ip, tailscale_ip)
+            .await
+    }
+
+    /// Exercise advertisement and stable-port behavior without exposing a
+    /// test executable to the LAN. Advertised addresses remain caller supplied;
+    /// only the actual listener is constrained to loopback.
+    #[doc(hidden)]
+    pub async fn listen_lan_advertising_for_test(
+        &self,
+        lan_ip: Option<Ipv4Addr>,
+        tailscale_ip: Option<Ipv4Addr>,
+    ) -> Result<Vec<RouteEndpoint>, AircError> {
+        self.listen_lan_advertising_on(Ipv4Addr::LOCALHOST, lan_ip, tailscale_ip)
+            .await
+    }
+
+    async fn listen_lan_advertising_on(
+        &self,
+        bind_ip: Ipv4Addr,
+        lan_ip: Option<Ipv4Addr>,
+        tailscale_ip: Option<Ipv4Addr>,
+    ) -> Result<Vec<RouteEndpoint>, AircError> {
         let adapter = self.lan_adapter().await?;
         // Bind a STABLE port derived from our identity so the advertised
         // endpoint survives daemon restarts. An ephemeral `:0` re-rolls the
@@ -152,7 +175,7 @@ impl Airc {
         // an OS-assigned port only if the preferred one is already taken.
         let preferred = stable_lan_port(self.inner.identity.peer_id);
         let actual = self
-            .bind_preferred_or_ephemeral(&adapter, preferred)
+            .bind_preferred_or_ephemeral(&adapter, bind_ip, preferred)
             .await?;
         self.ensure_lan_subscriber().await?;
         self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
@@ -226,6 +249,7 @@ impl Airc {
     async fn bind_preferred_or_ephemeral(
         &self,
         adapter: &LanTcpAdapter,
+        bind_ip: Ipv4Addr,
         preferred: u16,
     ) -> Result<SocketAddr, AircError> {
         // Short and bounded: this covers an outgoing daemon releasing its
@@ -237,10 +261,7 @@ impl Airc {
 
         let mut last_error = None;
         for attempt in 1..=ATTEMPTS {
-            match adapter
-                .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
-                .await
-            {
+            match adapter.listen(SocketAddr::from((bind_ip, preferred))).await {
                 Ok(addr) => return Ok(addr),
                 Err(error) => {
                     last_error = Some(error.to_string());
@@ -252,7 +273,7 @@ impl Airc {
         }
 
         let addr = adapter
-            .listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .listen(SocketAddr::from((bind_ip, 0)))
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
 
@@ -588,6 +609,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn isolated_bind_keeps_preferred_and_fallback_listeners_on_loopback() {
+        let (_dir, airc) = test_airc().await;
+        let adapter = airc.lan_adapter().await.unwrap();
+        let actual = airc
+            .bind_preferred_or_ephemeral(&adapter, Ipv4Addr::LOCALHOST, 0)
+            .await
+            .unwrap();
+        assert_eq!(actual.ip(), Ipv4Addr::LOCALHOST);
+
+        let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let preferred = occupied.local_addr().unwrap().port();
+        let (_fallback_dir, fallback) = test_airc().await;
+        let adapter = fallback.lan_adapter().await.unwrap();
+        let actual = fallback
+            .bind_preferred_or_ephemeral(&adapter, Ipv4Addr::LOCALHOST, preferred)
+            .await
+            .unwrap();
+        assert_eq!(actual.ip(), Ipv4Addr::LOCALHOST);
+        assert_ne!(actual.port(), preferred);
+    }
+
     /// what this catches: the RESTART HANDOVER RACE that silently demoted a
     /// node to an ephemeral port — and kept it there.
     ///
@@ -636,8 +679,7 @@ mod tests {
             let (dir, airc) = test_airc().await;
             let preferred = stable_lan_port(airc.inner.identity.peer_id);
             // Stand in for the outgoing daemon still holding the listener.
-            match std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, preferred)))
-            {
+            match std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, preferred))) {
                 Ok(listener) => {
                     chosen = Some((dir, airc, preferred, listener));
                     break;
@@ -658,7 +700,7 @@ mod tests {
         });
 
         let advertised = airc
-            .listen_lan_advertising(Some(Ipv4Addr::new(192, 168, 1, 50)), None)
+            .listen_lan_advertising_for_test(Some(Ipv4Addr::new(192, 168, 1, 50)), None)
             .await
             .expect("bind must succeed once the outgoing listener releases");
 

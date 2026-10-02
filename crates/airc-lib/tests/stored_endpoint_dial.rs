@@ -484,12 +484,14 @@ async fn identity_mismatch_never_retries_an_unenrolled_identity() {
 }
 
 /// The dual-advertise contract: `listen_lan_advertising` binds ONE
-/// wildcard listener and publishes BOTH the LAN and the Tailscale
+/// listener and publishes BOTH the LAN and the Tailscale
 /// address under the same port, LAN sorted first. This is the daemon's
 /// connection ladder (local → LAN → Tailscale → grid): a same-subnet
 /// peer dials the LAN address directly and Tailscale is dialed only if
 /// the peer has left the LAN. Earlier the daemon advertised Tailscale
 /// exclusively, forcing every same-LAN peer through a wasted 100.x hop.
+/// The fixture injects loopback binding while retaining the real advertisement
+/// logic; it must not expose this hashed test executable on the user's LAN.
 #[tokio::test]
 async fn advertise_publishes_both_lan_and_tailscale_lan_first() {
     let tmp = TempDir::new().expect("tempdir");
@@ -498,7 +500,7 @@ async fn advertise_publishes_both_lan_and_tailscale_lan_first() {
     let lan_ip = Ipv4Addr::new(192, 168, 1, 50);
     let tailscale_ip = Ipv4Addr::new(100, 79, 156, 3);
     let advertised = airc
-        .listen_lan_advertising(Some(lan_ip), Some(tailscale_ip))
+        .listen_lan_advertising_for_test(Some(lan_ip), Some(tailscale_ip))
         .await
         .expect("advertise both");
 
@@ -537,7 +539,7 @@ async fn advertise_publishes_both_lan_and_tailscale_lan_first() {
 
 /// End-to-end ladder pin: a peer that imports BOTH advertised endpoints
 /// connects via the LAN rung and never touches the (unreachable, off-box)
-/// Tailscale rung. The wildcard listener accepts the loopback dial, so we
+/// Tailscale rung. The isolated listener accepts the loopback dial, so we
 /// advertise 127.0.0.1 as the "LAN" address and a real-range 100.x that
 /// nothing answers — discovery must connect with ZERO failures, proving
 /// LAN-first-break (Tailscale only if we leave the LAN).
@@ -557,14 +559,14 @@ async fn peer_dials_lan_rung_and_skips_tailscale() {
     alice.add_peer(bob_spec).await.expect("alice trusts bob");
     bob.add_peer(alice_spec).await.expect("bob trusts alice");
 
-    // Bind the wildcard listener (advertising only the unreachable 100.x
+    // Bind the loopback-only listener (advertising only the unreachable 100.x
     // Tailscale rung — self-healing join's advertise hygiene rightly
     // refuses loopback as a LAN advertisement), then build the peer-side
     // endpoint set MANUALLY with loopback standing in for the LAN IP.
     // This test pins the DIAL ladder, not the advertise filter, and an
     // import can legitimately hold any addr an older/other node stored.
     let advertised = alice
-        .listen_lan_advertising(None, Some(Ipv4Addr::new(100, 79, 156, 3)))
+        .listen_lan_advertising_for_test(None, Some(Ipv4Addr::new(100, 79, 156, 3)))
         .await
         .expect("alice advertises the tailscale rung");
     let port = advertised
