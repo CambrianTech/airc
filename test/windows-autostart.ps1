@@ -260,7 +260,7 @@ fn main() {
     $global:aircStartupFixture.existing.Principal.RunLevel='Highest'
     $global:aircStartupFixture.ignorePrincipal=$true
     $failed=$false
-    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'principal verification failed' }
+    $failed=(Get-FixtureEntryFailure { & $registrar -AircPath $binary }) -match 'principal verification failed'
     if (-not $failed -or ($global:aircStartupFixture.events -join ',') -ne 'register') { throw 'Unapplied principal change reported success or stopped the task' }
     $global:aircStartupFixture.ignorePrincipal=$false
     & $registrar -AircPath $binary
@@ -281,7 +281,7 @@ fn main() {
     $global:aircStartupFixture.existing.Principal.RunLevel='Highest'
     $global:aircStartupFixture.daemons=@([pscustomobject]@{CommandLine=$null})
     $failed=$false
-    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'maintenance window' }
+    $failed=(Get-FixtureEntryFailure { & $registrar -AircPath $binary }) -match 'maintenance window'
     if (-not $failed -or ($global:aircStartupFixture.events -join ',') -ne 'register,disable,enable') { throw 'Legacy principal repair stopped an uninspectable daemon or claimed runtime recovery' }
     $global:aircStartupFixture.daemons=@()
     $global:aircStartupFixture.events=@()
