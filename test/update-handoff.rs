@@ -1,5 +1,8 @@
 // Run with rustc --edition 2021 --test test/update-handoff.rs -o <temp>/handoff,
 // then <temp>/handoff --nocapture. Only tiny fixture programs are compiled.
+extern crate self as airc_core;
+#[path = "../crates/airc-core/src/process.rs"]
+mod process;
 #[path = "../crates/airc-cli/src/update_artifact.rs"]
 mod update_artifact;
 #[path = "../crates/airc-cli/src/update_shutdown.rs"]
