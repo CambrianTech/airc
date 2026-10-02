@@ -207,6 +207,7 @@ jobs:
             Windows) bash test/setup-source-acquisition.sh ;;
           esac
           bash test/install-bin-directory.sh
+          bash test/unix-autostart.sh
       - name: Native setup acquisition and remaining-work storage planning
         if: runner.os == 'Windows'
         shell: powershell

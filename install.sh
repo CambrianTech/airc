@@ -1325,17 +1325,6 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
 fi
 
 
-# ── Optional background daemon ─────────────────────────────────────────
-#
-# Deliberately not installed or prompted from install.sh. The public
-# product surface is `airc join`; the daemon is only an explicit
-# supervisor for unattended machines that need `airc join` restarted at
-# login/sleep/wake. Keeping curl/install side-effect-light avoids macOS
-# Login Items surprises and keeps first-run setup easy to trust.
-if [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
-  info "AIRC_INSTALL_YES=1 no longer installs the daemon automatically; run 'airc daemon install' explicitly if wanted."
-fi
-
 # ── Done ────────────────────────────────────────────────────────────────
 
 # The updater's artifact handoff owns its own maintenance lease and restart.
@@ -1353,6 +1342,23 @@ if [ -z "$EXPECTED_BUILD" ] && [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ]; then
     *) "$installed_airc" --home "$installer_home" update --adopt-installed || fail 'Installed daemon could not be started and verified. Setup is incomplete; rerun this installer to resume.' ;;
   esac
 fi
+
+# ── Mesh autostart (macOS / Linux) ─────────────────────────────────────
+# A node that reboots must come back on the mesh without a hand: the M5 sat
+# off the mesh for hours after a restart because nothing ran `airc join`
+# (2026-10-02). Register the login supervisor, the POSIX twin of Windows'
+# `airc-join` task. AIRC_AUTOSTART=0 opts out; an existing registration is
+# still repaired so an update never leaves it pointing at a stale binary.
+case "$(uname -s)" in
+  Darwin|Linux)
+    autostart_flags=()
+    [ "${AIRC_AUTOSTART:-1}" = 1 ] || autostart_flags+=(--existing-only)
+    if bash "$CLONE_DIR/unix/register-autostart.sh" "$BIN_DIR/airc" ${autostart_flags[@]+"${autostart_flags[@]}"}; then
+      ok "Mesh autostart checked"
+    else
+      fail "Mesh autostart registration failed. Setup is incomplete; rerun the installer, or set AIRC_AUTOSTART=0 to skip it."
+    fi ;;
+esac
 
 echo ""
 ok "Installed."
