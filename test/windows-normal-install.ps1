@@ -4,6 +4,7 @@ $ErrorActionPreference='Stop'
 if($env:GITHUB_ACTIONS -ne 'true'){throw 'Token-changing installation acceptance runs only on a disposable hosted runner.'}
 $root=Split-Path $PSScriptRoot -Parent
 . (Join-Path $root 'windows/setup-entrypoint.ps1')
+Initialize-InstallerPowerShell
 Add-Type -Path (Join-Path $root 'windows/daemon-diagnostics.cs')
 function Read-ChildLogs {
     param($OutputTask,$ErrorTask)
@@ -91,14 +92,16 @@ try {
     Add-LocalGroupMember -Group $users -Member $account
     $sid=$account.SID.Value
     $acl=Get-Acl -LiteralPath $scratch
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid,'Modify','ContainerInherit,ObjectInherit','None','Allow')))
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($account.SID,'Modify','ContainerInherit,ObjectInherit','None','Allow')))
     Set-Acl -LiteralPath $scratch -AclObject $acl
     Ensure-Gsudo
     $gsudo=Find-GsudoExecutable
     $gsudoDirectory=Join-Path $scratch 'gsudo'
     New-Item -ItemType Directory -Path $gsudoDirectory | Out-Null
-    Get-ChildItem -LiteralPath (Split-Path $gsudo -Parent) | Copy-Item -Destination $gsudoDirectory -Recurse -Force
-    $gsudo=Join-Path $gsudoDirectory ([IO.Path]::GetFileName($gsudo))
+    $copiedGsudo=Join-Path $gsudoDirectory 'gsudo.exe'
+    [IO.File]::Copy($gsudo,$copiedGsudo) # Follow a WinGet alias; copy only the managed portable binary.
+    if((Get-FileHash -LiteralPath $gsudo -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $copiedGsudo -Algorithm SHA256).Hash){throw 'Managed gsudo fixture copy changed bytes'}
+    $gsudo=$copiedGsudo
     Invoke-InstallerProcess -OwnProcessTree $gsudo @('--version') | Out-Host
     if($LASTEXITCODE -ne 0){throw 'Cannot inspect managed gsudo'}
     $enginePath=if($Engine -eq 'powershell'){Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'}else{(Get-Command pwsh.exe -CommandType Application).Source}
