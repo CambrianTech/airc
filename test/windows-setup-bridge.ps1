@@ -110,6 +110,41 @@ public static class SetupBridgeFixture {
     & (Join-Path $entry 'install.ps1') -FirewallOnly -AircPath $installedBinary
     $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
     Assert-True ($calls.Trim() -eq ('firewall|' + $installedBinary)) 'Firewall-only public entry rebuilt or lost the installed path'
+    # A fresh PS5 public-entry process must choose its own Security module even
+    # when the desktop host passes a foreign module path. No caller cleanup.
+    $foreign = Join-Path $fixture 'foreign-modules'
+    $security = Join-Path $foreign 'Microsoft.PowerShell.Security'
+    New-Item -ItemType Directory -Path $security -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $security 'Microsoft.PowerShell.Security.psm1'), 'function Get-FileHash { throw "FOREIGN SECURITY MODULE" }; Export-ModuleMember -Function Get-FileHash')
+    [IO.File]::WriteAllText((Join-Path $security 'Microsoft.PowerShell.Security.psd1'), "@{RootModule='Microsoft.PowerShell.Security.psm1';ModuleVersion='99.0';FunctionsToExport=@('Get-FileHash')}")
+    $modulePathBefore = $env:PSModulePath; $pathBefore = $env:PATH; $sourceBefore = $env:AIRC_DIR
+    $controlEntry = Join-Path $entry 'control.ps1'
+    $entryText = [IO.File]::ReadAllText((Join-Path $entry 'install.ps1'))
+    $first = $entryText.IndexOf('# BEGIN GENERATED RUNTIME MODULES')
+    $last = $entryText.IndexOf('# END GENERATED RUNTIME MODULES')
+    Assert-True ($first -ge 0 -and $last -gt $first) 'Public runtime initialization region missing'
+    [IO.File]::WriteAllText($controlEntry, $entryText.Remove($first, $last + '# END GENERATED RUNTIME MODULES'.Length - $first))
+    $probe = Join-Path $fixture 'public-module-probe.ps1'
+    @'
+param($Entry, $Binary)
+$before = $env:PSModulePath
+try {
+    & $Entry -FirewallOnly -AircPath $Binary
+    if ($env:PSModulePath -cne $before) { throw 'Public entry rewrote inherited module paths.' }
+} catch { [Console]::Error.WriteLine($_.Exception.ToString()); exit 1 }
+'@ | Set-Content -LiteralPath $probe -Encoding UTF8
+    try {
+        $env:PSModulePath = $foreign + ';' + $env:PSModulePath
+        $env:PATH = (Join-Path $gitRoot 'cmd') + ';' + $saved['PATH']
+        $env:AIRC_DIR = $env:AIRC_FIXTURE_SOURCE
+        [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
+        $control = @(Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,$controlEntry,$installedBinary) 2>&1)
+        Assert-True ($global:LASTEXITCODE -ne 0 -and ($control -join "`n") -match 'FOREIGN SECURITY MODULE') 'Unfixed public-entry control did not select the hostile module'
+        Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,(Join-Path $entry 'install.ps1'),$installedBinary)
+        Assert-True ($global:LASTEXITCODE -eq 0) 'Fresh PS5 public entry selected an incompatible inherited module'
+        Assert-True ((Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw).Trim() -eq ('firewall|' + $installedBinary)) 'Foreign-module regression did not reach the public firewall boundary'
+    } finally { $env:PSModulePath = $modulePathBefore; $env:PATH = $pathBefore; $env:AIRC_DIR = $sourceBefore }
+    Write-Host 'PASS: fresh PS5 public entry retains foreign module paths and selects native built-ins'
     $env:AIRC_FIXTURE_FIREWALL_FAIL = '1'
     $LASTEXITCODE = 0
     try {

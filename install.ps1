@@ -7,19 +7,28 @@ param(
     [string]$AircPath
 )
 $ErrorActionPreference = 'Stop'
-if ($FirewallOnly -and (-not $AircPath -or -not (Test-Path -LiteralPath $AircPath -PathType Leaf))) {
-    throw 'Firewall-only setup requires the installed AIRC executable via -AircPath.'
-}
 # BEGIN GENERATED SHARED SETUP BOOTSTRAP
+# BEGIN GENERATED RUNTIME MODULES
+function Initialize-InstallerPowerShell {
+    # A PS7 desktop host may pass its PSModulePath to Windows PowerShell 5.
+    # Load the running engine's built-ins explicitly before autoload can select
+    # another engine's Security/Utility type data. Keep user module paths intact.
+    foreach ($name in @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security')) {
+        $manifest = [IO.Path]::Combine($PSHOME, 'Modules', $name, ($name + '.psd1'))
+        Import-Module $manifest -Global -ErrorAction Stop
+    }
+}
+Initialize-InstallerPowerShell
+# END GENERATED RUNTIME MODULES
 # Dot-source the same small setup artifacts used by Continuum. AIRC does not
 # install or require the Continuum application. Only immutable, verified bytes
 # are loaded; dependency choices remain in the generated canonical manifest.
 $aircSetupLock = @'
 {
   "schemaVersion": 1,
-  "continuumRevision": "c40cc9cc6d3ba086d83ac25c330116def24b80ed",
-  "elevationSha256": "c8f6cc943b7b8a63c1419aea8a74324d2d971ed527cbbe7b09562a522e0ab9da",
-  "manifestSha256": "47892357d9f082a95a117b81ada399ccd8a213be75a975f4eed8483a2c3f28b9"
+  "continuumRevision": "acb8ce8bc5397a6919c2163e916c791cae78d58a",
+  "elevationSha256": "58bec808c18cc1dfc3591c5cd3b6d872f4081e012dd80329eb20b4edddbb43b6",
+  "manifestSha256": "116ae91fb1209b9c1ee5dee44734c913685b606e92cc4e959d61f015d7e28217"
 }
 '@ | ConvertFrom-Json
 if ($aircSetupLock.schemaVersion -ne 1 -or $aircSetupLock.continuumRevision -notmatch '^[a-f0-9]{40}$') {
@@ -69,6 +78,9 @@ $aircSetupElevation = Get-AircSetupArtifact 'tools/scripts/lib/windows-elevation
 . $aircSetupManifest
 . $aircSetupElevation -GsudoSource $script:ContinuumManifest['gsudo'].source
 # END GENERATED SHARED SETUP BOOTSTRAP
+if ($FirewallOnly -and (-not $AircPath -or -not (Test-Path -LiteralPath $AircPath -PathType Leaf))) {
+    throw 'Firewall-only setup requires the installed AIRC executable via -AircPath.'
+}
 function Refresh-Path {
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $paths = [Collections.Generic.List[string]]::new()

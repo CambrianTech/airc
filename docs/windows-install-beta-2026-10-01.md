@@ -439,3 +439,21 @@ The current helper pin is a review-branch dependency (Continuum 71fb9cc51).
 Release repinning, final CI/review and public live acceptance remain OPEN.
 
 Released-helper validation: Continuum PR #4658 merged after all required CI and independent review at c40cc9cc6d3ba086d83ac25c330116def24b80ed. The standalone artifact lock now pins that released revision; generated bootstrap drift check and all five PS5 setup/firewall/storage/acquisition regression suites pass. Actual public installation and consent acceptance of this change remain open.
+
+### 2026-10-02 — inherited PowerShell module recovery
+
+A real Continuum public entry under Windows PowerShell 5 inherited PowerShell 7
+module paths from its desktop host and failed while loading Security/Get-Acl.
+Standalone AIRC also uses Get-FileHash before importing the shared launcher.
+Its generated bootstrap now projects the runtime initializer from the same
+checksum-pinned helper before artifact verification or FirewallOnly validation.
+It imports the executing runtime's built-in modules without rewriting the
+caller's PSModulePath. No Continuum application installation is required.
+
+The actual fresh PS5 public-entry fixture passes with an incompatible Security
+module first in PSModulePath; removing the generated initializer makes the same
+fixture fail with the foreign-module sentinel. The child asserts inherited paths
+are unchanged. The full setup bridge and the four storage/acquisition/firewall
+suites pass. These isolated fixtures do not modify the live firewall or daemon.
+The provisional helper revision depends on Continuum #4660; repinning to its
+released merge, CI, and live installation acceptance remain OPEN.

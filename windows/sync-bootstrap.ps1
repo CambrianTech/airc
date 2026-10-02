@@ -5,6 +5,29 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
 $lock = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'setup-artifacts.lock.json') -Raw).Trim()
 $loader = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'shared-setup.ps1') -Raw).Replace("`r`n", "`n")
+# Reuse the checksum-verified artifact acquisition path, then project its small
+# runtime initializer before the loader itself needs any autoloaded cmdlets.
+. (Join-Path $PSScriptRoot 'shared-setup.ps1')
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($aircSetupElevation, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw 'Pinned setup helper could not be parsed.' }
+$initializers = @($ast.FindAll({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Initialize-InstallerPowerShell'
+}, $false))
+if ($initializers.Count -ne 1) { throw 'Pinned setup helper must supply exactly one runtime initializer.' }
+$runtimeBegin = '# BEGIN GENERATED RUNTIME MODULES'
+$runtimeEnd = '# END GENERATED RUNTIME MODULES'
+$runtimeStart = $loader.IndexOf($runtimeBegin, [StringComparison]::Ordinal)
+$runtimeFinish = $loader.IndexOf($runtimeEnd, [StringComparison]::Ordinal)
+if ($runtimeStart -lt 0 -or $runtimeFinish -le $runtimeStart -or $loader.LastIndexOf($runtimeBegin) -ne $runtimeStart -or $loader.LastIndexOf($runtimeEnd) -ne $runtimeFinish) { throw 'Expected one generated runtime module region.' }
+$runtime = $initializers[0].Extent.Text.Replace("`r`n", "`n")
+$projected = $loader.Substring(0, $runtimeStart) + $runtimeBegin + "`n" + $runtime + "`nInitialize-InstallerPowerShell`n" + $runtimeEnd + $loader.Substring($runtimeFinish + $runtimeEnd.Length)
+if ($Check) {
+    if ($loader -cne $projected) { throw 'Runtime module drift: regenerate from the pinned shared helper.' }
+} else {
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'shared-setup.ps1'), $projected, (New-Object Text.UTF8Encoding($false)))
+}
+$loader = $projected
 $assignment = '$aircSetupLock = Get-Content -LiteralPath (Join-Path $PSScriptRoot ''setup-artifacts.lock.json'') -Raw | ConvertFrom-Json'
 if (-not $loader.Contains($assignment)) { throw 'Shared loader lock boundary changed; update the bootstrap projection.' }
 $loader = $loader.Replace($assignment, ('$aircSetupLock = @' + "'`n" + $lock.Replace("`r`n", "`n") + "`n'@ | ConvertFrom-Json"))
