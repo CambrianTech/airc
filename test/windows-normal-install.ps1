@@ -108,6 +108,7 @@ try {
     $start=New-Object Diagnostics.ProcessStartInfo
     $start.FileName=$enginePath;$start.Arguments=$quoted -join ' ';$start.WorkingDirectory=$root
     $start.UseShellExecute=$false;$start.CreateNoWindow=$true
+    $start.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden # Credentialed launch may ignore CreateNoWindow.
     $start.UserName=$testUser;$start.Domain=$env:COMPUTERNAME;$start.Password=$secret;$start.LoadUserProfile=$true
     $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
     $process=[Diagnostics.Process]::Start($start)
