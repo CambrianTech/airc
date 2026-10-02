@@ -42,8 +42,8 @@ Initialize-InstallerPowerShell
 $aircSetupLock = @'
 {
   "schemaVersion": 1,
-  "continuumRevision": "10cd21d7781b55789cdc1563c1f96e1304a599fc",
-  "elevationSha256": "49d5543bf52b5d296ca9fd6c766d0ba3b0f73c9a5b72688c23641be54131ae26",
+  "continuumRevision": "de1c8c0112521b3f46c357d9eaa90ba4b5280dcb",
+  "elevationSha256": "49db73895e2fdaf55628477d41b9df3d3d9bcc83475cc45bd2ad4f7302c54017",
   "manifestSha256": "116ae91fb1209b9c1ee5dee44734c913685b606e92cc4e959d61f015d7e28217"
 }
 '@ | ConvertFrom-Json
