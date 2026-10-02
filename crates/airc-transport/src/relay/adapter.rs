@@ -45,6 +45,10 @@ struct SubscriberHandle {
     tx: mpsc::Sender<Result<Frame, RelayClientError>>,
 }
 
+/// Called once when a live relay session ends (read or write side), with the
+/// relay's peer id, so the owner can redial at once instead of on its next tick.
+pub type RelayDisconnectObserver = Arc<dyn Fn(airc_core::PeerId) + Send + Sync>;
+
 struct Inner {
     config: RelayClientConfig,
     /// Outbound channel sender — `Some` only after [`connect`] has
@@ -52,6 +56,7 @@ struct Inner {
     outbound: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     subscribers: Mutex<Vec<SubscriberHandle>>,
     next_sub_id: AtomicU64,
+    on_disconnect: std::sync::Mutex<Option<RelayDisconnectObserver>>,
 }
 
 #[derive(Clone)]
@@ -67,6 +72,7 @@ impl RelayAdapter {
                 outbound: Mutex::new(None),
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
+                on_disconnect: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -105,10 +111,54 @@ impl RelayAdapter {
         *guard = Some(outbound_tx);
         drop(guard);
 
-        tokio::spawn(write_loop(write_half, outbound_rx));
+        tokio::spawn(write_loop(Arc::clone(&self.inner), write_half, outbound_rx));
         tokio::spawn(read_loop(Arc::clone(&self.inner), read_half));
 
         Ok(())
+    }
+
+    /// Whether the session is live: `false` once either loop saw the connection end.
+    /// A closed adapter is never reused — the owner dials a fresh one.
+    pub async fn is_connected(&self) -> bool {
+        self.inner.outbound.lock().await.is_some()
+    }
+
+    pub fn relay_addr(&self) -> std::net::SocketAddr {
+        self.inner.config.relay_addr
+    }
+
+    pub fn relay_peer_id(&self) -> airc_core::PeerId {
+        self.inner.config.relay_peer_id
+    }
+
+    /// Drop this session's outbound side without announcing a disconnect: for an
+    /// adapter its owner decided not to install (a concurrent dial won).
+    pub async fn close(&self) {
+        self.inner.outbound.lock().await.take();
+    }
+
+    /// Register the callback fired once when this session ends. A later call replaces it.
+    pub fn set_disconnect_observer(&self, observer: RelayDisconnectObserver) {
+        if let Ok(mut slot) = self.inner.on_disconnect.lock() {
+            *slot = Some(observer);
+        }
+    }
+}
+
+/// End the session: later sends surface `NotConnected`, and the owner hears about it
+/// exactly once (whichever loop notices first).
+async fn close_session(inner: &Arc<Inner>) {
+    let was_live = inner.outbound.lock().await.take().is_some();
+    if !was_live {
+        return;
+    }
+    let observer = inner
+        .on_disconnect
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(observer) = observer {
+        observer(inner.config.relay_peer_id);
     }
 }
 
@@ -130,25 +180,23 @@ where
     loop {
         let mut len_bytes = [0u8; 4];
         if read_half.read_exact(&mut len_bytes).await.is_err() {
-            // Connection closed — drop outbound so subsequent sends
-            // surface NotConnected.
-            *inner.outbound.lock().await = None;
+            close_session(&inner).await;
             return;
         }
         let len = u32::from_be_bytes(len_bytes);
         if len > MAX_FRAME_BYTES {
-            *inner.outbound.lock().await = None;
+            close_session(&inner).await;
             return;
         }
         let mut payload = vec![0u8; len as usize];
         if read_half.read_exact(&mut payload).await.is_err() {
-            *inner.outbound.lock().await = None;
+            close_session(&inner).await;
             return;
         }
         let frame: Frame = match serde_json::from_slice(&payload) {
             Ok(frame) => frame,
             Err(_) => {
-                *inner.outbound.lock().await = None;
+                close_session(&inner).await;
                 return;
             }
         };
@@ -181,19 +229,24 @@ async fn dispatch(inner: &Arc<Inner>, frame: Frame) {
     }
 }
 
-async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Vec<u8>>)
-where
+async fn write_loop<W>(
+    inner: Arc<Inner>,
+    mut write_half: W,
+    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
+) where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     while let Some(payload) = outbound_rx.recv().await {
         let len = (payload.len() as u32).to_be_bytes();
-        if write_half.write_all(&len).await.is_err() {
-            return;
-        }
-        if write_half.write_all(&payload).await.is_err() {
-            return;
-        }
-        if write_half.flush().await.is_err() {
+        let written = async {
+            write_half.write_all(&len).await?;
+            write_half.write_all(&payload).await?;
+            write_half.flush().await
+        };
+        if written.await.is_err() {
+            // A write that fails is a dead session even if the read side has not
+            // noticed yet; without this the adapter read as connected forever.
+            close_session(&inner).await;
             return;
         }
     }

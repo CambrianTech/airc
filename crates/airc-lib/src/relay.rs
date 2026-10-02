@@ -25,14 +25,27 @@ impl Airc {
         relay_addr: SocketAddr,
         relay_peer: PeerId,
     ) -> Result<(), AircError> {
-        {
-            let guard = self.inner.relay.lock().await;
-            if guard.is_some() {
-                drop(guard);
+        let installed = self.inner.relay.lock().await.clone();
+        if let Some(adapter) = installed {
+            let same_relay =
+                adapter.relay_addr() == relay_addr && adapter.relay_peer_id() == relay_peer;
+            if adapter.is_connected().await {
+                if !same_relay {
+                    // One relay session per handle. Saying Ok here made discovery count
+                    // a peer on another relay as dialed and stop trying its endpoints.
+                    return Err(AircError::Transport(format!(
+                        "relay route is held by {} at {}; {relay_peer} at {relay_addr} is not connected",
+                        adapter.relay_peer_id(),
+                        adapter.relay_addr()
+                    )));
+                }
                 self.ensure_relay_subscriber().await?;
                 self.upsert_relay_health(relay_addr, relay_peer)?;
                 return Ok(());
             }
+            // A closed session is replaced, never reused. Before this, a dropped relay
+            // kept its dead adapter installed and every later call returned Ok, so
+            // relay-only peers stayed dark until the daemon restarted.
         }
 
         let adapter = RelayAdapter::new(RelayClientConfig {
@@ -42,15 +55,36 @@ impl Airc {
             relay_addr,
             registry: self.inner.registry.clone(),
         });
+        // A dropped relay wakes the same refresh a dropped LAN session does, so the
+        // redial happens on the event, not on the next tick.
+        let on_disconnect = self.inner.on_disconnect.clone();
+        adapter.set_disconnect_observer(std::sync::Arc::new(move |peer_id| {
+            let callback = on_disconnect.lock().ok().and_then(|slot| slot.clone());
+            if let Some(callback) = callback {
+                callback(peer_id);
+            }
+        }));
         adapter
             .connect()
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
-        {
+        let replaced = {
             let mut guard = self.inner.relay.lock().await;
-            if guard.is_none() {
+            let concurrent_live = match guard.as_ref() {
+                Some(current) => current.is_connected().await,
+                None => false,
+            };
+            // A concurrent call already installed a live session: keep it.
+            if !concurrent_live {
                 *guard = Some(adapter.clone());
             }
+            !concurrent_live
+        };
+        if replaced {
+            // The ingest task belonged to the closed adapter's stream; subscribe the new one.
+            *self.inner.relay_subscriber.lock().await = None;
+        } else {
+            adapter.close().await;
         }
         self.ensure_relay_subscriber().await?;
         self.upsert_relay_health(relay_addr, relay_peer)?;
