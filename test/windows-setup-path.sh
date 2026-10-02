@@ -9,6 +9,11 @@ trap 'rm -rf "$fixture"' EXIT
 source_dir="$fixture/source with spaces"
 mkdir -p "$source_dir/windows" "$source_dir/setup" "$source_dir/.git" "$fixture/home" "$fixture/wsl-first"
 cp "$repo/install.sh" "$source_dir/install.sh"
+# This isolated PATH unit fixture mocks token policy. Full installation CI uses
+# windows-normal-install.ps1 with a real medium token and no predicate override.
+guard="$(sed -n '/^# BEGIN GENERATED WINDOWS TOKEN CHECK$/,/^# END GENERATED WINDOWS TOKEN CHECK$/p' "$source_dir/install.sh")"
+content="$(cat "$source_dir/install.sh")"
+printf '%s\n' "${content/"$guard"/'# synthetic PATH-fixture token boundary'}" > "$source_dir/install.sh"
 cp "$repo/windows/run-powershell.sh" "$source_dir/windows/run-powershell.sh"
 cp "$repo/windows/install-session.ps1" "$repo/windows/adopt-installed.ps1" "$repo/windows/shared-setup.ps1" "$repo/windows/setup-artifacts.lock.json" "$repo/windows/sync-bootstrap.ps1" "$repo/windows/setup-entrypoint.ps1" "$source_dir/windows/"
 # Exercise the real owner/context code without probing or closing any real cache.

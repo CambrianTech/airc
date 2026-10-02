@@ -34,8 +34,15 @@ function Invoke-InstallerEntryPoint {
         exit 1
     }
 }
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 Invoke-InstallerEntryPoint {
 Initialize-InstallerPowerShell
+if (-not $FirewallOnly -and -not $DiagnoseDaemon -and (Test-IsAdmin)) { throw 'AIRC full setup requires a normal user terminal. Close this administrator terminal and rerun the same installer normally; setup requests scoped consent when needed. No acquisition or installation was started.' }
 # END GENERATED RUNTIME MODULES
 # Dot-source the same small setup artifacts used by Continuum. AIRC does not
 # install or require the Continuum application. Only immutable, verified bytes

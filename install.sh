@@ -70,6 +70,17 @@ if [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT$EXPECTED_BUILD" ]; then
   [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ] || fail 'Handoff cannot skip artifact validation'
 fi
 
+# BEGIN GENERATED WINDOWS TOKEN CHECK
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*)
+  powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command 'function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+if (Test-IsAdmin) { [Console]::Error.WriteLine("AIRC full setup requires a normal user terminal; rerun normally for scoped consent. No installation started."); exit 1 }; exit 0' || exit $? ;;
+esac
+# END GENERATED WINDOWS TOKEN CHECK
+
 _verify_artifact() {
   local binary="$1" output actual
   [ -f "$binary" ] && [ -x "$binary" ] || fail "Artifact missing or not executable: $binary"
