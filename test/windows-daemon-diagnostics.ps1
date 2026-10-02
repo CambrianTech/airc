@@ -74,9 +74,10 @@ $script:clears = 0
 $script:resolverFails = $false
 function Initialize-ElevationSession { }
 function Clear-Elevation { $script:clears++ }
+function Get-AircInstallerHome { 'C:\fixture\account\.airc' }
 function Invoke-InstallerProcess {
     param([switch]$OwnProcessTree, [Parameter(Position=0)]$Executable, [Parameter(Position=1)]$Arguments)
-    Assert (($Arguments -join ' ') -eq 'ipc-endpoint --native') 'Must use canonical resolver before elevation.'
+    Assert (($Arguments -join ' ') -eq '--home C:\fixture\account\.airc ipc-endpoint --native') 'Must use canonical resolver with explicit installer scope before elevation.'
     $global:LASTEXITCODE = if ($script:resolverFails) { 2 } else { 0 }
     if (-not $script:resolverFails) { $endpoint }
 }

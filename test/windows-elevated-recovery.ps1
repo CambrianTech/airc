@@ -10,13 +10,14 @@ function Initialize-InstallerPowerShell {}
 '@ | Set-Content (Join-Path $scratch 'setup-entrypoint.ps1')
     @'
 function Test-IsAdmin { $false }
+function Get-AircInstallerHome { 'C:\fixture\account\.airc' }
 function Initialize-ElevationSession { $global:AircRecoveryTestEvents.Add('owner') }
 function Clear-Elevation { $global:AircRecoveryTestEvents.Add('cleanup') }
 function Invoke-InstallerProcess {
  param([switch]$OwnProcessTree,[switch]$PreserveChildrenOnSuccess,[Parameter(Position=0)]$Program,[Parameter(Position=1)]$Arguments)
- if($Arguments[0] -eq 'ipc-endpoint') { $global:LASTEXITCODE=0; return '\\.\pipe\synthetic' }
+ if($Arguments -contains 'ipc-endpoint') { if($Arguments[0] -ne '--home' -or $Arguments[1] -ne 'C:\fixture\account\.airc'){throw 'Wrong endpoint scope'}; $global:LASTEXITCODE=0; return '\\.\pipe\synthetic' }
  if($Arguments -contains '--probe') { $global:AircRecoveryTestEvents.Add('probe'); $global:LASTEXITCODE=$global:AircRecoveryTestProbe; return }
- if($Arguments[0] -eq 'update') { $global:AircRecoveryTestEvents.Add('adopt'); $global:LASTEXITCODE=0; return }
+ if($Arguments -contains 'update') { if($Arguments[0] -ne '--home' -or $Arguments[1] -ne 'C:\fixture\account\.airc'){throw 'Wrong adoption scope'}; $global:AircRecoveryTestEvents.Add('adopt'); $global:LASTEXITCODE=0; return }
  throw 'Unexpected process action'
 }
 function Invoke-Elevated {

@@ -101,6 +101,30 @@ $aircSetupManifest = Get-AircSetupArtifact 'tools/scripts/generated/manifest.win
 $aircSetupElevation = Get-AircSetupArtifact 'tools/scripts/lib/windows-elevation.ps1' $aircSetupLock.elevationSha256
 . $aircSetupManifest
 . $aircSetupElevation -GsudoSource $script:ContinuumManifest['gsudo'].source
+
+# Installation owns the account service, not the checkout's ambient scope.
+# Explicit AIRC_HOME remains supported; never walk the invoking cwd for .airc.
+function Get-AircInstallerHome {
+    param([string]$ScopeHome)
+    if (-not $ScopeHome) {
+        if ($env:AIRC_HOME) { $ScopeHome = $env:AIRC_HOME }
+        else {
+            $accountRoot = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+            if (-not $accountRoot) { throw 'Installer adoption requires HOME or USERPROFILE, or explicit AIRC_HOME.' }
+            $ScopeHome = $accountRoot.TrimEnd('/','\') + '/.airc'
+        }
+    }
+    # Bash passes cygpath-normalized input. A direct PS entry may inherit MSYS
+    # HOME; use the same existing converter rather than guessing drive syntax.
+    if ($ScopeHome.StartsWith('/') -and -not $ScopeHome.StartsWith('//')) {
+        $converter = Get-Command cygpath.exe -ErrorAction SilentlyContinue
+        if (-not $converter) { throw 'MSYS scope path requires cygpath; run the supported Bash entry or provide a native AIRC_HOME.' }
+        $converted = @(Invoke-InstallerProcess -OwnProcessTree $converter.Source @('-w', $ScopeHome))
+        if ($LASTEXITCODE -ne 0 -or $converted.Count -ne 1) { throw 'Could not normalize installer scope with cygpath.' }
+        $ScopeHome = [string]$converted[0]
+    }
+    return [IO.Path]::GetFullPath($ScopeHome)
+}
 # END GENERATED SHARED SETUP BOOTSTRAP
 if ($DiagnoseDaemon -or $RecoverElevatedDaemon) {
     if ($DiagnoseDaemon -and $RecoverElevatedDaemon) { throw 'Choose diagnostics or elevated daemon recovery.' }
@@ -119,7 +143,8 @@ if ($DiagnoseDaemon -or $RecoverElevatedDaemon) {
     # duplicate the canonical Windows endpoint hash in installer code.
     $callerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     if ($RecoverElevatedDaemon -and (Test-IsAdmin)) { throw 'Recovery must start from the normal user token so adoption cannot create another elevated daemon.' }
-    $endpoint = @(Invoke-InstallerProcess -OwnProcessTree $AircPath @('ipc-endpoint', '--native'))
+    $scopeArguments = @('--home', (Get-AircInstallerHome))
+    $endpoint = @(Invoke-InstallerProcess -OwnProcessTree $AircPath ($scopeArguments + @('ipc-endpoint', '--native')))
     if ($global:LASTEXITCODE -ne 0 -or $endpoint.Count -ne 1 -or
         -not ([string]$endpoint[0]).StartsWith('\\.\pipe\', [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Installed AIRC cannot resolve its native endpoint. Deploy a build supporting ipc-endpoint --native before diagnostic elevation; no daemon was changed.'
@@ -135,7 +160,7 @@ if ($DiagnoseDaemon -or $RecoverElevatedDaemon) {
             Invoke-Elevated -Reason 'gracefully stopping the verified same-account elevated AIRC daemon' -CommandLine @(
                 $AircPath, 'setup-recover-elevated-owner', '--endpoint', ([string]$endpoint[0]), '--caller-sid', $callerSid, '--installed-binary', $AircPath)
             if ($global:LASTEXITCODE -ne 0) { throw "Elevated daemon recovery refused or failed (exit $global:LASTEXITCODE); no force termination or permission change was attempted." }
-            Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $AircPath @('update','--adopt-installed')
+            Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $AircPath ($scopeArguments + @('update','--adopt-installed'))
             if ($global:LASTEXITCODE -ne 0) { throw "Normal-token adoption failed (exit $global:LASTEXITCODE); recovery remains incomplete." }
             return
         }

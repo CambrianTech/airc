@@ -771,3 +771,18 @@ Actual isolated PS5 shared-entry tests exercise pinned acquisition, checksum
 cache reuse/mismatch refusal and native handoff; no live UAC or provisioning
 was performed. Actual live reacquisition and installed binary acceptance remain
 OPEN. The separate pending owner-recovery PR is unchanged by this pin.
+### Foreign checkout scope during installation (2026-10-02)
+
+Fable's actual M5 install invoked adoption beneath another account's
+`.airc/worktrees`; inherited cwd selected that foreign scope despite isolated
+HOME. Prior normal-token clean CI did not exercise this layout. Public POSIX
+and PowerShell adoption now pass explicit AIRC_HOME when requested, otherwise
+the installer account's HOME/.airc, to both endpoint resolution and adoption.
+Windows paths cross Bash through cygpath, including inherited MSYS paths in a
+direct PowerShell entry. Ordinary CLI project resolution is unchanged.
+
+A fresh CLI regression uses a poisoned foreign events.sqlite and nested cwd,
+verifies isolated account state/socket/live daemon, repeats with explicit scope,
+and checks foreign bytes/timestamp/directory entries unchanged. Windows local
+normal-token public adapter passed; hosted extracted-callsite and complete
+public installation receipts for this new delta remain OPEN until fresh CI.
