@@ -305,6 +305,8 @@ impl Airc {
     pub fn start_lan_presence(&self, advertised_port: u16) -> Result<(), AircError> {
         let self_peer = self.inner.identity.peer_id;
         let learned = self.inner.learned_ips.clone();
+        let lan_seen = self.inner.lan_seen_ms.clone();
+        let on_arrival = self.inner.on_disconnect.clone();
         let registry = self.inner.registry.clone();
         airc_transport::lan_presence::spawn_lan_presence(
             self_peer.as_uuid(),
@@ -316,9 +318,10 @@ impl Airc {
                     // strangers, and none of them are routes.
                     return;
                 }
+                let mut ip_changed = false;
                 if let Ok(mut map) = learned.lock() {
-                    let changed = map.get(&peer) != Some(&hint.ip);
-                    if changed {
+                    ip_changed = map.get(&peer) != Some(&hint.ip);
+                    if ip_changed {
                         map.insert(peer, hint.ip);
                         tracing::info!(
                             peer = %peer,
@@ -326,6 +329,18 @@ impl Airc {
                             claimed_port = hint.port,
                             "LAN presence: learned peer address from multicast beacon"
                         );
+                    }
+                }
+                let Ok(now) = crate::time::now_ms() else {
+                    return;
+                };
+                let previous = lan_seen.lock().ok().and_then(|mut seen| seen.insert(peer, now));
+                if beacon_revives(previous, now, ip_changed) {
+                    // The same wake a dropped session uses: refresh now, so a peer
+                    // that just appeared is dialed in seconds, not on the next tick.
+                    let wake = on_arrival.lock().ok().and_then(|slot| slot.clone());
+                    if let Some(wake) = wake {
+                        wake(peer);
                     }
                 }
             },
@@ -552,6 +567,18 @@ impl Airc {
     }
 }
 
+/// A beacon that should wake route refresh: the peer is new on this network, came
+/// back after missing a few beacons (sleep, reboot, network change), or moved IP.
+/// A steady beacon every 15 s from a peer we already know is not news.
+fn beacon_revives(previous_seen_ms: Option<u64>, now_ms: u64, ip_changed: bool) -> bool {
+    const ABSENCE_MS: u64 = 3 * airc_transport::lan_presence::ANNOUNCE_INTERVAL.as_millis() as u64;
+    ip_changed
+        || match previous_seen_ms {
+            None => true,
+            Some(seen) => now_ms.saturating_sub(seen) > ABSENCE_MS,
+        }
+}
+
 /// A stable LAN listener port derived from this peer's identity (#8).
 ///
 /// An ephemeral `0.0.0.0:0` bind re-rolls the port on every daemon restart,
@@ -582,6 +609,29 @@ mod tests {
     use super::*;
     use crate::route::RouteEndpoint;
     use tempfile::tempdir;
+
+    // what this catches (airc audit 2026-10-02): a beacon only filled the learned-IP
+    // map and never woke route refresh, so a peer that came back waited for the next
+    // 60 s tick. New, returning, or moved peers wake it; the steady 15 s beacon of a
+    // peer we already know must not, or every beacon would trigger a refresh.
+    #[test]
+    fn a_new_returning_or_moved_peer_wakes_refresh_and_a_steady_one_does_not() {
+        let interval = airc_transport::lan_presence::ANNOUNCE_INTERVAL.as_millis() as u64;
+        let now = 1_000_000;
+        assert!(beacon_revives(None, now, false), "first beacon from a peer");
+        assert!(
+            !beacon_revives(Some(now - interval), now, false),
+            "steady beacon"
+        );
+        assert!(
+            beacon_revives(Some(now - 4 * interval), now, false),
+            "back after missed beacons"
+        );
+        assert!(
+            beacon_revives(Some(now - interval), now, true),
+            "moved to a new IP"
+        );
+    }
 
     // what this catches: the ephemeral-port churn regression. The advertised
     // port MUST be stable across restarts (same identity → same port) and in
