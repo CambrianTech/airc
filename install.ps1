@@ -226,8 +226,8 @@ try {
         return
     }
     $env:AIRC_DIR = $source
-    if ($env:BIN_TARGET) { $env:BIN_DIR = $env:BIN_TARGET }
-    elseif (-not $env:BIN_DIR) { $env:BIN_DIR = Join-Path $env:LOCALAPPDATA 'Programs\airc' }
+    # install.sh selects the explicit destination, existing PATH installation,
+    # or platform default once for copy, firewall, startup and adoption.
     $env:AIRC_WINDOWS_NATIVE = '1'
     $env:PSModulePath = $null
     # Cancellation owns the build subtree; only a completed successful

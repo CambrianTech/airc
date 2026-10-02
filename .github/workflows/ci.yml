@@ -194,7 +194,9 @@ jobs:
         run: bash test/setup-github-auth.sh
       - name: Downloaded setup source compatibility
         shell: bash
-        run: bash test/setup-source-acquisition.sh
+        run: |
+          bash test/setup-source-acquisition.sh
+          bash test/install-bin-directory.sh
       - name: Native setup acquisition and remaining-work storage planning
         if: runner.os == 'Windows'
         shell: powershell

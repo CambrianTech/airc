@@ -14,9 +14,22 @@ function Get-FixtureEntryFailure {
     } finally { [Console]::SetError($previous); $capture.Dispose() }
 }
 $repository = Split-Path $PSScriptRoot -Parent
+# Exercise only the registrar's pure ordering function, never real user PATH.
+$tokens=$null; $errors=$null
+$pathAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'windows/register-bin-path.ps1'),[ref]$tokens,[ref]$errors)
+$pathFunction=@($pathAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-AircRegisteredPath'},$true))
+if ($errors.Count -or $pathFunction.Count -ne 1) { throw 'Missing PATH reconciliation function' }
+. ([scriptblock]::Create($pathFunction[0].Extent.Text))
+$selected="C:\Fixture O'Brien\Selected bin"
+$other='C:\Fixture\Other bin'
+foreach($current in @("$other;$selected", "$selected;$other", "$other;$($selected.ToUpperInvariant())\;$selected")) {
+    $reconciled=Get-AircRegisteredPath $current $selected
+    if ($reconciled -cne "$selected;$other") { throw "Selected PATH directory did not win uniquely: $reconciled" }
+    if ((Get-AircRegisteredPath $reconciled $selected) -cne $reconciled) { throw 'PATH reconciliation is not idempotent' }
+}
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ("airc setup O'Brien " + [guid]::NewGuid().ToString('N'))
 $saved = @{}
-foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','AIRC_DIR','AIRC_CHANNEL','AIRC_FIXTURE_LOG','AIRC_FIXTURE_GIT_EXEC','AIRC_FIXTURE_SOURCE')) {
+foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','BIN_DIR','BIN_TARGET','AIRC_DIR','AIRC_CHANNEL','AIRC_FIXTURE_LOG','AIRC_FIXTURE_GIT_EXEC','AIRC_FIXTURE_SOURCE')) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 function Assert-True($condition,$message) { if (-not $condition) { throw $message } }
@@ -41,6 +54,8 @@ try {
     $env:LOCALAPPDATA = Join-Path $fixture 'local'
     $env:AIRC_DIR = $null
     $env:AIRC_CHANNEL = $null
+    $env:BIN_DIR = $null
+    $env:BIN_TARGET = $null
     $env:AIRC_FIXTURE_LOG = Join-Path $fixture 'calls.txt'
     $env:AIRC_FIXTURE_GIT_EXEC = Join-Path $gitRoot 'exec'
     $env:AIRC_FIXTURE_SOURCE = Join-Path $fixture 'source template'
@@ -79,7 +94,7 @@ public static class SetupBridgeFixture {
       return;
     }
     File.AppendAllText(Environment.GetEnvironmentVariable("AIRC_FIXTURE_LOG"),
-      "bash|" + string.Join("|", args) + "|source=" + Environment.GetEnvironmentVariable("AIRC_DIR") + "\n");
+      "bash|" + string.Join("|", args) + "|source=" + Environment.GetEnvironmentVariable("AIRC_DIR") + "|bin=" + Environment.GetEnvironmentVariable("BIN_DIR") + "|target=" + Environment.GetEnvironmentVariable("BIN_TARGET") + "\n");
   }
 }
 '@
@@ -133,6 +148,7 @@ public static class SetupBridgeFixture {
     $env:PATH = 'C:\airc PATH fixture;' * 1200
     & (Join-Path $entry 'install.ps1')
     $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
+    Assert-True ($calls -match '\|bin=\|target=\r?\n') 'Native entry overrode shared install destination selection'
     Assert-True ($calls -match 'git\|clone\|--quiet\|--branch\|canary\|') 'Fresh public source did not use matching channel'
     Assert-True ($calls -match "O'Brien") 'Path containing spaces/apostrophe was lost'
     Assert-True ($calls -match 'bash\|--noprofile\|--norc\|') 'Shared coordinator was not invoked'

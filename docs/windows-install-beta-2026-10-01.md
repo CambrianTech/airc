@@ -692,3 +692,70 @@ checkout whose installer fails after publication. It checks exact build
 provenance, original error visibility, restored executable contents/version,
 and absence of an unintentionally started daemon. Fixture and fresh-head gates
 are pending; no live update success is claimed.
+### OPEN: native setup and the existing PATH installation diverged
+
+Bigmama's public native setup published a fresh executable under the Windows
+Programs directory while the existing user PATH still selected the older
+`.local/bin` installation. The setup also failed later with gsudo exit 999;
+path divergence is a separate concrete defect, not a claim about that failure's
+cause. Investigation read the existing selection/registration code; no manual
+binary move, PATH repair, daemon stop or firewall mutation was performed.
+
+The shared Bash coordinator now owns destination selection for all entrypoints:
+explicit BIN_TARGET/BIN_DIR, then a native installed PATH executable excluding
+known source/configured Cargo output trees, then the platform's fresh default.
+The native bridge no longer imposes its own conflicting fallback. One selected
+destination drives publication, firewall, startup and daemon adoption. Historical
+alternate binaries are reported and preserved. Both updater paths pass their
+executing binary explicitly into PreparedInstall, which binds prepare/prebuilt
+BIN_DIR and BIN_TARGET to that directory instead of inherited defaults.
+
+Registration promotes the selected directory within User PATH and the installer
+process/Bash path, with repeatable deduplication. It does not change machine PATH
+or claim to override arbitrary machine-level shadows in fresh Windows processes.
+Synthetic fixtures cover competing user directories, explicit overrides, native
+versus script/function lookup, known Cargo outputs, literal spaces/apostrophes,
+case-insensitive Windows PATH registration, and repeated ordering. Actual public
+installation, installed/current PATH agreement and running-daemon build evidence
+remain OPEN; this patch alone does not close the reported outage or consent error.
+Validation: actual PS5 public bridge and isolated registrar ordering fixture
+passed (14458); shared Bash selection, downloaded-source compatibility, and
+native PATH-return fixtures passed (46525). The tiny Rust/Bash handoff fixture
+passed (10439), verifying that hostile inherited BIN_DIR and BIN_TARGET cannot
+redirect prepare/prebuilt publication away from the executing installation.
+Workspace Clippy passed with warnings denied (68384) in the dedicated
+D:/airc-build/doria/path-convergence-target cache; formatting/diff checks passed.
+No real installer, daemon, task or firewall operation was run for these checks.
+Independent parent review approved the shared selection/PATH change, and the
+updater reviewer independently approved the explicit executing-file handoff.
+The additional relative Cargo-target exclusion fixture passed (70059).
+
+CI coverage correction: PR1491 head0aa1b95 had an incorrectly indented run block
+in ci.yml. GitHub rejected workflow run37038119381 before creating jobs, so the
+PR check rollup showed Rust/shell checks but omitted the public installer matrix.
+That is a failed gate, not passing installation coverage. The indentation is
+corrected; an isolated developer-only PyYAML6.0.2 validator in D: scratch checked
+syntax, all four clean-install jobs, the three-platform setup-consent matrix,
+and rejection of the original broken indentation. No runtime/setup dependency
+was added. Fresh Windows/PS5/Linux/macOS installer CI remains mandatory before
+acceptance; no missing-workflow waiver is permitted.
+
+The restored matrix at df14cd2 exposed a Windows setup-consent failure in the
+new destination fixture (run37039301690, job110945178210). Source compatibility
+passed first; the destination fixture exited1 without identifying its assertion.
+The cause is not yet established: the old fixture also passed locally. The
+fixture now reports failing line/command and uses an actual Windows PE image
+(System32/where.exe copied as airc.exe, never executed) for native autodiscovery,
+instead of a truncated MZ header. This exercises the production type-aP lookup,
+including .exe resolution, separately from the updater's explicit destination.
+The strengthened local Windows fixture passed (25256). Fresh CI, including the
+cancelled macOS consent leg, must pass; this is not a live installation receipt.
+
+At 4daa036, macOS consent job110949393624 reported the first selection assertion
+at line44. The fixture compared its logical mktemp root with the selector's
+physical pwd-P directory. The fixture now canonicalizes its root and prints
+actual/expected values for initial selections; Windows scratch coverage passed
+(81046). The macOS path-alias explanation remains to be confirmed by CI; that
+run cancelled Windows consent, so its earlier failure is still unverified.
+Rebase onto canary318ca9b retains the merged ordinary-update rollback transaction
+and adds only its explicit executing-binary argument; both ledger entries remain.

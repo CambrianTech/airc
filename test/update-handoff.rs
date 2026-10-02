@@ -86,7 +86,8 @@ esac
         paths.extend(std::env::split_paths(&old_path));
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         std::env::set_var("HOME", &home);
-        std::env::set_var("BIN_DIR", home.join("bin"));
+        std::env::set_var("BIN_DIR", home.join("wrong-dir"));
+        std::env::set_var("BIN_TARGET", home.join("wrong-target"));
         std::env::set_var(
             "AIRC_FIXTURE_ROOT",
             root.to_string_lossy().replace('\\', "/"),
@@ -115,8 +116,13 @@ esac
         for case in ["failure", "malformed", "missing", "empty"] {
             write(&root.join("metadata-case"), case);
             assert!(
-                update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890")
-                    .is_err(),
+                update_artifact::PreparedInstall::prepare(
+                    &bash,
+                    &source,
+                    "abcdef1234567890",
+                    &home.join("bin/airc")
+                )
+                .is_err(),
                 "metadata case {case} used a guessed build directory"
             );
             assert!(!root.join("stopped").exists());
@@ -128,8 +134,13 @@ esac
             "#!/bin/sh\necho 'build: deadbee'\n",
         );
         std::fs::remove_file(root.join("events")).unwrap();
-        let prepared =
-            update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890").unwrap();
+        let prepared = update_artifact::PreparedInstall::prepare(
+            &bash,
+            &source,
+            "abcdef1234567890",
+            &home.join("bin/airc"),
+        )
+        .unwrap();
         // Prove install uses its owned snapshot, even if a different build has
         // since replaced the shared Cargo output.
         write(
@@ -151,22 +162,38 @@ esac
             std::fs::read_to_string(home.join("bin/airc")).unwrap(),
             good
         );
+        assert!(!home.join("wrong-dir").exists());
+        assert!(!home.join("wrong-target").exists());
         drop(prepared);
         std::fs::remove_file(root.join("stopped")).unwrap();
         // A stale artifact and a failed compiler both abort preparation while
         // the daemon is still up; install_after cannot be reached.
-        assert!(
-            update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890").is_err()
-        );
+        assert!(update_artifact::PreparedInstall::prepare(
+            &bash,
+            &source,
+            "abcdef1234567890",
+            &home.join("bin/airc")
+        )
+        .is_err());
         assert!(!root.join("stopped").exists());
         write(&root.join("fail-build"), "fail");
-        assert!(
-            update_artifact::PreparedInstall::prepare(&bash, &source, "abcdef1234567890").is_err()
-        );
+        assert!(update_artifact::PreparedInstall::prepare(
+            &bash,
+            &source,
+            "abcdef1234567890",
+            &home.join("bin/airc")
+        )
+        .is_err());
         assert!(!root.join("stopped").exists());
         // Wrong expected source SHA is rejected before any build.
         let before = std::fs::read_to_string(root.join("events")).unwrap();
-        assert!(update_artifact::PreparedInstall::prepare(&bash, &source, "deadbee").is_err());
+        assert!(update_artifact::PreparedInstall::prepare(
+            &bash,
+            &source,
+            "deadbee",
+            &home.join("bin/airc")
+        )
+        .is_err());
         assert_eq!(
             std::fs::read_to_string(root.join("events")).unwrap(),
             before
