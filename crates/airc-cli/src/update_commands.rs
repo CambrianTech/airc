@@ -366,19 +366,17 @@ fn prepare_build_source(
 /// Flow: fetch the channel; if source and installed binary are current, leave
 /// a stopped daemon stopped or verify the running revision. A reachable stale
 /// owner adopts the installed binary without rebuilding. Otherwise prepare a
-/// verified artifact, back up the installed binary, stop/install/restart, and
-/// smoke-test. Failed artifact verification restores the backup.
+/// verified artifact, retain the original in an owned transaction directory,
+/// stop/install/restart, and smoke-test. Failure restores the original file
+/// object without copying over the mapped executable.
 ///
 /// A matching-current daemon must not restart on a no-op update. The old
 /// stop-before-compare ordering caused recurring transport blackouts even when
 /// nothing changed. Running-build reconciliation is necessary too: a replaced
 /// file does not prove an already-running process adopted that file.
 ///
-/// Platform note: on Windows the live `airc.exe` is locked while this
-/// process runs, so the in-place reinstall (and thus the swap) inherits
-/// the same constraint as `run_update` — most valuable on the macOS /
-/// Linux grid nodes today. The rollback path is a no-op there because no
-/// swap occurred.
+/// Windows rollback restores the original file object by rename. It must not
+/// overwrite the executable from which this updater is still running.
 pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
@@ -415,112 +413,73 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
     let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
 
-    // Back up the live binary BEFORE stopping the daemon — this is the rollback
-    // anchor. Copying a running exe for read is allowed on every platform.
-    let prev = airc_exe.with_file_name("airc.prev");
-    std::fs::copy(&airc_exe, &prev).map_err(|e| {
-        format!(
-            "could not back up the current binary to {}: {e}",
-            prev.display()
-        )
-    })?;
-
-    // Get the live exe OUT OF THE WAY before the installer writes.
-    //
-    // Windows refuses to overwrite a running executable (`Device or resource
-    // busy` / ERROR_SHARING_VIOLATION) — and `stop_daemon` above does not clear
-    // it, because other processes share this binary: other scopes' daemons, a
-    // `join` stream, the ACP bridge. Measured on BigMama: two `airc.exe` plus
-    // `airc-acp-bridge.exe` still holding it after a clean stop.
-    //
-    // So the installer's copy silently failed, the smoke-test then failed
-    // (correctly — the exe still reported the OLD sha), and the whole thing
-    // reported a ROLLBACK. `airc update` has never once updated a Windows box,
-    // and it never said so: the rollback branch's own comment concedes the
-    // reinstall "couldn't replace the locked live exe in the first place" and
-    // treats that as fine.
-    //
-    // Windows DOES allow renaming a running exe — the handle follows the inode,
-    // the process keeps running from the renamed file. That is the standard
-    // self-update idiom on this platform. Move it aside and the installer writes
-    // to a free path.
-    //
-    // Unix does not need this (write-over-running is legal there), but it is
-    // harmless and one code path beats two.
-    let displaced = airc_exe.with_file_name(format!("airc.old-{before}"));
-    let mut displaced_current = false;
+    let previous_build = installed_binary_sha(&airc_exe)
+        .ok_or("cannot verify current binary before update; nothing displaced")?;
+    let mut swap = None;
+    let mut stopped = false;
     let installed = prepared.install_after(|| {
         if daemon_was_running {
             stop_daemon(&airc_exe, home, &socket)?;
+            stopped = true;
         }
-        let _ = std::fs::remove_file(&displaced); // a previous update's leftover
-        if let Err(e) = std::fs::rename(&airc_exe, &displaced) {
-            return Err(format!(
-                "could not move the live binary aside before installing ({e}). \
-             {} is still the running executable and nothing was changed. \
-             Something holds it that a rename cannot displace — check for \
-             other airc processes ({}).",
-                airc_exe.display(),
-                "airc.exe, airc-acp-bridge.exe"
-            )
-            .into());
-        }
-
-        displaced_current = true;
+        swap = Some(crate::update_rollback::BinarySwap::displace(
+            &airc_exe,
+            prepared.artifact(),
+        )?);
         Ok(())
     });
-
-    // A failed stop or rename never entered installation. Preserve that error
-    // and the unchanged live binary instead of attempting installer rollback.
-    if !displaced_current {
+    let Some(swap) = swap else {
+        // A failed stop or displacement did not publish a candidate. Do not
+        // overwrite the original with a backup or act on an unknown owner.
+        if stopped {
+            if let Err(ref failure) = installed {
+                restart_daemon(&airc_exe, home, &socket).map_err(|error|
+                    format!("update failed before displacement ({failure}); original daemon restart failed: {error}"))?;
+                wait_daemon_ready(&airc_exe, home, &socket)
+                    .and_then(|()| verify_daemon_build(&airc_exe, home, &socket, &previous_build))
+                    .map_err(|error| format!("update failed before displacement ({failure}); original daemon recovery verification failed: {error}"))?;
+            }
+        }
         return installed;
-    }
+    };
 
-    // If the installer did not produce a binary, put the original back NOW —
-    // otherwise the rename above has left the box with no `airc` on PATH at
-    // all, which is strictly worse than a stale one.
-    if installed.is_err() || !airc_exe.exists() {
-        let _ = std::fs::rename(&displaced, &airc_exe);
-    }
-
-    // Smoke-test: the new binary must RUN and report the SHA we pulled —
-    // a build that compiled but is broken (or didn't actually replace the
-    // binary) fails here and triggers rollback.
-    let smoke_ok = installed.is_ok() && smoke_test_new_binary(&airc_exe, &after);
-
-    if smoke_ok {
-        println!(
-            "Auto-updated: {before} -> {after} (smoke-test passed; backup at {}).",
-            prev.display()
-        );
-        if daemon_was_running {
-            restart_daemon(&airc_exe, home, &socket)?;
-            wait_daemon_ready(&airc_exe, home, &socket)?;
-        }
-        Ok(())
-    } else {
-        eprintln!("⚠ new build did not pass the smoke-test — ROLLING BACK to the previous binary.");
-        // Restore the known-good binary. (No-op-safe on Windows where the
-        // reinstall couldn't replace the locked live exe in the first place.)
-        if let Err(e) = std::fs::copy(&prev, &airc_exe) {
-            return Err(format!(
-                "auto-update FAILED and rollback ALSO failed ({e}); \
-                 your previous binary is at {} — restore it manually",
-                prev.display()
-            )
-            .into());
+    let failure = match installed {
+        Err(error) => Some(format!("installer failed: {error}")),
+        Ok(()) if !smoke_test_new_binary(&airc_exe, &after) => Some(format!(
+            "installed binary does not run and report expected build {after}"
+        )),
+        Ok(()) => None,
+    };
+    if let Some(failure) = failure {
+        eprintln!("Auto-update failed ({failure}); restoring the owned previous binary.");
+        swap.rollback().map_err(|error| format!(
+            "auto-update failed ({failure}); rollback failed ({error}); previous binary retained at {}",
+            swap.previous().display()
+        ))?;
+        if !smoke_test_new_binary(&airc_exe, &previous_build) {
+            return Err(format!("auto-update failed ({failure}); original file restored but build {previous_build} could not be verified").into());
         }
         if daemon_was_running {
-            // Restart on the rolled-back (known-good) binary.
-            let _ = restart_daemon(&airc_exe, home, &socket);
-            let _ = wait_daemon_ready(&airc_exe, home, &socket);
+            restart_daemon(&airc_exe, home, &socket).map_err(|error| format!(
+                "auto-update failed ({failure}); original build restored, but daemon restart failed: {error}"
+            ))?;
+            wait_daemon_ready(&airc_exe, home, &socket)
+                .and_then(|()| verify_daemon_build(&airc_exe, home, &socket, &previous_build))
+                .map_err(|error| format!("auto-update failed ({failure}); original build restored, but daemon recovery verification failed: {error}"))?;
         }
-        Err(format!(
-            "auto-update rolled back: the {after} build failed the smoke-test; \
-             restored the previous binary ({before})"
-        )
-        .into())
+        return Err(format!("auto-update failed ({failure}); previous binary {previous_build} restored and verified").into());
     }
+
+    if daemon_was_running {
+        restart_daemon(&airc_exe, home, &socket)?;
+        wait_daemon_ready(&airc_exe, home, &socket)?;
+        verify_daemon_build(&airc_exe, home, &socket, &after)?;
+    }
+    println!(
+        "Auto-updated: {previous_build} -> {after} (binary verified; previous file at {}).",
+        swap.previous().display()
+    );
+    Ok(())
 }
 
 /// THE skip rule, one place for `airc update` and `airc update --auto` (#354, and
