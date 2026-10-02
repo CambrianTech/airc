@@ -1,14 +1,11 @@
 //! Runtime client identity helpers for shell integration.
 
+#[cfg(any(unix, test))]
+use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(unix)]
-use std::process::Command;
-
-#[cfg(any(unix, test))]
-use sha2::{Digest, Sha256};
 
 #[cfg(any(unix, test))]
 use airc_core::humanhash;
@@ -108,7 +105,7 @@ struct ProcessRow {
 
 #[cfg(unix)]
 fn read_process(pid: u32) -> Result<Option<ProcessRow>, Box<dyn Error>> {
-    let output = match Command::new("ps")
+    let output = match airc_core::process::background("ps")
         .args(["-p", &pid.to_string(), "-o", "ppid=,command="])
         .output()
     {
