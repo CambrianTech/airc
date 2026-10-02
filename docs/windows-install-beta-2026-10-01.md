@@ -917,3 +917,39 @@ keeps its existing copied-image fixture. No sleep/retry, serialization, producti
 behavior or assertion waiver is added. Native Unix CI is the required platform
 proof; this does not resolve the separate Windows sharing32 holder.
 Reference: https://github.com/rust-lang/rust/issues/114554
+
+## CI consolidation audit (2026-10-02)
+
+Measured successful canary run37047711450: public Windows setup 621s, PS5 589s,
+Linux 286s, macOS 300s. Rust run37047711654: Windows tests 975s (912s in Cargo),
+macOS 643s, Linux 458s, Clippy 104s. These are distinct platform/feature and
+real-install contracts and remain intact. Runtime-guards run37044363177 spent
+122 of 127 seconds building a debug CLI for the same public-command proof that
+ci.yml already runs against installed Linux and macOS binaries.
+
+The separate runtime-guards workflow is consolidated into the existing named
+rust quality job. Shell syntax, cutover and quality checks remain; canary/main
+use the unchanged public-install proof, while rust-rewrite retains the debug
+proof because that branch has no public-install matrix. No jobs or required
+contexts are added, and the four configured required context names are kept.
+PR and push selection includes the three integration workspace members omitted
+by the previous Rust filter. Runtime-only pushes run the quality gate without
+accidentally enabling every Rust build. Missing classifier output and API file
+list limits select full checks conservatively; renamed paths include both names.
+All merge groups still run the Rust gates. Fresh hosted CI is required to confirm
+the consolidation; measured post-change time savings are not yet claimed.
+Local validation parsed YAML and checked required names/public-install jobs,
+then exercised 31 cases from the exact Bash selector (67609), including empty
+evidence, limits and conservative fallback. A real identical-head compare also
+selected full checks (214362). Existing quality, cutover and syntax guards passed
+(518aa0). Independent parent and peer reviews approved this scope. After the
+public installation completed, formatting and full workspace Clippy passed
+(15135) using this worktree's dedicated D: cache. Hosted CI remains pending.
+
+
+Rebased after the released native-adapter and rollback-fixture changes. The
+previous 2180059 CI run passed all four public installs but Linux Rust failed
+before BinarySwap: scratch executable spawn returned OS26 Text file busy
+(run37075997865, job111065953008). This was not waived or counted as green.
+Released 564af17 contains the independently reviewed Unix fixture repair; the
+consolidation workflow is unchanged and a fresh full matrix is required.
