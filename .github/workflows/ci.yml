@@ -262,6 +262,10 @@ jobs:
         shell: powershell
         run: ./test/windows-autostart.ps1
 
+      - name: Whole Windows updater owner and hidden Bash descendants
+        shell: powershell
+        run: ./test/windows-update-session.ps1 -CheckBash
+
       - name: Update artifact handoff through Git Bash
         shell: powershell
         run: |

@@ -17,6 +17,46 @@ fn hidden(command: &mut Command) -> &mut Command {
     command
 }
 
+// The real owner/ancestry/Job wrappers run, but these isolated IPC fixtures
+// never acquire credentials or touch a user's existing gsudo cache.
+fn isolated_windows_owner(source: &Path) {
+    #[cfg(windows)]
+    {
+        let originals = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../windows");
+        let windows = source.join("windows");
+        std::fs::create_dir_all(&windows).unwrap();
+        for name in [
+            "install-session.ps1",
+            "setup-entrypoint.ps1",
+            "setup-artifacts.lock.json",
+            "shared-setup.ps1",
+        ] {
+            std::fs::copy(originals.join(name), windows.join(name)).unwrap();
+        }
+        // Local development may exercise the reviewed helper before its
+        // release pin lands. CI/default behavior uses the actual pinned loader.
+        if let Some(helper) = std::env::var_os("AIRC_TEST_SHARED_HELPER") {
+            std::fs::copy(helper, windows.join("fixture-helper.ps1")).unwrap();
+            std::fs::write(
+                windows.join("shared-setup.ps1"),
+                ". (Join-Path $PSScriptRoot 'fixture-helper.ps1')\n",
+            )
+            .unwrap();
+        }
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(windows.join("shared-setup.ps1"))
+                .unwrap(),
+            "\nfunction Test-IsAdmin {{ $true }}\n"
+        )
+        .unwrap();
+    }
+    #[cfg(not(windows))]
+    let _ = source;
+}
+
 fn cli(account: &Path, source: &Path, args: &[&str]) -> Output {
     cli_with_isolation(account, source, args, true)
 }
@@ -193,6 +233,7 @@ fn public_update_verifies_current_owner_and_preserves_stopped_state() {
         String::from_utf8_lossy(&out.stderr)
     );
     git(&source, &["checkout", "-B", "canary", sha]);
+    isolated_windows_owner(&source);
     git(
         &source,
         &["remote", "set-url", "origin", source.to_str().unwrap()],
@@ -321,6 +362,7 @@ fn public_update_refuses_unknown_ipc_without_installing_or_starting() {
         std::fs::create_dir_all(&source).unwrap();
         git(&source, &["init"]);
         std::fs::write(source.join("install.sh"), "exit 98").unwrap();
+        isolated_windows_owner(&source);
         let endpoint = cli(&account, &source, &["ipc-endpoint"]);
         let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
         let mut owner = fixture(&socket, &temp.path().join("ready"), mode, "old");
@@ -387,6 +429,7 @@ fn both_update_modes_restore_the_executing_binary_after_publication_failure() {
         .unwrap();
     assert!(clone.status.success());
     git(&source, &["checkout", "-B", "canary", sha]);
+    isolated_windows_owner(&source);
     git(
         &source,
         &["remote", "set-url", "origin", source.to_str().unwrap()],
