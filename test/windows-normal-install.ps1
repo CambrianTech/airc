@@ -24,7 +24,7 @@ if($Child){
     $nativeProfile=[IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile')).TrimEnd('\')
     if(-not [string]::Equals($registeredProfile,$nativeProfile,[StringComparison]::OrdinalIgnoreCase)){throw 'Credentialed native profile does not match its SID registration'}
     $env:USERPROFILE=$registeredProfile
-    $userFolders=Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS/'+$OriginalSid+'/Software/Microsoft/Windows/CurrentVersion/Explorer/User Shell Folders')
+    $userFolders=Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS\'+$OriginalSid+'\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders')
     $env:LOCALAPPDATA=[Environment]::ExpandEnvironmentVariables($userFolders.'Local AppData')
     $env:APPDATA=[Environment]::ExpandEnvironmentVariables($userFolders.AppData)
     foreach($profileFolder in @($env:LOCALAPPDATA,$env:APPDATA)){if(-not [IO.Path]::GetFullPath($profileFolder).StartsWith($registeredProfile+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Credentialed application folder belongs to another profile'}}
