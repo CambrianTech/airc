@@ -154,7 +154,7 @@ pub fn daemon_command(
     socket: &Path,
 ) -> std::process::Command {
     let daemon_home = machine_account_home(scope_home);
-    let mut command = std::process::Command::new(airc_exe);
+    let mut command = airc_core::process::background(airc_exe);
     command
         .arg("--home")
         .arg(&daemon_home)

@@ -20,7 +20,10 @@
 //! the constants fall back to `unknown` rather than failing the
 //! build.
 
-use std::process::Command;
+// Build scripts run before the crate exists; reuse the same launch policy source.
+#[allow(dead_code)]
+#[path = "../airc-core/src/process.rs"]
+mod process;
 
 fn main() {
     let commit = git(["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
@@ -102,7 +105,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let output = Command::new("git").args(args).output().ok()?;
+    let output = process::background("git").args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }

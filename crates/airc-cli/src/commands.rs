@@ -805,10 +805,7 @@ pub(crate) fn detach_daemon(command: &mut Command) {
 
 #[cfg(windows)]
 pub(crate) fn detach_daemon(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x00000008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    airc_core::process::configure_detached(command);
 
     // Stop the detached daemon from inheriting THIS process's standard
     // handles. When `airc` is itself launched with piped stdio — every

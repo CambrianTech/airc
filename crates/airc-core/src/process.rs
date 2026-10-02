@@ -16,6 +16,15 @@ pub fn interactive(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
+/// Windows daemon lifecycle policy; Unix session ownership stays with callers.
+#[cfg(windows)]
+pub fn configure_detached(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP replace CREATE_NO_WINDOW:
+    // Windows ignores CREATE_NO_WINDOW when DETACHED_PROCESS is present.
+    command.creation_flags(0x0000_0008 | 0x0000_0200);
+}
+
 pub fn configure_background(command: &mut Command) {
     #[cfg(windows)]
     {
@@ -124,6 +133,20 @@ mod tests {
             .unwrap();
         assert_eq!(failure.status.code(), Some(23));
         assert!(String::from_utf8_lossy(&failure.stderr).contains("WINDOWLESS-STDERR"));
+    }
+
+    #[test]
+    fn detached_child_preserves_explicit_output_without_console() {
+        let mut child = background(std::env::current_exe().unwrap());
+        configure_detached(&mut child);
+        let output = child
+            .args(["--exact", CHILD, "--ignored", "--nocapture"])
+            .env("AIRC_WINDOW_TEST_ROLE", "child")
+            .env("AIRC_WINDOW_TEST_VALUE", "detached")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("WINDOWLESS-VALUE:detached"));
     }
 
     #[test]
