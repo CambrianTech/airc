@@ -51,8 +51,8 @@
 //!
 //! Slice 1 was the request/response pair. Slice 2 (2026-09-14, the day the 5090
 //! came back after six dark days and its board had none of the cards published
-//! meanwhile) is the wiring: the routed forwarder asks every peer the first time
-//! it sees it connected ([`Airc::backfill_all_from_peer`]), and the transport's
+//! meanwhile) is the wiring: the routed forwarder asks every peer whenever
+//! an authenticated session becomes ready ([`Airc::backfill_all_from_peer`]), and the transport's
 //! inbound path serves a request the moment it is delivered ([`Airc::serve_backfill`]).
 //!
 //! ## Continuation belongs to the responder
@@ -253,6 +253,7 @@ impl Airc {
         until_ms: Option<u64>,
         deadline: Duration,
     ) -> Result<BackfillResponse, AircError> {
+        let room = self.backfill_dispatch_room(channel).await?;
         let request = BackfillRequest {
             channel,
             since: None,
@@ -262,12 +263,35 @@ impl Airc {
             cursor_paging: true,
             before: None,
         };
-        self.request_backfill_page(peer, request, deadline).await
+        self.request_backfill_page(peer, &room, request, deadline)
+            .await
+    }
+
+    async fn backfill_dispatch_room(&self, channel: RoomId) -> Result<crate::Room, AircError> {
+        if let Some(room) = self.room_by_channel(channel).await? {
+            return Ok(room);
+        }
+        // The daemon gateway need not subscribe to a hosted project's room.
+        // Its existing owner bridge supplies that authority, not its default room.
+        if let Some(sink) = self.inbound_frame_sink() {
+            if sink
+                .backfill_channels()
+                .await
+                .map_err(AircError::Transport)?
+                .contains(&channel)
+            {
+                return Ok(crate::Room::at_channel(self.home(), "", channel)?);
+            }
+        }
+        Err(AircError::Route(format!(
+            "backfill channel {channel} is not subscribed or hosted"
+        )))
     }
 
     async fn request_backfill_page(
         &self,
         peer: PeerId,
+        room: &crate::Room,
         request: BackfillRequest,
         deadline: Duration,
     ) -> Result<BackfillResponse, AircError> {
@@ -278,7 +302,7 @@ impl Airc {
                 .map_err(|e| AircError::Crypto(format!("backfill request encode: {e}")))?,
         );
         let pending = self
-            .request(MentionTarget::Peer(peer), headers, body, deadline)
+            .request_in_resolved_room(room, MentionTarget::Peer(peer), headers, body, deadline)
             .await?;
         let reply = self.await_reply(pending).await?;
         let Some(Body::Json(value)) = reply.body else {
@@ -410,10 +434,12 @@ impl Airc {
         })?;
         let mut delivered = 0usize;
         let mut before = None;
+        let room = self.backfill_dispatch_room(channel).await?;
         for _page in 0..BACKFILL_MAX_PAGES {
             let response = self
                 .request_backfill_page(
                     peer,
+                    &room,
                     BackfillRequest {
                         channel,
                         since: None,
@@ -452,8 +478,8 @@ impl Airc {
         )))
     }
 
-    /// The reconnect watcher's whole job: the first time a peer is seen
-    /// connected, ask it what this node missed on every subscribed channel.
+    /// On an authenticated connection, ask what this node missed on every
+    /// subscribed channel. Each pass retains the bounded recent-history policy.
     /// Never fails the caller — a peer that cannot answer is logged, not fatal.
     pub(crate) async fn backfill_all_from_peer(&self, peer: PeerId) {
         let Some(sink) = self.inbound_frame_sink() else {

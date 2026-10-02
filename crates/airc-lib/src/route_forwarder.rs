@@ -137,9 +137,6 @@ pub(crate) fn ack_is_for(ack_receiver: PeerId, target: PeerId, aliases: &HashSet
 
 /// How long a computed alias set stands before the trust store is read again.
 const ALIAS_CACHE_TTL: Duration = Duration::from_secs(60);
-/// #1f58fc16: a peer unseen for this long is treated as reconnected the
-/// next time it appears, re-arming its bounded backfill pass.
-const REARM_GAP: Duration = Duration::from_secs(300);
 
 struct ForwarderInner {
     /// Per target peer: the ids sharing its pubkey (see [`ack_is_for`]), cached.
@@ -149,6 +146,9 @@ struct ForwarderInner {
     /// dialer handles). Never dialed from here — route discovery owns
     /// connection establishment.
     links: tokio::sync::RwLock<Vec<Airc>>,
+    /// One bounded recovery pass per peer. A connection arriving during a pass
+    /// sets its pending bit, so completion rechecks history without overlap.
+    backfills: std::sync::Mutex<HashMap<PeerId, bool>>,
     config: RoutedForwarderConfig,
     diag: std::sync::RwLock<Arc<dyn DiagnosticSink>>,
     /// Frames actually flushed to a LAN connection (post `send_to`
@@ -201,6 +201,7 @@ impl RoutedForwarder {
             aliases: std::sync::Mutex::new(HashMap::new()),
             forward_latest,
             links: tokio::sync::RwLock::new(Vec::new()),
+            backfills: std::sync::Mutex::new(HashMap::new()),
             config,
             diag: std::sync::RwLock::new(Arc::new(StderrJsonDiagnosticSink)),
             forwarded: AtomicU64::new(0),
@@ -222,7 +223,20 @@ impl RoutedForwarder {
     /// forwards may travel over. Idempotent by handle identity is not
     /// required — the daemon registers each handle exactly once.
     pub async fn add_link(&self, link: Airc) {
-        self.inner.links.write().await.push(link);
+        self.inner.links.write().await.push(link.clone());
+        let weak = Arc::downgrade(&self.inner);
+        link.set_connect_observer(Arc::new(move |peer| {
+            if let Some(inner) = weak.upgrade() {
+                request_backfill(&inner, peer);
+            }
+        }));
+        // Register before the snapshot: handles may already be connected when
+        // added, while later sessions are observed directly, without traffic.
+        if let Some(adapter) = link.inner.lan_tcp.lock().await.clone() {
+            for peer in adapter.connected_peers().await {
+                request_backfill(&self.inner, peer);
+            }
+        }
     }
 
     /// Replace the diagnostic sink (tests assert emissions instead of
@@ -252,6 +266,38 @@ impl RoutedForwarder {
     }
 }
 
+fn request_backfill(inner: &Arc<ForwarderInner>, peer: PeerId) {
+    {
+        let mut active = inner.backfills.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pending) = active.get_mut(&peer) {
+            *pending = true;
+            return;
+        }
+        active.insert(peer, false);
+    }
+    let weak = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        loop {
+            let Some(inner) = weak.upgrade() else { return };
+            let link = resolve_link(&inner, peer).await.map(|(link, _)| link);
+            drop(inner);
+            if let Some(link) = link {
+                link.backfill_all_from_peer(peer).await;
+            }
+            let Some(inner) = weak.upgrade() else { return };
+            let mut active = inner.backfills.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pending) = active.get_mut(&peer) {
+                if *pending {
+                    *pending = false;
+                    continue;
+                }
+            }
+            active.remove(&peer);
+            return;
+        }
+    });
+}
+
 fn emit(inner: &ForwarderInner, event: DiagnosticEvent) {
     let sink = inner
         .diag
@@ -271,13 +317,6 @@ struct PeerItem {
 /// minus the item's origin), spawning workers on demand.
 async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardItem>) {
     let mut workers: HashMap<PeerId, mpsc::Sender<PeerItem>> = HashMap::new();
-    // #1f58fc16: last tick each peer was observed live. Workers are
-    // never pruned, so first-sight alone fires exactly once per drain;
-    // a reconnecting peer would otherwise recover nothing. Re-arm when
-    // the gap since last observation exceeds REARM_GAP (bounded pass,
-    // idempotent at the board fold).
-    let mut last_seen: std::collections::HashMap<PeerId, std::time::Instant> =
-        std::collections::HashMap::new();
     // #1247 slice 3: the relay tier. A connected relay is a SINGLE pipe
     // (it fans out by target), not a per-peer link, so it gets ONE worker
     // — lazily spawned the first time a relay is actually connected, so a
@@ -306,26 +345,9 @@ async fn drain_loop(inner: Weak<ForwarderInner>, mut rx: mpsc::Receiver<ForwardI
             if Some(peer) == item.origin {
                 continue;
             }
-            // #1f58fc16: re-arm on reappearance as well as true first sight.
-            // A peer absent from the live set for REARM_GAP and then seen
-            // again gets another bounded pass; duplicates are free at fold.
-            let now = std::time::Instant::now();
-            let rearm = last_seen
-                .get(&peer)
-                .is_some_and(|t| now.duration_since(*t) > REARM_GAP);
-            last_seen.insert(peer, now);
-            let first_sight = !workers.contains_key(&peer) || rearm;
             let queue = workers
                 .entry(peer)
                 .or_insert_with(|| spawn_peer_worker(Arc::downgrade(&inner), peer, &inner.config));
-            if first_sight {
-                // Backfill slice 2: a peer seen connected for the first time (a node
-                // that came back, or this daemon just started) is asked what this
-                // node missed on every subscribed channel. Off the forward path.
-                if let Some((link, _adapter)) = resolve_link(&inner, peer).await {
-                    tokio::spawn(async move { link.backfill_all_from_peer(peer).await });
-                }
-            }
             match queue.try_send(PeerItem {
                 env: Arc::clone(&item.env),
             }) {
