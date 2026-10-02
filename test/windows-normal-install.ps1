@@ -5,7 +5,6 @@ if($env:GITHUB_ACTIONS -ne 'true'){throw 'Token-changing installation acceptance
 $root=Split-Path $PSScriptRoot -Parent
 . (Join-Path $root 'windows/setup-entrypoint.ps1')
 Initialize-InstallerPowerShell
-Add-Type -Path (Join-Path $root 'windows/daemon-diagnostics.cs')
 function Read-ChildLogs {
     param($OutputTask,$ErrorTask)
     if(-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($OutputTask,$ErrorTask),10000)){throw 'Owned child exited but its output pipes did not close within 10 seconds'}
@@ -18,16 +17,16 @@ function Read-OwnToken {
     try { [AircDaemonDiagnostics]::Inspect(('\\.\pipe\'+$name)) } finally { $server.Dispose() }
 }
 if($Child){
-    $token=Read-OwnToken
-    if((Test-IsAdmin) -or $token.tokenElevated -ne $false -or $token.tokenIntegritySid -ne 'S-1-16-8192' -or $token.tokenUserSid -ne $OriginalSid){throw ('Runner did not produce the required actual normal token: '+($token|ConvertTo-Json -Compress))}
+    if((Test-IsAdmin) -or [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne $OriginalSid){throw 'Credentialed child identity is not the requested normal account'}
     # Restore actual credentialed user's profile paths, never the supervisor's.
     $registeredProfile=[Environment]::ExpandEnvironmentVariables((Get-ItemProperty -LiteralPath ('HKLM:/SOFTWARE/Microsoft/Windows NT/CurrentVersion/ProfileList/'+$OriginalSid) -Name ProfileImagePath).ProfileImagePath)
     $registeredProfile=[IO.Path]::GetFullPath($registeredProfile).TrimEnd('\')
     $nativeProfile=[IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile')).TrimEnd('\')
     if(-not [string]::Equals($registeredProfile,$nativeProfile,[StringComparison]::OrdinalIgnoreCase)){throw 'Credentialed native profile does not match its SID registration'}
     $env:USERPROFILE=$registeredProfile
-    $env:LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData')
-    $env:APPDATA=[Environment]::GetFolderPath('ApplicationData')
+    $userFolders=Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS/'+$OriginalSid+'/Software/Microsoft/Windows/CurrentVersion/Explorer/User Shell Folders')
+    $env:LOCALAPPDATA=[Environment]::ExpandEnvironmentVariables($userFolders.'Local AppData')
+    $env:APPDATA=[Environment]::ExpandEnvironmentVariables($userFolders.AppData)
     foreach($profileFolder in @($env:LOCALAPPDATA,$env:APPDATA)){if(-not [IO.Path]::GetFullPath($profileFolder).StartsWith($registeredProfile+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Credentialed application folder belongs to another profile'}}
     Write-Host ('Verified fixture profile for SID '+$OriginalSid+': '+$registeredProfile)
     $env:HOME=$env:USERPROFILE
@@ -37,6 +36,9 @@ if($Child){
     New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
     $env:CARGO_HOME=$null;$env:RUSTUP_HOME=$null
     $env:PATH=$GsudoDirectory+';'+$env:PATH
+    Add-Type -Path (Join-Path $root 'windows/daemon-diagnostics.cs')
+    $token=Read-OwnToken
+    if((Test-IsAdmin) -or $token.tokenElevated -ne $false -or $token.tokenIntegritySid -ne 'S-1-16-8192' -or $token.tokenUserSid -ne $OriginalSid){throw ('Runner did not produce the required actual normal token: '+($token|ConvertTo-Json -Compress))}
     . (Join-Path $root 'windows/shared-setup.ps1')
     # A native pipe observation supplies authoritative PID/token evidence. The
     # child birth time additionally prevents a PID-reuse race when retaining it.
@@ -75,6 +77,7 @@ if($Child){
     exit 0
 }
 . (Join-Path $root 'windows/shared-setup.ps1')
+Add-Type -Path (Join-Path $root 'windows/daemon-diagnostics.cs')
 if(-not (Test-IsAdmin)){throw 'Hosted supervisor must start elevated to grant explicit process-scoped test consent.'}
 if(-not $CancellationOnly){
     Invoke-InstallerProcess -OwnProcessTree (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$PSCommandPath,'-Engine',$Engine,'-CancellationOnly')
@@ -127,6 +130,7 @@ try {
     # Child validates its SID-profile registration before resetting user paths.
     $start.EnvironmentVariables['GITHUB_ACTIONS']=$env:GITHUB_ACTIONS
     $start.EnvironmentVariables['AIRC_SKIP_AUTH']=$env:AIRC_SKIP_AUTH
+    foreach($name in @('USERPROFILE','LOCALAPPDATA','APPDATA','HOME','HOMEDRIVE','HOMEPATH','TEMP','TMP','USERNAME','USERDOMAIN','CARGO_HOME','RUSTUP_HOME')){$start.EnvironmentVariables.Remove($name)}
     $process=[Diagnostics.Process]::Start($start)
     $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
     $deadline=[DateTime]::UtcNow.AddMinutes(2)
