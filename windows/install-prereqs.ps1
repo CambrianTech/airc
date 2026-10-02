@@ -50,7 +50,7 @@ function Get-AircTargetDirectory {
     param([string]$SourceDirectory)
     Push-Location -LiteralPath $SourceDirectory
     try {
-        $metadata = & cargo metadata --format-version 1 --no-deps
+        $metadata = Invoke-InstallerProcess -OwnProcessTree 'cargo' @('metadata', '--format-version', '1', '--no-deps')
         if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve Cargo target directory.' }
     } finally { Pop-Location }
     $target = ($metadata | ConvertFrom-Json).target_directory
@@ -228,7 +228,7 @@ function Install-IfMissing {
         '--accept-source-agreements',
         '--disable-interactivity'
     )
-    & winget @wingetArgs
+    Invoke-InstallerProcess -OwnProcessTree 'winget' $wingetArgs
     if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
         # -1978335189 (0x8A15002B) = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE
         # = "already installed, no update needed". Treat as success.
@@ -248,7 +248,7 @@ function Install-GitHubCli {
     param([Parameter(Mandatory=$true)][string]$SourceDirectory)
     $existing = Get-Command gh -ErrorAction SilentlyContinue
     if ($existing) {
-        & $existing.Source --version | Out-Null
+        Invoke-InstallerProcess -OwnProcessTree $existing.Source @('--version') | Out-Null
         if ($LASTEXITCODE -eq 0) { Write-Ok 'GitHub CLI already installed'; return }
     }
     Write-Step 'Installing official GitHub CLI for the current user'
@@ -260,6 +260,7 @@ function Install-GitHubCli {
     if (-not $asset -or -not $checksumAsset) { throw 'Official GitHub CLI release is missing the Windows archive/checksum.' }
     $downloadDir = Join-Path $env:TEMP ('airc-gh-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $downloadDir | Out-Null
+    try {
     $archive = Join-Path $downloadDir $asset.name
     $checksums = Join-Path $downloadDir 'checksums.txt'
     Invoke-WebRequest $asset.browser_download_url -UseBasicParsing -OutFile $archive
@@ -269,12 +270,31 @@ function Install-GitHubCli {
     $expected = ($checksumLine -split '\s+')[0]
     if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) { throw 'GitHub CLI archive checksum mismatch.' }
     $destination = Join-Path $env:LOCALAPPDATA 'Programs\GitHub CLI'
-    Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+    # Use the framework ZIP reader directly: the Windows PowerShell Archive
+    # module can hang in a redirected, noninteractive installer host. Extract
+    # into our unique download directory and validate before publishing.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $staged = Join-Path $downloadDir 'expanded'
+    [IO.Compression.ZipFile]::ExtractToDirectory($archive, $staged)
+    Invoke-InstallerProcess -OwnProcessTree (Join-Path $staged 'bin\gh.exe') @('--version')
+    if ($LASTEXITCODE -ne 0) { throw 'GitHub CLI archive did not contain a working command.' }
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    Get-ChildItem -LiteralPath $staged | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
+    }
     & (Join-Path $SourceDirectory 'windows\register-bin-path.ps1') -BinDirectory (Join-Path $destination 'bin')
     Update-SessionPath
-    & (Join-Path $destination 'bin\gh.exe') --version
+    Invoke-InstallerProcess -OwnProcessTree (Join-Path $destination 'bin\gh.exe') @('--version')
     if ($LASTEXITCODE -ne 0) { throw 'GitHub CLI installation did not produce a working command.' }
-    Remove-Item -LiteralPath $archive,$checksums -Force
+    } finally {
+        $owned = [IO.Path]::GetFullPath($downloadDir)
+        $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+        if (-not $owned.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            [IO.Path]::GetFileName($owned) -notmatch '^airc-gh-[a-f0-9]{32}$') {
+            throw 'GitHub CLI staging cleanup escaped its owned temporary directory.'
+        }
+        if (Test-Path -LiteralPath $owned) { Remove-Item -LiteralPath $owned -Recurse -Force }
+    }
 }
 
 # -- Banner --------------------------------------------------------------
@@ -315,12 +335,12 @@ if ((Get-Command cargo -ErrorAction SilentlyContinue) -and (Get-Command rustup -
     $savedPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & cargo --version 2>$null | Out-Null
+        Invoke-InstallerProcess -OwnProcessTree 'cargo' @('--version') 2>$null | Out-Null
         $cargoAvailable = $LASTEXITCODE -eq 0
     } finally { $ErrorActionPreference = $savedPreference }
     if (-not $cargoAvailable) {
         Write-Step 'Repairing the existing Rust toolchain before resolving build storage ...'
-        & rustup default stable
+        Invoke-InstallerProcess -OwnProcessTree 'rustup' @('default', 'stable')
         if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain repair failed. Setup is incomplete.' }
     }
 }
@@ -332,7 +352,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
     $rustupExe = Join-Path $cargoHome 'bin\rustup.exe'
     if (Test-Path $rustupExe) {
-        & $rustupExe default stable
+        Invoke-InstallerProcess -OwnProcessTree $rustupExe @('default', 'stable')
         Update-SessionPath
     }
 }

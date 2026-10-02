@@ -7,6 +7,20 @@ if ($aircSetupLock.schemaVersion -ne 1 -or $aircSetupLock.continuumRevision -not
 }
 $aircSetupCache = Join-Path $env:LOCALAPPDATA ('airc\setup-artifacts\' + $aircSetupLock.continuumRevision)
 
+function Save-AircSetupArtifact {
+    param([string]$Uri, [string]$OutFile)
+    # Small pinned scripts only. Bound the entire response, including the body;
+    # PS5 Invoke-WebRequest can hang in its legacy response processing path.
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object Net.Http.HttpClient
+    try {
+        $client.Timeout = [TimeSpan]::FromSeconds(60)
+        $client.MaxResponseContentBufferSize = 1048576
+        $bytes = $client.GetByteArrayAsync($Uri).GetAwaiter().GetResult()
+        [IO.File]::WriteAllBytes($OutFile, $bytes)
+    } finally { $client.Dispose() }
+}
+
 function Get-AircSetupArtifact {
     param([string]$RelativePath, [string]$Sha256)
     if ($Sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Invalid shared-setup artifact checksum.' }
@@ -18,7 +32,8 @@ function Get-AircSetupArtifact {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $url = 'https://raw.githubusercontent.com/CambrianTech/continuum/' + $aircSetupLock.continuumRevision + '/' + $RelativePath
-        Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $temporary
+        Write-Host "Acquiring verified setup helper: $RelativePath"
+        Save-AircSetupArtifact -Uri $url -OutFile $temporary
         if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash -ne $Sha256) {
             throw "Shared-setup artifact checksum mismatch: $RelativePath"
         }

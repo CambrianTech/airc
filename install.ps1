@@ -10,6 +10,65 @@ $ErrorActionPreference = 'Stop'
 if ($FirewallOnly -and (-not $AircPath -or -not (Test-Path -LiteralPath $AircPath -PathType Leaf))) {
     throw 'Firewall-only setup requires the installed AIRC executable via -AircPath.'
 }
+# BEGIN GENERATED SHARED SETUP BOOTSTRAP
+# Dot-source the same small setup artifacts used by Continuum. AIRC does not
+# install or require the Continuum application. Only immutable, verified bytes
+# are loaded; dependency choices remain in the generated canonical manifest.
+$aircSetupLock = @'
+{
+  "schemaVersion": 1,
+  "continuumRevision": "71fb9cc510f65684440f81942a5dd2b88af15aa3",
+  "elevationSha256": "4c5a38198f0b18e7631c59e3e4cbed98a3b96c2f18ef958add6b913f84c6a3e3",
+  "manifestSha256": "47892357d9f082a95a117b81ada399ccd8a213be75a975f4eed8483a2c3f28b9"
+}
+'@ | ConvertFrom-Json
+if ($aircSetupLock.schemaVersion -ne 1 -or $aircSetupLock.continuumRevision -notmatch '^[a-f0-9]{40}$') {
+    throw 'Unsupported AIRC shared-setup artifact lock.'
+}
+$aircSetupCache = Join-Path $env:LOCALAPPDATA ('airc\setup-artifacts\' + $aircSetupLock.continuumRevision)
+
+function Save-AircSetupArtifact {
+    param([string]$Uri, [string]$OutFile)
+    # Small pinned scripts only. Bound the entire response, including the body;
+    # PS5 Invoke-WebRequest can hang in its legacy response processing path.
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object Net.Http.HttpClient
+    try {
+        $client.Timeout = [TimeSpan]::FromSeconds(60)
+        $client.MaxResponseContentBufferSize = 1048576
+        $bytes = $client.GetByteArrayAsync($Uri).GetAwaiter().GetResult()
+        [IO.File]::WriteAllBytes($OutFile, $bytes)
+    } finally { $client.Dispose() }
+}
+
+function Get-AircSetupArtifact {
+    param([string]$RelativePath, [string]$Sha256)
+    if ($Sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Invalid shared-setup artifact checksum.' }
+    $path = Join-Path $aircSetupCache (Split-Path $RelativePath -Leaf)
+    if ((Test-Path -LiteralPath $path -PathType Leaf) -and
+        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -eq $Sha256) { return $path }
+    New-Item -ItemType Directory -Path $aircSetupCache -Force | Out-Null
+    $temporary = Join-Path $aircSetupCache ([guid]::NewGuid().ToString('N') + '.download')
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $url = 'https://raw.githubusercontent.com/CambrianTech/continuum/' + $aircSetupLock.continuumRevision + '/' + $RelativePath
+        Write-Host "Acquiring verified setup helper: $RelativePath"
+        Save-AircSetupArtifact -Uri $url -OutFile $temporary
+        if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash -ne $Sha256) {
+            throw "Shared-setup artifact checksum mismatch: $RelativePath"
+        }
+        Move-Item -LiteralPath $temporary -Destination $path -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+    return $path
+}
+
+$aircSetupManifest = Get-AircSetupArtifact 'tools/scripts/generated/manifest.windows.ps1' $aircSetupLock.manifestSha256
+$aircSetupElevation = Get-AircSetupArtifact 'tools/scripts/lib/windows-elevation.ps1' $aircSetupLock.elevationSha256
+. $aircSetupManifest
+. $aircSetupElevation -GsudoSource $script:ContinuumManifest['gsudo'].source
+# END GENERATED SHARED SETUP BOOTSTRAP
 function Refresh-Path {
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $paths = [Collections.Generic.List[string]]::new()
@@ -24,7 +83,7 @@ function Refresh-Path {
 function Find-GitBash {
     $git = Get-Command git.exe -ErrorAction SilentlyContinue
     if ($git) {
-        $execPath = & $git.Source --exec-path
+        $execPath = Invoke-InstallerProcess -OwnProcessTree $git.Source @('--exec-path')
         if ($global:LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $execPath 'git-remote-https.exe'))) { return $null }
         $root = Split-Path (Split-Path $git.Source -Parent) -Parent
         foreach ($relative in @('bin\bash.exe','usr\bin\bash.exe')) {
@@ -41,8 +100,9 @@ if (-not $bash) {
         throw 'Git for Windows and winget are unavailable. Install Windows App Installer, then rerun AIRC setup.'
     }
     Write-Host 'Installing Git for Windows. If Windows requests consent, setup waits for you to approve it.'
-    & winget install --id Git.Git --source winget --exact --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+    Invoke-InstallerProcess -OwnProcessTree 'winget' @('install', '--id', 'Git.Git', '--source', 'winget', '--exact', '--scope', 'user', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
     $installExit = $global:LASTEXITCODE
+    if ($installExit -ne 0 -and $installExit -ne 3010) { throw "Git acquisition failed (winget exit $installExit)." }
     Refresh-Path
     $bash = Find-GitBash
     if (-not $bash) { throw "Git for Windows is unavailable after installation (exit $installExit). Rerun AIRC setup to resume." }
@@ -53,7 +113,7 @@ $source = if ($env:AIRC_DIR) { $env:AIRC_DIR } elseif ($PSScriptRoot -and (Test-
 } else { Join-Path $env:USERPROFILE '.airc\src' }
 $channel = if ($env:AIRC_CHANNEL) { $env:AIRC_CHANNEL } else { 'canary' }
 function Test-SetupLayout([string]$Directory) {
-    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1')) {
+    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1','windows\sync-bootstrap.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Directory $relative))) { return $false }
     }
     return $true
@@ -82,7 +142,7 @@ if (-not (Test-Path (Join-Path $source 'Cargo.toml'))) {
     # accidentally handing new setup to an older remote-default checkout.
     $cloneArgs += @('--branch',$channel)
     $cloneArgs += @('https://github.com/CambrianTech/airc.git',$source)
-    & git @cloneArgs
+    Invoke-InstallerProcess -OwnProcessTree 'git' $cloneArgs
     if ($global:LASTEXITCODE -ne 0) { throw 'AIRC source acquisition failed. Rerun setup to resume.' }
 }
 if (-not (Test-SetupLayout $source)) { throw 'Selected source does not contain this setup version. Installation stopped before invoking an incompatible coordinator.' }
@@ -102,7 +162,7 @@ try {
         # The same public source acquisition and owner serve standalone and
         # Continuum callers. Only AIRC owns the effective firewall policy.
         $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        & $powershell -NoProfile -ExecutionPolicy RemoteSigned -File (Join-Path $source 'windows\configure-firewall.ps1') -AircPath $AircPath
+        Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $powershell @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', (Join-Path $source 'windows\configure-firewall.ps1'), '-AircPath', $AircPath)
         if ($global:LASTEXITCODE -ne 0) { throw "AIRC firewall setup failed (exit $global:LASTEXITCODE)." }
         return
     }
@@ -111,7 +171,9 @@ try {
     elseif (-not $env:BIN_DIR) { $env:BIN_DIR = Join-Path $env:LOCALAPPDATA 'Programs\airc' }
     $env:AIRC_WINDOWS_NATIVE = '1'
     $env:PSModulePath = $null
-    & $bash --noprofile --norc ((Join-Path $source 'install.sh') -replace '\\','/')
+    # Cancellation owns the build subtree; only a completed successful
+    # coordinator may hand off its persistent daemon.
+    Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $bash @('--noprofile', '--norc', ((Join-Path $source 'install.sh') -replace '\\','/'))
     $result = $global:LASTEXITCODE
 } finally {
     try { if ($elevationReady) { Clear-Elevation } }

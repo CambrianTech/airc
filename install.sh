@@ -112,7 +112,7 @@ _compatible_setup_layout() {
   [ -f "$directory/setup/github-auth.sh" ] || return 1
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-      for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1; do
+      for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 sync-bootstrap.ps1; do
         [ -f "$directory/windows/$relative" ] || return 1
       done ;;
   esac

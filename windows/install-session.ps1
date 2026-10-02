@@ -16,7 +16,7 @@ try {
     if ($PrepareArtifact) { $arguments += @('--prepare-artifact', ($PrepareArtifact -replace '\\','/')) }
     if ($PrebuiltArtifact) { $arguments += @('--prebuilt', ($PrebuiltArtifact -replace '\\','/')) }
     if ($ExpectedBuild) { $arguments += @('--expected-build', $ExpectedBuild) }
-    & $BashPath @arguments
+    Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $BashPath $arguments
     $result = $LASTEXITCODE
 } finally { Clear-Elevation }
 exit $result

@@ -199,6 +199,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
+          ./windows/sync-bootstrap.ps1 -Check
           # Isolate deliberate native failure cases and function mocks. The
           # runner otherwise exits with a cancellation fixture's LASTEXITCODE.
           foreach ($test in @('windows-setup-bridge', 'windows-storage-plan', 'windows-gh-acquisition', 'windows-firewall-process', 'windows-firewall-policy')) {
