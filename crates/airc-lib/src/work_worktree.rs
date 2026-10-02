@@ -53,7 +53,7 @@ pub fn creation_base(worktree: &Path) -> Result<String, String> {
 }
 
 fn resolve_commit(repo: &Path, revision: &str) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .current_dir(repo)
         .args([
             "rev-parse",
@@ -143,7 +143,7 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
     // Resolve once before creation and give Git the immutable object, so a branch
     // moving concurrently cannot make the recorded base differ from the new tree.
     let base = resolve_commit(spec.clone_path, spec.start_point.unwrap_or("HEAD"))?;
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = airc_core::process::background("git");
     cmd.current_dir(spec.clone_path)
         .args(["worktree", "add", "-b", spec.branch])
         .arg(path.as_os_str())
@@ -160,7 +160,7 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
     }
     // Empty old-value means create-only: never overwrite an existing anchor.
     // Record before submodule initialization, whose failure leaves the tree reusable.
-    let recorded = std::process::Command::new("git")
+    let recorded = airc_core::process::background("git")
         .current_dir(&path)
         .args(["update-ref", CREATION_BASE_REF, &base, ""])
         .output()
@@ -202,7 +202,7 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
 /// A repo with no submodules is unaffected — the command is a successful no-op — so
 /// this is safe for every scope, not only continuum.
 fn init_submodules(worktree: &std::path::Path) -> Result<(), String> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .current_dir(worktree)
         .args(["submodule", "update", "--init", "--recursive"])
         .output()
@@ -293,7 +293,7 @@ mod tests {
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = airc_core::process::background("git")
             .current_dir(dir)
             .args(args)
             .output()

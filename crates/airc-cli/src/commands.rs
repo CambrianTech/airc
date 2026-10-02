@@ -145,7 +145,7 @@ pub async fn run_doctrine_publish(
     let path = match from_file {
         Some(p) => p,
         None => {
-            let repo_root = std::process::Command::new("git")
+            let repo_root = airc_core::process::background("git")
                 .args(["rev-parse", "--show-toplevel"])
                 .output()?;
             if !repo_root.status.success() {
@@ -722,7 +722,7 @@ fn resolve_gh_token_with(override_bin: Option<std::path::PathBuf>) -> Option<Str
         None => default_gh_candidates(),
     };
     for bin in candidates {
-        let Ok(output) = std::process::Command::new(&bin)
+        let Ok(output) = airc_core::process::background(&bin)
             .args(["auth", "token"])
             .output()
         else {
@@ -776,7 +776,10 @@ fn resolve_gh_bin_with(override_bin: Option<std::path::PathBuf>) -> Option<std::
         return Some(bin);
     }
     for bin in default_gh_candidates() {
-        if let Ok(output) = std::process::Command::new(&bin).arg("--version").output() {
+        if let Ok(output) = airc_core::process::background(&bin)
+            .arg("--version")
+            .output()
+        {
             if output.status.success() {
                 return Some(bin);
             }

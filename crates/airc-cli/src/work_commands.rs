@@ -294,7 +294,7 @@ pub async fn run_claim(
 /// this returns Err, so the agent gets the explicit refusal rather
 /// than a silent success.
 fn cwd_is_project_root(cwd: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()?;
@@ -713,7 +713,7 @@ pub(crate) async fn cleanup_card_worktree(
     }
 
     // Identify the worktree's branch so we can prune it after removal.
-    let branch_out = std::process::Command::new("git")
+    let branch_out = airc_core::process::background("git")
         .args(["-C", &worktree_str, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()?;
     let branch = if branch_out.status.success() {
@@ -724,7 +724,7 @@ pub(crate) async fn cleanup_card_worktree(
 
     // Resolve the main working tree's repo root so the `git worktree
     // remove` and branch-prune run from there.
-    let repo_root_out = std::process::Command::new("git")
+    let repo_root_out = airc_core::process::background("git")
         .args(["-C", &worktree_str, "rev-parse", "--git-common-dir"])
         .output()?;
     if !repo_root_out.status.success() {
@@ -741,7 +741,7 @@ pub(crate) async fn cleanup_card_worktree(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or(common_dir);
 
-    let remove_out = std::process::Command::new("git")
+    let remove_out = airc_core::process::background("git")
         .args([
             "-C",
             &repo_root,
@@ -765,7 +765,7 @@ pub(crate) async fn cleanup_card_worktree(
     // branch is gone (e.g. `gh pr merge --delete-branch` already
     // ran), this errors silently.
     if !branch.is_empty() && branch != "HEAD" {
-        let prune_out = std::process::Command::new("git")
+        let prune_out = airc_core::process::background("git")
             .args(["-C", &repo_root, "branch", "-d", &branch])
             .output()?;
         if prune_out.status.success() {
@@ -1235,7 +1235,7 @@ fn probe_upstream_gone(path: &std::path::Path) -> bool {
     // Step 1: resolve the upstream tracking ref. No upstream = no
     // signal; return false and let the card-state classifier
     // handle it.
-    let upstream_out = match std::process::Command::new("git")
+    let upstream_out = match airc_core::process::background("git")
         .args(["-C", &path_str, "rev-parse", "--abbrev-ref", "@{u}"])
         .output()
     {
@@ -1260,7 +1260,7 @@ fn probe_upstream_gone(path: &std::path::Path) -> bool {
     // 0 when present, non-zero-non-2 on transport errors. We treat
     // "absent" as "gone" and anything else (present, transport
     // error) as "not gone" — keeping the safe default.
-    let ls_out = match std::process::Command::new("git")
+    let ls_out = match airc_core::process::background("git")
         .args([
             "-C",
             &path_str,
@@ -1380,7 +1380,7 @@ fn probe_dirty_status_at(path: &std::path::Path) -> DirtyStatus {
     let path_str = path.to_string_lossy().to_string();
 
     // Step 1: porcelain probe.
-    let porcelain_out = match std::process::Command::new("git")
+    let porcelain_out = match airc_core::process::background("git")
         .args(["-C", &path_str, "status", "--porcelain"])
         .output()
     {
@@ -1400,7 +1400,7 @@ fn probe_dirty_status_at(path: &std::path::Path) -> DirtyStatus {
     // Step 2: unpushed-commits probe. `git rev-list --count @{u}..HEAD`
     // counts commits reachable from HEAD but not from the upstream
     // tracking branch.
-    let unpushed_out = match std::process::Command::new("git")
+    let unpushed_out = match airc_core::process::background("git")
         .args(["-C", &path_str, "rev-list", "--count", "@{u}..HEAD"])
         .output()
     {
@@ -1505,7 +1505,7 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
         // local repo actually knows about. `rev-parse --verify` is
         // the cheap existence check — succeeds when the ref
         // resolves, fails (non-zero exit) when it doesn't.
-        let exists = std::process::Command::new("git")
+        let exists = airc_core::process::background("git")
             .args(["-C", path_str, "rev-parse", "--verify", candidate])
             .output()
             .map(|o| o.status.success())
@@ -1520,7 +1520,7 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
         // NOT present upstream (unique work). `- <sha>` = patch-id
         // IS present upstream (squash-merged or cherry-picked).
         // Empty output ⇒ HEAD equals upstream ⇒ trivially Clean.
-        let cherry_out = match std::process::Command::new("git")
+        let cherry_out = match airc_core::process::background("git")
             .args(["-C", path_str, "cherry", candidate])
             .output()
         {
@@ -1563,7 +1563,7 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
             // range, cherry's verdict is incomplete — refuse to
             // delete rather than guess whether the merge brought in
             // unique resolution content.
-            let extra_merges = std::process::Command::new("git")
+            let extra_merges = airc_core::process::background("git")
                 .args([
                     "-C",
                     path_str,
@@ -1629,7 +1629,7 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
     // First find the repo's git-common-dir so `git worktree remove` runs
     // from the right place. Without `-C path`, git would refuse from the
     // worktree itself ("cannot remove main working tree").
-    let common_out = std::process::Command::new("git")
+    let common_out = airc_core::process::background("git")
         .args(["-C", &path_str, "rev-parse", "--git-common-dir"])
         .output()
         .map_err(|e| format!("spawn git rev-parse: {e}"))?;
@@ -1649,7 +1649,7 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| common_dir.clone());
-    let rm_out = std::process::Command::new("git")
+    let rm_out = airc_core::process::background("git")
         .args(["-C", &repo_root, "worktree", "remove", &path_str])
         .output()
         .map_err(|e| format!("spawn git worktree remove: {e}"))?;
@@ -1670,7 +1670,7 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
                 path.display()
             )
         })?;
-        let prune_out = std::process::Command::new("git")
+        let prune_out = airc_core::process::background("git")
             .args(["-C", &repo_root, "worktree", "prune"])
             .output()
             .map_err(|e| format!("spawn git worktree prune: {e}"))?;
@@ -2807,7 +2807,7 @@ mod tests {
         let clone = tmp.path().join("clone");
 
         let run = |args: &[&str], cwd: Option<&std::path::Path>| {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = airc_core::process::background("git");
             cmd.args(args);
             if let Some(d) = cwd {
                 cmd.current_dir(d);
@@ -2851,7 +2851,7 @@ mod tests {
                 None,
             );
             // Detect default branch (master vs main depending on git config)
-            let branch_out = std::process::Command::new("git")
+            let branch_out = airc_core::process::background("git")
                 .args([
                     "-C",
                     clone.to_str().unwrap(),
@@ -2915,7 +2915,7 @@ mod tests {
         // Make a clean commit but DON'T push it.
         std::fs::write(clone.join("local-only"), "committed but not pushed\n").expect("write");
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .args(args)
                 .current_dir(&clone)
                 .output()
@@ -2951,7 +2951,7 @@ mod tests {
         // Switch to a fresh branch that has no upstream configured
         // but starts from origin/HEAD — no unique content.
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .args(args)
                 .current_dir(&clone)
                 .output()
@@ -2983,7 +2983,7 @@ mod tests {
         let (clone, _tmp) = git_fixture_with_upstream(true);
 
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .args(args)
                 .current_dir(&clone)
                 .output()
@@ -3044,7 +3044,7 @@ mod tests {
         let nested = parent.join("src");
 
         // Init the nested path as a git worktree.
-        let init_out = std::process::Command::new("git")
+        let init_out = airc_core::process::background("git")
             .args(["init", nested.to_str().unwrap()])
             .output()
             .expect("git init");
@@ -3126,7 +3126,7 @@ mod tests {
         // Delete the upstream branch on origin — the universal "PR
         // merged / branch abandoned" signal probe_upstream_gone keys
         // off of.
-        let branch_out = std::process::Command::new("git")
+        let branch_out = airc_core::process::background("git")
             .args([
                 "-C",
                 nested.to_str().unwrap(),
@@ -3141,7 +3141,7 @@ mod tests {
             .trim()
             .to_string();
         let origin = real_tmp.path().join("origin.git");
-        let del = std::process::Command::new("git")
+        let del = airc_core::process::background("git")
             .args([
                 "-C",
                 origin.to_str().unwrap(),
@@ -3225,7 +3225,7 @@ mod tests {
         let other = tmp.path().join("other_clone");
 
         let run = |args: &[&str], cwd: Option<&std::path::Path>| {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = airc_core::process::background("git");
             cmd.args(args);
             if let Some(d) = cwd {
                 cmd.current_dir(d);
@@ -3242,7 +3242,7 @@ mod tests {
 
         // Detect default branch — fixture might be `main` or `master`
         // depending on the test host's git config.
-        let branch_out = std::process::Command::new("git")
+        let branch_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -3258,7 +3258,7 @@ mod tests {
         run(&["-C", &clone_str, "add", "feat.txt"], None);
         run(&["-C", &clone_str, "commit", "-m", "pr: add feat"], None);
         run(&["-C", &clone_str, "push", "-u", "origin", "pr-feat"], None);
-        let feat_sha_out = std::process::Command::new("git")
+        let feat_sha_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -3331,7 +3331,7 @@ mod tests {
         let other = tmp.path().join("other_clone");
 
         let run = |args: &[&str], cwd: Option<&std::path::Path>| {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = airc_core::process::background("git");
             cmd.args(args);
             if let Some(d) = cwd {
                 cmd.current_dir(d);
@@ -3345,7 +3345,7 @@ mod tests {
         };
         let clone_str = clone.to_str().unwrap().to_string();
         let other_str = other.to_str().unwrap().to_string();
-        let branch_out = std::process::Command::new("git")
+        let branch_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -3360,7 +3360,7 @@ mod tests {
         run(&["-C", &clone_str, "add", "feat.txt"], None);
         run(&["-C", &clone_str, "commit", "-m", "pr: add feat"], None);
         run(&["-C", &clone_str, "push", "-u", "origin", "pr-feat"], None);
-        let feat_sha_out = std::process::Command::new("git")
+        let feat_sha_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -4157,7 +4157,7 @@ mod tests {
         // semantic.
         let cwd = std::env::current_dir().expect("cwd available");
         // Find the actual workspace root via git
-        let output = std::process::Command::new("git")
+        let output = airc_core::process::background("git")
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(&cwd)
             .output();
@@ -4183,7 +4183,7 @@ mod tests {
         // project root — gate must refuse `--no-lease-required`
         // claims from random sub-paths.
         let cwd = std::env::current_dir().expect("cwd available");
-        let output = std::process::Command::new("git")
+        let output = airc_core::process::background("git")
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(&cwd)
             .output();
