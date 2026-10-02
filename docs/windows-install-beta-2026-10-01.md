@@ -457,3 +457,13 @@ are unchanged. The full setup bridge and the four storage/acquisition/firewall
 suites pass. These isolated fixtures do not modify the live firewall or daemon.
 The provisional helper revision depends on Continuum #4660; repinning to its
 released merge, CI, and live installation acceptance remain OPEN.
+
+Released dependency and CI fixture correction: Continuum #4660 merged all-green
+at d2604d832da2b47f7ba3680761c5a46d6b23fc2b. The lock and generated entry now
+pin that released revision and retain the verified artifact hashes. Initial
+Windows CI showed that PS5 startup can reorder inherited module paths, defeating
+the negative control. Both fixture children now establish the identical foreign
+module path before invoking the actual public entry, then assert preservation
+of that exact baseline. The unfixed control fails and the repaired entry passes;
+full bridge regression passes locally. Independent review approved this delta.
+Final-head CI and public live acceptance remain OPEN.

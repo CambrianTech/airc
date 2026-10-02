@@ -126,7 +126,10 @@ public static class SetupBridgeFixture {
     [IO.File]::WriteAllText($controlEntry, $entryText.Remove($first, $last + '# END GENERATED RUNTIME MODULES'.Length - $first))
     $probe = Join-Path $fixture 'public-module-probe.ps1'
     @'
-param($Entry, $Binary)
+param($Entry, $Binary, $ForeignModules)
+# Windows PowerShell may reorder inherited module paths during startup; establish
+# the deliberately incompatible fixture before either public entry executes.
+$env:PSModulePath = $ForeignModules + ';' + $env:PSModulePath
 $before = $env:PSModulePath
 try {
     & $Entry -FirewallOnly -AircPath $Binary
@@ -138,9 +141,9 @@ try {
         $env:PATH = (Join-Path $gitRoot 'cmd') + ';' + $saved['PATH']
         $env:AIRC_DIR = $env:AIRC_FIXTURE_SOURCE
         [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
-        $control = @(Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,$controlEntry,$installedBinary) 2>&1)
-        Assert-True ($global:LASTEXITCODE -ne 0 -and ($control -join "`n") -match 'FOREIGN SECURITY MODULE') 'Unfixed public-entry control did not select the hostile module'
-        Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,(Join-Path $entry 'install.ps1'),$installedBinary)
+        $control = @(Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,$controlEntry,$installedBinary,$foreign) 2>&1)
+        Assert-True ($global:LASTEXITCODE -ne 0 -and ($control -join "`n") -match 'FOREIGN SECURITY MODULE') "Unfixed public-entry control did not select the hostile module: $($control -join [Environment]::NewLine)"
+        Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$probe,(Join-Path $entry 'install.ps1'),$installedBinary,$foreign)
         Assert-True ($global:LASTEXITCODE -eq 0) 'Fresh PS5 public entry selected an incompatible inherited module'
         Assert-True ((Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw).Trim() -eq ('firewall|' + $installedBinary)) 'Foreign-module regression did not reach the public firewall boundary'
     } finally { $env:PSModulePath = $modulePathBefore; $env:PATH = $pathBefore; $env:AIRC_DIR = $sourceBefore }
