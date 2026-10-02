@@ -13,13 +13,10 @@ use std::{
 };
 
 fn hidden(command: &mut Command) -> &mut Command {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    airc_core::process::configure_background(command);
     command
 }
+
 fn cli(account: &Path, source: &Path, args: &[&str]) -> Output {
     cli_with_isolation(account, source, args, true)
 }
@@ -342,5 +339,132 @@ fn public_update_refuses_unknown_ipc_without_installing_or_starting() {
         }
         assert!(owner.child.try_wait().unwrap().is_none());
         assert!(!account.join(".airc/daemon.pid").exists());
+    }
+}
+
+/// Real public manual/automatic updater, with a local installer fixture that
+/// fails after copying its candidate. No package acquisition, UAC, or LAN.
+#[test]
+fn both_update_modes_restore_the_executing_binary_after_publication_failure() {
+    let temp = common::daemon_tempdir();
+    let account = temp.path().join("account");
+    std::fs::create_dir_all(account.join(".airc")).unwrap();
+    let source = temp.path().join("source");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let original = Path::new(env!("CARGO_BIN_EXE_airc"));
+    let version = hidden(&mut Command::new(original))
+        .arg("version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    let text = String::from_utf8(version.stdout).unwrap();
+    let sha = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("build:"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let head = hidden(&mut Command::new("git"))
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert!(
+        String::from_utf8_lossy(&head.stdout)
+            .trim()
+            .starts_with(sha),
+        "stale test binary: {text}"
+    );
+    println!("Testing publication rollback with {text}");
+    let clone = hidden(&mut Command::new("git"))
+        .args(["clone", "--shared", "--no-checkout"])
+        .arg(&repo)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(clone.status.success());
+    git(&source, &["checkout", "-B", "canary", sha]);
+    git(
+        &source,
+        &["remote", "set-url", "origin", source.to_str().unwrap()],
+    );
+    std::fs::write(
+        source.join("install.sh"),
+        r#"#!/usr/bin/env bash
+set -eu
+case "$1" in
+  --prepare-artifact) cp "$UPDATE_TEST_ORIGINAL" "$2" ;;
+  --prebuilt)
+    cp "$2" "$UPDATE_TEST_CURRENT"
+    echo 'fixture installer failed after publication' >&2
+    exit 23 ;;
+  *) exit 91 ;;
+esac
+"#,
+    )
+    .unwrap();
+    git(&source, &["add", "install.sh"]);
+    git(
+        &source,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "isolated failing installer",
+        ],
+    );
+    let current = temp
+        .path()
+        .join(format!("current{}", std::env::consts::EXE_SUFFIX));
+    for args in [&["update"][..], &["update", "--auto"][..]] {
+        std::fs::copy(original, &current).unwrap();
+        let result = hidden(&mut Command::new(&current))
+            .arg("--home")
+            .arg(account.join(".airc"))
+            .args(args)
+            .env("HOME", &account)
+            .env("USERPROFILE", &account)
+            .env("AIRC_DIR", &source)
+            .env("AIRC_RUNTIME_DIR", account.join(".airc/runtime"))
+            .env("AIRC_UPDATE_CHANNEL", "canary")
+            .env("AIRC_NO_STALENESS", "1")
+            .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+            .env("UPDATE_TEST_ORIGINAL", original)
+            .env("UPDATE_TEST_CURRENT", &current)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "failed installer must remain failure"
+        );
+        assert!(
+            stderr.contains("fixture installer failed after publication"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("restored and verified"), "{stderr}");
+        assert!(!stderr.contains("os error 32"), "{stderr}");
+        assert_eq!(
+            std::fs::read(&current).unwrap(),
+            std::fs::read(original).unwrap()
+        );
+        let restored = hidden(&mut Command::new(&current))
+            .arg("version")
+            .output()
+            .unwrap();
+        assert!(restored.status.success());
+        assert!(String::from_utf8_lossy(&restored.stdout).contains(sha));
+        assert!(
+            !cli(&account, &source, &["ping"]).status.success(),
+            "stopped daemon must stay stopped"
+        );
     }
 }

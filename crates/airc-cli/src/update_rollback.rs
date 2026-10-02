@@ -160,15 +160,7 @@ mod tests {
         }
     }
     fn command(executable: &Path) -> Command {
-        let command = Command::new(executable);
-        #[cfg(windows)]
-        let command = {
-            use std::os::windows::process::CommandExt;
-            let mut command = command;
-            command.creation_flags(0x08000000);
-            command
-        };
-        command
+        airc_core::process::background(executable)
     }
     #[test]
     fn rollback_restores_original_while_it_is_running() {
