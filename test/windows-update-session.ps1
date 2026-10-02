@@ -65,8 +65,9 @@ Invoke-InstallerEntryPoint {
         $public=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../install.sh')).Replace("`r`n","`n")
         $function=[regex]::Match($public,'(?ms)^_windows_powershell\(\) \{.*?^\}')
         $adoption=[regex]::Match($public.Substring($public.IndexOf('# Direct installation starts/verifies')), '(?ms)^  case "\$\(uname -s\)" in\n    MINGW.*?^  esac')
-        if(-not $function.Success -or -not $adoption.Success){throw 'Public adoption shell boundary is missing'}
-        $script='set -e'+"`n"+'CLONE_DIR="$AIRC_SESSION_TEST_WINDOWS/.."'+"`n"+'installed_airc="$AIRC_SESSION_TEST_WINDOWS/fake-gsudo.exe"'+"`n"+'fail() { echo "$*" >&2; exit 1; }'+"`n"+$function.Value+"`n"+$adoption.Value
+        $scope=[regex]::Match($public,'(?m)^  installer_home=.*$')
+        if(-not $function.Success -or -not $adoption.Success -or -not $scope.Success){throw 'Public adoption shell boundary is missing'}
+        $script='set -e'+"`n"+'CLONE_DIR="$AIRC_SESSION_TEST_WINDOWS/.."'+"`n"+'installed_airc="$AIRC_SESSION_TEST_WINDOWS/fake-gsudo.exe"'+"`n"+'fail() { echo "$*" >&2; exit 1; }'+"`n"+$function.Value+"`n"+$scope.Value+"`n"+$adoption.Value
         [IO.File]::WriteAllText($env:AIRC_SESSION_TEST_BASH_SCRIPT,$script)
 
     }
