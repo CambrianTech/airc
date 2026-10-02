@@ -898,3 +898,22 @@ diff checks passed (24391c, 41da91, 39d658). Parent and independent peer reviews
 approved this bounded coverage transfer. Local formatting and full workspace
 Clippy passed (14295, 1m55s) in this worktree's dedicated target. Hosted CI
 remains required before acceptance.
+
+## Unix mapped-image fixture writable-handle avoidance (2026-10-02)
+
+PR1502 Ubuntu job111065953008 failed with ETXTBSY at initial mapped-image
+fixture spawn, before BinarySwap. Linux reports this when the executable has a
+writable open handle. Rust upstream issue114554 documents a parallel fork
+inheriting a copy/write descriptor until exec despite CLOEXEC; the actual CI
+holder was not observed, so that mechanism remains a plausible diagnosis.
+
+The Unix fixture now hard-links the already-running immutable test binary into
+an owned temporary directory beside that binary, guaranteeing the same filesystem
+without creating a writable executable descriptor. All real child, mapped-image,
+rollback, collision and post-restore execution assertions remain. Original inode
+handling is rename/link/unlink plus reads only; candidate copy occurs only after
+an assertion that its destination is absent, creating a distinct inode. Windows
+keeps its existing copied-image fixture. No sleep/retry, serialization, production
+behavior or assertion waiver is added. Native Unix CI is the required platform
+proof; this does not resolve the separate Windows sharing32 holder.
+Reference: https://github.com/rust-lang/rust/issues/114554
