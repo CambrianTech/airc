@@ -89,6 +89,8 @@ mod update_artifact;
 mod update_commands;
 mod update_legacy;
 mod update_rollback;
+#[cfg(windows)]
+mod update_session;
 mod update_shutdown;
 mod work_cli;
 mod work_commands;
@@ -204,6 +206,10 @@ async fn async_main() -> ExitCode {
                 return ExitCode::from(code);
             }
             if let Some(code) = identity_commands::command_exit_code(error.as_ref()) {
+                return ExitCode::from(code);
+            }
+            #[cfg(windows)]
+            if let Some(code) = update_session::exit_code(error.as_ref()) {
                 return ExitCode::from(code);
             }
             eprintln!("airc: {error}");
@@ -651,10 +657,19 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let socket = cli::default_socket_path_in(&home);
             if adopt_installed {
                 update_commands::adopt_installed(&home, socket)
-            } else if auto {
-                update_commands::run_update_auto(&home, socket)
             } else {
-                update_commands::run_update(&home, socket)
+                #[cfg(windows)]
+                {
+                    update_session::run(&home, auto)
+                }
+                #[cfg(not(windows))]
+                {
+                    if auto {
+                        update_commands::run_update_auto(&home, socket)
+                    } else {
+                        update_commands::run_update(&home, socket)
+                    }
+                }
             }
         }
 
