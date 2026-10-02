@@ -787,3 +787,49 @@ The route-refresh clock already spaces work from completion and bounds wake
 nudges. Existing delivery accounting also purges connections after repeated
 unacknowledged sends; idle TCP keepalive/reconnect behavior is a separate audit
 owned alongside transport work, not claimed repaired by heartbeat scheduling.
+
+### Foreign checkout scope during installation (2026-10-02)
+
+Fable's actual M5 install invoked adoption beneath another account's
+`.airc/worktrees`; inherited cwd selected that foreign scope despite isolated
+HOME. Prior normal-token clean CI did not exercise this layout. Public POSIX
+and PowerShell adoption now pass explicit AIRC_HOME when requested, otherwise
+the installer account's HOME/.airc, to both endpoint resolution and adoption.
+Windows paths cross Bash through cygpath, including inherited MSYS paths in a
+direct PowerShell entry. Ordinary CLI project resolution is unchanged.
+
+A fresh CLI regression uses a poisoned foreign events.sqlite and nested cwd,
+verifies isolated account state/socket/live daemon, repeats with explicit scope,
+and checks foreign bytes/timestamp/directory entries unchanged. Windows local
+normal-token public adapter passed; hosted extracted-callsite and complete
+public installation receipts for this new delta remain OPEN until fresh CI.
+
+### Legacy owner exit before Stop acknowledgement (2026-10-02)
+
+Bigmama's real recovery exposed two separate assumptions: a historical backup
+suffix was the checkout SHA, not necessarily the runtime SHA (peer fix5c35bc1,
+retained unchanged); then old owned daemon25236 exited before acknowledging
+Stop, leaving the installer with early EOF despite the process/pipe exiting.
+Recovery now treats only read EOF after successful Stop write as compatible
+with shutdown, and still requires the captured verified handle to signal exit
+within the existing deadline. Explicit errors/malformed frames/live process
+never count as recovery. Actual isolated native child tests pass acknowledgement,
+EOF and truncated EOF on exit, and refuse EOF-alive/protocol errors; the separate
+binary unverified-owner test proves no Stop is sent on failed ownership checks.
+
+### Explicit-scope acceptance follow-up (2026-10-02)
+
+At b3a0daa, Windows public installation and doctor completed, but the fixture's
+ambient-cwd endpoint/Stop queried a different scope after the installer correctly
+selected its explicit account home. The hosted fixture now passes that same
+resolved --home to doctor, endpoint receipt and graceful cleanup. Native token
+and captured-process-exit assertions remain mandatory.
+
+The unchanged long-root macOS binary regression exposed a real legacy candidate
+inspection defect: the canonical hashed short socket started, while connecting
+to a nonexistent historical home-private path exceeded SUN_LEN before absence
+could be observed. Unix legacy inspection now uses symlink_metadata and skips
+ONLY NotFound; present entries (including dangling symlinks), permission errors
+and all other uncertainty retain refusal. The long-root CLI regression is not
+shortened. Actual IPC tests add nonexistent long legacy paths plus present-file
+and dangling-symlink refusal; Unix execution remains pending hosted CI.

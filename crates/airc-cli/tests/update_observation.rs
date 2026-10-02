@@ -4,7 +4,7 @@ use airc_ipc::{
     codec::{read_frame, write_frame},
     request::Request,
     response::{Response, StatusResponse},
-    transport::IpcListener,
+    transport::{IpcListener, IpcStream},
 };
 use std::{
     path::{Path, PathBuf},
@@ -15,6 +15,90 @@ use std::{
 fn hidden(command: &mut Command) -> &mut Command {
     airc_core::process::configure_background(command);
     command
+}
+
+#[cfg(windows)]
+#[test]
+fn elevated_recovery_refuses_unverified_owner_without_stop() {
+    let temp = tempfile::tempdir().unwrap();
+    let account = temp.path().join("account");
+    std::fs::create_dir_all(account.join(".airc")).unwrap();
+    let endpoint = cli(&account, temp.path(), &["ipc-endpoint"]);
+    assert!(endpoint.status.success());
+    let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
+    let mut owner = fixture(&socket, &temp.path().join("ready"), "stale", "8eaa592");
+    let output = cli(
+        &account,
+        temp.path(),
+        &[
+            "setup-recover-elevated-owner",
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--caller-sid",
+            "S-1-0-0",
+            "--installed-binary",
+            env!("CARGO_BIN_EXE_airc"),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("account SID"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        owner.child.try_wait().unwrap().is_none(),
+        "refusal must not stop owner"
+    );
+    let probe = cli(
+        &account,
+        temp.path(),
+        &[
+            "setup-recover-elevated-owner",
+            "--probe",
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--caller-sid",
+            "S-1-0-0",
+            "--installed-binary",
+            env!("CARGO_BIN_EXE_airc"),
+        ],
+    );
+    assert!(
+        probe.status.success(),
+        "accessible owner probe must remain read-only"
+    );
+    assert!(owner.child.try_wait().unwrap().is_none());
+}
+
+// The real owner/ancestry/Job wrappers run, but these isolated IPC fixtures
+// never acquire credentials or touch a user's existing gsudo cache.
+fn isolated_windows_owner(source: &Path) {
+    #[cfg(windows)]
+    {
+        let originals = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../windows");
+        let windows = source.join("windows");
+        std::fs::create_dir_all(&windows).unwrap();
+        for name in [
+            "install-session.ps1",
+            "setup-entrypoint.ps1",
+            "setup-artifacts.lock.json",
+            "shared-setup.ps1",
+        ] {
+            std::fs::copy(originals.join(name), windows.join(name)).unwrap();
+        }
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(windows.join("shared-setup.ps1"))
+                .unwrap(),
+            "\nfunction Test-IsAdmin {{ $true }}\n"
+        )
+        .unwrap();
+    }
+    #[cfg(not(windows))]
+    let _ = source;
 }
 
 fn cli(account: &Path, source: &Path, args: &[&str]) -> Output {
@@ -33,6 +117,11 @@ fn cli_with_isolation(account: &Path, source: &Path, args: &[&str], explicit: bo
         .args(args)
         .env("HOME", account)
         .env("USERPROFILE", account)
+        .env("LOCALAPPDATA", account.join("local-appdata"))
+        .env(
+            "PSModuleAnalysisCachePath",
+            account.join("powershell-module-cache"),
+        )
         .env("AIRC_DIR", source)
         .env("AIRC_RUNTIME_DIR", account.join(".airc/runtime"))
         .env("AIRC_UPDATE_CHANNEL", "canary")
@@ -55,6 +144,70 @@ fn git(source: &Path, args: &[&str]) {
 }
 struct Fixture {
     child: Child,
+}
+
+/// Hold the actual post-update endpoint connection through assertions. Teardown
+/// stops this connected, test-scoped owner even when a later assertion panics.
+struct RestoredOwner {
+    runtime: tokio::runtime::Runtime,
+    stream: IpcStream,
+    socket: PathBuf,
+}
+impl RestoredOwner {
+    fn connect(socket: &Path) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let stream = runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), IpcStream::connect(socket))
+                    .await
+                    .expect("restored owner connection timed out")
+            })
+            .expect("restored owner must already exist; no spawn/ensure command is used");
+        Self {
+            runtime,
+            stream,
+            socket: socket.to_owned(),
+        }
+    }
+    fn status(&mut self) -> StatusResponse {
+        self.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                // The protocol serves one request per connection. Retain the
+                // first connection for Drop, and prove this status connection
+                // belongs to the same native owner before consuming it.
+                let mut status_stream = IpcStream::connect(&self.socket).await.unwrap();
+                #[cfg(windows)]
+                assert_eq!(
+                    status_stream.server_process_id().unwrap(),
+                    self.stream.server_process_id().unwrap()
+                );
+                write_frame(&mut status_stream, &Request::Status)
+                    .await
+                    .unwrap();
+                match read_frame::<_, Response>(&mut status_stream).await.unwrap() {
+                    Some(Response::Status(status)) => status,
+                    other => panic!("unexpected direct owner response: {other:?}"),
+                }
+            })
+            .await
+            .expect("restored owner status timed out")
+        })
+    }
+}
+impl Drop for RestoredOwner {
+    fn drop(&mut self) {
+        self.runtime.block_on(async {
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                if write_frame(&mut self.stream, &Request::Stop).await.is_ok() {
+                    let _ = read_frame::<_, Response>(&mut self.stream).await;
+                }
+            })
+            .await;
+        });
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -193,6 +346,7 @@ fn public_update_verifies_current_owner_and_preserves_stopped_state() {
         String::from_utf8_lossy(&out.stderr)
     );
     git(&source, &["checkout", "-B", "canary", sha]);
+    isolated_windows_owner(&source);
     git(
         &source,
         &["remote", "set-url", "origin", source.to_str().unwrap()],
@@ -321,6 +475,7 @@ fn public_update_refuses_unknown_ipc_without_installing_or_starting() {
         std::fs::create_dir_all(&source).unwrap();
         git(&source, &["init"]);
         std::fs::write(source.join("install.sh"), "exit 98").unwrap();
+        isolated_windows_owner(&source);
         let endpoint = cli(&account, &source, &["ipc-endpoint"]);
         let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
         let mut owner = fixture(&socket, &temp.path().join("ready"), mode, "old");
@@ -387,6 +542,7 @@ fn both_update_modes_restore_the_executing_binary_after_publication_failure() {
         .unwrap();
     assert!(clone.status.success());
     git(&source, &["checkout", "-B", "canary", sha]);
+    isolated_windows_owner(&source);
     git(
         &source,
         &["remote", "set-url", "origin", source.to_str().unwrap()],
@@ -424,47 +580,123 @@ esac
     let current = temp
         .path()
         .join(format!("current{}", std::env::consts::EXE_SUFFIX));
-    for args in [&["update"][..], &["update", "--auto"][..]] {
-        std::fs::copy(original, &current).unwrap();
-        let result = hidden(&mut Command::new(&current))
-            .arg("--home")
-            .arg(account.join(".airc"))
-            .args(args)
-            .env("HOME", &account)
-            .env("USERPROFILE", &account)
-            .env("AIRC_DIR", &source)
-            .env("AIRC_RUNTIME_DIR", account.join(".airc/runtime"))
-            .env("AIRC_UPDATE_CHANNEL", "canary")
-            .env("AIRC_NO_STALENESS", "1")
-            .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
-            .env("UPDATE_TEST_ORIGINAL", original)
-            .env("UPDATE_TEST_CURRENT", &current)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(
-            !result.status.success(),
-            "failed installer must remain failure"
-        );
-        assert!(
-            stderr.contains("fixture installer failed after publication"),
-            "{stderr}"
-        );
-        assert!(stderr.contains("restored and verified"), "{stderr}");
-        assert!(!stderr.contains("os error 32"), "{stderr}");
-        assert_eq!(
-            std::fs::read(&current).unwrap(),
-            std::fs::read(original).unwrap()
-        );
-        let restored = hidden(&mut Command::new(&current))
-            .arg("version")
-            .output()
-            .unwrap();
-        assert!(restored.status.success());
-        assert!(String::from_utf8_lossy(&restored.stdout).contains(sha));
-        assert!(
-            !cli(&account, &source, &["ping"]).status.success(),
-            "stopped daemon must stay stopped"
-        );
+    let endpoint = cli(&account, &source, &["ipc-endpoint"]);
+    assert!(endpoint.status.success());
+    let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
+    for running in [false, true] {
+        for args in [&["update"][..], &["update", "--auto"][..]] {
+            std::fs::copy(original, &current).unwrap();
+            let ready = temp
+                .path()
+                .join(format!("rollback-owner-{running}-{}", args.len()));
+            let mut previous_owner = running.then(|| fixture(&socket, &ready, "stale", sha));
+            let result = hidden(&mut Command::new(&current))
+                .arg("--home")
+                .arg(account.join(".airc"))
+                .args(args)
+                .env("HOME", &account)
+                .env("USERPROFILE", &account)
+                .env("LOCALAPPDATA", account.join("local-appdata"))
+                .env(
+                    "PSModuleAnalysisCachePath",
+                    account.join("powershell-module-cache"),
+                )
+                .env("AIRC_DIR", &source)
+                .env("AIRC_RUNTIME_DIR", account.join(".airc/runtime"))
+                .env("AIRC_UPDATE_CHANNEL", "canary")
+                .env("AIRC_NO_STALENESS", "1")
+                .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+                .env("UPDATE_TEST_ORIGINAL", original)
+                .env("UPDATE_TEST_CURRENT", &current)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                !result.status.success(),
+                "failed installer must remain failure"
+            );
+            assert!(
+                stderr.contains("fixture installer failed after publication"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("restored and verified"), "{stderr}");
+            assert!(!stderr.contains("os error 32"), "{stderr}");
+            assert_eq!(
+                std::fs::read(&current).unwrap(),
+                std::fs::read(original).unwrap()
+            );
+            let restored = hidden(&mut Command::new(&current))
+                .arg("version")
+                .output()
+                .unwrap();
+            assert!(restored.status.success());
+            assert!(String::from_utf8_lossy(&restored.stdout).contains(sha));
+            if let Some(ref mut owner) = previous_owner {
+                assert!(
+                    owner.child.try_wait().unwrap().is_some(),
+                    "previous owner was not stopped"
+                );
+                let mut restored_owner = RestoredOwner::connect(&socket);
+                #[cfg(windows)]
+                let restored_pid = restored_owner.stream.server_process_id().unwrap();
+                #[cfg(windows)]
+                assert_ne!(
+                    restored_pid,
+                    owner.child.id(),
+                    "restoration must have started a new owner"
+                );
+                let status = restored_owner.status();
+                assert!(status
+                    .build_commit
+                    .as_deref()
+                    .is_some_and(|build| build.starts_with(sha)));
+                assert_eq!(
+                    result.status.code(),
+                    Some(1),
+                    "internal recovery code escaped public wrapper"
+                );
+                drop(restored_owner);
+                #[cfg(unix)]
+                {
+                    // Stop acknowledges shutdown before the detached process
+                    // necessarily exits. Prove its original executable inode
+                    // is no longer mapped before the next case copies to it.
+                    // Opening writable without truncate/write changes no bytes.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match std::fs::OpenOptions::new().write(true).open(&current) {
+                            Ok(file) => {
+                                drop(file);
+                                break;
+                            }
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                            {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "test-owned restored executable still running after Stop: {}: {error}",
+                                    current.display()
+                                );
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(error) => panic!(
+                                "cannot verify restored executable shutdown: {}: {error}",
+                                current.display()
+                            ),
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                assert!(
+                    common::wait_pid_gone(restored_pid, Duration::from_secs(5)),
+                    "test-owned restored process did not stop"
+                );
+            } else {
+                assert!(
+                    !cli(&account, &source, &["ping"]).status.success(),
+                    "stopped daemon must stay stopped"
+                );
+            }
+        }
     }
 }

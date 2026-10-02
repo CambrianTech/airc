@@ -225,26 +225,8 @@ jobs:
       - name: Run install.ps1 (no skip — real install path via winget)
         shell: pwsh
         run: |
-          $env:AIRC_DIR = "$env:USERPROFILE\.airc\src"
-          # Install this PR's detached checkout, as the Unix jobs do. Do not
-          # switch channels or pull a different revision during acceptance.
-          $env:AIRC_INSTALL_NO_PULL = '1'
-          New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
-          Copy-Item -Recurse -Force * $env:AIRC_DIR
-          # install.ps1 must work from default Windows PowerShell 5.1
-          # too; we test 5.1 path in a separate job below.
-          & "$env:AIRC_DIR\install.ps1"
-
-      - name: airc doctor (must report environment-clean)
-        shell: pwsh
-        run: |
-          $env:PATH = "$env:USERPROFILE\AppData\Local\Programs\airc;$env:PATH"
-          (Get-Command airc -ErrorAction SilentlyContinue) | Out-String
-          airc doctor
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "airc doctor failed with exit $LASTEXITCODE"
-            exit $LASTEXITCODE
-          }
+          ./test/windows-entry-token.ps1
+          ./test/windows-normal-install.ps1 -Engine pwsh
 
   clean-install-windows-ps5:
     # Validates the bootstrap path under Windows PowerShell 5.1 — the
@@ -262,6 +244,14 @@ jobs:
         shell: powershell
         run: ./test/windows-autostart.ps1
 
+      - name: Whole Windows updater owner and hidden Bash descendants
+        shell: powershell
+        run: ./test/windows-update-session.ps1 -CheckBash
+
+      - name: Elevated owner recovery adoption boundaries
+        shell: powershell
+        run: ./test/windows-recovery-test-contract.ps1
+
       - name: Update artifact handoff through Git Bash
         shell: powershell
         run: |
@@ -274,8 +264,5 @@ jobs:
       - name: Run install.ps1 under Windows PowerShell 5.1 (real install)
         shell: powershell
         run: |
-          $env:AIRC_DIR = "$env:USERPROFILE\.airc\src-ps5"
-          $env:AIRC_INSTALL_NO_PULL = '1'
-          New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
-          Copy-Item -Recurse -Force * $env:AIRC_DIR
-          & "$env:AIRC_DIR\install.ps1"
+          ./test/windows-entry-token.ps1
+          ./test/windows-normal-install.ps1 -Engine powershell

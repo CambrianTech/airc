@@ -34,7 +34,7 @@ foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','BIN_DIR','BIN_TARGET','
 }
 function Assert-True($condition,$message) { if (-not $condition) { throw $message } }
 function New-Source($directory) {
-    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1','windows/sync-bootstrap.ps1','windows/setup-entrypoint.ps1')) {
+    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1','windows/adopt-installed.ps1','windows/sync-bootstrap.ps1','windows/setup-entrypoint.ps1')) {
         $path = Join-Path $directory $relative
         New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
         [IO.File]::WriteAllText($path,'fixture')
@@ -47,6 +47,15 @@ try {
     $entry = Join-Path $fixture 'entry'
     New-Item -ItemType Directory -Force -Path (Join-Path $gitRoot 'cmd'),(Join-Path $gitRoot 'bin'),(Join-Path $gitRoot 'exec'),$entry | Out-Null
     Copy-Item (Join-Path $repository 'install.ps1') (Join-Path $entry 'install.ps1')
+    # This is the isolated source/package unit fixture, not hosted public
+    # installation. Its token boundary is synthetic; windows-entry-token and
+    # windows-normal-install cover the real refusal and actual medium token.
+    $copy=[IO.File]::ReadAllText((Join-Path $entry 'install.ps1'))
+    $parseTokens=$null;$parseErrors=$null
+    $copyAst=[Management.Automation.Language.Parser]::ParseInput($copy,[ref]$parseTokens,[ref]$parseErrors)
+    $tokenPredicate=@($copyAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-IsAdmin'},$true))
+    if($parseErrors.Count -or $tokenPredicate.Count -ne 1){throw 'Missing projected token predicate in bridge unit fixture'}
+    [IO.File]::WriteAllText((Join-Path $entry 'install.ps1'),$copy.Replace($tokenPredicate[0].Extent.Text,'function Test-IsAdmin { $false }'))
     # Exercise Windows checkout line endings even when the author uses LF.
     $fixtureEntry = Join-Path $entry 'install.ps1'
     [IO.File]::WriteAllText($fixtureEntry, [IO.File]::ReadAllText($fixtureEntry).Replace("`r`n", "`n").Replace("`n", "`r`n"))
