@@ -21,10 +21,18 @@ if($Child){
     $token=Read-OwnToken
     if((Test-IsAdmin) -or $token.tokenElevated -ne $false -or $token.tokenIntegritySid -ne 'S-1-16-8192' -or $token.tokenUserSid -ne $OriginalSid){throw ('Runner did not produce the required actual normal token: '+($token|ConvertTo-Json -Compress))}
     # Restore actual credentialed user's profile paths, never the supervisor's.
-    $env:USERPROFILE=[Environment]::GetFolderPath('UserProfile')
+    $registeredProfile=[Environment]::ExpandEnvironmentVariables((Get-ItemProperty -LiteralPath ('HKLM:/SOFTWARE/Microsoft/Windows NT/CurrentVersion/ProfileList/'+$OriginalSid) -Name ProfileImagePath).ProfileImagePath)
+    $registeredProfile=[IO.Path]::GetFullPath($registeredProfile).TrimEnd('\')
+    $nativeProfile=[IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile')).TrimEnd('\')
+    if(-not [string]::Equals($registeredProfile,$nativeProfile,[StringComparison]::OrdinalIgnoreCase)){throw 'Credentialed native profile does not match its SID registration'}
+    $env:USERPROFILE=$registeredProfile
     $env:LOCALAPPDATA=[Environment]::GetFolderPath('LocalApplicationData')
     $env:APPDATA=[Environment]::GetFolderPath('ApplicationData')
+    foreach($profileFolder in @($env:LOCALAPPDATA,$env:APPDATA)){if(-not [IO.Path]::GetFullPath($profileFolder).StartsWith($registeredProfile+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Credentialed application folder belongs to another profile'}}
+    Write-Host ('Verified fixture profile for SID '+$OriginalSid+': '+$registeredProfile)
     $env:HOME=$env:USERPROFILE
+    $env:USERNAME=[Environment]::UserName
+    $env:USERDOMAIN=[Environment]::UserDomainName
     $env:TEMP=Join-Path $env:LOCALAPPDATA 'Temp';$env:TMP=$env:TEMP
     New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
     $env:CARGO_HOME=$null;$env:RUSTUP_HOME=$null
@@ -50,10 +58,10 @@ if($Child){
     $env:AIRC_INSTALL_NO_PULL='1'
     New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
     Get-ChildItem -LiteralPath $root -Force | Copy-Item -Destination $env:AIRC_DIR -Recurse -Force
-    & (Join-Path $env:AIRC_DIR 'install.ps1')
-    if($LASTEXITCODE -ne 0){throw "Public installation failed with $LASTEXITCODE"}
     $installed=Join-Path $env:LOCALAPPDATA 'Programs/airc/airc.exe'
     try {
+        & (Join-Path $env:AIRC_DIR 'install.ps1')
+        if($LASTEXITCODE -ne 0){throw "Public installation failed with $LASTEXITCODE"}
         Invoke-InstallerProcess -OwnProcessTree $installed @('doctor')
         if($LASTEXITCODE -ne 0){throw 'Installed normal-token doctor failed'}
         $endpoint=@(Invoke-InstallerProcess -OwnProcessTree $installed @('ipc-endpoint','--native'))
@@ -114,6 +122,11 @@ try {
     $start.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden # Credentialed launch may ignore CreateNoWindow.
     $start.UserName=$testUser;$start.Domain=$env:COMPUTERNAME;$start.Password=$secret;$start.LoadUserProfile=$true
     $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+    # Credentialed launch otherwise receives a fresh logon environment. Carry
+    # the already validated hosted marker and the existing CI auth fixture flag.
+    # Child validates its SID-profile registration before resetting user paths.
+    $start.EnvironmentVariables['GITHUB_ACTIONS']=$env:GITHUB_ACTIONS
+    $start.EnvironmentVariables['AIRC_SKIP_AUTH']=$env:AIRC_SKIP_AUTH
     $process=[Diagnostics.Process]::Start($start)
     $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
     $deadline=[DateTime]::UtcNow.AddMinutes(2)
