@@ -629,12 +629,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Version => commands::run_version(),
 
-        Command::IpcEndpoint => {
+        Command::IpcEndpoint { native } => {
             // Resolve-only: print the canonical socket path airc would
             // bind for this scope. No daemon required (callers probe
             // liveness via `status`/`ping`). This is the contract
             // Continuum's airc discovery depends on.
-            println!("{}", cli::default_socket_path_in(&home).display());
+            let path = cli::default_socket_path_in(&home);
+            if native {
+                println!("{}", airc_ipc::transport::native_endpoint(&path));
+            } else {
+                println!("{}", path.display());
+            }
             Ok(())
         }
 

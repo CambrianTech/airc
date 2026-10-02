@@ -4,6 +4,7 @@
 [CmdletBinding()]
 param(
     [switch]$FirewallOnly,
+    [switch]$DiagnoseDaemon,
     [string]$AircPath
 )
 $ErrorActionPreference = 'Stop'
@@ -93,6 +94,37 @@ $aircSetupElevation = Get-AircSetupArtifact 'tools/scripts/lib/windows-elevation
 . $aircSetupManifest
 . $aircSetupElevation -GsudoSource $script:ContinuumManifest['gsudo'].source
 # END GENERATED SHARED SETUP BOOTSTRAP
+if ($DiagnoseDaemon) {
+    if ($FirewallOnly) { throw 'Daemon diagnostics cannot be combined with firewall setup.' }
+    if (-not $AircPath) { $AircPath = Join-Path $env:LOCALAPPDATA 'Programs\airc\airc.exe' }
+    if (-not (Test-Path -LiteralPath $AircPath -PathType Leaf)) { throw 'Daemon diagnostics requires the installed AIRC executable via -AircPath.' }
+    $diagnosticRoot = if ($env:AIRC_DIR) { $env:AIRC_DIR } else { $PSScriptRoot }
+    if (-not $diagnosticRoot) { throw 'Run daemon diagnostics from the current AIRC setup checkout.' }
+    foreach ($relative in @('windows\diagnose-daemon.ps1', 'windows\daemon-diagnostics.cs', 'windows\setup-entrypoint.ps1')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $diagnosticRoot $relative) -PathType Leaf)) {
+            throw "Diagnostic source is incomplete (missing $relative). Run from the current AIRC setup checkout; diagnostic mode does not acquire or update source."
+        }
+    }
+    $diagnosticHelper = Join-Path $diagnosticRoot 'windows\diagnose-daemon.ps1'
+    # Resolve with the original account/environment before elevation; never
+    # duplicate the canonical Windows endpoint hash in installer code.
+    $callerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $endpoint = @(Invoke-InstallerProcess -OwnProcessTree $AircPath @('ipc-endpoint', '--native'))
+    if ($global:LASTEXITCODE -ne 0 -or $endpoint.Count -ne 1 -or
+        -not ([string]$endpoint[0]).StartsWith('\\.\pipe\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Installed AIRC cannot resolve its native endpoint. Deploy a build supporting ipc-endpoint --native before diagnostic elevation; no daemon was changed.'
+    }
+    Write-Host 'AIRC setup will inspect the selected daemon endpoint and its Windows process token. No daemon, permissions, task or firewall changes are made.'
+    try {
+        Initialize-ElevationSession
+        Invoke-Elevated -Reason 'reading the selected AIRC daemon endpoint and Windows process token' -CommandLine @(
+            (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'),
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'RemoteSigned', '-File', $diagnosticHelper,
+            '-Endpoint', ([string]$endpoint[0]), '-CallerSid', $callerSid)
+        if ($global:LASTEXITCODE -ne 0) { throw "Read-only daemon diagnostics failed (exit $global:LASTEXITCODE). No recovery action was taken." }
+    } finally { Clear-Elevation }
+    return
+}
 if ($FirewallOnly -and (-not $AircPath -or -not (Test-Path -LiteralPath $AircPath -PathType Leaf))) {
     throw 'Firewall-only setup requires the installed AIRC executable via -AircPath.'
 }
