@@ -5,8 +5,11 @@ $repository=Split-Path $PSScriptRoot -Parent
 $fixture=Join-Path ([IO.Path]::GetTempPath()) ("airc firewall O'Brien " + [guid]::NewGuid().ToString('N'))
 $savedExpected=$env:AIRC_FIXTURE_EXPECTED_PATH
 $savedReadDenied=$env:AIRC_FIXTURE_FIREWALL_READ_DENIED
+$savedLocalAppData=$env:LOCALAPPDATA
 try {
     New-Item -ItemType Directory -Path $fixture | Out-Null
+    $env:LOCALAPPDATA=Join-Path $fixture 'local'
+    . (Join-Path $repository 'windows/shared-setup.ps1')
     Copy-Item (Join-Path $repository 'windows/configure-firewall.ps1') (Join-Path $fixture 'configure-firewall.ps1')
     [IO.File]::WriteAllText((Join-Path $fixture 'shared-setup.ps1'), 'function Initialize-ElevationSession { }; function Clear-Elevation { }')
     $binary=Join-Path $fixture 'installed airc.exe'
@@ -14,6 +17,8 @@ try {
     $env:AIRC_FIXTURE_EXPECTED_PATH=$binary
     [IO.File]::WriteAllText((Join-Path $fixture 'firewall-allow.ps1'), @'
 param([string]$AircPath,[switch]$CheckOnly,[string]$LogPath)
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'
+if ([ConsoleProbe]::GetConsoleWindow() -ne [IntPtr]::Zero) { exit 92 }
 if ($AircPath -ne $env:AIRC_FIXTURE_EXPECTED_PATH) { Write-Error 'Argument boundaries changed the binary path'; exit 91 }
 $state=Join-Path $PSScriptRoot 'applied'
 if ($CheckOnly) {
@@ -30,7 +35,7 @@ exit 0
         $testState.requests++
         if ($testState.deny) { throw 'fixture: consent denied' }
         $arguments = @($CommandLine | Select-Object -Skip 1)
-        & $CommandLine[0] @arguments
+        Invoke-InstallerProcess $CommandLine[0] $arguments
     }
     & (Join-Path $fixture 'configure-firewall.ps1') -AircPath $binary
     if (-not (Test-Path (Join-Path $fixture 'applied'))) { throw 'Apply child did not receive the literal path' }
@@ -49,6 +54,7 @@ exit 0
 } finally {
     $env:AIRC_FIXTURE_EXPECTED_PATH=$savedExpected
     $env:AIRC_FIXTURE_FIREWALL_READ_DENIED=$savedReadDenied
+    $env:LOCALAPPDATA=$savedLocalAppData
     $full=[IO.Path]::GetFullPath($fixture)
     $tempRoot=[IO.Path]::GetFullPath([IO.Path]::GetTempPath())
     if (-not $full.StartsWith($tempRoot,[StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture cleanup escaped TEMP' }

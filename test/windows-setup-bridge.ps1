@@ -4,12 +4,12 @@ $ErrorActionPreference = 'Stop'
 $repository = Split-Path $PSScriptRoot -Parent
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ("airc setup O'Brien " + [guid]::NewGuid().ToString('N'))
 $saved = @{}
-foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','AIRC_DIR','AIRC_CHANNEL','AIRC_FIXTURE_LOG','AIRC_FIXTURE_GIT_EXEC')) {
+foreach ($name in @('USERPROFILE','LOCALAPPDATA','PATH','AIRC_DIR','AIRC_CHANNEL','AIRC_FIXTURE_LOG','AIRC_FIXTURE_GIT_EXEC','AIRC_FIXTURE_SOURCE')) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 function Assert-True($condition,$message) { if (-not $condition) { throw $message } }
 function New-Source($directory) {
-    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1')) {
+    foreach ($relative in @('Cargo.toml','install.sh','setup/github-auth.sh','windows/install-prereqs.ps1','windows/run-powershell.sh','windows/register-bin-path.ps1','windows/configure-firewall.ps1','windows/setup-artifacts.lock.json','windows/install-session.ps1','windows/sync-bootstrap.ps1')) {
         $path = Join-Path $directory $relative
         New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
         [IO.File]::WriteAllText($path,'fixture')
@@ -28,6 +28,8 @@ try {
     $env:AIRC_CHANNEL = $null
     $env:AIRC_FIXTURE_LOG = Join-Path $fixture 'calls.txt'
     $env:AIRC_FIXTURE_GIT_EXEC = Join-Path $gitRoot 'exec'
+    $env:AIRC_FIXTURE_SOURCE = Join-Path $fixture 'source template'
+    New-Source $env:AIRC_FIXTURE_SOURCE
     $fakeGit = Join-Path $gitRoot 'cmd/git.exe'
     [IO.File]::WriteAllText((Join-Path $gitRoot 'exec/git-remote-https.exe'),'fixture')
     # A tiny process fixture checks actual Windows argv/path/env handoff. It is
@@ -35,8 +37,25 @@ try {
     Add-Type -OutputAssembly (Join-Path $gitRoot 'bin/bash.exe') -OutputType ConsoleApplication -TypeDefinition @'
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 public static class SetupBridgeFixture {
+  [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+  static void CopyTree(string source, string target) {
+    Directory.CreateDirectory(target);
+    foreach (var file in Directory.GetFiles(source)) File.Copy(file, Path.Combine(target, Path.GetFileName(file)));
+    foreach (var directory in Directory.GetDirectories(source)) CopyTree(directory, Path.Combine(target, Path.GetFileName(directory)));
+  }
   public static void Main(string[] args) {
+    if (GetConsoleWindow()!=IntPtr.Zero) { Environment.Exit(91); }
+    if (args.Length>0 && args[0]=="clone") {
+      File.AppendAllText(Environment.GetEnvironmentVariable("AIRC_FIXTURE_LOG"),"git|"+string.Join("|",args)+"\n");
+      CopyTree(Environment.GetEnvironmentVariable("AIRC_FIXTURE_SOURCE"),args[args.Length-1]); return;
+    }
+    if (args.Length>0 && args[0]=="install") {
+      if (Array.IndexOf(args,"user")<0) Environment.Exit(92);
+      File.AppendAllText(Environment.GetEnvironmentVariable("AIRC_FIXTURE_LOG"),"winget\n");
+      File.WriteAllText(Path.Combine(Environment.GetEnvironmentVariable("AIRC_FIXTURE_GIT_EXEC"),"git-remote-https.exe"),"fixture"); return;
+    }
     if (args.Length == 1 && args[0] == "--exec-path") {
       Console.WriteLine(Environment.GetEnvironmentVariable("AIRC_FIXTURE_GIT_EXEC"));
       return;
@@ -49,10 +68,15 @@ public static class SetupBridgeFixture {
     # A script setting global:LASTEXITCODE cannot emulate a native command when
     # an enclosing scope has its own value (e.g. the deliberate exit-73 case).
     Copy-Item -LiteralPath (Join-Path $gitRoot 'bin/bash.exe') -Destination $fakeGit
+    $fakeWinget = Join-Path $gitRoot 'cmd/winget.exe'
+    Copy-Item -LiteralPath $fakeGit -Destination $fakeWinget
+    # Seed only this test's isolated, checksum-verified setup cache. This loads
+    # the real shared launcher; native fixture programs cannot install anything.
+    . (Join-Path $repository 'windows/shared-setup.ps1')
     function Get-Command {
-        param([string]$Name, $ErrorAction)
-        if ($Name -eq 'git.exe') { return [pscustomobject]@{Source=$fakeGit} }
-        if ($Name -eq 'winget') { return [pscustomobject]@{Source='fixture-winget'} }
+        param([string]$Name, $ErrorAction, $CommandType)
+        if ($Name -in @('git.exe','git')) { return [pscustomobject]@{Source=$fakeGit} }
+        if ($Name -eq 'winget') { return [pscustomobject]@{Source=$fakeWinget} }
         Microsoft.PowerShell.Core\Get-Command @PSBoundParameters
     }
     function git {
@@ -147,14 +171,23 @@ public static class SetupBridgeFixture {
         @{schemaVersion=1;continuumRevision=$revision;elevationSha256=$helperHash;manifestSha256=$manifestHash} |
             ConvertTo-Json | Set-Content -LiteralPath (Join-Path $artifactSource 'setup-artifacts.lock.json')
         $downloadState = @{count=0;corrupt=$false}
-        function Invoke-WebRequest {
-            param($Uri,[switch]$UseBasicParsing,$OutFile)
+        $loaderPath = Join-Path $artifactSource 'shared-setup.ps1'
+        $tokens=$null; $parseErrors=$null
+        $loaderAst = [Management.Automation.Language.Parser]::ParseFile($loaderPath,[ref]$tokens,[ref]$parseErrors)
+        $downloadFunction = $loaderAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Save-AircSetupArtifact'},$true)
+        if ($parseErrors.Count -or -not $downloadFunction) { throw 'Shared artifact download boundary missing.' }
+        $downloadFixture = @'
+        function Save-AircSetupArtifact {
+            param($Uri,$OutFile)
+            if ($downloadState.fail) { throw 'fixture: download timed out' }
             if ($Uri -notlike ('https://raw.githubusercontent.com/CambrianTech/continuum/' + $revision + '/*')) { throw 'Artifact URL is not pinned' }
             $downloadState.count++
             $body = if ($downloadState.corrupt) { 'throw "unverified artifact executed"' }
                 elseif ($Uri.EndsWith('/manifest.windows.ps1')) { $manifestText } else { $helperText }
             [IO.File]::WriteAllText($OutFile,$body,$utf8)
         }
+'@
+        [IO.File]::WriteAllText($loaderPath, [IO.File]::ReadAllText($loaderPath).Replace($downloadFunction.Extent.Text,$downloadFixture))
         . (Join-Path $artifactSource 'shared-setup.ps1')
         Assert-True ($downloadState.count -eq 2) 'Fresh loader did not acquire both verified artifacts'
         . (Join-Path $artifactSource 'shared-setup.ps1')
@@ -169,6 +202,11 @@ public static class SetupBridgeFixture {
         try { . (Join-Path $artifactSource 'shared-setup.ps1') } catch { $rejected = $_.Exception.Message -match 'checksum mismatch' }
         Assert-True $rejected 'Unverified artifact was executed or silently accepted'
         Assert-True (-not (Get-ChildItem -LiteralPath (Split-Path $cachedManifest) -Filter '*.download')) 'Failed download left staging files'
+        $downloadState.fail = $true
+        $rejected = $false
+        try { . (Join-Path $artifactSource 'shared-setup.ps1') } catch { $rejected = $_.Exception.Message -match 'download timed out' }
+        Assert-True $rejected 'Download failure was hidden or treated as a valid cache hit'
+        Assert-True (-not (Get-ChildItem -LiteralPath (Split-Path $cachedManifest) -Filter '*.download')) 'Interrupted download left staging files'
         Write-Host 'PASS: immutable artifact acquisition, verified cache reuse/repair, mismatch refusal, shared manifest descriptor'
     }
     Write-Host 'PASS: fresh source, old-source upgrade, developer-tree preservation, broken Git, Windows path handoff'

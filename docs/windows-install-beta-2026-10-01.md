@@ -414,3 +414,28 @@ to this node timed out (correlation f0ca974e-6a36-4f4b-8c18-cf9685c36b22). This
 account has no discoverable continuum executable after registry PATH refresh,
 no ~/.continuum directory, and no running continuum/core process. Standalone
 AIRC messaging is not a claim that a Continuum command receiver is installed.
+### Hidden setup descendants and archive acquisition (repository repair)
+
+AIRC now uses its checksum-pinned shared launcher for Git/winget acquisition,
+prerequisite probes, firewall child checks, device authentication and Bash setup
+coordinators. Coordinators own their descendants until exit zero and drained
+output; only successful completion permits the intended daemon to survive.
+Bootstrap embeds a generated projection of the same artifact loader, with CI
+rejecting drift. Both source-layout checks reject older incomplete adapters.
+
+PS5 scratch tests passed for native no-console Git/Bash/gh fixtures, paths with
+spaces/apostrophes, source upgrade/preservation, immutable artifact cache and
+checksum refusal, storage planning, firewall process/policy and consent refusal.
+No real firewall, PATH registration or daemon changes occur in these fixtures.
+
+A real PS5 Expand-Archive hang reproduced with a tiny local ZIP independently
+of mocks. The GitHub CLI acquisition path now uses framework ZIP extraction into
+its unique staging directory, validates the staged executable, then publishes and
+validates the installed executable. Acquisition/reuse/corrupt-download tests pass.
+Pinned-script downloads use bounded HttpClient body acquisition after PS5 web
+response processing also stalled. These are repository changes, not local installs.
+
+The current helper pin is a review-branch dependency (Continuum 71fb9cc51).
+Release repinning, final CI/review and public live acceptance remain OPEN.
+
+Released-helper validation: Continuum PR #4658 merged after all required CI and independent review at c40cc9cc6d3ba086d83ac25c330116def24b80ed. The standalone artifact lock now pins that released revision; generated bootstrap drift check and all five PS5 setup/firewall/storage/acquisition regression suites pass. Actual public installation and consent acceptance of this change remain open.

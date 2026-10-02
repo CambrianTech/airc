@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$SourceDirectory)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'shared-setup.ps1')
 $git = Get-Command git.exe -ErrorAction Stop
 $gitRoot = Split-Path (Split-Path $git.Source -Parent) -Parent
 $bash = Join-Path $gitRoot 'bin\bash.exe'
@@ -15,6 +16,6 @@ $stage = Join-Path $SourceDirectory 'setup\github-auth.sh'
 $previousModulePath = $env:PSModulePath
 try {
     $env:PSModulePath = $null
-    & $bash --noprofile --norc ($stage -replace '\\','/')
+    Invoke-InstallerProcess $bash @('--noprofile', '--norc', ($stage -replace '\\','/'))
     if ($LASTEXITCODE -ne 0) { throw "AIRC GitHub authorization failed (exit $LASTEXITCODE). Rerun setup to resume." }
 } finally { $env:PSModulePath = $previousModulePath }

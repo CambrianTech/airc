@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "continuumRevision": "1248f9073391b149e4a3ab32a110fd2e42fd3b59",
-  "elevationSha256": "414b89c8c55e16b580bab8d3cacba77799e9ae11cb8667de52ee4db8cb26dc77",
-  "manifestSha256": "44e7d8c2b7ff080caa9d5fad78d7cf54ea7f0a4e95f6114b24dbb8f5477f7e64"
+  "continuumRevision": "c40cc9cc6d3ba086d83ac25c330116def24b80ed",
+  "elevationSha256": "c8f6cc943b7b8a63c1419aea8a74324d2d971ed527cbbe7b09562a522e0ab9da",
+  "manifestSha256": "47892357d9f082a95a117b81ada399ccd8a213be75a975f4eed8483a2c3f28b9"
 }

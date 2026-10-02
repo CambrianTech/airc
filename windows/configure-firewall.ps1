@@ -5,11 +5,11 @@ param([Parameter(Mandatory=$true)][string]$AircPath)
 $ErrorActionPreference = 'Stop'
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $helper = Join-Path $PSScriptRoot 'firewall-allow.ps1'
-& $powershell -NoProfile -ExecutionPolicy RemoteSigned -File $helper -AircPath $AircPath -CheckOnly
+. (Join-Path $PSScriptRoot 'shared-setup.ps1')
+Invoke-InstallerProcess $powershell @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $helper, '-AircPath', $AircPath, '-CheckOnly')
 if ($LASTEXITCODE -eq 0) { exit 0 }
 Write-Host 'AIRC setup will configure TCP and UDP access for this app from the local subnet.'
 Write-Host 'Setup uses its shared administrator session and waits for consent when needed.'
-. (Join-Path $PSScriptRoot 'shared-setup.ps1')
 try {
     Initialize-ElevationSession
     Invoke-Elevated -Reason 'configuring AIRC TCP/UDP local-subnet firewall policy' -CommandLine @(
@@ -17,7 +17,7 @@ try {
     $result = $LASTEXITCODE
 } finally { Clear-Elevation }
 if ($result -ne 0) { throw "Windows firewall setup failed (exit $result). Rerun AIRC setup to resume." }
-& $powershell -NoProfile -ExecutionPolicy RemoteSigned -File $helper -AircPath $AircPath -CheckOnly
+Invoke-InstallerProcess $powershell @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $helper, '-AircPath', $AircPath, '-CheckOnly')
 if ($LASTEXITCODE -eq 4) {
     # Apply verifies effective policy inside the elevated child before exit 0.
     Write-Host 'AIRC firewall policy was verified by the administrator setup process; this Windows account cannot read firewall policy without elevation.'
