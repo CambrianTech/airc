@@ -109,8 +109,12 @@ _register_systemd() {
     return 0
   fi
   if [ "$existing_only" = 1 ] && [ ! -f "$unit" ]; then return 0; fi
-  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1 ||
-    die "no systemd user session here; start airc join from your session manager instead (or rerun with AIRC_AUTOSTART=0)"
+  if ! { command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }; then
+    # A container or headless box without a user session cannot host the unit.
+    # Not an install failure: say so, so the operator knows nothing restarts airc.
+    printf 'AIRC autostart: no systemd user session here; airc will not restart at login. Run `airc join` from your session manager.\n' >&2
+    return 0
+  fi
   mkdir -p "$dir" "$HOME/.airc/logs"
   local rendered; rendered="$(autostart_unit "$airc" "$PATH")"
   if [ -f "$unit" ] && [ "$(cat "$unit")" = "$rendered" ] && systemctl --user is-enabled --quiet "$UNIT"; then

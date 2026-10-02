@@ -1349,14 +1349,21 @@ fi
 # (2026-10-02). Register the login supervisor, the POSIX twin of Windows'
 # `airc-join` task. AIRC_AUTOSTART=0 opts out; an existing registration is
 # still repaired so an update never leaves it pointing at a stale binary.
+autostart_registrar="$CLONE_DIR/unix/register-autostart.sh"
 case "$(uname -s)" in
   Darwin|Linux)
-    autostart_flags=()
-    [ "${AIRC_AUTOSTART:-1}" = 1 ] || autostart_flags+=(--existing-only)
-    if bash "$CLONE_DIR/unix/register-autostart.sh" "$BIN_DIR/airc" ${autostart_flags[@]+"${autostart_flags[@]}"}; then
-      ok "Mesh autostart checked"
+    if [ ! -f "$autostart_registrar" ]; then
+      # A setup source from before the registrar (an older managed checkout, or a
+      # test fixture) cannot register it; say so instead of failing the install.
+      warn "This setup source predates mesh autostart; airc will not restart at login until the next update."
     else
-      fail "Mesh autostart registration failed. Setup is incomplete; rerun the installer, or set AIRC_AUTOSTART=0 to skip it."
+      autostart_flags=()
+      [ "${AIRC_AUTOSTART:-1}" = 1 ] || autostart_flags+=(--existing-only)
+      if bash "$autostart_registrar" "$BIN_DIR/airc" ${autostart_flags[@]+"${autostart_flags[@]}"}; then
+        ok "Mesh autostart checked"
+      else
+        fail "Mesh autostart registration failed. Setup is incomplete; rerun the installer, or set AIRC_AUTOSTART=0 to skip it."
+      fi
     fi ;;
 esac
 
