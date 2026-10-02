@@ -79,6 +79,9 @@ if($Child){
 . (Join-Path $root 'windows/shared-setup.ps1')
 Add-Type -Path (Join-Path $root 'windows/daemon-diagnostics.cs')
 if(-not (Test-IsAdmin)){throw 'Hosted supervisor must start elevated to grant explicit process-scoped test consent.'}
+# Acquire once in the supervising host so its child inherits the canonical
+# refreshed PATH, rather than acquiring in a child with an unchanged parent.
+Ensure-Gsudo
 if(-not $CancellationOnly){
     Invoke-InstallerProcess -OwnProcessTree (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') @('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',$PSCommandPath,'-Engine',$Engine,'-CancellationOnly')
     if($LASTEXITCODE -ne 0){throw 'Hosted credentialed child cancellation proof failed'}
@@ -105,7 +108,6 @@ try {
     $acl=Get-Acl -LiteralPath $scratch
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($account.SID,'Modify','ContainerInherit,ObjectInherit','None','Allow')))
     Set-Acl -LiteralPath $scratch -AclObject $acl
-    Ensure-Gsudo
     $gsudo=Find-GsudoExecutable
     $gsudoDirectory=Join-Path $scratch 'gsudo'
     New-Item -ItemType Directory -Path $gsudoDirectory | Out-Null
