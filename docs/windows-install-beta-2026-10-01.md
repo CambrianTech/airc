@@ -759,3 +759,15 @@ actual/expected values for initial selections; Windows scratch coverage passed
 run cancelled Windows consent, so its earlier failure is still unverified.
 Rebase onto canary318ca9b retains the merged ordinary-update rollback transaction
 and adds only its explicit executing-binary argument; both ledger entries remain.
+
+## Released helper: registered gsudo reuse (2026-10-02)
+
+The standalone setup lock now consumes released Continuum961c4c70 with checksum
+6c6ba2fa18fe179c262af30c2fa0600735cc6d0345305deee42fd72f4109d94b.
+The shared helper refreshes registered session PATH before reacquiring a missing
+gsudo and verifies the discovered executable through its read-only version
+command. Manifest bytes are unchanged. Generated remote-entry lock matches.
+Actual isolated PS5 shared-entry tests exercise pinned acquisition, checksum
+cache reuse/mismatch refusal and native handoff; no live UAC or provisioning
+was performed. Actual live reacquisition and installed binary acceptance remain
+OPEN. The separate pending owner-recovery PR is unchanged by this pin.
