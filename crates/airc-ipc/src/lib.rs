@@ -29,6 +29,9 @@ pub mod response;
 pub mod sdk_conversions;
 pub mod transport;
 
+#[cfg(windows)]
+mod windows_pipe_security;
+
 /// Local daemon IPC ABI version.
 ///
 /// Bump this when the request/response wire encoding changes in a way

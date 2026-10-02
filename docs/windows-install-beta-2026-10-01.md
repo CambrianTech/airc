@@ -1030,3 +1030,26 @@ compatible sibling). Its existing coordinator selects/updates canary. A local
 `-File .\install.ps1` invocation instead uses that script's checkout and the
 existing explicit-source preservation rules. This note does not promote main or
 authorize an unannounced live consent prompt.
+
+### Explicit Windows pipe account ownership (2026-10-02)
+
+OPEN live incident: Bigmama reports IPC AccessDenied with an existing daemon.
+Her actual scheduled task is Interactive/Limited; that does not establish the
+running process token or prove the pipe ACL caused the outage. No live ACL was
+changed and no integrity label was lowered.
+
+Pipe creation now binds a protected DACL to the process TokenUser SID plus
+SYSTEM, for initial and replacement instances, instead of inheriting an implicit
+creator-owner descriptor. Remote clients remain rejected. Windows integrity
+checks remain in force; this is not an elevated-daemon access bypass.
+
+Local Windows binary validation: airc-ipc 65 tests passed (one helper test ignored
+in the main harness but exercised by its parent); a separate hidden test process
+round-trips through initial/replacement pipe instances, and GetSecurityInfo reads
+back the actual kernel DACL. The child exchange has its own deadline. Clippy all
+airc-ipc targets passes with warnings denied. Initial ACL assertion was corrected
+for Windows mapping generic-all to file-all and returned null terminators; actual
+rights/allowed SIDs are still compared exactly. Independent reviewer approved
+bounded ownership hardening subject to these tests. Cross-token denial and live
+Bigmama recovery are NOT claimed; fresh installed/running revisions and normal
+reader acknowledgements remain required.
