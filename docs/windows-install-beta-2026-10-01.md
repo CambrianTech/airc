@@ -750,3 +750,12 @@ instead of a truncated MZ header. This exercises the production type-aP lookup,
 including .exe resolution, separately from the updater's explicit destination.
 The strengthened local Windows fixture passed (25256). Fresh CI, including the
 cancelled macOS consent leg, must pass; this is not a live installation receipt.
+
+At 4daa036, macOS consent job110949393624 reported the first selection assertion
+at line44. The fixture compared its logical mktemp root with the selector's
+physical pwd-P directory. The fixture now canonicalizes its root and prints
+actual/expected values for initial selections; Windows scratch coverage passed
+(81046). The macOS path-alias explanation remains to be confirmed by CI; that
+run cancelled Windows consent, so its earlier failure is still unverified.
+Rebase onto canary318ca9b retains the merged ordinary-update rollback transaction
+and adds only its explicit executing-binary argument; both ledger entries remain.

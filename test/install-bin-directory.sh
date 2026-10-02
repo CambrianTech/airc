@@ -5,12 +5,19 @@ trap 'printf "FAIL: install destination fixture line %s: %s\n" "$LINENO" "$BASH_
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# The selector returns physical directories (for example /private/var on macOS).
+fixture="$(cd "$fixture" && pwd -P)"
 for function in _to_bash_path _select_bin_dir _add_path_entry; do
   eval "$(sed -n "/^${function}()/,/^}/p" "$repo/install.sh")"
 done
 fail() { echo "$*" >&2; exit 1; }
 ok() { :; }
 info() { :; }
+assert_selected() {
+  local actual
+  actual="$(_select_bin_dir)"
+  [ "$actual" = "$1" ] || fail "Expected destination '$1'; selected '$actual'"
+}
 fixture_platform="$(uname -s)"
 executable_name=airc
 native_windows_image=""
@@ -41,9 +48,9 @@ native "$CLONE_DIR/target/release/$executable_name"
 native "$fixture/custom-target/debug/$executable_name"
 unset BIN_DIR BIN_TARGET CARGO_TARGET_DIR
 PATH="$fixture/first bin:$fixture/second bin:$original_path"
-[ "$(_select_bin_dir)" = "$fixture/first bin" ]
+assert_selected "$fixture/first bin"
 PATH="$fixture/second bin:$fixture/first bin:$original_path"
-[ "$(_select_bin_dir)" = "$fixture/second bin" ]
+assert_selected "$fixture/second bin"
 # An alias/function or source build is not an installed executable.
 airc() { fail 'Selector executed a function'; }
 alias airc='echo must-not-run'
