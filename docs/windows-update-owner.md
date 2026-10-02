@@ -22,6 +22,7 @@ visibility. Unadapted Bash descendants are tested only on hosted Windows CI.
 Public binary integration uses isolated IPC owners and a test-only admin probe
 to prevent real credential-cache or machine setup operations.
 
-Acceptance remains OPEN until the released shared-helper pin, exact-head CI,
+Shared helper f77ddb5341062dea05aecde3a54eadb01a219c7e is released and pinned.
+Acceptance remains OPEN until exact-head CI,
 fresh public binary integration, and supported live installation/rerun pass.
-The local reviewed helper fixture does not establish released-pin deployment.
+The final binary fixtures use the released checksum-pinned loader; they do not establish live account deployment.
