@@ -70,6 +70,12 @@ fn is_ghost_peer(now_ms: u64, last_seen_ms: u64) -> bool {
     now_ms.saturating_sub(last_seen_ms) > crate::account_registry::DEFAULT_PEER_FRESHNESS_TTL_MS
 }
 
+/// The freshest contact with a peer: the registry's `last_seen_ms`, or a LAN
+/// beacon heard more recently. Monotonic, so a beacon never rewinds recency.
+fn contact_ms(registry_last_seen_ms: u64, lan_beacon_ms: Option<u64>) -> u64 {
+    registry_last_seen_ms.max(lan_beacon_ms.unwrap_or(0))
+}
+
 /// #9: build the LEARNED dial candidates for a peer — its known-reachable
 /// `learned_ip` paired with each STABLE port the peer already advertises (#8).
 /// A peer that connected to us proved it's reachable at `learned_ip`, so even
@@ -445,7 +451,16 @@ impl Airc {
         let mut declared_hosts: std::collections::HashMap<PeerId, PeerId> =
             std::collections::HashMap::new();
         let mut ghost_peers_skipped = 0usize;
-        for peer in stored {
+        let lan_seen = self
+            .inner
+            .lan_seen_ms
+            .lock()
+            .map(|seen| seen.clone())
+            .unwrap_or_default();
+        for mut peer in stored {
+            // A beacon heard on this network is fresher contact than the registry
+            // may have yet (a peer back from a long sleep), so it counts as life.
+            peer.last_seen_ms = contact_ms(peer.last_seen_ms, lan_seen.get(&peer.peer_id).copied());
             if peer.peer_id == self.inner.identity.peer_id || connected.contains(&peer.peer_id) {
                 continue;
             }
@@ -1339,6 +1354,30 @@ mod tests {
     // classified a ghost and skipped — so the dialer stops burning timeouts on
     // dead containers/scopes. A flipped comparison or a future-skewed last_seen
     // underflow would regress here.
+    // what this catches (airc audit 2026-10-02): a peer silent for over the TTL
+    // was skipped as a ghost until the GitHub registry refreshed, even while its
+    // LAN beacon arrived every 15 s, so two Macs waking from a long sleep waited
+    // minutes on GitHub. A fresh beacon must make it dialable.
+    #[test]
+    fn a_fresh_lan_beacon_keeps_a_registry_stale_peer_out_of_the_ghosts() {
+        let ttl = crate::account_registry::DEFAULT_PEER_FRESHNESS_TTL_MS;
+        let now = 10 * ttl;
+        let registry_stale = now - 2 * ttl;
+        assert!(
+            is_ghost_peer(now, contact_ms(registry_stale, None)),
+            "no beacon: still a ghost"
+        );
+        assert!(
+            !is_ghost_peer(now, contact_ms(registry_stale, Some(now - 1_000))),
+            "a beacon a second ago is life"
+        );
+        assert_eq!(
+            contact_ms(now, Some(now - ttl)),
+            now,
+            "an older beacon never rewinds the registry's recency"
+        );
+    }
+
     #[test]
     fn ghost_classification_respects_freshness_ttl() {
         let ttl = crate::account_registry::DEFAULT_PEER_FRESHNESS_TTL_MS;

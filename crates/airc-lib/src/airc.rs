@@ -320,6 +320,12 @@ pub(crate) struct AircInner {
     /// accepts the inbound, every handle's dialer sees the learned IP.
     pub(crate) learned_ips:
         Arc<std::sync::Mutex<std::collections::HashMap<PeerId, std::net::IpAddr>>>,
+    /// When each enrolled peer's LAN presence beacon was last heard (epoch ms).
+    /// A beacon is proof of life on this network right now, so discovery reads
+    /// it beside the registry's `last_seen_ms`: a peer back from a long sleep is
+    /// no ghost and is dialed without waiting for the GitHub registry. In-memory,
+    /// shared across daemon clones like `learned_ips`.
+    pub(crate) lan_seen_ms: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, u64>>>,
     /// #240 event-driven heal: optional callback the daemon registers to be
     /// notified when a peer's live LAN session terminates. A SLOT (not the
     /// adapter observer itself) so registration order is irrelevant — the LAN
@@ -715,6 +721,7 @@ impl Airc {
                 )),
                 advertised_endpoints_host: std::sync::Mutex::new(None),
                 learned_ips: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                lan_seen_ms: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 on_disconnect: Arc::new(std::sync::Mutex::new(None)),
                 lamport_clock: AtomicU64::new(0),
                 peer_sync_last_ms: AtomicU64::new(0),
@@ -1648,6 +1655,7 @@ impl Airc {
             // #9: share the learned-IP map across the daemon clone so an
             // inbound learned on any handle informs every handle's dialer.
             learned_ips: self.inner.learned_ips.clone(),
+            lan_seen_ms: self.inner.lan_seen_ms.clone(),
             on_disconnect: self.inner.on_disconnect.clone(),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             peer_sync_last_ms: AtomicU64::new(0),
