@@ -2198,7 +2198,12 @@ fn spawn_route_refresh(
     let delivery_stats = state.delivery_stats.clone();
     let endpoint_resync = state.endpoint_resync.clone();
     tokio::spawn(async move {
-        airc_daemon::route_refresh::run_periodic_refresh(
+        // The registry task applies this same isolation policy before starting
+        // LAN discovery. Route refresh must honor it too: its immediate first
+        // tick can create a wildcard listener through endpoint refresh even
+        // when registry startup correctly refused a test/disabled scope.
+        run_allowed_route_refresh(
+            airc_lib::account_registry_block(&state.home),
             &state.shutdown,
             &state.route_wake,
             || {
@@ -2213,6 +2218,22 @@ fn spawn_route_refresh(
         )
         .await;
     })
+}
+
+async fn run_allowed_route_refresh<F, Fut>(
+    block: Option<airc_lib::AccountRegistryBlock>,
+    shutdown: &tokio::sync::Notify,
+    wake: &tokio::sync::Notify,
+    refresh: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if let Some(block) = block {
+        eprintln!("airc daemon: automatic route refresh disabled: {block}");
+        return;
+    }
+    airc_daemon::route_refresh::run_periodic_refresh(shutdown, wake, refresh).await;
 }
 
 /// One periodic route refresh: run discovery on the shared daemon handle
@@ -3473,6 +3494,42 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn isolated_route_refresh_never_runs_the_immediate_tick() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let temp_block = airc_lib::account_registry_block(home.path());
+        assert!(temp_block.is_some(), "temporary daemon must be isolated");
+        for block in [
+            temp_block,
+            Some(airc_lib::AccountRegistryBlock::DisabledByEnv),
+        ] {
+            run_allowed_route_refresh(
+                block,
+                &tokio::sync::Notify::new(),
+                &tokio::sync::Notify::new(),
+                || async { panic!("isolated daemon must never refresh or open LAN") },
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_route_refresh_keeps_the_immediate_production_tick() {
+        let shutdown = tokio::sync::Notify::new();
+        let wake = tokio::sync::Notify::new();
+        let ticks = std::sync::atomic::AtomicUsize::new(0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_allowed_route_refresh(None, &shutdown, &wake, || async {
+                ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                shutdown.notify_waiters();
+            }),
+        )
+        .await
+        .expect("production refresh must start immediately and honor shutdown");
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn dropping_join_sos_fallback_cancels_only_its_poller() {
