@@ -181,7 +181,7 @@ fn main() {
         if ($env:PSModulePath -cne $parentModulePath) { throw 'Boundary regression changed the caller environment' }
     }
 
-    # Existing tasks retain their identity/settings/trigger; only action changes.
+    # Existing tasks retain identity/settings/triggers; legacy runtime tokens migrate.
     $global:aircStartupFixture = @{ updated=$null; registered=$null; existing=$null; events=@(); daemons=@(); failRegistration=$false; deny=$false; rejectElevation=$false; elevation=$null }
     $global:aircStartupFixture.registered = $null
     $global:aircStartupFixture.existing = [pscustomobject]@{ Actions = @([pscustomobject]@{ WorkingDirectory = $scratch }); State='Ready'; Settings=[pscustomobject]@{Enabled=$true}; Principal=[pscustomobject]@{UserId=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value} }
@@ -192,11 +192,12 @@ fn main() {
     function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory)
         [pscustomobject]@{ Execute=$Execute; Arguments=$Argument; WorkingDirectory=$WorkingDirectory }
     }
-    function Set-ScheduledTask { param($TaskName, $TaskPath, $Action, $ErrorAction)
+    function Set-ScheduledTask { param($TaskName, $TaskPath, $Action, $Principal, $ErrorAction)
         if ($global:aircStartupFixture.deny) { throw [UnauthorizedAccessException]::new('fixture access denied') }
         if ($global:aircStartupFixture.failRegistration) { throw 'fixture registration failure' }
         $global:aircStartupFixture.updated=$Action
         $global:aircStartupFixture.existing.Actions=@($Action)
+        if (-not $global:aircStartupFixture.ignorePrincipal) { $global:aircStartupFixture.existing.Principal=$Principal }
         $global:aircStartupFixture.events += 'register'
     }
     function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) $global:aircStartupFixture.daemons }
@@ -220,10 +221,10 @@ fn main() {
     }
     function Register-ScheduledTask { param($TaskName, $TaskPath, $Action, $Trigger, $Principal, $Settings, [switch]$Force, $Description, $ErrorAction)
         $global:aircStartupFixture.registered = [pscustomobject]@{ Action=$Action; Trigger=$Trigger; Principal=$Principal; Settings=$Settings; TaskPath=$TaskPath }
-        $global:aircStartupFixture.existing = [pscustomobject]@{ Actions=@($Action); State='Ready'; Settings=[pscustomobject]@{Enabled=$true}; Principal=[pscustomobject]@{UserId=$Principal} }
+        $global:aircStartupFixture.existing = [pscustomobject]@{ Actions=@($Action); State='Ready'; Settings=[pscustomobject]@{Enabled=$true}; Principal=$Principal }
     }
     function New-ScheduledTaskTrigger { param([switch]$AtLogOn, $User) $User }
-    function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) $UserId }
+    function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) [pscustomobject]@{UserId=$UserId; LogonType=$LogonType; RunLevel=$RunLevel} }
     function New-ScheduledTaskSettingsSet { param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $RestartInterval, $RestartCount, $ExecutionTimeLimit, $MultipleInstances)
         if ($RestartCount -ne 999 -or $RestartInterval.TotalMinutes -ne 2 -or $ExecutionTimeLimit -ne [TimeSpan]::Zero -or $MultipleInstances -ne 'IgnoreNew') { throw 'New-task recovery policy changed' }
         'expected-settings'
@@ -241,6 +242,29 @@ fn main() {
     $global:aircStartupFixture.events=@()
     & $registrar -AircPath $binary
     if ($global:aircStartupFixture.events.Count -ne 0) { throw 'Unchanged task was touched' }
+    # Regression: a matching action previously preserved Highest/S4U forever.
+    # Registration must normalize token policy without replacing settings or
+    # stopping an existing daemon. Rerunning the corrected task is a no-op.
+    $settingsBefore = $global:aircStartupFixture.existing.Settings
+    foreach ($legacy in @(@('Interactive','Highest'), @('S4U','Limited'), @('S4U','Highest'))) {
+        $global:aircStartupFixture.existing.Principal.LogonType=$legacy[0]
+        $global:aircStartupFixture.existing.Principal.RunLevel=$legacy[1]
+        $global:aircStartupFixture.events=@()
+        & $registrar -AircPath $binary
+        $principal=$global:aircStartupFixture.existing.Principal
+        if (($global:aircStartupFixture.events -join ',') -ne 'register' -or $principal.LogonType -ne 'Interactive' -or $principal.RunLevel -ne 'Limited' -or -not [object]::ReferenceEquals($settingsBefore,$global:aircStartupFixture.existing.Settings)) { throw 'Legacy principal migration changed settings or retained an unsafe token' }
+        $global:aircStartupFixture.events=@()
+        & $registrar -AircPath $binary
+        if ($global:aircStartupFixture.events.Count) { throw 'Corrected principal was not idempotent' }
+    }
+    $global:aircStartupFixture.existing.Principal.RunLevel='Highest'
+    $global:aircStartupFixture.ignorePrincipal=$true
+    $failed=$false
+    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'principal verification failed' }
+    if (-not $failed -or ($global:aircStartupFixture.events -join ',') -ne 'register') { throw 'Unapplied principal change reported success or stopped the task' }
+    $global:aircStartupFixture.ignorePrincipal=$false
+    & $registrar -AircPath $binary
+    $global:aircStartupFixture.events=@()
     $global:aircStartupFixture.existing.Principal.UserId='S-1-5-18'
     $failed=$false
     $failed=(Get-FixtureEntryFailure { & $registrar -AircPath $binary }) -match 'another Windows account'
@@ -253,6 +277,17 @@ fn main() {
     $global:aircStartupFixture.events=@()
     & $registrar -AircPath $binary
     if ($global:aircStartupFixture.events.Count -ne 0) { throw 'Unchanged running task restarted' }
+    $global:aircStartupFixture.existing.Principal.LogonType='S4U'
+    $global:aircStartupFixture.existing.Principal.RunLevel='Highest'
+    $global:aircStartupFixture.daemons=@([pscustomobject]@{CommandLine=$null})
+    $failed=$false
+    try { & $registrar -AircPath $binary } catch { $failed=$_ -match 'maintenance window' }
+    if (-not $failed -or ($global:aircStartupFixture.events -join ',') -ne 'register,disable,enable') { throw 'Legacy principal repair stopped an uninspectable daemon or claimed runtime recovery' }
+    $global:aircStartupFixture.daemons=@()
+    $global:aircStartupFixture.events=@()
+    & $registrar -AircPath $binary
+    if (($global:aircStartupFixture.events -join ',') -ne 'disable,stop,instances,enable,start') { throw 'Principal-only migration forgot its pending restart' }
+    $global:aircStartupFixture.events=@()
     $global:aircStartupFixture.existing.Actions[0].Arguments='old'
     $global:aircStartupFixture.failRegistration=$true
     $failed=$false
@@ -290,7 +325,7 @@ fn main() {
     & $registrar -AircPath $binary -ExistingOnly
     if ($global:aircStartupFixture.registered) { throw 'Bash install opted into new autostart' }
     & $registrar -AircPath $binary
-    if (-not $global:aircStartupFixture.registered -or $global:aircStartupFixture.registered.TaskPath -ne '\' -or $global:aircStartupFixture.registered.Principal -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'New task did not preserve current user identity/root task path' }
+    if (-not $global:aircStartupFixture.registered -or $global:aircStartupFixture.registered.TaskPath -ne '\' -or $global:aircStartupFixture.registered.Principal.UserId -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'New task did not preserve current user identity/root task path' }
     # A failed registrar used to become a warning in the shared coordinator,
     # allowing setup to report success. Execute that exact Bash stage with a
     # controlled registrar exit; no task or elevation operation is performed.

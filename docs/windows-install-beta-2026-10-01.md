@@ -534,3 +534,30 @@ These synthetic receipts do not establish a repaired live AIRC transport or a
 new installed/running binary revision; those remain separate acceptance work.
 
 Released shared helper pin: Continuum #4664 merged all-green reviewed at 10cd21d7781b55789cdc1563c1f96e1304a599fc. Actual standalone PS5 bridge repeated at released pin (86377) PASS, including hidden native coordinator stderr/data/exit and public entry fixtures. Parent review APPROVE; full live installation remains OPEN.
+### Existing startup task token migration (2026-10-02)
+
+OPEN: Bigmama reported IPC Access denied (OS error 5) while an old AIRC daemon
+remained present but uninspectable to its normal user. Its actual scheduled-task
+principal is Interactive/Limited (peer receipt 6403107). This separate legacy
+migration defect does not explain that incident or repair the running process.
+
+Code inspection found a concrete setup defect: existing same-SID airc-join tasks
+preserved Principal verbatim, and the no-op guard/verification compared only the
+action. A matching legacy Highest or S4U task therefore survived normal install.
+Fresh tasks already use Interactive/Limited. Registration now applies that same
+runtime token contract to existing same-account tasks, verifies SID/logon/run
+level as well as action, and includes principal-only changes in pending restart.
+Triggers/settings remain intact; foreign-account or unverifiable ownership still
+refuses. Elevated setup can repair task registration but must not elevate runtime.
+
+Validation: existing startup fixture now covers Highest, S4U and combined legacy
+principals, unchanged reruns, refused/ignored principal writes, and a running
+legacy principal with uninspectable daemon. That case updates registration but
+refuses stop/start; its pending restart resumes only after observed daemon absence.
+Actual PS5 focused -BoundaryChild fixture PASS 81823. The initial complete run
+75470 passed the nested PS7/Bash/PS5 fixture but its outer registrar test hit the
+previously identified inherited-module Get-FileHash lookup issue. The focused
+rerun dot-loaded the existing shared initializer before the fixture; no machine
+module settings were changed. Separate diagnostic-entry work wraps registrar
+initialization; this integration now includes both repairs. No live task, daemon, UAC,
+firewall or heavy build was exercised. Public binary/runtime proof remains open.

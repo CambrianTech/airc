@@ -23,6 +23,22 @@ function Get-AircStartupInstances {
     $instances = $service.GetFolder('\').GetTask('airc-join').GetInstances(0)
     for ($index = 1; $index -le $instances.Count; $index++) { $instances.Item($index).InstanceGuid }
 }
+function Get-AircStartupOwnerSid {
+    param($Task)
+    $owner = $Task.Principal.UserId
+    if (-not $owner) { throw 'Cannot verify the existing AIRC startup task owner; no task changes were made.' }
+    if ($owner -match '^S-1-') { return $owner }
+    return (New-Object Security.Principal.NTAccount($owner)).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+function Test-AircStartupToken {
+    param($Task)
+    # Runtime always belongs to the original user's interactive, limited token.
+    # A legacy same-SID Highest/S4U task is not equivalent: its daemon can deny
+    # IPC access to normal desktop clients. Elevation repairs registration only.
+    return $Task -and (Get-AircStartupOwnerSid $Task) -eq $UserSid -and
+        [string]$Task.Principal.LogonType -in @('Interactive', '3') -and
+        [string]$Task.Principal.RunLevel -in @('Limited', '0')
+}
 function Assert-NoAircDaemon {
     # Console detach does not break Windows Job membership. A missing parent PID
     # cannot prove independence, so maintenance must own the daemon's absence.
@@ -50,11 +66,7 @@ $shell = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $existing = Get-AircStartupTask
 if ($ExistingOnly -and -not $existing) { return }
 if ($existing) {
-    $owner = $existing.Principal.UserId
-    if (-not $owner) { throw 'Cannot verify the existing AIRC startup task owner; no task changes were made.' }
-    $ownerSid = if ($owner -match '^S-1-') { $owner } else {
-        (New-Object Security.Principal.NTAccount($owner)).Translate([Security.Principal.SecurityIdentifier]).Value
-    }
+    $ownerSid = Get-AircStartupOwnerSid $existing
     if ($ownerSid -ne $UserSid) { throw 'The existing airc-join task belongs to another Windows account; no task changes were made.' }
 }
 $workingDirectory = $UserHome
@@ -63,7 +75,7 @@ if ($existing -and $existing.Actions[0].WorkingDirectory) {
 }
 $action = New-ScheduledTaskAction -Execute $shell -WorkingDirectory $workingDirectory `
     -Argument ('//B //Nologo "' + $windowlessRunner + '" "' + $AircPath + '" "' + $logs + '"')
-$unchanged = $existing -and @($existing.Actions).Count -eq 1 -and
+$unchanged = (Test-AircStartupToken $existing) -and @($existing.Actions).Count -eq 1 -and
     $existing.Actions[0].Execute -eq $action.Execute -and
     $existing.Actions[0].Arguments -ceq $action.Arguments -and
     $existing.Actions[0].WorkingDirectory -eq $action.WorkingDirectory
@@ -76,8 +88,10 @@ if ($runnerChanged) {
 }
 if ($restart) { Set-Content -LiteralPath $pending -Value 'running supervisor needs updated action' }
 if (-not $unchanged -and $existing) {
-    # Retain the user's principal, triggers, restart policy and other settings.
-    Set-ScheduledTask -TaskName 'airc-join' -TaskPath '\' -Action $action -ErrorAction Stop | Out-Null
+    # Preserve triggers/settings, but migrate legacy elevated/noninteractive
+    # principals to the same account's normal desktop token.
+    $principal = New-ScheduledTaskPrincipal -UserId $UserSid -LogonType Interactive -RunLevel Limited
+    Set-ScheduledTask -TaskName 'airc-join' -TaskPath '\' -Action $action -Principal $principal -ErrorAction Stop | Out-Null
 } elseif (-not $existing) {
     $sid = New-Object Security.Principal.SecurityIdentifier($UserSid)
     $userName = $sid.Translate([Security.Principal.NTAccount]).Value
@@ -92,9 +106,9 @@ if (-not $unchanged -and $existing) {
         -Description 'Keep this node on the airc mesh: start the scope daemon at logon, restart it if it dies.' | Out-Null
 }
 $verified = Get-AircStartupTask
-if (-not $verified -or @($verified.Actions).Count -ne 1 -or
+if (-not (Test-AircStartupToken $verified) -or @($verified.Actions).Count -ne 1 -or
     $verified.Actions[0].Execute -ne $action.Execute -or $verified.Actions[0].Arguments -cne $action.Arguments -or
-    $verified.Actions[0].WorkingDirectory -ne $action.WorkingDirectory) { throw 'AIRC task action verification failed; the running task was not stopped.' }
+    $verified.Actions[0].WorkingDirectory -ne $action.WorkingDirectory) { throw 'AIRC task action/principal verification failed; the running task was not stopped.' }
 if ($restart) {
     if (-not $verified.Settings.Enabled) { throw 'Updated task is disabled; preserving its stopped/disabled policy instead of restarting it.' }
     # Suppress Task Scheduler's crash-restart race during the maintenance check.
