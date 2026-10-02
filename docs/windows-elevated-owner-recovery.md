@@ -29,3 +29,27 @@ the updater before commit cc5aadb. Local tests exercise refusal against a real
 isolated pipe owner, native token queries, path/identity guards, and synthetic
 PS5 public adoption/elevation sequencing. Positive elevated-owner recovery and
 live account adoption remain OPEN until the supported installer is exercised.
+
+## Public entry token policy
+
+Run full Windows installation and explicit recovery from a normal user terminal.
+An already elevated full entry now refuses before helper acquisition, source
+checkout, build, or installation writes. Setup owns the narrow consent session
+for firewall and recovery work; it never adopts a daemon under an administrator
+token. Explicit firewall-only and read-only diagnostic operations remain usable
+from an elevated observer. Both PowerShell and Windows Bash entries project the
+same canonical token check from the pinned shared helper.
+
+Hosted Windows acceptance starts an actual medium-integrity process of the same
+user via managed gsudo. A native named-pipe observation supplies its PID and
+token, a retained process handle and birth time protect that observation, and
+ancestry must lead back to the test supervisor before process-scoped consent is
+granted. The unchanged public installer runs in that child, followed by doctor
+and a native check that its daemon is also normal-token. The disposable runner
+cleans up its owned daemon and scoped cache. No token-changing acceptance test
+is run on a user's desktop.
+
+Local token-policy, source-acquisition and PATH fixtures pass; the hosted real
+medium-token installation remains OPEN until its CI receipt is available. A
+runner that cannot provide a real normal token fails explicitly; tests never
+mock normality for full installation.

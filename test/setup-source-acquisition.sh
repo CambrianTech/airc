@@ -51,6 +51,9 @@ printf 'old auth\n' > "$HOME/.airc/src/setup/github-auth.sh"
 old_fallback="$(find "$HOME/.airc" -maxdepth 1 -name 'setup-source-*' -type d | head -1)"
 printf 'local work\n' > "$old_fallback/local-work.txt"
 printf '#!/bin/sh\necho MINGW64_NT-10.0\n' > "$fixture/tools/uname"
+# Only the platform/source-selection unit fixture simulates this boundary.
+printf '#!/bin/sh\nexit 0\n' > "$fixture/tools/powershell.exe"
+chmod +x "$fixture/tools/powershell.exe"
 export AIRC_FIXTURE_WINDOWS=1
 unset CAMBRIAN_INSTALL_ELEVATION
 bash "$fixture/entry/install.sh" > "$fixture/output" 2>&1 || { cat "$fixture/output"; exit 1; }
