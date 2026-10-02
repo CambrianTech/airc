@@ -45,6 +45,13 @@ mod ownership_tests {
             include_str!("../../airc-cli/src/sos_commands.rs"),
             include_str!("../../airc-cli/src/work_commands_gh.rs"),
             include_str!("../../airc-cli/src/work_commands_git.rs"),
+            include_str!("../../airc-cli/src/hygiene_commands.rs"),
+            include_str!("../../airc-cli/src/identity_commands.rs"),
+            include_str!("../../airc-cli/src/knock_commands.rs"),
+            include_str!("../../airc-cli/src/queue_card_staleness.rs"),
+            include_str!("../../airc-daemon/src/reclaim.rs"),
+            include_str!("../../airc-work/src/local_git.rs"),
+            include_str!("../../airc-work/src/pull_requests/gh.rs"),
         ] {
             assert!(
                 !source.contains("Command::new("),

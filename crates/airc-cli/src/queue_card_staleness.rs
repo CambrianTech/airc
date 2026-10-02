@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{Map, Value};
 
@@ -248,7 +247,7 @@ fn stale_warnings(
 }
 
 fn git_origin(repo_root: &Path, base_git_ref: &str, content: &str, file: &str) -> String {
-    Command::new("git")
+    airc_core::process::background("git")
         .arg("-C")
         .arg(repo_root)
         .arg("log")
