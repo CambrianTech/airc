@@ -31,6 +31,8 @@ mod collaboration_peers;
 mod commands;
 mod discovery;
 mod doctor;
+#[cfg(windows)]
+mod elevated_owner;
 mod envelope_cli;
 mod event_render;
 mod events_cli;
@@ -635,6 +637,23 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Version => commands::run_version(),
+
+        #[cfg(windows)]
+        Command::SetupRecoverElevatedOwner {
+            probe,
+            endpoint,
+            caller_sid,
+            installed_binary,
+        } => {
+            if probe {
+                if elevated_owner::access_denied(&endpoint).await? {
+                    std::process::exit(5);
+                }
+                Ok(())
+            } else {
+                elevated_owner::recover(&endpoint, &caller_sid, &installed_binary).await
+            }
+        }
 
         Command::IpcEndpoint { native } => {
             // Resolve-only: print the canonical socket path airc would

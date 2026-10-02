@@ -5,6 +5,7 @@
 param(
     [switch]$FirewallOnly,
     [switch]$DiagnoseDaemon,
+    [switch]$RecoverElevatedDaemon,
     [string]$AircPath
 )
 $ErrorActionPreference = 'Stop'
@@ -94,7 +95,8 @@ $aircSetupElevation = Get-AircSetupArtifact 'tools/scripts/lib/windows-elevation
 . $aircSetupManifest
 . $aircSetupElevation -GsudoSource $script:ContinuumManifest['gsudo'].source
 # END GENERATED SHARED SETUP BOOTSTRAP
-if ($DiagnoseDaemon) {
+if ($DiagnoseDaemon -or $RecoverElevatedDaemon) {
+    if ($DiagnoseDaemon -and $RecoverElevatedDaemon) { throw 'Choose diagnostics or elevated daemon recovery.' }
     if ($FirewallOnly) { throw 'Daemon diagnostics cannot be combined with firewall setup.' }
     if (-not $AircPath) { $AircPath = Join-Path $env:LOCALAPPDATA 'Programs\airc\airc.exe' }
     if (-not (Test-Path -LiteralPath $AircPath -PathType Leaf)) { throw 'Daemon diagnostics requires the installed AIRC executable via -AircPath.' }
@@ -109,14 +111,27 @@ if ($DiagnoseDaemon) {
     # Resolve with the original account/environment before elevation; never
     # duplicate the canonical Windows endpoint hash in installer code.
     $callerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($RecoverElevatedDaemon -and (Test-IsAdmin)) { throw 'Recovery must start from the normal user token so adoption cannot create another elevated daemon.' }
     $endpoint = @(Invoke-InstallerProcess -OwnProcessTree $AircPath @('ipc-endpoint', '--native'))
     if ($global:LASTEXITCODE -ne 0 -or $endpoint.Count -ne 1 -or
         -not ([string]$endpoint[0]).StartsWith('\\.\pipe\', [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Installed AIRC cannot resolve its native endpoint. Deploy a build supporting ipc-endpoint --native before diagnostic elevation; no daemon was changed.'
     }
-    Write-Host 'AIRC setup will inspect the selected daemon endpoint and its Windows process token. No daemon, permissions, task or firewall changes are made.'
+    if ($RecoverElevatedDaemon) {
+        Invoke-InstallerProcess -OwnProcessTree $AircPath @('setup-recover-elevated-owner','--help') | Out-Null
+        if ($global:LASTEXITCODE -ne 0) { throw 'Selected AIRC binary lacks supported elevated-owner recovery. Build/deploy the current installer candidate first.' }
+        Write-Host 'AIRC setup will verify and gracefully stop only the selected same-account elevated AIRC owner, then adopt from this normal user token.'
+    } else { Write-Host 'AIRC setup will inspect the selected daemon endpoint and its Windows process token. No daemon, permissions, task or firewall changes are made.' }
     try {
         Initialize-ElevationSession
+        if ($RecoverElevatedDaemon) {
+            Invoke-Elevated -Reason 'gracefully stopping the verified same-account elevated AIRC daemon' -CommandLine @(
+                $AircPath, 'setup-recover-elevated-owner', '--endpoint', ([string]$endpoint[0]), '--caller-sid', $callerSid, '--installed-binary', $AircPath)
+            if ($global:LASTEXITCODE -ne 0) { throw "Elevated daemon recovery refused or failed (exit $global:LASTEXITCODE); no force termination or permission change was attempted." }
+            Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $AircPath @('update','--adopt-installed')
+            if ($global:LASTEXITCODE -ne 0) { throw "Normal-token adoption failed (exit $global:LASTEXITCODE); recovery remains incomplete." }
+            return
+        }
         Invoke-Elevated -Reason 'reading the selected AIRC daemon endpoint and Windows process token' -CommandLine @(
             (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'),
             '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'RemoteSigned', '-File', $diagnosticHelper,
@@ -172,7 +187,7 @@ $source = if ($env:AIRC_DIR) { $env:AIRC_DIR } elseif ($PSScriptRoot -and (Test-
 } else { Join-Path $env:USERPROFILE '.airc\src' }
 $channel = if ($env:AIRC_CHANNEL) { $env:AIRC_CHANNEL } else { 'canary' }
 function Test-SetupLayout([string]$Directory) {
-    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1','windows\sync-bootstrap.ps1','windows\setup-entrypoint.ps1')) {
+    foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1','windows\adopt-installed.ps1','windows\sync-bootstrap.ps1','windows\setup-entrypoint.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Directory $relative))) { return $false }
     }
     return $true

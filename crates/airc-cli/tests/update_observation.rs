@@ -17,6 +17,60 @@ fn hidden(command: &mut Command) -> &mut Command {
     command
 }
 
+#[cfg(windows)]
+#[test]
+fn elevated_recovery_refuses_unverified_owner_without_stop() {
+    let temp = tempfile::tempdir().unwrap();
+    let account = temp.path().join("account");
+    std::fs::create_dir_all(account.join(".airc")).unwrap();
+    let endpoint = cli(&account, temp.path(), &["ipc-endpoint"]);
+    assert!(endpoint.status.success());
+    let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
+    let mut owner = fixture(&socket, &temp.path().join("ready"), "stale", "8eaa592");
+    let output = cli(
+        &account,
+        temp.path(),
+        &[
+            "setup-recover-elevated-owner",
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--caller-sid",
+            "S-1-0-0",
+            "--installed-binary",
+            env!("CARGO_BIN_EXE_airc"),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("account SID"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        owner.child.try_wait().unwrap().is_none(),
+        "refusal must not stop owner"
+    );
+    let probe = cli(
+        &account,
+        temp.path(),
+        &[
+            "setup-recover-elevated-owner",
+            "--probe",
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--caller-sid",
+            "S-1-0-0",
+            "--installed-binary",
+            env!("CARGO_BIN_EXE_airc"),
+        ],
+    );
+    assert!(
+        probe.status.success(),
+        "accessible owner probe must remain read-only"
+    );
+    assert!(owner.child.try_wait().unwrap().is_none());
+}
+
 // The real owner/ancestry/Job wrappers run, but these isolated IPC fixtures
 // never acquire credentials or touch a user's existing gsudo cache.
 fn isolated_windows_owner(source: &Path) {
