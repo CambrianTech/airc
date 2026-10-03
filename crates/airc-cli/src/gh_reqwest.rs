@@ -161,11 +161,13 @@ impl ReqwestGhClient {
         }
         // gh-auth-token spawn. Same shape as ShellGhClient's subprocess
         // pattern; this is the only gh process spawn we do.
-        let output = Command::from(airc_core::process::background("gh"))
-            .args(["auth", "token"])
-            .output()
-            .await
-            .map_err(crate::gh_client::map_spawn_error)?;
+        let output = Command::from(airc_core::process::background(
+            airc_core::gh_executable::resolve(),
+        ))
+        .args(["auth", "token"])
+        .output()
+        .await
+        .map_err(crate::gh_client::map_spawn_error)?;
         if !output.status.success() {
             return Err(GhError::AuthRequired {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),

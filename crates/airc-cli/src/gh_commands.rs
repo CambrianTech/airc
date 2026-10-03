@@ -57,7 +57,7 @@ fn patch_gist_file_input(filename: &str, content: &str) -> String {
 }
 
 fn run_gh_with_input(gh_args: Vec<String>, input: Option<String>) -> Result<(), Box<dyn Error>> {
-    let gh = env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    let gh = airc_core::gh_executable::resolve();
 
     if gh_args.len() >= 2
         && gh_args[0] == "auth"

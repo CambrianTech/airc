@@ -323,6 +323,11 @@ const RESOLVER_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// return None so the caller falls through to the next resolver.
 fn run_command(argv: &[&str]) -> Option<String> {
     let (program, args) = argv.split_first()?;
+    let program = if *program == "gh" {
+        airc_core::gh_executable::resolve()
+    } else {
+        std::path::PathBuf::from(program)
+    };
     let mut child = airc_core::process::background(program)
         .args(args)
         .stdin(std::process::Stdio::null())

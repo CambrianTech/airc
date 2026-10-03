@@ -531,7 +531,7 @@ fn gh_capture(args: &[&str], stdin: Option<&str>) -> Result<String, Box<dyn Erro
         return Err(format!("airc sos: gh governor blocked this request ({reason})").into());
     }
 
-    let gh = std::env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    let gh = airc_core::gh_executable::resolve();
     let mut command = airc_core::process::background(&gh);
     command
         .args(args)
@@ -542,7 +542,7 @@ fn gh_capture(args: &[&str], stdin: Option<&str>) -> Result<String, Box<dyn Erro
     }
     let mut child = command
         .spawn()
-        .map_err(|error| format!("airc sos: failed to spawn {gh}: {error}"))?;
+        .map_err(|error| format!("airc sos: failed to spawn {}: {error}", gh.display()))?;
     if let (Some(input), Some(mut handle)) = (stdin, child.stdin.take()) {
         handle
             .write_all(input.as_bytes())
