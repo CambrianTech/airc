@@ -406,6 +406,7 @@ impl Airc {
 
         let connected: std::collections::HashSet<PeerId> =
             self.connected_lan_peers().await.into_iter().collect();
+        let lan = self.inner.lan_tcp.lock().await.clone();
         let mut failures = Vec::new();
         // Card 7e3c9a1f: endpoints skipped because they are in dial-failure
         // backoff — surfaced on the snapshot SEPARATELY from `failures` so a
@@ -446,7 +447,13 @@ impl Airc {
             std::collections::HashMap::new();
         let mut ghost_peers_skipped = 0usize;
         for peer in stored {
-            if peer.peer_id == self.inner.identity.peer_id || connected.contains(&peer.peer_id) {
+            if peer.peer_id == self.inner.identity.peer_id
+                || connected.contains(&peer.peer_id)
+                || match &lan {
+                    Some(adapter) => adapter.is_connected(peer.peer_id).await,
+                    None => false,
+                }
+            {
                 continue;
             }
             // #10: skip GHOSTS — enrolled peers we haven't had fresh contact
