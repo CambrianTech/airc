@@ -28,7 +28,7 @@ use airc_bus::{Filter, Seq};
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
-use airc_ipc::codec::{read_frame, write_frame};
+use airc_ipc::codec::{read_frame, write_encoded_frame, write_frame};
 use airc_ipc::request::{AttachRequest, AttachStart, IpcDelivery, IpcKind, Request};
 use airc_ipc::response::Response;
 use airc_ipc::transport::{IpcAcceptError, IpcListener, IpcStream};
@@ -696,12 +696,20 @@ where
                                 catchup.as_mut().and_then(BacklogCatchup::take_summary)
                             {
                                 for buffered in &seam.tail {
-                                    write_event_response(&mut writer, buffered).await?;
+                                    tokio::select! {
+                                        _ = &mut shutdown => return Ok(()),
+                                        _ = &mut hangup => return Ok(()),
+                                        result = write_event_response(&mut writer, buffered, &state.shared_frames) => result?,
+                                    }
                                 }
                                 write_response(&mut writer, &seam.summary.into_response())
                                     .await?;
                             }
-                            write_event_response(&mut writer, &env).await?;
+                            tokio::select! {
+                                _ = &mut shutdown => return Ok(()),
+                                _ = &mut hangup => return Ok(()),
+                                result = write_event_response(&mut writer, &env, &state.shared_frames) => result?,
+                            }
                             // Cursor heartbeat: tell the consumer this event
                             // is now safely delivered on this stream so its
                             // persisted watermark can advance past it.
@@ -891,18 +899,110 @@ where
     write_frame(writer, response).await.map_err(DaemonError::Io)
 }
 
-/// Keep the FlatBuffer Bytes allocation alive across framing without cloning it
-/// into Response::Event's owned Vec (the receiving API retains that owned type).
+/// Share the canonical event frame for this envelope allocation across attach
+/// writers. The receiving API and its owned Response::Event remain unchanged.
 async fn write_event_response<W>(
     writer: &mut W,
-    envelope: &airc_bus::Envelope,
+    envelope: &Arc<airc_bus::Envelope>,
+    frames: &crate::shared_frames::SharedFrames,
 ) -> Result<(), DaemonError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let encoded = airc_wire::encode(envelope);
-    let response = Response::event_ref(&encoded);
-    write_frame(writer, &response)
+    let frame = frames.get(envelope).await?;
+    write_encoded_frame(writer, &frame.payload)
         .await
         .map_err(DaemonError::Io)
+}
+
+#[cfg(test)]
+mod shared_frame_cancellation_tests {
+    use super::*;
+    use airc_core::{ClientId, PeerId, RoomId};
+    use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
+    use airc_store::InMemoryEventStore;
+
+    #[tokio::test]
+    async fn saturated_attach_admission_observes_client_hangup_and_shutdown() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::build(
+            PeerId::new(),
+            PeerKeypair::generate(),
+            Arc::new(PeerKeyRegistry::new()),
+            VerificationPolicy::Strict,
+            home.path().to_owned(),
+            &home.path().join("events.sqlite"),
+            Arc::new(InMemoryEventStore::new()),
+            crate::DaemonRuntimeInfo::unknown(),
+        )
+        .await
+        .unwrap();
+        state.shared_frames = crate::shared_frames::SharedFrames::new(
+            1,
+            2 * airc_ipc::codec::MAX_FRAME_BYTES as usize,
+        );
+        let state = Arc::new(state);
+        let held_envelope = Arc::new(Envelope::new(
+            RoomId::new(),
+            (PeerId::new(), ClientId::new()),
+            Kind::StreamChunk,
+            DeliveryClass::StreamChunk,
+            bytes::Bytes::from_static(b"held by another writer"),
+        ));
+        let held = state.shared_frames.get(&held_envelope).await.unwrap();
+        for shutdown in [false, true] {
+            let channel = RoomId::new();
+            let (mut client, daemon) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let task = tokio::spawn(stream_attach(
+                reader,
+                writer,
+                state.clone(),
+                AttachRequest::new(channel, AttachStart::Live),
+            ));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+            let waiting = state.shared_frames.admission_waiting.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            state
+                .router
+                .publish(Envelope::new(
+                    channel,
+                    (PeerId::new(), ClientId::new()),
+                    Kind::StreamChunk,
+                    DeliveryClass::StreamChunk,
+                    bytes::Bytes::from_static(b"must await entry budget"),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .expect("actual cache admission must be saturated");
+            let mut client = Some(client);
+            if shutdown {
+                state.shutdown.notify_waiters();
+            } else {
+                drop(client.take());
+            }
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("existing cancellation must interrupt admission")
+                .unwrap()
+                .unwrap();
+            drop(client);
+        }
+        drop(held);
+        // No cancelled waiter can retain the admission slot after its writer is
+        // gone. This uses a fresh allocation and the real cache path.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.shared_frames.get(&Arc::new((*held_envelope).clone())),
+        )
+        .await
+        .expect("cancelled attach must release admission state")
+        .unwrap();
+    }
 }

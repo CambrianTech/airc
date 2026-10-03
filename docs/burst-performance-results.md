@@ -181,3 +181,180 @@ zero pins after2071ms of retry, drain and final set validation. This is a
 synthetic in-memory sink, not SQLite/network throughput. Initial attempts include
 tracking-clone overhead; fast rejection dominates their reported attempt rate.
 Independent source review approved the retry test and these measurement limits.
+
+## Shared attach-frame encoding (candidate, not deployed)
+
+The daemon reuses immutable CBOR event payloads by the actual Arc allocation,
+retaining a Weak identity rather than trusting event IDs. Distinct allocations
+with the same event ID remain distinct. OnceCell shares initialization while an
+entry is resident; eviction may cause a later encoding of that allocation.
+
+Initial admission limits are 128 entries and 64 MiB of CBOR buffer capacity,
+including evicted entries/frames still held by writers. Before encoding, a
+32 MiB conservative reservation precedes encoding; the exact event encoder
+allocates at most the legal 16 MiB once. The charge then shrinks to actual
+retained Vec capacity without copying.
+There can be at most two such encoders concurrently. The existing four-byte
+prefix stays on the writer stack. Existing Planus FlatBuffer workspace remains
+input-dependent and is NOT included in this shared-frame memory bound. Existing
+ordinary RPC Vec buffers are also outside it; this is not a total daemon-memory bound.
+
+The canonical IPC codec factors serialization from framed writing. Its event
+encoder computes the exact existing CBOR size and validates it before one
+allocation. Differential Serde tests guard bytes and full oversize diagnostics.
+Length prefix, socket errors and flush behavior remain unchanged. Ordinary RPC
+writes retain their original Serde/Vec path and serialization-error precedence.
+
+There is no unchecked fallback allocation. Under pressure, cache references are
+evicted and misses asynchronously await admission. Slow socket writers keep their
+charges until release, so sufficiently many stalled writers can delay unrelated
+rooms. This is an explicit bounded-memory/backpressure tradeoff, not a throughput
+or fairness claim. The same pinned daemon-shutdown and client-hangup futures now
+interrupt admission and event writes. No lock spans encoding or socket waits.
+
+Focused tests cover shared identity, same-ID distinction, exact legacy bytes,
+entry/byte admission publication interleavings, cancellation, retained charges,
+serialization failure, and socket failure. Actual stream_attach tests saturate
+admission and independently exercise hangup and shutdown using in-memory duplex
+streams. Reviewed isolated matrices are documented below; no live account or
+installed daemon is changed.
+
+### Superseded generic bounded-writer experiments
+
+Same six-case optimized matrix on the same Windows machine, one candidate run
+per implementation, not paired repetitions or sustained-load capacity:
+
+| Payload | Readers | Prior decoder-only completion | Shared-frame candidate completion |
+| ---: | ---: | ---: | ---: |
+| 256 B | 1 | 37.985 ms | 40.708 ms |
+| 256 B | 8 | 41.287 ms | 40.065 ms |
+| 256 B | 32 | 51.487 ms | 44.565 ms |
+| 64 KiB | 1 | 519.456 ms | 550.153 ms |
+| 64 KiB | 8 | 581.160 ms | 566.279 ms |
+| 64 KiB | 32 | 911.834 ms | 719.032 ms |
+
+All first-64 payload/order and immediate empty-inbox assertions passed (42630).
+The 32-reader large-payload case measured 178.02 MiB/s through validation.
+The one-reader large case was slower; this is not a universal speedup claim.
+An initial candidate also applied the bounded buffer to ordinary RPCs and had
+large-case completions 659.108/620.486/817.881 ms. That broader allocation change
+was removed: ordinary RPCs retain Vec while sharing canonical codec policy.
+No CPU attribution or independent total-allocation profile has been measured.
+
+Focused native cache/cancellation tests8/8 passed (83750); canonical codec tests
+11 passed, one manual benchmark remained ignored (38018). Independent review
+approved scoped benchmark safety after fixing a cache-publication/admission
+missed-wake race. Final workspace Clippy and formatting checks passed (50153)
+after the allocation-path narrowing. Hosted CI and deployed binary/public grid
+acceptance remain OPEN.
+
+The existing ignored codec-phase harness adds 16 warmup pairs and 512 timed
+pairs, alternating ordinary/bounded order on the same immutable event response.
+Byte equality is checked outside timing; allocation/drop are included, socket
+framing and scheduling are excluded. Per-call wall-time distributions:
+
+| Buffer / phase | Payload | Mean | p50 | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary, initial paired run | 64 KiB | 590.218 us | 583.800 us | 630.900 us |
+| Bounded, initial paired run | 64 KiB | 1417.719 us | 1391.500 us | 1476.600 us |
+| Ordinary, final paired run | 256 B | 3.956 us | 3.900 us | 4.100 us |
+| Bounded, final paired run | 256 B | 6.774 us | 6.800 us | 6.800 us |
+| Ordinary, final paired run | 64 KiB | 534.010 us | 511.300 us | 560.600 us |
+| Bounded, final paired run | 64 KiB | 999.723 us | 964.300 us | 1038.600 us |
+
+The superseded bounded writer used Vec length on capacity-fit writes and counts only
+discarded oversize bytes separately. That change alone did not materially reduce
+cost (bounded mean1427.912us in the intervening run). An explicit inline complete
+write implementation avoids the generic partial-write retry adapter; final
+paired12315 passed with lower bounded cost, which still exceeds ordinary cost.
+All frame limits and late serializer-error behavior remain tested and unchanged.
+These measurements do not isolate inlining from retry-adapter removal or establish
+whole-pipeline CPU attribution. Final matrix42630 still shows a slower single
+reader versus the earlier unpaired decoder-only run, and multi-reader timings
+varied between runs. Publication remains held for performance review; there is
+no claim of a universal speedup or deployed improvement.
+
+### Paired retained-binary comparison (publication held)
+
+Baseline commit `7321076` and the unchanged candidate above were built serially
+in the same release target. Source was preserved with a named stash including
+untracked files and a separate seven-file SHA256 backup; exact source hashes and
+tracked binary diff were verified after restoration. Restored old file mtimes
+caused Cargo to reuse the baseline IPC artifact; a scoped `cargo clean -p airc-ipc
+--release` removed 14 files (11.3 MiB), then the candidate rebuilt successfully.
+No source timestamp manipulation or live installation was used. Both test
+executables were retained independently and hashed before measurement.
+
+The existing matrix uses an in-process library daemon, not an external CLI.
+Three serial pairs alternate B/C, C/B, B/C. All 36 scenario assertions passed
+(session 43752). Completion includes validation; each sample has 64 events.
+
+| Payload | Readers | Baseline median [range], ms | Candidate median [range], ms | Median change |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 B | 1 | 38.763 [37.355–40.032] | 39.521 [39.516–40.088] | +1.96% |
+| 256 B | 8 | 41.326 [41.107–41.424] | 38.828 [38.555–43.234] | -6.04% |
+| 256 B | 32 | 48.594 [48.592–49.506] | 44.545 [44.113–46.506] | -8.33% |
+| 64 KiB | 1 | 540.649 [528.703–555.690] | 585.719 [572.987–591.908] | +8.34% |
+| 64 KiB | 8 | 565.503 [556.075–567.721] | 551.756 [547.042–555.562] | -2.43% |
+| 64 KiB | 32 | 877.735 [874.432–932.199] | 764.297 [744.349–813.880] | -12.92% |
+
+The large single-reader ranges do not overlap: the candidate's cost is real in
+these runs, despite fanout improvements. Publication remains held. Three pairs
+are not a sustained-load capacity study or CPU attribution. Final formatting,
+eight cache tests and full workspace Clippy passed (86034) before source
+preservation. Logs, JSON measurements, preserved source and both executable
+hashes are retained in `D:/airc-build/doria/shared-frame-paired-20261003`.
+### Exact canonical event encoder candidate
+
+The next narrow change adds an IPC-owned encoder for the exact existing Event
+shape: the same tagged map prefix, shortest definite-array length and canonical
+unsigned u8 sequence. It computes checked complete length, applies the existing
+frame limit before allocation, then fills one exact-capacity buffer. It does not
+change the wire format, generic RPC serialization, cache admission or cancellation.
+The cache retains its conservative reservation; no allocation-bound bypass was
+introduced. Serde `Response::event_ref` remains the differential oracle, including
+all byte values, array length boundaries, mixed inputs, exact limit and oversize
+error text. Thirteen codec tests and eight cache/stream-cancellation tests pass;
+full workspace Clippy passes (61753/92426). Independent review approved benchmark
+safety, not an unconditional performance or deployment claim.
+
+The existing paired codec harness (38485), with 16 warmup pairs and 512 alternating
+pairs, measured ordinary versus exact-event mean/p50/p95 in microseconds:
+
+| Payload | Ordinary | Exact event |
+| ---: | ---: | ---: |
+| 256 B | 4.035 / 4.000 / 4.100 | 0.972 / 0.900 / 1.000 |
+| 64 KiB | 578.887 / 577.800 / 615.900 | 161.857 / 166.800 / 181.500 |
+
+A newly retained candidate executable was then compared against the same retained
+baseline in three new pairs, B/C, C/B, B/C. All 36 scenario assertions passed
+(53162). No source changed during measurement.
+
+| Payload | Readers | Baseline median [range], ms | Candidate median [range], ms | Median change |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 B | 1 | 38.072 [37.927–38.213] | 37.582 [37.398–37.757] | -1.29% |
+| 256 B | 8 | 40.732 [40.124–43.177] | 40.607 [39.837–40.638] | -0.31% |
+| 256 B | 32 | 50.018 [47.728–50.993] | 46.913 [45.220–47.726] | -6.21% |
+| 64 KiB | 1 | 534.965 [511.832–612.476] | 500.423 [491.579–512.881] | -6.46% |
+| 64 KiB | 8 | 555.271 [552.395–575.992] | 526.961 [505.545–547.661] | -5.10% |
+| 64 KiB | 32 | 875.315 [862.397–897.689] | 682.473 [679.507–683.247] | -22.03% |
+
+The earlier consistent single-reader regression is absent in these pairs; its
+large-payload ranges now overlap slightly. The 32-reader reduction is larger and
+nonoverlapping in these runs. This remains a short local experiment, not a claim
+of universal speedup, total CPU savings, deployed improvement or sustained capacity.
+Hosted CI, publication review and actual deployed grid acceptance remain open.
+Exact-event logs, binary hash and JSON results are retained beside the prior
+comparison in `D:/airc-build/doria/shared-frame-paired-20261003`.
+The unused generic bounded-writer API and implementation were removed after the
+exact-event measurements. Historical results above remain as the decision record;
+only the original generic codec and specialized exact-event encoder are shipped.
+
+PR #1521's first hosted Clippy run rejected metadata-lock unwraps and semaphore
+expect calls under its separate production-only policy. The local all-targets
+command had omitted that stricter existing command. Metadata poison now returns
+an explicit `Other` I/O error; closed admission budgets return `BrokenPipe`.
+Neither path silently recovers or retries. Focused tests cover poison, release of
+an uninserted permit, immediate/waiting closure of both budgets and final permit
+accounting. Existing admitted frames can still be served after budget closure;
+closure here is an admission failure, not a global shutdown contract.
