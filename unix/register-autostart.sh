@@ -51,17 +51,31 @@ autostart_plist() {
 PLIST
 }
 
+# A value for a double-quoted systemd unit setting: backslash and quote are escaped
+# C-style, and % is doubled so a path is never read as a specifier (%h, %u, ...).
+_systemd_quote() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
+}
+
+# The inverse, for reading back a value this script wrote.
+_systemd_unquote() {
+  printf '%s' "$1" | sed -e 's/%%/%/g' -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+}
+
 # The systemd user unit for <airc-path>, <path>.
 autostart_unit() {
+  local airc path
+  airc="$(_systemd_quote "$1")"
+  path="$(_systemd_quote "$2")"
   cat <<UNITFILE
 [Unit]
 Description=Keep this node on the airc mesh: run airc join from login and restart it if it exits
 
 [Service]
 Type=simple
-ExecStart="$1" join
+ExecStart="$airc" join
 Environment=AIRC_SUPERVISOR=1
-Environment="PATH=$2"
+Environment="PATH=$path"
 WorkingDirectory=%h
 Restart=always
 RestartSec=120
@@ -121,7 +135,7 @@ _register_systemd() {
   if [ "$check" = 1 ]; then
     [ -f "$unit" ] || { printf 'AIRC autostart: %s is not registered\n' "$UNIT" >&2; return 1; }
     local registered_path
-    registered_path="$(sed -n 's/^Environment="PATH=\(.*\)"$/\1/p' "$unit")"
+    registered_path="$(_systemd_unquote "$(sed -n 's/^Environment="PATH=\(.*\)"$/\1/p' "$unit")")"
     [ "$(cat "$unit")" = "$(autostart_unit "$airc" "$registered_path")" ] ||
       { printf 'AIRC autostart: %s runs a different command than %s\n' "$UNIT" "$airc" >&2; return 1; }
     systemctl --user is-enabled --quiet "$UNIT" 2>/dev/null ||

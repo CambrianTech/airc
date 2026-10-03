@@ -28,4 +28,13 @@ grep -qx 'WorkingDirectory=%h' <<<"$unit" || fail "unit does not run from the ac
 grep -qx 'Restart=always' <<<"$unit" || fail "unit does not restart join when it exits"
 grep -qx 'WantedBy=default.target' <<<"$unit" || fail "unit is not started with the user session"
 
+# Review of #1496: quoting alone does not escape a quote, a backslash or a % (a
+# systemd specifier). The fixed template keeps its own %h.
+odd='/opt/a "b"\c 100%/airc'
+unit="$(autostart_unit "$odd" '/x%y:/z"q')"
+grep -qxF 'ExecStart="/opt/a \"b\"\\c 100%%/airc" join' <<<"$unit" || fail "unit does not escape quote, backslash and % in the executable: $(grep ExecStart <<<"$unit")"
+grep -qxF 'Environment="PATH=/x%%y:/z\"q"' <<<"$unit" || fail "unit does not escape the PATH value: $(grep PATH <<<"$unit")"
+grep -qx 'WorkingDirectory=%h' <<<"$unit" || fail "the template's own %h must stay a specifier"
+[ "$(_systemd_unquote "$(_systemd_quote "$odd")")" = "$odd" ] || fail "systemd quoting does not round-trip"
+
 echo "✓ unix autostart renders a home-scoped, self-restarting airc join supervisor"
