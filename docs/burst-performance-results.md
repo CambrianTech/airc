@@ -112,3 +112,32 @@ attributing full pipeline latency to that phase. Independent source review
 approved measurement framing with the limits above.
 
 Run: cargo test --release -p airc-daemon --test owner_core_proof bench_stream_codec_phases -- --ignored --exact --nocapture
+
+## Canonical event response decoding
+
+The production candidate recognizes only the current writer's exact two-field
+CBOR event representation: fixed field order, shortest definite array lengths,
+and canonical u8 values. Every other frame goes untouched to the original
+Response decoder. The wire format and serialization are unchanged. This avoids
+the generic tagged-enum buffer on common live events without changing accepted
+noncanonical representations. An earlier high-level visitor prototype was
+rejected and removed because normalization changed edge-case acceptance.
+
+Same optimized six-case harness and machine, one run each (not a controlled
+sustained-load capacity result):
+
+| Payload | Readers | Baseline validated completion | Candidate validated completion |
+| ---: | ---: | ---: | ---: |
+| 256 B | 1 | 38.891 ms | 37.985 ms |
+| 256 B | 8 | 42.480 ms | 41.287 ms |
+| 256 B | 32 | 54.879 ms | 51.487 ms |
+| 64 KiB | 1 | 952.912 ms | 519.456 ms |
+| 64 KiB | 8 | 930.150 ms | 581.160 ms |
+| 64 KiB | 32 | 3086.588 ms | 911.834 ms |
+
+All cases passed first-64 payload/order and immediate empty-inbox checks. The
+largest case carries 128 MiB aggregate reader payload and measured 140.38 MiB/s
+through validation. No live account daemon or deployed network was changed.
+Independent source review approved the raw-frame subset and untouched fallback;
+IPC differential mutation/boundary tests, full IPC suite, and workspace Clippy
+passed. Existing generic codec phase tests still measure the original decoder.

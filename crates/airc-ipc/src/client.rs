@@ -13,7 +13,9 @@ use std::path::PathBuf;
 
 use tokio::time::{timeout, Duration};
 
-use crate::codec::{read_frame, write_frame};
+#[cfg(test)]
+use crate::codec::read_frame;
+use crate::codec::{read_response_frame, write_frame};
 use crate::transport::IpcStream;
 
 use crate::request::{
@@ -153,7 +155,7 @@ impl DaemonClient {
             .await
             .map_err(ClientError::Io)?;
         observer(RpcPhase::RequestWritten);
-        let response: Response = read_frame(&mut reader)
+        let response: Response = read_response_frame(&mut reader)
             .await
             .map_err(ClientError::Io)?
             .ok_or_else(|| {

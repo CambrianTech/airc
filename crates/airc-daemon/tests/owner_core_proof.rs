@@ -24,7 +24,7 @@ use airc_bus::envelope::{DeliveryClass, Envelope, Kind};
 use airc_core::{HeaderFilter, Headers, PeerId, RoomId};
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
 use airc_ipc::client::RpcPhase;
-use airc_ipc::codec::read_frame;
+use airc_ipc::codec::{read_frame, read_response_frame};
 use airc_ipc::{
     AttachRequest, DaemonClient, InboxRequest, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
     Request, Response, SendRequest,
@@ -238,7 +238,7 @@ async fn persona_collect(
         .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
-    match read_frame::<_, Response>(&mut stream).await {
+    match read_response_frame(&mut stream).await {
         Ok(Some(Response::Ok)) => {}
         other => panic!("expected Ok ack from attach, got {other:?}"),
     }
@@ -246,11 +246,7 @@ async fn persona_collect(
 
     let mut out = Vec::with_capacity(want);
     while out.len() < want {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            read_frame::<_, Response>(&mut stream),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(20), read_response_frame(&mut stream)).await
         {
             Ok(Ok(Some(Response::Event { envelope }))) => {
                 let env = airc_wire::decode(envelope.into()).expect("decode airc-wire event");
@@ -277,7 +273,7 @@ async fn collect_envelopes(
         .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
-    match read_frame::<_, Response>(&mut stream).await {
+    match read_response_frame(&mut stream).await {
         Ok(Some(Response::Ok)) => {}
         other => panic!("expected Ok ack, got {other:?}"),
     }
@@ -285,11 +281,7 @@ async fn collect_envelopes(
 
     let mut out = Vec::with_capacity(want);
     while out.len() < want {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            read_frame::<_, Response>(&mut stream),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(20), read_response_frame(&mut stream)).await
         {
             Ok(Ok(Some(Response::Event { envelope }))) => {
                 out.push(airc_wire::decode(envelope.into()).expect("decode"));
@@ -718,16 +710,14 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
             .await
             .expect("worker attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         worker_ready.wait().await;
         let cmd = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode command");
             }
@@ -766,16 +756,14 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
             .await
             .expect("requester attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         req_ready.wait().await;
         let result = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode result");
             }
@@ -848,17 +836,14 @@ async fn attach_header_filter_scopes_subscription_router_side() {
             .await
             .expect("attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         r.wait().await;
         let mut got = Vec::new();
         while got.len() < 2 {
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                .await
             {
                 Ok(Ok(Some(Response::Event { envelope }))) => {
                     got.push(airc_wire::decode(envelope.into()).expect("decode"));
@@ -1154,7 +1139,7 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
             .await
             .unwrap();
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         streams.push(stream);
@@ -1196,14 +1181,12 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
         // every decoded frame through it, without a timer-based absence claim.
         let mut replies = 0;
         loop {
-            let frame = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            let frame =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
             let Response::Event { envelope } = frame else {
                 panic!("expected event")
             };
