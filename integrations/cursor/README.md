@@ -15,7 +15,8 @@ airc join --no-room        # legacy 1:1 invite mode (prints inline join string; 
 For "always on" so the mesh survives sleep/wake/crash:
 
 ```bash
-airc daemon install           # launchd (mac) / systemd-user (linux)
+# install.sh registers this for you: launchd on macOS, a systemd user unit on Linux.
+# AIRC_AUTOSTART=0 skips it. Rerunning install.sh repairs it.
 ```
 
 Then add to `.cursorrules`:
