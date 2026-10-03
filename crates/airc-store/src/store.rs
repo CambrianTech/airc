@@ -116,7 +116,10 @@ pub trait EventStore: Send + Sync {
         consumer_id: &str,
     ) -> Result<Option<TranscriptCursor>, StoreError>;
 
-    /// Persist a named runtime consumer's checkpoint.
+    /// Advance a named runtime consumer's checkpoint atomically in full
+    /// transcript order `(lamport, event_id)`. Equal or older saves succeed
+    /// without changing the checkpoint; reconnects and concurrent consumers
+    /// sharing an identifier must never rewind already-consumed history.
     async fn save_runtime_cursor(
         &self,
         consumer_id: &str,

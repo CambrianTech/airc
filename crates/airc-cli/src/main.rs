@@ -609,6 +609,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Events(args) => match args.action {
+            EventsAction::Contains { event_id, json } => {
+                events_commands::run_contains(&home, event_id, json).await
+            }
             EventsAction::List {
                 kind,
                 header,

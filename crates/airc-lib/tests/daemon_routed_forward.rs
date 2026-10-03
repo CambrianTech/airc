@@ -246,7 +246,8 @@ async fn routed_room_send_traverses_lan_both_directions() {
 /// The daemon's gateway is NOT IPC-attached and does not subscribe to the
 /// project room. Both history and the hosted-room set must come from its real
 /// owner bridge. Seed before installing the forwarder so live delivery cannot
-/// disguise a broken backfill. The oldest card lies behind the former500 tail.
+/// disguise a broken backfill. The oldest card lies behind the former500 tail;
+/// a later room's first page must arrive before this busy room's second page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
     use airc_bus::{DeliveryClass, Envelope, Kind};
@@ -313,6 +314,26 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
             tokio::task::yield_now().await;
         }
     }
+    // This fixed name sorts after ROOM under the pinned mesh identity. Keep
+    // separate scopes so the existing project/default-room controls remain.
+    let quiet_publisher = source.attach("quiet-publisher").await;
+    let quiet_room = quiet_publisher
+        .join("quiet-backfill-marker-14")
+        .await
+        .expect("quiet source room");
+    assert!(room.channel.0 < quiet_room.channel.0);
+    let quiet_id = quiet_publisher
+        .say("a quiet room must not wait for another room's old history")
+        .await
+        .expect("quiet marker persists before any connection");
+    let first_page = source
+        .daemon
+        .router()
+        .durable_tail(room.channel, airc_lib::backfill::BACKFILL_PAGE)
+        .await
+        .expect("initial source page");
+    assert_eq!(first_page.len(), airc_lib::backfill::BACKFILL_PAGE);
+    let second_page_before = first_page.first().expect("nonempty source page").cursor();
     let source_forwarder =
         RoutedForwarder::install(&source.daemon.router(), RoutedForwarderConfig::default());
     source_forwarder.add_link(source_gateway.clone()).await;
@@ -329,6 +350,15 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
         .expect("control");
     let reader = receiving.machine.attach("project-reader").await;
     reader.join(ROOM).await.expect("reader joins project only");
+    let quiet_reader = receiving.machine.attach("quiet-reader").await;
+    assert_eq!(
+        quiet_reader
+            .join("quiet-backfill-marker-14")
+            .await
+            .expect("quiet reader room")
+            .channel,
+        quiet_room.channel
+    );
     for gateway in [&source_gateway, &receiving.gateway] {
         assert!(!gateway.is_daemon_attached(), "actual daemon-host shape");
         assert!(gateway
@@ -346,6 +376,9 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
         .is_none());
     let mut changes = reader.subscribe().await.expect("arm recovery observer");
     let mut pending: std::collections::HashSet<_> = expected.iter().copied().collect();
+    let mut emitted = std::collections::HashMap::<EventId, usize>::new();
+    let mut first_consumed = None;
+    let mut last_consumed = None;
     common::trust(&receiving.gateway, &source_gateway).await;
     let source_addr = source_gateway
         .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -377,6 +410,14 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
         (stop, task)
     };
     let (stop, hop) = start_hop();
+    let (captured, captured_page) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *history_probe.hold.lock().expect("history gate") = Some(HeldHistoryPage {
+        channel: room.channel,
+        before: Some(second_page_before),
+        captured,
+        released,
+    });
     // Fresh/down route tables must become send-ready before either connection
     // callback dispatches recovery, including the accepted-session direction.
     clear_route_health([&source_gateway, &receiving.gateway]);
@@ -386,6 +427,41 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
         .await
         .expect("initial authenticated session");
     // No room send wakes the forwarder: the connection itself starts recovery.
+    tokio::time::timeout(Duration::from_secs(10), captured_page)
+        .await
+        .expect("busy room reaches its exact second-page cursor")
+        .expect("captured second page signal");
+    assert_eq!(
+        wait_for_copies(&quiet_reader, quiet_id).await,
+        1,
+        "later room recovers while the earlier room's second page is held"
+    );
+    {
+        let reads = history_probe.reads.lock().expect("history read trace");
+        let first = reads
+            .iter()
+            .position(|read| *read == (room.channel, None))
+            .expect("busy room first page");
+        let quiet = reads
+            .iter()
+            .position(|read| *read == (quiet_room.channel, None))
+            .expect("quiet room first page");
+        let second = reads
+            .iter()
+            .position(|read| *read == (room.channel, Some(second_page_before)))
+            .expect("busy room second page");
+        assert!(
+            first < quiet && quiet < second,
+            "request pages fairly, preserving the responder cursor: {reads:?}"
+        );
+    }
+    assert!(reader
+        .work_board()
+        .await
+        .expect("busy history remains incomplete while its second page is held")
+        .card(card_id)
+        .is_none());
+    release.send(()).expect("release busy room's second page");
     // The oldest creation is first in the final ascending page. Seeing it
     // alone is not a barrier for the remaining frames in that page.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -395,11 +471,44 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
                 .await
                 .expect("recovery observer remains open")
                 .expect("recovery observer did not lag");
-            pending.remove(&event.event_id);
+            *emitted.entry(event.event_id).or_default() += 1;
+            if pending.remove(&event.event_id) {
+                first_consumed.get_or_insert_with(|| Arc::clone(&event));
+                last_consumed = Some(event);
+            }
         }
     })
     .await
     .expect("all expected owner-history frames arrive before the final assertion");
+    let first_consumed = first_consumed.expect("first delivered history event");
+    let last_consumed = last_consumed.expect("last delivered history event");
+    let consumer = "join-feed:fixture-reader";
+    let other_consumer = "persona:fixture-reader";
+    reader
+        .save_runtime_cursor_for_event(consumer, &last_consumed)
+        .await
+        .expect("checkpoint consumed history");
+    reader
+        .save_runtime_cursor_for_event(other_consumer, &first_consumed)
+        .await
+        .expect("independent consumer remains at its own position");
+    reader
+        .save_runtime_cursor_for_event(consumer, &first_consumed)
+        .await
+        .expect("a late older acknowledgement succeeds without rewinding");
+    let reopened_reader = receiving.machine.attach("project-reader").await;
+    assert_eq!(
+        reopened_reader.load_runtime_cursor(consumer).await.unwrap(),
+        Some(last_consumed.cursor()),
+        "a reopened consumer retains its durable full-tuple checkpoint"
+    );
+    assert_eq!(
+        reopened_reader
+            .load_runtime_cursor(other_consumer)
+            .await
+            .unwrap(),
+        Some(first_consumed.cursor())
+    );
     assert!(reader
         .work_board()
         .await
@@ -484,6 +593,7 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
     let (release, released) = tokio::sync::oneshot::channel();
     *history_probe.hold.lock().expect("history gate") = Some(HeldHistoryPage {
         channel: room.channel,
+        before: None,
         captured,
         released,
     });
@@ -559,6 +669,53 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
     assert_eq!(wait_for_copies(&reader, offline_created).await, 1);
     assert_eq!(wait_for_copies(&reader, later_id).await, 1);
     assert_eq!(wait_for_copies(&publisher, reverse_id).await, 1);
+    let mut fresh: std::collections::HashSet<_> = [offline_created, reverse_id, later_id]
+        .into_iter()
+        .collect();
+    let mut newest_consumed = None;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !fresh.is_empty() {
+            let event = changes
+                .next()
+                .await
+                .expect("consumer stream survives repeated reconnects")
+                .expect("consumer stream did not lag");
+            *emitted.entry(event.event_id).or_default() += 1;
+            fresh.remove(&event.event_id);
+            newest_consumed = Some(event);
+        }
+    })
+    .await
+    .expect("new offline events reach the actual consumer, not only storage");
+    // later_id requires the pending pass, so this stream has also crossed
+    // the earlier pass's replay of all 650 already-consumed history events.
+    for event_id in expected
+        .iter()
+        .chain([offline_created, reverse_id, later_id].iter())
+    {
+        assert_eq!(
+            emitted.get(event_id),
+            Some(&1),
+            "one live emission per event through repeated history replay: {event_id}"
+        );
+    }
+    let newest_consumed = newest_consumed.expect("new history delivered");
+    reader
+        .save_runtime_cursor_for_event(consumer, &newest_consumed)
+        .await
+        .expect("advance only after consumption");
+    assert_eq!(
+        reopened_reader.load_runtime_cursor(consumer).await.unwrap(),
+        Some(newest_consumed.cursor())
+    );
+    assert_eq!(
+        reopened_reader
+            .load_runtime_cursor(other_consumer)
+            .await
+            .unwrap(),
+        Some(first_consumed.cursor()),
+        "recovery does not advance a different reader's bookmark"
+    );
     assert_eq!(
         history_probe.max_active.load(Ordering::SeqCst),
         1,
@@ -588,6 +745,17 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
             "overlapping initial/reconnect pages retain one durable copy"
         );
     }
+    assert_eq!(
+        copies_in(
+            &quiet_reader
+                .page_recent(16)
+                .await
+                .expect("quiet final history"),
+            quiet_id
+        ),
+        1,
+        "overlapping reconnect passes retain the quiet marker exactly once"
+    );
     stop.send(()).expect("close final fixture hop");
     hop.await.expect("final hop stopped");
 }
@@ -603,6 +771,7 @@ struct ControlledHistory {
 
 struct HeldHistoryPage {
     channel: airc_core::RoomId,
+    before: Option<airc_bus::Cursor>,
     captured: tokio::sync::oneshot::Sender<()>,
     released: tokio::sync::oneshot::Receiver<()>,
 }
@@ -610,6 +779,7 @@ struct HeldHistoryPage {
 #[derive(Default)]
 struct HistoryReadProbe {
     hold: std::sync::Mutex<Option<HeldHistoryPage>>,
+    reads: std::sync::Mutex<Vec<(airc_core::RoomId, Option<airc_bus::Cursor>)>>,
     active: AtomicUsize,
     max_active: AtomicUsize,
 }
@@ -636,12 +806,20 @@ impl InboundFrameSink for ControlledHistory {
         if let Some(probe) = &self.probe {
             let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
             probe.max_active.fetch_max(active, Ordering::SeqCst);
+            probe
+                .reads
+                .lock()
+                .expect("history read trace")
+                .push((channel, before));
         }
         let page = self.inner.backfill_page(channel, before, limit).await;
         if let Some(probe) = &self.probe {
             let hold = {
                 let mut held = probe.hold.lock().expect("history gate");
-                if held.as_ref().is_some_and(|held| held.channel == channel) {
+                if held
+                    .as_ref()
+                    .is_some_and(|held| held.channel == channel && held.before == before)
+                {
                     held.take()
                 } else {
                     None

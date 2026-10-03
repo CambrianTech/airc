@@ -110,6 +110,31 @@ impl SqliteDurableSink {
         Self::open(&sqlite_file_url(path)).await
     }
 
+    /// Inspect an existing owner store without creating it, migrating it, or
+    /// changing journal mode. Ordinary reads see the live WAL; this is not an
+    /// immutable snapshot. Missing files/schema and read failures stay errors.
+    pub async fn open_read_only_path(path: &Path) -> Result<Self, BusError> {
+        let path = path.to_owned();
+        let mut opts = ConnectOptions::new("sqlite::memory:");
+        opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .max_connections(1)
+            .sqlx_logging(false);
+        // Supply the native filename through the typed driver, not a URI: `?`
+        // and `#` in a path must not become connection parameters.
+        opts.map_sqlx_sqlite_opts(move |_| {
+            sea_orm::sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true)
+                .create_if_missing(false)
+                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
+        });
+        let db = Database::connect(opts)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+        Ok(Self { db })
+    }
+
     /// Open an ephemeral in-memory durable tier. Convenience for tests.
     pub async fn in_memory() -> Result<Self, BusError> {
         Self::open("sqlite::memory:").await
@@ -568,6 +593,31 @@ mod tests {
         let page = sink.page(ch, None, 100).await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0], e, "full envelope round-trips through the row");
+    }
+
+    #[tokio::test]
+    async fn read_only_owner_observation_sees_wal_and_refuses_writes_or_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner # store.sqlite");
+        assert!(SqliteDurableSink::open_read_only_path(&path).await.is_err());
+        assert!(!path.exists(), "inspection must never create the store");
+        let writer = SqliteDurableSink::open_path(&path).await.unwrap();
+        let reader = SqliteDurableSink::open_read_only_path(&path).await.unwrap();
+        let event = durable_at(RoomId::from_u128(7), 1, 0);
+        assert!(!reader.contains(event.event_id).await.unwrap());
+        writer.append(&event).await.unwrap();
+        assert!(reader.contains(event.event_id).await.unwrap());
+        let another = durable_at(event.channel, 1, 1);
+        assert!(reader.append(&another).await.is_err());
+        assert!(!writer.contains(another.event_id).await.unwrap());
+
+        let empty = dir.path().join("uninitialized.sqlite");
+        std::fs::File::create(&empty).unwrap();
+        let uninitialized = SqliteDurableSink::open_read_only_path(&empty)
+            .await
+            .unwrap();
+        assert!(uninitialized.contains(event.event_id).await.is_err());
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
     }
 
     #[tokio::test]

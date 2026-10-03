@@ -216,6 +216,7 @@ dependencies = [
 name = "airc-cli"
 version = "0.1.0"
 dependencies = [
+ "airc-bus",
  "airc-core",
  "airc-daemon",
  "airc-diagnostics",
