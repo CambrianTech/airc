@@ -31,9 +31,9 @@ resumes service. Ordinary `airc update` preserves stopped state.
 
 ## When to use
 
-- A previous `airc join` left a daemon you want to bounce (e.g. to pick up a new airc binary).
+- You explicitly want AIRC to remain stopped until a later resume.
 - You want the account daemon stopped, including its subscribed project scopes.
-- Before re-arming a fresh `airc join` Monitor after `airc update`.
+- For binary adoption, use the guarded updater described in `/update`; it owns its transient handoff.
 
 ## State-wipe (the old `--flush`)
 
@@ -47,7 +47,8 @@ resumes service. Ordinary `airc update` preserves stopped state.
 ## Read the result
 
 - Daemon was running → it shuts down and `airc stop` returns.
-- No daemon for this account → records the same durable stop intent successfully.
+- No daemon or starting child for this account → records the same durable stop intent successfully.
+- A child is still starting → retains stop intent and reports that shutdown is unconfirmed. The child rechecks intent before serving; do not treat this error as process absence.
 
 ## Scope-awareness
 
