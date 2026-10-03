@@ -6,13 +6,13 @@
 //! asynchronous backpressure rather than an unaccounted encoding fallback.
 use std::collections::VecDeque;
 use std::io;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use airc_bus::Envelope;
 use airc_ipc::codec::{encode_event_frame_payload, MAX_FRAME_BYTES};
 #[cfg(test)]
 use airc_ipc::Response;
-use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 // Keep a conservative two-frame reservation before encoding; exact CBOR is
 // allocated once, then charged at retained capacity. The prefix stays on stack.
@@ -66,45 +66,59 @@ impl SharedFrames {
         }
     }
 
-    fn lookup(&self, envelope: &Arc<Envelope>) -> Option<Arc<Entry>> {
-        let identity = Arc::downgrade(envelope);
+    fn metadata(&self) -> io::Result<MutexGuard<'_, VecDeque<Arc<Entry>>>> {
         self.entries
             .lock()
-            .unwrap()
+            .map_err(|_| io::Error::other("shared frame cache metadata poisoned"))
+    }
+
+    fn closed_budget(name: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("shared frame {name} budget closed"),
+        )
+    }
+
+    fn lookup(&self, envelope: &Arc<Envelope>) -> io::Result<Option<Arc<Entry>>> {
+        let identity = Arc::downgrade(envelope);
+        Ok(self
+            .metadata()?
             .iter()
             .find(|entry| Weak::ptr_eq(&entry.identity.envelope, &identity))
-            .cloned()
+            .cloned())
     }
 
     // Only metadata is locked. Dropping a cache reference cannot release a
     // frame's permits while a socket writer still holds that frame.
-    fn evict(&self, protected: Option<&Arc<Entry>>) -> bool {
-        let mut entries = self.entries.lock().unwrap();
+    fn evict(&self, protected: Option<&Arc<Entry>>) -> io::Result<bool> {
+        let mut entries = self.metadata()?;
         let index = entries
             .iter()
             .position(|entry| protected.is_none_or(|protected| !Arc::ptr_eq(entry, protected)));
-        index.and_then(|index| entries.remove(index)).is_some()
+        Ok(index.and_then(|index| entries.remove(index)).is_some())
     }
 
-    async fn entry(&self, envelope: &Arc<Envelope>) -> Arc<Entry> {
-        if let Some(entry) = self.lookup(envelope) {
-            return entry;
+    async fn entry(&self, envelope: &Arc<Envelope>) -> io::Result<Arc<Entry>> {
+        if let Some(entry) = self.lookup(envelope)? {
+            return Ok(entry);
         }
         let permit = loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if let Some(entry) = self.lookup(envelope) {
-                return entry;
+            if let Some(entry) = self.lookup(envelope)? {
+                return Ok(entry);
             }
-            if let Ok(permit) = self.entry_budget.clone().try_acquire_owned() {
-                break permit;
+            match self.entry_budget.clone().try_acquire_owned() {
+                Ok(permit) => break permit,
+                Err(TryAcquireError::Closed) => return Err(Self::closed_budget("entry")),
+                Err(TryAcquireError::NoPermits) => {}
             }
-            if !self.evict(None) {
+            if !self.evict(None)? {
                 #[cfg(test)]
                 self.admission_waiting.notify_waiters();
                 tokio::select! {
-                    permit = self.entry_budget.clone().acquire_owned() => break permit.expect("private budget stays open"),
+                    permit = self.entry_budget.clone().acquire_owned() => break permit.map_err(|_| Self::closed_budget("entry"))?,
                     _ = changed => {},
                 }
             }
@@ -112,15 +126,19 @@ impl SharedFrames {
         self.insert(envelope, permit)
     }
 
-    fn insert(&self, envelope: &Arc<Envelope>, permit: OwnedSemaphorePermit) -> Arc<Entry> {
-        let mut entries = self.entries.lock().unwrap();
+    fn insert(
+        &self,
+        envelope: &Arc<Envelope>,
+        permit: OwnedSemaphorePermit,
+    ) -> io::Result<Arc<Entry>> {
+        let mut entries = self.metadata()?;
         // A different task may have installed this identity while we waited.
         let identity = Arc::downgrade(envelope);
         if let Some(entry) = entries
             .iter()
             .find(|entry| Weak::ptr_eq(&entry.identity.envelope, &identity))
         {
-            return entry.clone();
+            return Ok(entry.clone());
         }
         let entry = Arc::new(Entry {
             identity: Arc::new(Identity {
@@ -131,26 +149,28 @@ impl SharedFrames {
         });
         entries.push_back(entry.clone());
         self.changed.notify_waiters();
-        entry
+        Ok(entry)
     }
 
-    async fn reserve_encoding(&self, entry: &Arc<Entry>) -> OwnedSemaphorePermit {
+    async fn reserve_encoding(&self, entry: &Arc<Entry>) -> io::Result<OwnedSemaphorePermit> {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if let Ok(permit) = self
+            match self
                 .byte_budget
                 .clone()
                 .try_acquire_many_owned(ENCODING_RESERVATION as u32)
             {
-                return permit;
+                Ok(permit) => return Ok(permit),
+                Err(TryAcquireError::Closed) => return Err(Self::closed_budget("byte")),
+                Err(TryAcquireError::NoPermits) => {}
             }
-            if !self.evict(Some(entry)) {
+            if !self.evict(Some(entry))? {
                 #[cfg(test)]
                 self.admission_waiting.notify_waiters();
                 tokio::select! {
-                    permit = self.byte_budget.clone().acquire_many_owned(ENCODING_RESERVATION as u32) => return permit.expect("private budget stays open"),
+                    permit = self.byte_budget.clone().acquire_many_owned(ENCODING_RESERVATION as u32) => return permit.map_err(|_| Self::closed_budget("byte")),
                     _ = changed => {},
                 }
             }
@@ -158,13 +178,13 @@ impl SharedFrames {
     }
 
     pub(crate) async fn get(&self, envelope: &Arc<Envelope>) -> io::Result<Arc<SharedFrame>> {
-        let entry = self.entry(envelope).await;
+        let entry = self.entry(envelope).await?;
         let result = entry
             .frame
             .get_or_try_init(|| async {
                 // Reserve BEFORE either encoding allocation. No cache lock spans
                 // this wait, serialization, or the caller's socket writes.
-                let mut reservation = self.reserve_encoding(&entry).await;
+                let mut reservation = self.reserve_encoding(&entry).await?;
                 let wire = airc_wire::encode(envelope);
                 let payload = encode_event_frame_payload(&wire)?;
                 drop(wire);
@@ -203,6 +223,74 @@ mod tests {
             DeliveryClass::StreamChunk,
             payload.into(),
         ))
+    }
+
+    #[tokio::test]
+    async fn poisoned_metadata_returns_error_and_releases_uninserted_permit() {
+        let cache = Arc::new(SharedFrames::new(1, ENCODING_RESERVATION));
+        let poison = cache.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poison.entries.lock().unwrap();
+            panic!("controlled cache metadata poison");
+        })
+        .join()
+        .is_err());
+        let event = envelope(Bytes::from_static(b"poison"));
+        let error = cache.get(&event).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("metadata poisoned"));
+        let permit = cache.entry_budget.clone().acquire_owned().await.unwrap();
+        assert!(cache.insert(&event, permit).is_err());
+        assert_eq!(cache.entry_budget.available_permits(), 1);
+        assert_eq!(cache.byte_budget.available_permits(), ENCODING_RESERVATION);
+        assert!(cache.evict(None).is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_budgets_fail_immediate_and_waiting_admission_without_leaks() {
+        for byte_budget in [false, true] {
+            for close_while_waiting in [false, true] {
+                let cache = SharedFrames::new(1, ENCODING_RESERVATION);
+                let budget = if byte_budget {
+                    cache.byte_budget.clone()
+                } else {
+                    cache.entry_budget.clone()
+                };
+                let permits = budget.available_permits();
+                let held = if close_while_waiting {
+                    Some(
+                        budget
+                            .clone()
+                            .acquire_many_owned(permits as u32)
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let event = envelope(Bytes::from_static(b"closed"));
+                let mut pending = Box::pin(cache.get(&event));
+                if close_while_waiting {
+                    assert!(pending.as_mut().now_or_never().is_none());
+                }
+                budget.close();
+                let error = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                    .await
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                assert!(error.to_string().contains(if byte_budget {
+                    "byte budget closed"
+                } else {
+                    "entry budget closed"
+                }));
+                drop(held);
+                while cache.evict(None).unwrap() {}
+                assert_eq!(cache.entry_budget.available_permits(), 1);
+                assert_eq!(cache.byte_budget.available_permits(), ENCODING_RESERVATION);
+            }
+        }
     }
 
     #[tokio::test]
@@ -252,7 +340,7 @@ mod tests {
         let second = envelope(Bytes::from_static(b"next"));
         let held = cache.get(&first).await.unwrap();
         let charged = held.payload.capacity();
-        assert!(cache.evict(None));
+        assert!(cache.evict(None).unwrap());
         assert_eq!(cache.entry_budget.available_permits(), 0);
         assert_eq!(
             cache.byte_budget.available_permits(),
@@ -292,7 +380,7 @@ mod tests {
         let permit = cache.entry_budget.clone().acquire_owned().await.unwrap();
         let mut waiting = Box::pin(cache.get(&second));
         assert!(waiting.as_mut().now_or_never().is_none());
-        drop(cache.insert(&first, permit));
+        drop(cache.insert(&first, permit).unwrap());
         tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
             .await
             .expect("insertion must wake admission to evict")
@@ -315,7 +403,7 @@ mod tests {
         assert!(pending.as_mut().now_or_never().is_none());
         let payload = vec![0];
         drop(bytes.split(ENCODING_RESERVATION - payload.capacity()));
-        let entry = cache.insert(&first, entry_permit);
+        let entry = cache.insert(&first, entry_permit).unwrap();
         assert!(entry
             .frame
             .set(Arc::new(SharedFrame {
@@ -341,7 +429,7 @@ mod tests {
             airc_ipc::codec::write_encoded_frame(&mut writer, &frame.payload).await
         });
         assert!(writing.as_mut().now_or_never().is_none());
-        assert!(cache.evict(None));
+        assert!(cache.evict(None).unwrap());
         assert_eq!(cache.entry_budget.available_permits(), 0);
         drop(writing);
         assert_eq!(cache.entry_budget.available_permits(), 1);
@@ -369,7 +457,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        while cache.evict(None) {}
+        while cache.evict(None).unwrap() {}
         drop(frame);
         assert_eq!(cache.entry_budget.available_permits(), 2);
         assert_eq!(cache.byte_budget.available_permits(), ENCODING_RESERVATION);

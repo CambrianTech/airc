@@ -349,3 +349,12 @@ comparison in `D:/airc-build/doria/shared-frame-paired-20261003`.
 The unused generic bounded-writer API and implementation were removed after the
 exact-event measurements. Historical results above remain as the decision record;
 only the original generic codec and specialized exact-event encoder are shipped.
+
+PR #1521's first hosted Clippy run rejected metadata-lock unwraps and semaphore
+expect calls under its separate production-only policy. The local all-targets
+command had omitted that stricter existing command. Metadata poison now returns
+an explicit `Other` I/O error; closed admission budgets return `BrokenPipe`.
+Neither path silently recovers or retries. Focused tests cover poison, release of
+an uninserted permit, immediate/waiting closure of both budgets and final permit
+accounting. Existing admitted frames can still be served after budget closure;
+closure here is an admission failure, not a global shutdown contract.
