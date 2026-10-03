@@ -134,11 +134,21 @@ impl LanTcpAdapter {
     /// whether a session existed. Fires the disconnect observer via the
     /// same path as an observed termination.
     pub async fn drop_connection(&self, peer: PeerId) -> bool {
-        if !self.inner.connections.lock().await.contains_key(&peer) {
-            return false;
+        let removed = {
+            let mut connections = self.inner.connections.lock().await;
+            let Some((physical_peer, _)) = self.session_for(&connections, peer) else {
+                return false;
+            };
+            connections
+                .remove(&physical_peer)
+                .map(|session| (physical_peer, session))
+        };
+        if let Some((physical_peer, session)) = removed {
+            session.end();
+            connection::notify_disconnect(&self.inner, physical_peer);
+            return true;
         }
-        connection::disconnect(&self.inner, peer).await;
-        true
+        false
     }
 
     /// Snapshot of currently-connected peers. Useful for diagnostics
@@ -561,6 +571,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(frame.envelope.lamport, 81);
+        assert!(!bob.drop_connection(stranger).await);
+        assert!(bob.is_connected(alias).await);
         // Replacing trust must not retroactively change the key a session proved.
         bob.inner
             .registry
@@ -578,12 +590,40 @@ mod tests {
             .send_to(alice_id, frame_at(83, channel, "rotated primary"))
             .await
             .is_err());
+        assert!(!bob.drop_connection(alias).await);
         bob.inner.registry.remove_peer(alias);
         assert!(bob
             .send_to(alias, frame_at(82, channel, "revoked"))
             .await
             .is_err());
     }
+    #[tokio::test]
+    async fn dropping_alias_retires_physical_session_and_notifies_once() {
+        let (alice_id, alice, _, bob) = make_paired_adapters();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        bob.connect(bound, alice_id).await.unwrap();
+        let alias = PeerId::from_u128(0xa2);
+        bob.inner
+            .registry
+            .enrol(alias, 0, alice.inner.keypair.public_bytes())
+            .unwrap();
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        bob.set_disconnect_observer(Arc::new(move |peer| sink.lock().unwrap().push(peer)));
+        assert!(bob.drop_connection(alias).await);
+        assert!(bob.connected_peers().await.is_empty());
+        assert!(!bob.is_connected(alias).await);
+        assert!(!bob.drop_connection(alias).await);
+        assert_eq!(*fired.lock().unwrap(), vec![alice_id]);
+        bob.connect(bound, alice_id)
+            .await
+            .expect("physical session can reconnect");
+        assert!(bob.is_connected(alias).await);
+    }
+
     // #240 event-driven heal: a terminated session must (1) drop the peer from
     // `connections` and (2) fire the registered disconnect observer with that
     // peer_id — the signal the daemon turns into a route-refresh wake nudge.
@@ -614,7 +654,7 @@ mod tests {
         );
         assert!(alice.inner.connections.lock().await.contains_key(&bob_id));
 
-        super::connection::disconnect(&alice.inner, bob_id).await;
+        assert!(alice.drop_connection(bob_id).await);
 
         assert!(
             !alice.inner.connections.lock().await.contains_key(&bob_id),
