@@ -150,19 +150,6 @@ pub(super) async fn install_and_spawn_loops<R, W>(
     }
 }
 
-/// #240: terminate this peer's live session — drop it from `connections` and
-/// fire the disconnect observer (if the layer above registered one) so a
-/// dropped-but-still-reachable peer can be re-dialed at once. The connections
-/// lock is released BEFORE the observer runs (never held across the callback,
-/// mirroring the accept path's `on_inbound` discipline).
-pub(super) async fn disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
-    let removed = inner.connections.lock().await.remove(&peer_id);
-    if let Some(session) = removed {
-        session.end();
-    }
-    notify_disconnect(inner, peer_id);
-}
-
 /// A read loop ending on its own: remove this peer's entry only if it is still THIS session.
 /// A newer session for the same peer (a redial) is not this reader's to end.
 async fn disconnect_session(inner: &Arc<Inner>, peer_id: PeerId, id: u64) {
@@ -181,7 +168,7 @@ async fn disconnect_session(inner: &Arc<Inner>, peer_id: PeerId, id: u64) {
     }
 }
 
-fn notify_disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
+pub(super) fn notify_disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
     let observer = inner
         .on_disconnect
         .lock()
