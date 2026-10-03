@@ -6,7 +6,10 @@ param(
     [switch]$FirewallOnly,
     [switch]$DiagnoseDaemon,
     [switch]$RecoverElevatedDaemon,
-    [string]$AircPath
+    [string]$AircPath,
+    [string]$PrepareArtifact,
+    [string]$PrebuiltArtifact,
+    [string]$ExpectedBuild
 )
 $ErrorActionPreference = 'Stop'
 # BEGIN GENERATED SHARED SETUP BOOTSTRAP
@@ -126,6 +129,9 @@ function Get-AircInstallerHome {
     return [IO.Path]::GetFullPath($ScopeHome)
 }
 # END GENERATED SHARED SETUP BOOTSTRAP
+if (($PrepareArtifact -and $PrebuiltArtifact) -or (($PrepareArtifact -or $PrebuiltArtifact) -and ($FirewallOnly -or $DiagnoseDaemon -or $RecoverElevatedDaemon))) {
+    throw 'Artifact preparation/publication cannot be combined with another installer mode.'
+}
 if ($DiagnoseDaemon -or $RecoverElevatedDaemon) {
     if ($DiagnoseDaemon -and $RecoverElevatedDaemon) { throw 'Choose diagnostics or elevated daemon recovery.' }
     if ($FirewallOnly) { throw 'Daemon diagnostics cannot be combined with firewall setup.' }
@@ -187,18 +193,18 @@ function Refresh-Path {
     $env:PATH = $paths -join ';'
 }
 function Find-GitBash {
-    $git = Get-Command git.exe -ErrorAction SilentlyContinue
-    if ($git) {
+    foreach ($git in @(Get-Command git.exe -All -CommandType Application -ErrorAction SilentlyContinue)) {
         $execPath = Invoke-InstallerProcess -OwnProcessTree $git.Source @('--exec-path')
-        if ($global:LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $execPath 'git-remote-https.exe'))) { return $null }
+        if ($global:LASTEXITCODE -ne 0 -or -not $execPath -or -not (Test-Path (Join-Path $execPath 'git-remote-https.exe'))) { continue }
         $root = Split-Path (Split-Path $git.Source -Parent) -Parent
         foreach ($relative in @('bin\bash.exe','usr\bin\bash.exe')) {
             $candidate = Join-Path $root $relative
-            if (Test-Path -LiteralPath $candidate) { return $candidate }
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
         }
     }
     return $null
 }
+
 Refresh-Path
 $bash = Find-GitBash
 if (-not $bash) {
@@ -279,7 +285,11 @@ try {
     $env:PSModulePath = $null
     # Cancellation owns the build subtree; only a completed successful
     # coordinator may hand off its persistent daemon.
-    Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $bash @('--noprofile', '--norc', ((Join-Path $source 'install.sh') -replace '\\','/'))
+    $arguments = @('--noprofile', '--norc', ((Join-Path $source 'install.sh') -replace '\\','/'))
+    if ($PrepareArtifact) { $arguments += @('--prepare-artifact', ($PrepareArtifact -replace '\\','/')) }
+    if ($PrebuiltArtifact) { $arguments += @('--prebuilt', ($PrebuiltArtifact -replace '\\','/')) }
+    if ($ExpectedBuild) { $arguments += @('--expected-build', $ExpectedBuild) }
+    Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess $bash $arguments
     $result = $global:LASTEXITCODE
 } finally {
     try { if ($elevationReady) { Clear-Elevation } }
