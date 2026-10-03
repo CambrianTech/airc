@@ -9,12 +9,18 @@ use std::time::{Duration, Instant};
 pub(crate) fn status(
     socket: &Path,
 ) -> Result<Option<airc_ipc::response::StatusResponse>, Box<dyn std::error::Error>> {
+    observe_status(socket).map_err(|error| {
+        format!("Cannot establish daemon state at {}: {error}; refusing to treat an unknown owner as absent", socket.display()).into()
+    })
+}
+
+fn observe_status(
+    socket: &Path,
+) -> Result<Option<airc_ipc::response::StatusResponse>, airc_ipc::client::ClientError> {
     let endpoint = socket.to_path_buf();
     let result =
         daemon_rpc(async move { airc_ipc::client::DaemonClient::new(endpoint).status().await });
-    classify_daemon_status(result).map_err(|error| {
-        format!("Cannot establish daemon state at {}: {error}; refusing to treat an unknown owner as absent", socket.display()).into()
-    })
+    classify_daemon_status(result)
 }
 
 /// Synchronous CLI lifecycle boundaries are called inside Tokio. Keep typed IPC
@@ -75,7 +81,13 @@ pub(crate) fn stop(socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let stop_result =
         daemon_rpc(async move { airc_ipc::client::DaemonClient::new(endpoint).stop().await });
     #[cfg(not(windows))]
-    stop_result?;
+    if let Err(error) = stop_result {
+        // A requested shutdown may close IPC before its reply. This permits
+        // another bounded observation, never treating the error as absence.
+        if !shutdown_disconnect(&error) && !crate::update_legacy::endpoint_absent(&error) {
+            return Err(error.into());
+        }
+    }
     #[cfg(windows)]
     {
         // Shutdown can close IPC before delivering its reply. Only the pinned
@@ -86,13 +98,38 @@ pub(crate) fn stop(socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let deadline = Instant::now() + Duration::from_secs(20);
-    while status(socket)?.is_some() {
+    while !shutdown_complete(observe_status(socket))? {
         if Instant::now() >= deadline {
-            return Err("daemon still answers after stop; shutdown not confirmed".into());
+            return Err("daemon shutdown not confirmed before the stop deadline".into());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+fn shutdown_complete(
+    observation: Result<Option<airc_ipc::response::StatusResponse>, airc_ipc::client::ClientError>,
+) -> Result<bool, airc_ipc::client::ClientError> {
+    match observation {
+        Ok(status) => Ok(status.is_none()),
+        Err(error) if shutdown_disconnect(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn shutdown_disconnect(error: &airc_ipc::client::ClientError) -> bool {
+    use airc_ipc::client::ClientError;
+    use std::io::ErrorKind;
+    match error {
+        ClientError::Io(error) | ClientError::NotConnected(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+        ),
+        ClientError::Codec(_)
+        | ClientError::Timeout
+        | ClientError::Daemon(_)
+        | ClientError::UnexpectedResponse(_) => false,
+    }
 }
 
 #[cfg(windows)]
@@ -137,5 +174,19 @@ mod tests {
             ))))
             .is_err()
         );
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(classify_daemon_status(Err(ClientError::Io(Error::from(kind)))).is_err());
+            assert!(!shutdown_complete(Err(ClientError::Io(Error::from(kind)))).unwrap());
+        }
+        assert!(shutdown_complete(Ok(None)).unwrap());
+        assert!(shutdown_complete(Err(ClientError::Io(Error::from(
+            ErrorKind::PermissionDenied
+        ))))
+        .is_err());
+        assert!(shutdown_complete(Err(ClientError::Timeout)).is_err());
     }
 }

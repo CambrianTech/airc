@@ -245,6 +245,19 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
 
     // Shut the daemon down completely.
     let endpoint = ok(acct, "claude", "claude:main", &["ipc-endpoint"]);
+    // Model an admitted child whose parent timed out before readiness. Stop
+    // must still shut down the visible owner, retain intent, and refuse a
+    // completed receipt while that child's startup lease remains held.
+    let starting =
+        airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(&acct.join(".airc")).unwrap();
+    let incomplete = tab(acct, "new-stop-scope", "claude:main", &["stop"]);
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("shutdown not confirmed"));
+    assert!(acct.join(".airc/daemon-operator-stop").exists());
+    assert!(!tab(acct, "claude", "claude:main", &["ping"])
+        .status
+        .success());
+    assert!(starting.bound().is_err());
     ok(
         acct,
         "new-stop-scope",
@@ -268,6 +281,17 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
         .unwrap();
     assert!(!supervised.status.success());
     assert!(String::from_utf8_lossy(&supervised.stderr).contains("intentionally stopped"));
+    let raw = tab(
+        acct,
+        ".airc",
+        "claude:main",
+        &["daemon", "--socket", endpoint.trim()],
+    );
+    assert!(!raw.status.success());
+    assert!(String::from_utf8_lossy(&raw.stderr).contains("intentionally stopped"));
+    assert!(!tab(acct, "claude", "claude:main", &["ping"])
+        .status
+        .success());
 
     // The explicit operator join resumes the same owner and durable transcript.
     ok(acct, "claude", "claude:main", &["join", "standup"]);

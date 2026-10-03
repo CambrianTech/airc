@@ -21,7 +21,7 @@ use airc_core::{ClientId, EventId, PeerId, RoomId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
-use airc_daemon::{run as run_daemon_server, DaemonRuntimeInfo, DaemonState};
+use airc_daemon::{server::run_with_startup_check, DaemonRuntimeInfo, DaemonState};
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
@@ -1679,6 +1679,9 @@ pub async fn run_daemon(
         )
         .into());
     }
+    // A parent may time out or die before this child binds. Keep startup
+    // observable to stop even after that parent's admission lock is gone.
+    let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home)?;
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call
@@ -2129,7 +2132,12 @@ pub async fn run_daemon(
         .await;
     });
 
-    run_daemon_server(state, socket).await?;
+    let server_result =
+        run_with_startup_check(state.clone(), socket, move || startup.bound()).await;
+    if server_result.is_err() {
+        state.shutdown.notify_waiters();
+        registry_handle.abort();
+    }
     // The route-refresh loop exits on the shutdown `Notify` that ended
     // the accept loop; abort is the backstop for the listener-error
     // path, where Stop never fired (same abort discipline as
@@ -2145,6 +2153,7 @@ pub async fn run_daemon(
     // exit so the process doesn't drop an in-flight gist write
     // mid-flight.
     let _ = registry_handle.await;
+    server_result?;
     println!("airc daemon: stopped.");
     Ok(())
 }
@@ -2620,6 +2629,7 @@ pub async fn run_stop(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::e
     let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
     lifecycle.record_operator_stop()?;
     crate::update_shutdown::stop(&socket)?;
+    lifecycle.confirm_no_startup()?;
     println!("daemon: stopped; operator intent retained until `airc join`.");
     Ok(())
 }

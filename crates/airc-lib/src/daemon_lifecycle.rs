@@ -12,6 +12,39 @@ pub struct DaemonLifecycleGuard {
     owner: crate::MachineAccountHome,
 }
 
+/// A child owns startup until its endpoint is bound, independently of the
+/// updater's parent-held maintenance lock. This is never a lifetime daemon lock.
+pub struct DaemonStartupGuard {
+    active: File,
+    owner: crate::MachineAccountHome,
+}
+
+impl DaemonStartupGuard {
+    pub fn acquire(home: &Path) -> io::Result<Self> {
+        let owner = crate::machine_account_home(home);
+        let active = DaemonLifecycleGuard::open(&owner, "daemon-startup.lock")?;
+        FileExt::try_lock_shared(&active)?;
+        require_running(&owner)?;
+        Ok(Self { active, owner })
+    }
+
+    /// Call only after the endpoint is bound, before serving. Release before
+    /// checking intent: a concurrent stop either observes that bound endpoint
+    /// or sees startup still held and refuses to report a completed shutdown.
+    pub fn bound(self) -> io::Result<()> {
+        FileExt::unlock(&self.active)?;
+        require_running(&self.owner)
+    }
+}
+
+impl Drop for DaemonStartupGuard {
+    fn drop(&mut self) {
+        // Explicit unlock also releases a Unix flock briefly inherited by a
+        // concurrent fork; merely closing this descriptor waits for its exec.
+        let _ = FileExt::unlock(&self.active);
+    }
+}
+
 impl DaemonLifecycleGuard {
     /// Hold through status inspection and any resulting daemon spawn.
     pub fn autostart(home: &Path) -> io::Result<Self> {
@@ -38,12 +71,7 @@ impl DaemonLifecycleGuard {
             _maintenance_intent: None,
             owner,
         };
-        if guard.operator_stopped()? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "daemon intentionally stopped; automatic startup refused; run `airc join` to resume",
-            ));
-        }
+        require_running(&guard.owner)?;
         Ok(guard)
     }
 
@@ -73,11 +101,7 @@ impl DaemonLifecycleGuard {
     /// Read while admission is serialized. Unreadable state never means permission
     /// to start; a stop has no expiry and survives the operator command exiting.
     pub fn operator_stopped(&self) -> io::Result<bool> {
-        match std::fs::symlink_metadata(self.owner.join("daemon-operator-stop")) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+        operator_stopped(&self.owner)
     }
 
     /// Persist intent before requesting shutdown, under the same exclusive gate
@@ -91,6 +115,25 @@ impl DaemonLifecycleGuard {
             Err(error) => return Err(error),
         }
         self.sync_owner_directory()
+    }
+
+    /// After recording stop intent and stopping the visible endpoint, prove no
+    /// admitted child is still pre-bind. A slow/hung child is an error, never
+    /// absence; it will recheck the retained intent when it reaches bind.
+    pub fn confirm_no_startup(&self) -> io::Result<()> {
+        self.require_exclusive()?;
+        if !self.operator_stopped()? {
+            return Err(io::Error::other(
+                "stop intent is required before confirming shutdown",
+            ));
+        }
+        let startup = Self::open(&self.owner, "daemon-startup.lock")?;
+        FileExt::try_lock_exclusive(&startup).map_err(|error| {
+            io::Error::new(error.kind(), format!(
+                "operator stop recorded, but daemon startup is still active; shutdown not confirmed: {error}"
+            ))
+        })?;
+        FileExt::unlock(&startup)
     }
 
     /// Only an explicit resume/adoption may clear intent; maintenance alone never does.
@@ -130,6 +173,24 @@ impl DaemonLifecycleGuard {
     }
 }
 
+fn operator_stopped(owner: &crate::MachineAccountHome) -> io::Result<bool> {
+    match std::fs::symlink_metadata(owner.join("daemon-operator-stop")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn require_running(owner: &crate::MachineAccountHome) -> io::Result<()> {
+    if operator_stopped(owner)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon intentionally stopped; automatic startup refused; run `airc join` to resume",
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for DaemonLifecycleGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.active);
@@ -147,6 +208,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let update = DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
         assert!(DaemonLifecycleGuard::autostart(dir.path()).is_err());
+        // The updater owns maintenance while its replacement reaches bind.
+        DaemonStartupGuard::acquire(dir.path())
+            .unwrap()
+            .bound()
+            .unwrap();
         drop(update);
         assert!(DaemonLifecycleGuard::autostart(dir.path()).is_ok());
 
@@ -156,6 +222,7 @@ mod tests {
         stopped.record_operator_stop().unwrap();
         drop(stopped);
         assert!(DaemonLifecycleGuard::autostart(dir.path()).is_err());
+        assert!(DaemonStartupGuard::acquire(dir.path()).is_err());
         let restarted_owner = DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
         assert!(restarted_owner.operator_stopped().unwrap());
         drop(restarted_owner);
@@ -177,6 +244,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
         let start = DaemonLifecycleGuard::autostart(dir.path()).unwrap();
+        let child = DaemonStartupGuard::acquire(dir.path()).unwrap();
         let home = dir.path().to_owned();
         let (send, received) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -199,6 +267,15 @@ mod tests {
         drop(start);
         let update = received.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(DaemonLifecycleGuard::autostart(dir.path()).is_err());
+        // Losing the parent admission (timeout/cancellation) cannot make a
+        // still-starting child count as absent. Stop is bounded and retains its
+        // intent; the child rejects that intent at the actual bind callback.
+        update.record_operator_stop().unwrap();
+        assert!(update.confirm_no_startup().is_err());
+        assert!(child.bound().is_err());
+        update.confirm_no_startup().unwrap();
+        assert!(DaemonStartupGuard::acquire(dir.path()).is_err());
+        update.clear_operator_stop().unwrap();
         drop(update);
         worker.join().unwrap();
         assert!(DaemonLifecycleGuard::autostart(dir.path()).is_ok());

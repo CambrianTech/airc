@@ -216,6 +216,8 @@ impl Drop for Fixture {
     }
 }
 fn fixture(socket: &Path, ready: &Path, mode: &str, sha: &str) -> Fixture {
+    let log_path = ready.with_extension("log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let child = hidden(&mut Command::new(std::env::current_exe().unwrap()))
         .args(["--exact", "ipc_owner_fixture", "--nocapture"])
         .env("UPDATE_FIXTURE_SOCKET", socket)
@@ -223,14 +225,19 @@ fn fixture(socket: &Path, ready: &Path, mode: &str, sha: &str) -> Fixture {
         .env("UPDATE_FIXTURE_MODE", mode)
         .env("UPDATE_FIXTURE_SHA", sha)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
         .spawn()
         .unwrap();
-    let fixture = Fixture { child };
+    let mut fixture = Fixture { child };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() {
-        assert!(Instant::now() < deadline, "IPC fixture did not bind");
+        let exited = fixture.child.try_wait().unwrap();
+        assert!(
+            exited.is_none() && Instant::now() < deadline,
+            "IPC fixture did not bind ({exited:?}): {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     fixture
@@ -293,6 +300,25 @@ fn ipc_owner_fixture() {
                         }),
                         Request::Stop if mode == "stale" => {
                             let _ = write_frame(&mut stream, &Response::Ok).await;
+                            #[cfg(unix)]
+                            {
+                                // A real Unix daemon can accept one final status
+                                // probe while its listener is closing. Drop that
+                                // response deterministically: it is not absence,
+                                // and the updater must observe again before
+                                // publishing or starting a replacement.
+                                let mut closing =
+                                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                                        .await
+                                        .unwrap()
+                                        .unwrap();
+                                assert!(matches!(
+                                    read_frame::<_, Request>(&mut closing).await.unwrap(),
+                                    Some(Request::Status)
+                                ));
+                                drop(closing);
+                            }
+                            listener.cleanup();
                             return;
                         }
                         // A current owner must never receive stop or a mutating request.
