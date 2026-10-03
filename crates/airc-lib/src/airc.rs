@@ -276,11 +276,11 @@ pub struct Airc {
     pub(crate) inner: Arc<AircInner>,
 }
 
-/// #240 event-driven heal: the shared slot holding the optional peer-disconnect
-/// callback the daemon registers (see [`AircInner::on_disconnect`]). Aliased so
+/// Shared slot holding an optional peer-session
+/// callback (connect or disconnect). Aliased so
 /// the nested handle type doesn't trip clippy's `type_complexity` gate at the
 /// field and at every construction.
-pub(crate) type DisconnectCallbackSlot =
+pub(crate) type PeerSessionCallbackSlot =
     Arc<std::sync::Mutex<Option<Arc<dyn Fn(PeerId) + Send + Sync>>>>;
 
 pub(crate) struct AircInner {
@@ -328,7 +328,9 @@ pub(crate) struct AircInner {
     /// runs before or after the adapter is first built. Shared across daemon
     /// clones like `learned_ips`, so whichever handle owns the dropped session
     /// fires the same callback (the daemon's route-refresh wake nudge).
-    pub(crate) on_disconnect: DisconnectCallbackSlot,
+    pub(crate) on_disconnect: PeerSessionCallbackSlot,
+    /// Post-install authenticated LAN session notification, shared by clones.
+    pub(crate) on_connect: PeerSessionCallbackSlot,
     pub(crate) lamport_clock: AtomicU64,
     /// Epoch-ms of the last send-path peer-registry sync. Debounces the
     /// per-send disk load (see `sync_account_peer_registry_debounced`).
@@ -716,6 +718,7 @@ impl Airc {
                 advertised_endpoints_host: std::sync::Mutex::new(None),
                 learned_ips: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 on_disconnect: Arc::new(std::sync::Mutex::new(None)),
+                on_connect: Arc::new(std::sync::Mutex::new(None)),
                 lamport_clock: AtomicU64::new(0),
                 peer_sync_last_ms: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
@@ -1649,6 +1652,7 @@ impl Airc {
             // inbound learned on any handle informs every handle's dialer.
             learned_ips: self.inner.learned_ips.clone(),
             on_disconnect: self.inner.on_disconnect.clone(),
+            on_connect: self.inner.on_connect.clone(),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             peer_sync_last_ms: AtomicU64::new(0),
             lan_tcp: Mutex::new(None),

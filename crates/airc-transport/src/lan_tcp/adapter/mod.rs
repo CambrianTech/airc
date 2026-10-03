@@ -53,7 +53,7 @@ use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
 
 use crate::lan_tcp::adapter::connection::{handle_client_connection, handle_server_connection};
 use crate::lan_tcp::adapter::inner::{
-    DisconnectObserver, InboundObserver, Inner, Outbound, OutboundTx, SubscriberHandle,
+    InboundObserver, Inner, Outbound, OutboundTx, PeerSessionObserver, SubscriberHandle,
     MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
 };
 use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
@@ -86,6 +86,7 @@ impl LanTcpAdapter {
                 next_sub_id: AtomicU64::new(0),
                 on_inbound: std::sync::Mutex::new(None),
                 on_disconnect: std::sync::Mutex::new(None),
+                on_connect: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -107,8 +108,17 @@ impl LanTcpAdapter {
     /// dropped-but-still-reachable peer is re-dialed at once instead of up to a
     /// full refresh interval later. Idempotent set-once; a later call replaces
     /// the observer.
-    pub fn set_disconnect_observer(&self, observer: DisconnectObserver) {
+    pub fn set_disconnect_observer(&self, observer: PeerSessionObserver) {
         if let Ok(mut guard) = self.inner.on_disconnect.lock() {
+            *guard = Some(observer);
+        }
+    }
+
+    /// Observe every authenticated session after its send channel is installed.
+    /// Covers both accepted and dialed connections, including the same peer
+    /// reconnecting. A later registration replaces the observer.
+    pub fn set_connect_observer(&self, observer: PeerSessionObserver) {
+        if let Ok(mut guard) = self.inner.on_connect.lock() {
             *guard = Some(observer);
         }
     }

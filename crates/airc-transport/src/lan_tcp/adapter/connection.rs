@@ -114,7 +114,11 @@ async fn install_and_spawn_loops<R, W>(
     // Spawn the I/O loops; they continue to drive the wire after
     // this function returns.
     tokio::spawn(write_loop(write_half, outbound_rx));
-    tokio::spawn(read_loop(inner, peer_id, read_half));
+    tokio::spawn(read_loop(Arc::clone(&inner), peer_id, read_half));
+    let observer = inner.on_connect.lock().ok().and_then(|guard| guard.clone());
+    if let Some(observer) = observer {
+        observer(peer_id);
+    }
 }
 
 /// #240: terminate this peer's live session — drop it from `connections` and

@@ -96,7 +96,9 @@ pub(super) struct Inner {
     /// route-refresh loop so a dropped-but-still-reachable peer is re-dialed
     /// AT ONCE instead of up to a full refresh interval later. Same discipline
     /// as `on_inbound` — brief lock, never held across an await or the removal.
-    pub(super) on_disconnect: std::sync::Mutex<Option<DisconnectObserver>>,
+    pub(super) on_disconnect: std::sync::Mutex<Option<PeerSessionObserver>>,
+    /// Authenticated session ready for sends, for both accept and dial paths.
+    pub(super) on_connect: std::sync::Mutex<Option<PeerSessionObserver>>,
 }
 
 /// #9: callback the airc-lib layer registers to learn `(peer_id, source_ip)`
@@ -104,6 +106,6 @@ pub(super) struct Inner {
 /// can invoke it from any connection task.
 pub(super) type InboundObserver = std::sync::Arc<dyn Fn(PeerId, std::net::IpAddr) + Send + Sync>;
 
-/// #240: callback invoked with the `peer_id` whose live session just
-/// terminated. `Send + Sync` so any connection task can fire it.
-pub(super) type DisconnectObserver = std::sync::Arc<dyn Fn(PeerId) + Send + Sync>;
+/// Callback identifying the peer whose session became ready or terminated.
+/// `Send + Sync` so either connection task can fire its registered observer.
+pub(super) type PeerSessionObserver = std::sync::Arc<dyn Fn(PeerId) + Send + Sync>;

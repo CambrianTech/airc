@@ -111,11 +111,11 @@ impl Airc {
     /// the same store/live stream as local-fs frames.
     pub async fn listen_lan(&self, bind: SocketAddr) -> Result<SocketAddr, AircError> {
         let adapter = self.lan_adapter().await?;
+        self.ensure_lan_subscriber().await?;
         let actual = adapter
             .listen(bind)
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
-        self.ensure_lan_subscriber().await?;
         self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
         self.upsert_route_endpoint(RouteEndpoint::LanTcp { addr: actual })?;
         Ok(actual)
@@ -168,6 +168,7 @@ impl Airc {
         tailscale_ip: Option<Ipv4Addr>,
     ) -> Result<Vec<RouteEndpoint>, AircError> {
         let adapter = self.lan_adapter().await?;
+        self.ensure_lan_subscriber().await?;
         // Bind a STABLE port derived from our identity so the advertised
         // endpoint survives daemon restarts. An ephemeral `:0` re-rolls the
         // port every restart, staling every peer's stored endpoint for us —
@@ -177,7 +178,6 @@ impl Airc {
         let actual = self
             .bind_preferred_or_ephemeral(&adapter, bind_ip, preferred)
             .await?;
-        self.ensure_lan_subscriber().await?;
         self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
         let port = actual.port();
         // Self-healing join — advertise hygiene: never let a bridge /
@@ -494,12 +494,11 @@ impl Airc {
         expected_peer: PeerId,
     ) -> Result<(), AircError> {
         let adapter = self.lan_adapter().await?;
+        self.ensure_lan_subscriber().await?;
         adapter
             .connect(peer_addr, expected_peer)
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
-        self.ensure_lan_subscriber().await?;
-        self.upsert_transport_health(TransportHealthSample::healthy_direct(TransportKind::LanTcp))?;
         Ok(())
     }
 
@@ -535,6 +534,17 @@ impl Airc {
                 cb(peer_id);
             }
         }));
+        let on_connect = self.inner.on_connect.clone();
+        let route_health = self.inner.route_health.clone();
+        adapter.set_connect_observer(std::sync::Arc::new(move |peer_id| {
+            // Requests use the route resolver, not the adapter's peer map.
+            // Publish send readiness before recovery can request its first page.
+            route_health.upsert(TransportHealthSample::healthy_direct(TransportKind::LanTcp));
+            let cb = on_connect.lock().ok().and_then(|guard| guard.clone());
+            if let Some(cb) = cb {
+                cb(peer_id);
+            }
+        }));
         *guard = Some(adapter.clone());
         Ok(adapter)
     }
@@ -547,6 +557,15 @@ impl Airc {
     /// before or after the adapter is first built. A later call replaces it.
     pub fn set_disconnect_observer(&self, observer: std::sync::Arc<dyn Fn(PeerId) + Send + Sync>) {
         if let Ok(mut guard) = self.inner.on_disconnect.lock() {
+            *guard = Some(observer);
+        }
+    }
+
+    pub(crate) fn set_connect_observer(
+        &self,
+        observer: std::sync::Arc<dyn Fn(PeerId) + Send + Sync>,
+    ) {
+        if let Ok(mut guard) = self.inner.on_connect.lock() {
             *guard = Some(observer);
         }
     }

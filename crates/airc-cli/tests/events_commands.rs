@@ -165,11 +165,14 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
             .expect("write stdin");
     }
 
+    let child_pid = child.id();
     let output = child.wait_with_output().expect("airc-core command output");
     assert!(
         output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
+        "airc-core {:?} failed (pid={child_pid}, status={}, home={}): stdout={} stderr={}",
         args,
+        output.status,
+        home.display(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
