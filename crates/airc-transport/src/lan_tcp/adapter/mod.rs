@@ -153,6 +153,35 @@ impl LanTcpAdapter {
             .collect()
     }
 
+    // One authenticated lookup for unicast, discovery and duplicate-dial prevention.
+    fn session_for<'a>(
+        &self,
+        connections: &'a HashMap<PeerId, inner::Session>,
+        peer: PeerId,
+    ) -> Option<(PeerId, &'a inner::Session)> {
+        let authorized = |session: &inner::Session| {
+            self.inner
+                .registry
+                .has_key(peer, &session.authenticated_key)
+        };
+        connections
+            .get(&peer)
+            .filter(|session| authorized(session))
+            .map(|session| (peer, session))
+            .or_else(|| {
+                connections
+                    .iter()
+                    .find(|(_, session)| authorized(session))
+                    .map(|(id, session)| (*id, session))
+            })
+    }
+
+    /// Whether an enrolled identity has an authenticated session, including key aliases.
+    /// Unlike connected_peers this does not expand one physical connection into many IDs.
+    pub async fn is_connected(&self, peer: PeerId) -> bool {
+        self.session_for(&*self.inner.connections.lock().await, peer)
+            .is_some()
+    }
     /// Bind a TCP listener and accept incoming connections
     /// indefinitely. The returned `SocketAddr` is the actual bound
     /// address (useful when `bind_addr.port() == 0` and the OS
@@ -226,7 +255,7 @@ impl LanTcpAdapter {
     ) -> Result<(), LanTcpError> {
         {
             let connections = self.inner.connections.lock().await;
-            if connections.contains_key(&expected_peer) {
+            if self.session_for(&connections, expected_peer).is_some() {
                 return Err(LanTcpError::AlreadyConnectedTo(expected_peer));
             }
         }
@@ -278,21 +307,8 @@ impl LanTcpAdapter {
         }
         let tx = {
             let connections = self.inner.connections.lock().await;
-            connections
-                .get(&peer)
-                .filter(|session| {
-                    self.inner
-                        .registry
-                        .has_key(peer, &session.authenticated_key)
-                })
-                .or_else(|| {
-                    connections.values().find(|session| {
-                        self.inner
-                            .registry
-                            .has_key(peer, &session.authenticated_key)
-                    })
-                })
-                .map(|session| session.outbound.clone())
+            self.session_for(&connections, peer)
+                .map(|(_, session)| session.outbound.clone())
                 .ok_or(LanTcpError::NoActivePeers)?
         };
         let (flushed, flushed_rx) = oneshot::channel();
@@ -519,6 +535,11 @@ mod tests {
             .registry
             .enrol(alias, 0, alice.inner.keypair.public_bytes())
             .unwrap();
+        assert!(bob.is_connected(alias).await);
+        assert!(
+            matches!(bob.connect(bound, alias).await, Err(LanTcpError::AlreadyConnectedTo(id)) if id == alias)
+        );
+        assert_eq!(bob.connected_peers().await.len(), 1);
         let stranger = PeerId::from_u128(0xa3);
         bob.inner
             .registry
@@ -629,6 +650,7 @@ mod tests {
         super::connection::install_and_spawn_loops(
             alice.inner.clone(),
             bob_id,
+            _bob.inner.keypair.public_bytes(),
             read_half,
             write_half,
         )
@@ -657,7 +679,14 @@ mod tests {
         // The redial: a new session for bob replaces the blocked one.
         let (near2, _far2) = tokio::io::duplex(64);
         let (r2, w2) = tokio::io::split(near2);
-        super::connection::install_and_spawn_loops(alice.inner.clone(), bob_id, r2, w2).await;
+        super::connection::install_and_spawn_loops(
+            alice.inner.clone(),
+            bob_id,
+            _bob.inner.keypair.public_bytes(),
+            r2,
+            w2,
+        )
+        .await;
 
         use tokio::io::AsyncWriteExt;
         let released = tokio::time::timeout(Duration::from_secs(3), async {
