@@ -651,7 +651,27 @@ esac
 "#,
     )
     .unwrap();
-    git(&source, &["add", "install.sh"]);
+    #[cfg(windows)]
+    std::fs::write(source.join("install.ps1"), r#"
+param([string]$PrepareArtifact,[string]$PrebuiltArtifact,[string]$ExpectedBuild)
+$ErrorActionPreference='Stop'
+if($PrepareArtifact){
+  if($env:UPDATE_TEST_STOP_DURING_PREPARE -eq '1'){
+    $start=New-Object Diagnostics.ProcessStartInfo
+    $start.FileName=$env:UPDATE_TEST_ORIGINAL
+    $start.Arguments='--home "'+$env:UPDATE_TEST_HOME+'" stop'
+    $start.UseShellExecute=$false;$start.CreateNoWindow=$true
+    $child=[Diagnostics.Process]::Start($start)
+    try{$child.WaitForExit();if($child.ExitCode -ne 0){exit $child.ExitCode}}finally{$child.Dispose()}
+  }
+  Copy-Item -LiteralPath $env:UPDATE_TEST_ORIGINAL -Destination $PrepareArtifact
+}elseif($PrebuiltArtifact){
+  Copy-Item -LiteralPath $PrebuiltArtifact -Destination $env:UPDATE_TEST_CURRENT
+  [Console]::Error.WriteLine('fixture installer failed after publication')
+  exit 23
+}else{exit 91}
+"#).unwrap();
+    git(&source, &["add", "install.sh", "install.ps1"]);
     git(
         &source,
         &[

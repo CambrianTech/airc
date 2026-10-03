@@ -110,6 +110,9 @@ public static class SetupBridgeFixture {
     # A script setting global:LASTEXITCODE cannot emulate a native command when
     # an enclosing scope has its own value (e.g. the deliberate exit-73 case).
     Copy-Item -LiteralPath (Join-Path $gitRoot 'bin/bash.exe') -Destination $fakeGit
+    $minimalGit = Join-Path $fixture 'minimal git/cmd/git.exe'
+    New-Item -ItemType Directory -Force -Path (Split-Path $minimalGit -Parent) | Out-Null
+    Copy-Item -LiteralPath $fakeGit -Destination $minimalGit
     $fakeWinget = Join-Path $gitRoot 'cmd/winget.exe'
     Copy-Item -LiteralPath $fakeGit -Destination $fakeWinget
     # Seed only this test's isolated, checksum-verified setup cache. This loads
@@ -132,8 +135,11 @@ public static class SetupBridgeFixture {
     } finally { $native.Dispose() }
     Write-Host 'PASS: actual nested PS5 coordinator preserves diagnostic, data and exit status'
     function Get-Command {
-        param([string]$Name, $ErrorAction, $CommandType)
-        if ($Name -in @('git.exe','git')) { return [pscustomobject]@{Source=$fakeGit} }
+        param([string]$Name, $ErrorAction, $CommandType, [switch]$All)
+        if ($Name -in @('git.exe','git')) {
+            if ($All) { return @([pscustomobject]@{Source=$minimalGit},[pscustomobject]@{Source=$fakeGit}) }
+            return [pscustomobject]@{Source=$minimalGit}
+        }
         if ($Name -eq 'winget') { return [pscustomobject]@{Source=$fakeWinget} }
         Microsoft.PowerShell.Core\Get-Command @PSBoundParameters
     }
@@ -162,6 +168,33 @@ public static class SetupBridgeFixture {
     Assert-True ($calls -match "O'Brien") 'Path containing spaces/apostrophe was lost'
     Assert-True ($calls -match 'bash\|--noprofile\|--norc\|') 'Shared coordinator was not invoked'
     Assert-True ($calls -notmatch 'winget') 'Working Git was unnecessarily reinstalled'
+    # Both updater phases use this public adapter and preserve exact paths/build.
+    $artifact = Join-Path $fixture "prepared O'Brien.exe"
+    foreach ($phase in @('PrepareArtifact','PrebuiltArtifact')) {
+        [IO.File]::WriteAllText($env:AIRC_FIXTURE_LOG,'')
+        $phaseArgs = @{ ExpectedBuild='abcdef1234567890' }; $phaseArgs[$phase]=$artifact
+        & (Join-Path $entry 'install.ps1') @phaseArgs
+        Assert-True ($global:LASTEXITCODE -eq 0) "Public $phase failed"
+        $calls = Get-Content -LiteralPath $env:AIRC_FIXTURE_LOG -Raw
+        $flag = if ($phase -eq 'PrepareArtifact') { '--prepare-artifact' } else { '--prebuilt' }
+        Assert-True ($calls.Contains("|$flag|$($artifact -replace '\\','/')|--expected-build|abcdef1234567890|")) 'Updater phase/path/build lost at native handoff'
+        Assert-True ($calls -notmatch 'winget') 'Minimal Git shadow caused unnecessary acquisition'
+    }
+    $failure = Get-FixtureEntryFailure { & (Join-Path $entry 'install.ps1') -PrepareArtifact $artifact -PrebuiltArtifact $artifact }
+    Assert-True ($failure -match 'cannot be combined') 'Conflicting phases were not refused'
+    foreach ($adapter in @('FirewallOnly','DiagnoseDaemon','RecoverElevatedDaemon')) {
+        $conflict=@{ PrepareArtifact=$artifact }; $conflict[$adapter]=$true
+        $failure=Get-FixtureEntryFailure { & (Join-Path $entry 'install.ps1') @conflict }
+        Assert-True ($failure -match 'cannot be combined') "Conflicting $adapter ran instead of refusing"
+    }
+    $previousError = [Console]::Error; $phaseError = New-Object IO.StringWriter
+    try {
+        [Console]::SetError($phaseError)
+        & (Join-Path $entry 'install.ps1') -PrepareArtifact $artifact -ExpectedBuild diagnostic-fixture | Out-Null
+        Assert-True ($global:LASTEXITCODE -eq 1) 'Public native phase masked coordinator failure'
+        Assert-True ($phaseError.ToString().Contains('FIXTURE COMPILER ERROR')) 'Public native phase lost coordinator diagnostic'
+    } finally { [Console]::SetError($previousError); $phaseError.Dispose() }
+    Write-Host 'PASS: minimal Git shadow skipped; native updater phases preserve paths, build and failures'
 
     $installedBinary = Join-Path $fixture "installed airc O'Brien.exe"
     [IO.File]::WriteAllText($installedBinary,'fixture')

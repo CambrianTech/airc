@@ -89,6 +89,26 @@ esac
 "#;
         write(&target.join("release/airc"), good);
         let bash = std::env::var_os("AIRC_TEST_BASH").unwrap_or_else(|| "bash".into());
+        #[cfg(windows)]
+        {
+            // PreparedInstall must select the native adapter even though its
+            // legacy shell argument is deliberately unusable on Windows.
+            std::env::set_var("AIRC_HANDOFF_BASH", &bash);
+            write(&source.join("install.ps1"), r#"
+param([string]$PrepareArtifact,[string]$PrebuiltArtifact,[string]$ExpectedBuild)
+$mode=if($PrepareArtifact){'--prepare-artifact'}else{'--prebuilt'}
+$artifact=if($PrepareArtifact){$PrepareArtifact}else{$PrebuiltArtifact}
+$start=New-Object Diagnostics.ProcessStartInfo
+$start.FileName=$env:AIRC_HANDOFF_BASH
+$start.Arguments='--noprofile --norc "'+($PSScriptRoot -replace '\\','/')+'/install.sh" '+$mode+' "'+($artifact -replace '\\','/')+'" --expected-build "'+$ExpectedBuild+'"'
+$start.UseShellExecute=$false;$start.CreateNoWindow=$true
+$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+$child=[Diagnostics.Process]::Start($start)
+try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadToEndAsync();$child.WaitForExit();[Console]::Out.Write($out.Result);[Console]::Error.Write($err.Result);exit $child.ExitCode}finally{$child.Dispose()}
+"#);
+        }
+        #[cfg(windows)]
+        let bash = std::ffi::OsString::from("unusable-wsl-fixture.exe");
         let old_path = std::env::var_os("PATH").unwrap();
         let mut paths = vec![tools.clone()];
         paths.extend(std::env::split_paths(&old_path));
@@ -217,7 +237,8 @@ esac
             if fails {
                 write(&root.join("fail-adopt"), "fail");
             }
-            let output = std::process::Command::new(&bash)
+            let normal_shell = std::env::var_os("AIRC_HANDOFF_BASH").unwrap_or_else(|| bash.clone());
+            let output = process::background(normal_shell)
                 .arg(source.join("install.sh"))
                 .env("AIRC_DIR", &source)
                 .env("AIRC_INSTALL_NO_PULL", "1")

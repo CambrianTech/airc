@@ -993,3 +993,40 @@ receipt writes; full workspace Clippy and fmt passed after that correction
 (80980). The six-case execution preceded that ordering-only correction; hosted
 CI and failure-artifact upload remain separate evidence. Historical holder
 identification and a production repair remain OPEN.
+
+## Windows updater native-entry convergence (2026-10-03)
+
+Actual public update from installed f534 failed before consent: a minimal Git
+bundled with the caller was first on PATH, its exec-path had no Bash, and the
+Rust resolver fell back to System32 bash.exe (WSL without a distribution).
+Preparation failed before maintenance; the healthy running daemon was preserved.
+No WSL installation or caller PATH override is a repair.
+
+Windows prepared-artifact and prebuilt publication now enter the same supported
+install.ps1 adapter as native public setup. It refreshes registered process PATH,
+examines all Git applications for a complete distribution, and forwards the
+phase, artifact and expected build to the existing shared install.sh coordinator.
+The existing update owner remains the elevation owner; native entry borrows it.
+Unix keeps its Bash coordinator path. Conflicting phases/adapters are refused
+before any diagnostic or elevated-owner recovery operation.
+
+Bootstrap limitation: the installed f534 executable still contains its old Rust
+resolver. A new source commit cannot alter that executable in place. The supported
+route to this repair is running the released repaired public install.ps1 once,
+then verifying installed/running revisions and testing ordinary update again.
+Do not substitute a manually changed PATH, direct binary copy or WSL install.
+Public install/update and identical-rerun acceptance remain OPEN until exercised.
+
+After this repair reaches canary, the native public bootstrap for the existing
+canary installation is the usual remote entry (no environment overrides):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -Command "Invoke-RestMethod 'https://raw.githubusercontent.com/CambrianTech/airc/canary/install.ps1' | Invoke-Expression"
+```
+
+With no explicit AIRC_DIR and no local script root, that entry uses its managed
+`~/.airc/src` checkout (or preserves an incompatible old tree and acquires a
+compatible sibling). Its existing coordinator selects/updates canary. A local
+`-File .\install.ps1` invocation instead uses that script's checkout and the
+existing explicit-source preservation rules. This note does not promote main or
+authorize an unannounced live consent prompt.
