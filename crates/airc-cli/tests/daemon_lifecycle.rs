@@ -224,6 +224,21 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     ok(acct, "claude", "claude:main", &["room", "standup"]);
     ok(acct, "claude", "claude:main", &["send", "durable line one"]);
     ok(acct, "claude", "claude:main", &["send", "durable line two"]);
+    let inbox: serde_json::Value = serde_json::from_str(&ok(
+        acct,
+        "claude",
+        "claude:main",
+        &["inbox", "--limit", "16", "--json"],
+    ))
+    .unwrap();
+    let observed_id = inbox["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["body"].to_string().contains("durable line one"))
+        .expect("durable line receipt")["event_id"]
+        .as_str()
+        .unwrap();
     let before = daemon_id(acct, "claude");
     let running: serde_json::Value =
         serde_json::from_str(&ok(acct, "claude", "claude:main", &["status", "--json"])).unwrap();
@@ -305,6 +320,32 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     assert!(stopped["daemon"].is_null());
     assert!(acct.join(".airc/daemon-operator-stop").exists());
 
+    // The supported offline observer shares the owner's ORM and never resumes
+    // a stopped daemon. An exact unknown ID is absent; a read error is not.
+    let missing_id = uuid::Uuid::new_v4().to_string();
+    for (event_id, present) in [(observed_id, true), (missing_id.as_str(), false)] {
+        let observed: serde_json::Value = serde_json::from_str(&ok(
+            acct,
+            "codex",
+            "codex:probe",
+            &["events", "contains", event_id, "--json"],
+        ))
+        .unwrap();
+        assert_eq!(observed["schema_version"], 1);
+        assert_eq!(observed["event_id"], event_id);
+        assert_eq!(observed["present"], present);
+        assert_eq!(
+            std::path::Path::new(observed["database"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            acct.join(".airc/events.sqlite").canonicalize().unwrap()
+        );
+        assert!(!tab(acct, "claude", "claude:main", &["ping"])
+            .status
+            .success());
+        assert!(acct.join(".airc/daemon-operator-stop").exists());
+    }
+
     // The explicit operator join resumes the same owner and durable transcript.
     ok(acct, "claude", "claude:main", &["join", "standup"]);
     let replayed = ok(acct, "claude", "claude:main", &["inbox", "--limit", "16"]);
@@ -336,6 +377,23 @@ fn status_does_not_start_an_absent_daemon() {
     let account = common::daemon_tempdir();
     let acct = account.path();
     for scope in ["claude", "codex"] {
+        let missing = tab(
+            acct,
+            scope,
+            "codex:probe",
+            &[
+                "events",
+                "contains",
+                &uuid::Uuid::new_v4().to_string(),
+                "--json",
+            ],
+        );
+        assert!(
+            !missing.status.success(),
+            "missing store is unknown, never absent"
+        );
+        assert!(missing.stdout.is_empty());
+        assert!(!acct.join(".airc/events.sqlite").exists());
         let output = tab(acct, scope, "codex:probe", &["status"]);
         assert!(
             !output.status.success(),

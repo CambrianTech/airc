@@ -74,6 +74,7 @@
 //! the same channel remap, the same trust. Backfill cannot introduce anything a
 //! live relay could not.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use airc_core::headers::Headers;
@@ -419,67 +420,84 @@ impl Airc {
     }
 }
 
+/// Continuation belongs to one room in one peer's bounded catch-up pass.
+/// Keep it while other rooms advance, without creating another recovery task.
+struct ChannelBackfill {
+    channel: RoomId,
+    room: Option<crate::Room>,
+    before: Option<airc_bus::Cursor>,
+    pages: usize,
+    delivered: usize,
+}
+
 impl Airc {
-    /// Ask `peer` for one channel's missed events and deliver them through this
-    /// node's inbound bridge. Returns how many frames were delivered (new or
-    /// duplicate — duplicates are free, see the module doc).
-    pub(crate) async fn backfill_channel_from_peer(
+    /// Advance one page through the ordinary inbound owner. A pending room goes
+    /// behind the other rooms before requesting its next (older) page.
+    async fn backfill_next_page(
         &self,
         peer: PeerId,
-        channel: RoomId,
+        progress: &mut ChannelBackfill,
+        sink: &dyn crate::router_bridge::InboundFrameSink,
         since_ms: u64,
-    ) -> Result<usize, AircError> {
-        let sink = self.inbound_frame_sink().ok_or_else(|| {
-            AircError::Transport("backfill inbound owner is unavailable".to_string())
+    ) -> Result<bool, AircError> {
+        if progress.room.is_none() {
+            progress.room = Some(self.backfill_dispatch_room(progress.channel).await?);
+        }
+        let room = progress.room.as_ref().ok_or_else(|| {
+            AircError::Transport("backfill dispatch room is unavailable".to_string())
         })?;
-        let mut delivered = 0usize;
-        let mut before = None;
-        let room = self.backfill_dispatch_room(channel).await?;
-        for _page in 0..BACKFILL_MAX_PAGES {
-            let response = self
-                .request_backfill_page(
-                    peer,
-                    &room,
-                    BackfillRequest {
-                        channel,
-                        since: None,
-                        limit: BACKFILL_PAGE,
-                        since_ms: Some(since_ms),
-                        until_ms: None,
-                        cursor_paging: true,
-                        before,
-                    },
-                    Duration::from_secs(30),
-                )
-                .await?;
-            for frame in &response.frames {
-                use crate::router_bridge::InboundDeliveryVerdict as V;
-                match sink.deliver(frame).await {
-                    V::Delivered | V::DeliveredRemapped(_) => delivered += 1,
-                    V::UnknownChannel => {
-                        return Err(AircError::Transport(format!(
-                            "backfill incomplete after {delivered} frames: local channel is unbound"
-                        )));
-                    }
-                    V::Failed(error) => {
-                        return Err(AircError::Transport(format!(
-                            "backfill incomplete after {delivered} frames: {error}"
-                        )));
-                    }
+        let response = self
+            .request_backfill_page(
+                peer,
+                room,
+                BackfillRequest {
+                    channel: progress.channel,
+                    since: None,
+                    limit: BACKFILL_PAGE,
+                    since_ms: Some(since_ms),
+                    until_ms: None,
+                    cursor_paging: true,
+                    before: progress.before,
+                },
+                Duration::from_secs(30),
+            )
+            .await?;
+        progress.pages += 1;
+        for frame in &response.frames {
+            use crate::router_bridge::InboundDeliveryVerdict as V;
+            match sink.deliver(frame).await {
+                V::Delivered | V::DeliveredRemapped(_) => progress.delivered += 1,
+                V::UnknownChannel => {
+                    return Err(AircError::Transport(format!(
+                        "backfill incomplete after {} frames: local channel is unbound",
+                        progress.delivered
+                    )));
+                }
+                V::Failed(error) => {
+                    return Err(AircError::Transport(format!(
+                        "backfill incomplete after {} frames: {error}",
+                        progress.delivered
+                    )));
                 }
             }
-            if !response.truncated {
-                return Ok(delivered);
-            }
-            before = response.next_before;
         }
-        Err(AircError::Transport(format!(
-            "backfill incomplete: page budget {BACKFILL_MAX_PAGES} reached after {delivered} frames; next_before={before:?}"
-        )))
+        if !response.truncated {
+            return Ok(true);
+        }
+        progress.before = response.next_before;
+        if progress.pages == BACKFILL_MAX_PAGES {
+            return Err(AircError::Transport(format!(
+                "backfill incomplete: page budget {BACKFILL_MAX_PAGES} reached after {} frames; next_before={:?}",
+                progress.delivered, progress.before
+            )));
+        }
+        Ok(false)
     }
 
     /// On an authenticated connection, ask what this node missed on every
-    /// subscribed channel. Each pass retains the bounded recent-history policy.
+    /// subscribed channel, one page per room in round-robin order. A busy room
+    /// cannot consume its whole history budget before quiet rooms get a turn.
+    /// Each pass retains the bounded recent-history policy.
     /// Never fails the caller — a peer that cannot answer is logged, not fatal.
     pub(crate) async fn backfill_all_from_peer(&self, peer: PeerId) {
         let Some(sink) = self.inbound_frame_sink() else {
@@ -498,16 +516,28 @@ impl Airc {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0); // JUSTIFIED unwrap_or: a broken clock asks from the epoch = everything the page bound allows
         let since_ms = now_ms.saturating_sub(BACKFILL_LOOKBACK_MS);
-        for channel in channels {
+        let mut pending: VecDeque<_> = channels
+            .into_iter()
+            .map(|channel| ChannelBackfill {
+                channel,
+                room: None,
+                before: None,
+                pages: 0,
+                delivered: 0,
+            })
+            .collect();
+        while let Some(mut progress) = pending.pop_front() {
+            let channel = progress.channel;
             match self
-                .backfill_channel_from_peer(peer, channel, since_ms)
+                .backfill_next_page(peer, &mut progress, sink.as_ref(), since_ms)
                 .await
             {
-                Ok(n) => tracing::info!(
+                Ok(false) => pending.push_back(progress),
+                Ok(true) => tracing::info!(
                     target: "airc::backfill",
                     %peer,
                     %channel,
-                    delivered = n,
+                    delivered = progress.delivered,
                     since_ms,
                     "finished bounded recent-history backfill; older history is outside this pass"
                 ),

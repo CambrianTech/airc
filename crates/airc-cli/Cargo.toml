@@ -13,6 +13,7 @@ name = "airc"
 path = "src/main.rs"
 
 [dependencies]
+airc-bus = { path = "../airc-bus" }
 airc-core = { path = "../airc-core" }
 airc-diagnostics = { path = "../airc-diagnostics" }
 airc-identity = { path = "../airc-identity" }

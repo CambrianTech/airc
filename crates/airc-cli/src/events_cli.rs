@@ -10,6 +10,14 @@ pub struct EventsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EventsAction {
+    /// Observe one durable event ID in the machine owner's store without
+    /// starting the daemon or modifying the database. Read failures are errors.
+    Contains {
+        event_id: uuid::Uuid,
+        /// Emit schema_version=1 JSON with event_id, database, and present.
+        #[arg(long)]
+        json: bool,
+    },
     /// List persisted current-room events matching filters.
     List {
         /// Restrict to transcript kind. Repeatable.
