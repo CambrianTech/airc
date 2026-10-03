@@ -17,6 +17,24 @@ use crate::route::{
 };
 use crate::Airc;
 
+/// One relay session per handle: a live session answers only for its own relay.
+/// Saying Ok for another made discovery count a peer on that relay as dialed and stop
+/// trying its endpoints.
+fn live_relay_serves(
+    session: &RelayAdapter,
+    relay_addr: SocketAddr,
+    relay_peer: PeerId,
+) -> Result<(), AircError> {
+    if session.relay_addr() == relay_addr && session.relay_peer_id() == relay_peer {
+        return Ok(());
+    }
+    Err(AircError::Transport(format!(
+        "relay route is held by {} at {}; {relay_peer} at {relay_addr} is not connected",
+        session.relay_peer_id(),
+        session.relay_addr()
+    )))
+}
+
 impl Airc {
     /// Connect this handle to a pinned relay and make the relay route
     /// available for subsequent sends when route health selects it.
@@ -27,18 +45,8 @@ impl Airc {
     ) -> Result<(), AircError> {
         let installed = self.inner.relay.lock().await.clone();
         if let Some(adapter) = installed {
-            let same_relay =
-                adapter.relay_addr() == relay_addr && adapter.relay_peer_id() == relay_peer;
             if adapter.is_connected().await {
-                if !same_relay {
-                    // One relay session per handle. Saying Ok here made discovery count
-                    // a peer on another relay as dialed and stop trying its endpoints.
-                    return Err(AircError::Transport(format!(
-                        "relay route is held by {} at {}; {relay_peer} at {relay_addr} is not connected",
-                        adapter.relay_peer_id(),
-                        adapter.relay_addr()
-                    )));
-                }
+                live_relay_serves(&adapter, relay_addr, relay_peer)?;
                 self.ensure_relay_subscriber().await?;
                 self.upsert_relay_health(relay_addr, relay_peer)?;
                 return Ok(());
@@ -68,23 +76,29 @@ impl Airc {
             .connect()
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
-        let replaced = {
+        // Install ours unless a concurrent call already installed a live session. In
+        // that case ours is closed and the winner must be the requested relay, the same
+        // rule as the fast path: a session to another relay never answers for this one.
+        let winner = {
             let mut guard = self.inner.relay.lock().await;
-            let concurrent_live = match guard.as_ref() {
-                Some(current) => current.is_connected().await,
-                None => false,
+            let concurrent = match guard.as_ref() {
+                Some(current) if current.is_connected().await => Some(current.clone()),
+                _ => None,
             };
-            // A concurrent call already installed a live session: keep it.
-            if !concurrent_live {
+            if concurrent.is_none() {
                 *guard = Some(adapter.clone());
             }
-            !concurrent_live
+            concurrent
         };
-        if replaced {
-            // The ingest task belonged to the closed adapter's stream; subscribe the new one.
-            *self.inner.relay_subscriber.lock().await = None;
-        } else {
-            adapter.close().await;
+        match winner {
+            None => {
+                // The ingest task belonged to the closed adapter's stream; subscribe the new one.
+                *self.inner.relay_subscriber.lock().await = None;
+            }
+            Some(winner) => {
+                adapter.close().await;
+                live_relay_serves(&winner, relay_addr, relay_peer)?;
+            }
         }
         self.ensure_relay_subscriber().await?;
         self.upsert_relay_health(relay_addr, relay_peer)?;

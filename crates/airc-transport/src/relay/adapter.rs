@@ -57,6 +57,10 @@ struct Inner {
     subscribers: Mutex<Vec<SubscriberHandle>>,
     next_sub_id: AtomicU64,
     on_disconnect: std::sync::Mutex<Option<RelayDisconnectObserver>>,
+    /// The session's read and write loops. `close` aborts them, which drops both TLS
+    /// halves and so closes the socket; clearing the sender alone left the read loop,
+    /// and the connection, alive.
+    loops: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -73,6 +77,7 @@ impl RelayAdapter {
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
                 on_disconnect: std::sync::Mutex::new(None),
+                loops: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -111,8 +116,11 @@ impl RelayAdapter {
         *guard = Some(outbound_tx);
         drop(guard);
 
-        tokio::spawn(write_loop(Arc::clone(&self.inner), write_half, outbound_rx));
-        tokio::spawn(read_loop(Arc::clone(&self.inner), read_half));
+        let writer = tokio::spawn(write_loop(Arc::clone(&self.inner), write_half, outbound_rx));
+        let reader = tokio::spawn(read_loop(Arc::clone(&self.inner), read_half));
+        if let Ok(mut loops) = self.inner.loops.lock() {
+            loops.extend([writer, reader]);
+        }
 
         Ok(())
     }
@@ -131,10 +139,20 @@ impl RelayAdapter {
         self.inner.config.relay_peer_id
     }
 
-    /// Drop this session's outbound side without announcing a disconnect: for an
-    /// adapter its owner decided not to install (a concurrent dial won).
+    /// End this session without announcing a disconnect, for an adapter its owner
+    /// decided not to install (a concurrent dial won): the loops are aborted, so both
+    /// TLS halves drop and the socket closes.
     pub async fn close(&self) {
         self.inner.outbound.lock().await.take();
+        let loops = self
+            .inner
+            .loops
+            .lock()
+            .map(|mut loops| std::mem::take(&mut *loops))
+            .unwrap_or_default();
+        for task in loops {
+            task.abort();
+        }
     }
 
     /// Register the callback fired once when this session ends. A later call replaces it.
