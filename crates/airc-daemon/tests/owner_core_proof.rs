@@ -47,7 +47,7 @@ struct TestDaemon {
 #[tokio::test]
 #[ignore = "manual codec phase measurement"]
 async fn bench_stream_codec_phases() {
-    use airc_ipc::codec::write_frame;
+    use airc_ipc::codec::{encode_event_frame_payload, encode_frame_payload, write_frame};
     use std::hint::black_box;
 
     const REPEATS: u32 = 512;
@@ -68,6 +68,47 @@ async fn bench_stream_codec_phases() {
             panic!("wrong response");
         };
         assert_eq!(airc_wire::decode(envelope.into()).unwrap(), env);
+
+        // Paired alternating measurements isolate buffer bookkeeping from the
+        // rest of the daemon. Equality is checked outside the timed region;
+        // normal allocation and drop are included, socket framing is excluded.
+        assert_eq!(encode_frame_payload(&response).unwrap(), frame[4..]);
+        assert_eq!(encode_event_frame_payload(&encoded).unwrap(), frame[4..]);
+        for _ in 0..16 {
+            black_box(encode_frame_payload(black_box(&response)).unwrap());
+            black_box(encode_event_frame_payload(black_box(&encoded)).unwrap());
+        }
+        let mut ordinary_samples = Vec::with_capacity(REPEATS as usize);
+        let mut bounded_samples = Vec::with_capacity(REPEATS as usize);
+        for iteration in 0..REPEATS {
+            for bounded in if iteration % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = Instant::now();
+                if bounded {
+                    black_box(encode_event_frame_payload(black_box(&encoded)).unwrap());
+                } else {
+                    black_box(encode_frame_payload(black_box(&response)).unwrap());
+                }
+                let nanos = start.elapsed().as_nanos();
+                if bounded {
+                    bounded_samples.push(nanos);
+                } else {
+                    ordinary_samples.push(nanos);
+                }
+            }
+        }
+        for (name, mut samples) in [
+            ("ordinary", ordinary_samples),
+            ("exact_event", bounded_samples),
+        ] {
+            samples.sort_unstable();
+            eprintln!("paired_cbor payload={payload_len} buffer={name} repeats={REPEATS} mean_ns={} p50_ns={} p95_ns={} min_ns={} max_ns={}",
+                samples.iter().sum::<u128>() / samples.len() as u128,
+                samples[samples.len() / 2], samples[(samples.len() - 1) * 95 / 100], samples[0], samples[samples.len() - 1]);
+        }
 
         let start = Instant::now();
         for _ in 0..REPEATS {

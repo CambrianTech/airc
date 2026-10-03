@@ -31,6 +31,7 @@ use airc_store::{EventStore, SqliteDurableSink};
 /// underlying handles (registry, router, store) do their own interior
 /// locking.
 pub struct DaemonState {
+    pub(crate) shared_frames: crate::shared_frames::SharedFrames,
     pub peer_id: PeerId,
     pub keypair: PeerKeypair,
     pub registry: Arc<PeerKeyRegistry>,
@@ -142,6 +143,7 @@ impl DaemonState {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let router = EventRouter::new(RouterConfig::default(), clock, seq, sink);
         Ok(Self {
+            shared_frames: crate::shared_frames::SharedFrames::default(),
             peer_id,
             keypair,
             registry,
