@@ -49,20 +49,26 @@ const CLAUDE_PREFIX: &str = "claude:";
 const PROCESS_WALK_LIMIT: usize = 16;
 
 pub fn current_client_id() -> Result<Option<String>, Box<dyn Error>> {
+    match explicit_client_id() {
+        Some(value) => Ok(Some(value)),
+        None => agent_process_client_id(),
+    }
+}
+
+/// The identity a runtime states outright in its environment, if any. A caller that has
+/// a more specific identity of its own (the Codex hook's stdin `session_id`) ranks it
+/// between this and the process-walk guess, which only infers an agent from ancestors.
+pub(crate) fn explicit_client_id() -> Option<String> {
     if let Some(value) = non_empty_env("AIRC_CLIENT_ID") {
-        return Ok(Some(value));
+        return Some(value);
     }
     if let Some(value) = non_empty_env("CODEX_THREAD_ID") {
-        return Ok(Some(format!("{CODEX_PREFIX}{value}")));
+        return Some(format!("{CODEX_PREFIX}{value}"));
     }
     if let Some(value) = non_empty_env("CLAUDE_CODE_SESSION_ID") {
-        return Ok(Some(format!("{CLAUDE_PREFIX}{value}")));
+        return Some(format!("{CLAUDE_PREFIX}{value}"));
     }
-    if let Some(value) = non_empty_env("CLAUDE_SESSION_ID") {
-        return Ok(Some(format!("{CLAUDE_PREFIX}{value}")));
-    }
-
-    agent_process_client_id()
+    non_empty_env("CLAUDE_SESSION_ID").map(|value| format!("{CLAUDE_PREFIX}{value}"))
 }
 
 #[cfg(any(unix, test))]
@@ -75,7 +81,7 @@ pub fn agent_label(seed: &str) -> Result<String, Box<dyn Error>> {
 }
 
 #[cfg(unix)]
-fn agent_process_client_id() -> Result<Option<String>, Box<dyn Error>> {
+pub(crate) fn agent_process_client_id() -> Result<Option<String>, Box<dyn Error>> {
     let mut pid = std::process::id();
     for _ in 0..PROCESS_WALK_LIMIT {
         let Some(process) = read_process(pid)? else {
@@ -93,7 +99,7 @@ fn agent_process_client_id() -> Result<Option<String>, Box<dyn Error>> {
 }
 
 #[cfg(not(unix))]
-fn agent_process_client_id() -> Result<Option<String>, Box<dyn Error>> {
+pub(crate) fn agent_process_client_id() -> Result<Option<String>, Box<dyn Error>> {
     Ok(None)
 }
 
