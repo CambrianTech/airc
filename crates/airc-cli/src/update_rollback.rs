@@ -170,11 +170,23 @@ mod tests {
             std::thread::sleep(Duration::from_secs(60));
             return;
         }
+        let executable = std::env::current_exe().unwrap();
+        // Unix exec refuses an inode while any process holds it writable. A
+        // parallel fork can inherit fs::copy's write fd until exec (Rust #114554).
+        // Link the immutable running image on its own filesystem instead: no
+        // writable executable fd exists to inherit. The transaction only moves
+        // original names; candidate publication creates a distinct inode.
+        #[cfg(unix)]
+        let temp = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        #[cfg(not(unix))]
         let temp = tempfile::tempdir().unwrap();
         let current = temp
             .path()
             .join(format!("airc{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(std::env::current_exe().unwrap(), &current).unwrap();
+        #[cfg(unix)]
+        std::fs::hard_link(&executable, &current).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&executable, &current).unwrap();
         let ready = temp.path().join("ready");
         let mut child = OwnedChild(
             command(&current)
@@ -198,6 +210,7 @@ mod tests {
         let candidate = temp.path().join("candidate");
         std::fs::write(&candidate, "failed new artifact").unwrap();
         let swap = BinarySwap::displace(&current, &candidate).unwrap();
+        assert!(!current.exists(), "publication must create a new inode");
         std::fs::copy(&candidate, &current).unwrap();
         assert!(child.0.try_wait().unwrap().is_none());
         swap.rollback().unwrap();
