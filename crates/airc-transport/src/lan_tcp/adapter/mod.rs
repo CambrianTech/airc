@@ -509,6 +509,7 @@ mod tests {
                 outbound: tx,
                 id: 0,
                 reader: reader.abort_handle(),
+                writer: tokio::spawn(std::future::pending::<()>()).abort_handle(),
             },
         );
         assert!(alice.inner.connections.lock().await.contains_key(&bob_id));
@@ -531,6 +532,73 @@ mod tests {
                 .unwrap_err()
                 .is_cancelled(),
             "disconnect must abort the session's reader, which owns its socket half"
+        );
+    }
+
+    // what this catches (Astra's review of #1511): a session replaced while its writer is
+    // BLOCKED in write_all (the peer stopped reading, the buffer is full) kept its write half
+    // and the socket, because dropping the sender only ends a writer idle in recv. A 64-byte
+    // in-memory duplex whose far end never reads blocks the writer; after the redial the far
+    // end must see the stream fully released (a write into it fails), which only holds if
+    // the writer was aborted. The check never reads, so it cannot unblock the writer itself.
+    #[tokio::test]
+    async fn a_redial_releases_a_session_whose_writer_is_blocked() {
+        let (alice_id, alice, bob_id, _bob) = make_paired_adapters();
+        let _ = alice_id;
+        let (near, mut far) = tokio::io::duplex(64);
+        let (read_half, write_half) = tokio::io::split(near);
+        super::connection::install_and_spawn_loops(
+            alice.inner.clone(),
+            bob_id,
+            read_half,
+            write_half,
+        )
+        .await;
+        // Queue more than the duplex holds, so the writer blocks in write_all.
+        let outbound = alice
+            .inner
+            .connections
+            .lock()
+            .await
+            .get(&bob_id)
+            .unwrap()
+            .outbound
+            .clone();
+        let (flushed, _flushed_rx) = tokio::sync::oneshot::channel();
+        outbound
+            .send(Outbound {
+                payload: vec![7u8; 4096],
+                flushed,
+            })
+            .await
+            .unwrap();
+        drop(outbound);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The redial: a new session for bob replaces the blocked one.
+        let (near2, _far2) = tokio::io::duplex(64);
+        let (r2, w2) = tokio::io::split(near2);
+        super::connection::install_and_spawn_loops(alice.inner.clone(), bob_id, r2, w2).await;
+
+        use tokio::io::AsyncWriteExt;
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if far.write_all(b"x").await.is_err() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            released,
+            "the replaced session's blocked writer still holds its half of the stream"
+        );
+        assert_eq!(
+            alice.inner.connections.lock().await.len(),
+            1,
+            "only the new session remains"
         );
     }
 

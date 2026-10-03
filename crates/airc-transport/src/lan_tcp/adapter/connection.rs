@@ -103,7 +103,7 @@ fn resolve_peer_from_client_stream(
 /// A session it replaces (the same peer, redialed) is ended here, not left running: its
 /// outbound sender drops with the map entry (closing its write loop) and its reader is
 /// aborted, so both halves of the old TLS stream drop and the socket closes.
-async fn install_and_spawn_loops<R, W>(
+pub(super) async fn install_and_spawn_loops<R, W>(
     inner: Arc<Inner>,
     peer_id: PeerId,
     read_half: R,
@@ -116,7 +116,7 @@ async fn install_and_spawn_loops<R, W>(
     let id = inner
         .next_session_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tokio::spawn(write_loop(write_half, outbound_rx));
+    let writer = tokio::spawn(write_loop(write_half, outbound_rx));
     // The reader starts only once its session is in the map, so a read that ends at once
     // cannot remove an entry that does not exist yet and leave a dead session installed.
     let (installed_tx, installed_rx) = oneshot::channel::<()>();
@@ -135,11 +135,12 @@ async fn install_and_spawn_loops<R, W>(
             outbound: outbound_tx,
             id,
             reader: reader.abort_handle(),
+            writer: writer.abort_handle(),
         },
     );
     let _ = installed_tx.send(());
     if let Some(old) = replaced {
-        old.reader.abort();
+        old.end();
     }
     let observer = inner.on_connect.lock().ok().and_then(|guard| guard.clone());
     if let Some(observer) = observer {
@@ -155,7 +156,7 @@ async fn install_and_spawn_loops<R, W>(
 pub(super) async fn disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
     let removed = inner.connections.lock().await.remove(&peer_id);
     if let Some(session) = removed {
-        session.reader.abort();
+        session.end();
     }
     notify_disconnect(inner, peer_id);
 }
@@ -170,7 +171,10 @@ async fn disconnect_session(inner: &Arc<Inner>, peer_id: PeerId, id: u64) {
             _ => None,
         }
     };
-    if removed.is_some() {
+    if let Some(session) = removed {
+        // The reader is this very task and is ending anyway; the writer may be blocked on
+        // a peer that stopped reading, so it is aborted rather than left holding its half.
+        session.writer.abort();
         notify_disconnect(inner, peer_id);
     }
 }

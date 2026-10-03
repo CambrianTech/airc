@@ -63,6 +63,19 @@ pub(super) struct Session {
     /// never a newer session for the same peer.
     pub(super) id: u64,
     pub(super) reader: tokio::task::AbortHandle,
+    /// The write loop. Dropping `outbound` ends it only when it is idle in `recv`; a writer
+    /// blocked in `write_all`/`flush` on a peer that stopped reading holds the TLS write
+    /// half (and the socket) until aborted (Astra's review of #1511).
+    pub(super) writer: tokio::task::AbortHandle,
+}
+
+impl Session {
+    /// End this session: abort both I/O tasks, so both TLS halves drop and the socket
+    /// closes whatever either loop was blocked on.
+    pub(super) fn end(self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
 }
 
 /// One subscriber's filtered inbound channel + matching predicate.
