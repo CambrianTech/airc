@@ -485,6 +485,28 @@ mod tests {
         );
     }
 
+    // Regression: a daemon ACK names the signer, while TLS may index its same-key alias.
+    #[tokio::test]
+    async fn unicast_uses_authenticated_session_for_enrolled_alias_only() {
+        let (alice_id, alice, _bob_id, bob) = make_paired_adapters();
+        let bound = alice.listen(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let mut received = alice.subscribe(Subscription { channel: None, ..Default::default() }).await.unwrap();
+        bob.connect(bound, alice_id).await.unwrap();
+        // Enrol AFTER handshake, making the stored connection's original ID deterministic.
+        let alias = PeerId::from_u128(0xa2);
+        bob.inner.registry.enrol(alias, 0, alice.inner.keypair.public_bytes()).unwrap();
+        let stranger = PeerId::from_u128(0xa3);
+        bob.inner.registry.enrol(stranger, 0, PeerKeypair::generate().public_bytes()).unwrap();
+        let channel = RoomId::from_u128(0xc0ffee);
+        for refused in [stranger, PeerId::from_u128(0xa4)] {
+            assert!(bob.send_to(refused, frame_at(80, channel, "must not send")).await.is_err());
+        }
+        bob.send_to(alias, frame_at(81, channel, "alias ack")).await.expect("same authenticated key must use the live session");
+        let frame = tokio::time::timeout(Duration::from_secs(3), received.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(frame.envelope.lamport, 81);
+        bob.inner.registry.remove_peer(alias);
+        assert!(bob.send_to(alias, frame_at(82, channel, "revoked")).await.is_err());
+    }
     // #240 event-driven heal: a terminated session must (1) drop the peer from
     // `connections` and (2) fire the registered disconnect observer with that
     // peer_id — the signal the daemon turns into a route-refresh wake nudge.
