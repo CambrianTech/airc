@@ -225,6 +225,13 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     ok(acct, "claude", "claude:main", &["send", "durable line one"]);
     ok(acct, "claude", "claude:main", &["send", "durable line two"]);
     let before = daemon_id(acct, "claude");
+    let running: serde_json::Value =
+        serde_json::from_str(&ok(acct, "claude", "claude:main", &["status", "--json"])).unwrap();
+    assert_eq!(running["schema_version"], 1);
+    assert_eq!(running["state"], "running");
+    assert_eq!(running["daemon"]["peer_id"], before.peer_id);
+    assert!(running["daemon"]["build_commit"].is_string());
+    assert!(running["error"].is_null());
     let rooms_before = ok(acct, "claude", "claude:main", &["room"]);
     ok(acct, "claude", "claude:main", &["join", "--ensure"]);
     assert_eq!(ok(acct, "claude", "claude:main", &["room"]), rooms_before);
@@ -292,6 +299,11 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     assert!(!tab(acct, "claude", "claude:main", &["ping"])
         .status
         .success());
+    let stopped: serde_json::Value =
+        serde_json::from_str(&ok(acct, "claude", "claude:main", &["status", "--json"])).unwrap();
+    assert_eq!(stopped["state"], "absent");
+    assert!(stopped["daemon"].is_null());
+    assert!(acct.join(".airc/daemon-operator-stop").exists());
 
     // The explicit operator join resumes the same owner and durable transcript.
     ok(acct, "claude", "claude:main", &["join", "standup"]);
@@ -332,6 +344,15 @@ fn status_does_not_start_an_absent_daemon() {
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(error.contains("No daemon was started"), "{error}");
         assert!(error.contains("airc join"), "{error}");
+        let json: serde_json::Value =
+            serde_json::from_str(&ok(acct, scope, "codex:probe", &["status", "--json"])).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["state"], "absent");
+        assert!(json["daemon"].is_null());
+        assert!(json["error"].is_null());
+        let native = ok(acct, scope, "codex:probe", &["ipc-endpoint", "--native"]);
+        assert_eq!(json["endpoint"], native.trim());
+        assert!(common::find_daemon_pid_under(acct).is_none());
         assert!(!tab(acct, scope, "codex:probe", &["ping"]).status.success());
     }
 }
