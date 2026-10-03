@@ -42,6 +42,65 @@ struct TestDaemon {
     _home: tempfile::TempDir,
 }
 
+/// Serial in-memory codec costs; excludes IPC scheduling, routing and storage.
+/// Each phase includes its ordinary allocation/drop costs. Not a CPU profile.
+#[tokio::test]
+#[ignore = "manual codec phase measurement"]
+async fn bench_stream_codec_phases() {
+    use airc_ipc::codec::write_frame;
+    use std::hint::black_box;
+
+    const REPEATS: u32 = 512;
+    for payload_len in [256usize, 65_536] {
+        let env = Envelope::new(
+            RoomId::new(),
+            (PeerId::new(), airc_core::ClientId::new()),
+            Kind::Event,
+            DeliveryClass::StreamChunk,
+            vec![0x42; payload_len].into(),
+        );
+        let encoded = airc_wire::encode(&env);
+        let response = Response::event_ref(&encoded);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &response).await.unwrap();
+        let decoded: Response = read_frame(&mut frame.as_slice()).await.unwrap().unwrap();
+        let Response::Event { envelope } = decoded else {
+            panic!("wrong response");
+        };
+        assert_eq!(airc_wire::decode(envelope.into()).unwrap(), env);
+
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            black_box(airc_wire::encode(black_box(&env)));
+        }
+        let wire_encode = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            let mut output = Vec::new();
+            write_frame(&mut output, black_box(&response))
+                .await
+                .unwrap();
+            black_box(output);
+        }
+        let cbor_encode = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            black_box(
+                read_frame::<_, Response>(&mut black_box(frame.as_slice()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let cbor_decode = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            black_box(airc_wire::decode(black_box(encoded.clone())).unwrap());
+        }
+        let wire_decode = start.elapsed();
+        eprintln!("codec payload={payload_len} wire_bytes={} ipc_bytes={} repeats={REPEATS} mean_ns wire_encode={} cbor_frame_encode={} cbor_frame_decode={} wire_decode={}", encoded.len(), frame.len(), wire_encode.as_nanos() / u128::from(REPEATS), cbor_encode.as_nanos() / u128::from(REPEATS), cbor_decode.as_nanos() / u128::from(REPEATS), wire_decode.as_nanos() / u128::from(REPEATS));
+    }
+}
+
 fn unique_socket() -> PathBuf {
     // Short /tmp path keeps us well under macOS SUN_LEN (104 bytes).
     static N: AtomicU64 = AtomicU64::new(0);

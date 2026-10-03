@@ -92,3 +92,23 @@ Independent source review approved these boundaries; the actual startup cleanup
 regression and package all-target Clippy also passed.
 
 Run: cargo test --release -p airc-daemon --test owner_core_proof bench_stream_fanout_sizes -- --ignored --exact --nocapture
+
+## Isolated codec phases
+
+Serial optimized in-memory measurement, 512 repetitions of each reused input.
+Means include normal allocation/drop costs, not latency percentiles or CPU
+profiling. CBOR phases include framing and memory copies. Wire decode clones
+Bytes and shares the existing payload allocation. Summing these isolated means
+does not reconstruct daemon fan-out time. Actual framed round-trip equality
+passed before measurement; no production encoding change is included.
+
+| Payload | Wire bytes | IPC bytes | Wire encode mean | CBOR frame encode mean | CBOR frame decode mean | Wire decode mean |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 B | 384 | 744 | 0.738 us | 4.407 us | 30.985 us | 0.109 us |
+| 65536 B | 65664 | 131303 | 109.130 us | 664.461 us | 6662.511 us | 0.127 us |
+
+This identifies framed decoding as a candidate for investigation, without
+attributing full pipeline latency to that phase. Independent source review
+approved measurement framing with the limits above.
+
+Run: cargo test --release -p airc-daemon --test owner_core_proof bench_stream_codec_phases -- --ignored --exact --nocapture
