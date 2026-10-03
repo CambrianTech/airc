@@ -305,3 +305,50 @@ async fn a_dropped_relay_session_wakes_the_owner_and_is_redialed() {
         .expect("a session that was never redialed cannot drop a second time");
     assert_eq!(dropped_again, Some(relay_peer));
 }
+
+// what this catches (review of #1498): when two connects for DIFFERENT relays raced,
+// the losing call closed its own session and still reported success for its relay,
+// although the other relay held the route. Exactly one may succeed.
+#[tokio::test]
+async fn concurrent_connects_to_different_relays_never_both_succeed() {
+    let tmp = TempDir::new().expect("bob tempdir");
+    let bob = Airc::open(tmp.path().join(".airc"))
+        .await
+        .expect("bob open");
+    let bob_spec: PeerSpec = bob.peer_spec().parse().expect("bob spec");
+    let relay = |n: u128| {
+        let peer = PeerId::from_u128(n);
+        let keypair = PeerKeypair::generate();
+        let registry = Arc::new(PeerKeyRegistry::new());
+        registry
+            .enrol(bob_spec.peer_id, 1, bob_spec.pubkey)
+            .expect("relay enrols bob");
+        (
+            peer,
+            keypair.clone(),
+            DisposableRelay::start(peer, keypair, registry),
+        )
+    };
+    let (peer_a, key_a, relay_a) = relay(0x_3e_1c);
+    let (peer_b, key_b, relay_b) = relay(0x_3e_1d);
+    for (peer, key) in [(peer_a, &key_a), (peer_b, &key_b)] {
+        bob.add_peer(PeerSpec {
+            peer_id: peer,
+            pubkey: key.public_bytes(),
+        })
+        .await
+        .expect("bob trusts the relay");
+    }
+
+    let (a, b) = tokio::join!(
+        bob.connect_relay(relay_a.addr, peer_a),
+        bob.connect_relay(relay_b.addr, peer_b)
+    );
+    assert_eq!(
+        a.is_ok() as u8 + b.is_ok() as u8,
+        1,
+        "one relay session per handle: exactly one connect may succeed (a: {a:?}, b: {b:?})"
+    );
+    relay_a.kill();
+    relay_b.kill();
+}
