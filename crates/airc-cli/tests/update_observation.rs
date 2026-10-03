@@ -522,6 +522,20 @@ fn public_update_refuses_unknown_ipc_without_installing_or_starting() {
         let endpoint = cli(&account, &source, &["ipc-endpoint"]);
         let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
         let mut owner = fixture(&socket, &temp.path().join("ready"), mode, "old");
+        let observed = cli(&account, &source, &["status", "--json"]);
+        assert!(!observed.status.success(), "{mode} must remain unknown");
+        let json: serde_json::Value = serde_json::from_slice(&observed.stdout).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["state"], "unknown");
+        assert!(json["daemon"].is_null());
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to treat an unknown owner as absent"));
+        assert_eq!(
+            json["endpoint"],
+            airc_ipc::transport::native_endpoint(&socket)
+        );
         let out = cli(&account, &source, &["update"]);
         assert!(!out.status.success());
         let error = String::from_utf8_lossy(&out.stderr);

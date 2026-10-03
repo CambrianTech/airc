@@ -20,6 +20,17 @@ Audience: Claude Code, Codex, future agent runtimes. Goal: leave the user with a
 
 `--health` and `--fix` compose with the env probe and with each other.
 
+For a read-only machine observation, use `airc status --json`. Schema version 1
+has `schema_version`, `state`, `socket`, `endpoint`, `daemon`, and `error` fields.
+`socket` is the requested socket path and `endpoint` its native IPC address.
+`running` carries the daemon's status response; build metadata is reported only
+when that daemon supplies it. No PID is inferred from a file or process name.
+`absent` is returned only for a missing or refused endpoint connection. Both
+states exit zero. `unknown` carries an error and exits nonzero; access denial,
+timeout, malformed responses, or mid-call disconnects are never absence. The
+unused `daemon` or `error` field is null. Observation never starts a daemon or
+clears operator-stop intent. Default human `airc status` behavior is unchanged.
+
 ## Decision tree
 
 When something feels wrong, in this order:

@@ -14,6 +14,30 @@ pub(crate) fn status(
     })
 }
 
+/// Machine-readable observation uses the same absence classification as stop
+/// and update. The endpoint is the native address probed; daemon metadata comes
+/// only from its response. In particular, never infer a PID from a shared file.
+pub(crate) fn print_status_json(socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let observation = status(socket);
+    let (state, daemon, error) = match &observation {
+        Ok(Some(daemon)) => ("running", Some(daemon), None),
+        Ok(None) => ("absent", None, None),
+        Err(error) => ("unknown", None, Some(error.to_string())),
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": 1,
+            "state": state,
+            "socket": socket.to_string_lossy(),
+            "endpoint": airc_ipc::transport::native_endpoint(socket),
+            "daemon": daemon,
+            "error": error,
+        })
+    );
+    observation.map(|_| ())
+}
+
 fn observe_status(
     socket: &Path,
 ) -> Result<Option<airc_ipc::response::StatusResponse>, airc_ipc::client::ClientError> {

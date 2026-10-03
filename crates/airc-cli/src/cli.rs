@@ -387,6 +387,10 @@ pub enum Command {
     Status {
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Emit schema_version=1 JSON: running, absent, or unknown. Unknown
+        /// exits nonzero; absent means the endpoint was missing or refused.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Stop the account daemon and retain operator intent until explicit `join`.
