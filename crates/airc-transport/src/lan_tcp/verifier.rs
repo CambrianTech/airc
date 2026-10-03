@@ -112,12 +112,11 @@ impl ServerCertVerifier for PinnedServerVerifier {
         let pubkey = extract_ed25519_pubkey(end_entity)
             .map_err(|error| RustlsError::General(error.to_string()))?;
 
-        // Resolve the cert's pubkey to a (peer, key_id) entry. We
-        // accept only if the resolved peer matches the expected one.
+        // Pin to the requested identity's key, not an arbitrary reverse-lookup alias.
+        if self.registry.has_key(self.expected_peer, &pubkey) {
+            return Ok(ServerCertVerified::assertion());
+        }
         match self.registry.find_peer(&pubkey) {
-            Some((peer, _key_id)) if peer == self.expected_peer => {
-                Ok(ServerCertVerified::assertion())
-            }
             Some((peer, _)) => Err(RustlsError::General(peer_identity_mismatch_error(
                 peer,
                 self.expected_peer,
@@ -304,6 +303,28 @@ mod tests {
         let server_name = ServerName::try_from("localhost").unwrap();
         let result = verifier.verify_server_cert(&cert, &[], &server_name, &[], unix_now());
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn server_verifier_checks_each_alias_pin_independently() {
+        let primary = PeerId::from_u128(0xa1);
+        let alias = PeerId::from_u128(0xa2);
+        let keypair = PeerKeypair::generate();
+        let (cert, _) = generate_self_signed_cert(&keypair, primary).unwrap();
+        let registry = make_registry_with(primary, &keypair);
+        registry.enrol(alias, 0, keypair.public_bytes()).unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        for peer in [primary, alias] {
+            let verifier = PinnedServerVerifier::new(peer, registry.clone());
+            assert!(verifier
+                .verify_server_cert(&cert, &[], &server_name, &[], unix_now())
+                .is_ok());
+        }
+        registry.remove_peer(alias);
+        let verifier = PinnedServerVerifier::new(alias, registry);
+        assert!(verifier
+            .verify_server_cert(&cert, &[], &server_name, &[], unix_now())
+            .is_err());
     }
 
     #[test]
