@@ -81,6 +81,7 @@ impl LanTcpAdapter {
                 registry,
                 server_config,
                 connections: Mutex::new(HashMap::new()),
+                next_session_id: AtomicU64::new(0),
                 listening: Mutex::new(false),
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
@@ -279,7 +280,7 @@ impl LanTcpAdapter {
             let connections = self.inner.connections.lock().await;
             connections
                 .get(&peer)
-                .cloned()
+                .map(|session| session.outbound.clone())
                 .ok_or(LanTcpError::NoActivePeers)?
         };
         let (flushed, flushed_rx) = oneshot::channel();
@@ -321,7 +322,7 @@ impl Transport for LanTcpAdapter {
             }
             connections
                 .iter()
-                .map(|(peer, tx)| (*peer, tx.clone()))
+                .map(|(peer, session)| (*peer, session.outbound.clone()))
                 .collect()
         };
 
@@ -501,7 +502,16 @@ mod tests {
 
         // Stand in a live connection entry for bob, then terminate it.
         let (tx, _rx) = tokio::sync::mpsc::channel::<Outbound>(1);
-        alice.inner.connections.lock().await.insert(bob_id, tx);
+        let reader = tokio::spawn(std::future::pending::<()>());
+        alice.inner.connections.lock().await.insert(
+            bob_id,
+            super::inner::Session {
+                outbound: tx,
+                id: 0,
+                reader: reader.abort_handle(),
+                writer: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            },
+        );
         assert!(alice.inner.connections.lock().await.contains_key(&bob_id));
 
         super::connection::disconnect(&alice.inner, bob_id).await;
@@ -515,6 +525,141 @@ mod tests {
             &[bob_id],
             "the disconnect observer must fire once with the terminated peer's id"
         );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), reader)
+                .await
+                .expect("reader ended")
+                .unwrap_err()
+                .is_cancelled(),
+            "disconnect must abort the session's reader, which owns its socket half"
+        );
+    }
+
+    // what this catches (Astra's review of #1511): a session replaced while its writer is
+    // BLOCKED in write_all (the peer stopped reading, the buffer is full) kept its write half
+    // and the socket, because dropping the sender only ends a writer idle in recv. A 64-byte
+    // in-memory duplex whose far end never reads blocks the writer; after the redial the far
+    // end must see the stream fully released (a write into it fails), which only holds if
+    // the writer was aborted. The check never reads, so it cannot unblock the writer itself.
+    #[tokio::test]
+    async fn a_redial_releases_a_session_whose_writer_is_blocked() {
+        let (alice_id, alice, bob_id, _bob) = make_paired_adapters();
+        let _ = alice_id;
+        let (near, mut far) = tokio::io::duplex(64);
+        let (read_half, write_half) = tokio::io::split(near);
+        super::connection::install_and_spawn_loops(
+            alice.inner.clone(),
+            bob_id,
+            read_half,
+            write_half,
+        )
+        .await;
+        // Queue more than the duplex holds, so the writer blocks in write_all.
+        let outbound = alice
+            .inner
+            .connections
+            .lock()
+            .await
+            .get(&bob_id)
+            .unwrap()
+            .outbound
+            .clone();
+        let (flushed, _flushed_rx) = tokio::sync::oneshot::channel();
+        outbound
+            .send(Outbound {
+                payload: vec![7u8; 4096],
+                flushed,
+            })
+            .await
+            .unwrap();
+        drop(outbound);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The redial: a new session for bob replaces the blocked one.
+        let (near2, _far2) = tokio::io::duplex(64);
+        let (r2, w2) = tokio::io::split(near2);
+        super::connection::install_and_spawn_loops(alice.inner.clone(), bob_id, r2, w2).await;
+
+        use tokio::io::AsyncWriteExt;
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if far.write_all(b"x").await.is_err() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            released,
+            "the replaced session's blocked writer still holds its half of the stream"
+        );
+        assert_eq!(
+            alice.inner.connections.lock().await.len(),
+            1,
+            "only the new session remains"
+        );
+    }
+
+    // what this catches (M5 and BigMama, 2026-10-03): every redial of the same peer
+    // replaced its map entry but left the old read loop holding its TLS half, so the old
+    // socket never closed (56 ESTABLISHED on the M5, 69 on BigMama), and when such a stale
+    // reader finally ended it removed the NEW session. Three adapters with bob's identity
+    // dial alice in turn, as redials do: alice must keep exactly one session for bob, the
+    // two replaced dialers must see their sockets closed, and alice's live session must
+    // survive those closes.
+    #[tokio::test]
+    async fn a_redial_ends_the_replaced_session_and_a_stale_reader_cannot_end_the_new_one() {
+        ensure_crypto_provider();
+        let alice_id = PeerId::from_u128(0xa1);
+        let bob_id = PeerId::from_u128(0xb2);
+        let alice_kp = PeerKeypair::generate();
+        let bob_kp = PeerKeypair::generate();
+        let registry = PeerKeyRegistry::new();
+        registry
+            .enrol(alice_id, 0, alice_kp.public_bytes())
+            .unwrap();
+        registry.enrol(bob_id, 0, bob_kp.public_bytes()).unwrap();
+        let registry = Arc::new(registry);
+        let alice = LanTcpAdapter::new(alice_id, alice_kp, registry.clone()).unwrap();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+
+        let mut dialers = Vec::new();
+        for _ in 0..3 {
+            let bob = LanTcpAdapter::new(bob_id, bob_kp.clone(), registry.clone()).unwrap();
+            bob.connect(bound, alice_id).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            dialers.push(bob);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let replaced_closed = dialers[0].connected_peers().await.is_empty()
+                && dialers[1].connected_peers().await.is_empty();
+            if replaced_closed || tokio::time::Instant::now() >= deadline {
+                assert!(
+                    replaced_closed,
+                    "the replaced sessions' sockets must close, not linger"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            dialers[2].connected_peers().await,
+            vec![alice_id],
+            "the latest dial stays connected"
+        );
+        assert_eq!(
+            alice.connected_peers().await,
+            vec![bob_id],
+            "alice keeps exactly the live session for bob"
+        );
+        assert_eq!(alice.inner.connections.lock().await.len(), 1);
     }
 
     #[tokio::test]

@@ -52,6 +52,32 @@ pub(super) struct Outbound {
 /// TLS stream, signalling `flushed` once each is on the wire.
 pub(super) type OutboundTx = mpsc::Sender<Outbound>;
 
+/// One live, authenticated session to a peer: the only owner of its socket. Replacing or
+/// dropping it ends the session: `outbound` closes the write loop and `reader` is aborted,
+/// so both TLS halves drop and the socket closes. Before this, a replaced session's read
+/// loop kept its half (and the socket) open for good: 56 such sockets on the M5 and 69 on
+/// BigMama, 2026-10-03, one per redial.
+pub(super) struct Session {
+    pub(super) outbound: OutboundTx,
+    /// Unique per installed session, so a read loop that ends removes only its own entry,
+    /// never a newer session for the same peer.
+    pub(super) id: u64,
+    pub(super) reader: tokio::task::AbortHandle,
+    /// The write loop. Dropping `outbound` ends it only when it is idle in `recv`; a writer
+    /// blocked in `write_all`/`flush` on a peer that stopped reading holds the TLS write
+    /// half (and the socket) until aborted (Astra's review of #1511).
+    pub(super) writer: tokio::task::AbortHandle,
+}
+
+impl Session {
+    /// End this session: abort both I/O tasks, so both TLS halves drop and the socket
+    /// closes whatever either loop was blocked on.
+    pub(super) fn end(self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
+}
+
 /// One subscriber's filtered inbound channel + matching predicate.
 pub(super) struct SubscriberHandle {
     pub(super) id: u64,
@@ -71,7 +97,8 @@ pub(super) struct Inner {
     /// the accept loop (server-side handshakes) and `connect()`
     /// (client-side dials). Entries removed when the read loop
     /// detects a closed connection.
-    pub(super) connections: Mutex<HashMap<PeerId, OutboundTx>>,
+    pub(super) connections: Mutex<HashMap<PeerId, Session>>,
+    pub(super) next_session_id: AtomicU64,
     /// True after the first `listen()` call so subsequent calls
     /// error rather than silently spawning a second accept loop.
     pub(super) listening: Mutex<bool>,
