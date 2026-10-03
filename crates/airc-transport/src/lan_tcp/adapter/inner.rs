@@ -58,6 +58,7 @@ pub(super) type OutboundTx = mpsc::Sender<Outbound>;
 /// loop kept its half (and the socket) open for good: 56 such sockets on the M5 and 69 on
 /// BigMama, 2026-10-03, one per redial.
 pub(super) struct Session {
+    pub(super) authenticated_key: [u8; 32],
     pub(super) outbound: OutboundTx,
     /// Unique per installed session, so a read loop that ends removes only its own entry,
     /// never a newer session for the same peer.

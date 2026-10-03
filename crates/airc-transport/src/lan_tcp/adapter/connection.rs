@@ -34,7 +34,7 @@ pub(super) async fn handle_server_connection(
     tls_stream: ServerTlsStream<TcpStream>,
     peer_addr: std::net::SocketAddr,
 ) -> Result<(), LanTcpError> {
-    let peer_id = resolve_peer_from_server_stream(&inner, &tls_stream)
+    let (peer_id, authenticated_key) = resolve_peer_from_server_stream(&inner, &tls_stream)
         .ok_or(LanTcpError::PeerNotInRegistry)?;
     // #9: the peer just proved (via the authenticated handshake) it's
     // reachable at `peer_addr.ip()`. Report it to the learn-observer if one
@@ -48,7 +48,7 @@ pub(super) async fn handle_server_connection(
         observer(peer_id, peer_addr.ip());
     }
     let (read_half, write_half) = tokio::io::split(tls_stream);
-    install_and_spawn_loops(inner, peer_id, read_half, write_half).await;
+    install_and_spawn_loops(inner, peer_id, authenticated_key, read_half, write_half).await;
     Ok(())
 }
 
@@ -60,37 +60,37 @@ pub(super) async fn handle_client_connection(
     inner: Arc<Inner>,
     tls_stream: ClientTlsStream<TcpStream>,
 ) -> Result<(), LanTcpError> {
-    let peer_id = resolve_peer_from_client_stream(&inner, &tls_stream)
+    let (peer_id, authenticated_key) = resolve_peer_from_client_stream(&inner, &tls_stream)
         .ok_or(LanTcpError::PeerNotInRegistry)?;
     let (read_half, write_half) = tokio::io::split(tls_stream);
-    install_and_spawn_loops(inner, peer_id, read_half, write_half).await;
+    install_and_spawn_loops(inner, peer_id, authenticated_key, read_half, write_half).await;
     Ok(())
 }
 
 fn resolve_peer_from_server_stream(
     inner: &Arc<Inner>,
     tls_stream: &ServerTlsStream<TcpStream>,
-) -> Option<PeerId> {
+) -> Option<(PeerId, [u8; 32])> {
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
     inner
         .registry
         .find_peer(&pubkey)
-        .map(|(peer, _key_id)| peer)
+        .map(|(peer, _key_id)| (peer, pubkey))
 }
 
 fn resolve_peer_from_client_stream(
     inner: &Arc<Inner>,
     tls_stream: &ClientTlsStream<TcpStream>,
-) -> Option<PeerId> {
+) -> Option<(PeerId, [u8; 32])> {
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
     inner
         .registry
         .find_peer(&pubkey)
-        .map(|(peer, _key_id)| peer)
+        .map(|(peer, _key_id)| (peer, pubkey))
 }
 
 /// Install the outbound channel into `inner` **before** spawning the
@@ -106,6 +106,7 @@ fn resolve_peer_from_client_stream(
 pub(super) async fn install_and_spawn_loops<R, W>(
     inner: Arc<Inner>,
     peer_id: PeerId,
+    authenticated_key: [u8; 32],
     read_half: R,
     write_half: W,
 ) where
@@ -132,6 +133,7 @@ pub(super) async fn install_and_spawn_loops<R, W>(
     let replaced = inner.connections.lock().await.insert(
         peer_id,
         Session {
+            authenticated_key,
             outbound: outbound_tx,
             id,
             reader: reader.abort_handle(),
