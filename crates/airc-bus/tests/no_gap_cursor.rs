@@ -180,3 +180,84 @@ async fn exact_live_handles_skip_history_while_explicit_resume_keeps_it() {
     );
     assert_eq!(owner.sink.page_count(), 1);
 }
+
+/// A full persistence queue must reject before publishing to memory or readers.
+/// Current-thread execution deliberately leaves the drain task unpolled until
+/// after admission assertions: capacity one is deterministically exhausted.
+#[tokio::test]
+async fn saturated_publish_has_no_visible_state_and_can_retry() {
+    use airc_bus::{BusError, InMemoryEpochStore, ManualClock, PublishIfNew};
+    let backing = Arc::new(InMemoryDurableSink::new());
+    let gated = Arc::new(GatedSink::new(backing.clone()));
+    let r = EventRouter::new(
+        RouterConfig {
+            write_behind_buffer: 1,
+            ..RouterConfig::default()
+        },
+        Arc::new(ManualClock::new(1)),
+        Arc::new(SeqSource::start(&InMemoryEpochStore::new())),
+        gated.clone(),
+    );
+    let ch = RoomId::new();
+    let (live, _) = r.subscribe_live_with_lag(Filter::channel(ch));
+    futures::pin_mut!(live);
+    r.publish(durable(ch, 1, "accepted")).await.unwrap();
+    let before = r.head_cursor(ch);
+    for marker in [2, 3] {
+        let result = if marker == 2 {
+            r.publish(durable(ch, marker, "rejected")).await.map(|_| ())
+        } else {
+            r.publish_if_new(durable(ch, marker, "rejected"))
+                .await
+                .map(|_| ())
+        };
+        assert!(matches!(result, Err(BusError::WriteBehindSaturated)));
+    }
+    assert_eq!(
+        r.head_cursor(ch),
+        before,
+        "rejection must not advance the visible cursor"
+    );
+    assert_eq!(
+        r.pinned_in_ring(ch),
+        1,
+        "only accepted event can occupy the ring"
+    );
+    assert_eq!(r.ring_len(ch), 1);
+    assert_eq!(r.shed_count(), 2);
+    assert_eq!(take_n(&mut live, 1).await[0].event_id.0.as_u128(), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), live.next())
+            .await
+            .is_err(),
+        "rejected events must not reach live readers"
+    );
+    gated.open();
+    for marker in [2, 3] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while r.pinned_in_ring(ch) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                r.publish_if_new(durable(ch, marker, "retry"))
+                    .await
+                    .unwrap(),
+                PublishIfNew::Published(_)
+            ),
+            "rejection must not poison deduplication"
+        );
+        assert_eq!(take_n(&mut live, 1).await[0].event_id.0.as_u128(), marker);
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while r.pinned_in_ring(ch) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(backing.len(ch), 3);
+}

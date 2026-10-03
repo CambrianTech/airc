@@ -403,6 +403,7 @@ impl EventRouter {
     /// Publish an envelope (§4 publish-hot). Returns the assigned [`Seq`].
     ///
     /// Steps, all synchronous up to the write-behind enqueue:
+    /// 0. Reserve durable queue capacity without waiting; reject before mutation.
     /// 1. Stamp owner metadata: `seq` (generational) + `occurred_at_ms`.
     /// 2. Under the shard lock: push to the ring (deliver-first), coalesce if
     ///    `EphemeralLatest`, fan out to matching subscribers via `try_send`
@@ -545,6 +546,24 @@ impl EventRouter {
         mut env: Envelope,
         origin: Option<PeerId>,
     ) -> crate::Result<crate::Seq> {
+        // Reserve persistence capacity before exposing the event to the ring,
+        // subscribers, or deduplication. Rejection must leave no pinned event
+        // with no writer responsible for it. This is nonblocking admission;
+        // the actual write still occurs asynchronously after live fan-out.
+        let durable_permit = if env.delivery.is_durable() {
+            match self.inner.write_behind_tx.try_reserve() {
+                Ok(permit) => Some(permit),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.inner.shed_count.fetch_add(1, Ordering::SeqCst);
+                    return Err(crate::BusError::WriteBehindSaturated);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(crate::BusError::Sink("write-behind task gone".into()));
+                }
+            }
+        } else {
+            None
+        };
         let seq = self.inner.seq.next();
         env.seq = seq;
         env.occurred_at_ms = self.inner.clock.now_ms();
@@ -646,27 +665,12 @@ impl EventRouter {
             );
         } // shard lock released here, before any await
 
-        // --- write-behind (durable only), off the hot lock ---
-        if env.delivery.is_durable() {
-            match self.inner.write_behind_tx.try_send(WriteBehindItem {
+        // Fill the reserved slot only after live fan-out, off the shard lock.
+        if let Some(permit) = durable_permit {
+            permit.send(WriteBehindItem {
                 env: Arc::clone(&env),
-            }) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // §3.8: bounded write-behind full. Slice-1 fire-and-forget
-                    // policy: shed + surface, never silently drop, never OOM.
-                    // (The `await_durable`/blocking publisher variant is a
-                    // later refinement; the default path sheds with a surfaced
-                    // error so the contract is explicit.)
-                    self.inner.shed_count.fetch_add(1, Ordering::SeqCst);
-                    return Err(crate::BusError::WriteBehindSaturated);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(crate::BusError::Sink("write-behind task gone".into()));
-                }
-            }
+            });
         }
-
         // Card 1998f6cb: the event is accepted locally (ring + fan-out,
         // and for durable also write-behind enqueued) — offer it to the
         // route layer so it traverses established LAN routes. Off the
