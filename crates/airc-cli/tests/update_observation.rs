@@ -554,11 +554,39 @@ fn public_update_refuses_unknown_ipc_without_installing_or_starting() {
     }
 }
 
+/// Retention is opt-in and failure-only; ordinary cleanup stays the default.
+#[test]
+fn failure_artifacts_are_opt_in_and_success_still_cleans() {
+    for (preserve, fail) in [(false, true), (true, false), (true, true)] {
+        let mut path = PathBuf::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let temp = common::daemon_tempdir();
+            let temp = if preserve {
+                temp.preserve_on_panic()
+            } else {
+                temp
+            };
+            path = temp.path().to_owned();
+            std::fs::write(path.join("receipt"), "isolated evidence").unwrap();
+            assert!(!fail, "controlled fixture assertion");
+        }));
+        assert_eq!(result.is_err(), fail);
+        assert_eq!(path.exists(), preserve && fail);
+        if path.exists() {
+            assert_eq!(
+                std::fs::read(path.join("receipt")).unwrap(),
+                b"isolated evidence"
+            );
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
+
 /// Real public manual/automatic updater, with a local installer fixture that
 /// fails after copying its candidate. No package acquisition, UAC, or LAN.
 #[test]
 fn both_update_modes_restore_the_executing_binary_after_publication_failure() {
-    let temp = common::daemon_tempdir();
+    let temp = common::daemon_tempdir().preserve_on_panic();
     let account = temp.path().join("account");
     std::fs::create_dir_all(account.join(".airc")).unwrap();
     let source = temp.path().join("source");
@@ -664,7 +692,7 @@ esac
                 args.len()
             ));
             let mut previous_owner = running.then(|| fixture(&socket, &ready, "stale", sha));
-            let result = hidden(&mut Command::new(&current))
+            let updater = hidden(&mut Command::new(&current))
                 .arg("--home")
                 .arg(account.join(".airc"))
                 .args(args)
@@ -687,14 +715,36 @@ esac
                     "UPDATE_TEST_STOP_DURING_PREPARE",
                     if stop_during_prepare { "1" } else { "0" },
                 )
-                .output()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .unwrap();
-            // Own the test-scoped recovered endpoint BEFORE assertions: an
-            // unexpected pre-publication failure may already have restored a
-            // daemon. A diagnostic assertion must not leak that owned process.
+            let updater_pid = updater.id();
+            let result = updater.wait_with_output().unwrap();
+            // Own the test-scoped recovered endpoint BEFORE fallible receipt
+            // writes or assertions: neither may leak the recovered process.
             // This is a direct IPC connection, never an ensure/start command.
             let mut recovered_owner =
                 (running && !stop_during_prepare).then(|| RestoredOwner::connect(&socket));
+            // Fixed-size last-case receipts survive only on failure. No host
+            // process scan or account data is captured; these are owned children.
+            let receipt = format!(
+                "running={running} stop_during_prepare={stop_during_prepare} args={args:?}\nupdater_pid={updater_pid} previous_fixture_pid={:?} exit={:?}\ncurrent={}\n",
+                previous_owner.as_ref().map(|owner| owner.child.id()),
+                result.status.code(), current.display()
+            );
+            std::fs::write(temp.path().join("last-update.txt"), &receipt).unwrap();
+            for (name, bytes) in [
+                ("last-update.stdout", &result.stdout),
+                ("last-update.stderr", &result.stderr),
+            ] {
+                std::fs::write(temp.path().join(name), &bytes[..bytes.len().min(64 * 1024)])
+                    .unwrap();
+            }
+            if !String::from_utf8_lossy(&result.stderr).contains("restored and verified") {
+                eprintln!("unexpected recovery outcome: {receipt}");
+            }
             let stderr = String::from_utf8_lossy(&result.stderr);
             assert!(
                 !result.status.success(),

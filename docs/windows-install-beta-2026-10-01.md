@@ -970,3 +970,26 @@ Positive SOS/CLI discovery and unavailable/invalid explicit overrides passed
 with the fresh native CLI (session17745, 1/1). No live update or public-entry
 acceptance has run for this
 repair; the case remains OPEN until the repaired deployed binary exercises it.
+
+### Windows retained-original rollback diagnostics (OPEN)
+
+Hosted decoder PR #1520 job111243251061 failed in the final restore rename
+with sharing violation32 after the failed candidate had already been retained.
+The process holding the incompatible handle is UNKNOWN. One unchanged native
+six-case run at db6a20abc83d passed (184.30s); that does not waive the hosted failure.
+
+A test-only control holds the previous binary without delete sharing after
+initial displacement, proves both original and failed candidate survive the
+refusal, then explicitly exercises recovery after releasing the known handle.
+The public six-case fixture now preserves its owned scratch directory on panic,
+after daemon teardown, with bounded last-case stdout/stderr and owned PID/path
+receipts. Successful runs still clean up. No production retry, launch behavior,
+security setting, or live installed binary changes are part of this diagnosis.
+
+Native Windows checks: known-holder control passed (42231, 1/1), failure-only
+retention passed (68718, 1/1), six public updater cases passed (51537, 184.92s).
+Independent review then moved recovered endpoint ownership ahead of fallible
+receipt writes; full workspace Clippy and fmt passed after that correction
+(80980). The six-case execution preceded that ordering-only correction; hosted
+CI and failure-artifact upload remain separate evidence. Historical holder
+identification and a production repair remain OPEN.

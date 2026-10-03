@@ -262,6 +262,46 @@ mod tests {
         assert_eq!(std::fs::read(&current).unwrap(), b"original");
     }
 
+    // Reproduce the final-restore failure phase of Windows job111243251061
+    // with a known holder. This does not identify the unobserved hosted holder.
+    #[cfg(windows)]
+    #[test]
+    fn rollback_retains_original_and_candidate_when_previous_denies_delete() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current.exe");
+        let candidate = temp.path().join("candidate.exe");
+        std::fs::write(&current, "original").unwrap();
+        std::fs::write(&candidate, "candidate").unwrap();
+        let swap = BinarySwap::displace(&current, &candidate).unwrap();
+        std::fs::copy(&candidate, &current).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ; forbid rename of the retained original.
+            .open(swap.previous())
+            .unwrap();
+        let refusal = swap.rollback().unwrap_err().to_string();
+        assert!(refusal.contains("could not restore"), "{refusal}");
+        assert!(refusal.contains("os error 32"), "{refusal}");
+        assert!(
+            refusal.contains("retained rollback files were not deleted"),
+            "{refusal}"
+        );
+        assert!(
+            !current.exists(),
+            "candidate must already be retained separately"
+        );
+        assert_eq!(std::fs::read(swap.previous()).unwrap(), b"original");
+        assert_eq!(std::fs::read(&swap.failed).unwrap(), b"candidate");
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"candidate");
+        drop(held);
+        // Explicit recovery after the known holder releases; no production retry.
+        swap.rollback().unwrap();
+        assert_eq!(std::fs::read(&current).unwrap(), b"original");
+        assert!(!swap.previous().exists());
+        assert_eq!(std::fs::read(&swap.failed).unwrap(), b"candidate");
+    }
+
     #[test]
     fn rollback_preserves_unknown_current_and_owned_destination_collisions() {
         for collision in [false, true] {
