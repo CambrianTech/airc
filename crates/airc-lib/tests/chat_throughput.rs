@@ -346,3 +346,141 @@ async fn bench_chat_concurrent_publishers_latency() {
          one-room contention degraded badly"
     );
 }
+
+/// Closed-loop burst scaling with peer-consumer observations, isolated homes,
+/// real TLS loopback and SQLite. No production peers or daemon are involved.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual burst scaling and peer receipt measurement"]
+async fn bench_chat_burst_peer_receipts() {
+    use futures::StreamExt;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    for (publishers, per) in [(15usize, 40usize), (64, 64), (128, 64)] {
+        let alice_home = TempDir::new().unwrap();
+        let bob_home = TempDir::new().unwrap();
+        let (alice, bob) = tokio::time::timeout(
+            Duration::from_secs(30),
+            paired_airc(alice_home.path().to_owned(), bob_home.path().to_owned()),
+        )
+        .await
+        .expect("bounded peer setup");
+        let mut stream = tokio::time::timeout(Duration::from_secs(30), bob.subscribe())
+            .await
+            .expect("bounded subscriber setup")
+            .unwrap();
+        let sender_id = alice.peer_id();
+        let total = publishers * per;
+        let start = Instant::now();
+        let receiver = async move {
+            let mut seen = HashMap::new();
+            let mut duplicates = 0usize;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while seen.len() < total {
+                match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(Some(Ok(event))) if event.peer_id == sender_id => {
+                        if match seen.entry(event.event_id) {
+                            std::collections::hash_map::Entry::Occupied(_) => true,
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(start.elapsed());
+                                false
+                            }
+                        } {
+                            duplicates += 1;
+                        }
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(error))) => panic!("receiver failed: {error}"),
+                    _ => break,
+                }
+            }
+            // A bounded post-drain observation detects extra deliveries; it does
+            // not claim absence of duplicates forever after this window.
+            let tail_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+            while let Ok(Some(event)) = tokio::time::timeout_at(tail_deadline, stream.next()).await
+            {
+                let event = event.expect("tail receiver failed");
+                if event.peer_id == sender_id
+                    && match seen.entry(event.event_id) {
+                        std::collections::hash_map::Entry::Occupied(_) => true,
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(start.elapsed());
+                            false
+                        }
+                    }
+                {
+                    duplicates += 1;
+                }
+            }
+            (seen, duplicates)
+        };
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(publishers + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for p in 0..publishers {
+            let publisher = alice.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                let mut calls = Vec::new();
+                for i in 0..per {
+                    let before = start.elapsed();
+                    let result = publisher.say(&format!("burst {p}/{i}")).await;
+                    calls.push((result, before, start.elapsed() - before));
+                }
+                calls
+            });
+        }
+        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+            let publish = async {
+                barrier.wait().await;
+                let mut calls = Vec::new();
+                while let Some(result) = tasks.join_next().await {
+                    calls.extend(result?);
+                }
+                Ok::<_, tokio::task::JoinError>((calls, start.elapsed()))
+            };
+            tokio::join!(publish, receiver)
+        })
+        .await;
+        // JoinSet owns every publisher: never detach work on an early error.
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        let (published, (seen, duplicates)) = outcome.expect("bounded burst scenario");
+        let (calls, publish_wall) = published.expect("publisher task failed");
+        let mut publish_ns = Vec::new();
+        let mut receive_ns = Vec::new();
+        let mut failures = 0;
+        let mut missing = 0;
+        for (result, before, elapsed) in calls {
+            publish_ns.push(elapsed.as_nanos());
+            match result {
+                Ok(id) => match seen.get(&id) {
+                    Some(at) => receive_ns.push(at.saturating_sub(before).as_nanos()),
+                    None => missing += 1,
+                },
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("publish error: {error}");
+                }
+            }
+        }
+        let receive_wall = seen.values().max().copied().unwrap_or_default();
+        eprintln!("burst {publishers}x{per}: attempts={total} failures={failures} received={} missing={missing} duplicates={duplicates} publish_ms={} last_peer_receipt_ms={} peer_receipts_per_sec={:.1}", seen.len(), publish_wall.as_millis(), receive_wall.as_millis(), seen.len() as f64 / receive_wall.as_secs_f64().max(0.000001));
+        for (label, values) in [
+            ("publish", &mut publish_ns),
+            ("peer-consumer", &mut receive_ns),
+        ] {
+            values.sort_unstable();
+            if !values.is_empty() {
+                eprintln!(
+                    "{label} ns: p50={} p95={} p99={} max={}",
+                    values[values.len() / 2],
+                    values[values.len() * 95 / 100],
+                    values[values.len() * 99 / 100],
+                    values[values.len() - 1]
+                );
+            }
+        }
+        assert_eq!((failures, missing, duplicates), (0, 0, 0));
+        assert_eq!(seen.len(), total);
+    }
+}
