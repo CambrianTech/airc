@@ -79,25 +79,39 @@ async fn start_daemon() -> TestDaemon {
     let handle = tokio::spawn(async move {
         let _ = run(server_state, server_socket).await;
     });
-    // Wait for the listener to bind (the socket file appears).
-    for _ in 0..200 {
-        if socket.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    TestDaemon {
+    // Own the task before the next await so cancelled setup cannot detach it.
+    let daemon = TestDaemon {
         socket,
         state,
         handle,
         _home: home,
+    };
+    // Wait for the listener to bind (the socket file appears).
+    for _ in 0..200 {
+        if daemon.socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    daemon
 }
 
 impl TestDaemon {
-    async fn stop(self) {
+    async fn stop(mut self) {
         let _ = DaemonClient::new(self.socket.clone()).stop().await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.handle).await;
+        if tokio::time::timeout(Duration::from_secs(3), &mut self.handle)
+            .await
+            .is_err()
+        {
+            self.handle.abort();
+            let _ = (&mut self.handle).await;
+        }
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -107,7 +121,7 @@ async fn startup_check_runs_only_after_bind_and_rejection_cleans_endpoint() {
     use airc_ipc::transport::IpcListener;
     use futures::FutureExt;
 
-    let daemon = start_daemon().await;
+    let mut daemon = start_daemon().await;
     let state = daemon.state.clone();
     let socket = daemon.socket.clone();
     let mut checked = false;
@@ -122,7 +136,7 @@ async fn startup_check_runs_only_after_bind_and_rejection_cleans_endpoint() {
         "failed bind must drop admission without calling it bound"
     );
     DaemonClient::new(socket.clone()).stop().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), daemon.handle)
+    tokio::time::timeout(Duration::from_secs(3), &mut daemon.handle)
         .await
         .unwrap()
         .unwrap();
@@ -1154,4 +1168,90 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
         "only selected replies and fences reach IPC decode"
     );
     daemon.stop().await;
+}
+
+/// Isolated streaming fan-out wall-time matrix. Includes IPC framing, per-reader
+/// encoding, consumer decode/copy and payload validation; this is not an
+/// allocator or CPU profile. Checks the first 64 frames, not trailing duplicates;
+/// the empty inbox is an immediate observation, not a long-term storage proof.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual streaming fan-out measurement"]
+async fn bench_stream_fanout_sizes() {
+    const FRAMES: usize = 64;
+    for payload_len in [256usize, 65_536] {
+        for readers in [1usize, 8, 32] {
+            let daemon = tokio::time::timeout(Duration::from_secs(30), start_daemon())
+                .await
+                .unwrap();
+            let channel = RoomId::new();
+            let frames: Vec<Vec<u8>> = (0..FRAMES)
+                .map(|i| {
+                    let mut bytes = vec![0x42; payload_len];
+                    bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    bytes
+                })
+                .collect();
+            let ready = Arc::new(Barrier::new(readers + 1));
+            let mut collectors = tokio::task::JoinSet::new();
+            for _ in 0..readers {
+                collectors.spawn(persona_collect(
+                    daemon.socket.clone(),
+                    channel,
+                    FRAMES,
+                    ready.clone(),
+                ));
+            }
+            let result = tokio::time::timeout(Duration::from_secs(60), async {
+                ready.wait().await;
+                let start = Instant::now();
+                let publisher = DaemonClient::new(daemon.socket.clone());
+                for frame in &frames {
+                    publisher
+                        .publish(PublishRequest {
+                            channel: channel.as_uuid(),
+                            from_peer: uuid::Uuid::from_u128(0x573EA3),
+                            from_client: uuid::Uuid::from_u128(0x573EAC),
+                            kind: IpcKind::Event,
+                            delivery: IpcDelivery::StreamChunk,
+                            target: IpcTarget::All,
+                            correlation_id: None,
+                            coalesce_key: None,
+                            payload: frame.clone(),
+                            headers: Headers::new(),
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                let publish_wall = start.elapsed();
+                while let Some(got) = collectors.join_next().await {
+                    let got = got.map_err(|e| e.to_string())?;
+                    if got != frames {
+                        return Err("stream payload/order/count mismatch".to_owned());
+                    }
+                }
+                let delivery_wall = start.elapsed();
+                let inbox = publisher
+                    .inbox(InboxRequest {
+                        since: None,
+                        channel: Some(channel),
+                        limit: Some(100),
+                        kinds: None,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !inbox.envelopes.is_empty() {
+                    return Err("stream entered transcript".to_owned());
+                }
+                Ok((publish_wall, delivery_wall))
+            })
+            .await;
+            collectors.abort_all();
+            while collectors.join_next().await.is_some() {}
+            daemon.stop().await;
+            let (publish_wall, delivery_wall) = result
+                .expect("bounded streaming scenario")
+                .expect("valid stream delivery");
+            eprintln!("stream payload={payload_len} readers={readers} frames={FRAMES} publish_us={} validated_consumers_us={} validated_MiB_per_sec={:.2}", publish_wall.as_micros(), delivery_wall.as_micros(), (payload_len * readers * FRAMES) as f64 / 1048576.0 / delivery_wall.as_secs_f64());
+        }
+    }
 }

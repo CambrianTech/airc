@@ -55,3 +55,40 @@ and drains publishers before surfacing scenario errors, and retains first receip
 timestamps. Independent source reviewer approved those measurement boundaries.
 
 Run: cargo test --release -p airc-lib --test chat_throughput bench_chat_burst_peer_receipts -- --ignored --exact --nocapture --test-threads=1
+
+## Streaming fan-out through daemon IPC
+
+Optimized Windows run on the same i7-6800K, isolated temporary daemon homes.
+Each case sends 64 unique frames over real IPC to 1, 8 or 32 readers. The wall
+clock ends after all consumer payloads have been decoded and compared, so it
+includes validation and task collection, not just transport. Consumers verify
+the first 64 frames and their order; they do not watch for trailing duplicates.
+The immediate inbox query was empty for these StreamChunk cases. This is not a
+long-term or crash/reopen persistence proof.
+
+| Payload bytes | Readers | Publish completion | Validated consumer completion | Aggregate validated MiB/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 1 | 38.819 ms | 38.891 ms | 0.40 |
+| 256 | 8 | 42.303 ms | 42.480 ms | 2.94 |
+| 256 | 32 | 54.269 ms | 54.879 ms | 9.11 |
+| 65536 | 1 | 944.751 ms | 952.912 ms | 4.20 |
+| 65536 | 8 | 902.162 ms | 930.150 ms | 34.40 |
+| 65536 | 32 | 3000.211 ms | 3086.588 ms | 41.47 |
+
+One run, not a sustained capacity guarantee or CPU profile. Every case passed.
+The publisher is sequential, and aggregate bytes count a separate delivery to
+each reader. These rates are not comparable to durable-chat receipt rates.
+
+Source audit candidates: the server encodes an envelope for each IPC subscriber,
+and CBOR uses the existing integer-sequence representation of its opaque bytes.
+The compatibility test explicitly demonstrates installed Vec decoders rejecting
+CBOR byte strings. No wire representation change is included. Phase profiling
+is still needed before attributing the observed wall time to encoding or copies.
+
+The fixture owns its server task before awaiting listener readiness, aborts it
+on cancellation, and retains/aborts/awaits the handle if graceful stop exceeds
+three seconds. Collectors use JoinSet with cleanup before errors are surfaced.
+Independent source review approved these boundaries; the actual startup cleanup
+regression and package all-target Clippy also passed.
+
+Run: cargo test --release -p airc-daemon --test owner_core_proof bench_stream_fanout_sizes -- --ignored --exact --nocapture
