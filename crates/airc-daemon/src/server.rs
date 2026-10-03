@@ -86,6 +86,17 @@ impl From<std::io::Error> for DaemonError {
 /// a Stop request handler), the temp-home idle watchdog trips (card
 /// f122b5b5), or the listener errors.
 pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), DaemonError> {
+    run_with_startup_check(state, socket_path, || Ok(())).await
+}
+
+/// Complete caller-owned startup admission at the actual bind boundary. On any
+/// bind failure the check is dropped; a rejected check cleans the new endpoint
+/// before any request can be served. Embedded runtimes can use `run` directly.
+pub async fn run_with_startup_check(
+    state: Arc<DaemonState>,
+    socket_path: PathBuf,
+    bound: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), DaemonError> {
     // #355: a contended lock is not automatically "already running" — the
     // holder must PROVE it serves (request-response ping). A wedged holder
     // is reclaimed via the pidfile kill-handle and the acquire retried
@@ -103,6 +114,10 @@ pub async fn run(state: Arc<DaemonState>, socket_path: PathBuf) -> Result<(), Da
     };
     cleanup_stale_socket(&socket_path).map_err(DaemonError::StaleSocket)?;
     let listener = IpcListener::bind(&socket_path).await?;
+    if let Err(error) = bound() {
+        listener.cleanup();
+        return Err(error.into());
+    }
 
     // Card f122b5b5: write `<home>/daemon.pid` once the bind guard is
     // held (only the WINNING daemon for this socket writes), so test

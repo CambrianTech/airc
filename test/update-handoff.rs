@@ -5,8 +5,8 @@ extern crate self as airc_core;
 mod process;
 #[path = "../crates/airc-cli/src/update_artifact.rs"]
 mod update_artifact;
-#[path = "../crates/airc-cli/src/update_shutdown.rs"]
-mod update_shutdown;
+#[path = "../crates/airc-cli/src/update_shutdown/process_exit.rs"]
+mod process_exit;
 
 use std::path::Path;
 
@@ -259,7 +259,7 @@ fn shutdown_wait_observes_process_exit_not_stop_acknowledgement() {
         .unwrap();
     let pid_file = std::env::temp_dir().join(format!("airc-exit-proof-{}.pid", child.id()));
     std::fs::write(&pid_file, child.id().to_string()).unwrap();
-    let process = update_shutdown::DaemonExit::capture(&pid_file).unwrap();
+    let process = process_exit::DaemonExit::capture(&pid_file).unwrap();
     std::fs::remove_file(&pid_file).unwrap(); // stop acknowledged, pidfile gone
     assert_eq!(
         process

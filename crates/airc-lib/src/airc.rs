@@ -165,6 +165,26 @@ pub fn daemon_command(
 }
 
 fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    machine_account_home_for(
+        scope_home,
+        &std::env::temp_dir(),
+        home.as_deref(),
+        profile.as_deref(),
+    )
+}
+
+/// Resolve ownership without mutating scope directories or process environment.
+/// Injected roots keep the before/after-creation contract testable in parallel.
+pub(crate) fn machine_account_home_for(
+    scope_home: &Path,
+    temp: &Path,
+    home: Option<&Path>,
+    profile: Option<&Path>,
+) -> PathBuf {
+    use crate::socket_path::normalized_path;
+
     // Temp-rooted scopes are their own account boundary on EVERY
     // platform. On Linux/macOS that falls out of `/tmp` living outside
     // `$HOME`, but on Windows `%TEMP%` is
@@ -182,42 +202,25 @@ fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
     // this) — its scopes legitimately share that simulated account, so
     // the temp guard must not fire. Real boxes never have a temp-rooted
     // home, so the b0a81c31 fix is unaffected.
-    let temp = std::env::temp_dir();
-    let normalized_temp = temp.canonicalize().unwrap_or(temp);
-    let normalized_scope_for_temp = scope_home
-        .canonicalize()
-        .unwrap_or_else(|_| scope_home.to_path_buf());
-    let home_var = std::env::var_os("HOME").map(PathBuf::from);
-    let profile_var = std::env::var_os("USERPROFILE").map(PathBuf::from);
-    let any_home_is_temp_rooted = [home_var.as_ref(), profile_var.as_ref()]
+    let normalized_temp = normalized_path(temp);
+    let normalized_scope = normalized_path(scope_home);
+    let any_home_is_temp_rooted = [home, profile]
         .into_iter()
         .flatten()
-        .any(|h| {
-            h.canonicalize()
-                .unwrap_or_else(|_| h.clone())
-                .starts_with(&normalized_temp)
-        });
-    if !any_home_is_temp_rooted && normalized_scope_for_temp.starts_with(&normalized_temp) {
+        .any(|home| normalized_path(home).starts_with(&normalized_temp));
+    if !any_home_is_temp_rooted && normalized_scope.starts_with(&normalized_temp) {
         return scope_home.to_path_buf();
     }
 
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        let normalized_home = home.canonicalize().unwrap_or(home);
-        let normalized_scope = scope_home
-            .canonicalize()
-            .unwrap_or_else(|_| scope_home.to_path_buf());
+    if let Some(home) = home {
+        let normalized_home = normalized_path(home);
         if normalized_scope.starts_with(&normalized_home) {
             return normalized_home.join(".airc");
         }
     }
     #[cfg(windows)]
-    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        let userprofile = PathBuf::from(userprofile);
-        let normalized_userprofile = userprofile.canonicalize().unwrap_or(userprofile);
-        let normalized_scope = scope_home
-            .canonicalize()
-            .unwrap_or_else(|_| scope_home.to_path_buf());
+    if let Some(userprofile) = profile {
+        let normalized_userprofile = normalized_path(userprofile);
         if normalized_scope.starts_with(&normalized_userprofile) {
             return normalized_userprofile.join(".airc");
         }
@@ -2965,9 +2968,40 @@ mod room_trust_policy_tests {
     #[test]
     fn machine_account_home_keeps_temp_scopes_isolated() {
         let dir = tempfile::tempdir().unwrap();
-        let scope = dir.path().join("scope-home");
-        std::fs::create_dir(&scope).unwrap();
-        assert_eq!(super::machine_account_home(&scope).as_path(), scope);
+        let scope = dir.path().join("missing").join("nested");
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let canonical_scope = canonical_root.join("missing").join("nested");
+        let unrelated_home = dir.path().parent().unwrap().join("unrelated-account");
+        let expected_owner = canonical_root.join(".airc");
+
+        for created in [false, true] {
+            if created {
+                std::fs::create_dir_all(&scope).unwrap();
+            }
+            for alias in [&scope, &canonical_scope] {
+                // An actual temp scope stays isolated, including its original
+                // path spelling. A simulated temp account deliberately shares.
+                assert_eq!(
+                    super::machine_account_home_for(alias, dir.path(), Some(&unrelated_home), None,),
+                    *alias
+                );
+                assert_eq!(
+                    super::machine_account_home_for(alias, dir.path(), Some(dir.path()), None,),
+                    expected_owner,
+                    "missing scope and existing scope must have the same owner"
+                );
+                #[cfg(windows)]
+                assert_eq!(
+                    super::machine_account_home_for(alias, dir.path(), None, Some(dir.path())),
+                    expected_owner
+                );
+            }
+            assert_eq!(
+                scope.exists(),
+                created,
+                "resolution must not create scope directories"
+            );
+        }
     }
 }
 

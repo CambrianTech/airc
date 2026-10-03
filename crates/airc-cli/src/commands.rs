@@ -21,7 +21,7 @@ use airc_core::{ClientId, EventId, PeerId, RoomId, TranscriptCursor};
 use airc_protocol::{PeerKeyRegistry, VerificationPolicy, HEADER_AIRC_CLIENT};
 use futures::stream::StreamExt;
 
-use airc_daemon::{run as run_daemon_server, DaemonRuntimeInfo, DaemonState};
+use airc_daemon::{server::run_with_startup_check, DaemonRuntimeInfo, DaemonState};
 use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
@@ -207,12 +207,24 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
 /// `join` — account-room coordinator entrypoint. With no explicit
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
-pub async fn run_join(home: &Path, room: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_join(
+    home: &Path,
+    room: Option<String>,
+    ensure_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     reject_recovery_room(room.as_deref())?;
+    if crate::runtime_context::join_resumes_daemon(ensure_only) {
+        let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+        lifecycle.clear_operator_stop()?;
+    }
     // Start the machine-singular daemon and attach: join, heartbeat, and
     // the live feed all route through the daemon's router (one path).
     let socket = crate::cli::default_socket_path_in(home);
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
+    if ensure_only {
+        println!("daemon: available (rooms unchanged).");
+        return Ok(());
+    }
     let airc = Airc::attach(home, socket.clone()).await?;
     let runtime_context = crate::runtime_context::RuntimeContext::current();
     match room {
@@ -1667,6 +1679,9 @@ pub async fn run_daemon(
         )
         .into());
     }
+    // A parent may time out or die before this child binds. Keep startup
+    // observable to stop even after that parent's admission lock is gone.
+    let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home)?;
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call
@@ -2117,7 +2132,12 @@ pub async fn run_daemon(
         .await;
     });
 
-    run_daemon_server(state, socket).await?;
+    let server_result =
+        run_with_startup_check(state.clone(), socket, move || startup.bound()).await;
+    if server_result.is_err() {
+        state.shutdown.notify_waiters();
+        registry_handle.abort();
+    }
     // The route-refresh loop exits on the shutdown `Notify` that ended
     // the accept loop; abort is the backstop for the listener-error
     // path, where Stop never fired (same abort discipline as
@@ -2133,6 +2153,7 @@ pub async fn run_daemon(
     // exit so the process doesn't drop an in-flight gist write
     // mid-flight.
     let _ = registry_handle.await;
+    server_result?;
     println!("airc daemon: stopped.");
     Ok(())
 }
@@ -2599,10 +2620,17 @@ pub async fn run_status(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-pub async fn run_stop(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let client = DaemonClient::new(socket);
-    client.stop().await?;
-    println!("daemon: stop requested.");
+pub async fn run_stop(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    if socket != crate::cli::default_socket_path_in(home) {
+        return Err(
+            "operator stop requires this home's canonical endpoint; use the matching --home".into(),
+        );
+    }
+    let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    lifecycle.record_operator_stop()?;
+    crate::update_shutdown::stop(&socket)?;
+    lifecycle.confirm_no_startup()?;
+    println!("daemon: stopped; operator intent retained until `airc join`.");
     Ok(())
 }
 
@@ -3604,7 +3632,7 @@ mod tests {
         let home = parent.path().join("not-created");
         for name in ["sos", "#sos", " SOS ", " #SoS "] {
             for result in [
-                run_join(&home, Some(name.into())).await,
+                run_join(&home, Some(name.into()), false).await,
                 run_room(&home, Some(name.into())).await,
                 run_send(&home, Vec::new(), Some(name), "must not publish").await,
                 run_msg(

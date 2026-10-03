@@ -216,6 +216,8 @@ impl Drop for Fixture {
     }
 }
 fn fixture(socket: &Path, ready: &Path, mode: &str, sha: &str) -> Fixture {
+    let log_path = ready.with_extension("log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let child = hidden(&mut Command::new(std::env::current_exe().unwrap()))
         .args(["--exact", "ipc_owner_fixture", "--nocapture"])
         .env("UPDATE_FIXTURE_SOCKET", socket)
@@ -223,14 +225,19 @@ fn fixture(socket: &Path, ready: &Path, mode: &str, sha: &str) -> Fixture {
         .env("UPDATE_FIXTURE_MODE", mode)
         .env("UPDATE_FIXTURE_SHA", sha)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
         .spawn()
         .unwrap();
-    let fixture = Fixture { child };
+    let mut fixture = Fixture { child };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() {
-        assert!(Instant::now() < deadline, "IPC fixture did not bind");
+        let exited = fixture.child.try_wait().unwrap();
+        assert!(
+            exited.is_none() && Instant::now() < deadline,
+            "IPC fixture did not bind ({exited:?}): {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     fixture
@@ -293,6 +300,25 @@ fn ipc_owner_fixture() {
                         }),
                         Request::Stop if mode == "stale" => {
                             let _ = write_frame(&mut stream, &Response::Ok).await;
+                            #[cfg(unix)]
+                            {
+                                // A real Unix daemon can accept one final status
+                                // probe while its listener is closing. Drop that
+                                // response deterministically: it is not absence,
+                                // and the updater must observe again before
+                                // publishing or starting a replacement.
+                                let mut closing =
+                                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                                        .await
+                                        .unwrap()
+                                        .unwrap();
+                                assert!(matches!(
+                                    read_frame::<_, Request>(&mut closing).await.unwrap(),
+                                    Some(Request::Status)
+                                ));
+                                drop(closing);
+                            }
+                            listener.cleanup();
                             return;
                         }
                         // A current owner must never receive stop or a mutating request.
@@ -354,6 +380,8 @@ fn public_update_verifies_current_owner_and_preserves_stopped_state() {
     let endpoint = cli(&account, &source, &["ipc-endpoint"]);
     assert!(endpoint.status.success());
     let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
+    // A stop remains deliberate even when no owner was running at the time.
+    assert!(cli(&account, &source, &["stop"]).status.success());
     for args in [&["update"][..], &["update", "--auto"][..]] {
         let out = cli(&account, &source, args);
         assert!(
@@ -363,7 +391,14 @@ fn public_update_verifies_current_owner_and_preserves_stopped_state() {
         );
         assert!(String::from_utf8_lossy(&out.stdout).contains("left stopped"));
         assert!(!cli(&account, &source, &["ping"]).status.success());
+        assert!(!cli(&account, &source, &["join", "--ensure"])
+            .status
+            .success());
     }
+    airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(&account.join(".airc"))
+        .unwrap()
+        .clear_operator_stop()
+        .unwrap();
     let ready = temp.path().join("ready");
     let mut owner = fixture(&socket, &ready, "current", sha);
     for args in [
@@ -384,6 +419,11 @@ fn public_update_verifies_current_owner_and_preserves_stopped_state() {
     }
     drop(owner);
     for args in [&["update"][..], &["update", "--auto"][..]] {
+        // Fixture setup models an allowed running owner for each update mode.
+        airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(&account.join(".airc"))
+            .unwrap()
+            .clear_operator_stop()
+            .unwrap();
         #[cfg(unix)]
         let _ = std::fs::remove_file(&socket);
         std::fs::remove_file(&ready).unwrap();
@@ -457,6 +497,9 @@ fn public_update_verifies_current_owner_and_preserves_stopped_state() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        assert!(cli(&account, &source, &["join", "--ensure"])
+            .status
+            .success());
     }
     assert!(cli(&account, &source, &["stop"]).status.success());
 }
@@ -552,7 +595,11 @@ fn both_update_modes_restore_the_executing_binary_after_publication_failure() {
         r#"#!/usr/bin/env bash
 set -eu
 case "$1" in
-  --prepare-artifact) cp "$UPDATE_TEST_ORIGINAL" "$2" ;;
+  --prepare-artifact)
+    if [ "$UPDATE_TEST_STOP_DURING_PREPARE" = 1 ]; then
+      "$UPDATE_TEST_ORIGINAL" --home "$UPDATE_TEST_HOME" stop
+    fi
+    cp "$UPDATE_TEST_ORIGINAL" "$2" ;;
   --prebuilt)
     cp "$2" "$UPDATE_TEST_CURRENT"
     echo 'fixture installer failed after publication' >&2
@@ -583,13 +630,25 @@ esac
     let endpoint = cli(&account, &source, &["ipc-endpoint"]);
     assert!(endpoint.status.success());
     let socket = PathBuf::from(String::from_utf8(endpoint.stdout).unwrap().trim());
-    for running in [false, true] {
+    for (running, stop_during_prepare) in [(false, false), (true, false), (true, true)] {
         for args in [&["update"][..], &["update", "--auto"][..]] {
-            println!("Publication case: daemon_was_running={running}, args={args:?}");
+            println!("Publication case: running={running}, stop_during_prepare={stop_during_prepare}, args={args:?}");
+            // Reuse this account/installer for absence, transient maintenance,
+            // and a newer operator stop issued inside artifact preparation.
+            let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(
+                &account.join(".airc"),
+            )
+            .unwrap();
+            lifecycle.clear_operator_stop().unwrap();
+            if !running {
+                lifecycle.record_operator_stop().unwrap();
+            }
+            drop(lifecycle);
             std::fs::copy(original, &current).unwrap();
-            let ready = temp
-                .path()
-                .join(format!("rollback-owner-{running}-{}", args.len()));
+            let ready = temp.path().join(format!(
+                "rollback-owner-{running}-{stop_during_prepare}-{}",
+                args.len()
+            ));
             let mut previous_owner = running.then(|| fixture(&socket, &ready, "stale", sha));
             let result = hidden(&mut Command::new(&current))
                 .arg("--home")
@@ -609,13 +668,19 @@ esac
                 .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
                 .env("UPDATE_TEST_ORIGINAL", original)
                 .env("UPDATE_TEST_CURRENT", &current)
+                .env("UPDATE_TEST_HOME", account.join(".airc"))
+                .env(
+                    "UPDATE_TEST_STOP_DURING_PREPARE",
+                    if stop_during_prepare { "1" } else { "0" },
+                )
                 .output()
                 .unwrap();
             // Own the test-scoped recovered endpoint BEFORE assertions: an
             // unexpected pre-publication failure may already have restored a
             // daemon. A diagnostic assertion must not leak that owned process.
             // This is a direct IPC connection, never an ensure/start command.
-            let mut recovered_owner = running.then(|| RestoredOwner::connect(&socket));
+            let mut recovered_owner =
+                (running && !stop_during_prepare).then(|| RestoredOwner::connect(&socket));
             let stderr = String::from_utf8_lossy(&result.stderr);
             assert!(
                 !result.status.success(),
@@ -642,6 +707,14 @@ esac
                     owner.child.try_wait().unwrap().is_some(),
                     "previous owner was not stopped"
                 );
+            }
+            if running && !stop_during_prepare {
+                assert!(
+                    cli(&account, &source, &["join", "--ensure"])
+                        .status
+                        .success(),
+                    "transient update shutdown must not record operator stop"
+                );
                 let mut restored_owner =
                     recovered_owner.take().expect("running case owns recovery");
                 #[cfg(windows)]
@@ -649,7 +722,7 @@ esac
                 #[cfg(windows)]
                 assert_ne!(
                     restored_pid,
-                    owner.child.id(),
+                    previous_owner.as_ref().unwrap().child.id(),
                     "restoration must have started a new owner"
                 );
                 let status = restored_owner.status();
@@ -703,6 +776,9 @@ esac
                     !cli(&account, &source, &["ping"]).status.success(),
                     "stopped daemon must stay stopped"
                 );
+                let refused = cli(&account, &source, &["join", "--ensure"]);
+                assert!(!refused.status.success());
+                assert!(String::from_utf8_lossy(&refused.stderr).contains("intentionally stopped"));
             }
         }
     }

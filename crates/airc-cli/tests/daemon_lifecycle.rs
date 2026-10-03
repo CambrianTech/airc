@@ -26,19 +26,28 @@ fn airc() -> &'static str {
 /// machine-account daemon. `client` is the stable agent id (the
 /// participant identity the daemon attributes events to).
 fn tab(account: &Path, scope: &str, client: &str, args: &[&str]) -> std::process::Output {
-    Command::new(airc())
+    tab_command(account, scope, client, args)
+        .output()
+        .expect("airc must spawn")
+}
+
+fn tab_command(account: &Path, scope: &str, client: &str, args: &[&str]) -> Command {
+    let mut command = airc_core::process::background(airc());
+    command
         .arg("--home")
         .arg(account.join(scope))
         .args(args)
         .env("HOME", account)
         .env("USERPROFILE", account)
         .env("AIRC_CLIENT_ID", client)
+        .env("AIRC_NO_ATTACH", "1")
+        .env_remove("AIRC_SUPERVISOR")
+        .env_remove("AIRC_CODEX_START_CHILD")
         // Hermetic gate (card d793c242): tabs spawn-or-connect the
         // daemon, which inherits this env — the spawned daemon must
         // never touch the operator's real gh account rendezvous.
-        .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
-        .output()
-        .expect("airc must spawn")
+        .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1");
+    command
 }
 
 /// Run a tab and require success, returning stdout.
@@ -100,7 +109,13 @@ fn assert_no_frames_jsonl(dir: &Path) {
 }
 
 fn stop_daemon(account: &Path) {
-    let _ = tab(account, "claude", "claude:stop", &["stop"]);
+    ok(account, "claude", "claude:stop", &["stop"]);
+    assert!(
+        !tab(account, "claude", "claude:stop", &["ping"])
+            .status
+            .success(),
+        "public stop must confirm shutdown before returning"
+    );
 }
 
 #[test]
@@ -118,10 +133,16 @@ fn one_daemon_serves_many_tabs_through_a_full_room_lifecycle() {
         &["send", "hello from claude"],
     );
     let launched = daemon_id(acct, "claude");
+    let launched_pid = common::find_daemon_pid_under(acct).expect("first daemon PID");
 
     // --- Convergence: a different tab on the same machine shares the
     // one daemon and sees the first tab's message. ---
     let codex_inbox = ok(acct, "codex", "codex:main", &["inbox", "--limit", "16"]);
+    assert_eq!(
+        common::find_daemon_pid_under(acct),
+        Some(launched_pid),
+        "a previously nonexistent scope must share the same process, not only its stored peer key"
+    );
     assert!(
         codex_inbox.contains("hello from claude"),
         "second tab must see the first tab's message via the shared daemon: {codex_inbox}"
@@ -146,6 +167,7 @@ fn one_daemon_serves_many_tabs_through_a_full_room_lifecycle() {
         }
     });
     let after_contention = daemon_id(acct, "claude");
+    assert_eq!(common::find_daemon_pid_under(acct), Some(launched_pid));
     assert_eq!(
         after_contention.peer_id, launched.peer_id,
         "every contending tab must share ONE daemon — peer identity must not change"
@@ -203,13 +225,76 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     ok(acct, "claude", "claude:main", &["send", "durable line one"]);
     ok(acct, "claude", "claude:main", &["send", "durable line two"]);
     let before = daemon_id(acct, "claude");
+    let rooms_before = ok(acct, "claude", "claude:main", &["room"]);
+    ok(acct, "claude", "claude:main", &["join", "--ensure"]);
+    assert_eq!(ok(acct, "claude", "claude:main", &["room"]), rooms_before);
+    let owner_pid = common::find_daemon_pid_under(acct).expect("fixture daemon PID");
+    let mismatched = tab(
+        acct,
+        "claude",
+        "claude:main",
+        &["stop", "--socket", "other-owner.sock"],
+    );
+    assert!(!mismatched.status.success());
+    assert!(String::from_utf8_lossy(&mismatched.stderr).contains("canonical endpoint"));
+    assert!(!acct.join(".airc/daemon-operator-stop").exists());
+    assert_eq!(common::find_daemon_pid_under(acct), Some(owner_pid));
+    assert!(tab(acct, "claude", "claude:main", &["ping"])
+        .status
+        .success());
 
     // Shut the daemon down completely.
-    stop_daemon(acct);
+    let endpoint = ok(acct, "claude", "claude:main", &["ipc-endpoint"]);
+    // Model an admitted child whose parent timed out before readiness. Stop
+    // must still shut down the visible owner, retain intent, and refuse a
+    // completed receipt while that child's startup lease remains held.
+    let starting =
+        airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(&acct.join(".airc")).unwrap();
+    let incomplete = tab(acct, "new-stop-scope", "claude:main", &["stop"]);
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("shutdown not confirmed"));
+    assert!(acct.join(".airc/daemon-operator-stop").exists());
+    assert!(!tab(acct, "claude", "claude:main", &["ping"])
+        .status
+        .success());
+    assert!(starting.bound().is_err());
+    ok(
+        acct,
+        "new-stop-scope",
+        "claude:main",
+        &["stop", "--socket", endpoint.trim()],
+    );
+    assert!(!tab(acct, "claude", "claude:main", &["ping"])
+        .status
+        .success());
 
-    // The next command respawns the daemon (spawn-or-connect) AND the
-    // durable transcript replays from the persistent ORM — proof the
-    // owner-core survives a full restart, not just a reconnect.
+    // Regression: an explicit stop persists across separate CLI processes;
+    // neither ordinary consumers nor a non-streaming supervisor may undo it.
+    for args in [&["inbox"][..], &["join", "--ensure"][..]] {
+        let refused = tab(acct, "claude", "claude:main", args);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("intentionally stopped"));
+    }
+    let supervised = tab_command(acct, "claude", "claude:main", &["join"])
+        .env("AIRC_SUPERVISOR", "1")
+        .output()
+        .unwrap();
+    assert!(!supervised.status.success());
+    assert!(String::from_utf8_lossy(&supervised.stderr).contains("intentionally stopped"));
+    let raw = tab(
+        acct,
+        ".airc",
+        "claude:main",
+        &["daemon", "--socket", endpoint.trim()],
+    );
+    assert!(!raw.status.success());
+    assert!(String::from_utf8_lossy(&raw.stderr).contains("intentionally stopped"));
+    assert!(!tab(acct, "claude", "claude:main", &["ping"])
+        .status
+        .success());
+
+    // The explicit operator join resumes the same owner and durable transcript.
+    ok(acct, "claude", "claude:main", &["join", "standup"]);
     let replayed = ok(acct, "claude", "claude:main", &["inbox", "--limit", "16"]);
     assert!(
         replayed.contains("durable line one") && replayed.contains("durable line two"),
@@ -217,10 +302,17 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     );
 
     let after = daemon_id(acct, "claude");
-    assert!(
-        after.uptime <= before.uptime,
-        "a restart means a fresh daemon (uptime reset): before={before:?} after={after:?}"
-    );
+    assert_eq!(after.peer_id, before.peer_id);
+    assert_ne!(common::find_daemon_pid_under(acct), Some(owner_pid));
+
+    // Unexpected process loss is different: the existing platform cleanup
+    // adapter terminates this fixture owner without creating operator intent.
+    // Automatic recovery must still work and retain the same durable history.
+    common::reap_daemons_under(acct);
+    ok(acct, "claude", "claude:main", &["join", "--ensure"]);
+    let recovered = ok(acct, "claude", "claude:main", &["inbox", "--limit", "16"]);
+    assert!(recovered.contains("durable line one") && recovered.contains("durable line two"));
+    assert_eq!(daemon_id(acct, "claude").peer_id, before.peer_id);
 
     assert_no_frames_jsonl(acct);
     stop_daemon(acct);

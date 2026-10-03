@@ -389,8 +389,9 @@ pub enum Command {
         socket: Option<PathBuf>,
     },
 
-    /// Ask the daemon to shut down gracefully.
+    /// Stop the account daemon and retain operator intent until explicit `join`.
     Stop {
+        /// Must match this home's canonical endpoint; another owner is refused.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -599,7 +600,12 @@ pub enum Command {
     /// no separate public "attach" mode.
     Join {
         /// Optional channel name to join.
+        #[arg(conflicts_with = "ensure")]
         room: Option<String>,
+        /// Ensure the daemon is available without resuming an operator stop,
+        /// changing rooms, or attaching a live feed. For unattended recovery.
+        #[arg(long)]
+        ensure: bool,
     },
 
     /// Out-of-band coordination channel of last resort.
@@ -830,6 +836,21 @@ mod tests {
         // Each alone parses fine (guard isn't over-broad).
         assert!(Cli::try_parse_from(["airc", "--here", "init"]).is_ok());
         assert!(Cli::try_parse_from(["airc", "--home", "/x", "init"]).is_ok());
+    }
+
+    #[test]
+    fn unattended_join_cannot_change_rooms() {
+        use super::{Cli, Command};
+        use clap::Parser;
+        let parsed = Cli::try_parse_from(["airc", "join", "--ensure"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Join {
+                room: None,
+                ensure: true
+            }
+        ));
+        assert!(Cli::try_parse_from(["airc", "join", "--ensure", "another-room"]).is_err());
     }
 
     // what this catches: the `ipc-endpoint` subcommand silently vanishing

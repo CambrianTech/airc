@@ -37,6 +37,7 @@ use tokio::task::JoinHandle;
 /// A live daemon on a Unix socket, owning a real router + SQLite ORM.
 struct TestDaemon {
     socket: PathBuf,
+    state: Arc<DaemonState>,
     handle: JoinHandle<()>,
     _home: tempfile::TempDir,
 }
@@ -87,6 +88,7 @@ async fn start_daemon() -> TestDaemon {
     }
     TestDaemon {
         socket,
+        state,
         handle,
         _home: home,
     }
@@ -97,6 +99,56 @@ impl TestDaemon {
         let _ = DaemonClient::new(self.socket.clone()).stop().await;
         let _ = tokio::time::timeout(Duration::from_secs(3), self.handle).await;
     }
+}
+
+#[tokio::test]
+async fn startup_check_runs_only_after_bind_and_rejection_cleans_endpoint() {
+    use airc_daemon::server::run_with_startup_check;
+    use airc_ipc::transport::IpcListener;
+    use futures::FutureExt;
+
+    let daemon = start_daemon().await;
+    let state = daemon.state.clone();
+    let socket = daemon.socket.clone();
+    let mut checked = false;
+    let duplicate = run_with_startup_check(state.clone(), socket.clone(), || {
+        checked = true;
+        Ok(())
+    })
+    .await;
+    assert!(duplicate.is_err());
+    assert!(
+        !checked,
+        "failed bind must drop admission without calling it bound"
+    );
+    DaemonClient::new(socket.clone()).stop().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), daemon.handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let rejected = run_with_startup_check(state, socket.clone(), || {
+        // The real platform bind is immediate. A second bind must already be
+        // refused when the startup owner relinquishes its lease.
+        let probe = IpcListener::bind(&socket).now_or_never().unwrap();
+        if let Ok(listener) = probe {
+            listener.cleanup();
+            panic!("startup check ran before actual endpoint bind");
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "operator stopped",
+        ))
+    })
+    .await;
+    assert!(rejected
+        .unwrap_err()
+        .to_string()
+        .contains("operator stopped"));
+    let clean = IpcListener::bind(&socket)
+        .await
+        .expect("rejected startup cleaned its endpoint");
+    clean.cleanup();
 }
 
 /// Attach to `channel`, confirm the `Ok` ack (which — subscribe-before-ack

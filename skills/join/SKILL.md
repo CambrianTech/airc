@@ -36,9 +36,15 @@ Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `air
 |---|---|
 | `airc join` | project room (from cwd's git remote org) + `#general` sidecar |
 | `airc join NAME` | named mesh room, made the default |
+| `airc join --ensure` | unattended one-shot daemon ensure; no room changes or live feed |
 | `airc sos status` | reads the separate account recovery gist; does not join a mesh room |
 
 Use `airc join --help` from the installed build for supported options. The current Rust CLI takes a positional room; do not invent `--room`, `--room-only`, or legacy invitation switches.
+
+Explicit `airc join` resumes a deliberate `airc stop`. Unattended consumers must
+use `airc join --ensure`, which retains operator stop intent. Login supervisors
+marked `AIRC_SUPERVISOR=1` also retain that intent, including with `AIRC_NO_ATTACH`.
+Unexpected daemon exit without an operator stop still permits automatic recovery.
 
 ## Lobby etiquette: #general vs project room
 

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::update_shutdown::{status as daemon_status, stop as stop_daemon};
+
 /// Public setup already built and installed the binary. Reuse the updater's
 /// guarded shutdown/start/verification instead of leaving an old daemon alive.
 /// Explicit installation starts the service, including recovery from an
@@ -18,17 +20,18 @@ fn adopt_installed_with_executable(
     airc_exe: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected = installed_binary_sha(airc_exe).ok_or("Cannot verify installed AIRC build")?;
-    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
-    if daemon_is_running(airc_exe, home, socket)? {
+    let maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    maintenance.clear_operator_stop()?;
+    if daemon_is_running(socket)? {
         if daemon_build_matches(airc_exe, home, socket, &expected)? {
             println!("daemon: installed build already running.");
             retire_legacy_endpoints(airc_exe, home, socket, &expected)?;
             return Ok(());
         }
-        stop_daemon(airc_exe, home, socket)?;
+        stop_daemon(socket)?;
     }
     restart_daemon(airc_exe, home, socket)?;
-    wait_daemon_ready(airc_exe, home, socket)?;
+    wait_daemon_ready(home, socket)?;
     verify_daemon_build(airc_exe, home, socket, &expected)?;
     retire_legacy_endpoints(airc_exe, home, socket, &expected)?;
     println!("daemon: adopted installed build {expected} (verified).");
@@ -42,7 +45,7 @@ fn retire_legacy_endpoints(
     expected: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for endpoint in crate::update_legacy::verified_endpoints(home, canonical)? {
-        stop_daemon(airc_exe, home, &endpoint)?;
+        stop_daemon(&endpoint)?;
         println!(
             "daemon: retired verified legacy endpoint {}",
             endpoint.display()
@@ -55,7 +58,9 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
     let airc_exe = env::current_exe()?;
-    let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
+    // Fail before preparation for an unknown owner, but never carry this
+    // observation across a build: maintenance re-reads current state and intent.
+    daemon_is_running(&socket)?;
 
     let channel = update_channel();
 
@@ -108,20 +113,15 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
         &after,
         &airc_exe,
     )?;
-    let (binary_before, _) = install_prepared_update(
-        &prepared,
-        &airc_exe,
-        home,
-        &socket,
-        &after,
-        daemon_was_running,
-    )?;
+    let installed = install_prepared_update(&prepared, &airc_exe, home, &socket, &after)?;
     println!(
         "{}",
-        update_summary(Some(&binary_before), &before, &after, &channel)
+        update_summary(Some(&installed.previous_build), &before, &after, &channel)
     );
-    if daemon_was_running {
+    if installed.daemon_restarted {
         println!("daemon: restarted (build verified).");
+    } else {
+        println!("daemon: stopped (left stopped).");
     }
     Ok(())
 }
@@ -301,7 +301,7 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
     let airc_exe = env::current_exe()?;
-    let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
+    daemon_is_running(&socket)?;
 
     let channel = update_channel();
     // Channel-pinned build source: fetch/reset only ever touch the channel
@@ -335,18 +335,17 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         &after,
         &airc_exe,
     )?;
-    let (previous_build, previous_path) = install_prepared_update(
-        &prepared,
-        &airc_exe,
-        home,
-        &socket,
-        &after,
-        daemon_was_running,
-    )?;
+    let installed = install_prepared_update(&prepared, &airc_exe, home, &socket, &after)?;
     println!(
-        "Auto-updated: {previous_build} -> {after} (binary verified; previous file at {}).",
-        previous_path.display()
+        "Auto-updated: {} -> {after} (binary verified; previous file at {}).",
+        installed.previous_build,
+        installed.previous_path.display()
     );
+    if installed.daemon_restarted {
+        println!("daemon: restarted (build verified).");
+    } else {
+        println!("daemon: stopped (left stopped).");
+    }
     Ok(())
 }
 
@@ -365,6 +364,12 @@ pub(crate) fn restored_runtime_verified(error: &(dyn std::error::Error + 'static
     error.downcast_ref::<RecoveredUpdateFailure>().is_some()
 }
 
+struct InstalledUpdate {
+    previous_build: String,
+    previous_path: PathBuf,
+    daemon_restarted: bool,
+}
+
 /// Both public update modes publish the same verified artifact transaction.
 /// Preparation remains outside the maintenance window; intentionally stopped
 /// daemons stay stopped. A failed publication restores and verifies the owned
@@ -375,9 +380,14 @@ fn install_prepared_update(
     home: &Path,
     socket: &Path,
     expected: &str,
-    daemon_was_running: bool,
-) -> Result<(String, PathBuf), Box<dyn std::error::Error>> {
-    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+) -> Result<InstalledUpdate, Box<dyn std::error::Error>> {
+    let maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    // Preparation can outlive an operator stop or resume. Decide from current
+    // owner state only after acquiring maintenance, and retain that guard
+    // through publication and recovery so no newer intent can be overwritten.
+    let operator_stopped = maintenance.operator_stopped()?;
+    let daemon_was_running = daemon_is_running(socket)?;
+    let restart_owner = daemon_was_running && !operator_stopped;
 
     let previous_build = installed_binary_sha(airc_exe)
         .ok_or("cannot verify current binary before update; nothing displaced")?;
@@ -385,7 +395,7 @@ fn install_prepared_update(
     let mut stopped = false;
     let installed = prepared.install_after(|| {
         if daemon_was_running {
-            stop_daemon(airc_exe, home, socket)?;
+            stop_daemon(socket)?;
             stopped = true;
         }
         swap = Some(crate::update_rollback::BinarySwap::displace(
@@ -397,11 +407,11 @@ fn install_prepared_update(
     let Some(swap) = swap else {
         // A failed stop or displacement did not publish a candidate. Do not
         // overwrite the original with a backup or act on an unknown owner.
-        if stopped {
+        if stopped && restart_owner {
             if let Err(ref failure) = installed {
                 restart_daemon(airc_exe, home, socket).map_err(|error|
                     format!("update failed before displacement ({failure}); original daemon restart failed: {error}"))?;
-                wait_daemon_ready(airc_exe, home, socket)
+                wait_daemon_ready(home, socket)
                     .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
                     .map_err(|error| format!("update failed before displacement ({failure}); original daemon recovery verification failed: {error}"))?;
                 return Err(Box::new(RecoveredUpdateFailure(format!(
@@ -431,11 +441,11 @@ fn install_prepared_update(
         if !smoke_test_new_binary(airc_exe, &previous_build) {
             return Err(format!("update failed ({failure}); original file restored but build {previous_build} could not be verified").into());
         }
-        if daemon_was_running {
+        if restart_owner {
             restart_daemon(airc_exe, home, socket).map_err(|error| format!(
                 "update failed ({failure}); original build restored, but daemon restart failed: {error}"
             ))?;
-            wait_daemon_ready(airc_exe, home, socket)
+            wait_daemon_ready(home, socket)
                 .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
                 .map_err(|error| format!("update failed ({failure}); original build restored, but daemon recovery verification failed: {error}"))?;
             return Err(Box::new(RecoveredUpdateFailure(format!(
@@ -448,12 +458,16 @@ fn install_prepared_update(
         .into());
     }
 
-    if daemon_was_running {
+    if restart_owner {
         restart_daemon(airc_exe, home, socket)?;
-        wait_daemon_ready(airc_exe, home, socket)?;
+        wait_daemon_ready(home, socket)?;
         verify_daemon_build(airc_exe, home, socket, expected)?;
     }
-    Ok((previous_build, swap.previous().to_owned()))
+    Ok(InstalledUpdate {
+        previous_build,
+        previous_path: swap.previous().to_owned(),
+        daemon_restarted: restart_owner,
+    })
 }
 
 /// THE skip rule, one place for `airc update` and `airc update --auto` (#354, and
@@ -561,41 +575,7 @@ fn smoke_sha_matches(installed_sha: &str, expected_short: &str) -> bool {
         && (installed_sha.starts_with(expected_short) || expected_short.starts_with(installed_sha))
 }
 
-/// A failed observation is not evidence that the owner is absent. In particular,
-/// AccessDenied on a Windows pipe must not authorize a second owner or success.
-fn daemon_status(
-    socket: &Path,
-) -> Result<Option<airc_ipc::response::StatusResponse>, Box<dyn std::error::Error>> {
-    let endpoint = socket.to_path_buf();
-    let result = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(airc_ipc::client::ClientError::Io)?;
-        runtime.block_on(airc_ipc::client::DaemonClient::new(endpoint).status())
-    })
-    .join()
-    .map_err(|_| std::io::Error::other("daemon observation thread failed"))?;
-    classify_daemon_status(result).map_err(|error| {
-        format!("Cannot establish daemon state at {}: {error}; refusing to treat an unknown owner as absent", socket.display()).into()
-    })
-}
-
-fn classify_daemon_status(
-    result: Result<airc_ipc::response::StatusResponse, airc_ipc::client::ClientError>,
-) -> Result<Option<airc_ipc::response::StatusResponse>, airc_ipc::client::ClientError> {
-    match result {
-        Ok(status) => Ok(Some(status)),
-        Err(error) if crate::update_legacy::endpoint_absent(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn daemon_is_running(
-    _airc_exe: &Path,
-    _home: &Path,
-    socket: &Path,
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn daemon_is_running(socket: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(daemon_status(socket)?.is_some())
 }
 
@@ -608,64 +588,19 @@ fn reconcile_current_daemon(
     socket: &Path,
     expected: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
-    if !daemon_is_running(airc_exe, home, socket)? {
+    let maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    let operator_stopped = maintenance.operator_stopped()?;
+    if !daemon_is_running(socket)? {
         println!("daemon: stopped (left stopped).");
+        return Ok(());
+    }
+    if operator_stopped {
+        stop_daemon(socket)?;
+        println!("daemon: stopped (operator stop retained).");
         return Ok(());
     }
     verify_daemon_build(airc_exe, home, socket, expected)?;
     println!("daemon: running build {expected} verified.");
-    Ok(())
-}
-
-fn stop_daemon(
-    airc_exe: &Path,
-    home: &Path,
-    socket: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Bind the wait handle to this endpoint before stop. A shared informational
-    // PID file can refer to a legacy daemon listening on a different endpoint.
-    #[cfg(windows)]
-    let exiting = {
-        let endpoint = socket.to_path_buf();
-        // The synchronous updater is itself called inside Tokio. A short-lived
-        // thread owns this connection runtime rather than nesting block_on.
-        std::thread::spawn(
-            move || -> std::io::Result<crate::update_shutdown::DaemonExit> {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(async {
-                        let connection = airc_ipc::transport::IpcStream::connect(&endpoint).await?;
-                        crate::update_shutdown::DaemonExit::capture_process(
-                            connection.server_process_id()?,
-                        )
-                    })
-            },
-        )
-        .join()
-        .map_err(|_| std::io::Error::other("daemon endpoint capture thread failed"))??
-    };
-    let mut command = daemon_command(airc_exe, home, "stop", socket);
-    let stop_result = run_checked(&mut command, "airc stop before update");
-    #[cfg(not(windows))]
-    stop_result?;
-    #[cfg(windows)]
-    {
-        // Shutdown can close IPC before delivering its reply. Only the pinned
-        // process's confirmed exit permits proceeding after a failed response.
-        exiting.wait(Duration::from_secs(20))?;
-        if let Err(error) = stop_result {
-            eprintln!("Stop response failed ({error}), but the original daemon has exited.");
-        }
-    }
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while daemon_is_running(airc_exe, home, socket)? {
-        if Instant::now() >= deadline {
-            return Err("daemon still answers after stop; update not installed".into());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
     Ok(())
 }
 
@@ -697,11 +632,7 @@ fn spawn_restarted_daemon(
     Ok(())
 }
 
-fn wait_daemon_ready(
-    airc_exe: &Path,
-    home: &Path,
-    socket: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_daemon_ready(home: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // what this catches: the same cold-start-too-short bug #1211 fixed
     // for `ensure_daemon_running` (5s → 20s). A freshly rebuilt daemon
     // re-runs SQLite migrations + identity load + substrate `Airc::open`
@@ -712,7 +643,7 @@ fn wait_daemon_ready(
     // still surfacing a genuinely dead daemon.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if daemon_is_running(airc_exe, home, socket)? {
+        if daemon_is_running(socket)? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -844,9 +775,9 @@ fn verify_daemon_build(
          once more before reporting anything (a process that survived the stop \
          answers IPC just fine)."
     );
-    stop_daemon(airc_exe, home, socket)?;
+    stop_daemon(socket)?;
     restart_daemon(airc_exe, home, socket)?;
-    wait_daemon_ready(airc_exe, home, socket)?;
+    wait_daemon_ready(home, socket)?;
 
     if daemon_build_matches(airc_exe, home, socket, expected)? {
         eprintln!("✓ self-healed: the daemon is now running {expected}.");
@@ -976,41 +907,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn only_missing_or_refused_connection_is_absence() {
-        use airc_ipc::client::ClientError;
-        use std::io::{Error, ErrorKind};
-        for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
-            assert!(
-                classify_daemon_status(Err(ClientError::NotConnected(Error::from(kind))))
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                classify_daemon_status(Err(ClientError::Io(Error::from(kind)))).is_err(),
-                "a connection that failed after opening is not absence"
-            );
-        }
-        for kind in [
-            ErrorKind::PermissionDenied,
-            ErrorKind::TimedOut,
-            ErrorKind::WouldBlock,
-            ErrorKind::ConnectionReset,
-            ErrorKind::Other,
-        ] {
-            assert!(
-                classify_daemon_status(Err(ClientError::NotConnected(Error::from(kind)))).is_err()
-            );
-        }
-        assert!(classify_daemon_status(Err(ClientError::Timeout)).is_err());
-        assert!(
-            classify_daemon_status(Err(ClientError::UnexpectedResponse(Box::new(
-                airc_ipc::response::Response::Pong
-            ))))
-            .is_err()
-        );
-    }
 
     #[test]
     fn restarted_daemon_does_not_hold_updater_output_open() {
