@@ -10,7 +10,9 @@ use airc_lib::{Airc, EventFilter, LiveLag};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::client_id::{current_client_id, RuntimeSelfFilter};
+use crate::client_id::{
+    agent_process_client_id, current_client_id, explicit_client_id, RuntimeSelfFilter,
+};
 use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 const CONSUMER_PREFIX: &str = "codex-hook";
@@ -55,7 +57,14 @@ async fn run_hook(
 
     let airc = crate::commands::attached_airc(home).await?;
     let filter = hook_filter();
-    let runtime_client = current_client_id()?.or(hook_session);
+    // An identity the runtime states outright wins; then the hook's own session, which
+    // names this exact Codex task; only then the ancestor-process guess. The guess ranked
+    // above the session made every hook call under one agent ancestor share a cursor (on
+    // a dev box run from Claude Code, two Codex sessions read as one).
+    let runtime_client = match explicit_client_id().or(hook_session) {
+        Some(client) => Some(client),
+        None => agent_process_client_id()?,
+    };
     let consumer_id = consumer_id(runtime_client.as_deref());
     let events = unread_events(&airc, &consumer_id, filter, count).await?;
 
