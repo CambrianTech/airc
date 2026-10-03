@@ -19,7 +19,7 @@ use airc_bus::envelope::{Envelope, Kind, Target};
 use airc_core::{
     Body, MentionTarget, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
 };
-use airc_ipc::codec::read_frame;
+use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
     AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
     PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
@@ -591,7 +591,7 @@ impl Airc {
                 .attach(request)
                 .await
                 .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
-            match read_frame::<_, Response>(&mut stream).await {
+            match read_response_frame(&mut stream).await {
                 Ok(Some(Response::Ok)) => {}
                 Ok(Some(Response::Error { message })) => {
                     return Err(AircError::Route(format!("daemon attach: {message}")))
@@ -621,7 +621,7 @@ impl Airc {
                 let mut backoff_ms = RECONNECT_BACKOFF_START_MS;
                 loop {
                     loop {
-                        match read_frame::<_, Response>(&mut stream).await {
+                        match read_response_frame(&mut stream).await {
                             Ok(Some(Response::Event { envelope })) => {
                                 match decode_wire_event(envelope) {
                                     Ok(event) => {
@@ -724,7 +724,7 @@ impl Airc {
                                 continue;
                             }
                         };
-                        match read_frame::<_, Response>(&mut s).await {
+                        match read_response_frame(&mut s).await {
                             Ok(Some(Response::Ok)) => {
                                 stream = s;
                                 backoff_ms = RECONNECT_BACKOFF_START_MS;

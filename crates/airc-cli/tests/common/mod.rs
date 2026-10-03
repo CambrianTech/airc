@@ -31,6 +31,7 @@ pub struct DaemonTempDir {
     // daemons are reaped while their home still exists, then TempDir
     // deletes the tree.
     dir: tempfile::TempDir,
+    preserve_on_panic: bool,
 }
 
 /// The ONLY way tests get a home-bearing tempdir — returns the guarded
@@ -50,10 +51,17 @@ pub fn daemon_tempdir() -> DaemonTempDir {
     std::env::set_var("AIRC_NO_STALENESS", "1");
     DaemonTempDir {
         dir: tempfile::TempDir::new().expect("create guarded tempdir"),
+        preserve_on_panic: false,
     }
 }
 
 impl DaemonTempDir {
+    /// Opt-in failure evidence; daemon teardown still runs before preserving files.
+    pub fn preserve_on_panic(mut self) -> Self {
+        self.preserve_on_panic = true;
+        self
+    }
+
     pub fn path(&self) -> &Path {
         self.dir.path()
     }
@@ -62,6 +70,14 @@ impl DaemonTempDir {
 impl Drop for DaemonTempDir {
     fn drop(&mut self) {
         reap_daemons_under(self.dir.path());
+        if self.preserve_on_panic && std::thread::panicking() {
+            self.dir.disable_cleanup(true);
+            eprintln!(
+                "preserved failed fixture artifacts at {} (test pid {})",
+                self.dir.path().display(),
+                std::process::id()
+            );
+        }
     }
 }
 

@@ -47,6 +47,97 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    let Some(payload) = read_payload(reader).await? else {
+        return Ok(None);
+    };
+    ciborium::from_reader(payload.as_slice())
+        .map(Some)
+        .map_err(invalid_data)
+}
+
+/// Decode ordinary responses unchanged; avoid Serde's per-byte tagged-enum
+/// buffer only for the exact canonical event shape emitted by our writer.
+pub async fn read_response_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<crate::Response>> {
+    let Some(payload) = read_payload(reader).await? else {
+        return Ok(None);
+    };
+    decode_response(&payload).map(Some)
+}
+
+fn decode_response(payload: &[u8]) -> std::io::Result<crate::Response> {
+    if let Some(envelope) = canonical_event(payload) {
+        return Ok(crate::Response::Event { envelope });
+    }
+    // Never normalize the input before fallback: field order, tags, duplicate
+    // fields and noncanonical representations retain existing acceptance rules.
+    ciborium::from_reader(payload).map_err(invalid_data)
+}
+
+fn canonical_event(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = payload.strip_prefix(b"\xa2\x64kind\x65event\x68envelope")?;
+    let (&head, after) = rest.split_first()?;
+    rest = after;
+    let count = match head {
+        0x80..=0x97 => usize::from(head - 0x80),
+        0x98 => {
+            let (&n, after) = rest.split_first()?;
+            rest = after;
+            if n < 24 {
+                return None;
+            }
+            usize::from(n)
+        }
+        0x99 => {
+            let bytes = rest.get(..2)?;
+            let n = u16::from_be_bytes(bytes.try_into().ok()?);
+            rest = &rest[2..];
+            if n < 256 {
+                return None;
+            }
+            usize::from(n)
+        }
+        0x9a => {
+            let bytes = rest.get(..4)?;
+            let n = u32::from_be_bytes(bytes.try_into().ok()?);
+            rest = &rest[4..];
+            if n < 65536 {
+                return None;
+            }
+            usize::try_from(n).ok()?
+        }
+        _ => return None,
+    };
+    // Every u8 needs at least one input byte. Bound allocation by the validated
+    // frame itself, not an untrusted declared array length.
+    if count > rest.len() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (&n, after) = rest.split_first()?;
+        rest = after;
+        match n {
+            0..=23 => bytes.push(n),
+            0x18 => {
+                let (&n, after) = rest.split_first()?;
+                if n < 24 {
+                    return None;
+                }
+                rest = after;
+                bytes.push(n);
+            }
+            _ => return None,
+        }
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(bytes)
+}
+
+async fn read_payload<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_bytes = [0_u8; 4];
     match reader.read_exact(&mut len_bytes).await {
         Ok(_) => {}
@@ -64,9 +155,7 @@ where
 
     let mut payload = vec![0_u8; len as usize];
     reader.read_exact(&mut payload).await?;
-    ciborium::from_reader(payload.as_slice())
-        .map(Some)
-        .map_err(invalid_data)
+    Ok(Some(payload))
 }
 
 fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
@@ -77,6 +166,109 @@ fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
 mod tests {
     use super::*;
     use crate::request::Request;
+
+    #[test]
+    fn canonical_event_matches_legacy_at_boundaries() {
+        for len in [0, 1, 23, 24, 255, 256, 65535, 65536] {
+            let envelope: Vec<u8> = (0..len).map(|n| (n % 256) as u8).collect();
+            let mut payload = Vec::new();
+            ciborium::into_writer(&crate::Response::event_ref(&envelope), &mut payload).unwrap();
+            assert_eq!(canonical_event(&payload), Some(envelope.clone()));
+            assert_eq!(
+                decode_response(&payload).unwrap(),
+                crate::Response::Event { envelope }
+            );
+            for end in [0, 1, payload.len() / 2, payload.len() - 1] {
+                assert_eq!(
+                    decode_response(&payload[..end]).is_ok(),
+                    ciborium::from_reader::<crate::Response, _>(&payload[..end]).is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn altered_event_frames_preserve_legacy_decoder() {
+        let mut original = Vec::new();
+        ciborium::into_writer(&crate::Response::event_ref(&[0, 24, 255]), &mut original).unwrap();
+        let compare = |bytes: &[u8]| {
+            let old = ciborium::from_reader::<crate::Response, _>(bytes);
+            let new = decode_response(bytes);
+            assert_eq!(old.is_ok(), new.is_ok(), "{bytes:?}");
+            if let (Ok(old), Ok(new)) = (old, new) {
+                assert_eq!(old, new);
+            }
+        };
+        for i in 0..original.len() {
+            for b in 0..=255 {
+                let mut bytes = original.clone();
+                bytes[i] = b;
+                compare(&bytes);
+            }
+        }
+        for bytes in [
+            b"\xa2\x68envelope\x80\x64kind\x65event".as_slice(),
+            b"\xa2\x64kind\x7f\x62ev\x63ent\xff\x68envelope\x80".as_slice(),
+            b"\xa2\x64kind\x65event\x68envelope\x81\xd8\x2a\x07".as_slice(),
+            b"\xa2\x64kind\x65event\x68envelope\x40".as_slice(),
+            b"\xa1\x64kind\x62ok".as_slice(),
+        ] {
+            assert!(canonical_event(bytes).is_none());
+            compare(bytes);
+        }
+    }
+
+    /// Event-only decoder experiment, not a replacement for Response.
+    /// Same frames, serial means including allocations; not a CPU profile.
+    #[tokio::test]
+    #[ignore = "manual same-frame decoder comparison"]
+    async fn bench_event_decoder_comparison() {
+        use crate::response::Response;
+        use std::{hint::black_box, time::Instant};
+        #[derive(serde::Deserialize)]
+        struct EventFields {
+            kind: String,
+            envelope: Vec<u8>,
+        }
+        const N: u128 = 512;
+        for size in [384, 65_664] {
+            let payload = vec![0x42; size];
+            let mut frame = Vec::new();
+            write_frame(&mut frame, &Response::event_ref(&payload))
+                .await
+                .unwrap();
+            let direct: EventFields = read_frame(&mut frame.as_slice()).await.unwrap().unwrap();
+            assert_eq!(direct.kind, "event");
+            assert_eq!(direct.envelope, payload);
+            assert_eq!(
+                read_frame::<_, Response>(&mut frame.as_slice())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Response::Event { envelope: payload }
+            );
+            let start = Instant::now();
+            for _ in 0..N {
+                black_box(
+                    read_frame::<_, Response>(&mut black_box(frame.as_slice()))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            let tagged = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..N {
+                let direct = read_frame::<_, EventFields>(&mut black_box(frame.as_slice()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(direct.kind, "event");
+                black_box(direct);
+            }
+            eprintln!("same_frame envelope_bytes={size} framed_bytes={} tagged_mean_ns={} direct_fields_mean_ns={}",frame.len(),tagged.as_nanos()/N,start.elapsed().as_nanos()/N);
+        }
+    }
 
     // what this catches: replacing the existing byte-array encoding with CBOR
     // byte strings must first prove that already-installed Vec decoders accept it.

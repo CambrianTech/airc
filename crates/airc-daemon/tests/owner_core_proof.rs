@@ -24,7 +24,7 @@ use airc_bus::envelope::{DeliveryClass, Envelope, Kind};
 use airc_core::{HeaderFilter, Headers, PeerId, RoomId};
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
 use airc_ipc::client::RpcPhase;
-use airc_ipc::codec::read_frame;
+use airc_ipc::codec::{read_frame, read_response_frame};
 use airc_ipc::{
     AttachRequest, DaemonClient, InboxRequest, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
     Request, Response, SendRequest,
@@ -106,6 +106,111 @@ fn unique_socket() -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(format!("/tmp/airc-ocp-{}-{n}.sock", std::process::id()))
+}
+
+/// Real SQLite visibility after concurrent IPC publication. Observation begins
+/// after publishers finish, so drain time is an upper bound, not commit timing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual SQLite drain measurement"]
+async fn bench_daemon_sqlite_drain() {
+    use airc_bus::{Cursor, DurableSink, Seq};
+    use std::collections::HashSet;
+    for publishers in [16usize, 64] {
+        const PER: usize = 64;
+        let daemon = tokio::time::timeout(Duration::from_secs(30), start_daemon())
+            .await
+            .unwrap();
+        let channel = RoomId::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let result = tokio::time::timeout(Duration::from_secs(90), async {
+            let sink = airc_store::SqliteDurableSink::open_read_only_path(
+                &daemon._home.path().join("events.sqlite"),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let start = Instant::now();
+            for p in 0..publishers {
+                let socket = daemon.socket.clone();
+                tasks.spawn(async move {
+                    let client = DaemonClient::new(socket);
+                    let mut accepted = Vec::new();
+                    let mut errors = Vec::new();
+                    for n in 0..PER {
+                        match client
+                            .publish(durable_text(channel, &format!("drain {p} {n}")))
+                            .await
+                        {
+                            Ok(r) => accepted.push(r),
+                            Err(e) => errors.push(e.to_string()),
+                        }
+                    }
+                    (accepted, errors)
+                });
+            }
+            let mut accepted = Vec::new();
+            let mut errors = Vec::new();
+            while let Some(task) = tasks.join_next().await {
+                let (a, e) = task.map_err(|e| e.to_string())?;
+                accepted.extend(a);
+                errors.extend(e);
+            }
+            let publish_wall = start.elapsed();
+            let pinned = daemon.state.router.pinned_in_ring(channel);
+            let expected: HashSet<_> = accepted.iter().map(|r| r.event_id).collect();
+            if expected.len() != accepted.len() || accepted.is_empty() {
+                return Err("duplicate/empty accepted receipts".to_owned());
+            }
+            let last = accepted
+                .iter()
+                .map(|r| Cursor::new(Seq::new(r.epoch, r.counter), r.event_id))
+                .max_by_key(|cursor| cursor.seq)
+                .unwrap();
+            loop {
+                if sink.head_cursor(channel).await.map_err(|e| e.to_string())? == Some(last) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let tip_observed = start.elapsed();
+            loop {
+                let rows = sink
+                    .page(channel, None, publishers * PER + 1)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let found: HashSet<_> = rows.iter().map(|e| e.event_id).collect();
+                if !found.is_subset(&expected) || rows.len() != found.len() {
+                    return Err("SQLite unexpected/duplicate receipt IDs".to_owned());
+                }
+                // A high cursor can persist before an earlier concurrent
+                // publisher enqueues. Only the complete set proves drain.
+                if found == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let verified = start.elapsed();
+            Ok((
+                accepted.len(),
+                errors,
+                publish_wall,
+                tip_observed,
+                verified,
+                pinned,
+            ))
+        })
+        .await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        daemon.stop().await;
+        let (accepted, errors, publish, tip, verified, pinned) = result
+            .expect("bounded SQLite scenario")
+            .expect("SQLite receipt proof");
+        eprintln!("sqlite_drain publishers={publishers} attempts={} accepted={accepted} errors={} publish_ms={:.3} tip_observed_ms={:.3} exact_rows_verified_ms={:.3} pinned_at_publish={pinned} first_error={:?}",publishers*PER,errors.len(),publish.as_secs_f64()*1000.,tip.as_secs_f64()*1000.,verified.as_secs_f64()*1000.,errors.first());
+        assert!(
+            errors.is_empty(),
+            "publication errors are not successful throughput"
+        );
+    }
 }
 
 async fn start_daemon() -> TestDaemon {
@@ -238,7 +343,7 @@ async fn persona_collect(
         .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
-    match read_frame::<_, Response>(&mut stream).await {
+    match read_response_frame(&mut stream).await {
         Ok(Some(Response::Ok)) => {}
         other => panic!("expected Ok ack from attach, got {other:?}"),
     }
@@ -246,11 +351,7 @@ async fn persona_collect(
 
     let mut out = Vec::with_capacity(want);
     while out.len() < want {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            read_frame::<_, Response>(&mut stream),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(20), read_response_frame(&mut stream)).await
         {
             Ok(Ok(Some(Response::Event { envelope }))) => {
                 let env = airc_wire::decode(envelope.into()).expect("decode airc-wire event");
@@ -277,7 +378,7 @@ async fn collect_envelopes(
         .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
-    match read_frame::<_, Response>(&mut stream).await {
+    match read_response_frame(&mut stream).await {
         Ok(Some(Response::Ok)) => {}
         other => panic!("expected Ok ack, got {other:?}"),
     }
@@ -285,11 +386,7 @@ async fn collect_envelopes(
 
     let mut out = Vec::with_capacity(want);
     while out.len() < want {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            read_frame::<_, Response>(&mut stream),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(20), read_response_frame(&mut stream)).await
         {
             Ok(Ok(Some(Response::Event { envelope }))) => {
                 out.push(airc_wire::decode(envelope.into()).expect("decode"));
@@ -718,16 +815,14 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
             .await
             .expect("worker attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         worker_ready.wait().await;
         let cmd = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode command");
             }
@@ -766,16 +861,14 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
             .await
             .expect("requester attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         req_ready.wait().await;
         let result = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode result");
             }
@@ -848,17 +941,14 @@ async fn attach_header_filter_scopes_subscription_router_side() {
             .await
             .expect("attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         r.wait().await;
         let mut got = Vec::new();
         while got.len() < 2 {
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                .await
             {
                 Ok(Ok(Some(Response::Event { envelope }))) => {
                     got.push(airc_wire::decode(envelope.into()).expect("decode"));
@@ -1154,7 +1244,7 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
             .await
             .unwrap();
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         streams.push(stream);
@@ -1196,14 +1286,12 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
         // every decoded frame through it, without a timer-based absence claim.
         let mut replies = 0;
         loop {
-            let frame = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            let frame =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
             let Response::Event { envelope } = frame else {
                 panic!("expected event")
             };

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use airc_core::{Body, MentionTarget, RoomId, TranscriptEvent, TranscriptKind};
-use airc_ipc::{codec::read_frame, AttachRequest, AttachStart, DaemonClient, Response};
+use airc_ipc::{codec::read_response_frame, AttachRequest, AttachStart, DaemonClient, Response};
 use airc_lib::{decode_wire_event, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
 
@@ -113,7 +113,7 @@ pub(crate) async fn run(
                 }
                 if let Ok(mut stream) = client.attach(request).await {
                     let mut got_frame = false;
-                    while let Ok(Some(response)) = read_frame::<_, Response>(&mut stream).await {
+                    while let Ok(Some(response)) = read_response_frame(&mut stream).await {
                         match response {
                             Response::Event { envelope } => match decode_wire_event(envelope) {
                                 Ok(event) => {

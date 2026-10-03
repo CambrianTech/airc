@@ -112,3 +112,72 @@ attributing full pipeline latency to that phase. Independent source review
 approved measurement framing with the limits above.
 
 Run: cargo test --release -p airc-daemon --test owner_core_proof bench_stream_codec_phases -- --ignored --exact --nocapture
+
+## Canonical event response decoding
+
+The production candidate recognizes only the current writer's exact two-field
+CBOR event representation: fixed field order, shortest definite array lengths,
+and canonical u8 values. Every other frame goes untouched to the original
+Response decoder. The wire format and serialization are unchanged. This avoids
+the generic tagged-enum buffer on common live events without changing accepted
+noncanonical representations. An earlier high-level visitor prototype was
+rejected and removed because normalization changed edge-case acceptance.
+
+Same optimized six-case harness and machine, one run each (not a controlled
+sustained-load capacity result):
+
+| Payload | Readers | Baseline validated completion | Candidate validated completion |
+| ---: | ---: | ---: | ---: |
+| 256 B | 1 | 38.891 ms | 37.985 ms |
+| 256 B | 8 | 42.480 ms | 41.287 ms |
+| 256 B | 32 | 54.879 ms | 51.487 ms |
+| 64 KiB | 1 | 952.912 ms | 519.456 ms |
+| 64 KiB | 8 | 930.150 ms | 581.160 ms |
+| 64 KiB | 32 | 3086.588 ms | 911.834 ms |
+
+All cases passed first-64 payload/order and immediate empty-inbox checks. The
+largest case carries 128 MiB aggregate reader payload and measured 140.38 MiB/s
+through validation. No live account daemon or deployed network was changed.
+Independent source review approved the raw-frame subset and untouched fallback;
+IPC differential mutation/boundary tests, full IPC suite, and workspace Clippy
+passed. Existing generic codec phase tests still measure the original decoder.
+
+## SQLite visibility after concurrent IPC publication
+
+An opt-in isolated daemon benchmark opens the existing SQLite file read-only,
+without migration or journal changes. Each publisher awaits its preceding RPC.
+After all callers finish, it observes the maximum accepted cursor and then polls
+for the complete accepted receipt-ID set. A high cursor alone is insufficient:
+concurrent publishers can enqueue and commit out of sequence. Unexpected IDs or
+duplicates fail immediately; temporarily missing expected IDs may drain within
+the scenario deadline. Publication errors fail the measurement.
+
+| Publishers x messages | Accepted | Errors | All publishers finished | Highest accepted cursor observed | Complete SQLite ID set verified | Pinned at publish completion |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 x 64 | 1024 | 0 | 196.919 ms | 204.506 ms | 213.610 ms | 1 |
+| 64 x 64 | 4096 | 0 | 786.985 ms | 794.076 ms | 830.464 ms | 1 |
+
+One optimized Windows run. Observation begins after publication and includes
+poll/query cost; these are upper bounds on visibility, not per-event commit
+latencies. Exact IDs were read from SQLite through a separate read-only handle,
+not the hot ring. This verifies live-WAL visibility, not power-loss, crash or
+reopen durability. Independent review approved bounded task ownership and
+complete-set observation; the rerun and package all-target Clippy passed.
+
+Run: cargo test --release -p airc-daemon --test owner_core_proof bench_daemon_sqlite_drain -- --ignored --exact --nocapture
+
+## Recovery after storage backpressure
+
+The existing synthetic delayed-sink test now retries the original rejected IDs
+after the first accepted batch drains. The sink delays each batch by 10 ms.
+Retries pause 10 ms only on explicit saturation. Both drain phases are bounded;
+final rows must contain exactly all original IDs, without duplicate rows or pins.
+This tests publish retry behavior, not concurrent idempotent ingestion.
+
+Optimized 8192-attempt case: 1025 initially accepted, 7167 initially rejected;
+accepted rows drained in281ms, leaving zero pins. Retrying the rejected IDs
+encountered109 additional saturation responses; all8192 IDs were verified with
+zero pins after2071ms of retry, drain and final set validation. This is a
+synthetic in-memory sink, not SQLite/network throughput. Initial attempts include
+tracking-clone overhead; fast rejection dominates their reported attempt rate.
+Independent source review approved the retry test and these measurement limits.
