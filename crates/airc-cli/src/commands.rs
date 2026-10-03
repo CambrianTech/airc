@@ -674,35 +674,12 @@ fn inject_gh_token(command: &mut Command) {
 /// every gh resolution in this process — token extraction, the
 /// daemon's gate + store, the manual `registry sync` gate.
 pub(crate) fn gh_bin_override() -> Option<std::path::PathBuf> {
-    let raw = std::env::var_os("AIRC_GH_BIN")?;
-    if raw.is_empty() {
-        return None;
-    }
-    Some(std::path::PathBuf::from(raw))
+    airc_core::gh_executable::override_path()
 }
 
-/// Known gh install locations, tried after bare `gh` on PATH. Only
-/// consulted when the operator has NOT set `AIRC_GH_BIN`.
 fn default_gh_candidates() -> Vec<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("gh")];
-    #[cfg(windows)]
-    {
-        candidates.push(std::path::PathBuf::from(
-            r"C:\Program Files\GitHub CLI\gh.exe",
-        ));
-        candidates.push(std::path::PathBuf::from(
-            r"C:\Program Files (x86)\GitHub CLI\gh.exe",
-        ));
-    }
-    #[cfg(not(windows))]
-    {
-        candidates.push(std::path::PathBuf::from("/opt/homebrew/bin/gh"));
-        candidates.push(std::path::PathBuf::from("/usr/local/bin/gh"));
-        candidates.push(std::path::PathBuf::from("/usr/bin/gh"));
-    }
-    candidates
+    airc_core::gh_executable::candidates()
 }
-
 /// `gh auth token` from the parent, robust to PATH-resolution quirks in
 /// a bash-descended process (where bare `gh` may not resolve the same as
 /// in an interactive shell). Honors `AIRC_GH_BIN` (the override is the

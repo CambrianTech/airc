@@ -1,5 +1,5 @@
 //! GitHub operations — PR creation + linking + base-branch resolution.
-//! Currently shells out via `airc_core::process::background("gh")`; card
+//! Currently shells out via `airc_core::process::background(airc_core::gh_executable::resolve())`; card
 //! dec35ec7 will migrate these to the typed `GhClient` trait from
 //! `airc-lib::tools` once that lands.
 //!
@@ -89,7 +89,7 @@ pub(crate) async fn open_pr_and_link(
         Some(base) => base,
         None => gh_default_branch(&worktree_str)?,
     };
-    let create_out = airc_core::process::background("gh")
+    let create_out = airc_core::process::background(airc_core::gh_executable::resolve())
         .current_dir(&worktree_str)
         .args([
             "pr",
@@ -234,7 +234,7 @@ pub(crate) async fn link_existing_pr(
     // Read the PR's actual head/base/state from GitHub. `--repo` is
     // explicit (not cwd-derived) so this works from anywhere, including
     // a card whose worktree was already cleaned up.
-    let out = airc_core::process::background("gh")
+    let out = airc_core::process::background(airc_core::gh_executable::resolve())
         .args([
             "pr",
             "view",
@@ -325,7 +325,7 @@ pub(crate) async fn relink_card_pr(
 
     // Read the successor PR's actual head/base/state from GitHub —
     // typed JSON, explicit --repo, never parsed from human output.
-    let out = airc_core::process::background("gh")
+    let out = airc_core::process::background(airc_core::gh_executable::resolve())
         .args([
             "pr",
             "view",
@@ -398,7 +398,7 @@ pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::e
     // Card a4fe899f: `gh` does NOT accept `-C`; set cwd via
     // `Command::current_dir(...)` so `gh repo view` resolves the
     // worktree's origin remote, not the shell cwd's.
-    let out = airc_core::process::background("gh")
+    let out = airc_core::process::background(airc_core::gh_executable::resolve())
         .current_dir(worktree)
         .args([
             "repo",

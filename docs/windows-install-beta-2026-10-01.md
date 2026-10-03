@@ -953,3 +953,20 @@ before BinarySwap: scratch executable spawn returned OS26 Text file busy
 (run37075997865, job111065953008). This was not waived or counted as green.
 Released 564af17 contains the independently reviewed Unix fixture repair; the
 consolidation workflow is unchanged and a fresh full matrix is required.
+## Runtime GitHub CLI discovery after installation (2026-10-02, OPEN)
+
+Actual installed `airc sos status` failed to spawn `gh` when the calling app's
+PATH predated GitHub CLI installation, although the public installer had found
+and authenticated the registered installation. No SOS publication occurred.
+The repair shares executable discovery across SOS, account registry, gist
+transport, and CLI/work GitHub calls. It keeps explicit `AIRC_GH_BIN`
+authoritative and inherited absolute PATH entries first, then reads supported
+Windows per-user layouts, registered user/machine PATH, and MSI locations.
+It neither changes the caller's environment nor launches registry/auth probes.
+
+A real CLI child regression uses stale PATH and an isolated native fake GH in a
+path containing spaces; it rejects unexpected operations and asserts no console.
+Positive SOS/CLI discovery and unavailable/invalid explicit overrides passed
+with the fresh native CLI (session17745, 1/1). No live update or public-entry
+acceptance has run for this
+repair; the case remains OPEN until the repaired deployed binary exercises it.

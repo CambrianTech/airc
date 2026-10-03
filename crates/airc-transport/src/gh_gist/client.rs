@@ -26,7 +26,7 @@ pub struct GhCliClient {
 impl GhCliClient {
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: airc_core::gh_executable::resolve(),
         }
     }
 

@@ -207,7 +207,7 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 }
 
 fn query_gh_login() -> Option<String> {
-    let output = airc_core::process::background("gh")
+    let output = airc_core::process::background(airc_core::gh_executable::resolve())
         .args(["api", "user", "--jq", ".login"])
         .output()
         .ok()?;

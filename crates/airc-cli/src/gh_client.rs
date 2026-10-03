@@ -3,7 +3,7 @@
 //   types, and the pure parse helpers — that's the consumer-facing
 //   half (Continuum, OpenClaw, Hermes, codex, headless workers).
 // - airc-cli::gh_client owns the shell-based implementation — the
-//   `tokio::process::Command::from(airc_core::process::background("gh"))` spawn lives here only.
+//   `tokio::process::Command::from(airc_core::process::background(airc_core::gh_executable::resolve()))` spawn lives here only.
 //
 // Reason for the split: card a094aa81 (substrate-vision consumer
 // embedding). Consumers that want the gh boundary without the
@@ -58,7 +58,9 @@ impl ShellGhClient {
 #[async_trait]
 impl GhClient for ShellGhClient {
     async fn pr_view(&self, args: PrViewArgs) -> Result<PrView, GhError> {
-        let mut cmd = Command::from(airc_core::process::background("gh"));
+        let mut cmd = Command::from(airc_core::process::background(
+            airc_core::gh_executable::resolve(),
+        ));
         if let Some(ref cwd) = args.cwd {
             cmd.current_dir(cwd);
         }
@@ -82,12 +84,14 @@ impl GhClient for ShellGhClient {
     }
 
     async fn pr_create(&self, args: PrCreateArgs) -> Result<PrCreated, GhError> {
-        let output = Command::from(airc_core::process::background("gh"))
-            .current_dir(&args.cwd)
-            .args(["pr", "create", "--fill", "--base", args.base.as_str()])
-            .output()
-            .await
-            .map_err(map_spawn_error)?;
+        let output = Command::from(airc_core::process::background(
+            airc_core::gh_executable::resolve(),
+        ))
+        .current_dir(&args.cwd)
+        .args(["pr", "create", "--fill", "--base", args.base.as_str()])
+        .output()
+        .await
+        .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
@@ -97,19 +101,21 @@ impl GhClient for ShellGhClient {
     }
 
     async fn pr_merge(&self, args: PrMergeArgs) -> Result<MergeReceipt, GhError> {
-        let output = Command::from(airc_core::process::background("gh"))
-            .args([
-                "pr",
-                "merge",
-                &args.number.to_string(),
-                "--repo",
-                args.repo.as_str(),
-                "--squash",
-                "--delete-branch",
-            ])
-            .output()
-            .await
-            .map_err(map_spawn_error)?;
+        let output = Command::from(airc_core::process::background(
+            airc_core::gh_executable::resolve(),
+        ))
+        .args([
+            "pr",
+            "merge",
+            &args.number.to_string(),
+            "--repo",
+            args.repo.as_str(),
+            "--squash",
+            "--delete-branch",
+        ])
+        .output()
+        .await
+        .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
@@ -122,11 +128,13 @@ impl GhClient for ShellGhClient {
     async fn pr_edit_base(&self, args: PrEditBaseArgs) -> Result<(), GhError> {
         let path = format!("repos/{}/pulls/{}", args.repo, args.number);
         let base_field = format!("base={}", args.base);
-        let output = Command::from(airc_core::process::background("gh"))
-            .args(["api", "-X", "PATCH", &path, "-f", &base_field])
-            .output()
-            .await
-            .map_err(map_spawn_error)?;
+        let output = Command::from(airc_core::process::background(
+            airc_core::gh_executable::resolve(),
+        ))
+        .args(["api", "-X", "PATCH", &path, "-f", &base_field])
+        .output()
+        .await
+        .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
@@ -148,11 +156,13 @@ impl GhClient for ShellGhClient {
                 "repos/{}/commits/{}/check-runs?per_page={CHECK_RUN_PAGE_SIZE}&page={page}",
                 args.repo, args.branch
             );
-            let output = Command::from(airc_core::process::background("gh"))
-                .args(["api", &path])
-                .output()
-                .await
-                .map_err(map_spawn_error)?;
+            let output = Command::from(airc_core::process::background(
+                airc_core::gh_executable::resolve(),
+            ))
+            .args(["api", &path])
+            .output()
+            .await
+            .map_err(map_spawn_error)?;
             if !output.status.success() {
                 return Err(classify_gh_failure(&output));
             }
@@ -170,19 +180,21 @@ impl GhClient for ShellGhClient {
     /// loud `JsonParse` rather than a silently empty body (which the
     /// closer would read as "no envelope, skip this card").
     async fn issue_view(&self, args: IssueViewArgs) -> Result<IssueView, GhError> {
-        let output = Command::from(airc_core::process::background("gh"))
-            .args([
-                "issue",
-                "view",
-                &args.number.to_string(),
-                "--repo",
-                args.repo.as_str(),
-                "--json",
-                "number,title,body,state",
-            ])
-            .output()
-            .await
-            .map_err(map_spawn_error)?;
+        let output = Command::from(airc_core::process::background(
+            airc_core::gh_executable::resolve(),
+        ))
+        .args([
+            "issue",
+            "view",
+            &args.number.to_string(),
+            "--repo",
+            args.repo.as_str(),
+            "--json",
+            "number,title,body,state",
+        ])
+        .output()
+        .await
+        .map_err(map_spawn_error)?;
         if !output.status.success() {
             return Err(classify_gh_failure(&output));
         }
