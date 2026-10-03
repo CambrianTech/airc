@@ -150,6 +150,13 @@ impl PeerKeyRegistry {
         self.keys.iter().any(|entry| entry.key().0 == peer)
     }
 
+    /// Whether this peer still trusts the key authenticated by a live TLS session.
+    pub fn has_key(&self, peer: PeerId, pubkey: &[u8; 32]) -> bool {
+        self.keys
+            .iter()
+            .any(|entry| entry.key().0 == peer && entry.value().as_bytes() == pubkey)
+    }
+
     /// Reverse lookup: find which `(peer, key_id)` enrolled a given
     /// pubkey. Used by the lan-tcp TLS verifier — at handshake time
     /// the server receives a client cert but doesn't know which peer

@@ -280,6 +280,18 @@ impl LanTcpAdapter {
             let connections = self.inner.connections.lock().await;
             connections
                 .get(&peer)
+                .filter(|session| {
+                    self.inner
+                        .registry
+                        .has_key(peer, &session.authenticated_key)
+                })
+                .or_else(|| {
+                    connections.values().find(|session| {
+                        self.inner
+                            .registry
+                            .has_key(peer, &session.authenticated_key)
+                    })
+                })
                 .map(|session| session.outbound.clone())
                 .ok_or(LanTcpError::NoActivePeers)?
         };
@@ -489,23 +501,67 @@ mod tests {
     #[tokio::test]
     async fn unicast_uses_authenticated_session_for_enrolled_alias_only() {
         let (alice_id, alice, _bob_id, bob) = make_paired_adapters();
-        let bound = alice.listen(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
-        let mut received = alice.subscribe(Subscription { channel: None, ..Default::default() }).await.unwrap();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let mut received = alice
+            .subscribe(Subscription {
+                channel: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         bob.connect(bound, alice_id).await.unwrap();
         // Enrol AFTER handshake, making the stored connection's original ID deterministic.
         let alias = PeerId::from_u128(0xa2);
-        bob.inner.registry.enrol(alias, 0, alice.inner.keypair.public_bytes()).unwrap();
+        bob.inner
+            .registry
+            .enrol(alias, 0, alice.inner.keypair.public_bytes())
+            .unwrap();
         let stranger = PeerId::from_u128(0xa3);
-        bob.inner.registry.enrol(stranger, 0, PeerKeypair::generate().public_bytes()).unwrap();
+        bob.inner
+            .registry
+            .enrol(stranger, 0, PeerKeypair::generate().public_bytes())
+            .unwrap();
         let channel = RoomId::from_u128(0xc0ffee);
         for refused in [stranger, PeerId::from_u128(0xa4)] {
-            assert!(bob.send_to(refused, frame_at(80, channel, "must not send")).await.is_err());
+            assert!(bob
+                .send_to(refused, frame_at(80, channel, "must not send"))
+                .await
+                .is_err());
         }
-        bob.send_to(alias, frame_at(81, channel, "alias ack")).await.expect("same authenticated key must use the live session");
-        let frame = tokio::time::timeout(Duration::from_secs(3), received.next()).await.unwrap().unwrap().unwrap();
+        bob.send_to(alias, frame_at(81, channel, "alias ack"))
+            .await
+            .expect("same authenticated key must use the live session");
+        let frame = tokio::time::timeout(Duration::from_secs(3), received.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(frame.envelope.lamport, 81);
+        // Replacing trust must not retroactively change the key a session proved.
+        bob.inner
+            .registry
+            .enrol(alias, 0, PeerKeypair::generate().public_bytes())
+            .unwrap();
+        assert!(bob
+            .send_to(alias, frame_at(82, channel, "rotated alias"))
+            .await
+            .is_err());
+        bob.inner
+            .registry
+            .enrol(alice_id, 0, PeerKeypair::generate().public_bytes())
+            .unwrap();
+        assert!(bob
+            .send_to(alice_id, frame_at(83, channel, "rotated primary"))
+            .await
+            .is_err());
         bob.inner.registry.remove_peer(alias);
-        assert!(bob.send_to(alias, frame_at(82, channel, "revoked")).await.is_err());
+        assert!(bob
+            .send_to(alias, frame_at(82, channel, "revoked"))
+            .await
+            .is_err());
     }
     // #240 event-driven heal: a terminated session must (1) drop the peer from
     // `connections` and (2) fire the registered disconnect observer with that
@@ -528,6 +584,7 @@ mod tests {
         alice.inner.connections.lock().await.insert(
             bob_id,
             super::inner::Session {
+                authenticated_key: _bob.inner.keypair.public_bytes(),
                 outbound: tx,
                 id: 0,
                 reader: reader.abort_handle(),
