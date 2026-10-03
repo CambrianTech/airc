@@ -24,6 +24,16 @@ pub enum RuntimeContext {
     TestHarness,
 }
 
+/// Startup intent is independent of whether this invocation streams. In
+/// particular NO_ATTACH must not turn a supervised recovery into operator consent.
+pub(crate) fn join_resumes_daemon(ensure_only: bool) -> bool {
+    join_resumes_with(ensure_only, |key| std::env::var_os(key).is_some())
+}
+
+fn join_resumes_with(ensure_only: bool, is_set: impl Fn(&str) -> bool) -> bool {
+    !ensure_only && !is_set("AIRC_SUPERVISOR") && !is_set("AIRC_CODEX_START_CHILD")
+}
+
 impl RuntimeContext {
     pub fn current() -> Self {
         use std::io::IsTerminal;
@@ -168,6 +178,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::{classify_for_test, AgentRuntimeKind, RuntimeContext};
+
+    #[test]
+    fn unattended_join_never_becomes_resume_when_streaming_is_disabled() {
+        for markers in [
+            vec!["AIRC_SUPERVISOR"],
+            vec!["AIRC_SUPERVISOR", "AIRC_NO_ATTACH"],
+            vec!["AIRC_CODEX_START_CHILD", "AIRC_NO_ATTACH"],
+        ] {
+            assert!(!super::join_resumes_with(false, |key| markers.contains(&key)));
+        }
+        assert!(!super::join_resumes_with(true, |_| false));
+        assert!(super::join_resumes_with(false, |key| key == "AIRC_NO_ATTACH"));
+    }
 
     #[test]
     fn join_streams_for_codex_agent() {

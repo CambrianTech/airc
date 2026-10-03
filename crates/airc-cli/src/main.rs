@@ -424,7 +424,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,
         Command::Status { socket } => commands::run_status(&home, default_or(socket, &home)).await,
-        Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
+        Command::Stop { socket } => commands::run_stop(&home, default_or(socket, &home)).await,
 
         Command::Msg {
             socket,
@@ -628,7 +628,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             GistAction::FileContent { filename } => gist_commands::run_file_content(&filename),
         },
 
-        Command::Join { room } => commands::run_join(&home, room).await,
+        Command::Join { room, ensure } => commands::run_join(&home, room, ensure).await,
 
         Command::Sos { action } => match action {
             SosAction::Send { message } => sos_commands::run_send(&home, &message).await,

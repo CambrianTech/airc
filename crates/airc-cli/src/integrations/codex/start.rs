@@ -29,6 +29,7 @@ pub async fn run(
         .args(normalize_join_args(join_args))
         .env("AIRC_HOME", &home)
         .env("AIRC_CODEX_START_CHILD", "1")
+        .env("AIRC_SUPERVISOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
