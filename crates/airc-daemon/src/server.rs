@@ -528,6 +528,13 @@ where
     // `AttachRequest::start`. No flag precedence to re-derive here.
     let parts = attach.into_parts();
 
+    // A channel SET rides one stream (`stream_attach_set`); the single
+    // channel keeps the path below unchanged, so an older client's
+    // request is served exactly as before.
+    if parts.channels.is_some() {
+        return stream_attach_set(reader, writer, state, parts).await;
+    }
+
     // The owner-core router subscribes per channel (no global table to
     // scan). A client attaches once per room it cares about.
     let channel = match parts.channel {
@@ -739,6 +746,155 @@ where
                             break;
                         }
                     }
+                    None => return Ok(()),
+                },
+            }
+        }
+    }
+}
+
+/// Serve an `Attach` that names a CHANNEL SET on one stream
+/// (`AttachRequest::channel_set`). Why: the router subscribes per
+/// channel, so a subscriber of N rooms used to hold N sockets, N daemon
+/// tasks and N reader tasks — measured 2026-10-04 on a 15-subscriber
+/// continuum core: ~960 attach sockets to one daemon, growing with every
+/// room and citizen. Here the N router subscriptions (in-process mpsc
+/// receivers, cheap) are merged and written down ONE socket; the client
+/// routes each frame by the envelope's own `channel`.
+///
+/// Per room, independently: the start (`Live`, or resume after its own
+/// cursor), the last delivered cursor, and the router's lag flag. A
+/// lagged room re-resumes from ITS cursor; the other rooms are
+/// re-registered from theirs (`SelectAll` cannot drop one member, and a
+/// resume is gap-free, so the simple rebuild is correct — lag is the
+/// slow-client exception, not the hot path). Order within a room is the
+/// router's; across rooms none was ever promised (they were separate
+/// sockets before).
+///
+/// Not served on a set, refused before the ack: `coalesce_backlog` and
+/// `cursor_heartbeat` (their `AttachCursorAdvanced` frame names no
+/// channel yet), and an empty set. Loud, so a client never waits on a
+/// stream the daemon silently narrowed.
+async fn stream_attach_set<R, W>(
+    reader: R,
+    mut writer: W,
+    state: Arc<DaemonState>,
+    parts: airc_ipc::AttachParts,
+) -> Result<(), DaemonError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let refuse = |message: &str| Response::Error {
+        message: message.to_string(),
+    };
+    let Some(entries) = parts.channels else {
+        return write_response(&mut writer, &refuse("attach: no channel set")).await;
+    };
+    if entries.is_empty() {
+        return write_response(
+            &mut writer,
+            &refuse("attach: an empty channel set subscribes to nothing"),
+        )
+        .await;
+    }
+    if parts.coalesce_backlog || parts.cursor_heartbeat {
+        return write_response(
+            &mut writer,
+            &refuse("attach: coalesce_backlog and cursor_heartbeat are single-channel only (the cursor frame names no channel)"),
+        )
+        .await;
+    }
+    // Per-room start and cursor, deduplicated: a room named twice gets
+    // one subscription, the first entry's start.
+    let mut rooms: Vec<(airc_core::RoomId, Option<Cursor>)> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if rooms.iter().any(|(room, _)| *room == entry.channel) {
+            continue;
+        }
+        let from = match entry.start() {
+            AttachStart::After(c) => Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id)),
+            AttachStart::Live | AttachStart::FromTranscriptStart => None,
+        };
+        rooms.push((entry.channel, from));
+    }
+    let kinds: Option<Vec<Kind>> = parts
+        .kinds
+        .map(|k| k.into_iter().map(map_ipc_kind).collect());
+    let delivery: Option<Vec<DeliveryClass>> = parts
+        .delivery
+        .map(|d| d.into_iter().map(map_ipc_delivery).collect());
+    let headers = parts.headers;
+    let filter_for = |room: airc_core::RoomId| {
+        let mut filter = Filter::channel(room);
+        if let Some(kinds) = kinds.clone() {
+            filter = filter.with_kinds(kinds);
+        }
+        if let Some(delivery) = delivery.clone() {
+            filter = filter.with_delivery(delivery);
+        }
+        filter.with_headers(headers.clone())
+    };
+
+    // Register every room BEFORE the ack, the same subscribe-before-ack
+    // contract as the single channel: once the client sees `Ok`, no
+    // room has a gap between ack and registration.
+    let subscribe_all = |rooms: &[(airc_core::RoomId, Option<Cursor>)]| {
+        let mut merged = futures::stream::SelectAll::new();
+        let mut lags: Vec<(airc_core::RoomId, airc_bus::LagFlag)> = Vec::with_capacity(rooms.len());
+        for (room, from) in rooms {
+            let (stream, lag) = match from {
+                // No cursor is the live edge, never a ring replay: a room
+                // that has delivered nothing yet must not re-feed history.
+                None => {
+                    let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(*room));
+                    (stream.boxed(), lag)
+                }
+                Some(cursor) => {
+                    let (stream, lag) = state
+                        .router
+                        .subscribe_with_lag(filter_for(*room), Some(*cursor));
+                    (stream.boxed(), lag)
+                }
+            };
+            merged.push(stream);
+            lags.push((*room, lag));
+        }
+        (merged, lags)
+    };
+    let mut pending = Some(subscribe_all(&rooms));
+    write_response(&mut writer, &Response::Ok).await?;
+
+    let shutdown = state.shutdown.notified();
+    tokio::pin!(shutdown);
+    let hangup = client_hung_up(reader);
+    tokio::pin!(hangup);
+
+    loop {
+        let (merged, lags) = pending.take().unwrap_or_else(|| subscribe_all(&rooms));
+        tokio::pin!(merged);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => return Ok(()),
+                _ = &mut hangup => return Ok(()),
+                next = merged.next() => match next {
+                    Some(env) => {
+                        if let Some((_, from)) = rooms.iter_mut().find(|(room, _)| *room == env.channel) {
+                            *from = Some(env.cursor());
+                        }
+                        tokio::select! {
+                            _ = &mut shutdown => return Ok(()),
+                            _ = &mut hangup => return Ok(()),
+                            result = write_event_response(&mut writer, &env, &state.shared_frames) => result?,
+                        }
+                        // One room dropped a live push: rebuild from every
+                        // room's cursor (gap-free) rather than carry a hole.
+                        if lags.iter().any(|(_, lag)| lag.is_lagged()) {
+                            break;
+                        }
+                    }
+                    // Every router stream ended: the router is shutting down.
                     None => return Ok(()),
                 },
             }
@@ -1004,5 +1160,190 @@ mod shared_frame_cancellation_tests {
         .await
         .expect("cancelled attach must release admission state")
         .unwrap();
+    }
+
+    mod channel_set {
+        use super::*;
+        use airc_ipc::ChannelAttach;
+
+        async fn state() -> Arc<DaemonState> {
+            let home = tempfile::tempdir().unwrap();
+            let state = DaemonState::build(
+                PeerId::new(),
+                PeerKeypair::generate(),
+                Arc::new(PeerKeyRegistry::new()),
+                VerificationPolicy::Strict,
+                home.path().to_owned(),
+                &home.path().join("events.sqlite"),
+                Arc::new(InMemoryEventStore::new()),
+                crate::DaemonRuntimeInfo::unknown(),
+            )
+            .await
+            .unwrap();
+            // Keep the tempdir alive for the test by leaking it into the state's lifetime.
+            std::mem::forget(home);
+            Arc::new(state)
+        }
+
+        fn chat(channel: RoomId, text: &'static str) -> Envelope {
+            Envelope::new(
+                channel,
+                (PeerId::new(), ClientId::new()),
+                Kind::Message,
+                DeliveryClass::Durable,
+                bytes::Bytes::from_static(text.as_bytes()),
+            )
+        }
+
+        async fn next_event<C: AsyncReadExt + Unpin>(client: &mut C) -> Envelope {
+            match tokio::time::timeout(Duration::from_secs(2), read_frame::<_, Response>(client))
+                .await
+                .expect("an event frame within 2 s")
+                .unwrap()
+            {
+                Some(Response::Event { envelope }) => {
+                    airc_wire::decode(bytes::Bytes::from(envelope)).unwrap()
+                }
+                other => panic!("expected an Event frame, got {other:?}"),
+            }
+        }
+
+        // what this catches (2026-10-04, ~960 sockets on one daemon): a set attach
+        // serves N rooms on ONE stream, each frame carrying its own room so the
+        // client can route it, with the order inside a room preserved — the
+        // contract that lets airc-lib hold one socket per subscriber instead of
+        // one per room. Also: a resume cursor is honoured per room (B replays
+        // only what came after its cursor while A is live), and the client's
+        // hang-up ends the stream exactly as it does for a single channel.
+        #[tokio::test]
+        async fn a_channel_set_streams_every_room_on_one_socket_routed_by_room() {
+            let state = state().await;
+            let a = RoomId::new();
+            let b = RoomId::new();
+            // B has history: the attach resumes after its first line. The cursor
+            // is read the way a client gets it — off the delivered event — through
+            // a throwaway single-channel attach from the transcript start.
+            state.router.publish(chat(b, "b-old")).await.unwrap();
+            state
+                .router
+                .publish(chat(b, "b-after-cursor"))
+                .await
+                .unwrap();
+            let b_cursor = {
+                let (mut probe, daemon) = tokio::io::duplex(64 * 1024);
+                let (reader, writer) = tokio::io::split(daemon);
+                let task = tokio::spawn(stream_attach(
+                    reader,
+                    writer,
+                    state.clone(),
+                    AttachRequest::new(b, AttachStart::FromTranscriptStart),
+                ));
+                assert!(matches!(
+                    read_frame::<_, Response>(&mut probe).await.unwrap(),
+                    Some(Response::Ok)
+                ));
+                let first = next_event(&mut probe).await;
+                assert_eq!(&first.payload[..], b"b-old");
+                let c = first.cursor();
+                drop(probe);
+                task.await.unwrap().unwrap();
+                airc_ipc::IpcCursor {
+                    epoch: c.seq.epoch,
+                    counter: c.seq.counter,
+                    event_id: c.event_id,
+                }
+            };
+            let (mut client, daemon) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(vec![
+                ChannelAttach {
+                    channel: a,
+                    from: None,
+                },
+                ChannelAttach {
+                    channel: b,
+                    from: Some(b_cursor),
+                },
+            ]);
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+
+            // B's resume replays the one line after its cursor, nothing older.
+            let replayed = next_event(&mut client).await;
+            assert_eq!(replayed.channel, b);
+            assert_eq!(&replayed.payload[..], b"b-after-cursor");
+
+            for (room, text) in [(a, "a-1"), (b, "b-1"), (a, "a-2")] {
+                state.router.publish(chat(room, text)).await.unwrap();
+            }
+            let mut per_room: std::collections::HashMap<RoomId, Vec<Vec<u8>>> = Default::default();
+            for _ in 0..3 {
+                let env = next_event(&mut client).await;
+                per_room
+                    .entry(env.channel)
+                    .or_default()
+                    .push(env.payload.to_vec());
+            }
+            assert_eq!(
+                per_room[&a],
+                vec![b"a-1".to_vec(), b"a-2".to_vec()],
+                "A's order is kept"
+            );
+            assert_eq!(per_room[&b], vec![b"b-1".to_vec()]);
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("client hang-up ends the set stream")
+                .unwrap()
+                .unwrap();
+        }
+
+        // what this catches: the shapes a set does not serve are refused BEFORE
+        // the ack, loudly, so a client never waits on a silently narrowed
+        // stream: an empty set, and the single-channel-only backlog/heartbeat
+        // frames (their cursor frame names no channel yet).
+        #[tokio::test]
+        async fn a_set_refuses_before_the_ack_what_it_does_not_serve() {
+            let state = state().await;
+            let room = RoomId::new();
+            let shapes = [
+                AttachRequest::channel_set(vec![]),
+                AttachRequest::channel_set(vec![ChannelAttach {
+                    channel: room,
+                    from: None,
+                }])
+                .with_coalesced_backlog(),
+                AttachRequest::channel_set(vec![ChannelAttach {
+                    channel: room,
+                    from: None,
+                }])
+                .with_cursor_heartbeat(),
+            ];
+            for request in shapes {
+                let (mut client, daemon) = tokio::io::duplex(4096);
+                let (reader, writer) = tokio::io::split(daemon);
+                let task = tokio::spawn(stream_attach(
+                    reader,
+                    writer,
+                    state.clone(),
+                    request.clone(),
+                ));
+                match read_frame::<_, Response>(&mut client).await.unwrap() {
+                    Some(Response::Error { message }) => {
+                        assert!(message.starts_with("attach:"), "{message}")
+                    }
+                    other => panic!("{request:?} must be refused, got {other:?}"),
+                }
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+        }
     }
 }

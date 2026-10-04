@@ -4193,6 +4193,7 @@ mod tests {
             executable: Some("/tmp/airc".to_string()),
             connected_lan_peers: 0,
             connections: None,
+            attach_channel_sets: false,
         }
     }
 

@@ -21,8 +21,8 @@ use airc_core::{
 };
 use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
-    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
-    PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
+    AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind,
+    IpcTarget, PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -573,6 +573,23 @@ impl Airc {
             .clone()
             .ok_or_else(|| AircError::Route("daemon client is not attached".to_string()))?;
         let (tx, rx) = mpsc::channel::<Arc<TranscriptEvent>>(1024);
+        // ONE socket for the whole set when the daemon serves channel sets
+        // (`StatusResponse::attach_channel_sets`, the typed capability): a
+        // 15-subscriber core held ~960 per-channel attach sockets to its
+        // daemon (2026-10-04) because every subscriber paid one socket, one
+        // daemon task and one reader task per ROOM. A daemon predating the
+        // field reports `false` and gets the per-channel shape below,
+        // unchanged — no error text is ever interpreted to decide this.
+        let daemon_serves_sets = client
+            .status()
+            .await
+            .map_err(|e| AircError::Route(format!("daemon status: {e}")))?
+            .attach_channel_sets;
+        if daemon_serves_sets && channels.len() > 1 {
+            let handle =
+                Self::daemon_subscribe_set(client, channels, delivery, headers, tx).await?;
+            return Ok(EventStream::daemon(rx, vec![handle]));
+        }
         let mut handles = Vec::with_capacity(channels.len());
         for channel in channels {
             // Initial attach + ack — fail fast so `subscribe()` errors if
@@ -750,6 +767,128 @@ impl Airc {
             }));
         }
         Ok(EventStream::daemon(rx, handles))
+    }
+}
+
+impl Airc {
+    /// The channel-set half of [`Self::daemon_subscribe`]: one attach for
+    /// every room, one reader task, a resume cursor PER ROOM. A reconnect
+    /// re-attaches the whole set with each room's own cursor (`Live` for a
+    /// room that has delivered nothing yet), so every room's durable gap
+    /// is replayed and no room re-feeds history. Same decode, drop and
+    /// backoff discipline as the per-channel reader (card 807193ab).
+    async fn daemon_subscribe_set(
+        client: Arc<airc_ipc::DaemonClient>,
+        channels: Vec<RoomId>,
+        delivery: Option<Vec<IpcDelivery>>,
+        headers: airc_core::HeaderFilter,
+        tx: mpsc::Sender<Arc<TranscriptEvent>>,
+    ) -> Result<tokio::task::JoinHandle<()>, AircError> {
+        let request_for = {
+            let channels = channels.clone();
+            let delivery = delivery.clone();
+            let headers = headers.clone();
+            move |cursors: &std::collections::HashMap<RoomId, IpcCursor>| {
+                let mut request = AttachRequest::channel_set(
+                    channels
+                        .iter()
+                        .map(|channel| ChannelAttach {
+                            channel: *channel,
+                            from: cursors.get(channel).copied(),
+                        })
+                        .collect(),
+                );
+                if let Some(classes) = delivery.clone() {
+                    request = request.with_delivery(classes);
+                }
+                request.with_headers(headers.clone())
+            }
+        };
+        let mut cursors: std::collections::HashMap<RoomId, IpcCursor> = Default::default();
+        let mut stream = client
+            .attach(request_for(&cursors))
+            .await
+            .map_err(|e| AircError::Route(format!("daemon attach (set): {e}")))?;
+        match read_response_frame(&mut stream).await {
+            Ok(Some(Response::Ok)) => {}
+            Ok(Some(Response::Error { message })) => {
+                return Err(AircError::Route(format!("daemon attach (set): {message}")))
+            }
+            Ok(Some(_)) | Ok(None) => {
+                return Err(AircError::Route("daemon attach (set): no ack".to_string()))
+            }
+            Err(e) => return Err(AircError::Route(format!("daemon attach (set) ack: {e}"))),
+        }
+        let rooms = channels.len();
+        Ok(tokio::spawn(async move {
+            let mut backoff_ms = RECONNECT_BACKOFF_START_MS;
+            loop {
+                loop {
+                    match read_response_frame(&mut stream).await {
+                        Ok(Some(Response::Event { envelope })) => match decode_wire_event(envelope)
+                        {
+                            Ok(event) => {
+                                cursors.insert(event.room_id, cursor_after(&event));
+                                if tx.send(Arc::new(event)).await.is_err() {
+                                    return; // consumer gone
+                                }
+                                backoff_ms = RECONNECT_BACKOFF_START_MS;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    rooms,
+                                    error = %error,
+                                    "airc subscribe (set): dropping subscription — decode_wire_event failed"
+                                );
+                                return;
+                            }
+                        },
+                        Ok(Some(Response::AttachCursorAdvanced { .. })) => {}
+                        Ok(Some(other)) => {
+                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): ignoring non-Event frame");
+                        }
+                        Ok(None) | Err(_) => {
+                            tracing::warn!(
+                                rooms,
+                                "airc subscribe (set): stream closed — reconnecting"
+                            );
+                            break;
+                        }
+                    }
+                }
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
+                    if tx.is_closed() {
+                        return; // consumer dropped while we were down
+                    }
+                    let mut s = match client.attach(request_for(&cursors)).await {
+                        Ok(s) => s,
+                        Err(error) => {
+                            tracing::warn!(rooms, backoff_ms, error = %error, "airc subscribe (set): reattach failed");
+                            continue;
+                        }
+                    };
+                    match read_response_frame(&mut s).await {
+                        Ok(Some(Response::Ok)) => {
+                            stream = s;
+                            backoff_ms = RECONNECT_BACKOFF_START_MS;
+                            break;
+                        }
+                        Ok(Some(other)) => {
+                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): reattach ack mismatch — expected Ok");
+                        }
+                        Ok(None) | Err(_) => {
+                            tracing::warn!(
+                                rooms,
+                                backoff_ms,
+                                "airc subscribe (set): reattach ack read failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }))
     }
 }
 

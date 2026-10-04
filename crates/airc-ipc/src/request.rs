@@ -316,9 +316,70 @@ pub struct AttachRequest {
     /// all; consumers scope by their `forge.*` projection headers.
     #[serde(default)]
     headers: HeaderFilter,
+    /// A CHANNEL SET served on this one stream, each room with its own
+    /// resume point. The daemon fans the set out router-side and routes
+    /// every `Event` frame by the envelope's own `channel`, so one
+    /// subscriber holds ONE socket for all its rooms instead of one per
+    /// room (measured 2026-10-04: a 15-subscriber core held ~960 attach
+    /// sockets to its daemon). Wire-compat: omitted when unset, so an
+    /// older daemon ignores it and rejects the channel-less request as
+    /// it always did; a client picks this shape only when the daemon's
+    /// status reports `attach_channel_sets`. When set, `channel` /
+    /// `from` / `from_now` are not consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channels: Option<Vec<ChannelAttach>>,
+}
+
+/// One room of a channel-set attach: the room and where its stream
+/// starts. `from: None` is the live edge; `Some` resumes strictly after
+/// that cursor, replaying the durable gap exactly as a single-channel
+/// [`AttachStart::After`] does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelAttach {
+    pub channel: airc_core::RoomId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<IpcCursor>,
+}
+
+impl ChannelAttach {
+    /// The typed start this entry encodes. A set entry has no
+    /// `from_now` flag: no cursor IS the live edge, never the transcript
+    /// start — a set exists for live subscribers that track their own
+    /// cursors, and a full-history replay of N rooms on one socket is
+    /// not a shape anyone asked for.
+    pub fn start(&self) -> AttachStart {
+        match self.from {
+            Some(cursor) => AttachStart::After(cursor),
+            None => AttachStart::Live,
+        }
+    }
 }
 
 impl AttachRequest {
+    /// Attach to a CHANNEL SET on one stream. Each entry carries its
+    /// own start; filters apply to every room in the set. An empty set
+    /// is rejected by the daemon. See [`Self::channels`] for the
+    /// version contract.
+    pub fn channel_set(channels: Vec<ChannelAttach>) -> Self {
+        Self {
+            channel: None,
+            from: None,
+            from_now: false,
+            coalesce_backlog: false,
+            backlog_tail: None,
+            cursor_heartbeat: false,
+            kinds: None,
+            delivery: None,
+            headers: HeaderFilter::default(),
+            channels: Some(channels),
+        }
+    }
+
+    /// The channel set this request attaches to, if it is a set attach.
+    pub fn channels(&self) -> Option<&[ChannelAttach]> {
+        self.channels.as_deref()
+    }
+
     /// Attach to `channel`, starting at `start`. No filters: every
     /// event class on the channel is delivered. Narrow with the
     /// `with_*` builders.
@@ -338,6 +399,7 @@ impl AttachRequest {
             kinds: None,
             delivery: None,
             headers: HeaderFilter::default(),
+            channels: None,
         }
     }
 
@@ -437,6 +499,7 @@ impl AttachRequest {
             kinds: self.kinds,
             delivery: self.delivery,
             headers: self.headers,
+            channels: self.channels,
         }
     }
 }
@@ -453,6 +516,9 @@ pub struct AttachParts {
     pub kinds: Option<Vec<IpcKind>>,
     pub delivery: Option<Vec<IpcDelivery>>,
     pub headers: HeaderFilter,
+    /// See [`AttachRequest::channel_set`]. `Some` makes this a set
+    /// attach; `channel` / `start` are then not consulted.
+    pub channels: Option<Vec<ChannelAttach>>,
 }
 
 #[inline]
@@ -625,6 +691,47 @@ mod tests {
         );
         let decoded: AttachRequest = serde_json::from_str(&skewed).unwrap();
         assert_eq!(decoded.start(), AttachStart::Live);
+    }
+
+    // what this catches: the channel-set attach's wire contract. (a) The
+    // set and each room's own cursor survive the round-trip. (b) A
+    // single-channel request still omits `channels` entirely, so an older
+    // daemon that knows nothing of sets sees byte-identical requests from
+    // a newer client that chose the legacy shape. (c) A set entry with no
+    // cursor starts LIVE, never at the transcript start — N rooms of full
+    // history on one socket is not a shape a subscriber ever asked for.
+    #[test]
+    fn a_channel_set_attach_carries_each_rooms_own_cursor_and_hides_from_old_daemons() {
+        let a = airc_core::RoomId(Uuid::from_u128(1));
+        let b = airc_core::RoomId(Uuid::from_u128(2));
+        let request = AttachRequest::channel_set(vec![
+            ChannelAttach {
+                channel: a,
+                from: None,
+            },
+            ChannelAttach {
+                channel: b,
+                from: Some(cursor(9)),
+            },
+        ]);
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: AttachRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let set = decoded.channels().expect("a set attach");
+        assert_eq!(set[0].start(), AttachStart::Live);
+        assert_eq!(set[1].start(), AttachStart::After(cursor(9)));
+        assert!(
+            decoded.channel().is_none(),
+            "a set attach names no single channel"
+        );
+        let parts = decoded.into_parts();
+        assert_eq!(parts.channels.as_ref().map(Vec::len), Some(2));
+
+        let single = serde_json::to_string(&AttachRequest::live(a)).unwrap();
+        assert!(
+            !single.contains("channels"),
+            "legacy shape must not mention the set: {single}"
+        );
     }
 
     /// Card c0cb6cdc: the dangerous start must be named — the safe
