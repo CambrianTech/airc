@@ -65,6 +65,13 @@ pub enum DiagnosticCode {
     /// orphan path). Carries the count, not the dump.
     AccountRegistryStaleBeaconsPruned,
     WireLostEmitFailed,
+    /// airc #1523 follow-up: a room of a channel-set attach dropped a live
+    /// push (the client fell behind) and was re-subscribed from its own
+    /// resume point. One event per re-subscription with the room, how
+    /// many times this stream has re-subscribed it, and the pacing delay
+    /// applied, so a slow client that keeps lagging reads as a churn in
+    /// the log instead of as unexplained daemon CPU.
+    AttachSetRoomLagged,
     MalformedReplayFrameSkipped,
     UnverifiableReplayFrameSkipped,
     ReplayFramesSkipped,

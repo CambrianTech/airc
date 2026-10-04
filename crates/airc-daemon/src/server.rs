@@ -753,6 +753,118 @@ where
     }
 }
 
+/// A room of a channel-set attach that lags again within this window of its
+/// last lag re-subscription is a slow client, not a transient: its resume
+/// replay (up to a sink page of 1024 events) overflowed the same 1024-slot
+/// buffer again. Re-subscribing in a tight loop is a deep replay per lag.
+const LAG_RESUBSCRIBE_QUIET: Duration = Duration::from_secs(2);
+/// Pacing for such a room: starts here, doubles per quick re-lag, caps below.
+const LAG_RESUBSCRIBE_BACKOFF_START: Duration = Duration::from_millis(250);
+const LAG_RESUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// PURE: how long a lagged room waits before its next re-subscription. Zero
+/// unless it lagged again within [`LAG_RESUBSCRIBE_QUIET`] of its last one;
+/// then a backoff that doubles with each quick re-lag, capped.
+fn lag_resubscribe_delay(lagged: u32, since_last: Option<Duration>) -> Duration {
+    match since_last {
+        Some(since) if since < LAG_RESUBSCRIBE_QUIET => {
+            let step = LAG_RESUBSCRIBE_BACKOFF_START * 2u32.saturating_pow(lagged.min(6));
+            step.min(LAG_RESUBSCRIBE_BACKOFF_MAX)
+        }
+        _ => Duration::ZERO,
+    }
+}
+
+/// One room of the set: where a re-subscription resumes, the router's
+/// lag flag for its current stream, and the pacing state for lag
+/// re-subscriptions.
+struct RoomSub {
+    resume: Option<Cursor>,
+    lag: airc_bus::LagFlag,
+    /// How many times this stream re-subscribed the room for lag.
+    lagged: u32,
+    /// When the room was last re-subscribed for lag.
+    last_resubscribe: Option<Instant>,
+    /// Not before this instant: a room that lags again right after a
+    /// re-subscription (its resume replay overflowed the same slow
+    /// client) waits, with capped backoff, instead of replaying in a
+    /// tight loop. Siblings and the client's own reads are unaffected.
+    not_before: Option<Instant>,
+}
+/// Re-subscribe every room that dropped a live push, from its own resume
+/// point, pacing a room that lags again right after its last resume.
+fn resubscribe_lagged(
+    state: &DaemonState,
+    filter_for: &dyn Fn(airc_core::RoomId) -> Filter,
+    subs: &mut std::collections::HashMap<airc_core::RoomId, RoomSub>,
+    merged: &mut tokio_stream::StreamMap<
+        airc_core::RoomId,
+        futures::stream::BoxStream<'static, Arc<Envelope>>,
+    >,
+) {
+    // Only a room that dropped a live push is re-subscribed,
+    // from its own resume point; its siblings keep their
+    // streams and everything queued on them. A room that lags
+    // again within LAG_RESUBSCRIBE_QUIET of its last
+    // re-subscription is paced: the resume replay would just
+    // overflow the same slow client again, and an unpaced loop
+    // is a deep replay from the sink per lag.
+    let now = Instant::now();
+    for (room, sub) in subs.iter_mut() {
+        if !sub.lag.is_lagged() {
+            continue;
+        }
+        if sub.not_before.is_some_and(|t| now < t) {
+            continue;
+        }
+        let delay = lag_resubscribe_delay(
+            sub.lagged,
+            sub.last_resubscribe.map(|t| now.duration_since(t)),
+        );
+        if !delay.is_zero() && sub.not_before.is_none() {
+            // First sight of a quick re-lag: arm the pause and say so;
+            // the re-subscription happens when the pause has passed.
+            // The stale stream is REMOVED now, not left polled: the
+            // router flags a lagged subscriber but does not fence it, so
+            // a push after the dropped one can still land, and a resume
+            // point advanced past the gap would omit the dropped event
+            // forever (Astra's review of #1524). Dropping the stream
+            // unsubscribes it; the room is silent until the paced
+            // re-subscription replays from the frozen resume point.
+            merged.remove(room);
+            sub.not_before = Some(now + delay);
+            StderrJsonDiagnosticSink.emit(
+                DiagnosticEvent::warn(
+                    DiagnosticComponent::Daemon,
+                    DiagnosticCode::AttachSetRoomLagged,
+                    "channel-set room lagged again right after its resume; pacing the next re-subscription",
+                )
+                .with_field("room", room.to_string())
+                .with_field("lagged", sub.lagged)
+                .with_field("delay_ms", delay.as_millis() as u64),
+            );
+            continue;
+        }
+        let (stream, lag) = state
+            .router
+            .subscribe_with_lag(filter_for(*room), sub.resume);
+        merged.insert(*room, stream.boxed());
+        sub.lag = lag;
+        sub.lagged = sub.lagged.saturating_add(1);
+        sub.last_resubscribe = Some(now);
+        sub.not_before = None;
+        StderrJsonDiagnosticSink.emit(
+            DiagnosticEvent::warn(
+                DiagnosticComponent::Daemon,
+                DiagnosticCode::AttachSetRoomLagged,
+                "channel-set room dropped a live push; re-subscribed from its resume point",
+            )
+            .with_field("room", room.to_string())
+            .with_field("lagged", sub.lagged),
+        );
+    }
+}
+
 /// Serve an `Attach` that names a CHANNEL SET on one stream
 /// (`AttachRequest::channel_set`). Why: the router subscribes per
 /// channel, so a subscriber of N rooms used to hold N sockets, N daemon
@@ -827,12 +939,6 @@ where
         filter.with_headers(headers.clone())
     };
 
-    /// One room of the set: where a re-subscription resumes, and the
-    /// router's lag flag for its current stream.
-    struct RoomSub {
-        resume: Option<Cursor>,
-        lag: airc_bus::LagFlag,
-    }
     // Register every room BEFORE the ack — the same subscribe-before-ack
     // contract as the single channel: once the client sees `Ok`, no
     // room has a gap between ack and registration. A room named twice
@@ -873,7 +979,16 @@ where
             }
         };
         merged.insert(room, stream);
-        subs.insert(room, RoomSub { resume, lag });
+        subs.insert(
+            room,
+            RoomSub {
+                resume,
+                lag,
+                lagged: 0,
+                last_resubscribe: None,
+                not_before: None,
+            },
+        );
     }
     write_response(&mut writer, &Response::Ok).await?;
 
@@ -883,11 +998,30 @@ where
     tokio::pin!(hangup);
 
     loop {
+        // A paced room's pause ends on a timer, not only on the next event:
+        // a quiet set must not wait for unrelated traffic to catch a room up.
+        let pause_ends = subs.values().filter_map(|s| s.not_before).min();
+        let pause = async {
+            match pause_ends {
+                Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             biased;
             _ = &mut shutdown => return Ok(()),
             _ = &mut hangup => return Ok(()),
-            next = merged.next() => match next {
+            _ = pause => {
+                resubscribe_lagged(&state, &filter_for, &mut subs, &mut merged);
+            }
+            // An EMPTY map (every room paused) yields `None` at once; that is
+            // "nothing to poll until the pause ends", not the router ending.
+            next = async {
+                if merged.is_empty() {
+                    std::future::pending::<()>().await;
+                }
+                merged.next().await
+            } => match next {
                 Some((room, env)) => {
                     if let Some(sub) = subs.get_mut(&room) {
                         sub.resume = Some(env.cursor());
@@ -897,19 +1031,7 @@ where
                         _ = &mut hangup => return Ok(()),
                         result = write_event_response(&mut writer, &env, &state.shared_frames) => result?,
                     }
-                    // Only a room that dropped a live push is re-subscribed,
-                    // from its own resume point; its siblings keep their
-                    // streams and everything queued on them.
-                    for (room, sub) in subs.iter_mut() {
-                        if !sub.lag.is_lagged() {
-                            continue;
-                        }
-                        let (stream, lag) = state
-                            .router
-                            .subscribe_with_lag(filter_for(*room), sub.resume);
-                        merged.insert(*room, stream.boxed());
-                        sub.lag = lag;
-                    }
+                    resubscribe_lagged(&state, &filter_for, &mut subs, &mut merged);
                 }
                 // Every router stream ended: the router is shutting down.
                 None => return Ok(()),
@@ -1559,6 +1681,201 @@ mod shared_frame_cancellation_tests {
                 .unwrap()
                 .unwrap()
                 .unwrap();
+        }
+
+        // what this catches (IntelMac 2026-10-04, mixed-state daemon at ~2 cores):
+        // a slow set consumer that lags again right after its resume replay must
+        // not be re-subscribed in a tight loop (each re-subscription is a deep
+        // replay from the sink). The first lag, and any lag after a quiet
+        // window, resumes at once; a quick re-lag waits, doubling per re-lag,
+        // capped.
+        #[test]
+        fn a_quick_re_lag_is_paced_and_a_quiet_one_is_not() {
+            assert_eq!(
+                lag_resubscribe_delay(0, None),
+                Duration::ZERO,
+                "first lag: resume now"
+            );
+            assert_eq!(
+                lag_resubscribe_delay(3, Some(Duration::from_secs(30))),
+                Duration::ZERO,
+                "a lag after a quiet window resumes now"
+            );
+            assert_eq!(
+                lag_resubscribe_delay(0, Some(Duration::from_millis(100))),
+                Duration::from_millis(250)
+            );
+            assert_eq!(
+                lag_resubscribe_delay(1, Some(Duration::from_millis(100))),
+                Duration::from_millis(500)
+            );
+            assert_eq!(
+                lag_resubscribe_delay(3, Some(Duration::from_millis(100))),
+                Duration::from_secs(2)
+            );
+            assert_eq!(
+                lag_resubscribe_delay(40, Some(Duration::from_millis(100))),
+                LAG_RESUBSCRIBE_BACKOFF_MAX,
+                "capped, and no overflow at a high count"
+            );
+        }
+
+        // what this catches (Astra's review of #1524): the router flags a lagged
+        // subscriber but does not fence it, so while a paced room waits, its
+        // stale stream can still deliver a push from AFTER the dropped one; a
+        // resume point advanced past the gap then omits the dropped line for
+        // good. The paced room's stream is removed when the pause is armed and
+        // its resume point frozen. Here: the writer is held, A overflows, its
+        // immediate resume replay overflows again (a quick re-lag, so a pause),
+        // more lines land during the pause, then the client drains everything:
+        // every line published arrives exactly once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_paced_room_replays_the_gap_it_dropped_and_never_skips_it() {
+            let state = state().await;
+            let a = RoomId::new();
+            let (mut client, daemon) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(vec![ChannelAttach {
+                channel: a,
+                from: None,
+            }]);
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+            // Three buffers' worth while the writer is held: the first lag's
+            // resume replay overflows again, which is the quick re-lag.
+            let total = 3200usize;
+            for i in 0..total {
+                let text: &'static str = Box::leak(format!("a-{i:05}").into_boxed_str());
+                publish_durable(&state, chat(a, text)).await;
+            }
+            // Let the write-behind land every line so a deep replay can find them.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let tip = state.router.sink_head_cursor(a).await;
+                let ring = state.router.head_cursor(a);
+                if tip.is_some() && tip == ring {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the sink never caught up"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // The client drains; the daemon lags, resumes, re-lags, pauses, resumes.
+            let mut seen: Vec<String> = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while seen.len() < total && std::time::Instant::now() < deadline {
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    read_frame::<_, Response>(&mut client),
+                )
+                .await
+                {
+                    Ok(Ok(Some(Response::Event { envelope }))) => {
+                        let env = airc_wire::decode(bytes::Bytes::from(envelope)).unwrap();
+                        seen.push(String::from_utf8(env.payload.to_vec()).unwrap());
+                    }
+                    Ok(Ok(Some(_))) => {}
+                    other => panic!("stream ended early after {} lines: {other:?}", seen.len()),
+                }
+            }
+            let mut dedup = seen.clone();
+            dedup.sort();
+            dedup.dedup();
+            assert_eq!(dedup.len(), seen.len(), "a line was delivered twice");
+            assert_eq!(
+                seen.len(),
+                total,
+                "a dropped line was never replayed (a gap)"
+            );
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        // what this catches (Astra's review of #1524, the fence itself): when a
+        // pause is armed for a quick re-lag, the room's stale stream must be OUT
+        // of the merge and its resume point frozen. The router flags a lagged
+        // subscriber but does not fence it, so a stream left in the map could
+        // deliver a push from after the gap and advance the resume point past
+        // the dropped line. Pinned at the function, because the timing of a
+        // live reproduction is a race no test should depend on.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_a_pause_removes_the_rooms_stream_and_freezes_its_resume_point() {
+            let state = state().await;
+            let room = RoomId::new();
+            let filter_for = |room: RoomId| Filter::channel(room);
+            // A subscription nobody polls: 1100 pushes overflow its 1024 slots,
+            // which sets its lag flag the way a slow client does.
+            let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
+            let mut merged: tokio_stream::StreamMap<
+                RoomId,
+                futures::stream::BoxStream<'static, Arc<Envelope>>,
+            > = tokio_stream::StreamMap::new();
+            merged.insert(room, stream.boxed());
+            for i in 0..1100 {
+                let text: &'static str = Box::leak(format!("p-{i:04}").into_boxed_str());
+                publish_durable(&state, chat(room, text)).await;
+            }
+            assert!(
+                lag.is_lagged(),
+                "the unpolled subscription must have lagged"
+            );
+            let frozen = state.router.head_cursor(room);
+            let mut subs = std::collections::HashMap::new();
+            subs.insert(
+                room,
+                RoomSub {
+                    resume: frozen,
+                    lag,
+                    lagged: 1,
+                    last_resubscribe: Some(Instant::now()), // a quick re-lag
+                    not_before: None,
+                },
+            );
+            resubscribe_lagged(&state, &filter_for, &mut subs, &mut merged);
+            let sub = &subs[&room];
+            assert!(sub.not_before.is_some(), "a quick re-lag arms a pause");
+            assert!(
+                !merged.contains_key(&room),
+                "the stale stream is fenced out of the merge"
+            );
+            assert_eq!(
+                sub.resume, frozen,
+                "the resume point is frozen through the pause"
+            );
+            assert_eq!(sub.lagged, 1, "no re-subscription happened yet");
+
+            // A lag after a quiet window is not paced: it re-subscribes at once.
+            let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
+            merged.insert(room, stream.boxed());
+            for i in 0..1100 {
+                let text: &'static str = Box::leak(format!("q-{i:04}").into_boxed_str());
+                publish_durable(&state, chat(room, text)).await;
+            }
+            assert!(lag.is_lagged());
+            subs.insert(
+                room,
+                RoomSub {
+                    resume: frozen,
+                    lag,
+                    lagged: 1,
+                    last_resubscribe: Some(Instant::now() - Duration::from_secs(30)),
+                    not_before: None,
+                },
+            );
+            resubscribe_lagged(&state, &filter_for, &mut subs, &mut merged);
+            let sub = &subs[&room];
+            assert!(sub.not_before.is_none());
+            assert!(merged.contains_key(&room), "re-subscribed in place");
+            assert_eq!(sub.lagged, 2);
         }
 
         // what this catches: the shapes a set does not serve are refused BEFORE
