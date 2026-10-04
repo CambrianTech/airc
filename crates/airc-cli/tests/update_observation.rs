@@ -297,6 +297,7 @@ fn ipc_owner_fixture() {
                             executable: None,
                             connected_lan_peers: 0,
                             connections: None,
+                            attach_channel_sets: false,
                         }),
                         Request::Stop if mode == "stale" => {
                             let _ = write_frame(&mut stream, &Response::Ok).await;

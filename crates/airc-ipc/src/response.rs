@@ -147,6 +147,20 @@ pub struct StatusResponse {
     /// flat count is a daemon keeping dead streams (card e28889cc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<usize>,
+    /// Whether this daemon serves an `Attach` that names a CHANNEL SET
+    /// ([`crate::request::AttachRequest::channels`]) on one stream. The
+    /// typed capability a client reads to choose the attach shape, so a
+    /// newer airc-lib against an older daemon never has to recognise a
+    /// rejection by its message text. `#[serde(default)]`: a daemon
+    /// predating the field decodes as `false`, and the client attaches
+    /// per channel as it always did.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub attach_channel_sets: bool,
+}
+
+#[inline]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One entry in the `Peers` response. Mirrors `peers_store::StoredPeer`
@@ -392,6 +406,7 @@ mod tests {
             peer_id: "07e7ad58-ba56-4535-b4e5-a161a110e487".to_string(),
             uptime_seconds: 42,
             ipc_protocol_version: Some(3),
+            attach_channel_sets: false,
             build_commit: Some("abc123".to_string()),
             build_branch: Some("rust-rewrite".to_string()),
             executable: Some("/tmp/airc".to_string()),
@@ -420,6 +435,7 @@ mod tests {
                 executable: None,
                 connected_lan_peers: 0,
                 connections: None,
+                attach_channel_sets: false,
             })
         );
     }

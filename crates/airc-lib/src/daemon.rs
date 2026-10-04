@@ -21,8 +21,8 @@ use airc_core::{
 };
 use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
-    AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
-    PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
+    AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind,
+    IpcTarget, PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -573,183 +573,442 @@ impl Airc {
             .clone()
             .ok_or_else(|| AircError::Route("daemon client is not attached".to_string()))?;
         let (tx, rx) = mpsc::channel::<Arc<TranscriptEvent>>(1024);
+        // ONE socket for the whole set when the daemon serves channel sets
+        // (`StatusResponse::attach_channel_sets`, the typed capability): a
+        // 15-subscriber core held ~960 per-channel attach sockets to its
+        // daemon (2026-10-04) because every subscriber paid one socket, one
+        // daemon task and one reader task per ROOM. A daemon predating the
+        // field reports `false` and gets the per-channel shape below,
+        // unchanged — no error text is ever interpreted to decide this.
+        let daemon_serves_sets = client
+            .status()
+            .await
+            .map_err(|e| AircError::Route(format!("daemon status: {e}")))?
+            .attach_channel_sets;
+        if daemon_serves_sets && channels.len() > 1 {
+            let handle =
+                Self::daemon_subscribe_set(client, channels, delivery, headers, tx).await?;
+            return Ok(EventStream::daemon(rx, vec![handle]));
+        }
         let mut handles = Vec::with_capacity(channels.len());
         for channel in channels {
-            // Initial attach + ack — fail fast so `subscribe()` errors if
-            // the daemon is down right now (don't silently spin).
-            //
-            // Card bf0b5790: this is the LIVE subscribe surface, so the
-            // stream starts at the live edge. Catch-up is a separate,
-            // bounded concern (`resume_from_subscribed_filtered` with a
-            // stored cursor — see `join_feed`).
-            let mut request = AttachRequest::live(channel);
-            if let Some(classes) = delivery.clone() {
-                request = request.with_delivery(classes);
-            }
-            request = request.with_headers(headers.clone());
-            let mut stream = client
-                .attach(request)
-                .await
-                .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
-            match read_response_frame(&mut stream).await {
-                Ok(Some(Response::Ok)) => {}
-                Ok(Some(Response::Error { message })) => {
-                    return Err(AircError::Route(format!("daemon attach: {message}")))
-                }
-                Ok(Some(_)) | Ok(None) => {
-                    return Err(AircError::Route("daemon attach: no ack".to_string()))
-                }
-                Err(e) => return Err(AircError::Route(format!("daemon attach ack: {e}"))),
-            }
-            let tx = tx.clone();
-            let client = client.clone();
-            // Per-task copy of the delivery + header filters: each
-            // channel's reader task re-applies them on every reconnect
-            // (see below), and the loop must keep its own copy for the
-            // remaining channels.
-            let delivery = delivery.clone();
-            let headers = headers.clone();
-            handles.push(tokio::spawn(async move {
-                // Drain the live stream; when it drops (daemon restart /
-                // transient loss) re-attach and RESUME strictly after the
-                // last delivered cursor. Durable events in the gap are
-                // replayed; ephemeral classes are lossy and correctly
-                // skipped. The `DaemonAttachGuard` aborts this task when
-                // the consumer drops the `EventStream`, so it only runs
-                // while the subscription is wanted.
-                let mut from: Option<IpcCursor> = None;
-                let mut backoff_ms = RECONNECT_BACKOFF_START_MS;
-                loop {
-                    loop {
-                        match read_response_frame(&mut stream).await {
-                            Ok(Some(Response::Event { envelope })) => {
-                                match decode_wire_event(envelope) {
-                                    Ok(event) => {
-                                        from = Some(cursor_after(&event));
-                                        if tx.send(Arc::new(event)).await.is_err() {
-                                            return; // consumer gone
-                                        }
-                                        backoff_ms = RECONNECT_BACKOFF_START_MS;
-                                    }
-                                    Err(error) => {
-                                        // Card 807193ab: a silent return here
-                                        // killed the subscription with no
-                                        // diagnostic — the consumer's mpsc
-                                        // would close and `next().await` just
-                                        // yielded None. Now operators see
-                                        // WHY the substrate dropped the
-                                        // subscription (wire schema drift,
-                                        // encoding bug, anything that breaks
-                                        // decode).
-                                        tracing::warn!(
-                                            channel = %channel,
-                                            error = %error,
-                                            "airc subscribe: dropping subscription — decode_wire_event failed"
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                            Ok(Some(Response::AttachCursorAdvanced { .. })) => {
-                                // The daemon's CURSOR HEARTBEAT (server.rs, continuum #261): one per
-                                // second per subscription after events, so a cursor-persisting
-                                // consumer advances. This reader does not persist cursors; the frame
-                                // is bookkeeping, not an event. It used to fall through to the warn
-                                // below — 3,100 lines/min on a 16-citizen core, rotating the log
-                                // every 15 minutes (2026-09-14, airc #1411).
-                            }
-                            Ok(Some(other)) => {
-                                // Non-Event frames on a live subscription
-                                // are unexpected (ack already consumed); a
-                                // recurring stream of these indicates the
-                                // daemon is sending shapes the SDK doesn't
-                                // recognise.
-                                tracing::warn!(
-                                    channel = %channel,
-                                    frame = ?other,
-                                    "airc subscribe: ignoring non-Event frame"
-                                );
-                            }
-                            Ok(None) | Err(_) => {
-                                // Card 807193ab: surface stream drops so a
-                                // session of "no events" can be told apart
-                                // from "connection died, reconnecting."
-                                tracing::warn!(
-                                    channel = %channel,
-                                    "airc subscribe: stream closed — reconnecting"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    // Reconnect with resume + capped backoff.
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
-                        if tx.is_closed() {
-                            return; // consumer dropped while we were down
-                        }
-                        // Card bf0b5790: a drop BEFORE the first
-                        // delivered event leaves no cursor — re-attach
-                        // at the live edge rather than replaying the
-                        // transcript. With a cursor, resume the gap
-                        // exactly as before.
-                        let start = match from {
-                            Some(cursor) => AttachStart::After(cursor),
-                            None => AttachStart::Live,
-                        };
-                        // The reconnect attach carries the SAME delivery
-                        // filter as the initial one — a filter that
-                        // silently vanished on the first daemon restart
-                        // would re-open the fan-out flood and no reader
-                        // could tell why the socket got loud again.
-                        let mut request = AttachRequest::new(channel, start);
-                        if let Some(classes) = delivery.clone() {
-                            request = request.with_delivery(classes);
-                        }
-                        request = request.with_headers(headers.clone());
-                        let mut s = match client.attach(request).await {
-                            Ok(s) => s,
-                            Err(error) => {
-                                // Card 807193ab: silent `continue` left
-                                // operators watching a dead connection with
-                                // no signal. Show the reattach failure +
-                                // current backoff.
-                                tracing::warn!(
-                                    channel = %channel,
-                                    backoff_ms,
-                                    error = %error,
-                                    "airc subscribe: reattach failed"
-                                );
-                                continue;
-                            }
-                        };
-                        match read_response_frame(&mut s).await {
-                            Ok(Some(Response::Ok)) => {
-                                stream = s;
-                                backoff_ms = RECONNECT_BACKOFF_START_MS;
-                                break; // reconnected; resume draining
-                            }
-                            Ok(Some(other)) => {
-                                tracing::warn!(
-                                    channel = %channel,
-                                    frame = ?other,
-                                    "airc subscribe: reattach ack mismatch — expected Ok"
-                                );
-                            }
-                            Ok(None) | Err(_) => {
-                                tracing::warn!(
-                                    channel = %channel,
-                                    backoff_ms,
-                                    "airc subscribe: reattach ack read failed"
-                                );
-                            }
-                        }
-                    }
-                }
-            }));
+            handles.push(
+                spawn_channel_reader(
+                    client.clone(),
+                    channel,
+                    None,
+                    delivery.clone(),
+                    headers.clone(),
+                    tx.clone(),
+                )
+                .await?,
+            );
         }
         Ok(EventStream::daemon(rx, handles))
+    }
+}
+
+/// The attach for ONE room: resume after `from`, or the live edge; the
+/// consumer's delivery and header filters ride every attach, initial and
+/// reconnect alike.
+fn channel_request(
+    channel: RoomId,
+    from: Option<IpcCursor>,
+    delivery: Option<Vec<IpcDelivery>>,
+    headers: airc_core::HeaderFilter,
+) -> AttachRequest {
+    let mut request = match from {
+        Some(cursor) => AttachRequest::new(channel, AttachStart::After(cursor)),
+        None => AttachRequest::live(channel),
+    };
+    if let Some(classes) = delivery {
+        request = request.with_delivery(classes);
+    }
+    request.with_headers(headers)
+}
+
+/// The attach for a CHANNEL SET: every room with its own resume cursor
+/// (`None` = that room's live edge), the same filters on all of them.
+fn channel_set_request(
+    channels: &[RoomId],
+    cursors: &std::collections::HashMap<RoomId, IpcCursor>,
+    delivery: Option<Vec<IpcDelivery>>,
+    headers: airc_core::HeaderFilter,
+) -> AttachRequest {
+    let mut request = AttachRequest::channel_set(
+        channels
+            .iter()
+            .map(|channel| ChannelAttach {
+                channel: *channel,
+                from: cursors.get(channel).copied(),
+            })
+            .collect(),
+    );
+    if let Some(classes) = delivery {
+        request = request.with_delivery(classes);
+    }
+    request.with_headers(headers)
+}
+
+/// Aborts the wrapped task when dropped: the per-room readers a set reader
+/// spawns on fallback live and die with it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// ONE room's live reader: attach (at `from`, or the live edge), drain, and on a
+/// drop re-attach with resume + capped backoff, re-applying the same filters.
+/// The per-channel shape every daemon serves; the set reader falls back to it
+/// when a reconnect finds the daemon no longer serves channel sets, handing
+/// over each room's cursor so nothing is replayed or lost.
+async fn spawn_channel_reader(
+    client: Arc<airc_ipc::DaemonClient>,
+    channel: RoomId,
+    from: Option<IpcCursor>,
+    delivery: Option<Vec<IpcDelivery>>,
+    headers: airc_core::HeaderFilter,
+    tx: mpsc::Sender<Arc<TranscriptEvent>>,
+) -> Result<tokio::task::JoinHandle<()>, AircError> {
+    // Initial attach + ack — fail fast so `subscribe()` errors if
+    // the daemon is down right now (don't silently spin).
+    //
+    // Card bf0b5790: this is the LIVE subscribe surface, so the
+    // stream starts at the live edge. Catch-up is a separate,
+    // bounded concern (`resume_from_subscribed_filtered` with a
+    // stored cursor — see `join_feed`).
+    // `from` is the resume point a caller hands over (the set reader
+    // falling back after a daemon rollback); `None` is the live edge.
+    let request = channel_request(channel, from, delivery.clone(), headers.clone());
+    let mut stream = client
+        .attach(request)
+        .await
+        .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
+    match read_response_frame(&mut stream).await {
+        Ok(Some(Response::Ok)) => {}
+        Ok(Some(Response::Error { message })) => {
+            return Err(AircError::Route(format!("daemon attach: {message}")))
+        }
+        Ok(Some(_)) | Ok(None) => {
+            return Err(AircError::Route("daemon attach: no ack".to_string()))
+        }
+        Err(e) => return Err(AircError::Route(format!("daemon attach ack: {e}"))),
+    }
+    Ok(tokio::spawn(async move {
+        // Drain the live stream; when it drops (daemon restart /
+        // transient loss) re-attach and RESUME strictly after the
+        // last delivered cursor. Durable events in the gap are
+        // replayed; ephemeral classes are lossy and correctly
+        // skipped. The `DaemonAttachGuard` aborts this task when
+        // the consumer drops the `EventStream`, so it only runs
+        // while the subscription is wanted.
+        let mut from: Option<IpcCursor> = from;
+        let mut backoff_ms = RECONNECT_BACKOFF_START_MS;
+        loop {
+            loop {
+                match read_response_frame(&mut stream).await {
+                    Ok(Some(Response::Event { envelope })) => {
+                        match decode_wire_event(envelope) {
+                            Ok(event) => {
+                                from = Some(cursor_after(&event));
+                                if tx.send(Arc::new(event)).await.is_err() {
+                                    return; // consumer gone
+                                }
+                                backoff_ms = RECONNECT_BACKOFF_START_MS;
+                            }
+                            Err(error) => {
+                                // Card 807193ab: a silent return here
+                                // killed the subscription with no
+                                // diagnostic — the consumer's mpsc
+                                // would close and `next().await` just
+                                // yielded None. Now operators see
+                                // WHY the substrate dropped the
+                                // subscription (wire schema drift,
+                                // encoding bug, anything that breaks
+                                // decode).
+                                tracing::warn!(
+                                    channel = %channel,
+                                    error = %error,
+                                    "airc subscribe: dropping subscription — decode_wire_event failed"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Some(Response::AttachCursorAdvanced { .. })) => {
+                        // The daemon's CURSOR HEARTBEAT (server.rs, continuum #261): one per
+                        // second per subscription after events, so a cursor-persisting
+                        // consumer advances. This reader does not persist cursors; the frame
+                        // is bookkeeping, not an event. It used to fall through to the warn
+                        // below — 3,100 lines/min on a 16-citizen core, rotating the log
+                        // every 15 minutes (2026-09-14, airc #1411).
+                    }
+                    Ok(Some(other)) => {
+                        // Non-Event frames on a live subscription
+                        // are unexpected (ack already consumed); a
+                        // recurring stream of these indicates the
+                        // daemon is sending shapes the SDK doesn't
+                        // recognise.
+                        tracing::warn!(
+                            channel = %channel,
+                            frame = ?other,
+                            "airc subscribe: ignoring non-Event frame"
+                        );
+                    }
+                    Ok(None) | Err(_) => {
+                        // Card 807193ab: surface stream drops so a
+                        // session of "no events" can be told apart
+                        // from "connection died, reconnecting."
+                        tracing::warn!(
+                            channel = %channel,
+                            "airc subscribe: stream closed — reconnecting"
+                        );
+                        break;
+                    }
+                }
+            }
+            // Reconnect with resume + capped backoff.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
+                if tx.is_closed() {
+                    return; // consumer dropped while we were down
+                }
+                // Card bf0b5790: a drop BEFORE the first
+                // delivered event leaves no cursor — re-attach
+                // at the live edge rather than replaying the
+                // transcript. With a cursor, resume the gap
+                // exactly as before.
+                let start = match from {
+                    Some(cursor) => AttachStart::After(cursor),
+                    None => AttachStart::Live,
+                };
+                // The reconnect attach carries the SAME delivery
+                // filter as the initial one — a filter that
+                // silently vanished on the first daemon restart
+                // would re-open the fan-out flood and no reader
+                // could tell why the socket got loud again.
+                let mut request = AttachRequest::new(channel, start);
+                if let Some(classes) = delivery.clone() {
+                    request = request.with_delivery(classes);
+                }
+                request = request.with_headers(headers.clone());
+                let mut s = match client.attach(request).await {
+                    Ok(s) => s,
+                    Err(error) => {
+                        // Card 807193ab: silent `continue` left
+                        // operators watching a dead connection with
+                        // no signal. Show the reattach failure +
+                        // current backoff.
+                        tracing::warn!(
+                            channel = %channel,
+                            backoff_ms,
+                            error = %error,
+                            "airc subscribe: reattach failed"
+                        );
+                        continue;
+                    }
+                };
+                match read_response_frame(&mut s).await {
+                    Ok(Some(Response::Ok)) => {
+                        stream = s;
+                        backoff_ms = RECONNECT_BACKOFF_START_MS;
+                        break; // reconnected; resume draining
+                    }
+                    Ok(Some(other)) => {
+                        tracing::warn!(
+                            channel = %channel,
+                            frame = ?other,
+                            "airc subscribe: reattach ack mismatch — expected Ok"
+                        );
+                    }
+                    Ok(None) | Err(_) => {
+                        tracing::warn!(
+                            channel = %channel,
+                            backoff_ms,
+                            "airc subscribe: reattach ack read failed"
+                        );
+                    }
+                }
+            }
+        }
+    }))
+}
+
+impl Airc {
+    /// The channel-set half of [`Self::daemon_subscribe`]: one attach for
+    /// every room, one reader task, a resume cursor PER ROOM. A reconnect
+    /// re-attaches the whole set with each room's own cursor (`Live` for a
+    /// room that has delivered nothing yet), so every room's durable gap
+    /// is replayed and no room re-feeds history. Same decode, drop and
+    /// backoff discipline as the per-channel reader (card 807193ab).
+    async fn daemon_subscribe_set(
+        client: Arc<airc_ipc::DaemonClient>,
+        channels: Vec<RoomId>,
+        delivery: Option<Vec<IpcDelivery>>,
+        headers: airc_core::HeaderFilter,
+        tx: mpsc::Sender<Arc<TranscriptEvent>>,
+    ) -> Result<tokio::task::JoinHandle<()>, AircError> {
+        let request_for = {
+            let channels = channels.clone();
+            let delivery = delivery.clone();
+            let headers = headers.clone();
+            move |cursors: &std::collections::HashMap<RoomId, IpcCursor>| {
+                channel_set_request(&channels, cursors, delivery.clone(), headers.clone())
+            }
+        };
+        let mut cursors: std::collections::HashMap<RoomId, IpcCursor> = Default::default();
+        let mut stream = client
+            .attach(request_for(&cursors))
+            .await
+            .map_err(|e| AircError::Route(format!("daemon attach (set): {e}")))?;
+        match read_response_frame(&mut stream).await {
+            Ok(Some(Response::Ok)) => {}
+            Ok(Some(Response::Error { message })) => {
+                return Err(AircError::Route(format!("daemon attach (set): {message}")))
+            }
+            Ok(Some(_)) | Ok(None) => {
+                return Err(AircError::Route("daemon attach (set): no ack".to_string()))
+            }
+            Err(e) => return Err(AircError::Route(format!("daemon attach (set) ack: {e}"))),
+        }
+        let rooms = channels.len();
+        Ok(tokio::spawn(async move {
+            let mut backoff_ms = RECONNECT_BACKOFF_START_MS;
+            loop {
+                loop {
+                    match read_response_frame(&mut stream).await {
+                        Ok(Some(Response::Event { envelope })) => match decode_wire_event(envelope)
+                        {
+                            Ok(event) => {
+                                cursors.insert(event.room_id, cursor_after(&event));
+                                if tx.send(Arc::new(event)).await.is_err() {
+                                    return; // consumer gone
+                                }
+                                backoff_ms = RECONNECT_BACKOFF_START_MS;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    rooms,
+                                    error = %error,
+                                    "airc subscribe (set): dropping subscription — decode_wire_event failed"
+                                );
+                                return;
+                            }
+                        },
+                        Ok(Some(Response::AttachCursorAdvanced { .. })) => {}
+                        Ok(Some(other)) => {
+                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): ignoring non-Event frame");
+                        }
+                        Ok(None) | Err(_) => {
+                            tracing::warn!(
+                                rooms,
+                                "airc subscribe (set): stream closed — reconnecting"
+                            );
+                            break;
+                        }
+                    }
+                }
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
+                    if tx.is_closed() {
+                        return; // consumer dropped while we were down
+                    }
+                    // The daemon behind the socket may have been replaced while we
+                    // were down (a rollback to a build that predates channel sets).
+                    // Re-read the typed capability; a daemon that no longer serves
+                    // sets gets the per-channel readers, each handed its room's
+                    // own cursor and the same filters. The readers are held here
+                    // so the consumer's drop (which aborts this task) takes them
+                    // down too. An unreadable status is a daemon still coming up:
+                    // keep backing off and ask again.
+                    match client.status().await {
+                        Ok(status) if !status.attach_channel_sets => {
+                            tracing::warn!(
+                                rooms,
+                                "airc subscribe (set): the daemon no longer serves channel sets — falling back to one reader per room, cursors kept"
+                            );
+                            // Every room is attached with its own cursor; a room whose
+                            // attach or ack fails right now (the daemon is still coming
+                            // up) KEEPS its cursor and filters and is retried with capped
+                            // backoff, like the per-room reader's own reconnect. Dropping
+                            // it would silently narrow the stream (Astra's re-review).
+                            let mut children = Vec::with_capacity(channels.len());
+                            let mut pending: Vec<RoomId> = channels.clone();
+                            let mut retry_ms = RECONNECT_BACKOFF_START_MS;
+                            while !pending.is_empty() {
+                                if tx.is_closed() {
+                                    return;
+                                }
+                                let mut still = Vec::new();
+                                for channel in pending {
+                                    match spawn_channel_reader(
+                                        client.clone(),
+                                        channel,
+                                        cursors.get(&channel).copied(),
+                                        delivery.clone(),
+                                        headers.clone(),
+                                        tx.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(handle) => children.push(AbortOnDrop(handle)),
+                                        Err(error) => {
+                                            tracing::warn!(channel = %channel, retry_ms, error = %error, "airc subscribe (set): per-room fallback attach failed — retrying with its cursor");
+                                            still.push(channel);
+                                        }
+                                    }
+                                }
+                                pending = still;
+                                if !pending.is_empty() {
+                                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms))
+                                        .await;
+                                    retry_ms = (retry_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
+                                }
+                            }
+                            // Stay alive as the children's parent until the consumer
+                            // goes; `AbortOnDrop` ends them with this task.
+                            tx.closed().await;
+                            drop(children);
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(rooms, backoff_ms, error = %error, "airc subscribe (set): daemon status unreadable — retrying");
+                            continue;
+                        }
+                    }
+                    let mut s = match client.attach(request_for(&cursors)).await {
+                        Ok(s) => s,
+                        Err(error) => {
+                            tracing::warn!(rooms, backoff_ms, error = %error, "airc subscribe (set): reattach failed");
+                            continue;
+                        }
+                    };
+                    match read_response_frame(&mut s).await {
+                        Ok(Some(Response::Ok)) => {
+                            stream = s;
+                            backoff_ms = RECONNECT_BACKOFF_START_MS;
+                            break;
+                        }
+                        Ok(Some(other)) => {
+                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): reattach ack mismatch — expected Ok");
+                        }
+                        Ok(None) | Err(_) => {
+                            tracing::warn!(
+                                rooms,
+                                backoff_ms,
+                                "airc subscribe (set): reattach ack read failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }))
     }
 }
 
@@ -787,6 +1046,70 @@ fn ipc_delivery(delivery: airc_bus::DeliveryClass) -> IpcDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (Astra's re-review of airc #1523): a daemon rolled back
+    // under a live set subscription stops serving channel sets, and the set
+    // reader falls back to one reader per room. The fallback must hand each
+    // room ITS OWN cursor (a room that delivered nothing resumes live, never
+    // from the transcript start) and carry the same delivery + header filters
+    // the set attach carried, or the rollback would replay history into the
+    // consumer or re-open the fan-out flood the filters were there to stop.
+    #[test]
+    fn a_rollback_fallback_hands_each_room_its_own_cursor_and_the_same_filters() {
+        let a = RoomId(uuid::Uuid::from_u128(1));
+        let b = RoomId(uuid::Uuid::from_u128(2));
+        let cursor_a = IpcCursor {
+            epoch: 3,
+            counter: 41,
+            event_id: airc_core::EventId::from_u128(0xa),
+        };
+        let mut cursors = std::collections::HashMap::new();
+        cursors.insert(a, cursor_a);
+        let delivery = Some(vec![IpcDelivery::Durable]);
+        let headers = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Prefix {
+            key: "airc.kind".to_string(),
+            value_prefix: "airc.heartbeat.".to_string(),
+        }));
+
+        let set = channel_set_request(&[a, b], &cursors, delivery.clone(), headers.clone());
+        let entries = set.channels().expect("a set attach");
+        assert_eq!(entries[0].start(), AttachStart::After(cursor_a));
+        assert_eq!(
+            entries[1].start(),
+            AttachStart::Live,
+            "a room with nothing delivered is live"
+        );
+
+        for room in [a, b] {
+            let fallback = channel_request(
+                room,
+                cursors.get(&room).copied(),
+                delivery.clone(),
+                headers.clone(),
+            );
+            let expected = if room == a {
+                AttachStart::After(cursor_a)
+            } else {
+                AttachStart::Live
+            };
+            assert_eq!(
+                fallback.start(),
+                expected,
+                "room {room}: the fallback resumes where the set left it"
+            );
+            assert_eq!(fallback.channel(), Some(room));
+            assert!(
+                fallback.channels().is_none(),
+                "the fallback is the per-channel shape every daemon serves"
+            );
+            // Same filters on the wire: the set and its per-room fallback encode
+            // identical delivery + headers.
+            let set_json: serde_json::Value = serde_json::to_value(&set).unwrap();
+            let one_json: serde_json::Value = serde_json::to_value(&fallback).unwrap();
+            assert_eq!(set_json["delivery"], one_json["delivery"]);
+            assert_eq!(set_json["headers"], one_json["headers"]);
+        }
+    }
 
     #[test]
     fn seq_packs_and_unpacks_losslessly_and_orders() {

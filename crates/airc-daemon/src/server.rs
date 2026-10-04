@@ -528,6 +528,13 @@ where
     // `AttachRequest::start`. No flag precedence to re-derive here.
     let parts = attach.into_parts();
 
+    // A channel SET rides one stream (`stream_attach_set`); the single
+    // channel keeps the path below unchanged, so an older client's
+    // request is served exactly as before.
+    if parts.channels.is_some() {
+        return stream_attach_set(reader, writer, state, parts).await;
+    }
+
     // The owner-core router subscribes per channel (no global table to
     // scan). A client attaches once per room it cares about.
     let channel = match parts.channel {
@@ -742,6 +749,171 @@ where
                     None => return Ok(()),
                 },
             }
+        }
+    }
+}
+
+/// Serve an `Attach` that names a CHANNEL SET on one stream
+/// (`AttachRequest::channel_set`). Why: the router subscribes per
+/// channel, so a subscriber of N rooms used to hold N sockets, N daemon
+/// tasks and N reader tasks — measured 2026-10-04 on a 15-subscriber
+/// continuum core: ~960 attach sockets to one daemon, growing with every
+/// room and citizen. Here the N router subscriptions (in-process mpsc
+/// receivers, cheap) are merged and written down ONE socket; the client
+/// routes each frame by the envelope's own `channel`.
+///
+/// Per room, independently: the start (`Live`, or resume after its own
+/// cursor), the resume point, and the router's lag flag. A lagged room
+/// is re-subscribed from ITS resume point and nothing else is touched:
+/// the merge is a keyed `StreamMap`, so replacing one room's stream
+/// leaves every sibling's queued events in place (Astra's review of
+/// #1523: a rebuild of the whole set dropped a sibling's queued line and
+/// re-opened a cursorless sibling at a newer edge). A room's resume
+/// point before it has delivered anything is the ring head read BEFORE
+/// its live registration, so a lag that drops its first events replays
+/// exactly those; a room empty at attach resumes from the ring start,
+/// which is everything since. Order within a room is the router's;
+/// across rooms none was ever promised (they were separate sockets).
+///
+/// Not served on a set, refused before the ack: `coalesce_backlog` and
+/// `cursor_heartbeat` (their `AttachCursorAdvanced` frame names no
+/// channel yet), and an empty set. Loud, so a client never waits on a
+/// stream the daemon silently narrowed.
+async fn stream_attach_set<R, W>(
+    reader: R,
+    mut writer: W,
+    state: Arc<DaemonState>,
+    parts: airc_ipc::AttachParts,
+) -> Result<(), DaemonError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let refuse = |message: &str| Response::Error {
+        message: message.to_string(),
+    };
+    let Some(entries) = parts.channels else {
+        return write_response(&mut writer, &refuse("attach: no channel set")).await;
+    };
+    if entries.is_empty() {
+        return write_response(
+            &mut writer,
+            &refuse("attach: an empty channel set subscribes to nothing"),
+        )
+        .await;
+    }
+    if parts.coalesce_backlog || parts.cursor_heartbeat {
+        return write_response(
+            &mut writer,
+            &refuse("attach: coalesce_backlog and cursor_heartbeat are single-channel only (the cursor frame names no channel)"),
+        )
+        .await;
+    }
+    let kinds: Option<Vec<Kind>> = parts
+        .kinds
+        .map(|k| k.into_iter().map(map_ipc_kind).collect());
+    let delivery: Option<Vec<DeliveryClass>> = parts
+        .delivery
+        .map(|d| d.into_iter().map(map_ipc_delivery).collect());
+    let headers = parts.headers;
+    let filter_for = |room: airc_core::RoomId| {
+        let mut filter = Filter::channel(room);
+        if let Some(kinds) = kinds.clone() {
+            filter = filter.with_kinds(kinds);
+        }
+        if let Some(delivery) = delivery.clone() {
+            filter = filter.with_delivery(delivery);
+        }
+        filter.with_headers(headers.clone())
+    };
+
+    /// One room of the set: where a re-subscription resumes, and the
+    /// router's lag flag for its current stream.
+    struct RoomSub {
+        resume: Option<Cursor>,
+        lag: airc_bus::LagFlag,
+    }
+    // Register every room BEFORE the ack — the same subscribe-before-ack
+    // contract as the single channel: once the client sees `Ok`, no
+    // room has a gap between ack and registration. A room named twice
+    // gets one subscription, the first entry's start.
+    let mut subs: std::collections::HashMap<airc_core::RoomId, RoomSub> = Default::default();
+    let mut merged: tokio_stream::StreamMap<
+        airc_core::RoomId,
+        futures::stream::BoxStream<'static, Arc<Envelope>>,
+    > = tokio_stream::StreamMap::new();
+    for entry in entries {
+        if subs.contains_key(&entry.channel) {
+            continue;
+        }
+        let room = entry.channel;
+        let (stream, lag, resume) = match entry.start() {
+            AttachStart::After(c) => {
+                let cursor = Cursor::new(Seq::new(c.epoch, c.counter), c.event_id);
+                let (stream, lag) = state
+                    .router
+                    .subscribe_with_lag(filter_for(room), Some(cursor));
+                (stream.boxed(), lag, Some(cursor))
+            }
+            // No cursor is the live edge, never a ring replay. The resume
+            // point is the head read BEFORE registering, so a lag before
+            // the first delivery replays exactly what was dropped. The ring
+            // is RAM: after a daemon restart it is empty while the durable
+            // transcript is not, and a `None` baseline would replay that whole
+            // history on the first lag (Astra's re-review of #1523). The
+            // router's own durable fallback answers the cold ring, the same
+            // seam the coalesce path uses.
+            AttachStart::Live | AttachStart::FromTranscriptStart => {
+                let edge = match state.router.head_cursor(room) {
+                    Some(c) => Some(c),
+                    None => state.router.sink_head_cursor(room).await,
+                };
+                let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
+                (stream.boxed(), lag, edge)
+            }
+        };
+        merged.insert(room, stream);
+        subs.insert(room, RoomSub { resume, lag });
+    }
+    write_response(&mut writer, &Response::Ok).await?;
+
+    let shutdown = state.shutdown.notified();
+    tokio::pin!(shutdown);
+    let hangup = client_hung_up(reader);
+    tokio::pin!(hangup);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return Ok(()),
+            _ = &mut hangup => return Ok(()),
+            next = merged.next() => match next {
+                Some((room, env)) => {
+                    if let Some(sub) = subs.get_mut(&room) {
+                        sub.resume = Some(env.cursor());
+                    }
+                    tokio::select! {
+                        _ = &mut shutdown => return Ok(()),
+                        _ = &mut hangup => return Ok(()),
+                        result = write_event_response(&mut writer, &env, &state.shared_frames) => result?,
+                    }
+                    // Only a room that dropped a live push is re-subscribed,
+                    // from its own resume point; its siblings keep their
+                    // streams and everything queued on them.
+                    for (room, sub) in subs.iter_mut() {
+                        if !sub.lag.is_lagged() {
+                            continue;
+                        }
+                        let (stream, lag) = state
+                            .router
+                            .subscribe_with_lag(filter_for(*room), sub.resume);
+                        merged.insert(*room, stream.boxed());
+                        sub.lag = lag;
+                    }
+                }
+                // Every router stream ended: the router is shutting down.
+                None => return Ok(()),
+            },
         }
     }
 }
@@ -1004,5 +1176,433 @@ mod shared_frame_cancellation_tests {
         .await
         .expect("cancelled attach must release admission state")
         .unwrap();
+    }
+
+    mod channel_set {
+        use super::*;
+        use airc_ipc::ChannelAttach;
+
+        async fn state() -> Arc<DaemonState> {
+            let home = tempfile::tempdir().unwrap();
+            let state = DaemonState::build(
+                PeerId::new(),
+                PeerKeypair::generate(),
+                Arc::new(PeerKeyRegistry::new()),
+                VerificationPolicy::Strict,
+                home.path().to_owned(),
+                &home.path().join("events.sqlite"),
+                Arc::new(InMemoryEventStore::new()),
+                crate::DaemonRuntimeInfo::unknown(),
+            )
+            .await
+            .unwrap();
+            // Keep the tempdir alive for the test by leaking it into the state's lifetime.
+            std::mem::forget(home);
+            Arc::new(state)
+        }
+
+        fn chat(channel: RoomId, text: &'static str) -> Envelope {
+            Envelope::new(
+                channel,
+                (PeerId::new(), ClientId::new()),
+                Kind::Message,
+                DeliveryClass::Durable,
+                bytes::Bytes::from_static(text.as_bytes()),
+            )
+        }
+
+        // Durable lines, so a resume can replay what a lag dropped. The
+        // write-behind sink is bounded too: when it reports saturation the
+        // publish yields and retries, which is backpressure, not a failure.
+        async fn publish_durable(state: &DaemonState, env: Envelope) {
+            loop {
+                match state.router.publish(env.clone()).await {
+                    Ok(_) => return,
+                    Err(airc_bus::BusError::WriteBehindSaturated) => tokio::task::yield_now().await,
+                    Err(e) => panic!("publish failed: {e:?}"),
+                }
+            }
+        }
+
+        async fn next_event<C: AsyncReadExt + Unpin>(client: &mut C) -> Envelope {
+            match tokio::time::timeout(Duration::from_secs(2), read_frame::<_, Response>(client))
+                .await
+                .expect("an event frame within 2 s")
+                .unwrap()
+            {
+                Some(Response::Event { envelope }) => {
+                    airc_wire::decode(bytes::Bytes::from(envelope)).unwrap()
+                }
+                other => panic!("expected an Event frame, got {other:?}"),
+            }
+        }
+
+        // what this catches (2026-10-04, ~960 sockets on one daemon): a set attach
+        // serves N rooms on ONE stream, each frame carrying its own room so the
+        // client can route it, with the order inside a room preserved — the
+        // contract that lets airc-lib hold one socket per subscriber instead of
+        // one per room. Also: a resume cursor is honoured per room (B replays
+        // only what came after its cursor while A is live), and the client's
+        // hang-up ends the stream exactly as it does for a single channel.
+        #[tokio::test]
+        async fn a_channel_set_streams_every_room_on_one_socket_routed_by_room() {
+            let state = state().await;
+            let a = RoomId::new();
+            let b = RoomId::new();
+            // B has history: the attach resumes after its first line. The cursor
+            // is read the way a client gets it — off the delivered event — through
+            // a throwaway single-channel attach from the transcript start.
+            state.router.publish(chat(b, "b-old")).await.unwrap();
+            state
+                .router
+                .publish(chat(b, "b-after-cursor"))
+                .await
+                .unwrap();
+            let b_cursor = {
+                let (mut probe, daemon) = tokio::io::duplex(64 * 1024);
+                let (reader, writer) = tokio::io::split(daemon);
+                let task = tokio::spawn(stream_attach(
+                    reader,
+                    writer,
+                    state.clone(),
+                    AttachRequest::new(b, AttachStart::FromTranscriptStart),
+                ));
+                assert!(matches!(
+                    read_frame::<_, Response>(&mut probe).await.unwrap(),
+                    Some(Response::Ok)
+                ));
+                let first = next_event(&mut probe).await;
+                assert_eq!(&first.payload[..], b"b-old");
+                let c = first.cursor();
+                drop(probe);
+                task.await.unwrap().unwrap();
+                airc_ipc::IpcCursor {
+                    epoch: c.seq.epoch,
+                    counter: c.seq.counter,
+                    event_id: c.event_id,
+                }
+            };
+            let (mut client, daemon) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(vec![
+                ChannelAttach {
+                    channel: a,
+                    from: None,
+                },
+                ChannelAttach {
+                    channel: b,
+                    from: Some(b_cursor),
+                },
+            ]);
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+
+            // B's resume replays the one line after its cursor, nothing older.
+            let replayed = next_event(&mut client).await;
+            assert_eq!(replayed.channel, b);
+            assert_eq!(&replayed.payload[..], b"b-after-cursor");
+
+            for (room, text) in [(a, "a-1"), (b, "b-1"), (a, "a-2")] {
+                state.router.publish(chat(room, text)).await.unwrap();
+            }
+            let mut per_room: std::collections::HashMap<RoomId, Vec<Vec<u8>>> = Default::default();
+            for _ in 0..3 {
+                let env = next_event(&mut client).await;
+                per_room
+                    .entry(env.channel)
+                    .or_default()
+                    .push(env.payload.to_vec());
+            }
+            assert_eq!(
+                per_room[&a],
+                vec![b"a-1".to_vec(), b"a-2".to_vec()],
+                "A's order is kept"
+            );
+            assert_eq!(per_room[&b], vec![b"b-1".to_vec()]);
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("client hang-up ends the set stream")
+                .unwrap()
+                .unwrap();
+        }
+
+        // what this catches (Astra's review of #1523): a lag on ONE room must not
+        // touch its siblings. The writer is held (the client does not read), A's
+        // router buffer overflows so A lags, and a B line is queued meanwhile.
+        // Rebuilding the whole set re-subscribed B live and dropped that queued
+        // line. Now only A is re-subscribed from its own resume point: B's line
+        // arrives exactly once, A's lines stay in order with no duplicate, and
+        // A keeps delivering after the lag.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lag_on_one_room_leaves_its_siblings_queued_events_untouched() {
+            let state = state().await;
+            let a = RoomId::new();
+            let b = RoomId::new();
+            let (mut client, daemon) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(vec![
+                ChannelAttach {
+                    channel: a,
+                    from: None,
+                },
+                ChannelAttach {
+                    channel: b,
+                    from: None,
+                },
+            ]);
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+            // Nobody reads the client: the daemon's writer blocks on the duplex,
+            // A's 1024-slot subscriber buffer fills, and the rest is dropped (lag).
+            let flood = 1600usize;
+            for i in 0..flood {
+                let text: &'static str = Box::leak(format!("a-{i:04}").into_boxed_str());
+                publish_durable(&state, chat(a, text)).await;
+            }
+            publish_durable(&state, chat(b, "b-queued-during-lag")).await;
+            publish_durable(&state, chat(a, "a-final")).await;
+
+            let mut a_seen: Vec<String> = Vec::new();
+            let mut b_seen = 0usize;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let env = next_event(&mut client).await;
+                let text = String::from_utf8(env.payload.to_vec()).unwrap();
+                if env.channel == b {
+                    assert_eq!(text, "b-queued-during-lag");
+                    b_seen += 1;
+                } else {
+                    a_seen.push(text);
+                }
+                if b_seen == 1 && a_seen.last().is_some_and(|t| t == "a-final") {
+                    break;
+                }
+            }
+            assert_eq!(b_seen, 1, "the sibling's queued line arrives exactly once");
+            assert_eq!(
+                a_seen.last().map(String::as_str),
+                Some("a-final"),
+                "A resumed after its lag"
+            );
+            let mut sorted = a_seen.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                a_seen.len(),
+                "A never repeats a line across its resume"
+            );
+            let numbered: Vec<&String> = a_seen.iter().filter(|t| t.starts_with("a-")).collect();
+            assert!(
+                numbered.windows(2).all(|w| w[0] <= w[1]),
+                "A's order is kept across the resume"
+            );
+            // The lag is certain by construction: the daemon is blocked writing
+            // into a 1 KiB duplex while A's 1024-slot buffer takes 1601 pushes.
+            // Gap-free delivery is the resume replaying the dropped lines from
+            // the durable sink, which is the single-channel contract kept per room.
+            assert_eq!(
+                a_seen.len(),
+                flood + 1,
+                "A's resume replays every dropped line"
+            );
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        // what this catches (Astra's re-review of #1523): the ring is RAM, so a
+        // daemon that restarted over a durable transcript has an EMPTY ring and a
+        // full store. A room's pre-first-delivery resume point read from the ring
+        // alone is None, and a lag on that room before its first delivery then
+        // replays the room's whole history into a live subscriber. The shape that
+        // exercises the baseline is two rooms: A delivers and drives the loop, B
+        // overflows before delivering anything, so B is re-subscribed from its
+        // BASELINE, not from a delivered cursor. (A one-room version cannot tell
+        // the baselines apart: a room's resume point is set from its first event
+        // before any lag is judged. Mutation-checked: the ring-only baseline
+        // fails this test.)
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_cold_ring_over_a_durable_transcript_never_replays_history_on_a_first_lag() {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(InMemoryEventStore::new());
+            let build = |home: std::path::PathBuf, store: Arc<InMemoryEventStore>| async move {
+                DaemonState::build(
+                    PeerId::new(),
+                    PeerKeypair::generate(),
+                    Arc::new(PeerKeyRegistry::new()),
+                    VerificationPolicy::Strict,
+                    home.clone(),
+                    &home.join("events.sqlite"),
+                    store,
+                    crate::DaemonRuntimeInfo::unknown(),
+                )
+                .await
+                .unwrap()
+            };
+            let a = RoomId::new();
+            let b = RoomId::new();
+            // The first daemon generation writes B's durable history through its router.
+            let warm = Arc::new(build(home.path().to_owned(), store.clone()).await);
+            for i in 0..20 {
+                let text: &'static str = Box::leak(format!("b-old-{i:02}").into_boxed_str());
+                publish_durable(&warm, chat(b, text)).await;
+            }
+            // The write-behind must have landed in the store before the "restart",
+            // or the second generation has no durable history and the test proves nothing.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while warm.router.sink_head_cursor(b).await.is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the durable sink never received the history"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(warm);
+            // The second generation: same store, cold ring, durable history present.
+            let state = Arc::new(build(home.path().to_owned(), store).await);
+            assert!(
+                state.router.head_cursor(b).is_none(),
+                "the ring is cold after a restart"
+            );
+            assert!(
+                state.router.sink_head_cursor(b).await.is_some(),
+                "the durable transcript survives the restart"
+            );
+
+            let (mut client, daemon) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(vec![
+                ChannelAttach {
+                    channel: a,
+                    from: None,
+                },
+                ChannelAttach {
+                    channel: b,
+                    from: None,
+                },
+            ]);
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+            // The writer is held (nobody reads). A gets a few lines; B overflows its
+            // 1024-slot buffer before any of its lines could be written. When the
+            // client drains, A's lines drive the loop, B is seen lagged with nothing
+            // delivered, and B is re-subscribed from its baseline.
+            // A's lines are bigger than the 1 KiB pipe, so the writer blocks on A's
+            // FIRST frame and no B frame is written before B overflows; otherwise B's
+            // resume point would come from a delivered line and the baseline would be
+            // unused (the one-room version of this test passed its own mutation).
+            for i in 0..3 {
+                let text: &'static str =
+                    Box::leak(format!("a-{i}-{}", "x".repeat(700)).into_boxed_str());
+                publish_durable(&state, chat(a, text)).await;
+            }
+            let b_new = 1300usize;
+            for i in 0..b_new {
+                let text: &'static str = Box::leak(format!("b-new-{i:04}").into_boxed_str());
+                publish_durable(&state, chat(b, text)).await;
+            }
+            publish_durable(&state, chat(b, "b-final")).await;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut b_seen: Vec<String> = Vec::new();
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "b-final never arrived"
+                );
+                let env = next_event(&mut client).await;
+                if env.channel != b {
+                    continue;
+                }
+                let text = String::from_utf8(env.payload.to_vec()).unwrap();
+                assert!(
+                    !text.starts_with("b-old-"),
+                    "history from before the attach was replayed into a live subscriber: {text}"
+                );
+                b_seen.push(text);
+                if b_seen.last().is_some_and(|t| t == "b-final") {
+                    break;
+                }
+            }
+            let mut dedup = b_seen.clone();
+            dedup.sort();
+            dedup.dedup();
+            assert_eq!(
+                dedup.len(),
+                b_seen.len(),
+                "B never repeats a line across its resume"
+            );
+            assert_eq!(
+                b_seen.len(),
+                b_new + 1,
+                "every post-attach B line, gap-free across the resume"
+            );
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        // what this catches: the shapes a set does not serve are refused BEFORE
+        // the ack, loudly, so a client never waits on a silently narrowed
+        // stream: an empty set, and the single-channel-only backlog/heartbeat
+        // frames (their cursor frame names no channel yet).
+        #[tokio::test]
+        async fn a_set_refuses_before_the_ack_what_it_does_not_serve() {
+            let state = state().await;
+            let room = RoomId::new();
+            let shapes = [
+                AttachRequest::channel_set(vec![]),
+                AttachRequest::channel_set(vec![ChannelAttach {
+                    channel: room,
+                    from: None,
+                }])
+                .with_coalesced_backlog(),
+                AttachRequest::channel_set(vec![ChannelAttach {
+                    channel: room,
+                    from: None,
+                }])
+                .with_cursor_heartbeat(),
+            ];
+            for request in shapes {
+                let (mut client, daemon) = tokio::io::duplex(4096);
+                let (reader, writer) = tokio::io::split(daemon);
+                let task = tokio::spawn(stream_attach(
+                    reader,
+                    writer,
+                    state.clone(),
+                    request.clone(),
+                ));
+                match read_frame::<_, Response>(&mut client).await.unwrap() {
+                    Some(Response::Error { message }) => {
+                        assert!(message.starts_with("attach:"), "{message}")
+                    }
+                    other => panic!("{request:?} must be refused, got {other:?}"),
+                }
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+        }
     }
 }
