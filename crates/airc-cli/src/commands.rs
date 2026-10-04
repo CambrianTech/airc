@@ -70,6 +70,35 @@ pub(crate) fn reject_recovery_room(name: Option<&str>) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// What `airc room <word>` means. A room is joined by naming it, so a verb typed
+/// where a name goes (`airc room list`) used to create a room with that name and
+/// move the current-room pointer into it, on a scope other agents share. Verbs
+/// are never room names: the listing verbs print the listing they asked for, and
+/// the rest refuse with the form that does what they meant.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RoomArg {
+    List,
+    Refuse(String),
+    Switch,
+}
+
+pub(crate) fn classify_room_arg(name: &str) -> Result<RoomArg, Box<dyn std::error::Error>> {
+    let word = airc_lib::ChannelName::new(name)?;
+    Ok(match word.as_str() {
+        "list" | "ls" | "show" | "current" => RoomArg::List,
+        verb @ ("join" | "switch" | "create" | "new" | "add") => RoomArg::Refuse(format!(
+            "`{verb}` is not a room name. Join or switch with `airc room <name>`. No room was created or switched."
+        )),
+        verb @ ("leave" | "part" | "delete" | "remove" | "rm") => RoomArg::Refuse(format!(
+            "`{verb}` is not a room name. Leave the current room with `airc part`. No room was created or switched."
+        )),
+        "help" => RoomArg::Refuse(
+            "`help` is not a room name. See `airc room --help`. No room was created or switched.".into(),
+        ),
+        _ => RoomArg::Switch,
+    })
+}
+
 /// Resolve once and pin the validated target, including legacy defaults and IDs.
 pub(crate) async fn mesh_publish_target(
     airc: &Airc,
@@ -89,6 +118,11 @@ pub(crate) async fn mesh_publish_target(
 /// deterministic room derived from `<name>`.
 pub async fn run_room(home: &Path, name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     reject_recovery_room(name.as_deref())?;
+    let name = match name.as_deref().map(classify_room_arg).transpose()? {
+        Some(RoomArg::Refuse(message)) => return Err(message.into()),
+        Some(RoomArg::List) => None,
+        Some(RoomArg::Switch) | None => name,
+    };
     let airc = Airc::open(home).await?;
     match name {
         Some(name) => {
@@ -3662,6 +3696,32 @@ mod tests {
         }
         assert!(reject_recovery_room(Some("sos-development")).is_ok());
         assert!(reject_recovery_room(None).is_ok());
+    }
+
+    // what this catches: `airc room list` created a room named "list" and moved a
+    // shared scope's current room into it (2026-10-04, card 9e3319a0). Verbs never
+    // become room names, in any case; real names, including ones that merely
+    // contain a verb, still switch.
+    #[test]
+    fn room_verbs_are_never_room_names() {
+        for word in ["list", "LS", "show", "current"] {
+            assert_eq!(classify_room_arg(word).unwrap(), RoomArg::List, "{word}");
+        }
+        for word in ["join", "switch", "create", "leave", "part", "rm", "help"] {
+            assert!(
+                matches!(classify_room_arg(word).unwrap(), RoomArg::Refuse(_)),
+                "{word}"
+            );
+        }
+        for word in [
+            "general",
+            "cambriantech",
+            "continuum-dev",
+            "listings",
+            "join-us",
+        ] {
+            assert_eq!(classify_room_arg(word).unwrap(), RoomArg::Switch, "{word}");
+        }
     }
 
     /// what this catches (live 2026-08-12): the @mention parse feeding the
