@@ -330,6 +330,7 @@ fn cwd_is_project_root(cwd: &std::path::Path) -> Result<bool, Box<dyn std::error
 
 pub async fn run_release(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     claim_id: Option<String>,
     reason: Option<String>,
@@ -343,11 +344,21 @@ pub async fn run_release(
         Some(raw) => parse_claim_id(&raw)?,
         None => resolve_my_active_claim(&airc, card_uuid).await?,
     };
-    airc.release_work_claim(ReleaseWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        reason,
-    })
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "release a claim in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    airc.release_work_claim_in(
+        &room,
+        ReleaseWorkClaim {
+            card_id: card_uuid,
+            claim_id: claim_uuid,
+            reason,
+        },
+    )
     .await?;
     println!("released: card_id={card_id} claim_id={claim_uuid}");
     Ok(())
@@ -381,6 +392,7 @@ async fn resolve_my_active_claim(
 
 pub async fn run_heartbeat(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     claim_id: String,
     ttl_ms: u64,
@@ -388,11 +400,21 @@ pub async fn run_heartbeat(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let claim_uuid = parse_claim_id(&claim_id)?;
-    airc.heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        ttl_ms,
-    })
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "renew a claim in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    airc.heartbeat_work_claim_in(
+        &room,
+        airc_lib::HeartbeatWorkClaim {
+            card_id: card_uuid,
+            claim_id: claim_uuid,
+            ttl_ms,
+        },
+    )
     .await?;
     println!("claim_heartbeat: card_id={card_id} claim_id={claim_id} ttl_ms={ttl_ms}");
 
