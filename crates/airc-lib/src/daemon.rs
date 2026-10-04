@@ -932,22 +932,42 @@ impl Airc {
                                 rooms,
                                 "airc subscribe (set): the daemon no longer serves channel sets — falling back to one reader per room, cursors kept"
                             );
+                            // Every room is attached with its own cursor; a room whose
+                            // attach or ack fails right now (the daemon is still coming
+                            // up) KEEPS its cursor and filters and is retried with capped
+                            // backoff, like the per-room reader's own reconnect. Dropping
+                            // it would silently narrow the stream (Astra's re-review).
                             let mut children = Vec::with_capacity(channels.len());
-                            for channel in &channels {
-                                match spawn_channel_reader(
-                                    client.clone(),
-                                    *channel,
-                                    cursors.get(channel).copied(),
-                                    delivery.clone(),
-                                    headers.clone(),
-                                    tx.clone(),
-                                )
-                                .await
-                                {
-                                    Ok(handle) => children.push(AbortOnDrop(handle)),
-                                    Err(error) => {
-                                        tracing::warn!(channel = %channel, error = %error, "airc subscribe (set): per-room fallback attach failed");
+                            let mut pending: Vec<RoomId> = channels.clone();
+                            let mut retry_ms = RECONNECT_BACKOFF_START_MS;
+                            while !pending.is_empty() {
+                                if tx.is_closed() {
+                                    return;
+                                }
+                                let mut still = Vec::new();
+                                for channel in pending {
+                                    match spawn_channel_reader(
+                                        client.clone(),
+                                        channel,
+                                        cursors.get(&channel).copied(),
+                                        delivery.clone(),
+                                        headers.clone(),
+                                        tx.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(handle) => children.push(AbortOnDrop(handle)),
+                                        Err(error) => {
+                                            tracing::warn!(channel = %channel, retry_ms, error = %error, "airc subscribe (set): per-room fallback attach failed — retrying with its cursor");
+                                            still.push(channel);
+                                        }
                                     }
+                                }
+                                pending = still;
+                                if !pending.is_empty() {
+                                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms))
+                                        .await;
+                                    retry_ms = (retry_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
                                 }
                             }
                             // Stay alive as the children's parent until the consumer
