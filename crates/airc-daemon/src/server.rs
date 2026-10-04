@@ -857,9 +857,17 @@ where
             }
             // No cursor is the live edge, never a ring replay. The resume
             // point is the head read BEFORE registering, so a lag before
-            // the first delivery replays exactly what was dropped.
+            // the first delivery replays exactly what was dropped. The ring
+            // is RAM: after a daemon restart it is empty while the durable
+            // transcript is not, and a `None` baseline would replay that whole
+            // history on the first lag (Astra's re-review of #1523). The
+            // router's own durable fallback answers the cold ring, the same
+            // seam the coalesce path uses.
             AttachStart::Live | AttachStart::FromTranscriptStart => {
-                let edge = state.router.head_cursor(room);
+                let edge = match state.router.head_cursor(room) {
+                    Some(c) => Some(c),
+                    None => state.router.sink_head_cursor(room).await,
+                };
                 let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
                 (stream.boxed(), lag, edge)
             }
@@ -1203,6 +1211,19 @@ mod shared_frame_cancellation_tests {
             )
         }
 
+        // Durable lines, so a resume can replay what a lag dropped. The
+        // write-behind sink is bounded too: when it reports saturation the
+        // publish yields and retries, which is backpressure, not a failure.
+        async fn publish_durable(state: &DaemonState, env: Envelope) {
+            loop {
+                match state.router.publish(env.clone()).await {
+                    Ok(_) => return,
+                    Err(airc_bus::BusError::WriteBehindSaturated) => tokio::task::yield_now().await,
+                    Err(e) => panic!("publish failed: {e:?}"),
+                }
+            }
+        }
+
         async fn next_event<C: AsyncReadExt + Unpin>(client: &mut C) -> Envelope {
             match tokio::time::timeout(Duration::from_secs(2), read_frame::<_, Response>(client))
                 .await
@@ -1341,20 +1362,6 @@ mod shared_frame_cancellation_tests {
             ));
             // Nobody reads the client: the daemon's writer blocks on the duplex,
             // A's 1024-slot subscriber buffer fills, and the rest is dropped (lag).
-            // Durable lines, so the resume can replay what the lag dropped. The
-            // write-behind sink is bounded too: when it reports saturation the
-            // publish yields and retries, which is backpressure, not a failure.
-            async fn publish_durable(state: &DaemonState, env: Envelope) {
-                loop {
-                    match state.router.publish(env.clone()).await {
-                        Ok(_) => return,
-                        Err(airc_bus::BusError::WriteBehindSaturated) => {
-                            tokio::task::yield_now().await
-                        }
-                        Err(e) => panic!("publish failed: {e:?}"),
-                    }
-                }
-            }
             let flood = 1600usize;
             for i in 0..flood {
                 let text: &'static str = Box::leak(format!("a-{i:04}").into_boxed_str());
@@ -1408,6 +1415,94 @@ mod shared_frame_cancellation_tests {
                 "A's resume replays every dropped line"
             );
 
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        // what this catches (Astra's re-review of #1523): the ring is RAM, so a
+        // daemon that restarted over a durable transcript has an EMPTY ring and a
+        // full store. A room's pre-first-delivery resume point read from the ring
+        // alone is None, and the first lag then replays the room's whole history
+        // into a live subscriber. The baseline must fall through to the durable
+        // tip: after the lag, nothing published before the attach is delivered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_cold_ring_over_a_durable_transcript_never_replays_history_on_a_first_lag() {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(InMemoryEventStore::new());
+            let build = |home: std::path::PathBuf, store: Arc<InMemoryEventStore>| async move {
+                DaemonState::build(
+                    PeerId::new(),
+                    PeerKeypair::generate(),
+                    Arc::new(PeerKeyRegistry::new()),
+                    VerificationPolicy::Strict,
+                    home.clone(),
+                    &home.join("events.sqlite"),
+                    store,
+                    crate::DaemonRuntimeInfo::unknown(),
+                )
+                .await
+                .unwrap()
+            };
+            let room = RoomId::new();
+            // The first daemon generation writes durable history through its router.
+            let warm = Arc::new(build(home.path().to_owned(), store.clone()).await);
+            for i in 0..20 {
+                let text: &'static str = Box::leak(format!("old-{i:02}").into_boxed_str());
+                publish_durable(&warm, chat(room, text)).await;
+            }
+            // Let the write-behind land before the "restart".
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(warm);
+            // The second generation: same store, cold ring.
+            let state = Arc::new(build(home.path().to_owned(), store).await);
+            assert!(
+                state.router.head_cursor(room).is_none(),
+                "the ring is cold after a restart"
+            );
+
+            let (mut client, daemon) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(vec![ChannelAttach {
+                channel: room,
+                from: None,
+            }]);
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+            // Lag before the first delivery: the writer is held and the buffer overflows.
+            for i in 0..1300 {
+                let text: &'static str = Box::leak(format!("new-{i:04}").into_boxed_str());
+                publish_durable(&state, chat(room, text)).await;
+            }
+            publish_durable(&state, chat(room, "new-final")).await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut seen = 0usize;
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "new-final never arrived"
+                );
+                let env = next_event(&mut client).await;
+                let text = String::from_utf8(env.payload.to_vec()).unwrap();
+                assert!(
+                    !text.starts_with("old-"),
+                    "history from before the attach was replayed into a live subscriber: {text}"
+                );
+                seen += 1;
+                if text == "new-final" {
+                    break;
+                }
+            }
+            assert_eq!(
+                seen, 1301,
+                "every post-attach line, gap-free across the resume"
+            );
             drop(client);
             tokio::time::timeout(Duration::from_secs(2), task)
                 .await
