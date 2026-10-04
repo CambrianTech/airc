@@ -516,7 +516,9 @@ pub enum Command {
     /// current room's name + wire + channel. With a name, derives a
     /// deterministic `(wire, channel)` from the name and sets it as
     /// the current room — two peers who run `airc room project-x`
-    /// land in the same channel without sharing the UUID.
+    /// land in the same channel without sharing the UUID. Verbs are never
+    /// room names: `airc room list` prints the listing, and `join`, `leave`
+    /// and similar refuse with the right form instead of creating a room.
     Room {
         /// Room name. Omit to just print the current room.
         name: Option<String>,
