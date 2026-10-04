@@ -300,9 +300,7 @@ impl IpcListener {
         #[cfg(windows)]
         {
             let pipe_name = resolve_pipe_name(path);
-            let first = tokio::net::windows::named_pipe::ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(&pipe_name)?;
+            let first = crate::windows_pipe_security::create(&pipe_name, true)?;
             Ok(IpcListener::Windows {
                 pipe_name,
                 next: tokio::sync::Mutex::new(Some(first)),
@@ -344,8 +342,7 @@ impl IpcListener {
                 let mut guard = next.lock().await;
                 let server = guard.take().ok_or(IpcAcceptError::MissingPreparedPipe)?;
                 *guard = Some(
-                    tokio::net::windows::named_pipe::ServerOptions::new()
-                        .create(pipe_name)
+                    crate::windows_pipe_security::create(pipe_name, false)
                         .map_err(IpcAcceptError::WindowsPipeCreate)?,
                 );
                 drop(guard);
@@ -460,6 +457,85 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_child_entry() {
+        let Some(socket) = std::env::var_os("AIRC_TEST_OWNER_PIPE") else {
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    for _ in 0..2 {
+                        let mut stream = IpcStream::connect(Path::new(&socket)).await.unwrap();
+                        stream.write_all(b"PING").await.unwrap();
+                        let mut reply = [0; 4];
+                        stream.read_exact(&mut reply).await.unwrap();
+                        assert_eq!(&reply, b"PONG");
+                    }
+                })
+                .await
+                .expect("child IPC must terminate even if the parent test fails");
+            });
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_account_pipe_accepts_separate_binary_process() {
+        use std::os::windows::process::CommandExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = TempDir::new().unwrap();
+        let socket = directory.path().join("owner.sock");
+        let listener = IpcListener::bind(&socket).await.unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transport::tests::windows_pipe_child_entry",
+                "--nocapture",
+            ])
+            .env("AIRC_TEST_OWNER_PIPE", &socket)
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW, including test children.
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            // Exercise first and replacement instances, not only initial bind.
+            for _ in 0..2 {
+                let mut stream = listener.accept().await.unwrap();
+                let mut request = [0; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"PING");
+                stream.write_all(b"PONG").await.unwrap();
+            }
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            result.is_ok(),
+            "child IPC timed out: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn native_diagnostic_endpoint_matches_transport_resolution() {
