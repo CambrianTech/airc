@@ -135,6 +135,18 @@ Routing is a memory operation; it never touches the DB.
 - Rebuildable from recent events; it's a projection, not a log.
 
 ### 3.5 Cursor engine — efficient replay
+Writer reservation receipt (2026-10-04, card `f6ee0017`): file-WAL durable
+replay now uses a bounded read-only pool owned by `SqliteDurableSink`; its
+existing writer retains append, batch and epoch operations. Five read callers
+migrated from the writer pool. Memory, temporary, URI, shared-cache and existing
+read-only observation retain compatible single-pool behavior. The existing
+ORM fixture holds a reader snapshot and queues replay while writes commit,
+then checks stable snapshot, fresh replay, read-only enforcement and reopen.
+All 16 existing sink tests passed. The unsupported SeaORM `sqlite://:memory:`
+alias is explicitly rejected rather than claiming new support. Installed
+adoption and fleet consumer/resource measurements remain outstanding; a
+reserved writer does not remove external SQLite write-lock contention.
+
 - Cursor = `(seq, event_id)`, `seq = (epoch, counter)`; durable per-subscriber
   position. **Scoped per-owner-per-channel** — a channel's total order is
   authoritative only within one owner daemon. Cross-machine order of a shared
