@@ -763,13 +763,17 @@ where
 /// routes each frame by the envelope's own `channel`.
 ///
 /// Per room, independently: the start (`Live`, or resume after its own
-/// cursor), the last delivered cursor, and the router's lag flag. A
-/// lagged room re-resumes from ITS cursor; the other rooms are
-/// re-registered from theirs (`SelectAll` cannot drop one member, and a
-/// resume is gap-free, so the simple rebuild is correct — lag is the
-/// slow-client exception, not the hot path). Order within a room is the
-/// router's; across rooms none was ever promised (they were separate
-/// sockets before).
+/// cursor), the resume point, and the router's lag flag. A lagged room
+/// is re-subscribed from ITS resume point and nothing else is touched:
+/// the merge is a keyed `StreamMap`, so replacing one room's stream
+/// leaves every sibling's queued events in place (Astra's review of
+/// #1523: a rebuild of the whole set dropped a sibling's queued line and
+/// re-opened a cursorless sibling at a newer edge). A room's resume
+/// point before it has delivered anything is the ring head read BEFORE
+/// its live registration, so a lag that drops its first events replays
+/// exactly those; a room empty at attach resumes from the ring start,
+/// which is everything since. Order within a room is the router's;
+/// across rooms none was ever promised (they were separate sockets).
 ///
 /// Not served on a set, refused before the ack: `coalesce_backlog` and
 /// `cursor_heartbeat` (their `AttachCursorAdvanced` frame names no
@@ -805,19 +809,6 @@ where
         )
         .await;
     }
-    // Per-room start and cursor, deduplicated: a room named twice gets
-    // one subscription, the first entry's start.
-    let mut rooms: Vec<(airc_core::RoomId, Option<Cursor>)> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if rooms.iter().any(|(room, _)| *room == entry.channel) {
-            continue;
-        }
-        let from = match entry.start() {
-            AttachStart::After(c) => Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id)),
-            AttachStart::Live | AttachStart::FromTranscriptStart => None,
-        };
-        rooms.push((entry.channel, from));
-    }
     let kinds: Option<Vec<Kind>> = parts
         .kinds
         .map(|k| k.into_iter().map(map_ipc_kind).collect());
@@ -836,33 +827,46 @@ where
         filter.with_headers(headers.clone())
     };
 
-    // Register every room BEFORE the ack, the same subscribe-before-ack
+    /// One room of the set: where a re-subscription resumes, and the
+    /// router's lag flag for its current stream.
+    struct RoomSub {
+        resume: Option<Cursor>,
+        lag: airc_bus::LagFlag,
+    }
+    // Register every room BEFORE the ack — the same subscribe-before-ack
     // contract as the single channel: once the client sees `Ok`, no
-    // room has a gap between ack and registration.
-    let subscribe_all = |rooms: &[(airc_core::RoomId, Option<Cursor>)]| {
-        let mut merged = futures::stream::SelectAll::new();
-        let mut lags: Vec<(airc_core::RoomId, airc_bus::LagFlag)> = Vec::with_capacity(rooms.len());
-        for (room, from) in rooms {
-            let (stream, lag) = match from {
-                // No cursor is the live edge, never a ring replay: a room
-                // that has delivered nothing yet must not re-feed history.
-                None => {
-                    let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(*room));
-                    (stream.boxed(), lag)
-                }
-                Some(cursor) => {
-                    let (stream, lag) = state
-                        .router
-                        .subscribe_with_lag(filter_for(*room), Some(*cursor));
-                    (stream.boxed(), lag)
-                }
-            };
-            merged.push(stream);
-            lags.push((*room, lag));
+    // room has a gap between ack and registration. A room named twice
+    // gets one subscription, the first entry's start.
+    let mut subs: std::collections::HashMap<airc_core::RoomId, RoomSub> = Default::default();
+    let mut merged: tokio_stream::StreamMap<
+        airc_core::RoomId,
+        futures::stream::BoxStream<'static, Arc<Envelope>>,
+    > = tokio_stream::StreamMap::new();
+    for entry in entries {
+        if subs.contains_key(&entry.channel) {
+            continue;
         }
-        (merged, lags)
-    };
-    let mut pending = Some(subscribe_all(&rooms));
+        let room = entry.channel;
+        let (stream, lag, resume) = match entry.start() {
+            AttachStart::After(c) => {
+                let cursor = Cursor::new(Seq::new(c.epoch, c.counter), c.event_id);
+                let (stream, lag) = state
+                    .router
+                    .subscribe_with_lag(filter_for(room), Some(cursor));
+                (stream.boxed(), lag, Some(cursor))
+            }
+            // No cursor is the live edge, never a ring replay. The resume
+            // point is the head read BEFORE registering, so a lag before
+            // the first delivery replays exactly what was dropped.
+            AttachStart::Live | AttachStart::FromTranscriptStart => {
+                let edge = state.router.head_cursor(room);
+                let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
+                (stream.boxed(), lag, edge)
+            }
+        };
+        merged.insert(room, stream);
+        subs.insert(room, RoomSub { resume, lag });
+    }
     write_response(&mut writer, &Response::Ok).await?;
 
     let shutdown = state.shutdown.notified();
@@ -871,33 +875,37 @@ where
     tokio::pin!(hangup);
 
     loop {
-        let (merged, lags) = pending.take().unwrap_or_else(|| subscribe_all(&rooms));
-        tokio::pin!(merged);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => return Ok(()),
-                _ = &mut hangup => return Ok(()),
-                next = merged.next() => match next {
-                    Some(env) => {
-                        if let Some((_, from)) = rooms.iter_mut().find(|(room, _)| *room == env.channel) {
-                            *from = Some(env.cursor());
-                        }
-                        tokio::select! {
-                            _ = &mut shutdown => return Ok(()),
-                            _ = &mut hangup => return Ok(()),
-                            result = write_event_response(&mut writer, &env, &state.shared_frames) => result?,
-                        }
-                        // One room dropped a live push: rebuild from every
-                        // room's cursor (gap-free) rather than carry a hole.
-                        if lags.iter().any(|(_, lag)| lag.is_lagged()) {
-                            break;
-                        }
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return Ok(()),
+            _ = &mut hangup => return Ok(()),
+            next = merged.next() => match next {
+                Some((room, env)) => {
+                    if let Some(sub) = subs.get_mut(&room) {
+                        sub.resume = Some(env.cursor());
                     }
-                    // Every router stream ended: the router is shutting down.
-                    None => return Ok(()),
-                },
-            }
+                    tokio::select! {
+                        _ = &mut shutdown => return Ok(()),
+                        _ = &mut hangup => return Ok(()),
+                        result = write_event_response(&mut writer, &env, &state.shared_frames) => result?,
+                    }
+                    // Only a room that dropped a live push is re-subscribed,
+                    // from its own resume point; its siblings keep their
+                    // streams and everything queued on them.
+                    for (room, sub) in subs.iter_mut() {
+                        if !sub.lag.is_lagged() {
+                            continue;
+                        }
+                        let (stream, lag) = state
+                            .router
+                            .subscribe_with_lag(filter_for(*room), sub.resume);
+                        merged.insert(*room, stream.boxed());
+                        sub.lag = lag;
+                    }
+                }
+                // Every router stream ended: the router is shutting down.
+                None => return Ok(()),
+            },
         }
     }
 }
@@ -1298,6 +1306,112 @@ mod shared_frame_cancellation_tests {
             tokio::time::timeout(Duration::from_secs(2), task)
                 .await
                 .expect("client hang-up ends the set stream")
+                .unwrap()
+                .unwrap();
+        }
+
+        // what this catches (Astra's review of #1523): a lag on ONE room must not
+        // touch its siblings. The writer is held (the client does not read), A's
+        // router buffer overflows so A lags, and a B line is queued meanwhile.
+        // Rebuilding the whole set re-subscribed B live and dropped that queued
+        // line. Now only A is re-subscribed from its own resume point: B's line
+        // arrives exactly once, A's lines stay in order with no duplicate, and
+        // A keeps delivering after the lag.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_lag_on_one_room_leaves_its_siblings_queued_events_untouched() {
+            let state = state().await;
+            let a = RoomId::new();
+            let b = RoomId::new();
+            let (mut client, daemon) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(vec![
+                ChannelAttach {
+                    channel: a,
+                    from: None,
+                },
+                ChannelAttach {
+                    channel: b,
+                    from: None,
+                },
+            ]);
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+            // Nobody reads the client: the daemon's writer blocks on the duplex,
+            // A's 1024-slot subscriber buffer fills, and the rest is dropped (lag).
+            // Durable lines, so the resume can replay what the lag dropped. The
+            // write-behind sink is bounded too: when it reports saturation the
+            // publish yields and retries, which is backpressure, not a failure.
+            async fn publish_durable(state: &DaemonState, env: Envelope) {
+                loop {
+                    match state.router.publish(env.clone()).await {
+                        Ok(_) => return,
+                        Err(airc_bus::BusError::WriteBehindSaturated) => {
+                            tokio::task::yield_now().await
+                        }
+                        Err(e) => panic!("publish failed: {e:?}"),
+                    }
+                }
+            }
+            let flood = 1600usize;
+            for i in 0..flood {
+                let text: &'static str = Box::leak(format!("a-{i:04}").into_boxed_str());
+                publish_durable(&state, chat(a, text)).await;
+            }
+            publish_durable(&state, chat(b, "b-queued-during-lag")).await;
+            publish_durable(&state, chat(a, "a-final")).await;
+
+            let mut a_seen: Vec<String> = Vec::new();
+            let mut b_seen = 0usize;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let env = next_event(&mut client).await;
+                let text = String::from_utf8(env.payload.to_vec()).unwrap();
+                if env.channel == b {
+                    assert_eq!(text, "b-queued-during-lag");
+                    b_seen += 1;
+                } else {
+                    a_seen.push(text);
+                }
+                if b_seen == 1 && a_seen.last().is_some_and(|t| t == "a-final") {
+                    break;
+                }
+            }
+            assert_eq!(b_seen, 1, "the sibling's queued line arrives exactly once");
+            assert_eq!(
+                a_seen.last().map(String::as_str),
+                Some("a-final"),
+                "A resumed after its lag"
+            );
+            let mut sorted = a_seen.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                a_seen.len(),
+                "A never repeats a line across its resume"
+            );
+            let numbered: Vec<&String> = a_seen.iter().filter(|t| t.starts_with("a-")).collect();
+            assert!(
+                numbered.windows(2).all(|w| w[0] <= w[1]),
+                "A's order is kept across the resume"
+            );
+            // The lag is certain by construction: the daemon is blocked writing
+            // into a 1 KiB duplex while A's 1024-slot buffer takes 1601 pushes.
+            // Gap-free delivery is the resume replaying the dropped lines from
+            // the durable sink, which is the single-channel contract kept per room.
+            assert_eq!(
+                a_seen.len(),
+                flood + 1,
+                "A's resume replays every dropped line"
+            );
+
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
                 .unwrap()
                 .unwrap();
         }

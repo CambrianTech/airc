@@ -288,6 +288,7 @@ dependencies = [
  "futures",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "uuid",
 ]
 
