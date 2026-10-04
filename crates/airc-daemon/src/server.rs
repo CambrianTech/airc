@@ -1426,9 +1426,14 @@ mod shared_frame_cancellation_tests {
         // what this catches (Astra's re-review of #1523): the ring is RAM, so a
         // daemon that restarted over a durable transcript has an EMPTY ring and a
         // full store. A room's pre-first-delivery resume point read from the ring
-        // alone is None, and the first lag then replays the room's whole history
-        // into a live subscriber. The baseline must fall through to the durable
-        // tip: after the lag, nothing published before the attach is delivered.
+        // alone is None, and a lag on that room before its first delivery then
+        // replays the room's whole history into a live subscriber. The shape that
+        // exercises the baseline is two rooms: A delivers and drives the loop, B
+        // overflows before delivering anything, so B is re-subscribed from its
+        // BASELINE, not from a delivered cursor. (A one-room version cannot tell
+        // the baselines apart: a room's resume point is set from its first event
+        // before any lag is judged. Mutation-checked: the ring-only baseline
+        // fails this test.)
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_cold_ring_over_a_durable_transcript_never_replays_history_on_a_first_lag() {
             let home = tempfile::tempdir().unwrap();
@@ -1447,61 +1452,106 @@ mod shared_frame_cancellation_tests {
                 .await
                 .unwrap()
             };
-            let room = RoomId::new();
-            // The first daemon generation writes durable history through its router.
+            let a = RoomId::new();
+            let b = RoomId::new();
+            // The first daemon generation writes B's durable history through its router.
             let warm = Arc::new(build(home.path().to_owned(), store.clone()).await);
             for i in 0..20 {
-                let text: &'static str = Box::leak(format!("old-{i:02}").into_boxed_str());
-                publish_durable(&warm, chat(room, text)).await;
+                let text: &'static str = Box::leak(format!("b-old-{i:02}").into_boxed_str());
+                publish_durable(&warm, chat(b, text)).await;
             }
-            // Let the write-behind land before the "restart".
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // The write-behind must have landed in the store before the "restart",
+            // or the second generation has no durable history and the test proves nothing.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while warm.router.sink_head_cursor(b).await.is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the durable sink never received the history"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             drop(warm);
-            // The second generation: same store, cold ring.
+            // The second generation: same store, cold ring, durable history present.
             let state = Arc::new(build(home.path().to_owned(), store).await);
             assert!(
-                state.router.head_cursor(room).is_none(),
+                state.router.head_cursor(b).is_none(),
                 "the ring is cold after a restart"
+            );
+            assert!(
+                state.router.sink_head_cursor(b).await.is_some(),
+                "the durable transcript survives the restart"
             );
 
             let (mut client, daemon) = tokio::io::duplex(1024);
             let (reader, writer) = tokio::io::split(daemon);
-            let request = AttachRequest::channel_set(vec![ChannelAttach {
-                channel: room,
-                from: None,
-            }]);
+            let request = AttachRequest::channel_set(vec![
+                ChannelAttach {
+                    channel: a,
+                    from: None,
+                },
+                ChannelAttach {
+                    channel: b,
+                    from: None,
+                },
+            ]);
             let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
             assert!(matches!(
                 read_frame::<_, Response>(&mut client).await.unwrap(),
                 Some(Response::Ok)
             ));
-            // Lag before the first delivery: the writer is held and the buffer overflows.
-            for i in 0..1300 {
-                let text: &'static str = Box::leak(format!("new-{i:04}").into_boxed_str());
-                publish_durable(&state, chat(room, text)).await;
+            // The writer is held (nobody reads). A gets a few lines; B overflows its
+            // 1024-slot buffer before any of its lines could be written. When the
+            // client drains, A's lines drive the loop, B is seen lagged with nothing
+            // delivered, and B is re-subscribed from its baseline.
+            // A's lines are bigger than the 1 KiB pipe, so the writer blocks on A's
+            // FIRST frame and no B frame is written before B overflows; otherwise B's
+            // resume point would come from a delivered line and the baseline would be
+            // unused (the one-room version of this test passed its own mutation).
+            for i in 0..3 {
+                let text: &'static str =
+                    Box::leak(format!("a-{i}-{}", "x".repeat(700)).into_boxed_str());
+                publish_durable(&state, chat(a, text)).await;
             }
-            publish_durable(&state, chat(room, "new-final")).await;
+            let b_new = 1300usize;
+            for i in 0..b_new {
+                let text: &'static str = Box::leak(format!("b-new-{i:04}").into_boxed_str());
+                publish_durable(&state, chat(b, text)).await;
+            }
+            publish_durable(&state, chat(b, "b-final")).await;
+
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let mut seen = 0usize;
+            let mut b_seen: Vec<String> = Vec::new();
             loop {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "new-final never arrived"
+                    "b-final never arrived"
                 );
                 let env = next_event(&mut client).await;
+                if env.channel != b {
+                    continue;
+                }
                 let text = String::from_utf8(env.payload.to_vec()).unwrap();
                 assert!(
-                    !text.starts_with("old-"),
+                    !text.starts_with("b-old-"),
                     "history from before the attach was replayed into a live subscriber: {text}"
                 );
-                seen += 1;
-                if text == "new-final" {
+                b_seen.push(text);
+                if b_seen.last().is_some_and(|t| t == "b-final") {
                     break;
                 }
             }
+            let mut dedup = b_seen.clone();
+            dedup.sort();
+            dedup.dedup();
             assert_eq!(
-                seen, 1301,
-                "every post-attach line, gap-free across the resume"
+                dedup.len(),
+                b_seen.len(),
+                "B never repeats a line across its resume"
+            );
+            assert_eq!(
+                b_seen.len(),
+                b_new + 1,
+                "every post-attach B line, gap-free across the resume"
             );
             drop(client);
             tokio::time::timeout(Duration::from_secs(2), task)
