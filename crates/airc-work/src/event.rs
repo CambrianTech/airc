@@ -871,8 +871,12 @@ mod tests {
                 Err(SubmissionRejectionReason::SettledCard)
             );
         }
+        // Card d826e5f1: her own submissions and state change renewed her lease
+        // (claimed at 20 with ttl 1000; last owner event at 50), so it ends at 1050,
+        // not 1020. Past the RENEWED end, an expired claim is still refused.
+        assert_eq!(card.claim_expires_at_ms, Some(1050));
         let expired = WorkSubmission {
-            submitted_at_ms: 1020,
+            submitted_at_ms: card.claim_expires_at_ms.unwrap(),
             ..fresh.clone()
         };
         assert_eq!(

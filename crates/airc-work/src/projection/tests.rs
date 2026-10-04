@@ -2020,3 +2020,121 @@ fn relink_for_unknown_card_errors_strict_and_skips_windowed() {
     );
     assert_eq!(projection.apply_windowed(&event), Ok(()));
 }
+
+fn durable_fixture(at: u64) -> (WorkBoardProjection, WorkCardId, ClaimId, PeerId) {
+    let card_id = WorkCardId::from_u128(41);
+    let alice_claim = ClaimId::from_u128(42);
+    let alice = peer(43);
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "her card".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: alice,
+            created_at_ms: at,
+            reviews: None,
+            origin: None,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
+            card_id,
+            claim_id: alice_claim,
+            owner: alice,
+            ttl_ms: 100,
+            claimed_at_ms: at + 1,
+            origin: ClaimOrigin::Explicit,
+        }))
+        .unwrap();
+    (projection, card_id, alice_claim, alice)
+}
+
+fn stranger_claims(projection: &mut WorkBoardProjection, card_id: WorkCardId, at: u64) -> ClaimId {
+    let bob_claim = ClaimId::from_u128(52);
+    projection
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
+            card_id,
+            claim_id: bob_claim,
+            owner: peer(53),
+            ttl_ms: 100,
+            claimed_at_ms: at,
+            origin: ClaimOrigin::Explicit,
+        }))
+        .unwrap();
+    bob_claim
+}
+
+// what this catches: card d826e5f1. Kimi's lapsed lease made her own card claimable,
+// and on 2026-09-21 her finished card went to another peer. From the cutover on, a
+// stranger's claim on an owned card is dropped on every node; before it, history
+// replays unchanged; and an explicit, attributed release still hands the card over.
+#[test]
+fn ownership_is_durable_from_the_cutover_and_handover_is_explicit() {
+    let cut = OWNERSHIP_DURABLE_SINCE_MS;
+
+    let (mut after, card_id, alice_claim, alice) = durable_fixture(cut);
+    stranger_claims(&mut after, card_id, cut + 500); // her lease lapsed at cut + 101
+    let card = after.card(card_id).unwrap();
+    assert_eq!(card.owner, Some(alice), "a lapsed lease is not a handover");
+    assert_eq!(card.claim_id, Some(alice_claim));
+
+    let (mut before, card_id, _, _) = durable_fixture(1);
+    let bob_claim = stranger_claims(&mut before, card_id, 200);
+    assert_eq!(
+        before.card(card_id).unwrap().claim_id,
+        Some(bob_claim),
+        "pre-cutover history replays as it always did"
+    );
+
+    after
+        .apply(&WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id: alice_claim,
+            owner: peer(53),
+            reason: Some("handover: Alice is gone".into()),
+            released_at_ms: cut + 600,
+        }))
+        .unwrap();
+    let bob_claim = stranger_claims(&mut after, card_id, cut + 700);
+    assert_eq!(
+        after.card(card_id).unwrap().claim_id,
+        Some(bob_claim),
+        "explicit handover works"
+    );
+}
+
+// what this catches: the owner working her card is presence. Her own state change
+// renews her lease by the ttl she claimed with; a stranger's event does not.
+#[test]
+fn the_owners_own_events_renew_her_lease() {
+    let (mut projection, card_id, _, alice) = durable_fixture(1_000);
+    assert_eq!(
+        projection.card(card_id).unwrap().claim_expires_at_ms,
+        Some(1_101)
+    );
+    let change = |by: PeerId, at: u64| {
+        WorkEvent::CardStateChanged(CardStateChanged {
+            card_id,
+            state: CardState::InProgress,
+            changed_by: by,
+            changed_at_ms: at,
+        })
+    };
+    projection.apply(&change(alice, 1_090)).unwrap();
+    assert_eq!(
+        projection.card(card_id).unwrap().claim_expires_at_ms,
+        Some(1_190)
+    );
+    projection.apply(&change(peer(53), 1_150)).unwrap();
+    assert_eq!(
+        projection.card(card_id).unwrap().claim_expires_at_ms,
+        Some(1_190),
+        "a stranger's event is not her presence"
+    );
+}

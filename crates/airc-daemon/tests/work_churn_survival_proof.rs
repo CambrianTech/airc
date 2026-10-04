@@ -1,3 +1,11 @@
+//! CONTRACT CHANGE (card d826e5f1, Joel 2026-10-04): ownership is durable and the
+//! lease is presence. From `OWNERSHIP_DURABLE_SINCE_MS` on, Bob's implicit reclaim
+//! below is dropped by the projection and refused at the SDK gate; work still
+//! outlives Alice, through an explicit, attributed `ClaimReleased` of her claim and
+//! then Bob's claim. This file's transcript uses t=1..301, before the cutover, so it
+//! now proves that HISTORICAL boards replay unchanged. The post-cutover contract
+//! is pinned by airc-work `ownership_is_durable_from_the_cutover_and_handover_is_explicit`.
+//!
 //! Card 75b54d0a — flywheel continuity under agent/machine churn:
 //!
 //! > Work must outlive any participant.

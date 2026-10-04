@@ -1397,8 +1397,11 @@ impl Airc {
                 .find(|claim| claim.card_id == card.card_id)
                 .cloned();
             let open = card.state == airc_work::CardState::Open && card.claim_id.is_none();
+            // A lapsed lease is claimable only by its owner, as a resume: ownership is
+            // durable (card d826e5f1), so advertising it to anyone else invites a refusal.
             let stale_claimable = query.include_stale_claims
                 && stale_claim.is_some()
+                && card.owner == Some(peer_id)
                 && !matches!(
                     card.state,
                     airc_work::CardState::Merged | airc_work::CardState::Closed
@@ -1526,37 +1529,36 @@ impl Airc {
                 room_id: room.channel,
             });
         };
-        if let Some(claim_id) = owner_resumes(card, self.peer_id()) {
-            return Ok(ClaimGate::Resume(claim_id));
-        }
-        // Settled work is history, not backlog: a Review/Merged/Closed card is
-        // past claiming regardless of lease status. Live evidence (2026-07-24):
-        // personas kept re-claiming already-completed cards because this guard
-        // only checked lease expiry — the board read as open work forever.
-        // Reopening is an explicit `airc work state` transition, never a claim.
-        // The predicate lives on CardState so the surfaces that ADVERTISE
-        // claimability answer with the same rule this gate enforces.
-        if card.state.is_settled() {
-            return Err(AircError::WorkCardNotClaimable {
-                card_id,
-                state: card.state,
-            });
-        }
-        let now_ms = now_ms()?;
-        if card.claim_id.is_none()
-            || card
-                .claim_expires_at_ms
-                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
-        {
-            return Ok(ClaimGate::Fresh);
-        }
-
-        Err(AircError::WorkCardAlreadyClaimed {
-            card_id,
-            claim_id: card.claim_id,
-            owner: card.owner,
-        })
+        claim_gate_for(card, self.peer_id())
     }
+}
+
+/// The claim gate over one card, pure so every branch is testable without peers.
+///
+/// - the owner with her claim standing resumes it (card 4fee35cf);
+/// - settled work is past claiming for everyone else;
+/// - ownership is durable (card d826e5f1): while another owner's claim stands, lapsed
+///   lease or not, a stranger is refused. Handover is an explicit release first.
+fn claim_gate_for(card: &WorkCard, me: airc_core::PeerId) -> Result<ClaimGate, AircError> {
+    if let Some(claim_id) = owner_resumes(card, me) {
+        return Ok(ClaimGate::Resume(claim_id));
+    }
+    // Settled work is history, not backlog: a Review/Merged/Closed card is past
+    // claiming. Reopening is an explicit `airc work state` transition, never a claim.
+    if card.state.is_settled() {
+        return Err(AircError::WorkCardNotClaimable {
+            card_id: card.card_id,
+            state: card.state,
+        });
+    }
+    if card.claim_id.is_none() {
+        return Ok(ClaimGate::Fresh);
+    }
+    Err(AircError::WorkCardAlreadyClaimed {
+        card_id: card.card_id,
+        claim_id: card.claim_id,
+        owner: card.owner,
+    })
 }
 
 /// What a claim request turns into once the gate has read the board.
@@ -1691,6 +1693,37 @@ mod tests {
             after.claim_expires_at_ms.unwrap() > now_ms().unwrap(),
             "lease is live again"
         );
+    }
+
+    // what this catches: card d826e5f1. Ownership is durable at the gate too: a lapsed
+    // lease never lets a stranger in, the owner resumes, and only an unowned open card
+    // takes a fresh claim.
+    #[test]
+    fn a_stranger_never_takes_an_owned_card_even_after_its_lease_lapses() {
+        let alice = airc_core::PeerId::from_u128(7);
+        let bob = airc_core::PeerId::from_u128(8);
+        let claim = ClaimId::new();
+        let mut card: WorkCard = serde_json::from_value(serde_json::json!({
+            "card_id": WorkCardId::new(), "repo": "fixture/r", "title": "t",
+            "priority": "p1", "state": "claimed", "created_by": alice,
+            "created_at_ms": 1, "updated_at_ms": 1
+        }))
+        .unwrap();
+        card.owner = Some(alice);
+        card.claim_id = Some(claim);
+        card.claim_expires_at_ms = Some(2); // long lapsed
+        assert!(matches!(
+            claim_gate_for(&card, bob),
+            Err(AircError::WorkCardAlreadyClaimed { .. })
+        ));
+        assert_eq!(
+            claim_gate_for(&card, alice).unwrap(),
+            ClaimGate::Resume(claim)
+        );
+        card.owner = None;
+        card.claim_id = None;
+        card.state = CardState::Open;
+        assert_eq!(claim_gate_for(&card, bob).unwrap(), ClaimGate::Fresh);
     }
 
     // what this catches: the owner pass is hers alone and stops at terminal states.
