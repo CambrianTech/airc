@@ -35,13 +35,7 @@ pub async fn run_create(
     // Resolve ONCE, like `run_state`: `--room` names the project board the card belongs
     // to without moving the scope's pointer. Without it, a card lands wherever that
     // pointer is, which put Continuum cards on the org room's board (2026-10-04).
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "create a work card in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "create a work card in").await?;
     let card_id = airc
         .create_work_card_in(
             &room,
@@ -127,13 +121,7 @@ pub async fn run_review(
 
     // Resolve once: parent lookup and sibling publication must share a room,
     // even if another client changes this scope's default during the command.
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "review work in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "review work in").await?;
     let board = airc.work_board_in(&room).await?;
     let parent = board.card(parent_card_id).ok_or_else(|| {
         format!(
@@ -199,6 +187,7 @@ fn format_review_title(parent_title: &str) -> String {
 
 pub async fn run_claim(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     ttl_ms: u64,
     no_lease_required: bool,
@@ -273,13 +262,16 @@ pub async fn run_claim(
     }
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
+    let room = room_or_current(&airc, room.as_deref(), "claim work in").await?;
     let claim_id = airc
-        .claim_work_card_with_origin(
+        .claim_work_card_with_provenance_in(
+            &room,
             ClaimWorkCard {
                 card_id: card_uuid,
                 ttl_ms,
             },
             airc_work::ClaimOrigin::Explicit,
+            None,
         )
         .await?;
     println!("claim_id: {claim_id}");
@@ -290,7 +282,9 @@ pub async fn run_claim(
     // tell). Best-effort: a git failure does NOT undo the claim or
     // the lease — the claim is the authoritative record, the
     // worktree is convenience around it.
-    if let Err(error) = crate::work_commands_git::spawn_claim_worktree(&airc, card_uuid).await {
+    if let Err(error) =
+        crate::work_commands_git::spawn_claim_worktree(&airc, &room, card_uuid).await
+    {
         eprintln!("airc: worktree spawn skipped — {error}");
     }
     Ok(())
@@ -344,13 +338,7 @@ pub async fn run_release(
         Some(raw) => parse_claim_id(&raw)?,
         None => resolve_my_active_claim(&airc, card_uuid).await?,
     };
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "release a claim in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "release a claim in").await?;
     airc.release_work_claim_in(
         &room,
         ReleaseWorkClaim {
@@ -390,6 +378,20 @@ async fn resolve_my_active_claim(
     }
 }
 
+/// The room a work verb acts in: `--room` resolved by name or channel (refusing a
+/// room this scope is not subscribed to), else the scope's current room. ONE place
+/// for the choice every `--room` verb makes; it never moves the current-room pointer.
+async fn room_or_current(
+    airc: &airc_lib::Airc,
+    room: Option<&str>,
+    verb: &str,
+) -> Result<airc_lib::Room, Box<dyn std::error::Error>> {
+    Ok(match room {
+        Some(requested) => airc.room_by_name_or_channel(requested, verb).await?,
+        None => airc.current_room().await?,
+    })
+}
+
 pub async fn run_heartbeat(
     home: &Path,
     room: Option<String>,
@@ -400,13 +402,7 @@ pub async fn run_heartbeat(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let claim_uuid = parse_claim_id(&claim_id)?;
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "renew a claim in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "renew a claim in").await?;
     airc.heartbeat_work_claim_in(
         &room,
         airc_lib::HeartbeatWorkClaim {
@@ -451,6 +447,7 @@ pub async fn run_heartbeat(
 /// idiom).
 pub async fn run_update(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     title: Option<String>,
     body: Option<String>,
@@ -470,7 +467,8 @@ pub async fn run_update(
         request = request.with_priority(priority.into());
     }
 
-    airc.update_work_card(request).await?;
+    let room = room_or_current(&airc, room.as_deref(), "update a work card in").await?;
+    airc.update_work_card_in(&room, request).await?;
     println!("card_updated: card_id={card_uuid}");
     Ok(())
 }
@@ -488,13 +486,7 @@ pub async fn run_state(
     // Resolve ONCE, like `run_review` and `run_merge` (#1447): the close-gate board
     // read, the state change, the PR link and the review sibling all bind to THIS
     // room — even if another client moves this scope's default mid-command.
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "change work state in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "change work state in").await?;
 
     // Card a1bc62b3 (substrate-target gate): refuse direct CLI writes
     // to states that should only come from substrate observers (e.g.
@@ -1730,12 +1722,14 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
 /// delegate.
 pub async fn run_link(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     pr: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
-    crate::work_commands_gh::link_existing_pr(&airc, card_uuid, pr).await
+    let room = room_or_current(&airc, room.as_deref(), "link a pull request in").await?;
+    crate::work_commands_gh::link_existing_pr(&airc, &room, card_uuid, pr).await
 }
 
 /// Card 09fddedd: `airc work relink <CARD_ID> --pr <number-or-url>` —
@@ -1806,13 +1800,7 @@ pub async fn run_merge(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
 
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "merge work in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "merge work in").await?;
     let board = airc.work_board_in(&room).await?;
     let card = board
         .card(card_uuid)
@@ -2075,13 +2063,7 @@ pub async fn run_board(
     filter: BoardFilter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "read the work board of")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "read the work board of").await?;
     // Continuum #154: the board is always the COMPLETE projection —
     // the old recent-window read lost every durable card to chat
     // traffic in busy rooms. `limit` now caps displayed rows only.

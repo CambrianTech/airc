@@ -894,10 +894,11 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
             }
             WorkAction::Claim {
+                room,
                 card_id,
                 ttl_ms,
                 no_lease_required,
-            } => work_commands::run_claim(&home, card_id, ttl_ms, no_lease_required).await,
+            } => work_commands::run_claim(&home, room, card_id, ttl_ms, no_lease_required).await,
             WorkAction::Heartbeat {
                 room,
                 card_id,
@@ -911,11 +912,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 reason,
             } => work_commands::run_release(&home, room, card_id, claim_id, reason).await,
             WorkAction::Update {
+                room,
                 card_id,
                 title,
                 body,
                 priority,
-            } => work_commands::run_update(&home, card_id, title, body, priority).await,
+            } => work_commands::run_update(&home, room, card_id, title, body, priority).await,
             WorkAction::State {
                 room,
                 card_id,
@@ -1014,7 +1016,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 work_commands::run_merge(&home, room, card_id, dry_run, pending_timeout_secs).await
             }
-            WorkAction::Link { card_id, pr } => work_commands::run_link(&home, card_id, pr).await,
+            WorkAction::Link { room, card_id, pr } => {
+                work_commands::run_link(&home, room, card_id, pr).await
+            }
             WorkAction::Relink { card_id, pr } => {
                 work_commands::run_relink(&home, card_id, pr).await
             }

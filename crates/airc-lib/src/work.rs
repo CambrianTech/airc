@@ -586,15 +586,28 @@ impl Airc {
         origin: airc_work::ClaimOrigin,
         selected_at_ms: Option<u64>,
     ) -> Result<ClaimId, AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
-        if let ClaimGate::Resume(claim_id) = self.claim_gate(request.card_id).await? {
+        let room = self.current_room().await?;
+        self.claim_work_card_with_provenance_in(&room, request, origin, selected_at_ms)
+            .await
+    }
+
+    /// Claim a card on a SPECIFIC room's board without moving the current-room
+    /// pointer (card ad19de1a; the claim sibling of `heartbeat_work_claim_in`).
+    /// Same guard, gate and owner-resume rule, scoped to `room`.
+    pub async fn claim_work_card_with_provenance_in(
+        &self,
+        room: &Room,
+        request: ClaimWorkCard,
+        origin: airc_work::ClaimOrigin,
+        selected_at_ms: Option<u64>,
+    ) -> Result<ClaimId, AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
+        if let ClaimGate::Resume(claim_id) = self.claim_gate_in(room, request.card_id).await? {
             // Her own card, her own claim: renew it, never re-claim it. A new
             // CardClaimed would set the card's state to Claimed and take a Review
             // card out of the merge gate.
-            let room = self.current_room().await?;
             self.heartbeat_work_claim_in(
-                &room,
+                room,
                 HeartbeatWorkClaim {
                     card_id: request.card_id,
                     claim_id,
@@ -614,7 +627,7 @@ impl Airc {
             claimed_at_ms: now_ms()?,
             origin,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(claim_id)
     }
 
@@ -703,8 +716,18 @@ impl Airc {
     /// silently target a card from a different room — same guard
     /// `change_work_card_state` uses.
     pub async fn update_work_card(&self, request: UpdateWorkCard) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.update_work_card_in(&room, request).await
+    }
+
+    /// Amend a card on a SPECIFIC room's board without moving the current-room
+    /// pointer (card ad19de1a). Same guard as [`Airc::update_work_card`].
+    pub async fn update_work_card_in(
+        &self,
+        room: &Room,
+        request: UpdateWorkCard,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::CardUpdated(airc_work::event::CardUpdated {
             claim_selection: None,
             card_id: request.card_id,
@@ -714,7 +737,7 @@ impl Airc {
             updated_by: self.peer_id(),
             updated_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -1516,16 +1539,19 @@ impl Airc {
         })
     }
 
-    /// Whether a claim on `card_id` is a fresh claim or the owner resuming her own.
-    async fn claim_gate(&self, card_id: WorkCardId) -> Result<ClaimGate, AircError> {
-        let room = self.current_room().await?;
+    /// Whether a claim on `card_id` in `room` is a fresh claim or the owner resuming her own.
+    async fn claim_gate_in(
+        &self,
+        room: &Room,
+        card_id: WorkCardId,
+    ) -> Result<ClaimGate, AircError> {
         let board = self
-            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
+            .project_room_work_board(room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         let Some(card) = board.card(card_id) else {
             return Err(AircError::WorkCardNotInCurrentRoom {
                 card_id,
-                room_name: room.name,
+                room_name: room.name.clone(),
                 room_id: room.channel,
             });
         };
@@ -1633,6 +1659,65 @@ fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: card ad19de1a. A card on room A's board is claimed and amended
+    // from a scope whose current room is B, without moving the current-room pointer;
+    // the current-room verbs still refuse it, so the room is an explicit choice.
+    #[tokio::test]
+    async fn claim_and_update_act_on_a_named_rooms_board_without_moving_the_pointer() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room_a = airc.join("board-a").await.unwrap();
+        let card = airc
+            .create_work_card(CreateWorkCard::new(
+                RepoId::new("fixture/room-scoped").unwrap(),
+                "a card on A",
+                Priority::P2,
+            ))
+            .await
+            .unwrap();
+        let room_b = airc.join("board-b").await.unwrap();
+        assert_eq!(airc.current_room().await.unwrap().channel, room_b.channel);
+
+        let request = ClaimWorkCard {
+            card_id: card,
+            ttl_ms: 600_000,
+        };
+        assert!(
+            airc.claim_work_card(request).await.is_err(),
+            "the current-room claim must not reach A's card from B"
+        );
+        let claim = airc
+            .claim_work_card_with_provenance_in(
+                &room_a,
+                request,
+                airc_work::ClaimOrigin::Explicit,
+                None,
+            )
+            .await
+            .expect("a claim on A's board by name");
+        airc.update_work_card_in(
+            &room_a,
+            UpdateWorkCard::amend(card).with_title("renamed on A"),
+        )
+        .await
+        .expect("an update on A's board by name");
+
+        let board = airc.work_board_in(&room_a).await.unwrap();
+        let on_a = board.card(card).unwrap();
+        assert_eq!(on_a.claim_id, Some(claim));
+        assert_eq!(on_a.title, "renamed on A");
+        assert_eq!(
+            airc.current_room().await.unwrap().channel,
+            room_b.channel,
+            "acting on A never moves the pointer off B"
+        );
+    }
 
     // what this catches: card 4fee35cf. Kimi's lease on her own Review card lapsed and
     // her re-claim was refused WorkCardNotClaimable (29 of 42 board calls failed on
