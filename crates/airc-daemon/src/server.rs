@@ -1453,6 +1453,50 @@ mod shared_frame_cancellation_tests {
                 .unwrap();
         }
 
+        // what this catches (2026-10-04, Kimi on the 5090): a persona's channel-set
+        // attach (40 rooms) received durable events only when she authored them;
+        // other nodes' durable events, which enter through the inbound bridge's
+        // publish_if_new_from, never reached her live stream. A live set subscriber
+        // must receive a durable event from another peer arriving by that path, in
+        // a set as large as hers.
+        #[tokio::test]
+        async fn a_live_channel_set_receives_another_nodes_durable_event_via_the_bridge_path() {
+            let state = state().await;
+            let rooms: Vec<RoomId> = (0..40).map(|_| RoomId::new()).collect();
+            let target = rooms[37];
+            let (mut client, daemon) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(daemon);
+            let request = AttachRequest::channel_set(
+                rooms
+                    .iter()
+                    .map(|room| ChannelAttach {
+                        channel: *room,
+                        from: None,
+                    })
+                    .collect(),
+            );
+            let task = tokio::spawn(stream_attach(reader, writer, state.clone(), request));
+            assert!(matches!(
+                read_frame::<_, Response>(&mut client).await.unwrap(),
+                Some(Response::Ok)
+            ));
+            let remote_link = PeerId::new();
+            let outcome = state
+                .router
+                .publish_if_new_from(chat(target, "from-another-node"), Some(remote_link))
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, airc_bus::PublishIfNew::Published(_)),
+                "{outcome:?}"
+            );
+            let got = next_event(&mut client).await;
+            assert_eq!(got.channel, target);
+            assert_eq!(&got.payload[..], b"from-another-node");
+            drop(client);
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
+
         // what this catches (Astra's review of #1523): a lag on ONE room must not
         // touch its siblings. The writer is held (the client does not read), A's
         // router buffer overflows so A lags, and a B line is queued meanwhile.
