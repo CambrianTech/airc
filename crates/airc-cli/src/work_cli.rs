@@ -10,8 +10,12 @@ pub struct WorkArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkAction {
-    /// Create a typed work card in the current room.
+    /// Create a typed work card in the current room, or in `--room`.
     Create {
+        /// Subscribed room whose board gets the card; does not change the current room.
+        /// Without it the card lands wherever the scope's pointer is.
+        #[arg(long)]
+        room: Option<String>,
         /// Repository key, e.g. `CambrianTech/airc`.
         #[arg(long)]
         repo: String,

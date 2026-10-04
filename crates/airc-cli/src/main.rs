@@ -875,12 +875,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Work(args) => match args.action {
             WorkAction::Create {
+                room,
                 repo,
                 title,
                 body,
                 lane_id,
                 priority,
-            } => work_commands::run_create(&home, repo, title, body, lane_id, priority).await,
+            } => work_commands::run_create(&home, room, repo, title, body, lane_id, priority).await,
             WorkAction::Seed {
                 repo,
                 title,
