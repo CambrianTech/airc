@@ -129,6 +129,46 @@ mod tests {
     };
     use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
+    fn canonical_dacl(sddl: &str) -> String {
+        let input: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: input is terminated and descriptor is a writable output.
+        assert_ne!(
+            // SAFETY: input remains live and descriptor receives the allocation.
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    input.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let _descriptor = LocalAllocation(descriptor);
+        let mut text = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: descriptor stays live; both outputs are writable.
+        assert_ne!(
+            // SAFETY: the descriptor and writable output pointers remain valid.
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut count,
+                )
+            },
+            0
+        );
+        let _text = LocalAllocation(text.cast());
+        // SAFETY: the API owns count UTF-16 characters including termination.
+        unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, count as usize)) }
+            .trim_end_matches('\0')
+            .to_owned()
+    }
+
     #[tokio::test]
     async fn kernel_pipe_dacl_contains_only_system_and_current_user() {
         let name = format!(r"\\.\pipe\airc-security-test-{}", uuid::Uuid::new_v4());
@@ -174,7 +214,13 @@ mod tests {
         // The kernel maps generic-all into the pipe's file-all rights. The
         // returned string length can include extra null termination storage.
         let actual = actual.trim_end_matches('\0');
-        let expected = format!("D:P(A;;FA;;;SY)(A;;FA;;;{})", current_user_sid().unwrap());
+        // Windows serializes built-in account SIDs using aliases (for example
+        // LA for Administrator on hosted CI). Canonicalize the exact expected
+        // SID with the same Windows API rather than weakening the ACE check.
+        let expected = canonical_dacl(&format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;{})",
+            current_user_sid().unwrap()
+        ));
         assert_eq!(
             actual, expected,
             "read back actual kernel ACL, not a fixture string"
