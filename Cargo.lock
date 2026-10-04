@@ -201,6 +201,7 @@ name = "airc-bus"
 version = "0.1.0"
 dependencies = [
  "airc-core",
+ "airc-diagnostics",
  "async-stream",
  "async-trait",
  "bytes",
@@ -438,6 +439,7 @@ version = "0.1.0"
 dependencies = [
  "airc-bus",
  "airc-core",
+ "airc-diagnostics",
  "async-trait",
  "base64",
  "bytes",

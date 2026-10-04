@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use airc_bus::{BusError, Clock, EventRouter, RouterConfig, SeqSource, SystemClock};
 use airc_core::PeerId;
+use airc_diagnostics::StderrJsonDiagnosticSink;
 use airc_ipc::{DeliveryStatsResponse, IpcRouteEndpoint};
 use airc_protocol::{PeerKeyRegistry, PeerKeypair, VerificationPolicy};
 use airc_store::{EventStore, SqliteDurableSink};
@@ -141,7 +142,13 @@ impl DaemonState {
         let epoch_store = sink.bump_epoch().await?;
         let seq = Arc::new(SeqSource::start(&epoch_store));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let router = EventRouter::new(RouterConfig::default(), clock, seq, sink);
+        let router = EventRouter::new_with_diagnostics(
+            RouterConfig::default(),
+            clock,
+            seq,
+            sink,
+            Arc::new(StderrJsonDiagnosticSink),
+        );
         Ok(Self {
             shared_frames: crate::shared_frames::SharedFrames::default(),
             peer_id,

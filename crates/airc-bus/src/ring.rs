@@ -10,7 +10,9 @@
 //! find an event that is neither in the ring nor in the ORM yet. The ring
 //! therefore enforces a **capacity floor ≥ max un-persisted backlog**: if the
 //! oldest entry is still pinned when we need room, the ring grows past nominal
-//! capacity rather than drop an unpersisted `Durable` event.
+//! capacity rather than drop an unpersisted `Durable` event. A pinned floor
+//! does not retain an unlimited non-durable tail: those lossy cache entries
+//! remain evictable without punching a hole in the durable suffix.
 //!
 //! This type is **not** internally synchronized — the router owns it behind a
 //! shard mutex and never holds that lock across an `.await`.
@@ -69,9 +71,11 @@ impl HotRing {
         self.evict_to_capacity();
     }
 
-    /// Drop oldest entries until at nominal capacity, but **never** evict a
-    /// pinned (un-persisted `Durable`) entry — that would violate the no-gap
-    /// precondition. Eviction stops at the first pinned entry from the front.
+    /// Drop the oldest safe entries until at nominal capacity. Behind a pinned
+    /// head, ONLY non-durable entries may be reclaimed: removing a persisted
+    /// durable there would punch a hole in the durable suffix that the router's
+    /// ring/deep-replay merge assumes is complete. The retained writer batch
+    /// plus its bounded queue bound the unpersisted durable floor separately.
     fn evict_to_capacity(&mut self) {
         while self.slots.len() > self.capacity {
             match self.slots.front() {
@@ -79,9 +83,20 @@ impl HotRing {
                 Some(slot) if !slot.pinned => {
                     self.slots.pop_front();
                 }
-                // Front is pinned -> floor reached; stop. The ring exceeds
-                // nominal capacity until write-behind confirms (§3.8 floor).
-                _ => break,
+                // A failed/slow write must not pin an unbounded lossy tail.
+                // Live fan-out is independent of this bounded recent cache;
+                // these classes are outside the durable replay guarantee.
+                Some(_) => match self
+                    .slots
+                    .iter()
+                    .position(|slot| !slot.env.delivery.is_durable())
+                {
+                    Some(index) => {
+                        self.slots.remove(index);
+                    }
+                    None => break, // only the durable floor remains
+                },
+                None => break,
             }
         }
     }
@@ -199,6 +214,28 @@ mod tests {
             "ring exceeds nominal capacity rather than drop an unpersisted Durable (§3.8 floor)"
         );
         assert_eq!(ring.pinned_count(), 3);
+
+        // A later confirmed durable MUST stay behind the pinned head: deep
+        // replay reads only before the oldest ring cursor. Lossy traffic may
+        // be reclaimed instead, regardless of its live delivery class.
+        ring.mark_persisted(EventId::from_u128(3)); // counter 2
+        for (counter, delivery) in [
+            (3, DeliveryClass::EphemeralWindow),
+            (4, DeliveryClass::StreamChunk),
+            (5, DeliveryClass::RequestResponse),
+        ] {
+            ring.push(Arc::new(env_at(counter, delivery)));
+            assert_eq!(ring.len(), 3, "lossy traffic cannot grow the durable floor");
+        }
+        assert_eq!(
+            ring.replay_after(None)
+                .iter()
+                .map(|env| env.seq.counter)
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+            "pinned and later persisted durables form an intact suffix"
+        );
+        assert_eq!(ring.pinned_count(), 2);
 
         // Confirm persistence of the oldest -> now evictable.
         ring.mark_persisted(EventId::from_u128(1)); // counter 0

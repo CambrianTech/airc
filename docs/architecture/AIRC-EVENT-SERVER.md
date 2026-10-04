@@ -135,6 +135,20 @@ Routing is a memory operation; it never touches the DB.
 - Rebuildable from recent events; it's a projection, not a log.
 
 ### 3.5 Cursor engine — efficient replay
+Retention repair receipt (2026-10-04, card `309566f9`): the existing
+`EventRouter::run_write_behind` now retains a failed batch with capped backoff
+instead of discarding it and leaving its ring pins indefinitely. The existing
+ring reclaims only non-durable cache behind a pinned head; persisted durable
+suffixes remain intact. Daemon construction injects its existing diagnostic
+sink, and the shared diagnostic event adapter maps failure/recovery codes.
+No additional writer, queue or persistence implementation was introduced.
+The existing real SQLite router fixture now forwards `append_batch` and covers
+failure, bounded rejection, non-durable flooding, recovery and replay: 2/2
+tests passed. Bus unit tests passed 25/25; workspace Clippy with warnings denied
+and formatting checks passed. Independent source review found no blockers.
+Installed adoption and heap/consumer measurements remain outstanding; these
+tests do not establish the observed allocator growth's complete cause.
+
 - Cursor = `(seq, event_id)`, `seq = (epoch, counter)`; durable per-subscriber
   position. **Scoped per-owner-per-channel** — a channel's total order is
   authoritative only within one owner daemon. Cross-machine order of a shared
@@ -180,6 +194,15 @@ them away** — they're where a naive cursor contract silently drops or reorders
   until write-behind confirms it's in the ORM — the precondition for "no gap"
   (otherwise an event can be neither in the ring nor persisted at a seam replay).
   Sets a **ring capacity floor ≥ max un-persisted backlog**.
+  A failed batch stays with the same writer and retries with capped backoff;
+  newer batches remain queued so admission backpressure bounds the accepted
+  durable backlog. Only a successful append unpins the batch. Failure and
+  recovery use typed diagnostics, with pinned counts and exponentially spaced
+  failure reminders; diagnostics never enter the failing event queue.
+  A pinned head does not retain unlimited non-durable traffic: the ring may
+  reclaim those lossy cache entries behind it, but retains every durable there
+  so the ring/deep-replay merge still sees a complete durable suffix. This
+  does not change deliver-first receipts or eliminate the unflushed crash tail.
 - **Durable receipt + `await_durable` opt-in.** Default receipt `(event_id, seq)`
   returns after fan-out, before persistence — correct for fire-and-forget chat.
   Durability-critical flows (a command/result the publisher acts on) pass
