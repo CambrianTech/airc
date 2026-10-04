@@ -875,12 +875,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Work(args) => match args.action {
             WorkAction::Create {
+                room,
                 repo,
                 title,
                 body,
                 lane_id,
                 priority,
-            } => work_commands::run_create(&home, repo, title, body, lane_id, priority).await,
+            } => work_commands::run_create(&home, room, repo, title, body, lane_id, priority).await,
             WorkAction::Seed {
                 repo,
                 title,
@@ -898,15 +899,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 no_lease_required,
             } => work_commands::run_claim(&home, card_id, ttl_ms, no_lease_required).await,
             WorkAction::Heartbeat {
+                room,
                 card_id,
                 claim_id,
                 ttl_ms,
-            } => work_commands::run_heartbeat(&home, card_id, claim_id, ttl_ms).await,
+            } => work_commands::run_heartbeat(&home, room, card_id, claim_id, ttl_ms).await,
             WorkAction::Release {
+                room,
                 card_id,
                 claim_id,
                 reason,
-            } => work_commands::run_release(&home, card_id, claim_id, reason).await,
+            } => work_commands::run_release(&home, room, card_id, claim_id, reason).await,
             WorkAction::Update {
                 card_id,
                 title,

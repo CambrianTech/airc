@@ -24,6 +24,7 @@ use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
 
 pub async fn run_create(
     home: &Path,
+    room: Option<String>,
     repo: String,
     title: String,
     body: Option<String>,
@@ -31,17 +32,31 @@ pub async fn run_create(
     priority: CliPriority,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
+    // Resolve ONCE, like `run_state`: `--room` names the project board the card belongs
+    // to without moving the scope's pointer. Without it, a card lands wherever that
+    // pointer is, which put Continuum cards on the org room's board (2026-10-04).
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "create a work card in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
     let card_id = airc
-        .create_work_card(CreateWorkCard {
-            repo: RepoId::new(repo)?,
-            title,
-            body,
-            priority: priority.into(),
-            lane_id: parse_optional_lane_id(lane_id.as_deref())?,
-            reviews: None,
-        })
+        .create_work_card_in(
+            &room,
+            CreateWorkCard {
+                repo: RepoId::new(repo)?,
+                title,
+                body,
+                priority: priority.into(),
+                lane_id: parse_optional_lane_id(lane_id.as_deref())?,
+                reviews: None,
+            },
+        )
         .await?;
     println!("card_id: {card_id}");
+    println!("room:    {}", room.name);
     Ok(())
 }
 
@@ -315,6 +330,7 @@ fn cwd_is_project_root(cwd: &std::path::Path) -> Result<bool, Box<dyn std::error
 
 pub async fn run_release(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     claim_id: Option<String>,
     reason: Option<String>,
@@ -328,11 +344,21 @@ pub async fn run_release(
         Some(raw) => parse_claim_id(&raw)?,
         None => resolve_my_active_claim(&airc, card_uuid).await?,
     };
-    airc.release_work_claim(ReleaseWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        reason,
-    })
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "release a claim in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    airc.release_work_claim_in(
+        &room,
+        ReleaseWorkClaim {
+            card_id: card_uuid,
+            claim_id: claim_uuid,
+            reason,
+        },
+    )
     .await?;
     println!("released: card_id={card_id} claim_id={claim_uuid}");
     Ok(())
@@ -366,6 +392,7 @@ async fn resolve_my_active_claim(
 
 pub async fn run_heartbeat(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     claim_id: String,
     ttl_ms: u64,
@@ -373,11 +400,21 @@ pub async fn run_heartbeat(
     let airc = crate::commands::attached_airc(home).await?;
     let card_uuid = parse_work_card_id(&card_id)?;
     let claim_uuid = parse_claim_id(&claim_id)?;
-    airc.heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        ttl_ms,
-    })
+    let room = match room {
+        Some(ref requested) => {
+            airc.room_by_name_or_channel(requested, "renew a claim in")
+                .await?
+        }
+        None => airc.current_room().await?,
+    };
+    airc.heartbeat_work_claim_in(
+        &room,
+        airc_lib::HeartbeatWorkClaim {
+            card_id: card_uuid,
+            claim_id: claim_uuid,
+            ttl_ms,
+        },
+    )
     .await?;
     println!("claim_heartbeat: card_id={card_id} claim_id={claim_id} ttl_ms={ttl_ms}");
 
@@ -4021,10 +4058,11 @@ mod tests {
     /// 2026-09-21: two peers had reviewed a citizen's submission and the board showed
     /// zero, because the verdict never reached the card.
     ///
-    /// EXACTLY ONE un-scoped `.create_work_card(` is legitimate: `run_create`, where
-    /// "make a card in the room I am standing in" IS the intent. Every other creation
-    /// carries a resolved room. A maintainer who adds a second drops this to >1 and
-    /// breaks the test until they either pass a room or justify the exception here.
+    /// ZERO un-scoped `.create_work_card(` calls remain. `run_create` was the one
+    /// exception ("make a card in the room I am standing in"); since card 5f1d0f95 it
+    /// resolves that room too (the current room, or `--room`) and calls
+    /// `create_work_card_in`, so every creation names its board. A maintainer who adds
+    /// an un-scoped call breaks this test until they pass a resolved room.
     #[test]
     fn a_review_sibling_is_never_created_into_an_unresolved_room() {
         fn production_only(src: &str) -> &str {
@@ -4042,10 +4080,10 @@ mod tests {
                 .count();
 
         assert_eq!(
-            total, 1,
+            total, 0,
             "Found {total} un-scoped `.create_work_card(` calls in production across \
-             work_commands.rs + work_commands_gh.rs. Exactly one is allowed — \
-             `run_create`, where the current room is the intent.\n\n\
+             work_commands.rs + work_commands_gh.rs. None is allowed: even `run_create` \
+             resolves its room (current or `--room`) first.\n\n\
              If you added a card-creation path: resolve the room ONCE in the command \
              and call `create_work_card_in(&room, request)`, the way `run_review` and \
              `auto_spawn_review_card` do. A sibling minted into a room its parent is \

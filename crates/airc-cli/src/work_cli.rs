@@ -10,8 +10,12 @@ pub struct WorkArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkAction {
-    /// Create a typed work card in the current room.
+    /// Create a typed work card in the current room, or in `--room`.
     Create {
+        /// Subscribed room whose board gets the card; does not change the current room.
+        /// Without it the card lands wherever the scope's pointer is.
+        #[arg(long)]
+        room: Option<String>,
         /// Repository key, e.g. `CambrianTech/airc`.
         #[arg(long)]
         repo: String,
@@ -68,6 +72,9 @@ pub enum WorkAction {
     },
     /// Extend this peer's claim lease on a work card.
     Heartbeat {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
         /// Claim UUID returned by `work claim`.
@@ -89,6 +96,9 @@ pub enum WorkAction {
     /// holds, regardless of cwd. So there is no `--no-lease-required`
     /// flag here; release is unconditionally permitted.
     Release {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
         /// Claim UUID returned by `work claim`. Optional — see command help.
