@@ -60,6 +60,9 @@ pub enum WorkAction {
     /// `--no-lease-required` to override — useful for one-shot
     /// admin claims from the main checkout.
     Claim {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
         /// Claim lease duration.
@@ -123,6 +126,9 @@ pub enum WorkAction {
     /// To clear a body, pass `--body ""` (empty string is the
     /// canonical "no body" idiom for markdown).
     Update {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID.
         card_id: String,
         /// New title (omit to leave unchanged).
@@ -377,6 +383,9 @@ pub enum WorkAction {
     /// head/base from `gh` and emits `PullRequestLinked` so the merger
     /// gate picks it up. Idempotent on an already-linked card.
     Link {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
         /// Work card UUID to link the PR to.
         card_id: String,
         /// GitHub PR number to link (e.g. 1471).

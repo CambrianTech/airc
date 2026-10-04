@@ -16,13 +16,12 @@
 /// exists, which lets re-claim after release work without surprise.
 pub(crate) async fn spawn_claim_worktree(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Need the card's title for the branch slug — board projection
-    // is the source of truth.
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    // Need the card's title for the branch slug — the board of the room the card
+    // was claimed in is the source of truth.
+    let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;

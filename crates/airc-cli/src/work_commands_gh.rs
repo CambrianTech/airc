@@ -210,17 +210,16 @@ pub(crate) fn configured_base_branch(repo: &airc_work::RepoId) -> Option<String>
 /// Idempotent: re-linking a card that already has a PR is a no-op.
 pub(crate) async fn link_existing_pr(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
     pr_number: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_work::model::{BranchName, PullRequestRef};
 
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
-        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+        .ok_or_else(|| format!("card {card_id} not visible in room {}'s board", room.name))?;
     if let Some(existing) = &card.pull_request {
         println!(
             "pull_request already linked: card={card_id} pr=#{} ({})",
@@ -280,10 +279,13 @@ pub(crate) async fn link_existing_pr(
         head: BranchName::new(head)?,
         base: BranchName::new(base)?,
     };
-    airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
-        card_id,
-        pull_request,
-    })
+    airc.link_card_pull_request_in(
+        room,
+        airc_lib::LinkCardPullRequest {
+            card_id,
+            pull_request,
+        },
+    )
     .await?;
     println!("pull_request_linked: card={card_id} pr=#{pr_number}");
     Ok(())
