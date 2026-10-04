@@ -57,7 +57,9 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
                     .connected_lan_peers
                     .load(std::sync::atomic::Ordering::Relaxed),
                 connections: Some(state.connections.load(std::sync::atomic::Ordering::Relaxed)),
+                channel_count: Some(retained.channel_count),
                 ring_entries_total: Some(retained.ring_entries_total),
+                ring_bytes_total: Some(retained.ring_bytes_total),
                 ring_pinned_total: Some(retained.ring_pinned_total),
                 write_behind_queued: Some(retained.write_behind_queued),
                 subscriber_queue_depth_total: Some(retained.subscriber_queue_depth_total),

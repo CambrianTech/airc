@@ -60,6 +60,12 @@ pub struct RouterConfig {
     /// Nominal per-channel hot-ring capacity. The §3.8 floor means a ring may
     /// temporarily exceed this while un-persisted `Durable` entries are pinned.
     pub ring_capacity: usize,
+    /// Per-channel hot-ring byte budget (payload + headers + coalesce key).
+    /// Bounds a channel of large envelopes the count cannot: 1 MiB keeps the
+    /// recent tail in RAM for chat-sized traffic while ~55 channels cost at
+    /// most ~55 MiB, where the count alone reached ~7.5 MB per channel. Older
+    /// replay falls through to the durable tier (§3.5). Same §3.8 floor.
+    pub ring_byte_budget: usize,
     /// Bound on each subscriber's live channel. Full = subscriber is lagged.
     pub subscriber_buffer: usize,
     /// Bound on the write-behind queue (§3.8 ≥ ring floor).
@@ -73,6 +79,7 @@ impl Default for RouterConfig {
         Self {
             shards: 16,
             ring_capacity: 256,
+            ring_byte_budget: 1 << 20,
             subscriber_buffer: 1024,
             write_behind_buffer: 1024,
             ephemeral_ttl_ms: 30_000,
@@ -100,10 +107,10 @@ struct ChannelState {
 }
 
 impl ChannelState {
-    fn new(ring_capacity: usize, ephemeral_ttl_ms: u64) -> Self {
+    fn new(config: &RouterConfig) -> Self {
         Self {
-            ring: HotRing::new(ring_capacity),
-            ephemeral: EphemeralCache::new(ephemeral_ttl_ms),
+            ring: HotRing::new(config.ring_capacity, config.ring_byte_budget),
+            ephemeral: EphemeralCache::new(config.ephemeral_ttl_ms),
             subscribers: SubscriberIndex::new(),
         }
     }
@@ -291,7 +298,11 @@ pub struct EventRouter {
 /// Scalar holder snapshot, not unique heap bytes or an atomic global census.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionSnapshot {
+    /// Live channel states (each holds one ring + ephemeral cache).
+    pub channel_count: usize,
     pub ring_entries_total: usize,
+    /// Retained payload + header bytes across all rings (not allocator bytes).
+    pub ring_bytes_total: usize,
     pub ring_pinned_total: usize,
     /// Occupied admission slots, including reserved permits; excludes the
     /// writer's retained in-flight/retry batch (at most MAX_BATCH entries).
@@ -627,12 +638,9 @@ impl EventRouter {
             let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             let key = env.channel.0.as_u128();
             let is_new = !map.contains_key(&key);
-            let state = map.entry(key).or_insert_with(|| {
-                ChannelState::new(
-                    self.inner.config.ring_capacity,
-                    self.inner.config.ephemeral_ttl_ms,
-                )
-            });
+            let state = map
+                .entry(key)
+                .or_insert_with(|| ChannelState::new(&self.inner.config));
             if is_new {
                 self.inner.channels_created.fetch_add(1, Ordering::SeqCst);
             }
@@ -1181,9 +1189,9 @@ impl EventRouter {
             let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             let key = channel.0.as_u128();
             let is_new = !map.contains_key(&key);
-            let state = map.entry(key).or_insert_with(|| {
-                ChannelState::new(inner.config.ring_capacity, inner.config.ephemeral_ttl_ms)
-            });
+            let state = map
+                .entry(key)
+                .or_insert_with(|| ChannelState::new(&inner.config));
             if is_new {
                 inner.channels_created.fetch_add(1, Ordering::SeqCst);
             }
@@ -1446,8 +1454,10 @@ impl EventRouter {
         };
         for shard in &self.inner.shards {
             let channels = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            snapshot.channel_count += channels.len();
             for state in channels.values() {
                 snapshot.ring_entries_total += state.ring.len();
+                snapshot.ring_bytes_total += state.ring.retained_bytes();
                 snapshot.ring_pinned_total += state.ring.pinned_count();
                 for subscriber in state.subscribers.values() {
                     // This owner only uses try_send, never outstanding permits.
