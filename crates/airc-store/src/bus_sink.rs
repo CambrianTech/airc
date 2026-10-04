@@ -4,9 +4,10 @@
 //! This replaces the in-memory test sink (`airc_bus::InMemoryDurableSink`)
 //! with a SeaORM-backed SQLite store so the owner-core's `Durable`
 //! envelopes persist and replay from disk. The owner daemon is the
-//! **single writer** of this store (§3.3) — there is no write-lock
-//! contention — and the connection runs in **WAL** mode so reads
-//! (deep-replay) never block the writer.
+//! **single writer** of this durable tier (§3.3). File-backed stores use
+//! **WAL** and separate, bounded reader and writer pools with private caches
+//! so deep-replay cannot consume the writer's connection. Other handles/
+//! processes can still contend for SQLite's write lock.
 //!
 //! ## The one sanctioned serialize/deserialize copy
 //!
@@ -57,26 +58,30 @@ const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// SQLite-backed durable tier for the owner-core (§3.3).
 ///
-/// Single-writer (the daemon owns it) + WAL — exactly the SQLite shape
-/// that makes the durable tier fast (§3.3): no write-lock contention,
-/// readers never block the writer.
+/// Ordinary file-backed WAL stores reserve one connection for persistence
+/// and one for reads. Memory/temporary databases, SQLite URI filenames,
+/// shared caches, and read-only observers retain a single pool.
 pub struct SqliteDurableSink {
     db: DatabaseConnection,
+    readers: DatabaseConnection,
 }
 
 impl SqliteDurableSink {
+    fn pool_options(db_url: &str) -> ConnectOptions {
+        let mut opts = ConnectOptions::new(db_url.to_owned());
+        opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .max_connections(1);
+        opts
+    }
+
     /// Open (or create) a SQLite database at `db_url`, run migrations,
     /// and put the connection in WAL mode.
     ///
     /// For an in-memory store use `"sqlite::memory:"`; for a file store
     /// use `"sqlite://<path>?mode=rwc"`.
     pub async fn open(db_url: &str) -> Result<Self, BusError> {
-        let mut opts = ConnectOptions::new(db_url.to_owned());
-        // Single writer (the daemon). One connection avoids SQLite
-        // write-lock contention entirely (§3.3).
-        opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .max_connections(1);
+        let mut opts = Self::pool_options(db_url);
         // WAL + the busy timeout ride the connection options so the journal switch
         // never needs a separate exclusive statement racing another opener — see
         // `SqliteEventStore::open` (2026-09-14: "database is locked" at attach on
@@ -96,7 +101,53 @@ impl SqliteDurableSink {
         crate::migration::apply_migrations(&db)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
-        Ok(Self { db })
+        // Inspect the driver's resolved mode rather than guessing from the
+        // input URL. Reopening a memory URL can create a different database;
+        // shared-cache memory also lacks file-WAL reader/writer isolation.
+        use sea_orm::sqlx::ConnectOptions as _;
+        let sqlite_options = db.get_sqlite_connection_pool().connect_options();
+        // SQLx's URL serializer can reject its own generated memory filename
+        // as a URL authority. A classification-only clone keeps the typed mode
+        // but replaces the filename; actual connections retain it unchanged.
+        let shared_pool_mode = sqlite_options
+            .as_ref()
+            .clone()
+            .filename("airc-mode-probe.sqlite")
+            .to_url_lossy()
+            .query_pairs()
+            .any(|(key, value)| {
+                (key == "mode" && value == "memory") || (key == "cache" && value == "shared")
+            });
+        // An empty SQLite filename denotes a connection-local temporary DB.
+        // SQLite also interprets `file:` filenames as URIs, including memory
+        // aliases not represented by SQLx's mode flag. Conservatively keep
+        // those on the existing pool rather than reinterpret their identity.
+        // Explicit shared caches also retain serialization: their table locks
+        // can block writes behind reads even when the file uses WAL.
+        let share_pool = shared_pool_mode
+            || sqlite_options.get_filename().as_os_str().is_empty()
+            || sqlite_options.get_filename() == Path::new(":memory:")
+            || sqlite_options
+                .get_filename()
+                .to_string_lossy()
+                .starts_with("file:");
+        let readers = if share_pool {
+            db.clone()
+        } else {
+            // Preserve the exact filename/VFS/cache options of the opened
+            // writer. Only reads use this pool; migrations run once above.
+            let read_options = sqlite_options
+                .as_ref()
+                .clone()
+                .read_only(true)
+                .create_if_missing(false);
+            let mut opts = Self::pool_options(db_url);
+            opts.map_sqlx_sqlite_opts(move |_| read_options.clone());
+            Database::connect(opts)
+                .await
+                .map_err(|e| BusError::Sink(e.to_string()))?
+        };
+        Ok(Self { db, readers })
     }
 
     /// Open a file-backed durable tier from a filesystem path. Keeps
@@ -115,11 +166,8 @@ impl SqliteDurableSink {
     /// immutable snapshot. Missing files/schema and read failures stay errors.
     pub async fn open_read_only_path(path: &Path) -> Result<Self, BusError> {
         let path = path.to_owned();
-        let mut opts = ConnectOptions::new("sqlite::memory:");
-        opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .max_connections(1)
-            .sqlx_logging(false);
+        let mut opts = Self::pool_options("sqlite::memory:");
+        opts.sqlx_logging(false);
         // Supply the native filename through the typed driver, not a URI: `?`
         // and `#` in a path must not become connection parameters.
         opts.map_sqlx_sqlite_opts(move |_| {
@@ -132,7 +180,10 @@ impl SqliteDurableSink {
         let db = Database::connect(opts)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self {
+            readers: db.clone(),
+            db,
+        })
     }
 
     /// Open an ephemeral in-memory durable tier. Convenience for tests.
@@ -254,7 +305,7 @@ impl DurableSink for SqliteDurableSink {
             .order_by_asc(bus_event::Column::Counter)
             .order_by_asc(bus_event::Column::EventId)
             .limit(bounded)
-            .all(&self.db)
+            .all(&self.readers)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
 
@@ -292,7 +343,7 @@ impl DurableSink for SqliteDurableSink {
             .order_by_desc(bus_event::Column::Counter)
             .order_by_desc(bus_event::Column::EventId)
             .limit(bounded)
-            .all(&self.db)
+            .all(&self.readers)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
 
@@ -330,7 +381,7 @@ impl DurableSink for SqliteDurableSink {
             .order_by_desc(bus_event::Column::Counter)
             .order_by_desc(bus_event::Column::EventId)
             .limit(bounded)
-            .all(&self.db)
+            .all(&self.readers)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
 
@@ -348,7 +399,7 @@ impl DurableSink for SqliteDurableSink {
             .order_by_desc(bus_event::Column::Epoch)
             .order_by_desc(bus_event::Column::Counter)
             .order_by_desc(bus_event::Column::EventId)
-            .one(&self.db)
+            .one(&self.readers)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
         Ok(row.map(|r| {
@@ -363,7 +414,7 @@ impl DurableSink for SqliteDurableSink {
     /// PK) — the durable leg of `EventRouter::publish_if_new`.
     async fn contains(&self, event_id: EventId) -> Result<bool, BusError> {
         let row = bus_event::Entity::find_by_id(event_id.as_uuid())
-            .one(&self.db)
+            .one(&self.readers)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
         Ok(row.is_some())
@@ -582,17 +633,26 @@ mod tests {
     async fn append_then_page_round_trips_full_envelope() {
         // The minimum-viable proof: write one, read it back, every field
         // (incl. opaque payload + headers + target enum) intact.
-        let sink = SqliteDurableSink::in_memory().await.unwrap();
         let ch = RoomId::from_u128(0xc0ffee);
         let e = durable_at(ch, 1, 0)
             .with_target(Target::Peer(PeerId::from_u128(0x99)))
             .with_correlation_id(Uuid::from_u128(0x1234))
             .with_coalesce_key("k");
-        sink.append(&e).await.unwrap();
-
-        let page = sink.page(ch, None, 100).await.unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0], e, "full envelope round-trips through the row");
+        for url in [
+            "sqlite::memory:",
+            "sqlite://memory-pool-control?mode=memory&cache=private",
+            "sqlite:",
+            "sqlite:file::memory:",
+        ] {
+            let sink = SqliteDurableSink::open(url).await.unwrap();
+            sink.append(&e).await.unwrap();
+            let page = sink.page(ch, None, 100).await.unwrap();
+            assert_eq!(page.len(), 1, "single database for {url}");
+            assert_eq!(page[0], e, "full envelope round-trips through {url}");
+        }
+        // SeaORM rejects this URL before SQLx sees it; do not manufacture
+        // support for an alias that the existing constructor never accepted.
+        assert!(SqliteDurableSink::open("sqlite://:memory:").await.is_err());
     }
 
     #[tokio::test]
@@ -872,24 +932,105 @@ mod tests {
 
     #[tokio::test]
     async fn persists_across_handles_on_disk() {
-        // Real durability: append through one handle, reopen the file,
-        // read it back — the WAL-backed row survives.
+        use sea_orm::TransactionTrait;
+        use std::time::Duration;
+
+        // Real WAL isolation: exhaust the bounded reader pool, commit through
+        // the reserved writer, release the reader, then reopen the same file.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bus_events.sqlite");
         let ch = RoomId::from_u128(0x42);
         let e = durable_at(ch, 1, 0);
+        let sink = SqliteDurableSink::open_path(&path).await.unwrap();
+        sink.append(&e).await.unwrap();
+        let read_lease = sink.readers.begin().await.unwrap();
+        assert_eq!(
+            bus_event::Entity::find()
+                .all(&read_lease)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut queued_page = Box::pin(sink.page(ch, None, 100));
+        assert!(futures::poll!(&mut queued_page).is_pending());
 
-        SqliteDurableSink::open_path(&path)
-            .await
-            .unwrap()
-            .append(&e)
-            .await
-            .unwrap();
-
+        let batch_a = durable_at(ch, 1, 1);
+        let batch_b = durable_at(ch, 1, 2);
+        let single = durable_at(ch, 1, 3);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            sink.append_batch(&[&batch_a, &batch_b]).await.unwrap();
+            sink.append(&single).await.unwrap();
+            sink.bump_epoch().await.unwrap();
+        })
+        .await
+        .expect("a held reader and queued replay must not consume the writer connection");
+        assert_eq!(
+            bus_event::Entity::find()
+                .all(&read_lease)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the held read snapshot remains stable while writes commit"
+        );
+        assert!(futures::poll!(&mut queued_page).is_pending());
+        read_lease.rollback().await.unwrap();
+        let expected = vec![e, batch_a, batch_b, single];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), queued_page)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected,
+            "the queued replay sees all committed IDs once the reader is released"
+        );
+        assert_eq!(
+            sink.head_cursor(ch).await.unwrap(),
+            Some(expected[3].cursor())
+        );
+        assert!(sink.contains(expected[3].event_id).await.unwrap());
+        assert_eq!(sink.page_tail(ch, None, 2).await.unwrap(), expected[2..]);
+        assert_eq!(
+            sink.page_tail_of_kinds(ch, None, &[Kind::Message], 100)
+                .await
+                .unwrap(),
+            expected
+        );
+        let forbidden = durable_at(ch, 1, 4);
+        assert!(
+            bus_event::Entity::insert(to_active_model(&forbidden).unwrap())
+                .exec(&sink.readers)
+                .await
+                .is_err(),
+            "the replay pool is read-only"
+        );
+        let SqliteDurableSink { db, readers } = sink;
+        readers.close().await.unwrap();
+        db.close().await.unwrap();
         let reopened = SqliteDurableSink::open_path(&path).await.unwrap();
         let page = reopened.page(ch, None, 100).await.unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0], e);
+        assert_eq!(
+            page, expected,
+            "all committed events survive closing both pools"
+        );
+        reopened.readers.close().await.unwrap();
+        reopened.db.close().await.unwrap();
+
+        // An explicitly shared SQLite cache keeps the old serialized pool;
+        // adding a second connection would introduce table-lock contention.
+        let shared = SqliteDurableSink::open(&format!("{}&cache=shared", sqlite_file_url(&path)))
+            .await
+            .unwrap();
+        let read_lease = shared.readers.begin().await.unwrap();
+        assert!(shared
+            .db
+            .get_sqlite_connection_pool()
+            .try_acquire()
+            .is_none());
+        read_lease.rollback().await.unwrap();
+        shared.append(&forbidden).await.unwrap();
+        assert!(shared.contains(forbidden.event_id).await.unwrap());
     }
 
     #[test]
