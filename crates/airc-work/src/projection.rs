@@ -18,6 +18,7 @@ use crate::model::{
 };
 
 mod apply;
+pub use apply::OWNERSHIP_DURABLE_SINCE_MS;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkBoardProjection {

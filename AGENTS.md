@@ -168,12 +168,19 @@ airc work create  --repo … --title … [--priority p0|p1|p2|p3] [--body …]
 States flow: `Open → Claimed → InProgress → Review → Merged/Closed`.
 `Blocked` is valid mid-flight when waiting on another card.
 
-**Lease + heartbeat keep the flywheel alive across churn.** A claim
-expires after `--ttl-ms` (default 10 minutes). Heartbeat to extend
-while you're actively working. If you go offline mid-claim, the lease
-decays and another peer can reclaim — work outlives any single
-participant, by design. See `lease=` column on the board (`<STALE>` =
-reclaim-eligible).
+**Ownership is durable; the lease is presence** (Joel, 2026-10-04, card
+d826e5f1). A claim's lease (`--ttl-ms`, default 10 minutes) says whether its
+owner is here, not whether the card is up for grabs. Your heartbeats, your
+submissions and your state changes on the card all renew it. When your lease
+lapses the card is still yours: `airc work claim` on it resumes your own claim
+(even in Review), and anyone else is refused. `<STALE>` on the board means the
+owner is away, not that the card is free.
+
+Work still outlives any participant, explicitly: to take over a card whose
+owner is gone, release their claim by name with a reason (`airc work release
+<card> <their-claim-id> --reason "…"`, which records who released it and why),
+then claim it. A
+handover is an attributed event on the board, never a silent lease expiry.
 
 ---
 
