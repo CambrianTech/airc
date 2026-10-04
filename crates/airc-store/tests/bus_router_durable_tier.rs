@@ -13,8 +13,8 @@
 //! the production durable tier, not just the in-memory test sink.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,21 +25,23 @@ use tokio::sync::Notify;
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind};
 use airc_bus::{
     BusError, Clock, DurableSink, EventRouter, Filter, InMemoryEpochStore, ManualClock,
-    RouterConfig, SeqSource,
+    PublishIfNew, RouterConfig, SeqSource,
 };
 use airc_core::{ClientId, EventId, PeerId, RoomId};
+use airc_diagnostics::{DiagnosticCode, DiagnosticComponent, MemoryDiagnosticSink};
 use airc_store::SqliteDurableSink;
 
-/// A [`DurableSink`] decorator that delays `append` until a gate opens,
-/// forwarding everything to a real [`SqliteDurableSink`]. Lets the test
-/// hold `Durable` events "evicted-pending" (pinned in the ring, not yet
-/// on disk), then release them so write-behind persists + unpins — after
-/// which ring-capacity pressure evicts them and a later subscriber's
-/// deep-replay must fetch them from SQLite (§3.8 no-gap).
+/// Fail the first batch, hold its retry, then forward actual group commits to
+/// SQLite. Notifications expose operation boundaries without timing guesses.
 struct GatedSqliteSink {
     inner: Arc<SqliteDurableSink>,
     open: Notify,
     is_open: AtomicBool,
+    attempts: AtomicUsize,
+    attempted: Notify,
+    batches: Mutex<Vec<Vec<EventId>>>,
+    committed: AtomicUsize,
+    commit_finished: Notify,
 }
 
 impl GatedSqliteSink {
@@ -48,6 +50,11 @@ impl GatedSqliteSink {
             inner,
             open: Notify::new(),
             is_open: AtomicBool::new(false),
+            attempts: AtomicUsize::new(0),
+            attempted: Notify::new(),
+            batches: Mutex::new(Vec::new()),
+            committed: AtomicUsize::new(0),
+            commit_finished: Notify::new(),
         }
     }
 
@@ -55,15 +62,62 @@ impl GatedSqliteSink {
         self.is_open.store(true, Ordering::SeqCst);
         self.open.notify_waiters();
     }
+
+    async fn wait_open(&self) {
+        loop {
+            let opened = self.open.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if self.is_open.load(Ordering::SeqCst) {
+                return;
+            }
+            opened.await;
+        }
+    }
+
+    async fn wait_for_attempts(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.attempts.load(Ordering::SeqCst) < count {
+                self.attempted.notified().await;
+            }
+        })
+        .await
+        .expect("writer reaches the requested batch attempt");
+    }
+
+    async fn wait_for_commits(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.committed.load(Ordering::SeqCst) < count {
+                self.commit_finished.notified().await;
+            }
+        })
+        .await
+        .expect("accepted durables reach the actual SQLite group commit");
+    }
 }
 
 #[async_trait]
 impl DurableSink for GatedSqliteSink {
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
-        while !self.is_open.load(Ordering::SeqCst) {
-            self.open.notified().await;
-        }
+        self.wait_open().await;
         self.inner.append(e).await
+    }
+
+    async fn append_batch(&self, events: &[&Envelope]) -> Result<(), BusError> {
+        self.batches
+            .lock()
+            .expect("batch trace")
+            .push(events.iter().map(|event| event.event_id).collect());
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        self.attempted.notify_one();
+        if attempt == 1 {
+            return Err(BusError::Sink("injected first group-commit failure".into()));
+        }
+        self.wait_open().await;
+        self.inner.append_batch(events).await?;
+        self.committed.fetch_add(events.len(), Ordering::SeqCst);
+        self.commit_finished.notify_one();
+        Ok(())
     }
 
     async fn page(
@@ -136,87 +190,209 @@ where
 
 #[tokio::test]
 async fn evicted_pending_durable_is_served_from_real_sqlite_not_skipped() {
-    // Use a file-backed SQLite so the deep-replay genuinely comes off
-    // disk (WAL), not just process memory.
+    // One file-backed owner follows failure, bounded admission, recovery and
+    // replay. The current-thread runtime lets the initial synchronous publish
+    // burst fill the queue before the one writer forms its first batch.
     let dir = tempfile::tempdir().expect("tempdir");
     let path: &Path = &dir.path().join("bus_events.sqlite");
     let real = Arc::new(SqliteDurableSink::open_path(path).await.expect("open sink"));
     let gated = Arc::new(GatedSqliteSink::new(real.clone()));
-
     let ch = RoomId::from_u128(0xeee);
-
-    // Build the owner-core router directly against the gated REAL sink,
-    // with a tiny ring so eviction bites once durables are persisted.
     let epoch_store = InMemoryEpochStore::new();
     let clock = ManualClock::new(1_700_000_000_000);
     let seq = Arc::new(SeqSource::start(&epoch_store));
-    let r = EventRouter::new(
+    let diagnostics = Arc::new(MemoryDiagnosticSink::default());
+    let r = EventRouter::new_with_diagnostics(
         RouterConfig {
             ring_capacity: 2,
+            write_behind_buffer: 4,
             ..Default::default()
         },
         Arc::new(clock) as Arc<dyn Clock>,
         seq,
         gated.clone(),
+        diagnostics.clone(),
     );
+    let durable_filter = Filter::channel(ch).with_delivery(vec![DeliveryClass::Durable]);
+    let (live, lag) = r.subscribe_live_with_lag(durable_filter.clone());
+    futures::pin_mut!(live);
 
-    // Publish 6 durables while the sink gate is SHUT: they fan out + ring
-    // but write-behind blocks on append, so all 6 stay pinned in the ring
-    // (the §3.8 floor — the ring grows past its nominal 2 rather than drop
-    // an unpersisted durable).
-    for i in 1..=6u128 {
+    for i in 1..=4u128 {
         r.publish(durable(ch, i, &format!("m{i}")))
             .await
             .expect("publish");
     }
+    // The first actual append_batch fails. Its retry must occur with no new
+    // publish to wake it, and remains held before touching SQLite.
+    gated.wait_for_attempts(2).await;
+    let initial: Vec<_> = (1..=4).map(EventId::from_u128).collect();
     assert_eq!(
-        r.pinned_in_ring(ch),
-        6,
-        "all unpersisted durables pinned — ring exceeds capacity (§3.8 floor)"
+        *gated.batches.lock().expect("batch trace"),
+        vec![initial.clone(), initial],
+        "retry owns the same batch, not a later queue drain"
+    );
+    assert!(real.page(ch, None, 100).await.expect("page").is_empty());
+    let failures = diagnostics.events();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].code, DiagnosticCode::WriteBehindBatchFailed);
+    assert_eq!(failures[0].component, DiagnosticComponent::Persistence);
+    for (key, value) in [
+        ("failed_attempts", "1"),
+        ("batch_len", "4"),
+        ("pinned_count", "4"),
+        ("retry_ms", "100"),
+    ] {
+        assert_eq!(failures[0].fields.get(key).map(String::as_str), Some(value));
+    }
+
+    // Queue capacity excludes the held in-flight batch. Exactly four newer
+    // events fit; both ordinary and deduplicating admission then refuse before
+    // mutating the cursor, ring, subscriber or recent-ID state.
+    for i in 5..=8u128 {
+        r.publish(durable(ch, i, &format!("m{i}")))
+            .await
+            .expect("queue newer durable");
+    }
+    let before = r.head_cursor(ch);
+    assert!(matches!(
+        r.publish(durable(ch, 9, "refused ordinary publish")).await,
+        Err(BusError::WriteBehindSaturated)
+    ));
+    assert!(matches!(
+        r.publish_if_new(durable(ch, 10, "refused deduplicating publish"))
+            .await,
+        Err(BusError::WriteBehindSaturated)
+    ));
+    assert_eq!(r.head_cursor(ch), before);
+    assert_eq!(r.pinned_in_ring(ch), 8);
+    assert_eq!(r.ring_len(ch), 8);
+    assert_eq!(r.shed_count(), 2);
+    assert_eq!(gated.attempts.load(Ordering::SeqCst), 2);
+    let accepted = take_n(&mut live, 8).await;
+    assert_eq!(
+        accepted
+            .iter()
+            .map(|env| env.event_id.0.as_u128())
+            .collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
     );
 
-    // Open the gate: write-behind drains into real SQLite, persists + unpins
-    // all 6, and the ring evicts toward capacity. Wait until the sink holds
-    // all 6 (verified via page) and the ring has shrunk.
-    gated.open();
-    let mut waited = 0;
-    loop {
-        let persisted = real.page(ch, None, 100).await.expect("page").len();
-        if persisted >= 6 && r.ring_len(ch) <= 2 {
-            break;
-        }
-        assert!(
-            waited < 5000,
-            "timed out waiting for persistence + eviction"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        waited += 5;
+    // Lossy traffic cannot make an old failed durable pin an unbounded suffix.
+    // Filter the live consumer to durable events so this tests retention, not
+    // an unrelated subscriber overflow from the flood.
+    for i in 0..384u128 {
+        let mut event = durable(ch, 1_000 + i, "non-durable during failed commit");
+        (event.kind, event.delivery) = match i % 3 {
+            0 => (Kind::CommandResult, DeliveryClass::RequestResponse),
+            1 => (Kind::StreamChunk, DeliveryClass::StreamChunk),
+            _ => (Kind::Event, DeliveryClass::EphemeralWindow),
+        };
+        r.publish(event).await.expect("non-durable stays available");
+        assert_eq!(r.pinned_in_ring(ch), 8);
+        assert_eq!(r.ring_len(ch), 8, "only the accepted durable floor remains");
     }
+    assert!(!lag.is_lagged());
+    let pending_replay = r.subscribe(durable_filter.clone(), None);
+    futures::pin_mut!(pending_replay);
     assert_eq!(
-        real.page(ch, None, 100).await.expect("page").len(),
-        6,
-        "all durables persisted to real SQLite after gate open"
+        take_n(&mut pending_replay, 8)
+            .await
+            .iter()
+            .map(|env| env.event_id.0.as_u128())
+            .collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>(),
+        "every accepted durable is replayable while SQLite still lacks it"
+    );
+
+    gated.open();
+    gated.wait_for_commits(8).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while r.pinned_in_ring(ch) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful commit releases every durable pin");
+    let batches = gated.batches.lock().expect("batch trace").clone();
+    assert_eq!(batches.len(), 3, "failed batch retries before newer work");
+    assert_eq!(batches[0], batches[1]);
+    assert_eq!(
+        batches[2],
+        (5..=8).map(EventId::from_u128).collect::<Vec<_>>()
+    );
+    assert!(batches.iter().all(|batch| batch.len() <= 64));
+    let persisted = real.page(ch, None, 100).await.expect("real SQLite history");
+    assert_eq!(
+        persisted
+            .iter()
+            .map(|env| env.event_id.0.as_u128())
+            .collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>(),
+        "all accepted IDs persisted once; refusals and lossy flood did not"
     );
     assert!(
         r.ring_len(ch) <= 2,
-        "ring evicted the now-persisted durables (so 1..=4 are NOT in RAM)"
+        "the ring shrinks after the writer releases the failed batch's floor"
     );
+    let events = diagnostics.events();
+    assert_eq!(events.len(), 2);
+    let recovered = &events[1];
+    assert_eq!(recovered.code, DiagnosticCode::WriteBehindBatchRecovered);
+    assert_eq!(recovered.component, DiagnosticComponent::Persistence);
+    for (key, value) in [
+        ("failed_attempts", "1"),
+        ("batch_len", "4"),
+        ("pinned_count", "4"),
+    ] {
+        assert_eq!(recovered.fields.get(key).map(String::as_str), Some(value));
+    }
 
-    // Attach from the beginning. Events 1..=4 are gone from the ring; they
-    // MUST be served from the SQLite deep-replay leg or they'd be skipped.
-    let stream = r.subscribe(Filter::channel(ch), None);
+    // Attach after shrink: the evicted prefix now comes from SQLite. Keep both
+    // replay streams alive through subsequent events to exercise their seams.
+    let stream = r.subscribe(durable_filter, None);
     futures::pin_mut!(stream);
-    let got = take_n(&mut stream, 6).await;
+    let got = take_n(&mut stream, 8).await;
     let markers: Vec<u128> = got.iter().map(|e| e.event_id.0.as_u128()).collect();
-    assert_eq!(
-        markers,
-        vec![1, 2, 3, 4, 5, 6],
-        "evicted-pending durables come from REAL SQLite — none skipped (§3.8 no-gap)"
-    );
+    assert_eq!(markers, (1..=8).collect::<Vec<_>>());
 
-    // No-dup at the seam: no further event should be immediately available.
-    let extra = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
-    assert!(extra.is_err(), "no duplicate at the replay→live seam");
+    // Retry the previously refused identities through the real deduplication
+    // API. Their first visible copies must come now, never from the refusal or
+    // persistence retry. A final ordered live sentinel makes duplicates fail
+    // by identity instead of relying on a quiet-period timeout.
+    for marker in [9, 10, 11] {
+        assert!(matches!(
+            r.publish_if_new(durable(ch, marker, "accepted after recovery"))
+                .await
+                .expect("retry after capacity returns"),
+            PublishIfNew::Published(_)
+        ));
+        for received in [
+            take_n(&mut live, 1).await,
+            take_n(&mut pending_replay, 1).await,
+            take_n(&mut stream, 1).await,
+        ] {
+            assert_eq!(received[0].event_id, EventId::from_u128(marker));
+        }
+    }
+    gated.wait_for_commits(11).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while r.pinned_in_ring(ch) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-recovery durables also unpin");
+    assert_eq!(
+        real.page(ch, None, 100)
+            .await
+            .expect("complete SQLite history")
+            .iter()
+            .map(|env| env.event_id.0.as_u128())
+            .collect::<Vec<_>>(),
+        (1..=11).collect::<Vec<_>>()
+    );
+    assert!(r.ring_len(ch) <= 2);
+    assert!(!lag.is_lagged());
 }
 
 #[tokio::test]

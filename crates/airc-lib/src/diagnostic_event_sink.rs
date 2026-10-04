@@ -233,6 +233,7 @@ fn component_header_value(component: DiagnosticComponent) -> &'static str {
         DiagnosticComponent::Transport => "transport",
         DiagnosticComponent::WebRtc => "webrtc",
         DiagnosticComponent::Work => "work",
+        DiagnosticComponent::Persistence => "persistence",
     }
 }
 
@@ -242,6 +243,8 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::IpcAcceptFailed => "ipc_accept_failed",
         DiagnosticCode::FrameVerificationFailed => "frame_verification_failed",
         DiagnosticCode::StoreAppendFailed => "store_append_failed",
+        DiagnosticCode::WriteBehindBatchFailed => "write_behind_batch_failed",
+        DiagnosticCode::WriteBehindBatchRecovered => "write_behind_batch_recovered",
         DiagnosticCode::TrustRefreshFailed => "trust_refresh_failed",
         DiagnosticCode::AccountRegistryPublishFailed => "account_registry_publish_failed",
         DiagnosticCode::AccountRegistryRefreshFailed => "account_registry_refresh_failed",
@@ -293,6 +296,7 @@ mod tests {
             DiagnosticComponent::Transport,
             DiagnosticComponent::WebRtc,
             DiagnosticComponent::Work,
+            DiagnosticComponent::Persistence,
         ] {
             let header = component_header_value(component);
             assert!(!header.is_empty(), "{component:?} should map to non-empty");
@@ -306,6 +310,8 @@ mod tests {
             DiagnosticCode::IpcAcceptFailed,
             DiagnosticCode::FrameVerificationFailed,
             DiagnosticCode::StoreAppendFailed,
+            DiagnosticCode::WriteBehindBatchFailed,
+            DiagnosticCode::WriteBehindBatchRecovered,
             DiagnosticCode::TrustRefreshFailed,
             DiagnosticCode::AccountRegistryPublishFailed,
             DiagnosticCode::AccountRegistryRefreshFailed,

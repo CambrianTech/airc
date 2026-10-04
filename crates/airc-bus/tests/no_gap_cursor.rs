@@ -201,7 +201,25 @@ async fn saturated_publish_has_no_visible_state_and_can_retry() {
     let ch = RoomId::new();
     let (live, _) = r.subscribe_live_with_lag(Filter::channel(ch));
     futures::pin_mut!(live);
-    r.publish(durable(ch, 1, "accepted")).await.unwrap();
+    let (indexed, _) = r.subscribe_live_with_lag(Filter::channel(ch).with_headers(
+        airc_core::HeaderFilter::Exact {
+            key: "holder".into(),
+            value: "indexed".into(),
+        },
+    ));
+    r.publish(durable(ch, 1, "accepted").with_header("holder", "indexed"))
+        .await
+        .unwrap();
+    // Same fixture verifies general + exact-header holder enumeration and the
+    // deterministic current-thread admission queue before the writer runs.
+    let retained = r.retention_snapshot();
+    assert_eq!(retained.ring_entries_total, 1);
+    assert_eq!(retained.ring_pinned_total, 1);
+    assert_eq!(retained.write_behind_queued, 1);
+    assert_eq!(retained.subscriber_queue_depth_total, 2);
+    assert_eq!(retained.subscriber_queue_depth_max, 1);
+    drop(indexed);
+    assert_eq!(r.retention_snapshot().subscriber_queue_depth_total, 1);
     let before = r.head_cursor(ch);
     for marker in [2, 3] {
         let result = if marker == 2 {
@@ -232,6 +250,13 @@ async fn saturated_publish_has_no_visible_state_and_can_retry() {
             .is_err(),
         "rejected events must not reach live readers"
     );
+    let retained = r.retention_snapshot();
+    assert_eq!(
+        retained.write_behind_queued, 0,
+        "in-flight gated batch is not a queue slot"
+    );
+    assert_eq!(retained.ring_pinned_total, 1);
+    assert_eq!(retained.subscriber_queue_depth_total, 0);
     gated.open();
     for marker in [2, 3] {
         tokio::time::timeout(Duration::from_secs(5), async {

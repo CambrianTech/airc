@@ -147,6 +147,22 @@ pub struct StatusResponse {
     /// flat count is a daemon keeping dead streams (card e28889cc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<usize>,
+    /// Router-held ring entries. None means this daemon cannot report the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_entries_total: Option<usize>,
+    /// Durable ring entries still awaiting persistence; not a measured leak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_pinned_total: Option<usize>,
+    /// Occupied write admission slots, INCLUDING reserved permits. Excludes
+    /// the writer's in-flight/retry batch; not an exact count of queued messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_behind_queued: Option<usize>,
+    /// Live subscriber queue occupancy. Excludes historical replay snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriber_queue_depth_total: Option<usize>,
+    /// Largest live subscriber queue occupancy observed in this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriber_queue_depth_max: Option<usize>,
     /// Whether this daemon serves an `Attach` that names a CHANNEL SET
     /// ([`crate::request::AttachRequest::channels`]) on one stream. The
     /// typed capability a client reads to choose the attach shape, so a
@@ -412,6 +428,11 @@ mod tests {
             executable: Some("/tmp/airc".to_string()),
             connected_lan_peers: 2,
             connections: None,
+            ring_entries_total: Some(12),
+            ring_pinned_total: Some(3),
+            write_behind_queued: Some(2),
+            subscriber_queue_depth_total: Some(9),
+            subscriber_queue_depth_max: Some(5),
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
@@ -435,6 +456,11 @@ mod tests {
                 executable: None,
                 connected_lan_peers: 0,
                 connections: None,
+                ring_entries_total: None,
+                ring_pinned_total: None,
+                write_behind_queued: None,
+                subscriber_queue_depth_total: None,
+                subscriber_queue_depth_max: None,
                 attach_channel_sets: false,
             })
         );

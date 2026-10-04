@@ -297,6 +297,11 @@ fn ipc_owner_fixture() {
                             executable: None,
                             connected_lan_peers: 0,
                             connections: None,
+                            ring_entries_total: None,
+                            ring_pinned_total: None,
+                            write_behind_queued: None,
+                            subscriber_queue_depth_total: None,
+                            subscriber_queue_depth_max: None,
                             attach_channel_sets: false,
                         }),
                         Request::Stop if mode == "stale" => {

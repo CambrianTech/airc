@@ -43,7 +43,9 @@ pub trait DurableSink: Send + Sync {
     ///
     /// Failure is all-or-nothing from the caller's view: on `Err` the caller
     /// (the write-behind task) leaves every batch entry pinned in the ring, so
-    /// the no-gap precondition (§3.8) holds and nothing is lost.
+    /// the no-gap precondition (§3.8) holds. It retries this SAME batch before
+    /// draining newer work. Implementations must tolerate an idempotent retry
+    /// even if some writes completed before an error (as with this default).
     async fn append_batch(&self, events: &[&Envelope]) -> Result<()> {
         for e in events {
             self.append(e).await?;
