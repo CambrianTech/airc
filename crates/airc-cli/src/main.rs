@@ -899,15 +899,17 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 no_lease_required,
             } => work_commands::run_claim(&home, card_id, ttl_ms, no_lease_required).await,
             WorkAction::Heartbeat {
+                room,
                 card_id,
                 claim_id,
                 ttl_ms,
-            } => work_commands::run_heartbeat(&home, card_id, claim_id, ttl_ms).await,
+            } => work_commands::run_heartbeat(&home, room, card_id, claim_id, ttl_ms).await,
             WorkAction::Release {
+                room,
                 card_id,
                 claim_id,
                 reason,
-            } => work_commands::run_release(&home, card_id, claim_id, reason).await,
+            } => work_commands::run_release(&home, room, card_id, claim_id, reason).await,
             WorkAction::Update {
                 card_id,
                 title,
