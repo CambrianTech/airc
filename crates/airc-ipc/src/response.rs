@@ -147,9 +147,16 @@ pub struct StatusResponse {
     /// flat count is a daemon keeping dead streams (card e28889cc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<usize>,
+    /// Live router channel states. None means this daemon cannot report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_count: Option<usize>,
     /// Router-held ring entries. None means this daemon cannot report the count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring_entries_total: Option<usize>,
+    /// Payload + header bytes the rings retain (not allocator bytes). None
+    /// means this daemon cannot report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_bytes_total: Option<usize>,
     /// Durable ring entries still awaiting persistence; not a measured leak.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring_pinned_total: Option<usize>,
@@ -428,7 +435,9 @@ mod tests {
             executable: Some("/tmp/airc".to_string()),
             connected_lan_peers: 2,
             connections: None,
+            channel_count: Some(4),
             ring_entries_total: Some(12),
+            ring_bytes_total: Some(4096),
             ring_pinned_total: Some(3),
             write_behind_queued: Some(2),
             subscriber_queue_depth_total: Some(9),
@@ -456,7 +465,9 @@ mod tests {
                 executable: None,
                 connected_lan_peers: 0,
                 connections: None,
+                channel_count: None,
                 ring_entries_total: None,
+                ring_bytes_total: None,
                 ring_pinned_total: None,
                 write_behind_queued: None,
                 subscriber_queue_depth_total: None,
