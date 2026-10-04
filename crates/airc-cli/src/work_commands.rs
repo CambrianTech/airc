@@ -4058,10 +4058,11 @@ mod tests {
     /// 2026-09-21: two peers had reviewed a citizen's submission and the board showed
     /// zero, because the verdict never reached the card.
     ///
-    /// EXACTLY ONE un-scoped `.create_work_card(` is legitimate: `run_create`, where
-    /// "make a card in the room I am standing in" IS the intent. Every other creation
-    /// carries a resolved room. A maintainer who adds a second drops this to >1 and
-    /// breaks the test until they either pass a room or justify the exception here.
+    /// ZERO un-scoped `.create_work_card(` calls remain. `run_create` was the one
+    /// exception ("make a card in the room I am standing in"); since card 5f1d0f95 it
+    /// resolves that room too (the current room, or `--room`) and calls
+    /// `create_work_card_in`, so every creation names its board. A maintainer who adds
+    /// an un-scoped call breaks this test until they pass a resolved room.
     #[test]
     fn a_review_sibling_is_never_created_into_an_unresolved_room() {
         fn production_only(src: &str) -> &str {
@@ -4079,10 +4080,10 @@ mod tests {
                 .count();
 
         assert_eq!(
-            total, 1,
+            total, 0,
             "Found {total} un-scoped `.create_work_card(` calls in production across \
-             work_commands.rs + work_commands_gh.rs. Exactly one is allowed — \
-             `run_create`, where the current room is the intent.\n\n\
+             work_commands.rs + work_commands_gh.rs. None is allowed: even `run_create` \
+             resolves its room (current or `--room`) first.\n\n\
              If you added a card-creation path: resolve the room ONCE in the command \
              and call `create_work_card_in(&room, request)`, the way `run_review` and \
              `auto_spawn_review_card` do. A sibling minted into a room its parent is \
