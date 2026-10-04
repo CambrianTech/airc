@@ -80,6 +80,15 @@ impl<T> SubscriberIndex<T> {
         }
     }
 
+    /// All owned registrations exactly once, independent of publish headers.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
+        self.general.values().chain(
+            self.exact
+                .values()
+                .flat_map(|values| values.values().flat_map(|bucket| bucket.values())),
+        )
+    }
+
     pub(crate) fn visit(&self, headers: &Headers, mut visit: impl FnMut(&T)) {
         for entry in self.general.values() {
             visit(entry);

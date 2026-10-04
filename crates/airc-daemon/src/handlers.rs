@@ -44,20 +44,28 @@ const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as 
 pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
     match request {
         Request::Ping => Response::Pong,
-        Request::Status => Response::Status(StatusResponse {
-            peer_id: state.peer_id.to_string(),
-            uptime_seconds: state.uptime_seconds(),
-            ipc_protocol_version: state.runtime.ipc_protocol_version,
-            build_commit: state.runtime.build_commit.clone(),
-            build_branch: state.runtime.build_branch.clone(),
-            executable: state.runtime.executable.clone(),
-            connected_lan_peers: state
-                .connected_lan_peers
-                .load(std::sync::atomic::Ordering::Relaxed),
-            connections: Some(state.connections.load(std::sync::atomic::Ordering::Relaxed)),
-            // Served by `stream_attach`: one stream fans out a channel set.
-            attach_channel_sets: true,
-        }),
+        Request::Status => {
+            let retained = state.router.retention_snapshot();
+            Response::Status(StatusResponse {
+                peer_id: state.peer_id.to_string(),
+                uptime_seconds: state.uptime_seconds(),
+                ipc_protocol_version: state.runtime.ipc_protocol_version,
+                build_commit: state.runtime.build_commit.clone(),
+                build_branch: state.runtime.build_branch.clone(),
+                executable: state.runtime.executable.clone(),
+                connected_lan_peers: state
+                    .connected_lan_peers
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                connections: Some(state.connections.load(std::sync::atomic::Ordering::Relaxed)),
+                ring_entries_total: Some(retained.ring_entries_total),
+                ring_pinned_total: Some(retained.ring_pinned_total),
+                write_behind_queued: Some(retained.write_behind_queued),
+                subscriber_queue_depth_total: Some(retained.subscriber_queue_depth_total),
+                subscriber_queue_depth_max: Some(retained.subscriber_queue_depth_max),
+                // Served by `stream_attach`: one stream fans out a channel set.
+                attach_channel_sets: true,
+            })
+        }
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,

@@ -23,6 +23,7 @@ workspace = true
 
 [dependencies]
 airc-core = { path = "../airc-core" }
+airc-diagnostics = { path = "../airc-diagnostics" }
 
 async-trait = "0.1"
 bytes = "1"
