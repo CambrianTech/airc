@@ -288,6 +288,18 @@ pub struct EventRouter {
     inner: Arc<RouterInner>,
 }
 
+/// Scalar holder snapshot, not unique heap bytes or an atomic global census.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionSnapshot {
+    pub ring_entries_total: usize,
+    pub ring_pinned_total: usize,
+    /// Occupied admission slots, including reserved permits; excludes the
+    /// writer's retained in-flight/retry batch (at most MAX_BATCH entries).
+    pub write_behind_queued: usize,
+    pub subscriber_queue_depth_total: usize,
+    pub subscriber_queue_depth_max: usize,
+}
+
 struct RouterInner {
     shards: Vec<Shard>,
     config: RouterConfig,
@@ -1418,6 +1430,38 @@ impl EventRouter {
         let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
         map.get(&channel.0.as_u128())
             .map_or(0, |s| s.ring.pinned_count())
+    }
+
+    /// On-demand O(channels + registrations + ring entries) observation. One
+    /// shard lock at a time, no awaits or envelope clones. Counts overlap Arc
+    /// holders and exclude stream replay snapshots and the writer's retry batch.
+    pub fn retention_snapshot(&self) -> RetentionSnapshot {
+        let mut snapshot = RetentionSnapshot {
+            write_behind_queued: self
+                .inner
+                .write_behind_tx
+                .max_capacity()
+                .saturating_sub(self.inner.write_behind_tx.capacity()),
+            ..RetentionSnapshot::default()
+        };
+        for shard in &self.inner.shards {
+            let channels = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            for state in channels.values() {
+                snapshot.ring_entries_total += state.ring.len();
+                snapshot.ring_pinned_total += state.ring.pinned_count();
+                for subscriber in state.subscribers.values() {
+                    // This owner only uses try_send, never outstanding permits.
+                    let depth = subscriber
+                        .tx
+                        .max_capacity()
+                        .saturating_sub(subscriber.tx.capacity());
+                    snapshot.subscriber_queue_depth_total += depth;
+                    snapshot.subscriber_queue_depth_max =
+                        snapshot.subscriber_queue_depth_max.max(depth);
+                }
+            }
+        }
+        snapshot
     }
 
     /// Test/diagnostic: snapshot the count of retained ring entries.
