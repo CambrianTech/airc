@@ -35,6 +35,10 @@ pub enum SealError {
     /// Authentication failed: the wrong key, the wrong associated data, or tampering.
     /// Deliberately one variant; the three are indistinguishable by design.
     Unauthentic,
+    /// HKDF refused the output length (never for a 32-byte key; typed rather than a panic).
+    KeyDerivation,
+    /// The AEAD refused to encrypt (never for an in-memory buffer; typed rather than a panic).
+    Encrypt,
 }
 
 impl std::fmt::Display for SealError {
@@ -47,6 +51,8 @@ impl std::fmt::Display for SealError {
             SealError::Unauthentic => {
                 write!(f, "sealed blob does not open under this key and binding")
             }
+            SealError::KeyDerivation => write!(f, "seal key derivation failed"),
+            SealError::Encrypt => write!(f, "sealing failed"),
         }
     }
 }
@@ -55,12 +61,15 @@ impl std::error::Error for SealError {}
 
 /// Her seal key: derived from her identity secret and bound to her peer id, so two
 /// identities never share one, even from a reused secret.
-pub fn mind_seal_key(identity_secret: &[u8; 32], peer_id: &[u8]) -> SymmetricKey {
+pub fn mind_seal_key(
+    identity_secret: &[u8; 32],
+    peer_id: &[u8],
+) -> Result<SymmetricKey, SealError> {
     let hk = Hkdf::<Sha256>::new(Some(SEAL_KEY_SALT), identity_secret);
     let mut key = [0u8; 32];
     hk.expand(peer_id, &mut key)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    key
+        .map_err(|_| SealError::KeyDerivation)?;
+    Ok(key)
 }
 
 /// A fresh random key (her mind key, made once).
@@ -71,7 +80,7 @@ pub fn random_key() -> SymmetricKey {
 }
 
 /// Seal `plaintext` under `key`, bound to `associated`. Returns `nonce || ciphertext+tag`.
-pub fn seal(key: &SymmetricKey, plaintext: &[u8], associated: &[u8]) -> Vec<u8> {
+pub fn seal(key: &SymmetricKey, plaintext: &[u8], associated: &[u8]) -> Result<Vec<u8>, SealError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
@@ -83,11 +92,11 @@ pub fn seal(key: &SymmetricKey, plaintext: &[u8], associated: &[u8]) -> Vec<u8> 
                 aad: associated,
             },
         )
-        .expect("ChaCha20-Poly1305 encryption of an in-memory buffer cannot fail");
+        .map_err(|_| SealError::Encrypt)?;
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
-    out
+    Ok(out)
 }
 
 /// Open a blob made by [`seal`] with the same key and associated data.
@@ -118,20 +127,20 @@ mod tests {
     #[test]
     fn a_sealed_record_opens_only_for_her_key_and_its_own_binding() {
         let secret = [7u8; 32];
-        let her = mind_seal_key(&secret, b"peer-her");
+        let her = mind_seal_key(&secret, b"peer-her").unwrap();
         assert_ne!(
             her,
-            mind_seal_key(&secret, b"peer-other"),
+            mind_seal_key(&secret, b"peer-other").unwrap(),
             "bound to her peer id"
         );
         assert_ne!(
             her,
-            mind_seal_key(&[8u8; 32], b"peer-her"),
+            mind_seal_key(&[8u8; 32], b"peer-her").unwrap(),
             "bound to her secret"
         );
-        assert_eq!(her, mind_seal_key(&secret, b"peer-her"), "stable");
+        assert_eq!(her, mind_seal_key(&secret, b"peer-her").unwrap(), "stable");
 
-        let sealed = seal(&her, b"a private plan", b"record-1");
+        let sealed = seal(&her, b"a private plan", b"record-1").unwrap();
         assert!(
             !sealed.windows(14).any(|w| w == b"a private plan"),
             "no plaintext in the blob"
@@ -158,8 +167,8 @@ mod tests {
             Err(SealError::Truncated(20))
         );
         assert_ne!(
-            seal(&her, b"x", b"r"),
-            seal(&her, b"x", b"r"),
+            seal(&her, b"x", b"r").unwrap(),
+            seal(&her, b"x", b"r").unwrap(),
             "a fresh nonce every seal"
         );
     }

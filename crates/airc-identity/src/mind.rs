@@ -87,13 +87,13 @@ impl MindStore {
         let dir = home.join(MIND_DIR);
         std::fs::create_dir_all(dir.join(RECORDS_DIR))?;
         let peer = identity.peer_id.as_uuid();
-        let seal_key = mind_seal::mind_seal_key(&identity.keypair.secret_bytes(), peer.as_bytes());
+        let seal_key = mind_seal::mind_seal_key(&identity.keypair.secret_bytes(), peer.as_bytes())?;
         let key_path = dir.join(KEY_FILE);
         let key = match std::fs::read(&key_path) {
             Ok(sealed) => to_key(mind_seal::open(&seal_key, &sealed, KEY_BINDING)?)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = mind_seal::random_key();
-                write_atomically(&key_path, &mind_seal::seal(&seal_key, &key, KEY_BINDING))?;
+                write_atomically(&key_path, &mind_seal::seal(&seal_key, &key, KEY_BINDING)?)?;
                 key
             }
             Err(e) => return Err(e.into()),
@@ -106,7 +106,7 @@ impl MindStore {
     /// Seal `text` as a new record. Returns its id.
     pub fn put(&self, text: &str) -> Result<Uuid, MindError> {
         let id = Uuid::new_v4();
-        let sealed = mind_seal::seal(&self.key, text.as_bytes(), &self.binding(id));
+        let sealed = mind_seal::seal(&self.key, text.as_bytes(), &self.binding(id))?;
         write_atomically(&self.record_path(id), &sealed)?;
         Ok(id)
     }
@@ -159,7 +159,7 @@ impl MindStore {
         let old_seal = mind_seal::mind_seal_key(
             &old.keypair.secret_bytes(),
             old.peer_id.as_uuid().as_bytes(),
-        );
+        )?;
         let key = to_key(mind_seal::open(
             &old_seal,
             &std::fs::read(&key_path)?,
@@ -168,8 +168,8 @@ impl MindStore {
         let new_seal = mind_seal::mind_seal_key(
             &new.keypair.secret_bytes(),
             new.peer_id.as_uuid().as_bytes(),
-        );
-        write_atomically(&key_path, &mind_seal::seal(&new_seal, &key, KEY_BINDING))?;
+        )?;
+        write_atomically(&key_path, &mind_seal::seal(&new_seal, &key, KEY_BINDING)?)?;
         Ok(())
     }
 
