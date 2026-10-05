@@ -1929,10 +1929,9 @@ pub async fn run_merge(
     if card.state != CardState::Review {
         return Err(format!(
             "refusing to merge card {card_uuid}: state is {actual:?}, but `airc work merge` \
-             requires Review (the card has been finished + PR opened + announced).\n\n\
-             Next step: `airc work state {card_uuid} review` to open + link the PR, then \
-             `airc work merge {card_uuid}` once CI is green.",
+             requires Review (the card has been finished + PR opened + announced).\n\n{next}",
             actual = card.state,
+            next = merge_refusal_next_step(card),
         )
         .into());
     }
@@ -2631,6 +2630,32 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+/// What a caller does next when `airc work merge` refuses a card that is not in
+/// Review. A settled card has nothing left to merge; only an unfinished one is
+/// told to open its PR (card b1633915: a Merged card was told to `state review`).
+fn merge_refusal_next_step(card: &WorkCard) -> String {
+    let id = card.card_id;
+    let pr = card
+        .pull_request
+        .as_ref()
+        .map(|pr| format!(" (PR #{})", pr.number))
+        .unwrap_or_default();
+    match card.state {
+        CardState::Merged => format!("Nothing to do: card {id} is already merged{pr}."),
+        CardState::Closed => format!(
+            "Nothing to merge: card {id} is closed{pr}. Reopen it with \
+             `airc work state {id} open` if the work is live again."
+        ),
+        CardState::Open | CardState::Claimed | CardState::InProgress | CardState::Blocked => {
+            format!(
+                "Next step: `airc work state {id} review` to open + link the PR, then \
+                 `airc work merge {id}` once CI is green."
+            )
+        }
+        CardState::Review => format!("Card {id} is in Review; run `airc work merge {id}`."),
+    }
 }
 
 /// A card id as the caller typed it: the full id, or the short form the board
@@ -4139,6 +4164,23 @@ mod tests {
     /// (d1b2798d's `spawn_claim_worktree`); if those two ever
     /// disagree, cleanup silently does the wrong thing — either
     /// missing the target or removing an unrelated dir.
+    // regression for card b1633915: merging an already-merged card told the
+    // caller to `state review` and open a PR.
+    // what this catches: a settled card is never sent back to open a PR.
+    #[test]
+    fn a_merge_refusal_names_the_right_next_step_for_the_state() {
+        let mut card = make_card(CardState::Merged, None, None, None);
+        let merged = merge_refusal_next_step(&card);
+        assert!(
+            merged.contains("already merged") && !merged.contains("state"),
+            "{merged}"
+        );
+        card.state = CardState::InProgress;
+        assert!(merge_refusal_next_step(&card).contains("review"));
+        card.state = CardState::Closed;
+        assert!(merge_refusal_next_step(&card).contains("closed"));
+    }
+
     #[test]
     fn cleanup_path_matches_spawn_convention() {
         let card_id = airc_lib::WorkCardId::new();
