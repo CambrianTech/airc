@@ -68,6 +68,19 @@ impl WorkBoardProjection {
             .filter(move |review| review.submission_id == submission)
     }
 
+    /// Every review on any submission of `card`, in review-id order. The reconcile
+    /// pass that settles a citizen's learning credit reads this: a review that arrived
+    /// while she was not resident settled nothing at the time, and her next
+    /// registration asks the board what the room has already judged on her cards.
+    pub fn submission_reviews_for_card(
+        &self,
+        card: WorkCardId,
+    ) -> impl Iterator<Item = &crate::WorkSubmissionReview> {
+        self.submission_reviews
+            .values()
+            .filter(move |review| review.card_id == card)
+    }
+
     pub fn last_review_rejection(&self, card: WorkCardId) -> Option<&crate::RejectedWorkReview> {
         self.review_rejections.get(&card)
     }
