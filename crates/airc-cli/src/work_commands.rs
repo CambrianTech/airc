@@ -19,6 +19,8 @@ use airc_lib::{
     WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
 };
 
+use airc_core::shown_id::{Shown, ShownIdError};
+
 use crate::lease;
 use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
 
@@ -116,13 +118,14 @@ pub async fn run_review(
     priority: Option<CliPriority>,
     body: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parent_card_id = parse_work_card_id(&parent_id)?;
+    let parent_shown = Shown::try_from(parent_id.as_str())?;
     let airc = crate::commands::attached_airc(home).await?;
 
     // Resolve once: parent lookup and sibling publication must share a room,
     // even if another client changes this scope's default during the command.
     let room = room_or_current(&airc, room.as_deref(), "review work in").await?;
     let board = airc.work_board_in(&room).await?;
+    let parent_card_id = card_on_board(&board, &parent_shown)?;
     let parent = board.card(parent_card_id).ok_or_else(|| {
         format!(
             "parent card {parent_card_id} not found in room {}; \
@@ -261,8 +264,8 @@ pub async fn run_claim(
         }
     }
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
     let room = room_or_current(&airc, room.as_deref(), "claim work in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
     let claim_id = airc
         .claim_work_card_with_provenance_in(
             &room,
@@ -330,15 +333,15 @@ pub async fn run_release(
     reason: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
+    let room = room_or_current(&airc, room.as_deref(), "release a claim in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
     // Default: resolve THIS peer's active claim from the board so
     // callers don't have to track claim_ids the system already knows
     // (kink card acb8bfcd: release ergonomics).
     let claim_uuid = match claim_id {
-        Some(raw) => parse_claim_id(&raw)?,
+        Some(raw) => claim_in_room(&airc, &room, card_uuid, &raw).await?,
         None => resolve_my_active_claim(&airc, card_uuid).await?,
     };
-    let room = room_or_current(&airc, room.as_deref(), "release a claim in").await?;
     airc.release_work_claim_in(
         &room,
         ReleaseWorkClaim {
@@ -400,9 +403,9 @@ pub async fn run_heartbeat(
     ttl_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
-    let claim_uuid = parse_claim_id(&claim_id)?;
     let room = room_or_current(&airc, room.as_deref(), "renew a claim in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
+    let claim_uuid = claim_in_room(&airc, &room, card_uuid, &claim_id).await?;
     airc.heartbeat_work_claim_in(
         &room,
         airc_lib::HeartbeatWorkClaim {
@@ -453,8 +456,9 @@ pub async fn run_update(
     body: Option<String>,
     priority: Option<CliPriority>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let card_uuid = parse_work_card_id(&card_id)?;
     let airc = crate::commands::attached_airc(home).await?;
+    let room = room_or_current(&airc, room.as_deref(), "update a work card in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
 
     let mut request = UpdateWorkCard::amend(card_uuid);
     if let Some(title) = title {
@@ -467,7 +471,6 @@ pub async fn run_update(
         request = request.with_priority(priority.into());
     }
 
-    let room = room_or_current(&airc, room.as_deref(), "update a work card in").await?;
     airc.update_work_card_in(&room, request).await?;
     println!("card_updated: card_id={card_uuid}");
     Ok(())
@@ -480,13 +483,13 @@ pub async fn run_state(
     state: CliCardState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
     let card_state = CardState::from(state);
 
     // Resolve ONCE, like `run_review` and `run_merge` (#1447): the close-gate board
     // read, the state change, the PR link and the review sibling all bind to THIS
     // room — even if another client moves this scope's default mid-command.
     let room = room_or_current(&airc, room.as_deref(), "change work state in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
 
     // Card a1bc62b3 (substrate-target gate): refuse direct CLI writes
     // to states that should only come from substrate observers (e.g.
@@ -1727,8 +1730,8 @@ pub async fn run_link(
     pr: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
     let room = room_or_current(&airc, room.as_deref(), "link a pull request in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
     crate::work_commands_gh::link_existing_pr(&airc, &room, card_uuid, pr).await
 }
 
@@ -1742,7 +1745,16 @@ pub async fn run_relink(
     pr: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
+    let shown = Shown::<WorkCardId>::try_from(card_id.as_str())?;
+    let card_uuid = match shown.full() {
+        Some(id) => id,
+        None => card_on_board(
+            &airc
+                .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+                .await?,
+            &shown,
+        )?,
+    };
     let pr_number = parse_pr_spec(&pr)?;
     crate::work_commands_gh::relink_card_pr(&airc, card_uuid, pr_number).await
 }
@@ -1766,9 +1778,10 @@ pub async fn run_submission_review(
     let evidence = evidence_artifact(&evidence_text)?;
     let submission = submission.as_deref().map(Uuid::parse_str).transpose()?;
     let airc = crate::commands::attached_airc(home).await?;
-    let review_card = parse_work_card_id(&review_card_id)?;
+    let review_shown = Shown::try_from(review_card_id.as_str())?;
     let room = room_or_current(&airc, room.as_deref(), "review a submission in").await?;
     let board = airc.work_board_in(&room).await?;
+    let review_card = card_on_board(&board, &review_shown)?;
     let held = board
         .card(review_card)
         .ok_or_else(|| format!("review card {review_card} is not on {}'s board", room.name))?;
@@ -1904,10 +1917,11 @@ pub async fn run_merge(
     use airc_work::model::CardState;
 
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
+    let card_shown = Shown::try_from(card_id.as_str())?;
 
     let room = room_or_current(&airc, room.as_deref(), "merge work in").await?;
     let board = airc.work_board_in(&room).await?;
+    let card_uuid = card_on_board(&board, &card_shown)?;
     let card = board
         .card(card_uuid)
         .ok_or_else(|| format!("card {card_uuid} not visible in room {}", room.name))?;
@@ -2051,15 +2065,6 @@ pub(crate) fn close_transition_allowed_from_card(card: &WorkCard) -> bool {
     }
 }
 
-/// First 8 chars of a UUID-style id — enough to disambiguate at the
-/// board's typical scale, much easier on the eye than 36-char UUIDs.
-/// We deliberately do NOT shorten card_id in the board output because
-/// callers copy-paste it into `claim` / `state` / `close`; it's the
-/// API key, not a display field.
-fn short_id<T: std::fmt::Display>(id: T) -> String {
-    id.to_string().chars().take(8).collect()
-}
-
 /// Render a peer-id for the board: 'me' for self, the published alias
 /// when known (kink 6f111211 / card c397567a — looked up via
 /// Airc::peer_alias and pre-fetched into the map by run_board), else
@@ -2076,7 +2081,7 @@ fn format_peer(
     } else if let Some(alias) = aliases.get(&peer) {
         alias.clone()
     } else {
-        short_id(peer)
+        peer.shown()
     }
 }
 
@@ -2405,7 +2410,7 @@ fn print_board(
             .unwrap_or_else(|| "-".to_string());
         let claim = card
             .claim_id
-            .map(short_id)
+            .map(ClaimId::shown)
             .unwrap_or_else(|| "-".to_string());
         let lease = format_lease(card.claim_expires_at_ms, now);
         println!(
@@ -2439,7 +2444,7 @@ fn print_board(
                 "{card_id}  owner={owner}  claim={claim_id}  expired_at_ms={expired_at_ms}",
                 card_id = claim.card_id,
                 owner = format_peer(claim.owner, me, aliases),
-                claim_id = short_id(claim.claim_id),
+                claim_id = claim.claim_id.shown(),
                 expired_at_ms = claim.expired_at_ms,
             );
         }
@@ -2628,16 +2633,43 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
-    let uuid = Uuid::parse_str(input)
-        .map_err(|error| format!("work card id {input:?} is not a valid UUID: {error}"))?;
-    Ok(WorkCardId::from_uuid(uuid))
+/// A card id as the caller typed it: the full id, or the short form the board
+/// shows, resolved against this board's cards (refused with the candidates when
+/// it names none or several). One rule for every work verb: `airc_core::shown_id`.
+fn card_on_board(
+    board: &WorkBoardProjection,
+    shown: &Shown<WorkCardId>,
+) -> Result<WorkCardId, ShownIdError> {
+    shown.resolve(board.card_ids())
 }
 
-fn parse_claim_id(input: &str) -> Result<ClaimId, Box<dyn std::error::Error>> {
-    let uuid = Uuid::parse_str(input)
-        .map_err(|error| format!("claim id {input:?} is not a valid UUID: {error}"))?;
-    Ok(ClaimId::from_uuid(uuid))
+/// [`card_on_board`] against `room`'s board, read only when the id is short.
+pub(crate) async fn card_in_room(
+    airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
+    raw: &str,
+) -> Result<WorkCardId, Box<dyn std::error::Error>> {
+    let shown = Shown::<WorkCardId>::try_from(raw)?;
+    if let Some(id) = shown.full() {
+        return Ok(id);
+    }
+    Ok(card_on_board(&airc.work_board_in(room).await?, &shown)?)
+}
+
+/// A claim id as the caller typed it, resolved against the card's live claim
+/// (the board shows it short: `claim=136f8174`).
+pub(crate) async fn claim_in_room(
+    airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
+    card_id: WorkCardId,
+    raw: &str,
+) -> Result<ClaimId, Box<dyn std::error::Error>> {
+    let shown = Shown::<ClaimId>::try_from(raw)?;
+    if let Some(id) = shown.full() {
+        return Ok(id);
+    }
+    let board = airc.work_board_in(room).await?;
+    Ok(shown.resolve(board.card(card_id).and_then(|card| card.claim_id))?)
 }
 
 fn parse_optional_lane_id(
@@ -2790,12 +2822,6 @@ mod tests {
         );
         // Sub-minute pads seconds with leading zero.
         assert_eq!(format_lease(Some(1_000 + 5_000), 1_000), "0m05s");
-    }
-
-    #[test]
-    fn short_id_truncates_to_8_chars() {
-        assert_eq!(short_id("cdff6a9d-e995-4b4a-a119-10bc1faf1747"), "cdff6a9d");
-        assert_eq!(short_id("short"), "short");
     }
 
     // Card c9b28925 — `airc work cleanup` classifier tests. Pure
@@ -4127,10 +4153,10 @@ mod tests {
         // We can't easily mock lease_root in this binary-only test
         // module, but we CAN pin the substrate-level promise that
         // the short id matches what spawn_claim_worktree builds.
-        // (`short_id` lives in this file's helpers and already has its
-        // own test pinning the 8-char take. This test is the
-        // architectural cross-reference.)
-        assert_eq!(short_id(card_id.to_string()), expected_short);
+        // The board renders with `shown()`; the worktree directory must
+        // be the same string or an operator can't find it by eye.
+        assert_eq!(card_id.shown(), expected_short);
+        assert_eq!(airc_lib::work_worktree::short_id(card_id), expected_short);
     }
 
     // ---------------------------------------------------------------------

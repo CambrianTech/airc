@@ -35,10 +35,9 @@ use airc_work::WorkCardId;
 /// against this same constant rather than spelling the path again.
 pub const LEASE_ZONE_RELATIVE: &str = ".airc/worktrees";
 
-/// How many hex chars of the card id name the worktree directory. Matches the
-/// short id used in board output, so an operator reading the board can find
-/// the directory by eye.
-pub const SHORT_ID_LEN: usize = 8;
+/// How many hex chars of the card id name the worktree directory: the shown
+/// width, so an operator reading the board can find the directory by eye.
+pub use airc_core::shown_id::SHORT_ID_LEN;
 
 /// Git keeps refs/worktree/* private to each linked worktree. This immutable
 /// creation anchor survives branch movement and keeps its commit reachable.
@@ -81,7 +80,7 @@ pub fn worktree_root() -> Option<PathBuf> {
 
 /// The directory name for a card: the first [`SHORT_ID_LEN`] chars of its id.
 pub fn short_id(card_id: WorkCardId) -> String {
-    card_id.to_string().chars().take(SHORT_ID_LEN).collect()
+    card_id.shown()
 }
 
 /// Where this card's worktree lives — a pure function of the card id, so a

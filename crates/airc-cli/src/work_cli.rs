@@ -63,7 +63,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// Claim lease duration.
         #[arg(long, default_value_t = 600_000)]
@@ -78,9 +78,9 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
-        /// Claim UUID returned by `work claim`.
+        /// Claim id returned by `work claim`: full, or the short form the board shows.
         claim_id: String,
         /// New lease duration from this heartbeat.
         #[arg(long, default_value_t = 600_000)]
@@ -102,9 +102,9 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
-        /// Claim UUID returned by `work claim`. Optional — see command help.
+        /// Claim id returned by `work claim`: full, or the short form the board shows. Optional — see command help.
         claim_id: Option<String>,
         /// Optional release reason.
         #[arg(long)]
@@ -129,7 +129,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// New title (omit to leave unchanged).
         #[arg(long)]
@@ -146,7 +146,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// New lifecycle state.
         #[arg(value_enum)]
@@ -157,7 +157,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
     },
     /// Prune worktrees whose work card has reached a terminal state
@@ -304,7 +304,7 @@ pub enum WorkAction {
         /// Subscribed room containing the parent; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Parent card UUID being reviewed.
+        /// Parent card id (full, or the short form the board shows) being reviewed.
         parent_id: String,
         /// Optional pull-request URL the reviewer should consult. The
         /// body includes it explicitly so reviewers can find it
@@ -363,7 +363,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// Print the gate decision (Green / NotReady reason) without
         /// calling `gh pr merge`. Useful before committing.
@@ -386,7 +386,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID to link the PR to.
+        /// Work card id (full, or the short form the board shows) to link the PR to.
         card_id: String,
         /// GitHub PR number to link (e.g. 1471).
         #[arg(long)]
@@ -404,7 +404,7 @@ pub enum WorkAction {
     /// PR, or the successor doesn't exist / targets a different base
     /// than the link it supersedes (validated via `gh --json`).
     Relink {
-        /// Work card UUID whose PR link to supersede.
+        /// Work card id (full, or the short form the board shows) whose PR link to supersede.
         card_id: String,
         /// Successor PR: a number (e.g. 1137) or a full GitHub PR URL
         /// (e.g. https://github.com/CambrianTech/airc/pull/1137).
