@@ -411,6 +411,27 @@ pub enum WorkAction {
         #[arg(long)]
         pr: String,
     },
+    /// File a peer review on a submission, as the holder of its review card: the
+    /// verdict and its evidence go to the board under YOUR identity. Spawn the review
+    /// card with `airc work review <card>`, claim it, then run this. The parent card
+    /// and your claim are read from the review card; the submission defaults to the
+    /// card's latest.
+    SubmissionReview {
+        /// The review card you claimed.
+        review_card_id: String,
+        /// `passed` or `failed`.
+        #[arg(long)]
+        outcome: String,
+        /// A file saying what you read, ran and saw: the verdict's evidence.
+        #[arg(long)]
+        evidence_file: std::path::PathBuf,
+        /// The submission to review (default: the card's latest).
+        #[arg(long)]
+        submission: Option<String>,
+        /// Room whose board holds the cards (default: the current room).
+        #[arg(long)]
+        room: Option<String>,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
