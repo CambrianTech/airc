@@ -125,7 +125,10 @@ impl MindStore {
         for entry in std::fs::read_dir(self.dir.join(RECORDS_DIR))? {
             let entry = entry?;
             let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".sealed")).and_then(|n| Uuid::parse_str(n).ok())
+            let Some(id) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".sealed"))
+                .and_then(|n| Uuid::parse_str(n).ok())
             else {
                 continue;
             };
@@ -143,16 +146,29 @@ impl MindStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-        text.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).map_err(MindError::Serde)).collect()
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).map_err(MindError::Serde))
+            .collect()
     }
 
     /// Identity rotation: re-seal her mind key from `old` to `new`. The records are not
     /// touched; they stay sealed under the same mind key, so nothing she has is lost.
     pub fn reseal(home: &Path, old: &LocalIdentity, new: &LocalIdentity) -> Result<(), MindError> {
         let key_path = home.join(MIND_DIR).join(KEY_FILE);
-        let old_seal = mind_seal::mind_seal_key(&old.keypair.secret_bytes(), old.peer_id.as_uuid().as_bytes());
-        let key = to_key(mind_seal::open(&old_seal, &std::fs::read(&key_path)?, KEY_BINDING)?)?;
-        let new_seal = mind_seal::mind_seal_key(&new.keypair.secret_bytes(), new.peer_id.as_uuid().as_bytes());
+        let old_seal = mind_seal::mind_seal_key(
+            &old.keypair.secret_bytes(),
+            old.peer_id.as_uuid().as_bytes(),
+        );
+        let key = to_key(mind_seal::open(
+            &old_seal,
+            &std::fs::read(&key_path)?,
+            KEY_BINDING,
+        )?)?;
+        let new_seal = mind_seal::mind_seal_key(
+            &new.keypair.secret_bytes(),
+            new.peer_id.as_uuid().as_bytes(),
+        );
         write_atomically(&key_path, &mind_seal::seal(&new_seal, &key, KEY_BINDING))?;
         Ok(())
     }
@@ -174,8 +190,16 @@ impl MindStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0); // unwrap_or: a clock before 1970 still records THAT she was opened
-        let line = serde_json::to_string(&MindReceipt { at_ms, event: event.to_string(), record }).map_err(MindError::Serde)?;
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join(RECEIPTS_FILE))?;
+        let line = serde_json::to_string(&MindReceipt {
+            at_ms,
+            event: event.to_string(),
+            record,
+        })
+        .map_err(MindError::Serde)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(RECEIPTS_FILE))?;
         writeln!(file, "{line}")?;
         Ok(())
     }
@@ -183,7 +207,9 @@ impl MindStore {
 
 fn to_key(bytes: Vec<u8>) -> Result<SymmetricKey, MindError> {
     let len = bytes.len();
-    bytes.try_into().map_err(|_| MindError::Seal(SealError::Truncated(len)))
+    bytes
+        .try_into()
+        .map_err(|_| MindError::Seal(SealError::Truncated(len)))
 }
 
 /// Write via a temp file and rename, so a crash never leaves a half-written sealed file.
@@ -238,20 +264,48 @@ mod tests {
         assert_eq!(store.get(id).unwrap(), "a private plan");
         assert_eq!(store.list().unwrap(), vec![id]);
         let on_disk = all_bytes(&home.path().join(MIND_DIR));
-        assert!(!on_disk.windows(14).any(|w| w == b"a private plan"), "no plaintext anywhere in her mind store");
+        assert!(
+            !on_disk.windows(14).any(|w| w == b"a private plan"),
+            "no plaintext anywhere in her mind store"
+        );
 
         let stranger = identity(2);
-        assert!(matches!(MindStore::open(home.path(), &stranger), Err(MindError::Seal(_))), "hers alone");
+        assert!(
+            matches!(
+                MindStore::open(home.path(), &stranger),
+                Err(MindError::Seal(_))
+            ),
+            "hers alone"
+        );
 
         // A rotation replaces her KEY and keeps HER (identity is continuity; the peer id
         // stays): a new keypair under the same peer id.
-        let rotated = LocalIdentity { keypair: airc_protocol::keypair::PeerKeypair::from_secret_bytes(&[3; 32]), ..her.clone() };
+        let rotated = LocalIdentity {
+            keypair: airc_protocol::keypair::PeerKeypair::from_secret_bytes(&[3; 32]),
+            ..her.clone()
+        };
         MindStore::reseal(home.path(), &her, &rotated).unwrap();
         let after = MindStore::open(home.path(), &rotated).unwrap();
-        assert_eq!(after.get(id).unwrap(), "a private plan", "her records survive her rotation");
-        assert!(matches!(MindStore::open(home.path(), &her), Err(MindError::Seal(_))), "the old identity no longer opens it");
+        assert_eq!(
+            after.get(id).unwrap(),
+            "a private plan",
+            "her records survive her rotation"
+        );
+        assert!(
+            matches!(MindStore::open(home.path(), &her), Err(MindError::Seal(_))),
+            "the old identity no longer opens it"
+        );
 
-        let events: Vec<String> = after.receipts().unwrap().into_iter().map(|r| r.event).collect();
-        assert_eq!(events, vec!["open", "read", "open", "read"], "every open and read is a receipt she can see");
+        let events: Vec<String> = after
+            .receipts()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(
+            events,
+            vec!["open", "read", "open", "read"],
+            "every open and read is a receipt she can see"
+        );
     }
 }

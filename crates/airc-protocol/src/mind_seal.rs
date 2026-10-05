@@ -40,8 +40,13 @@ pub enum SealError {
 impl std::fmt::Display for SealError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SealError::Truncated(n) => write!(f, "sealed blob is {n} bytes, shorter than a nonce and a tag"),
-            SealError::Unauthentic => write!(f, "sealed blob does not open under this key and binding"),
+            SealError::Truncated(n) => write!(
+                f,
+                "sealed blob is {n} bytes, shorter than a nonce and a tag"
+            ),
+            SealError::Unauthentic => {
+                write!(f, "sealed blob does not open under this key and binding")
+            }
         }
     }
 }
@@ -53,7 +58,8 @@ impl std::error::Error for SealError {}
 pub fn mind_seal_key(identity_secret: &[u8; 32], peer_id: &[u8]) -> SymmetricKey {
     let hk = Hkdf::<Sha256>::new(Some(SEAL_KEY_SALT), identity_secret);
     let mut key = [0u8; 32];
-    hk.expand(peer_id, &mut key).expect("32 bytes is a valid HKDF-SHA256 output length");
+    hk.expand(peer_id, &mut key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
     key
 }
 
@@ -70,7 +76,13 @@ pub fn seal(key: &SymmetricKey, plaintext: &[u8], associated: &[u8]) -> Vec<u8> 
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: associated })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated,
+            },
+        )
         .expect("ChaCha20-Poly1305 encryption of an in-memory buffer cannot fail");
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce);
@@ -86,7 +98,13 @@ pub fn open(key: &SymmetricKey, sealed: &[u8], associated: &[u8]) -> Result<Vec<
     }
     let (nonce, ciphertext) = sealed.split_at(NONCE_LEN);
     ChaCha20Poly1305::new(Key::from_slice(key))
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: associated })
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: associated,
+            },
+        )
         .map_err(|_| SealError::Unauthentic)
 }
 
@@ -101,19 +119,48 @@ mod tests {
     fn a_sealed_record_opens_only_for_her_key_and_its_own_binding() {
         let secret = [7u8; 32];
         let her = mind_seal_key(&secret, b"peer-her");
-        assert_ne!(her, mind_seal_key(&secret, b"peer-other"), "bound to her peer id");
-        assert_ne!(her, mind_seal_key(&[8u8; 32], b"peer-her"), "bound to her secret");
+        assert_ne!(
+            her,
+            mind_seal_key(&secret, b"peer-other"),
+            "bound to her peer id"
+        );
+        assert_ne!(
+            her,
+            mind_seal_key(&[8u8; 32], b"peer-her"),
+            "bound to her secret"
+        );
         assert_eq!(her, mind_seal_key(&secret, b"peer-her"), "stable");
 
         let sealed = seal(&her, b"a private plan", b"record-1");
-        assert!(!sealed.windows(14).any(|w| w == b"a private plan"), "no plaintext in the blob");
+        assert!(
+            !sealed.windows(14).any(|w| w == b"a private plan"),
+            "no plaintext in the blob"
+        );
         assert_eq!(open(&her, &sealed, b"record-1").unwrap(), b"a private plan");
-        assert_eq!(open(&her, &sealed, b"record-2"), Err(SealError::Unauthentic), "bound to its record");
-        assert_eq!(open(&random_key(), &sealed, b"record-1"), Err(SealError::Unauthentic), "her key only");
+        assert_eq!(
+            open(&her, &sealed, b"record-2"),
+            Err(SealError::Unauthentic),
+            "bound to its record"
+        );
+        assert_eq!(
+            open(&random_key(), &sealed, b"record-1"),
+            Err(SealError::Unauthentic),
+            "her key only"
+        );
         let mut tampered = sealed.clone();
         *tampered.last_mut().unwrap() ^= 1;
-        assert_eq!(open(&her, &tampered, b"record-1"), Err(SealError::Unauthentic));
-        assert_eq!(open(&her, &sealed[..20], b"record-1"), Err(SealError::Truncated(20)));
-        assert_ne!(seal(&her, b"x", b"r"), seal(&her, b"x", b"r"), "a fresh nonce every seal");
+        assert_eq!(
+            open(&her, &tampered, b"record-1"),
+            Err(SealError::Unauthentic)
+        );
+        assert_eq!(
+            open(&her, &sealed[..20], b"record-1"),
+            Err(SealError::Truncated(20))
+        );
+        assert_ne!(
+            seal(&her, b"x", b"r"),
+            seal(&her, b"x", b"r"),
+            "a fresh nonce every seal"
+        );
     }
 }
