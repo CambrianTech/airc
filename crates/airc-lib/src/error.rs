@@ -37,6 +37,9 @@ pub enum AircError {
     #[error("room state: {0}")]
     Room(#[from] crate::room::RoomError),
 
+    #[error("mind store: {0}")]
+    Mind(#[from] airc_identity::mind::MindError),
+
     #[error("subscription state: {0}")]
     Subscription(#[from] crate::subscriptions::SubscriptionError),
 

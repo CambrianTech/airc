@@ -111,6 +111,23 @@ impl MindStore {
         Ok(id)
     }
 
+    /// Seal `text` under a caller-chosen id, replacing any record already there: one
+    /// stable place for a thing she keeps current (her private continuation).
+    pub fn put_at(&self, id: Uuid, text: &str) -> Result<(), MindError> {
+        let sealed = mind_seal::seal(&self.key, text.as_bytes(), &self.binding(id))?;
+        write_atomically(&self.record_path(id), &sealed)?;
+        Ok(())
+    }
+
+    /// Remove one record. Absent is not an error: the record is gone either way.
+    pub fn remove(&self, id: Uuid) -> Result<(), MindError> {
+        match std::fs::remove_file(self.record_path(id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Open one record. Writes a `read` receipt.
     pub fn get(&self, id: Uuid) -> Result<String, MindError> {
         let sealed = std::fs::read(self.record_path(id))?;
@@ -251,6 +268,26 @@ mod tests {
             }
         }
         files
+    }
+
+    // what this catches: a record kept "current" (her continuation) that accumulates
+    // copies instead of replacing, or that cannot be removed when she clears it.
+    #[test]
+    fn put_at_replaces_in_place_and_remove_clears() {
+        let home = tempfile::tempdir().unwrap();
+        let store = MindStore::open(home.path(), &identity(1)).unwrap();
+        let id = Uuid::new_v4();
+        store.put_at(id, "first").unwrap();
+        store.put_at(id, "second").unwrap();
+        assert_eq!(store.get(id).unwrap(), "second");
+        assert_eq!(
+            store.list().unwrap(),
+            vec![id],
+            "one record, replaced in place"
+        );
+        store.remove(id).unwrap();
+        store.remove(id).unwrap();
+        assert!(store.list().unwrap().is_empty());
     }
 
     // what this catches: her private text on disk in plaintext; a store another identity

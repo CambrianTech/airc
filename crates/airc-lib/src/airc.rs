@@ -850,6 +850,15 @@ impl Airc {
         &self.inner.wire_root
     }
 
+    /// Her mind store (her private records, sealed under her identity), opened with THIS
+    /// handle's own identity, so a caller never holds her key. Writes an `open` receipt.
+    pub fn mind_store(&self) -> Result<airc_identity::mind::MindStore, AircError> {
+        Ok(airc_identity::mind::MindStore::open(
+            &self.inner.home,
+            &self.inner.identity,
+        )?)
+    }
+
     /// Return the local peer's stable identifier.
     pub fn peer_id(&self) -> PeerId {
         self.inner.identity.peer_id
@@ -3009,6 +3018,32 @@ mod room_trust_policy_tests {
 mod publish_identity_tests {
     use super::*;
     use tempfile::tempdir;
+
+    // what this catches: her mind store opened with anything but her OWN identity (a
+    // caller handing in a key), or a handle that cannot read back what an earlier handle
+    // on the same home sealed (her private space lost across a restart).
+    #[tokio::test]
+    async fn her_mind_store_opens_with_her_own_identity_across_handles() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("citizen/.airc");
+        let wire = dir.path().join("wire");
+        let id = {
+            let airc = Airc::open_with_wire_root_for_test(&home, &wire)
+                .await
+                .unwrap();
+            let store = airc.mind_store().unwrap();
+            let id = uuid::Uuid::new_v4();
+            store.put_at(id, "a private plan").unwrap();
+            id
+        };
+        let again = Airc::open_with_wire_root_for_test(&home, &wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.mind_store().unwrap().get(id).unwrap(),
+            "a private plan"
+        );
+    }
 
     // what this catches: publish_identity grounds a citizen BY NAME via
     // the agent-name floor. open_as sets a runtime agent_name but NOT a
