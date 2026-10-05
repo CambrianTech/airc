@@ -37,6 +37,9 @@ use serde::Deserialize;
 
 /// On-disk schema version for local identity rows. Bump when the
 /// stored shape changes incompatibly.
+/// Her private records, sealed (continuum PRIVACY-OF-THOUGHT.md step 2).
+pub mod mind;
+
 const IDENTITY_STATE_VERSION: u32 = 1;
 
 /// Environment override for selecting the local agent identity row.
