@@ -1747,6 +1747,112 @@ pub async fn run_relink(
     crate::work_commands_gh::relink_card_pr(&airc, card_uuid, pr_number).await
 }
 
+/// `airc work submission-review <REVIEW_CARD> --outcome passed|failed --evidence-file F`:
+/// a peer review on a submission, filed under THIS scope's identity (an agent reviewing a
+/// citizen's work). The parent card and the claim come from the review card (it must be
+/// yours, claimed); the submission defaults to the parent's latest. airc-lib's
+/// `review_work_submission_in` had no verb, so no agent could file one from the CLI.
+pub async fn run_submission_review(
+    home: &Path,
+    room: Option<String>,
+    review_card_id: String,
+    outcome: String,
+    evidence_file: std::path::PathBuf,
+    submission: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let outcome = parse_review_outcome(&outcome)?;
+    let evidence_text = std::fs::read_to_string(&evidence_file)
+        .map_err(|e| format!("evidence file {}: {e}", evidence_file.display()))?;
+    let evidence = evidence_artifact(&evidence_text)?;
+    let submission = submission.as_deref().map(Uuid::parse_str).transpose()?;
+    let airc = crate::commands::attached_airc(home).await?;
+    let review_card = parse_work_card_id(&review_card_id)?;
+    let room = room_or_current(&airc, room.as_deref(), "review a submission in").await?;
+    let board = airc.work_board_in(&room).await?;
+    let held = board
+        .card(review_card)
+        .ok_or_else(|| format!("review card {review_card} is not on {}'s board", room.name))?;
+    let card_id = held
+        .reviews
+        .ok_or_else(|| format!("card {review_card} is not a review card (it reviews nothing)"))?;
+    let review_claim_id = match (held.owner, held.claim_id) {
+        (Some(owner), Some(claim)) if owner == airc.peer_id() => claim,
+        (Some(owner), _) => {
+            return Err(format!(
+                "review card {review_card} is held by {owner}, not by you: only its holder reviews"
+            )
+            .into())
+        }
+        (None, _) => {
+            return Err(format!(
+                "review card {review_card} is not claimed: `airc work claim` it first"
+            )
+            .into())
+        }
+    };
+    let parent = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} is not on {}'s board", room.name))?;
+    let chosen = match submission {
+        Some(id) => parent
+            .submissions
+            .iter()
+            .find(|s| s.submission_id.as_uuid() == id)
+            .ok_or_else(|| format!("card {card_id} has no submission {id}"))?,
+        None => parent
+            .submissions
+            .iter()
+            .max_by_key(|s| s.submitted_at_ms)
+            .ok_or_else(|| format!("card {card_id} has no submission to review yet"))?,
+    };
+    let review = airc
+        .review_work_submission_in(
+            &room,
+            airc_lib::ReviewWorkSubmission {
+                review_id: airc_work::WorkReviewId::from_uuid(Uuid::new_v4()),
+                card_id,
+                submission_id: chosen.submission_id,
+                artifact: chosen.artifact.clone(),
+                review_card_id: review_card,
+                review_claim_id,
+                outcome,
+                evidence,
+            },
+        )
+        .await?;
+    println!(
+        "review: {} card={} submission={} outcome={:?}",
+        review.review_id, review.card_id, review.submission_id, review.outcome
+    );
+    Ok(())
+}
+
+/// PURE: the verdict word, by name. Unknown is not a verdict a reviewer files.
+fn parse_review_outcome(word: &str) -> Result<airc_work::WorkReviewOutcome, String> {
+    match word.trim() {
+        "passed" => Ok(airc_work::WorkReviewOutcome::Passed),
+        "failed" => Ok(airc_work::WorkReviewOutcome::Failed),
+        other => Err(format!(
+            "--outcome must be `passed` or `failed`, got `{other}`"
+        )),
+    }
+}
+
+/// PURE: the evidence reference for what the reviewer wrote: SHA-256 over its bytes, its
+/// length, `text/plain`. Empty evidence is refused: a verdict without evidence is not one.
+fn evidence_artifact(text: &str) -> Result<airc_work::SubmissionArtifact, String> {
+    if text.trim().is_empty() {
+        return Err(
+            "the evidence file is empty: a verdict without evidence is not a verdict".to_string(),
+        );
+    }
+    Ok(airc_work::SubmissionArtifact {
+        hash: airc_blobs::ContentHash::from_bytes(text.as_bytes()),
+        size_bytes: text.len() as u64,
+        mime: Some("text/plain".to_string()),
+    })
+}
+
 /// Parse a `--pr` argument that is either a bare PR number (`1137`) or
 /// a full GitHub PR URL (`https://github.com/owner/repo/pull/1137`).
 /// Anything else is a loud error — no guessing, no substring scraping.
@@ -2583,6 +2689,34 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
+    // what this catches: a submission review filed with a verdict word nobody meant
+    // ("pass", "ok", "unknown"), or with no evidence; and evidence whose reference does
+    // not name the exact bytes the reviewer wrote.
+    #[test]
+    fn a_submission_review_names_its_verdict_and_carries_real_evidence() {
+        assert!(matches!(
+            parse_review_outcome("passed"),
+            Ok(airc_work::WorkReviewOutcome::Passed)
+        ));
+        assert!(matches!(
+            parse_review_outcome("failed"),
+            Ok(airc_work::WorkReviewOutcome::Failed)
+        ));
+        assert!(parse_review_outcome("pass").is_err());
+        assert!(parse_review_outcome("unknown").is_err());
+        assert!(
+            evidence_artifact("  \n").is_err(),
+            "no evidence, no verdict"
+        );
+        let text = "read PR #2 end to end; npm test 12/12";
+        let evidence = evidence_artifact(text).expect("evidence");
+        assert_eq!(
+            evidence.hash,
+            airc_blobs::ContentHash::from_bytes(text.as_bytes())
+        );
+        assert_eq!(evidence.size_bytes, text.len() as u64);
+    }
+
     use super::*;
 
     // Card 09fddedd — `--pr <number-or-url>` parser for `airc work
