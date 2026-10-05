@@ -54,6 +54,11 @@ macro_rules! uuid_newtype {
             pub fn as_uuid(&self) -> Uuid {
                 self.0
             }
+
+            /// The short form every surface displays and a caller types back.
+            pub fn shown(&self) -> String {
+                crate::shown_id::shown_form(self.0)
+            }
         }
 
         impl Default for $name {

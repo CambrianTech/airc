@@ -43,7 +43,7 @@ pub(crate) async fn open_pr_and_link(
         return Ok(());
     }
 
-    let short: String = card.card_id.to_string().chars().take(8).collect();
+    let short = card.card_id.shown();
     let lease_root = lease::lease_root()
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
     let worktree_path = lease_root.join(&short);

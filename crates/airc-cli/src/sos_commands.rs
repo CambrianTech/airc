@@ -455,7 +455,7 @@ async fn node_label(home: &Path) -> Result<String, Box<dyn Error>> {
     // Fallback: platform + short peer-id. peer_id is stable across runs,
     // so the fallback label is stable too (self-filter depends on that).
     let identity = airc_identity::LocalIdentity::load_or_generate(home).await?;
-    let short_peer: String = identity.peer_id.to_string().chars().take(8).collect();
+    let short_peer = identity.peer_id.shown();
     let fallback = format!("{}-{short_peer}", std::env::consts::OS);
     normalize_label(&fallback).ok_or_else(|| "airc sos: could not derive a machine label".into())
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 macro_rules! uuid_id {
-    ($name:ident) => {
+    ($name:ident, $label:literal) => {
         #[derive(
             Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
@@ -27,6 +27,21 @@ macro_rules! uuid_id {
             pub fn as_uuid(self) -> Uuid {
                 self.0
             }
+
+            /// The short form every surface displays and a caller types back.
+            pub fn shown(self) -> String {
+                airc_core::shown_id::shown_form(self.0)
+            }
+        }
+
+        impl airc_core::shown_id::ShownKind for $name {
+            const LABEL: &'static str = $label;
+            fn from_uuid(id: Uuid) -> Self {
+                Self(id)
+            }
+            fn to_uuid(self) -> Uuid {
+                self.0
+            }
         }
 
         impl Default for $name {
@@ -43,17 +58,17 @@ macro_rules! uuid_id {
     };
 }
 
-uuid_id!(WorkCardId);
-uuid_id!(LaneId);
-uuid_id!(ClaimId);
-uuid_id!(SubmissionId);
-uuid_id!(WorkReviewId);
-uuid_id!(WorkspaceId);
+uuid_id!(WorkCardId, "card");
+uuid_id!(LaneId, "lane");
+uuid_id!(ClaimId, "claim");
+uuid_id!(SubmissionId, "submission");
+uuid_id!(WorkReviewId, "review");
+uuid_id!(WorkspaceId, "workspace");
 // Card e4cad280 slice A: idle-agent engine goals (long-running
 // aspirations recipes synthesize work against). Goal events + projection
 // land in slice C; the ID type joins its siblings here so the typed-newtype
 // pattern stays canonical.
-uuid_id!(GoalId);
+uuid_id!(GoalId, "goal");
 
 /// Repository key such as `CambrianTech/continuum`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
