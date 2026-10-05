@@ -176,6 +176,12 @@ impl WorkBoardProjection {
         self.cards.get(&card_id)
     }
 
+    /// Every card id on this board: the candidates a shown (short) card id
+    /// resolves against.
+    pub fn card_ids(&self) -> impl Iterator<Item = WorkCardId> + '_ {
+        self.cards.keys().copied()
+    }
+
     pub fn workspace(&self, workspace_id: WorkspaceId) -> Option<&WorkspaceRecord> {
         self.workspaces.get(&workspace_id)
     }

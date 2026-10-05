@@ -25,7 +25,7 @@ pub(crate) async fn spawn_claim_worktree(
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
-    let short: String = card.card_id.to_string().chars().take(8).collect();
+    let short = card.card_id.shown();
 
     // Card 8a3082c4 + BIGMAMA review fix: skip worktree spawn when
     // card is linked to a LIVE PR (Open/Draft/Ready). A Merged or

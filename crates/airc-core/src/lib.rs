@@ -43,6 +43,7 @@ pub mod persona;
 pub mod process;
 pub mod receipt;
 pub mod scoped_state;
+pub mod shown_id;
 pub mod temp_home;
 pub mod transcript;
 
