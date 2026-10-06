@@ -1764,6 +1764,93 @@ pub async fn run_relink(
 /// citizen's work). The parent card and the claim come from the review card (it must be
 /// yours, claimed); the submission defaults to the parent's latest. airc-lib's
 /// `review_work_submission_in` had no verb, so no agent could file one from the CLI.
+/// `airc work submit`: publish a submission on a card the caller holds. continuum #4825's
+/// card went to Review with its PR linked, but no submission existed, so Kimi's verdict
+/// was refused ("no submission to review yet", 2026-10-06): the CLI had no way to publish
+/// one. airc-lib's `submit_work_in` validates the claim, the base and the instance.
+pub async fn run_submit(
+    home: &Path,
+    room: Option<String>,
+    card_id: String,
+    patch: std::path::PathBuf,
+    base: String,
+    instance: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes =
+        std::fs::read(&patch).map_err(|e| format!("patch file {}: {e}", patch.display()))?;
+    // Retain the exact bytes BEFORE publishing their identity (BigMama on #1548): a reviewer,
+    // grader or lift reads a submission by hash, and the patch file can change after this
+    // call. The scope's content-addressed store holds them; its hash is the one published.
+    let store = airc_blobs::FsStore::new(airc_lib::machine_account_home(home).join("blobs"))
+        .map_err(|e| format!("blob store: {e}"))?;
+    let artifact = retain_patch(&store, &bytes)?;
+    let base_sha = airc_work::GitObjectId::new(base.trim())
+        .map_err(|e| format!("--base `{base}`: {e} (give the FULL commit sha)"))?;
+    let airc = crate::commands::attached_airc(home).await?;
+    let shown = Shown::try_from(card_id.as_str())?;
+    let room = room_or_current(&airc, room.as_deref(), "submit work in").await?;
+    let board = airc.work_board_in(&room).await?;
+    let card_id = card_on_board(&board, &shown)?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} is not on {}'s board", room.name))?;
+    let claim_id = match (card.owner, card.claim_id) {
+        (Some(owner), Some(claim)) if owner == airc.peer_id() => claim,
+        (Some(owner), _) => {
+            return Err(format!(
+                "card {card_id} is held by {owner}, not by you: only its holder submits"
+            )
+            .into())
+        }
+        (None, _) => {
+            return Err(format!("card {card_id} is not claimed: `airc work claim` it first").into())
+        }
+    };
+    let instance = instance.unwrap_or_else(|| card.repo.to_string());
+    let submission = airc
+        .submit_work_in(
+            &room,
+            airc_lib::SubmitWork {
+                submission_id: airc_work::SubmissionId::new(),
+                card_id,
+                claim_id,
+                instance,
+                base_sha,
+                artifact,
+            },
+        )
+        .await?;
+    println!(
+        "submission: {} card={} size={} base={}",
+        submission.submission_id,
+        submission.card_id,
+        submission.artifact.size_bytes,
+        submission.base_sha
+    );
+    Ok(())
+}
+
+/// Retain a patch in `store` and return its artifact reference: the hash the store holds
+/// it under, its length, `text/x-patch`. An empty patch is refused: there is nothing to
+/// review. The same shape as continuum's `work/submit` (`retain_patch`).
+fn retain_patch(
+    store: &airc_blobs::FsStore,
+    bytes: &[u8],
+) -> Result<airc_work::SubmissionArtifact, String> {
+    use airc_blobs::ContentAddressedStore;
+    if bytes.is_empty() {
+        return Err("the patch file is empty: there is nothing to review".to_string());
+    }
+    let hash = store
+        .put(bytes)
+        .map_err(|e| format!("could not retain the patch: {e}"))?;
+    Ok(airc_work::SubmissionArtifact {
+        hash,
+        size_bytes: bytes.len() as u64,
+        mime: Some("text/x-patch".to_string()),
+    })
+}
+
 pub async fn run_submission_review(
     home: &Path,
     room: Option<String>,
@@ -2790,6 +2877,28 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
+    // what this catches (card 9c3ab08d; BigMama on #1548): a submission naming a hash that
+    // nothing holds, or an empty patch accepted as reviewable. The patch is retained first,
+    // the published hash reads its exact bytes back, and empty is refused.
+    #[test]
+    fn a_submitted_patch_is_retained_and_reads_back_by_its_hash() {
+        use airc_blobs::ContentAddressedStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = airc_blobs::FsStore::new(dir.path()).expect("store");
+        let patch = b"diff --git a/x b/x\n+one\n";
+        let artifact = super::retain_patch(&store, patch).expect("a patch");
+        assert_eq!(artifact.size_bytes, patch.len() as u64);
+        assert_eq!(artifact.mime.as_deref(), Some("text/x-patch"));
+        assert_eq!(
+            store.get(&artifact.hash).expect("held by its hash"),
+            patch.to_vec()
+        );
+        assert!(
+            super::retain_patch(&store, b"").is_err(),
+            "nothing to review"
+        );
+    }
+
     // what this catches (card 3e2b7f45): a capped board that drops a LIVE card to keep newer
     // finished ones (Kimi's claimed review card hidden at the default --limit 128 while
     // closed cards showed). Live rows are kept first, in the board's order; finished history

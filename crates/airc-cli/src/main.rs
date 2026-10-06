@@ -1022,6 +1022,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             WorkAction::Relink { card_id, pr } => {
                 work_commands::run_relink(&home, card_id, pr).await
             }
+            WorkAction::Submit {
+                card_id,
+                patch,
+                base,
+                instance,
+                room,
+            } => work_commands::run_submit(&home, room, card_id, patch, base, instance).await,
             WorkAction::SubmissionReview {
                 review_card_id,
                 outcome,
