@@ -1778,7 +1778,12 @@ pub async fn run_submit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes =
         std::fs::read(&patch).map_err(|e| format!("patch file {}: {e}", patch.display()))?;
-    let artifact = patch_artifact(&bytes)?;
+    // Retain the exact bytes BEFORE publishing their identity (BigMama on #1548): a reviewer,
+    // grader or lift reads a submission by hash, and the patch file can change after this
+    // call. The scope's content-addressed store holds them; its hash is the one published.
+    let store = airc_blobs::FsStore::new(airc_lib::machine_account_home(home).join("blobs"))
+        .map_err(|e| format!("blob store: {e}"))?;
+    let artifact = retain_patch(&store, &bytes)?;
     let base_sha = airc_work::GitObjectId::new(base.trim())
         .map_err(|e| format!("--base `{base}`: {e} (give the FULL commit sha)"))?;
     let airc = crate::commands::attached_airc(home).await?;
@@ -1825,14 +1830,22 @@ pub async fn run_submit(
     Ok(())
 }
 
-/// PURE: the artifact reference of a patch: SHA-256 over its bytes, its length,
-/// `text/x-patch`. An empty patch is refused: there is nothing to review.
-fn patch_artifact(bytes: &[u8]) -> Result<airc_work::SubmissionArtifact, String> {
+/// Retain a patch in `store` and return its artifact reference: the hash the store holds
+/// it under, its length, `text/x-patch`. An empty patch is refused: there is nothing to
+/// review. The same shape as continuum's `work/submit` (`retain_patch`).
+fn retain_patch(
+    store: &airc_blobs::FsStore,
+    bytes: &[u8],
+) -> Result<airc_work::SubmissionArtifact, String> {
+    use airc_blobs::ContentAddressedStore;
     if bytes.is_empty() {
         return Err("the patch file is empty: there is nothing to review".to_string());
     }
+    let hash = store
+        .put(bytes)
+        .map_err(|e| format!("could not retain the patch: {e}"))?;
     Ok(airc_work::SubmissionArtifact {
-        hash: airc_blobs::ContentHash::from_bytes(bytes),
+        hash,
         size_bytes: bytes.len() as u64,
         mime: Some("text/x-patch".to_string()),
     })
@@ -2864,17 +2877,26 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
-    // what this catches (card 9c3ab08d): a submission whose artifact is not the patch's own
-    // bytes, or an empty patch accepted as reviewable. The reference is the SHA-256 of the
-    // exact bytes and their length; the same bytes give the same hash, and empty is refused.
+    // what this catches (card 9c3ab08d; BigMama on #1548): a submission naming a hash that
+    // nothing holds, or an empty patch accepted as reviewable. The patch is retained first,
+    // the published hash reads its exact bytes back, and empty is refused.
     #[test]
-    fn a_submission_artifact_is_the_patch_bytes_and_empty_is_refused() {
+    fn a_submitted_patch_is_retained_and_reads_back_by_its_hash() {
+        use airc_blobs::ContentAddressedStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = airc_blobs::FsStore::new(dir.path()).expect("store");
         let patch = b"diff --git a/x b/x\n+one\n";
-        let artifact = super::patch_artifact(patch).expect("a patch");
+        let artifact = super::retain_patch(&store, patch).expect("a patch");
         assert_eq!(artifact.size_bytes, patch.len() as u64);
         assert_eq!(artifact.mime.as_deref(), Some("text/x-patch"));
-        assert_eq!(artifact.hash, airc_blobs::ContentHash::from_bytes(patch));
-        assert!(super::patch_artifact(b"").is_err(), "nothing to review");
+        assert_eq!(
+            store.get(&artifact.hash).expect("held by its hash"),
+            patch.to_vec()
+        );
+        assert!(
+            super::retain_patch(&store, b"").is_err(),
+            "nothing to review"
+        );
     }
 
     // what this catches (card 3e2b7f45): a capped board that drops a LIVE card to keep newer
