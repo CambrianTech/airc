@@ -79,6 +79,7 @@ mod route_commands;
 mod route_proof_commands;
 mod runtime_context;
 mod runtime_dir;
+mod signin_prompt;
 mod sos_commands;
 mod staleness;
 mod state_cli;
