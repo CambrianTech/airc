@@ -2070,13 +2070,13 @@ fn stranger_claims(projection: &mut WorkBoardProjection, card_id: WorkCardId, at
     bob_claim
 }
 
-// what this catches: card d826e5f1. Kimi's lapsed lease made her own card claimable,
-// and on 2026-09-21 her finished card went to another peer. From the cutover on, a
-// stranger's claim on an owned card is dropped on every node; before it, history
-// replays unchanged; and an explicit, attributed release still hands the card over.
+// what this catches: a takeover that leaves no record. From the cutover on, a BARE
+// stranger's claim on a held card is dropped on every node, so every takeover is an
+// attributed release then a claim (the SDK gate does exactly that, card 667b7e0c);
+// before the cutover, history replays unchanged.
 #[test]
-fn ownership_is_durable_from_the_cutover_and_handover_is_explicit() {
-    let cut = OWNERSHIP_DURABLE_SINCE_MS;
+fn a_takeover_is_release_then_claim_from_the_cutover_and_history_replays_unchanged() {
+    let cut = TAKEOVER_ON_RECORD_SINCE_MS;
 
     let (mut after, card_id, alice_claim, alice) = durable_fixture(cut);
     stranger_claims(&mut after, card_id, cut + 500); // her lease lapsed at cut + 101

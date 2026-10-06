@@ -1,10 +1,11 @@
-//! CONTRACT CHANGE (card d826e5f1, Joel 2026-10-04): ownership is durable and the
-//! lease is presence. From `OWNERSHIP_DURABLE_SINCE_MS` on, Bob's implicit reclaim
-//! below is dropped by the projection and refused at the SDK gate; work still
-//! outlives Alice, through an explicit, attributed `ClaimReleased` of her claim and
-//! then Bob's claim. This file's transcript uses t=1..301, before the cutover, so it
-//! now proves that HISTORICAL boards replay unchanged. The post-cutover contract
-//! is pinned by airc-work `ownership_is_durable_from_the_cutover_and_handover_is_explicit`.
+//! CONTRACT (card 667b7e0c, Joel 2026-10-06: "allow anyone to take it at any time"):
+//! a claim on a card someone else holds is a takeover. The SDK gate emits an
+//! attributed `ClaimReleased` of the holder's claim, then the taker's claim. From
+//! `TAKEOVER_ON_RECORD_SINCE_MS` on, the projection still drops a BARE stranger's
+//! claim (Bob's implicit reclaim below), so a takeover is always release-then-claim
+//! on the record. This file's transcript uses t=1..301, before that cutover, so it
+//! proves HISTORICAL boards replay unchanged. The takeover itself is pinned by
+//! airc-lib `a_second_peer_takes_a_live_held_card_and_the_holders_claim_is_released`.
 //!
 //! Card 75b54d0a — flywheel continuity under agent/machine churn:
 //!

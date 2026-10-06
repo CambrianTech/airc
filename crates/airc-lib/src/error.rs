@@ -161,16 +161,6 @@ pub enum AircError {
         claim_id: airc_work::ClaimId,
     },
 
-    /// Caller attempted to create a second active claim for a card
-    /// that already has one. Claims are leases; duplicate active
-    /// claims make manager/persona training data ambiguous.
-    #[error("work card {card_id} already has active claim {claim_id:?} owned by {owner:?}")]
-    WorkCardAlreadyClaimed {
-        card_id: airc_work::WorkCardId,
-        claim_id: Option<airc_work::ClaimId>,
-        owner: Option<airc_core::PeerId>,
-    },
-
     /// Caller attempted to claim a card whose lifecycle state is past
     /// claiming (Review/Merged/Closed). Live evidence (2026-07-24):
     /// personas kept re-claiming ALREADY-COMPLETED cards because the
