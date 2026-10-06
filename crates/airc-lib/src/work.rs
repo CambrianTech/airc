@@ -602,20 +602,41 @@ impl Airc {
         selected_at_ms: Option<u64>,
     ) -> Result<ClaimId, AircError> {
         self.ensure_work_card_in_room(room, request.card_id).await?;
-        if let ClaimGate::Resume(claim_id) = self.claim_gate_in(room, request.card_id).await? {
-            // Her own card, her own claim: renew it, never re-claim it. A new
-            // CardClaimed would set the card's state to Claimed and take a Review
-            // card out of the merge gate.
-            self.heartbeat_work_claim_in(
-                room,
-                HeartbeatWorkClaim {
-                    card_id: request.card_id,
-                    claim_id,
-                    ttl_ms: request.ttl_ms,
-                },
-            )
-            .await?;
-            return Ok(claim_id);
+        match self.claim_gate_in(room, request.card_id).await? {
+            ClaimGate::Resume(claim_id) => {
+                // Her own card, her own claim: renew it, never re-claim it. A new
+                // CardClaimed would set the card's state to Claimed and take a Review
+                // card out of the merge gate.
+                self.heartbeat_work_claim_in(
+                    room,
+                    HeartbeatWorkClaim {
+                        card_id: request.card_id,
+                        claim_id,
+                        ttl_ms: request.ttl_ms,
+                    },
+                )
+                .await?;
+                return Ok(claim_id);
+            }
+            ClaimGate::Takeover { prev, owner } => {
+                // Joel, 2026-10-06: anyone may take a held card at any time. The handover
+                // is on the record: the holder's claim released BY the taker, typed with
+                // whom it was taken from (never an id spelled into the reason), then the
+                // taker's claim. The projection accepts a release from anyone.
+                self.publish_work_event_in(
+                    room,
+                    &WorkEvent::ClaimReleased(ClaimReleased {
+                        card_id: request.card_id,
+                        claim_id: prev,
+                        owner: self.peer_id(),
+                        reason: Some("taken over".into()),
+                        released_at_ms: now_ms()?,
+                        taken_over_from: owner,
+                    }),
+                )
+                .await?;
+            }
+            ClaimGate::Fresh => {}
         }
         let claim_id = ClaimId::new();
         let event = WorkEvent::CardClaimed(WorkCardClaimed {
@@ -696,6 +717,7 @@ impl Airc {
             owner: self.peer_id(),
             reason: request.reason,
             released_at_ms: now_ms()?,
+            taken_over_from: None,
         });
         self.publish_work_event_in(room, &event).await?;
         Ok(())
@@ -1420,11 +1442,11 @@ impl Airc {
                 .find(|claim| claim.card_id == card.card_id)
                 .cloned();
             let open = card.state == airc_work::CardState::Open && card.claim_id.is_none();
-            // A lapsed lease is claimable only by its owner, as a resume: ownership is
-            // durable (card d826e5f1), so advertising it to anyone else invites a refusal.
+            // A lapsed lease is claimable by anyone (a takeover for a stranger, a resume for
+            // its owner). A LIVE claim is never offered here: a deliberate claim may take
+            // it, but the queue never hands someone's live turn to whoever pulls next.
             let stale_claimable = query.include_stale_claims
                 && stale_claim.is_some()
-                && card.owner == Some(peer_id)
                 && !matches!(
                     card.state,
                     airc_work::CardState::Merged | airc_work::CardState::Closed
@@ -1563,8 +1585,9 @@ impl Airc {
 ///
 /// - the owner with her claim standing resumes it (card 4fee35cf);
 /// - settled work is past claiming for everyone else;
-/// - ownership is durable (card d826e5f1): while another owner's claim stands, lapsed
-///   lease or not, a stranger is refused. Handover is an explicit release first.
+/// - a card someone else holds, live lease or lapsed, is taken over (Joel, 2026-10-06:
+///   "allow anyone to take it at any time"; durable ownership, card d826e5f1, is gone).
+///   The takeover releases the holder's claim on the record before claiming.
 fn claim_gate_for(card: &WorkCard, me: airc_core::PeerId) -> Result<ClaimGate, AircError> {
     if let Some(claim_id) = owner_resumes(card, me) {
         return Ok(ClaimGate::Resume(claim_id));
@@ -1577,21 +1600,26 @@ fn claim_gate_for(card: &WorkCard, me: airc_core::PeerId) -> Result<ClaimGate, A
             state: card.state,
         });
     }
-    if card.claim_id.is_none() {
-        return Ok(ClaimGate::Fresh);
-    }
-    Err(AircError::WorkCardAlreadyClaimed {
-        card_id: card.card_id,
-        claim_id: card.claim_id,
-        owner: card.owner,
+    Ok(match card.claim_id {
+        None => ClaimGate::Fresh,
+        Some(prev) => ClaimGate::Takeover {
+            prev,
+            owner: card.owner,
+        },
     })
 }
 
 /// What a claim request turns into once the gate has read the board.
 #[derive(Debug, PartialEq, Eq)]
 enum ClaimGate {
-    /// Mint a new claim (an open card, or one whose lease lapsed under someone else).
+    /// Mint a new claim on a card nobody holds.
     Fresh,
+    /// Someone else holds the card: release their claim, attributed to the taker, then
+    /// mint a new one.
+    Takeover {
+        prev: ClaimId,
+        owner: Option<airc_core::PeerId>,
+    },
     /// The caller owns this card and it still carries her claim: renew that claim.
     Resume(ClaimId),
 }
@@ -1780,11 +1808,12 @@ mod tests {
         );
     }
 
-    // what this catches: card d826e5f1. Ownership is durable at the gate too: a lapsed
-    // lease never lets a stranger in, the owner resumes, and only an unowned open card
-    // takes a fresh claim.
+    // what this catches: Joel, 2026-10-06, "allow anyone to take it at any time": a card
+    // someone else holds is taken over whether her lease is live or lapsed, and the
+    // takeover names the claim it releases; the owner still resumes her own; a settled
+    // card stays past claiming; nobody's claim means a fresh one.
     #[test]
-    fn a_stranger_never_takes_an_owned_card_even_after_its_lease_lapses() {
+    fn anyone_takes_over_a_held_card_live_or_lapsed_and_the_owner_resumes() {
         let alice = airc_core::PeerId::from_u128(7);
         let bob = airc_core::PeerId::from_u128(8);
         let claim = ClaimId::new();
@@ -1796,15 +1825,23 @@ mod tests {
         .unwrap();
         card.owner = Some(alice);
         card.claim_id = Some(claim);
+        let takeover = ClaimGate::Takeover {
+            prev: claim,
+            owner: Some(alice),
+        };
+        card.claim_expires_at_ms = Some(u64::MAX); // live
+        assert_eq!(claim_gate_for(&card, bob).unwrap(), takeover);
         card.claim_expires_at_ms = Some(2); // long lapsed
-        assert!(matches!(
-            claim_gate_for(&card, bob),
-            Err(AircError::WorkCardAlreadyClaimed { .. })
-        ));
+        assert_eq!(claim_gate_for(&card, bob).unwrap(), takeover);
         assert_eq!(
             claim_gate_for(&card, alice).unwrap(),
             ClaimGate::Resume(claim)
         );
+        card.state = CardState::Review;
+        assert!(matches!(
+            claim_gate_for(&card, bob),
+            Err(AircError::WorkCardNotClaimable { .. })
+        ));
         card.owner = None;
         card.claim_id = None;
         card.state = CardState::Open;

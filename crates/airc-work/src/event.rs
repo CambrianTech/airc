@@ -531,9 +531,15 @@ pub struct ClaimHeartbeat {
 pub struct ClaimReleased {
     pub card_id: WorkCardId,
     pub claim_id: ClaimId,
+    /// Who released the claim: its holder, or the peer taking the card over.
     pub owner: PeerId,
     pub reason: Option<String>,
     pub released_at_ms: u64,
+    /// Set when this release is a takeover: the holder the card was taken from. Typed, never
+    /// spelled into `reason` (Joel, 2026-10-06: an id is never part of a string). Absent on
+    /// a holder's own release and on every event written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_over_from: Option<PeerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -926,5 +932,27 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["kind"], "card_created");
         assert_eq!(event.occurred_at_ms(), 10);
+    }
+
+    // what this catches: the takeover field breaking the wire. A release written before
+    // `taken_over_from` existed still decodes (as no takeover), and a holder's own release
+    // serializes without the field, byte-for-byte what older readers expect.
+    #[test]
+    fn a_release_without_taken_over_from_reads_and_writes_as_before() {
+        let card_id = WorkCardId::new();
+        let claim_id = ClaimId::new();
+        let owner = PeerId::new();
+        let old = serde_json::json!({
+            "kind": "claim_released", "card_id": card_id, "claim_id": claim_id,
+            "owner": owner, "reason": null, "released_at_ms": 5
+        });
+        let WorkEvent::ClaimReleased(decoded) = serde_json::from_value(old.clone()).unwrap() else {
+            panic!("decodes as a release");
+        };
+        assert_eq!(decoded.taken_over_from, None);
+        assert_eq!(
+            serde_json::to_value(WorkEvent::ClaimReleased(decoded)).unwrap(),
+            old
+        );
     }
 }

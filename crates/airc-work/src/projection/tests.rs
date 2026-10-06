@@ -101,6 +101,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             owner,
             reason: None,
             released_at_ms: 202,
+            taken_over_from: None,
         }))
         .unwrap();
     assert!(restored.card(card_id).unwrap().claim_provenance.is_none());
@@ -119,6 +120,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             owner,
             reason: None,
             released_at_ms: 204,
+            taken_over_from: None,
         }))
         .unwrap();
     assert_eq!(
@@ -348,6 +350,7 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
             owner,
             reason: Some("merged".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -392,6 +395,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             owner,
             reason: Some("first release".to_string()),
             released_at_ms: 120,
+            taken_over_from: None,
         }),
         WorkEvent::ClaimReleased(ClaimReleased {
             card_id,
@@ -399,6 +403,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             owner,
             reason: Some("duplicate release".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -454,6 +459,7 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
             owner: first_owner,
             reason: Some("release original claim".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -982,6 +988,7 @@ fn release_for_superseded_claim_does_not_poison_projection() {
             owner: owner_b,
             reason: None,
             released_at_ms: 4,
+            taken_over_from: None,
         }))
         .expect("release of superseded claim must be tolerated");
 
@@ -2070,13 +2077,13 @@ fn stranger_claims(projection: &mut WorkBoardProjection, card_id: WorkCardId, at
     bob_claim
 }
 
-// what this catches: card d826e5f1. Kimi's lapsed lease made her own card claimable,
-// and on 2026-09-21 her finished card went to another peer. From the cutover on, a
-// stranger's claim on an owned card is dropped on every node; before it, history
-// replays unchanged; and an explicit, attributed release still hands the card over.
+// what this catches: a takeover that leaves no record. From the cutover on, a BARE
+// stranger's claim on a held card is dropped on every node, so every takeover is an
+// attributed release then a claim (the SDK gate does exactly that, card 667b7e0c);
+// before the cutover, history replays unchanged.
 #[test]
-fn ownership_is_durable_from_the_cutover_and_handover_is_explicit() {
-    let cut = OWNERSHIP_DURABLE_SINCE_MS;
+fn a_takeover_is_release_then_claim_from_the_cutover_and_history_replays_unchanged() {
+    let cut = TAKEOVER_ON_RECORD_SINCE_MS;
 
     let (mut after, card_id, alice_claim, alice) = durable_fixture(cut);
     stranger_claims(&mut after, card_id, cut + 500); // her lease lapsed at cut + 101
@@ -2099,6 +2106,7 @@ fn ownership_is_durable_from_the_cutover_and_handover_is_explicit() {
             owner: peer(53),
             reason: Some("handover: Alice is gone".into()),
             released_at_ms: cut + 600,
+            taken_over_from: None,
         }))
         .unwrap();
     let bob_claim = stranger_claims(&mut after, card_id, cut + 700);

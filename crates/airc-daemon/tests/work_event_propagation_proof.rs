@@ -286,6 +286,7 @@ async fn card_state_transitions_propagate_to_all_attached_peers() {
             owner,
             reason: None,
             released_at_ms: 5,
+            taken_over_from: None,
         }),
     ];
 

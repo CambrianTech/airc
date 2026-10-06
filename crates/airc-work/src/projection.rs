@@ -18,7 +18,7 @@ use crate::model::{
 };
 
 mod apply;
-pub use apply::OWNERSHIP_DURABLE_SINCE_MS;
+pub use apply::TAKEOVER_ON_RECORD_SINCE_MS;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkBoardProjection {

@@ -10,12 +10,13 @@ use crate::event::{
 use crate::ids::{WorkCardId, WorkspaceId};
 use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
 
-/// From this instant on, ownership is durable and the lease is presence (Joel,
-/// 2026-10-04, card d826e5f1): a claim by anyone else while the owner's claim
-/// stands is dropped, lapsed lease or not. Handover is explicit: a `ClaimReleased`
-/// naming her claim (attributed, with a reason), then a claim. Claims before this
-/// instant replay as they always did, so no historical board is rewritten.
-pub const OWNERSHIP_DURABLE_SINCE_MS: u64 = 1_791_129_600_000; // 2026-10-04T16:00:00Z
+/// From this instant on, a takeover is on the record: a BARE claim by anyone else
+/// while the holder's claim stands is dropped, lapsed lease or not. Anyone may take
+/// a card at any time (Joel, 2026-10-06), and the SDK gate does it as a
+/// `ClaimReleased` of the holder's claim, attributed to the taker with a reason,
+/// then the claim (card 667b7e0c). Claims before this instant replay as they always
+/// did, so no historical board is rewritten.
+pub const TAKEOVER_ON_RECORD_SINCE_MS: u64 = 1_791_129_600_000; // 2026-10-04T16:00:00Z
 
 /// The owner acting on her own claimed card is presence: renew her lease by the
 /// ttl she claimed with. Kimi's lease lapsed while she was working the card, and
@@ -262,7 +263,7 @@ impl WorkBoardProjection {
         {
             return Ok(());
         }
-        if e.claimed_at_ms >= OWNERSHIP_DURABLE_SINCE_MS
+        if e.claimed_at_ms >= TAKEOVER_ON_RECORD_SINCE_MS
             && card.claim_id.is_some()
             && card.owner.is_some_and(|owner| owner != e.owner)
             && !matches!(card.state, CardState::Merged | CardState::Closed)
