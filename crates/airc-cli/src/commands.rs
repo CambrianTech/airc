@@ -344,89 +344,132 @@ pub async fn run_join(
     if runtime_context.should_stream_join() {
         // The supervising join keeps the daemon it started (card a32f8ac0). Beside the
         // feed, never spawned: the feed ends the join, and the keeper ends with it.
+        let watched = airc.current_room().await?.channel;
         tokio::select! {
             fed = crate::join_feed::run(&airc) => fed?,
-            () = keep_daemon(home, socket) => {}
+            () = keep_daemon(home, socket, watched) => {}
         }
     }
     Ok(())
 }
 
-/// Restart the daemon when it stops answering while this join streams (card a32f8ac0).
-/// BigMama's machine daemon died at 16:53:01 on 2026-10-06 with nothing in its log; both
+/// Restart the daemon when it dies while this join streams (card a32f8ac0). BigMama's
+/// machine daemon died at 16:53:01 on 2026-10-06 (heap corruption, nothing logged); both
 /// supervising joins stayed alive and the node was dark until a hand restart, because
 /// `ensure_daemon_running` ran only when the join began and the feed's reconnect loop
-/// re-attaches forever without starting anything. The restart is the same
-/// `ensure_daemon_running`, under its autostart guard: an operator stop or an update in
-/// progress refuses it, and that refusal is respected, said once per outage.
-async fn keep_daemon(home: &Path, socket: PathBuf) {
-    let mut tick = tokio::time::interval(DAEMON_KEEPER_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+/// re-attaches forever without starting anything.
+///
+/// The death is an EVENT, never polled for (Fable on #1546): the keeper holds a live
+/// attach to `watched`, and the daemon closing it is the notice; a healthy daemon costs
+/// nothing. The restart is the same `ensure_daemon_running`, under its autostart guard
+/// (an operator stop or an update refuses it, said plainly) and under one exclusive
+/// per-machine revive lock, so two supervising joins seeing the same death start one
+/// daemon: the second finds the first's on the fast path. A hung daemon that still holds
+/// its endpoint is NOT replaced: the new daemon's bind refuses (AddrInUse / the pipe's
+/// single instance), so a restart never puts a second daemon beside it.
+async fn keep_daemon(home: &Path, socket: PathBuf, watched: RoomId) {
     let mut keeper = DaemonKeeper::default();
     loop {
-        tick.tick().await;
-        let answered = DaemonClient::new(socket.clone())
-            .status_with_timeout(DAEMON_KEEPER_PROBE_TIMEOUT)
-            .await
-            .is_ok();
-        if keeper.observe(answered) != KeeperAction::Restart {
-            continue;
+        if daemon_connection_closed(&socket, watched).await {
+            keeper.answered();
         }
-        let outcome = ensure_daemon_running(home, socket.clone(), Vec::new())
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string());
-        match outcome {
-            Ok(()) => eprintln!(
-                "airc join: the daemon at {} stopped answering; started it again",
-                socket.display()
-            ),
-            Err(why) => eprintln!(
-                "airc join: the daemon at {} stopped answering and was not restarted: {why}",
-                socket.display()
-            ),
+        match keeper.on_down(Instant::now()) {
+            KeeperAction::Wait(for_how_long) => tokio::time::sleep(for_how_long).await,
+            KeeperAction::Restart => {
+                let outcome = revive_daemon(home, &socket).await;
+                match outcome {
+                    Ok(()) => eprintln!(
+                        "airc join: the daemon at {} went away; it is running again",
+                        socket.display()
+                    ),
+                    Err(why) => eprintln!(
+                        "airc join: the daemon at {} went away and was not restarted: {why}",
+                        socket.display()
+                    ),
+                }
+            }
         }
     }
 }
 
-/// How often a supervising join asks whether its daemon is alive.
-const DAEMON_KEEPER_INTERVAL: Duration = Duration::from_secs(5);
-/// How long one probe waits for the daemon's status.
-const DAEMON_KEEPER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Consecutive unanswered probes before a restart: a daemon busy for one probe is not
-/// dead, and three in a row (about 15 s) is past any pause a live daemon takes.
-const DAEMON_KEEPER_MISSES: u32 = 3;
-/// Unanswered probes between restart attempts while the daemon stays down (about a
-/// minute): a restart that failed is tried again, and a refused one (an operator stop)
-/// is said once a minute, not every tick.
-const DAEMON_KEEPER_RETRY_MISSES: u32 = 12;
+/// Hold an attach to the daemon until it closes. `true` = it was attached, so the close is
+/// a death (or a restart) seen as it happened; `false` = nothing answered the attach.
+async fn daemon_connection_closed(socket: &Path, watched: RoomId) -> bool {
+    let client = DaemonClient::new(socket.to_path_buf());
+    let Ok(mut stream) = client
+        .attach(airc_ipc::AttachRequest::new(
+            watched,
+            airc_ipc::AttachStart::Live,
+        ))
+        .await
+    else {
+        return false;
+    };
+    loop {
+        match airc_ipc::codec::read_response_frame(&mut stream).await {
+            Ok(Some(_)) => {} // the room's traffic; the keeper only waits for the close
+            Ok(None) | Err(_) => return true,
+        }
+    }
+}
+
+/// `ensure_daemon_running` under one exclusive per-machine lock: two joins that see the
+/// same death would otherwise both find the socket stale, and on Unix the second's
+/// cleanup can unlink the first's fresh socket. The lock is taken on a blocking thread.
+async fn revive_daemon(home: &Path, socket: &Path) -> Result<(), String> {
+    let lock_path = airc_lib::machine_account_home(home).join("daemon-revive.lock");
+    let lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| format!("revive lock task: {e}"))?
+    .map_err(|e| format!("revive lock: {e}"))?;
+    let outcome = ensure_daemon_running(home, socket.to_path_buf(), Vec::new())
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    drop(lock); // closing the file releases the lock for the next join
+    outcome
+}
+
+/// While the daemon stays down, how long between restart attempts: a failed restart is
+/// tried again, and a refused one (an operator stop, an update) is said once a minute.
+const DAEMON_KEEPER_RETRY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, PartialEq, Eq)]
 enum KeeperAction {
-    Wait,
     Restart,
+    Wait(Duration),
 }
 
-/// The keeper's whole decision, pure: restart at [`DAEMON_KEEPER_MISSES`] unanswered
-/// probes in a row, then every [`DAEMON_KEEPER_RETRY_MISSES`] more while the daemon stays
-/// down; an answered probe ends the outage.
+/// The keeper's decision, pure: when the daemon goes away, restart at once; while it stays
+/// away, try again at most once per [`DAEMON_KEEPER_RETRY`]; a held connection resets.
 #[derive(Debug, Default)]
 struct DaemonKeeper {
-    misses: u32,
+    last_restart: Option<Instant>,
 }
 
 impl DaemonKeeper {
-    fn observe(&mut self, answered: bool) -> KeeperAction {
-        if answered {
-            self.misses = 0;
-            return KeeperAction::Wait;
-        }
-        self.misses = self.misses.saturating_add(1);
-        let past_first = self.misses.saturating_sub(DAEMON_KEEPER_MISSES);
-        if self.misses >= DAEMON_KEEPER_MISSES && past_first % DAEMON_KEEPER_RETRY_MISSES == 0 {
-            KeeperAction::Restart
-        } else {
-            KeeperAction::Wait
+    /// The daemon was attached (and has now closed): any later loss is a fresh outage.
+    fn answered(&mut self) {
+        self.last_restart = None;
+    }
+
+    fn on_down(&mut self, now: Instant) -> KeeperAction {
+        match self.last_restart {
+            Some(at) if now.duration_since(at) < DAEMON_KEEPER_RETRY => {
+                KeeperAction::Wait(DAEMON_KEEPER_RETRY - now.duration_since(at))
+            }
+            _ => {
+                self.last_restart = Some(now);
+                KeeperAction::Restart
+            }
         }
     }
 }
@@ -3632,34 +3675,33 @@ mod tests {
     use super::*;
 
     // what this catches (card a32f8ac0): a supervising join that never restarts its dead
-    // daemon (BigMama, 2026-10-06), and one that hammers a refused restart every tick. One
-    // busy probe is not death; three in a row restarts; a daemon still down is tried again
-    // a minute later, not every 5 s; an answer ends the outage.
+    // daemon (BigMama, 2026-10-06), and one that hammers a refused restart. A death
+    // restarts at once; while the daemon stays down it is tried again a minute later, not
+    // sooner; a held connection makes the next loss a fresh outage.
     #[test]
-    fn a_join_restarts_its_daemon_after_three_misses_then_once_a_minute() {
+    fn a_join_restarts_its_dead_daemon_at_once_then_once_a_minute() {
+        let t0 = Instant::now();
         let mut keeper = DaemonKeeper::default();
-        assert_eq!(keeper.observe(false), KeeperAction::Wait);
-        assert_eq!(keeper.observe(true), KeeperAction::Wait, "an answer resets");
-        assert_eq!(keeper.observe(false), KeeperAction::Wait);
-        assert_eq!(keeper.observe(false), KeeperAction::Wait);
         assert_eq!(
-            keeper.observe(false),
+            keeper.on_down(t0),
             KeeperAction::Restart,
-            "third miss in a row"
+            "a death restarts at once"
         );
-        for _ in 0..DAEMON_KEEPER_RETRY_MISSES - 1 {
-            assert_eq!(keeper.observe(false), KeeperAction::Wait, "not every tick");
-        }
+        let soon = t0 + Duration::from_secs(5);
         assert_eq!(
-            keeper.observe(false),
+            keeper.on_down(soon),
+            KeeperAction::Wait(DAEMON_KEEPER_RETRY - Duration::from_secs(5)),
+            "still down: wait out the minute, never hammer"
+        );
+        assert_eq!(
+            keeper.on_down(t0 + DAEMON_KEEPER_RETRY),
+            KeeperAction::Restart
+        );
+        keeper.answered();
+        assert_eq!(
+            keeper.on_down(t0 + DAEMON_KEEPER_RETRY + Duration::from_secs(1)),
             KeeperAction::Restart,
-            "retried a minute later"
-        );
-        assert_eq!(keeper.observe(true), KeeperAction::Wait);
-        assert_eq!(
-            keeper.observe(false),
-            KeeperAction::Wait,
-            "a fresh outage counts from zero"
+            "a fresh outage restarts at once"
         );
     }
 
