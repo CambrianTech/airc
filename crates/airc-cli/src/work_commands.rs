@@ -2352,6 +2352,31 @@ pub async fn run_availability(
     Ok(())
 }
 
+/// Which rows a capped board shows, as indices into `states` in their original order: every
+/// LIVE card first (anything not Merged or Closed: open, claimed, in progress, blocked, in
+/// review), newest live ones if even those exceed `cap`, then the newest finished cards to
+/// fill. A board that hides live work is wrong in the way that matters; one that hides old
+/// closed cards is only short (card 3e2b7f45).
+fn rows_to_keep(states: &[airc_work::CardState], cap: usize) -> Vec<usize> {
+    let finished = |s: &airc_work::CardState| {
+        matches!(
+            s,
+            airc_work::CardState::Merged | airc_work::CardState::Closed
+        )
+    };
+    let live: Vec<usize> = (0..states.len())
+        .filter(|&i| !finished(&states[i]))
+        .collect();
+    let done: Vec<usize> = (0..states.len())
+        .filter(|&i| finished(&states[i]))
+        .collect();
+    let mut keep: Vec<usize> = live.iter().rev().take(cap).copied().collect();
+    let room = cap.saturating_sub(keep.len());
+    keep.extend(done.iter().rev().take(room).copied());
+    keep.sort_unstable();
+    keep
+}
+
 fn print_board(
     board: &WorkBoardProjection,
     me: airc_lib::PeerId,
@@ -2373,17 +2398,21 @@ fn print_board(
         .filter(|card| filter.matches(card, me, now))
         .collect();
     // Continuum #154: `limit` caps displayed ROWS of the complete
-    // projection (newest kept), never the event window the board is
-    // built from — truncation is announced, never silent.
+    // projection, never the event window the board is built from, and
+    // truncation is announced, never silent. The cap drops finished history
+    // first: newest-only kept a closed card from today and dropped Kimi's live
+    // claim from yesterday (BigMama, 2026-10-06, card 3e2b7f45).
     let matched = visible.len();
     if matched > limit.max(1) {
-        visible = visible.split_off(matched - limit.max(1));
+        let states: Vec<airc_work::CardState> = visible.iter().map(|card| card.state).collect();
+        let keep = rows_to_keep(&states, limit.max(1));
+        visible = keep.into_iter().map(|i| visible[i]).collect();
     }
     if !visible.is_empty() {
         if matches!(filter, BoardFilter::All) {
             if visible.len() < matched {
                 println!(
-                    "work cards: showing {} of {} (raise --limit for the rest)",
+                    "work cards: showing {} of {}, live cards first (raise --limit for the rest)",
                     visible.len(),
                     matched,
                 );
@@ -2746,6 +2775,36 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
+    // what this catches (card 3e2b7f45): a capped board that drops a LIVE card to keep newer
+    // finished ones (Kimi's claimed review card hidden at the default --limit 128 while
+    // closed cards showed). Live rows are kept first, in the board's order; finished history
+    // fills what is left; live rows beyond the cap keep the newest.
+    #[test]
+    fn a_capped_board_keeps_live_cards_before_finished_history() {
+        use airc_work::CardState::{Claimed, Closed, InProgress, Merged, Open, Review};
+        let states = [Claimed, Closed, Merged, Open, Closed, Review];
+        assert_eq!(
+            rows_to_keep(&states, 3),
+            vec![0, 3, 5],
+            "live first, original order"
+        );
+        assert_eq!(
+            rows_to_keep(&states, 4),
+            vec![0, 3, 4, 5],
+            "then the newest finished"
+        );
+        assert_eq!(
+            rows_to_keep(&[Open, InProgress, Claimed], 2),
+            vec![1, 2],
+            "newest live"
+        );
+        assert_eq!(
+            rows_to_keep(&states, 6),
+            vec![0, 1, 2, 3, 4, 5],
+            "no cap, nothing dropped"
+        );
+    }
+
     // what this catches: a submission review filed with a verdict word nobody meant
     // ("pass", "ok", "unknown"), or with no evidence; and evidence whose reference does
     // not name the exact bytes the reviewer wrote.
