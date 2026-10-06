@@ -370,8 +370,8 @@ pub async fn run_join(
 async fn keep_daemon(home: &Path, socket: PathBuf, watched: RoomId) {
     let mut keeper = DaemonKeeper::default();
     loop {
-        if daemon_connection_closed(&socket, watched).await {
-            keeper.answered();
+        if let Some(held) = daemon_connection_closed(&socket, watched).await {
+            keeper.closed_after(held);
         }
         match keeper.on_down(Instant::now()) {
             KeeperAction::Wait(for_how_long) => tokio::time::sleep(for_how_long).await,
@@ -392,23 +392,22 @@ async fn keep_daemon(home: &Path, socket: PathBuf, watched: RoomId) {
     }
 }
 
-/// Hold an attach to the daemon until it closes. `true` = it was attached, so the close is
-/// a death (or a restart) seen as it happened; `false` = nothing answered the attach.
-async fn daemon_connection_closed(socket: &Path, watched: RoomId) -> bool {
+/// Hold an attach to the daemon until it closes. `Some(held)` = it was attached for `held`,
+/// so the close is a death (or a restart) seen as it happened; `None` = nothing answered.
+async fn daemon_connection_closed(socket: &Path, watched: RoomId) -> Option<Duration> {
     let client = DaemonClient::new(socket.to_path_buf());
-    let Ok(mut stream) = client
+    let mut stream = client
         .attach(airc_ipc::AttachRequest::new(
             watched,
             airc_ipc::AttachStart::Live,
         ))
         .await
-    else {
-        return false;
-    };
+        .ok()?;
+    let attached_at = Instant::now();
     loop {
         match airc_ipc::codec::read_response_frame(&mut stream).await {
             Ok(Some(_)) => {} // the room's traffic; the keeper only waits for the close
-            Ok(None) | Err(_) => return true,
+            Ok(None) | Err(_) => return Some(attached_at.elapsed()),
         }
     }
 }
@@ -456,9 +455,14 @@ struct DaemonKeeper {
 }
 
 impl DaemonKeeper {
-    /// The daemon was attached (and has now closed): any later loss is a fresh outage.
-    fn answered(&mut self) {
-        self.last_restart = None;
+    /// The daemon was attached for `held` and has now closed. Only a connection held a
+    /// full retry interval ends the outage: a daemon that dies soon after accepting (a
+    /// corrupt state crashing in its backfill; BigMama's died of heap corruption) stays
+    /// one outage and backs off to once a minute, never a restart loop (BigMama on #1546).
+    fn closed_after(&mut self, held: Duration) {
+        if held >= DAEMON_KEEPER_RETRY {
+            self.last_restart = None;
+        }
     }
 
     fn on_down(&mut self, now: Instant) -> KeeperAction {
@@ -3697,7 +3701,14 @@ mod tests {
             keeper.on_down(t0 + DAEMON_KEEPER_RETRY),
             KeeperAction::Restart
         );
-        keeper.answered();
+        let t1 = t0 + DAEMON_KEEPER_RETRY;
+        keeper.closed_after(Duration::from_secs(2));
+        assert_eq!(
+            keeper.on_down(t1 + Duration::from_secs(2)),
+            KeeperAction::Wait(DAEMON_KEEPER_RETRY - Duration::from_secs(2)),
+            "attached 2 s then closed is the same outage: a crash loop backs off"
+        );
+        keeper.closed_after(DAEMON_KEEPER_RETRY);
         assert_eq!(
             keeper.on_down(t0 + DAEMON_KEEPER_RETRY + Duration::from_secs(1)),
             KeeperAction::Restart,
