@@ -411,6 +411,25 @@ pub enum WorkAction {
         #[arg(long)]
         pr: String,
     },
+    /// Publish a submission on a card you hold: the patch's content hash, size and base,
+    /// under YOUR identity, so a reviewer's verdict has a candidate to attach to. Moving a
+    /// card to Review links its PR; only a submission makes it reviewable.
+    Submit {
+        /// The card you hold (full id, or the short form the board shows).
+        card_id: String,
+        /// The patch file (e.g. `git diff <base> HEAD > p.patch`): its bytes are hashed.
+        #[arg(long)]
+        patch: std::path::PathBuf,
+        /// The FULL commit sha the patch applies to (`git merge-base HEAD origin/<base>`).
+        #[arg(long)]
+        base: String,
+        /// What the patch is for (default: the card's repo).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Room whose board holds the card (default: the current room).
+        #[arg(long)]
+        room: Option<String>,
+    },
     /// File a peer review on a submission, as the holder of its review card: the
     /// verdict and its evidence go to the board under YOUR identity. Spawn the review
     /// card with `airc work review <card>`, claim it, then run this. The parent card

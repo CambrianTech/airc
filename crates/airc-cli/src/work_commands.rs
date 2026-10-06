@@ -1764,6 +1764,80 @@ pub async fn run_relink(
 /// citizen's work). The parent card and the claim come from the review card (it must be
 /// yours, claimed); the submission defaults to the parent's latest. airc-lib's
 /// `review_work_submission_in` had no verb, so no agent could file one from the CLI.
+/// `airc work submit`: publish a submission on a card the caller holds. continuum #4825's
+/// card went to Review with its PR linked, but no submission existed, so Kimi's verdict
+/// was refused ("no submission to review yet", 2026-10-06): the CLI had no way to publish
+/// one. airc-lib's `submit_work_in` validates the claim, the base and the instance.
+pub async fn run_submit(
+    home: &Path,
+    room: Option<String>,
+    card_id: String,
+    patch: std::path::PathBuf,
+    base: String,
+    instance: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes =
+        std::fs::read(&patch).map_err(|e| format!("patch file {}: {e}", patch.display()))?;
+    let artifact = patch_artifact(&bytes)?;
+    let base_sha = airc_work::GitObjectId::new(base.trim())
+        .map_err(|e| format!("--base `{base}`: {e} (give the FULL commit sha)"))?;
+    let airc = crate::commands::attached_airc(home).await?;
+    let shown = Shown::try_from(card_id.as_str())?;
+    let room = room_or_current(&airc, room.as_deref(), "submit work in").await?;
+    let board = airc.work_board_in(&room).await?;
+    let card_id = card_on_board(&board, &shown)?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} is not on {}'s board", room.name))?;
+    let claim_id = match (card.owner, card.claim_id) {
+        (Some(owner), Some(claim)) if owner == airc.peer_id() => claim,
+        (Some(owner), _) => {
+            return Err(format!(
+                "card {card_id} is held by {owner}, not by you: only its holder submits"
+            )
+            .into())
+        }
+        (None, _) => {
+            return Err(format!("card {card_id} is not claimed: `airc work claim` it first").into())
+        }
+    };
+    let instance = instance.unwrap_or_else(|| card.repo.to_string());
+    let submission = airc
+        .submit_work_in(
+            &room,
+            airc_lib::SubmitWork {
+                submission_id: airc_work::SubmissionId::new(),
+                card_id,
+                claim_id,
+                instance,
+                base_sha,
+                artifact,
+            },
+        )
+        .await?;
+    println!(
+        "submission: {} card={} size={} base={}",
+        submission.submission_id,
+        submission.card_id,
+        submission.artifact.size_bytes,
+        submission.base_sha
+    );
+    Ok(())
+}
+
+/// PURE: the artifact reference of a patch: SHA-256 over its bytes, its length,
+/// `text/x-patch`. An empty patch is refused: there is nothing to review.
+fn patch_artifact(bytes: &[u8]) -> Result<airc_work::SubmissionArtifact, String> {
+    if bytes.is_empty() {
+        return Err("the patch file is empty: there is nothing to review".to_string());
+    }
+    Ok(airc_work::SubmissionArtifact {
+        hash: airc_blobs::ContentHash::from_bytes(bytes),
+        size_bytes: bytes.len() as u64,
+        mime: Some("text/x-patch".to_string()),
+    })
+}
+
 pub async fn run_submission_review(
     home: &Path,
     room: Option<String>,
@@ -2790,6 +2864,19 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
+    // what this catches (card 9c3ab08d): a submission whose artifact is not the patch's own
+    // bytes, or an empty patch accepted as reviewable. The reference is the SHA-256 of the
+    // exact bytes and their length; the same bytes give the same hash, and empty is refused.
+    #[test]
+    fn a_submission_artifact_is_the_patch_bytes_and_empty_is_refused() {
+        let patch = b"diff --git a/x b/x\n+one\n";
+        let artifact = super::patch_artifact(patch).expect("a patch");
+        assert_eq!(artifact.size_bytes, patch.len() as u64);
+        assert_eq!(artifact.mime.as_deref(), Some("text/x-patch"));
+        assert_eq!(artifact.hash, airc_blobs::ContentHash::from_bytes(patch));
+        assert!(super::patch_artifact(b"").is_err(), "nothing to review");
+    }
+
     // what this catches (card 3e2b7f45): a capped board that drops a LIVE card to keep newer
     // finished ones (Kimi's claimed review card hidden at the default --limit 128 while
     // closed cards showed). Live rows are kept first, in the board's order; finished history
