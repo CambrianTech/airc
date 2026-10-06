@@ -180,6 +180,7 @@ async fn inbox_most_recent_n_returns_exact_ascending_tail() {
             channel: Some(channel),
             limit: Some(10),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox on empty room");
@@ -203,6 +204,7 @@ async fn inbox_most_recent_n_returns_exact_ascending_tail() {
             channel: Some(channel),
             limit: Some(10),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox limit 10");
@@ -223,6 +225,7 @@ async fn inbox_most_recent_n_returns_exact_ascending_tail() {
             channel: Some(channel),
             limit: Some(500),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox limit 500");
@@ -261,6 +264,7 @@ async fn deep_room_most_recent_n_costs_by_n_not_room_depth() {
                 channel: Some(channel),
                 limit: Some(N),
                 kinds: None,
+                before: None,
             })
             .await
             .expect("inbox limit N");
@@ -281,6 +285,7 @@ async fn deep_room_most_recent_n_costs_by_n_not_room_depth() {
                 channel: Some(channel),
                 limit: Some(DEEP),
                 kinds: None,
+                before: None,
             })
             .await
             .expect("inbox limit DEEP");
@@ -383,6 +388,7 @@ async fn inbox_kinds_filter_returns_buried_messages_under_chunk_flood() {
             channel: Some(channel),
             limit: Some(50),
             kinds: None,
+            before: None,
         })
         .await
         .expect("raw inbox");
@@ -403,6 +409,7 @@ async fn inbox_kinds_filter_returns_buried_messages_under_chunk_flood() {
             channel: Some(channel),
             limit: Some(50),
             kinds: Some(vec![IpcKind::Message]),
+            before: None,
         })
         .await
         .expect("filtered inbox");
@@ -421,6 +428,7 @@ async fn inbox_kinds_filter_returns_buried_messages_under_chunk_flood() {
             channel: Some(channel),
             limit: Some(50),
             kinds: Some(vec![]),
+            before: None,
         })
         .await
         .expect("empty-kinds inbox");
@@ -438,6 +446,7 @@ async fn inbox_kinds_filter_returns_buried_messages_under_chunk_flood() {
             channel: Some(channel),
             limit: Some(50),
             kinds: Some(vec![IpcKind::Message]),
+            before: None,
         })
         .await
         .expect("resumed filtered inbox");

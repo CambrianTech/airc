@@ -13,7 +13,6 @@
 //! the loop runs the transport's `cleanup` (unlinks the socket file
 //! on Unix; no-op on Windows) and returns.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -549,19 +548,15 @@ where
             .await;
         }
     };
-    // Live registration is atomic at the router and does not read history.
-    // Explicit cursor resumes retain the existing replay/live seam.
-    let mut from = match parts.start {
-        AttachStart::Live | AttachStart::FromTranscriptStart => None,
-        AttachStart::After(c) => Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id)),
-    };
-    // Card 7d5b6a65: `coalesce_backlog` lets the daemon collapse all
-    // historical catch-up into ONE `AttachCursorAdvanced` summary
-    // frame instead of streaming each event individually. We track the
-    // ring-snapshot's high-water cursor; everything at or before it is
-    // backlog (collapsed), everything after it is live (streamed
-    // event-by-event as before). `Live` has no backlog to coalesce.
-    let coalesce_backlog = parts.coalesce_backlog && parts.start != AttachStart::Live;
+    // NOW, THEN BACKWARD (Joel, 2026-10-06: "it should be impossible" to
+    // replay history down a stream; "it's backwards entirely"). Every
+    // attach registers at the live edge. A start in the past (a bookmark,
+    // or the transcript start) earns ONE page: the newest <= ATTACH_PAGE
+    // events, read backward from the tip after registration, then a
+    // summary counting what it left out. Older history is paged on demand
+    // (`Inbox { before }`), never streamed. `coalesce_backlog` and
+    // `backlog_tail` are no longer read: every past start is a page.
+    let past_start = past_start_of(parts.start);
 
     // Compile the consumer's kind/delivery/header filters into the router
     // filter, applied ROUTER-SIDE — the daemon never fans out an event a
@@ -582,14 +577,15 @@ where
     // would drop early events under concurrent senders). `subscribe_with_lag`
     // also keeps a slow IPC client from stalling fan-out to other
     // subscribers (§3.5); on lag we re-subscribe from `from`.
-    let (stream, lag) = if parts.start == AttachStart::Live {
-        let (stream, lag) = state.router.subscribe_live_with_lag(filter.clone());
-        (stream.boxed(), lag)
-    } else {
-        let (stream, lag) = state.router.subscribe_with_lag(filter.clone(), from);
-        (stream.boxed(), lag)
+    // The lag-resume point before anything is delivered is the head read
+    // BEFORE registering (the set path's rule): a lag then re-reads only what
+    // the slow client dropped, never the ring or the durable transcript.
+    let mut from = match state.router.head_cursor(channel) {
+        Some(c) => Some(c),
+        None => state.router.sink_head_cursor(channel).await,
     };
-    let mut pending = Some((stream, lag));
+    let (stream, lag) = state.router.subscribe_live_with_lag(filter.clone());
+    let mut pending = Some((stream.boxed(), lag));
     write_response(&mut writer, &Response::Ok).await?;
 
     // Pin one shutdown waiter across re-subscribes so a `notify_waiters`
@@ -609,31 +605,26 @@ where
     let hangup = client_hung_up(reader);
     tokio::pin!(hangup);
 
-    // Card 7d5b6a65 catch-up tracking. When `coalesce_backlog` is set,
-    // we count events until the ring's live-edge cursor (captured at
-    // subscribe time) is reached, then emit ONE summary frame and
-    // switch to per-event live streaming.
-    let mut catchup = if coalesce_backlog {
-        // Same ring-then-sink fallback as the `from_now` path above so
-        // a freshly-started daemon catching up on a real durable
-        // backlog actually has a `live_edge` to compare against (an
-        // empty ring with non-empty sink would otherwise treat every
-        // historical event as live and emit no summary).
-        let edge = match state.router.head_cursor(channel) {
-            Some(c) => Some(c),
-            None => state.router.sink_head_cursor(channel).await,
-        };
-        // "One page back" (Discord analogy): `backlog_tail` asks for
-        // the N most-recent backlog events at the seam; everything
-        // older stays coalesced into the summary. 0/None = today's
-        // all-or-nothing coalesce.
-        Some(BacklogCatchup::new(
-            edge,
-            parts.backlog_tail.unwrap_or(0) as usize,
-        ))
-    } else {
-        None
-    };
+    // ONE PAGE, then live. Written before the first live event so the
+    // consumer sees the page, then the summary, then the stream. Live events
+    // the page already carried (durable ones at or before its tip) are not
+    // written twice.
+    let mut seen_through: Option<Cursor> = None;
+    if let Some(bookmark) = past_start {
+        let page = attach_page(&state, channel, &filter, bookmark)
+            .await
+            .map_err(|error| DaemonError::Io(std::io::Error::other(error)))?;
+        for env in &page.events {
+            write_event_response(&mut writer, env, &state.shared_frames).await?;
+        }
+        if let Some(summary) = page.summary(parts.cursor_heartbeat, None) {
+            write_response(&mut writer, &summary).await?;
+        }
+        if page.through.is_some() {
+            from = page.through;
+            seen_through = page.through;
+        }
+    }
 
     // CURSOR HEARTBEAT (continuum #261, PR #2057 review): the seam summary
     // above was the ONLY `AttachCursorAdvanced` a consumer ever saw — during
@@ -667,51 +658,13 @@ where
                 _ = &mut hangup => return Ok(()),
                 next = stream.next() => match next {
                     Some(env) => {
+                        if env.delivery.is_durable()
+                            && seen_through.is_some_and(|through| !env.cursor().is_after(&through))
+                        {
+                            continue; // the page already carried it
+                        }
                         from = Some(env.cursor());
-                        let suppressed = match catchup.as_mut() {
-                            Some(c) => c.observe(&env),
-                            None => false,
-                        };
-                        if suppressed {
-                            // Inside catch-up window — count and skip
-                            // (buffering the tail_cap most recent),
-                            // the seam flush happens when we cross the
-                            // live edge.
-                        } else {
-                            // Flush the pending seam BEFORE the first
-                            // live event so the client sees the
-                            // catch-up boundary. Order: (a) buffered
-                            // tail envelopes as normal Event frames,
-                            // oldest first, (b) the summary carrying
-                            // the watermark, (c) the live event below.
-                            //
-                            // INVARIANT (continuum #261 discipline):
-                            // the summary's `advanced_to` is the LAST
-                            // suppressed cursor, which is ≥ every tail
-                            // cursor, and the tail is written BEFORE
-                            // the summary — so a consumer that
-                            // persists the watermark from the summary
-                            // never persists past an event it was not
-                            // delivered.
-                            //
-                            // Known limitation (same as the summary
-                            // since day one, not fixed here): the seam
-                            // only flushes when the first LIVE event
-                            // arrives — on an idle room the tail and
-                            // summary wait for live traffic.
-                            if let Some(seam) =
-                                catchup.as_mut().and_then(BacklogCatchup::take_summary)
-                            {
-                                for buffered in &seam.tail {
-                                    tokio::select! {
-                                        _ = &mut shutdown => return Ok(()),
-                                        _ = &mut hangup => return Ok(()),
-                                        result = write_event_response(&mut writer, buffered, &state.shared_frames) => result?,
-                                    }
-                                }
-                                write_response(&mut writer, &seam.summary.into_response())
-                                    .await?;
-                            }
+                        {
                             tokio::select! {
                                 _ = &mut shutdown => return Ok(()),
                                 _ = &mut hangup => return Ok(()),
@@ -735,6 +688,7 @@ where
                                             counter: c.seq.counter,
                                             event_id: c.event_id,
                                         },
+                                        channel: None,
                                     },
                                 )
                                 .await?;
@@ -790,6 +744,9 @@ struct RoomSub {
     /// client) waits, with capped backoff, instead of replaying in a
     /// tight loop. Siblings and the client's own reads are unaffected.
     not_before: Option<Instant>,
+    /// The tip of this room's attach page: a live durable at or before it was
+    /// already written in the page and is not written again.
+    seen_through: Option<Cursor>,
 }
 /// Re-subscribe every room that dropped a live push, from its own resume
 /// point, pacing a room that lags again right after its last resume.
@@ -914,10 +871,10 @@ where
         )
         .await;
     }
-    if parts.coalesce_backlog || parts.cursor_heartbeat {
+    if parts.cursor_heartbeat {
         return write_response(
             &mut writer,
-            &refuse("attach: coalesce_backlog and cursor_heartbeat are single-channel only (the cursor frame names no channel)"),
+            &refuse("attach: cursor_heartbeat is single-channel only"),
         )
         .await;
     }
@@ -944,6 +901,8 @@ where
     // room has a gap between ack and registration. A room named twice
     // gets one subscription, the first entry's start.
     let mut subs: std::collections::HashMap<airc_core::RoomId, RoomSub> = Default::default();
+    // Rooms whose start is in the past: each gets its page after the ack.
+    let mut pages: Vec<(airc_core::RoomId, Option<Cursor>)> = Vec::new();
     let mut merged: tokio_stream::StreamMap<
         airc_core::RoomId,
         futures::stream::BoxStream<'static, Arc<Envelope>>,
@@ -953,31 +912,23 @@ where
             continue;
         }
         let room = entry.channel;
-        let (stream, lag, resume) = match entry.start() {
-            AttachStart::After(c) => {
-                let cursor = Cursor::new(Seq::new(c.epoch, c.counter), c.event_id);
-                let (stream, lag) = state
-                    .router
-                    .subscribe_with_lag(filter_for(room), Some(cursor));
-                (stream.boxed(), lag, Some(cursor))
-            }
-            // No cursor is the live edge, never a ring replay. The resume
-            // point is the head read BEFORE registering, so a lag before
-            // the first delivery replays exactly what was dropped. The ring
-            // is RAM: after a daemon restart it is empty while the durable
-            // transcript is not, and a `None` baseline would replay that whole
-            // history on the first lag (Astra's re-review of #1523). The
-            // router's own durable fallback answers the cold ring, the same
-            // seam the coalesce path uses.
-            AttachStart::Live | AttachStart::FromTranscriptStart => {
-                let edge = match state.router.head_cursor(room) {
-                    Some(c) => Some(c),
-                    None => state.router.sink_head_cursor(room).await,
-                };
-                let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
-                (stream.boxed(), lag, edge)
-            }
+        // Every room registers at the live edge, whatever its start: a start
+        // in the past earns one page after the ack, never a replay (the
+        // single-channel rule). The resume point is the head read BEFORE
+        // registering, so a lag before the first delivery replays exactly
+        // what was dropped. The ring is RAM: after a daemon restart it is
+        // empty while the durable transcript is not, and a `None` baseline
+        // would replay that whole history on the first lag (Astra's
+        // re-review of #1523); the router's durable fallback answers it.
+        if let Some(bookmark) = past_start_of(entry.start()) {
+            pages.push((room, bookmark));
+        }
+        let edge = match state.router.head_cursor(room) {
+            Some(c) => Some(c),
+            None => state.router.sink_head_cursor(room).await,
         };
+        let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
+        let (stream, lag, resume) = (stream.boxed(), lag, edge);
         merged.insert(room, stream);
         subs.insert(
             room,
@@ -987,10 +938,30 @@ where
                 lagged: 0,
                 last_resubscribe: None,
                 not_before: None,
+                seen_through: None,
             },
         );
     }
     write_response(&mut writer, &Response::Ok).await?;
+
+    // One page per past-start room, each followed by a summary that names
+    // its room. The room's resume point moves to its page's tip, so a later
+    // lag re-reads from there, never from the old bookmark.
+    for (room, bookmark) in pages {
+        let page = attach_page(&state, room, &filter_for(room), bookmark)
+            .await
+            .map_err(|error| DaemonError::Io(std::io::Error::other(error)))?;
+        for env in &page.events {
+            write_event_response(&mut writer, env, &state.shared_frames).await?;
+        }
+        if let Some(summary) = page.summary(false, Some(room)) {
+            write_response(&mut writer, &summary).await?;
+        }
+        if let (Some(through), Some(sub)) = (page.through, subs.get_mut(&room)) {
+            sub.resume = Some(through);
+            sub.seen_through = Some(through);
+        }
+    }
 
     let shutdown = state.shutdown.notified();
     tokio::pin!(shutdown);
@@ -1023,6 +994,12 @@ where
                 merged.next().await
             } => match next {
                 Some((room, env)) => {
+                    let already_paged = subs.get(&room).and_then(|sub| sub.seen_through).is_some_and(
+                        |through| env.delivery.is_durable() && !env.cursor().is_after(&through),
+                    );
+                    if already_paged {
+                        continue; // the room's page already carried it
+                    }
                     if let Some(sub) = subs.get_mut(&room) {
                         sub.resume = Some(env.cursor());
                     }
@@ -1055,135 +1032,111 @@ async fn client_hung_up<R: AsyncReadExt + Unpin>(mut reader: R) {
     }
 }
 
-/// Card 7d5b6a65: tracks the catch-up phase of an `attach` with
-/// `coalesce_backlog: true`. Counts envelopes at or before the
-/// snapshot live edge (captured at subscribe time) so the daemon can
-/// emit ONE `Response::AttachCursorAdvanced` summary at the live seam
-/// instead of forwarding each historical envelope.
-struct BacklogCatchup {
-    /// Cursor of the most recent envelope in the ring at subscribe
-    /// time. Anything at or before is backlog; anything after is live.
-    /// `None` means the channel was empty at subscribe — there is no
-    /// backlog phase to coalesce; the first event is live.
-    live_edge: Option<Cursor>,
-    /// Number of envelopes suppressed during catch-up so far.
-    skipped: u64,
-    /// Cursor of the most recent suppressed envelope; advances as we
-    /// observe more backlog. Reported in the summary so the client
-    /// can persist it for future reconnects.
-    last_skipped_cursor: Option<Cursor>,
-    /// Set once when we cross the live edge so subsequent events skip
-    /// the per-cursor comparison and stream as live.
-    crossed: bool,
-    /// "One page back" (card 7d5b6a65 extension): how many of the
-    /// most-recent suppressed envelopes to deliver as real Event
-    /// frames at the seam. 0 = classic all-or-nothing coalesce.
-    tail_cap: usize,
-    /// The `tail_cap` most-recent suppressed envelopes, oldest first.
-    /// `skipped` keeps counting ALL suppressed envelopes; the summary
-    /// subtracts what the tail actually delivers.
-    tail: VecDeque<Arc<Envelope>>,
+/// The most history one attach streams: its newest page. Every start in the
+/// past, a bookmark or the transcript start, gets at most this many events,
+/// whatever the request asks (Joel, 2026-10-06: replaying more down a stream
+/// "should be impossible"). Older history is paged backward on demand with
+/// `Inbox { before }`.
+pub(crate) const ATTACH_PAGE: usize = 10;
+
+/// How many unread events beyond its page an attach counts before it reports
+/// "at least this many". Counting is a bounded store read, never a stream.
+const UNREAD_COUNT_CAP: u64 = 10_000;
+
+/// Durable rows read per backward step of the page-and-count walk.
+const PAGE_SCAN_STEP: usize = 256;
+
+/// `None` = the live edge only; `Some(None)` = the transcript start;
+/// `Some(Some(c))` = a bookmark. The last two are both "a start in the past"
+/// and are served the same way: one page, then live.
+fn past_start_of(start: AttachStart) -> Option<Option<Cursor>> {
+    match start {
+        AttachStart::Live => None,
+        AttachStart::FromTranscriptStart => Some(None),
+        AttachStart::After(c) => Some(Some(Cursor::new(Seq::new(c.epoch, c.counter), c.event_id))),
+    }
 }
 
-impl BacklogCatchup {
-    fn new(live_edge: Option<Cursor>, tail_cap: usize) -> Self {
-        Self {
-            live_edge,
-            skipped: 0,
-            last_skipped_cursor: None,
-            crossed: live_edge.is_some(),
-            tail_cap,
-            tail: VecDeque::new(),
-        }
-    }
+/// One attach's page: the newest events the consumer's filter admits, after
+/// its bookmark, oldest first; how many more it left out; and the tip the
+/// page was read at, so the live stream never writes an event twice.
+struct AttachPage {
+    events: Vec<Arc<Envelope>>,
+    skipped: u64,
+    through: Option<Cursor>,
+}
 
-    /// Observe one envelope. Returns `true` when the envelope is
-    /// inside the catch-up window (caller should suppress it; the
-    /// `tail_cap` most recent are buffered for the seam flush) and
-    /// `false` once we've crossed the live edge.
-    fn observe(&mut self, env: &Arc<Envelope>) -> bool {
-        if !self.crossed {
-            // No live_edge means the channel was empty at subscribe,
-            // so EVERYTHING that arrives is by definition live (no
-            // backlog phase).
-            return false;
-        }
-        if let Some(edge) = self.live_edge {
+impl AttachPage {
+    /// The summary frame: written whenever the page left something out (the
+    /// consumer must know there is more to page back), or when the consumer
+    /// persists cursors and the page delivered anything. `channel` names the
+    /// room on a set attach, where one stream carries several.
+    fn summary(&self, heartbeat: bool, channel: Option<airc_core::RoomId>) -> Option<Response> {
+        let through = self.through?;
+        (self.skipped > 0 || (heartbeat && !self.events.is_empty())).then_some(
+            Response::AttachCursorAdvanced {
+                skipped: self.skipped,
+                advanced_to: airc_ipc::request::IpcCursor {
+                    epoch: through.seq.epoch,
+                    counter: through.seq.counter,
+                    event_id: through.event_id,
+                },
+                channel,
+            },
+        )
+    }
+}
+
+/// Read one attach's page BACKWARD from the tip: the newest `ATTACH_PAGE`
+/// durable events after `bookmark` that `filter` admits, and a count of the
+/// older ones it left out (capped at `UNREAD_COUNT_CAP`). Work is bounded by
+/// the count cap, never by how deep the room is or how old the bookmark.
+async fn attach_page(
+    state: &DaemonState,
+    channel: airc_core::RoomId,
+    filter: &Filter,
+    bookmark: Option<Cursor>,
+) -> Result<AttachPage, String> {
+    let mut newest_first: Vec<Arc<Envelope>> = Vec::new();
+    let mut skipped: u64 = 0;
+    let mut through: Option<Cursor> = None;
+    let mut before: Option<Cursor> = None;
+    'walk: loop {
+        let rows = state
+            .router
+            .durable_tail_before(channel, before, PAGE_SCAN_STEP)
+            .await
+            .map_err(|error| format!("attach page: {error}"))?;
+        let exhausted = rows.len() < PAGE_SCAN_STEP;
+        for env in rows.iter().rev() {
             let cursor = env.cursor();
-            if cursor.is_after(&edge) {
-                self.crossed = false; // we've moved past catchup
-                return false;
+            through.get_or_insert(cursor);
+            if bookmark.is_some_and(|b| !cursor.is_after(&b)) {
+                break 'walk; // reached what the consumer had already read
             }
-            self.skipped = self.skipped.saturating_add(1);
-            self.last_skipped_cursor = Some(cursor);
-            if self.tail_cap > 0 {
-                if self.tail.len() == self.tail_cap {
-                    self.tail.pop_front();
+            if !filter.matches(env) {
+                continue;
+            }
+            if newest_first.len() < ATTACH_PAGE {
+                newest_first.push(env.clone());
+            } else {
+                skipped += 1;
+                if skipped >= UNREAD_COUNT_CAP {
+                    break 'walk;
                 }
-                self.tail.push_back(Arc::clone(env));
             }
-            return true;
         }
-        false
-    }
-
-    /// Pull the seam flush once we've crossed the live edge: the
-    /// buffered tail plus the coalesce summary. Returns `None` if
-    /// there's nothing pending (already taken or catch-up never had
-    /// backlog). The gate is TOTAL suppressed (> 0), not the
-    /// post-tail remainder: when the whole backlog fit in the tail
-    /// the summary's `skipped` is 0 but the client still needs the
-    /// watermark frame to persist its cursor.
-    fn take_summary(&mut self) -> Option<BacklogSeam> {
-        if self.crossed {
-            return None;
-        }
-        // crossed=false at this point means either (a) we observed
-        // something past the edge — pull the seam OR (b) we never
-        // had a live_edge to begin with. Mark crossed so we don't
-        // re-emit.
-        let delivered = self.tail.len() as u64;
-        let total_suppressed = self.skipped;
-        let advanced_to = self.last_skipped_cursor;
-        let tail = std::mem::take(&mut self.tail);
-        self.skipped = 0;
-        self.last_skipped_cursor = None;
-        self.crossed = true;
-        advanced_to.map(|cursor| BacklogSeam {
-            tail,
-            summary: BacklogSummary {
-                // Only events NOT delivered in the tail count as
-                // skipped in the summary the client renders.
-                skipped: total_suppressed.saturating_sub(delivered),
-                cursor,
-            },
-        })
-    }
-}
-
-/// Everything the daemon writes at the catch-up→live seam: the "one
-/// page back" tail (possibly empty) followed by the summary watermark.
-struct BacklogSeam {
-    tail: VecDeque<Arc<Envelope>>,
-    summary: BacklogSummary,
-}
-
-struct BacklogSummary {
-    skipped: u64,
-    cursor: Cursor,
-}
-
-impl BacklogSummary {
-    fn into_response(self) -> Response {
-        Response::AttachCursorAdvanced {
-            skipped: self.skipped,
-            advanced_to: airc_ipc::request::IpcCursor {
-                epoch: self.cursor.seq.epoch,
-                counter: self.cursor.seq.counter,
-                event_id: self.cursor.event_id,
-            },
+        match rows.first() {
+            Some(oldest) if !exhausted => before = Some(oldest.cursor()),
+            _ => break,
         }
     }
+    newest_first.reverse();
+    Ok(AttachPage {
+        events: newest_first,
+        skipped,
+        through,
+    })
 }
 
 async fn write_response<W>(writer: &mut W, response: &Response) -> Result<(), DaemonError>
@@ -1882,6 +1835,7 @@ mod shared_frame_cancellation_tests {
                     lagged: 1,
                     last_resubscribe: Some(Instant::now()), // a quick re-lag
                     not_before: None,
+                    seen_through: None,
                 },
             );
             resubscribe_lagged(&state, &filter_for, &mut subs, &mut merged);
@@ -1913,6 +1867,7 @@ mod shared_frame_cancellation_tests {
                     lagged: 1,
                     last_resubscribe: Some(Instant::now() - Duration::from_secs(30)),
                     not_before: None,
+                    seen_through: None,
                 },
             );
             resubscribe_lagged(&state, &filter_for, &mut subs, &mut merged);
@@ -1932,11 +1887,8 @@ mod shared_frame_cancellation_tests {
             let room = RoomId::new();
             let shapes = [
                 AttachRequest::channel_set(vec![]),
-                AttachRequest::channel_set(vec![ChannelAttach {
-                    channel: room,
-                    from: None,
-                }])
-                .with_coalesced_backlog(),
+                // `coalesce_backlog` on a set is no longer refused: every
+                // past start is served as one page, so the flag is implied.
                 AttachRequest::channel_set(vec![ChannelAttach {
                     channel: room,
                     from: None,

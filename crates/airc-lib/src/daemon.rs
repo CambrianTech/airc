@@ -278,6 +278,7 @@ impl Airc {
                 channel: Some(room.channel),
                 limit: Some(limit),
                 kinds: None,
+                before: None,
             })
             .await?;
         response
@@ -322,6 +323,7 @@ impl Airc {
                 channel: Some(channel),
                 limit: Some(limit),
                 kinds: Some(transcript_kinds_to_ipc(kinds)),
+                before: None,
             })
             .await?;
         response
@@ -349,6 +351,7 @@ impl Airc {
                 channel: Some(room.channel),
                 limit: Some(limit),
                 kinds: None,
+                before: None,
             })
             .await?;
         response
@@ -433,6 +436,7 @@ impl Airc {
                     channel: Some(channel),
                     limit: Some(page_size),
                     kinds: None,
+                    before: None,
                 })
                 .await?;
             let count = response.envelopes.len();

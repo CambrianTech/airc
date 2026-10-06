@@ -73,6 +73,11 @@ pub enum Response {
     AttachCursorAdvanced {
         skipped: u64,
         advanced_to: IpcCursor,
+        /// The room this frame speaks for on a channel-SET attach, where one
+        /// stream carries several rooms; `None` on a single-channel attach.
+        /// Wire-compatible both ways: old readers ignore it, old daemons omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<airc_core::RoomId>,
     },
     /// Response to `Publish` / `Send` — the owner-assigned receipt.
     Publish(PublishResponse),
