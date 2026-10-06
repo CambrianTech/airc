@@ -350,8 +350,13 @@ async fn every_past_start_streams_at_most_one_page_then_a_summary() {
                 skipped,
                 advanced_to,
                 channel: summary_channel,
+                skipped_at_least,
             } => {
                 assert_eq!(skipped, skipped_expected, "{name}: counts what it left out");
+                assert!(
+                    !skipped_at_least,
+                    "{name}: an exact count is never flagged a lower bound"
+                );
                 assert_eq!(advanced_to, tip, "{name}: the tip");
                 assert_eq!(
                     summary_channel, None,
@@ -430,6 +435,7 @@ async fn a_set_pages_each_room_and_its_summary_names_the_room() {
                 skipped,
                 advanced_to,
                 channel,
+                ..
             } => {
                 assert_eq!(skipped, 19);
                 assert_eq!(advanced_to, tip);

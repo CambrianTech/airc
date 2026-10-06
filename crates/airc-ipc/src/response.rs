@@ -78,6 +78,11 @@ pub enum Response {
         /// Wire-compatible both ways: old readers ignore it, old daemons omit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channel: Option<airc_core::RoomId>,
+        /// `skipped` is a lower bound: the daemon's backward count stopped
+        /// at its cap before reaching the bookmark. Say "at least". Omitted
+        /// when false, so the wire is unchanged for every exact count.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skipped_at_least: bool,
     },
     /// Response to `Publish` / `Send` — the owner-assigned receipt.
     Publish(PublishResponse),
