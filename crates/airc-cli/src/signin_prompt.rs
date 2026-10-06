@@ -30,8 +30,10 @@ pub fn signin_copy(open_click: &str) -> [String; 4] {
 }
 
 /// What the window says once GitHub's sign-in finishes, or doesn't.
-const SIGNED_IN: &str = "Signed in. Your computers can reach each other again. You can close this window.";
-const NOT_SIGNED_IN: &str = "Sign-in didn't finish. Nothing changed; it will ask again at your next login.";
+const SIGNED_IN: &str =
+    "Signed in. Your computers can reach each other again. You can close this window.";
+const NOT_SIGNED_IN: &str =
+    "Sign-in didn't finish. Nothing changed; it will ask again at your next login.";
 
 /// Offer the sign-in window? Only to a person who can see it (the login-time
 /// supervisor), only when gh is installed (without it there is nothing to run),
@@ -45,8 +47,15 @@ pub fn should_offer(context: &RuntimeContext, gh_installed: bool, gh_signed_in: 
 /// then a plain-words result.
 #[cfg(any(windows, test))] // the Windows window; tested everywhere
 fn windows_script(gh: &Path) -> String {
-    let say = |line: &str, color: &str| format!("Write-Host '  {}' -ForegroundColor {color}\n", line.replace('\'', "''"));
-    let mut script = String::from("$Host.UI.RawUI.WindowTitle = 'Continuum: GitHub sign-in needed'\nWrite-Host ''\n");
+    let say = |line: &str, color: &str| {
+        format!(
+            "Write-Host '  {}' -ForegroundColor {color}\n",
+            line.replace('\'', "''")
+        )
+    };
+    let mut script = String::from(
+        "$Host.UI.RawUI.WindowTitle = 'Continuum: GitHub sign-in needed'\nWrite-Host ''\n",
+    );
     let copy = signin_copy("Ctrl+click");
     script += &say(&copy[0], "Yellow");
     script += &say(&copy[1], "Gray");
@@ -130,11 +139,20 @@ mod tests {
     #[test]
     fn only_a_person_at_a_login_is_asked_and_only_when_it_would_help() {
         assert!(should_offer(&RuntimeContext::Supervisor, true, false));
-        assert!(!should_offer(&RuntimeContext::Supervisor, true, true), "already signed in");
-        assert!(!should_offer(&RuntimeContext::Supervisor, false, false), "no gh to run");
+        assert!(
+            !should_offer(&RuntimeContext::Supervisor, true, true),
+            "already signed in"
+        );
+        assert!(
+            !should_offer(&RuntimeContext::Supervisor, false, false),
+            "no gh to run"
+        );
         assert!(!should_offer(&RuntimeContext::Automation, true, false));
         assert!(!should_offer(&RuntimeContext::TestHarness, true, false));
-        assert!(!should_offer(&RuntimeContext::InteractiveTerminal, true, false), "a terminal user gets the CLI message, not a window");
+        assert!(
+            !should_offer(&RuntimeContext::InteractiveTerminal, true, false),
+            "a terminal user gets the CLI message, not a window"
+        );
     }
 
     // what this catches (Joel, 2026-10-06): a credential prompt that shows a code and
@@ -143,21 +161,31 @@ mod tests {
     #[test]
     fn the_window_explains_itself_before_it_asks() {
         let gh = Path::new("C:/tools/gh.exe");
-        for (script, click) in [(windows_script(gh), "Ctrl+click"), (macos_script(gh), "Cmd+click")] {
+        for (script, click) in [
+            (windows_script(gh), "Ctrl+click"),
+            (macos_script(gh), "Cmd+click"),
+        ] {
             let first_gh = script.find("auth login").expect("runs gh");
             let mut at = 0;
             for line in signin_copy(click) {
                 let line = line.as_str();
                 // as each script spells an apostrophe: PowerShell '' and POSIX '\''
-                let found = [line.replace('\'', "''"), line.replace('\'', "'\\''"), line.to_string()]
-                    .iter()
-                    .find_map(|form| script[at..].find(form.as_str()))
-                    .map(|i| i + at);
+                let found = [
+                    line.replace('\'', "''"),
+                    line.replace('\'', "'\\''"),
+                    line.to_string(),
+                ]
+                .iter()
+                .find_map(|form| script[at..].find(form.as_str()))
+                .map(|i| i + at);
                 let found = found.unwrap_or_else(|| panic!("copy line missing: {line}\n{script}"));
                 assert!(found < first_gh, "explained before asking: {line}");
                 at = found;
             }
-            assert!(script.contains("--web --clipboard"), "the code is copied and the browser opens");
+            assert!(
+                script.contains("--web --clipboard"),
+                "the code is copied and the browser opens"
+            );
             assert!(script.contains("https://github.com/login/device"));
         }
     }
