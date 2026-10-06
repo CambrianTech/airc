@@ -252,6 +252,37 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
         .as_ref()
         .filter(|kinds| !kinds.is_empty())
         .map(|kinds| kinds.iter().map(|k| map_kind(*k)).collect());
+    if request.since.is_some() && request.before.is_some() {
+        return Response::Error {
+            message: "inbox: `since` pages forward and `before` pages back; pass one".to_string(),
+        };
+    }
+    if let Some(b) = request.before {
+        // History, backward: the newest `limit` durable events strictly
+        // before the cursor, from the store, on demand. The read path behind
+        // an attach's one streamed page.
+        let before = Some(Cursor::new(Seq::new(b.epoch, b.counter), b.event_id));
+        let page = match &kinds {
+            None => {
+                state
+                    .router
+                    .durable_tail_before(channel, before, limit)
+                    .await
+            }
+            Some(kinds) => {
+                state
+                    .router
+                    .durable_tail_before_of_kinds(channel, before, kinds, limit)
+                    .await
+            }
+        };
+        return match page {
+            Ok(events) => inbox_page_response(&events, limit, true),
+            Err(error) => Response::Error {
+                message: format!("inbox: {error}"),
+            },
+        };
+    }
     let events = match request.since {
         // "Most recent N" when no cursor (card 8428ae8c): reverse-paged
         // at the store layer — work bounded by N (ring tail + at most
@@ -319,8 +350,15 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
             events
         }
     };
+    inbox_page_response(&events, limit, request.since.is_some())
+}
+
+/// One inbox page, encoded within the byte budget. `paging` = the caller is
+/// walking pages (a `since` or `before` cursor), so a full page means there
+/// may be more in that direction.
+fn inbox_page_response(events: &[Arc<Envelope>], limit: usize, paging: bool) -> Response {
     let page_full = events.len() >= limit;
-    let (envelopes, kept, cut) = encode_page_within_budget(&events, INBOX_PAGE_BYTE_BUDGET);
+    let (envelopes, kept, cut) = encode_page_within_budget(events, INBOX_PAGE_BYTE_BUDGET);
     let newest = kept.last().map(|e| {
         let cursor = e.cursor();
         IpcCursor {
@@ -332,7 +370,7 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
     Response::Inbox(InboxResponse {
         envelopes,
         newest,
-        has_more: cut || (page_full && request.since.is_some()),
+        has_more: cut || (page_full && paging),
     })
 }
 

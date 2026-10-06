@@ -1045,6 +1045,20 @@ impl EventRouter {
             .await
     }
 
+    /// [`Self::durable_tail_before`] restricted to `kinds`: the newest `limit`
+    /// durable events of these kinds strictly before `before`. The backward
+    /// page of `Inbox { before, kinds }`.
+    pub async fn durable_tail_before_of_kinds(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        kinds: &[Kind],
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        self.durable_tail_filtered(channel, before, Some(kinds), limit)
+            .await
+    }
+
     /// The one merge implementation behind [`Self::durable_tail`] /
     /// [`Self::durable_tail_of_kinds`] — `kinds: None` means no kind
     /// predicate. See `durable_tail` for the merge contract; the kind
