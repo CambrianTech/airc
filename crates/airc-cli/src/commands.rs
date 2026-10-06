@@ -297,7 +297,7 @@ pub async fn run_join(
             print_scope_context(home, &current.wire);
         }
     }
-    sync_daemon_peers_for_current_rooms(home, socket).await?;
+    sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     ensure_runtime_integrations();
 
     // Card 745e93f0 (slice 4/4 of engine-keystone 2903a8ef): surface
@@ -342,9 +342,93 @@ pub async fn run_join(
         .then(|| start_sos_fallback(home));
 
     if runtime_context.should_stream_join() {
-        crate::join_feed::run(&airc).await?;
+        // The supervising join keeps the daemon it started (card a32f8ac0). Beside the
+        // feed, never spawned: the feed ends the join, and the keeper ends with it.
+        tokio::select! {
+            fed = crate::join_feed::run(&airc) => fed?,
+            () = keep_daemon(home, socket) => {}
+        }
     }
     Ok(())
+}
+
+/// Restart the daemon when it stops answering while this join streams (card a32f8ac0).
+/// BigMama's machine daemon died at 16:53:01 on 2026-10-06 with nothing in its log; both
+/// supervising joins stayed alive and the node was dark until a hand restart, because
+/// `ensure_daemon_running` ran only when the join began and the feed's reconnect loop
+/// re-attaches forever without starting anything. The restart is the same
+/// `ensure_daemon_running`, under its autostart guard: an operator stop or an update in
+/// progress refuses it, and that refusal is respected, said once per outage.
+async fn keep_daemon(home: &Path, socket: PathBuf) {
+    let mut tick = tokio::time::interval(DAEMON_KEEPER_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut keeper = DaemonKeeper::default();
+    loop {
+        tick.tick().await;
+        let answered = DaemonClient::new(socket.clone())
+            .status_with_timeout(DAEMON_KEEPER_PROBE_TIMEOUT)
+            .await
+            .is_ok();
+        if keeper.observe(answered) != KeeperAction::Restart {
+            continue;
+        }
+        let outcome = ensure_daemon_running(home, socket.clone(), Vec::new())
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        match outcome {
+            Ok(()) => eprintln!(
+                "airc join: the daemon at {} stopped answering; started it again",
+                socket.display()
+            ),
+            Err(why) => eprintln!(
+                "airc join: the daemon at {} stopped answering and was not restarted: {why}",
+                socket.display()
+            ),
+        }
+    }
+}
+
+/// How often a supervising join asks whether its daemon is alive.
+const DAEMON_KEEPER_INTERVAL: Duration = Duration::from_secs(5);
+/// How long one probe waits for the daemon's status.
+const DAEMON_KEEPER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Consecutive unanswered probes before a restart: a daemon busy for one probe is not
+/// dead, and three in a row (about 15 s) is past any pause a live daemon takes.
+const DAEMON_KEEPER_MISSES: u32 = 3;
+/// Unanswered probes between restart attempts while the daemon stays down (about a
+/// minute): a restart that failed is tried again, and a refused one (an operator stop)
+/// is said once a minute, not every tick.
+const DAEMON_KEEPER_RETRY_MISSES: u32 = 12;
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeeperAction {
+    Wait,
+    Restart,
+}
+
+/// The keeper's whole decision, pure: restart at [`DAEMON_KEEPER_MISSES`] unanswered
+/// probes in a row, then every [`DAEMON_KEEPER_RETRY_MISSES`] more while the daemon stays
+/// down; an answered probe ends the outage.
+#[derive(Debug, Default)]
+struct DaemonKeeper {
+    misses: u32,
+}
+
+impl DaemonKeeper {
+    fn observe(&mut self, answered: bool) -> KeeperAction {
+        if answered {
+            self.misses = 0;
+            return KeeperAction::Wait;
+        }
+        self.misses = self.misses.saturating_add(1);
+        let past_first = self.misses.saturating_sub(DAEMON_KEEPER_MISSES);
+        if self.misses >= DAEMON_KEEPER_MISSES && past_first % DAEMON_KEEPER_RETRY_MISSES == 0 {
+            KeeperAction::Restart
+        } else {
+            KeeperAction::Wait
+        }
+    }
 }
 
 /// Poll the SOS gist alongside the live feed, printing any NEW peer posts.
@@ -3546,6 +3630,38 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (card a32f8ac0): a supervising join that never restarts its dead
+    // daemon (BigMama, 2026-10-06), and one that hammers a refused restart every tick. One
+    // busy probe is not death; three in a row restarts; a daemon still down is tried again
+    // a minute later, not every 5 s; an answer ends the outage.
+    #[test]
+    fn a_join_restarts_its_daemon_after_three_misses_then_once_a_minute() {
+        let mut keeper = DaemonKeeper::default();
+        assert_eq!(keeper.observe(false), KeeperAction::Wait);
+        assert_eq!(keeper.observe(true), KeeperAction::Wait, "an answer resets");
+        assert_eq!(keeper.observe(false), KeeperAction::Wait);
+        assert_eq!(keeper.observe(false), KeeperAction::Wait);
+        assert_eq!(
+            keeper.observe(false),
+            KeeperAction::Restart,
+            "third miss in a row"
+        );
+        for _ in 0..DAEMON_KEEPER_RETRY_MISSES - 1 {
+            assert_eq!(keeper.observe(false), KeeperAction::Wait, "not every tick");
+        }
+        assert_eq!(
+            keeper.observe(false),
+            KeeperAction::Restart,
+            "retried a minute later"
+        );
+        assert_eq!(keeper.observe(true), KeeperAction::Wait);
+        assert_eq!(
+            keeper.observe(false),
+            KeeperAction::Wait,
+            "a fresh outage counts from zero"
+        );
+    }
 
     #[tokio::test]
     async fn isolated_route_refresh_keeps_peer_clock_without_advertising() {
