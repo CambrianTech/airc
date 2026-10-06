@@ -312,6 +312,7 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
             owner: bob,
             reason: None,
             released_at_ms: bob_released_at,
+            taken_over_from: None,
         }),
     ];
     assert_eq!(transcript.len(), EVENTS);

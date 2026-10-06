@@ -10,7 +10,8 @@
 
 mod common;
 
-use airc_lib::{ClaimWorkCard, CreateWorkCard, Priority, RepoId};
+use airc_lib::{ClaimWorkCard, CreateWorkCard, Priority, RepoId, WorkEventFilter};
+use airc_work::WorkEvent;
 use common::Machine;
 
 #[tokio::test]
@@ -67,4 +68,30 @@ async fn a_second_peer_takes_a_live_held_card_and_the_holders_claim_is_released(
             "{who}'s board: bob's claim, not alice's"
         );
     }
+
+    // The release is the record of the takeover: by bob, of alice's claim, with alice
+    // TYPED as the holder it was taken from, never spelled into the reason.
+    let release = bob
+        .recent_work_events(WorkEventFilter::new(), 200)
+        .await
+        .expect("bob reads the room's work events")
+        .into_iter()
+        .find_map(|event| match event {
+            WorkEvent::ClaimReleased(r) if r.card_id == card_id => Some(r),
+            _ => None,
+        })
+        .expect("the takeover published a release");
+    assert_eq!(release.claim_id, alices, "it released alice's claim");
+    assert_eq!(release.owner, bob.peer_id(), "released by the taker");
+    assert_eq!(
+        release.taken_over_from,
+        Some(alice.peer_id()),
+        "typed holder"
+    );
+    let reason = release.reason.expect("a takeover says why");
+    assert!(
+        !reason.contains(&alice.peer_id().to_string())
+            && !reason.contains(&bob.peer_id().to_string()),
+        "no id inside the reason: {reason}"
+    );
 }

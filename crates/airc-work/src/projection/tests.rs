@@ -101,6 +101,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             owner,
             reason: None,
             released_at_ms: 202,
+            taken_over_from: None,
         }))
         .unwrap();
     assert!(restored.card(card_id).unwrap().claim_provenance.is_none());
@@ -119,6 +120,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             owner,
             reason: None,
             released_at_ms: 204,
+            taken_over_from: None,
         }))
         .unwrap();
     assert_eq!(
@@ -348,6 +350,7 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
             owner,
             reason: Some("merged".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -392,6 +395,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             owner,
             reason: Some("first release".to_string()),
             released_at_ms: 120,
+            taken_over_from: None,
         }),
         WorkEvent::ClaimReleased(ClaimReleased {
             card_id,
@@ -399,6 +403,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             owner,
             reason: Some("duplicate release".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -454,6 +459,7 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
             owner: first_owner,
             reason: Some("release original claim".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -982,6 +988,7 @@ fn release_for_superseded_claim_does_not_poison_projection() {
             owner: owner_b,
             reason: None,
             released_at_ms: 4,
+            taken_over_from: None,
         }))
         .expect("release of superseded claim must be tolerated");
 
@@ -2099,6 +2106,7 @@ fn a_takeover_is_release_then_claim_from_the_cutover_and_history_replays_unchang
             owner: peer(53),
             reason: Some("handover: Alice is gone".into()),
             released_at_ms: cut + 600,
+            taken_over_from: None,
         }))
         .unwrap();
     let bob_claim = stranger_claims(&mut after, card_id, cut + 700);

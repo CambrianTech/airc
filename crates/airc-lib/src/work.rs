@@ -620,21 +620,18 @@ impl Airc {
             }
             ClaimGate::Takeover { prev, owner } => {
                 // Joel, 2026-10-06: anyone may take a held card at any time. The handover
-                // is on the record: the holder's claim released BY the taker, naming both,
-                // then the taker's claim. The projection accepts a release from anyone.
-                let taker = self.peer_id();
-                let reason = match owner {
-                    Some(owner) => format!("taken over by {taker} from {owner}"),
-                    None => format!("taken over by {taker}"),
-                };
+                // is on the record: the holder's claim released BY the taker, typed with
+                // whom it was taken from (never an id spelled into the reason), then the
+                // taker's claim. The projection accepts a release from anyone.
                 self.publish_work_event_in(
                     room,
                     &WorkEvent::ClaimReleased(ClaimReleased {
                         card_id: request.card_id,
                         claim_id: prev,
-                        owner: taker,
-                        reason: Some(reason),
+                        owner: self.peer_id(),
+                        reason: Some("taken over".into()),
                         released_at_ms: now_ms()?,
+                        taken_over_from: owner,
                     }),
                 )
                 .await?;
@@ -720,6 +717,7 @@ impl Airc {
             owner: self.peer_id(),
             reason: request.reason,
             released_at_ms: now_ms()?,
+            taken_over_from: None,
         });
         self.publish_work_event_in(room, &event).await?;
         Ok(())

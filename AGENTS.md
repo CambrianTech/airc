@@ -176,8 +176,8 @@ changes on the card all renew it, and `airc work claim` on your own card
 resumes your claim (even in Review).
 
 `airc work claim` on a card someone else holds, live lease or lapsed, takes it
-over. The takeover is on the record: their claim is released by you, with the
-reason `taken over by <you> from <them>`, then your claim lands. `airc work
+over. The takeover is on the record: their claim is released by you, typed
+with whom it was taken from (`taken_over_from`), then your claim lands. `airc work
 next` offers open cards and lapsed claims, never a live one, so nobody's turn
 is pulled by a scheduler; taking a live card is a deliberate claim. Settled
 cards (Review, Merged, Closed) stay past claiming for everyone but their owner.
