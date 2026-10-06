@@ -297,7 +297,7 @@ pub async fn run_join(
             print_scope_context(home, &current.wire);
         }
     }
-    sync_daemon_peers_for_current_rooms(home, socket).await?;
+    sync_daemon_peers_for_current_rooms(home, socket.clone()).await?;
     ensure_runtime_integrations();
 
     // Card 745e93f0 (slice 4/4 of engine-keystone 2903a8ef): surface
@@ -342,9 +342,140 @@ pub async fn run_join(
         .then(|| start_sos_fallback(home));
 
     if runtime_context.should_stream_join() {
-        crate::join_feed::run(&airc).await?;
+        // The supervising join keeps the daemon it started (card a32f8ac0). Beside the
+        // feed, never spawned: the feed ends the join, and the keeper ends with it.
+        let watched = airc.current_room().await?.channel;
+        tokio::select! {
+            fed = crate::join_feed::run(&airc) => fed?,
+            () = keep_daemon(home, socket, watched) => {}
+        }
     }
     Ok(())
+}
+
+/// Restart the daemon when it dies while this join streams (card a32f8ac0). BigMama's
+/// machine daemon died at 16:53:01 on 2026-10-06 (heap corruption, nothing logged); both
+/// supervising joins stayed alive and the node was dark until a hand restart, because
+/// `ensure_daemon_running` ran only when the join began and the feed's reconnect loop
+/// re-attaches forever without starting anything.
+///
+/// The death is an EVENT, never polled for (Fable on #1546): the keeper holds a live
+/// attach to `watched`, and the daemon closing it is the notice; a healthy daemon costs
+/// nothing. The restart is the same `ensure_daemon_running`, under its autostart guard
+/// (an operator stop or an update refuses it, said plainly) and under one exclusive
+/// per-machine revive lock, so two supervising joins seeing the same death start one
+/// daemon: the second finds the first's on the fast path. A hung daemon that still holds
+/// its endpoint is NOT replaced: the new daemon's bind refuses (AddrInUse / the pipe's
+/// single instance), so a restart never puts a second daemon beside it.
+async fn keep_daemon(home: &Path, socket: PathBuf, watched: RoomId) {
+    let mut keeper = DaemonKeeper::default();
+    loop {
+        if let Some(held) = daemon_connection_closed(&socket, watched).await {
+            keeper.closed_after(held);
+        }
+        match keeper.on_down(Instant::now()) {
+            KeeperAction::Wait(for_how_long) => tokio::time::sleep(for_how_long).await,
+            KeeperAction::Restart => {
+                let outcome = revive_daemon(home, &socket).await;
+                match outcome {
+                    Ok(()) => eprintln!(
+                        "airc join: the daemon at {} went away; it is running again",
+                        socket.display()
+                    ),
+                    Err(why) => eprintln!(
+                        "airc join: the daemon at {} went away and was not restarted: {why}",
+                        socket.display()
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Hold an attach to the daemon until it closes. `Some(held)` = it was attached for `held`,
+/// so the close is a death (or a restart) seen as it happened; `None` = nothing answered.
+async fn daemon_connection_closed(socket: &Path, watched: RoomId) -> Option<Duration> {
+    let client = DaemonClient::new(socket.to_path_buf());
+    let mut stream = client
+        .attach(airc_ipc::AttachRequest::new(
+            watched,
+            airc_ipc::AttachStart::Live,
+        ))
+        .await
+        .ok()?;
+    let attached_at = Instant::now();
+    loop {
+        match airc_ipc::codec::read_response_frame(&mut stream).await {
+            Ok(Some(_)) => {} // the room's traffic; the keeper only waits for the close
+            Ok(None) | Err(_) => return Some(attached_at.elapsed()),
+        }
+    }
+}
+
+/// `ensure_daemon_running` under one exclusive per-machine lock: two joins that see the
+/// same death would otherwise both find the socket stale, and on Unix the second's
+/// cleanup can unlink the first's fresh socket. The lock is taken on a blocking thread.
+async fn revive_daemon(home: &Path, socket: &Path) -> Result<(), String> {
+    let lock_path = airc_lib::machine_account_home(home).join("daemon-revive.lock");
+    let lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| format!("revive lock task: {e}"))?
+    .map_err(|e| format!("revive lock: {e}"))?;
+    let outcome = ensure_daemon_running(home, socket.to_path_buf(), Vec::new())
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    drop(lock); // closing the file releases the lock for the next join
+    outcome
+}
+
+/// While the daemon stays down, how long between restart attempts: a failed restart is
+/// tried again, and a refused one (an operator stop, an update) is said once a minute.
+const DAEMON_KEEPER_RETRY: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeeperAction {
+    Restart,
+    Wait(Duration),
+}
+
+/// The keeper's decision, pure: when the daemon goes away, restart at once; while it stays
+/// away, try again at most once per [`DAEMON_KEEPER_RETRY`]; a held connection resets.
+#[derive(Debug, Default)]
+struct DaemonKeeper {
+    last_restart: Option<Instant>,
+}
+
+impl DaemonKeeper {
+    /// The daemon was attached for `held` and has now closed. Only a connection held a
+    /// full retry interval ends the outage: a daemon that dies soon after accepting (a
+    /// corrupt state crashing in its backfill; BigMama's died of heap corruption) stays
+    /// one outage and backs off to once a minute, never a restart loop (BigMama on #1546).
+    fn closed_after(&mut self, held: Duration) {
+        if held >= DAEMON_KEEPER_RETRY {
+            self.last_restart = None;
+        }
+    }
+
+    fn on_down(&mut self, now: Instant) -> KeeperAction {
+        match self.last_restart {
+            Some(at) if now.duration_since(at) < DAEMON_KEEPER_RETRY => {
+                KeeperAction::Wait(DAEMON_KEEPER_RETRY - now.duration_since(at))
+            }
+            _ => {
+                self.last_restart = Some(now);
+                KeeperAction::Restart
+            }
+        }
+    }
 }
 
 /// Poll the SOS gist alongside the live feed, printing any NEW peer posts.
@@ -3546,6 +3677,44 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (card a32f8ac0): a supervising join that never restarts its dead
+    // daemon (BigMama, 2026-10-06), and one that hammers a refused restart. A death
+    // restarts at once; while the daemon stays down it is tried again a minute later, not
+    // sooner; a held connection makes the next loss a fresh outage.
+    #[test]
+    fn a_join_restarts_its_dead_daemon_at_once_then_once_a_minute() {
+        let t0 = Instant::now();
+        let mut keeper = DaemonKeeper::default();
+        assert_eq!(
+            keeper.on_down(t0),
+            KeeperAction::Restart,
+            "a death restarts at once"
+        );
+        let soon = t0 + Duration::from_secs(5);
+        assert_eq!(
+            keeper.on_down(soon),
+            KeeperAction::Wait(DAEMON_KEEPER_RETRY - Duration::from_secs(5)),
+            "still down: wait out the minute, never hammer"
+        );
+        assert_eq!(
+            keeper.on_down(t0 + DAEMON_KEEPER_RETRY),
+            KeeperAction::Restart
+        );
+        let t1 = t0 + DAEMON_KEEPER_RETRY;
+        keeper.closed_after(Duration::from_secs(2));
+        assert_eq!(
+            keeper.on_down(t1 + Duration::from_secs(2)),
+            KeeperAction::Wait(DAEMON_KEEPER_RETRY - Duration::from_secs(2)),
+            "attached 2 s then closed is the same outage: a crash loop backs off"
+        );
+        keeper.closed_after(DAEMON_KEEPER_RETRY);
+        assert_eq!(
+            keeper.on_down(t0 + DAEMON_KEEPER_RETRY + Duration::from_secs(1)),
+            KeeperAction::Restart,
+            "a fresh outage restarts at once"
+        );
+    }
 
     #[tokio::test]
     async fn isolated_route_refresh_keeps_peer_clock_without_advertising() {
