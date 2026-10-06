@@ -147,6 +147,36 @@ pub struct RouterInboundBridge {
     /// handles without a rendezvous) keeps the plain unknown-channel
     /// verdict.
     account_registry: Option<Arc<dyn crate::account_registry::AccountRegistryStore>>,
+    /// The rooms some scope binds, as last read from the beacons. Every inbound frame asks
+    /// "is this channel bound", and the answer used to re-read every beacon from SQLite
+    /// per frame: about 150% CPU through a post-restart backfill on IntelMac (card 50bd2e1a).
+    bound: std::sync::Mutex<BoundRooms>,
+}
+
+/// How long a bound room is trusted without re-reading the beacons. A miss is never
+/// trusted: it always re-reads, so a channel subscribed a moment ago is never reported
+/// unbound. Only a REMOVED subscription can read as bound for this long, and its frames
+/// are durable either way.
+const BOUND_ROOMS_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The bound-room set the bridge answers from, with when it was read. Pure, so the rule
+/// (a fresh hit answers, a miss or an old read re-reads) is testable without beacons.
+#[derive(Default)]
+struct BoundRooms {
+    read: Option<(std::time::Instant, Arc<std::collections::HashSet<RoomId>>)>,
+}
+
+impl BoundRooms {
+    /// `Some(true)` when a fresh read holds `channel`; `None` when the beacons must be
+    /// re-read (no read yet, an old read, or `channel` absent: a miss is never trusted).
+    fn answer(&self, channel: RoomId, now: std::time::Instant) -> Option<bool> {
+        let (at, rooms) = self.read.as_ref()?;
+        (now.duration_since(*at) < BOUND_ROOMS_TTL && rooms.contains(&channel)).then_some(true)
+    }
+
+    fn store(&mut self, rooms: Arc<std::collections::HashSet<RoomId>>, now: std::time::Instant) {
+        self.read = Some((now, rooms));
+    }
 }
 
 impl RouterInboundBridge {
@@ -159,6 +189,7 @@ impl RouterInboundBridge {
             coordinator_store,
             diag_sink: Arc::new(StderrJsonDiagnosticSink),
             account_registry: None,
+            bound: std::sync::Mutex::new(BoundRooms::default()),
         }
     }
 
@@ -188,13 +219,24 @@ impl RouterInboundBridge {
     /// names there. Stale beacons count: a subscription is durable
     /// scope state, and a quiet scope still reads its transcript later.
     async fn channel_has_subscribed_scope(&self, channel: RoomId) -> Result<bool, String> {
-        let snapshot = self.subscribed_scope_snapshot().await?;
-        Ok(snapshot
-            .live
-            .iter()
-            .chain(snapshot.stale.iter())
-            .flat_map(|beacon| beacon.subscribed_channels.iter())
-            .any(|name| derive_room_id(&snapshot.mesh_identity, name) == channel))
+        let now = std::time::Instant::now();
+        // bound first, so the guard drops at the semicolon, never held into an await; a
+        // poisoned lock only means a re-read
+        let cached = self.bound.lock().ok().and_then(|b| b.answer(channel, now));
+        if let Some(answer) = cached {
+            return Ok(answer);
+        }
+        let rooms: Arc<std::collections::HashSet<RoomId>> = Arc::new(
+            self.subscribed_scope_channels()
+                .await?
+                .into_iter()
+                .collect(),
+        );
+        let bound = rooms.contains(&channel);
+        if let Ok(mut cache) = self.bound.lock() {
+            cache.store(rooms, now);
+        }
+        Ok(bound)
     }
 
     async fn subscribed_scope_snapshot(&self) -> Result<coordinator::CoordinatorSnapshot, String> {
@@ -670,5 +712,33 @@ mod tests {
             );
             assert!(bus_envelope_for_inbound(&f).is_err());
         }
+    }
+
+    // what this catches (card 50bd2e1a): the per-frame beacon re-read coming back, or a
+    // cache that reports a just-subscribed room unbound. A fresh read answers its hits; a
+    // miss and an old read both send the bridge back to the beacons.
+    #[test]
+    fn a_bound_room_is_answered_from_a_fresh_read_and_a_miss_always_rereads() {
+        let bound = RoomId::new();
+        let other = RoomId::new();
+        let t0 = std::time::Instant::now();
+        let mut rooms = BoundRooms::default();
+        assert_eq!(
+            rooms.answer(bound, t0),
+            None,
+            "nothing read yet: read the beacons"
+        );
+        rooms.store(Arc::new([bound].into_iter().collect()), t0);
+        assert_eq!(rooms.answer(bound, t0), Some(true), "a fresh hit answers");
+        assert_eq!(
+            rooms.answer(other, t0),
+            None,
+            "a miss is never trusted: a room subscribed since the read must be found"
+        );
+        assert_eq!(
+            rooms.answer(bound, t0 + BOUND_ROOMS_TTL),
+            None,
+            "an old read is re-read"
+        );
     }
 }
