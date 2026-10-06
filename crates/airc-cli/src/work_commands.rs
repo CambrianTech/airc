@@ -2352,27 +2352,29 @@ pub async fn run_availability(
     Ok(())
 }
 
-/// Which rows a capped board shows, as indices into `states` in their original order: every
-/// LIVE card first (anything not Merged or Closed: open, claimed, in progress, blocked, in
-/// review), newest live ones if even those exceed `cap`, then the newest finished cards to
-/// fill. A board that hides live work is wrong in the way that matters; one that hides old
-/// closed cards is only short (card 3e2b7f45).
+/// Which rows a capped board shows, as indices into `states` in their original order, by
+/// tier: HELD cards first (claimed, in progress, blocked, in review: someone's live work),
+/// then OPEN ones, then the newest finished (Merged, Closed) to fill; newest first within a
+/// tier when it alone exceeds what is left. A board that hides live work is wrong in the way
+/// that matters; one that hides old closed cards is only short (card 3e2b7f45; Fable on #1547:
+/// held before open, so the oldest claim is the last to go).
 fn rows_to_keep(states: &[airc_work::CardState], cap: usize) -> Vec<usize> {
-    let finished = |s: &airc_work::CardState| {
-        matches!(
-            s,
-            airc_work::CardState::Merged | airc_work::CardState::Closed
-        )
+    use airc_work::CardState::{Closed, Merged, Open};
+    let tier = |s: &airc_work::CardState| match s {
+        Merged | Closed => 2,
+        Open => 1,
+        _ => 0,
     };
-    let live: Vec<usize> = (0..states.len())
-        .filter(|&i| !finished(&states[i]))
-        .collect();
-    let done: Vec<usize> = (0..states.len())
-        .filter(|&i| finished(&states[i]))
-        .collect();
-    let mut keep: Vec<usize> = live.iter().rev().take(cap).copied().collect();
-    let room = cap.saturating_sub(keep.len());
-    keep.extend(done.iter().rev().take(room).copied());
+    let mut keep: Vec<usize> = Vec::with_capacity(cap.min(states.len()));
+    for t in 0..3 {
+        let room = cap.saturating_sub(keep.len());
+        keep.extend(
+            (0..states.len())
+                .rev()
+                .filter(|&i| tier(&states[i]) == t)
+                .take(room),
+        );
+    }
     keep.sort_unstable();
     keep
 }
@@ -2403,18 +2405,31 @@ fn print_board(
     // first: newest-only kept a closed card from today and dropped Kimi's live
     // claim from yesterday (BigMama, 2026-10-06, card 3e2b7f45).
     let matched = visible.len();
+    let live = |card: &&airc_work::WorkCard| {
+        !matches!(
+            card.state,
+            airc_work::CardState::Merged | airc_work::CardState::Closed
+        )
+    };
+    let live_matched = visible.iter().filter(|card| live(*card)).count();
     if matched > limit.max(1) {
         let states: Vec<airc_work::CardState> = visible.iter().map(|card| card.state).collect();
         let keep = rows_to_keep(&states, limit.max(1));
         visible = keep.into_iter().map(|i| visible[i]).collect();
     }
+    let live_hidden = live_matched - visible.iter().filter(|card| live(*card)).count();
     if !visible.is_empty() {
         if matches!(filter, BoardFilter::All) {
             if visible.len() < matched {
                 println!(
-                    "work cards: showing {} of {}, live cards first (raise --limit for the rest)",
+                    "work cards: showing {} of {}, live cards first{} (raise --limit for the rest)",
                     visible.len(),
                     matched,
+                    if live_hidden > 0 {
+                        format!("; {live_hidden} LIVE not shown")
+                    } else {
+                        String::new()
+                    },
                 );
             } else {
                 println!("work cards: {}", visible.len());
@@ -2797,6 +2812,12 @@ mod tests {
             rows_to_keep(&[Open, InProgress, Claimed], 2),
             vec![1, 2],
             "newest live"
+        );
+        assert_eq!(rows_to_keep(&states, 2), vec![0, 5], "held before open");
+        assert_eq!(
+            rows_to_keep(&[Claimed, Open, Open, Open], 2),
+            vec![0, 3],
+            "the oldest claim outlasts newer open cards (Fable on #1547)"
         );
         assert_eq!(
             rows_to_keep(&states, 6),
