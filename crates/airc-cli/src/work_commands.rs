@@ -2411,13 +2411,13 @@ fn print_board(
             airc_work::CardState::Merged | airc_work::CardState::Closed
         )
     };
-    let live_matched = visible.iter().filter(|card| live(*card)).count();
+    let live_matched = visible.iter().filter(|card| live(card)).count();
     if matched > limit.max(1) {
         let states: Vec<airc_work::CardState> = visible.iter().map(|card| card.state).collect();
         let keep = rows_to_keep(&states, limit.max(1));
         visible = keep.into_iter().map(|i| visible[i]).collect();
     }
-    let live_hidden = live_matched - visible.iter().filter(|card| live(*card)).count();
+    let live_hidden = live_matched - visible.iter().filter(|card| live(card)).count();
     if !visible.is_empty() {
         if matches!(filter, BoardFilter::All) {
             if visible.len() < matched {
