@@ -238,6 +238,28 @@ pub async fn run_part(home: &Path, room: Option<String>) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// Once per login: when this machine's GitHub sign-in is broken, open the window
+/// that explains it and lets the person fix it (`signin_prompt`). The join is not
+/// held up either way; discovery re-checks gh on its own cadence and resumes when
+/// the person signs in, now or later.
+async fn offer_signin_if_needed(context: &crate::runtime_context::RuntimeContext) {
+    let gh = airc_core::gh_executable::resolve();
+    let installed = gh.is_absolute() && gh.is_file();
+    if !matches!(context, crate::runtime_context::RuntimeContext::Supervisor) || !installed {
+        return;
+    }
+    let signed_in = airc_lib::gh::account_registry::gh_auth_ready(Some(&gh)).await;
+    if !crate::signin_prompt::should_offer(context, installed, signed_in) {
+        return;
+    }
+    let opened = airc_lib::runtime_dir::runtime_dir()
+        .and_then(|dir| crate::signin_prompt::open_signin_window(&dir, &gh));
+    match opened {
+        Ok(path) => eprintln!("gh: not signed in; opened the sign-in window ({})", path.display()),
+        Err(error) => eprintln!("gh: not signed in, and the sign-in window could not open ({error}); run `gh auth login`"),
+    }
+}
+
 /// `join` — account-room coordinator entrypoint. With no explicit
 /// room, subscribe to `#general` plus the inferred Git owner channel.
 /// With a room, join that arbitrary channel and make it default.
@@ -298,6 +320,7 @@ pub async fn run_join(
         }
     }
     sync_daemon_peers_for_current_rooms(home, socket).await?;
+    offer_signin_if_needed(&runtime_context).await;
     ensure_runtime_integrations();
 
     // Card 745e93f0 (slice 4/4 of engine-keystone 2903a8ef): surface
