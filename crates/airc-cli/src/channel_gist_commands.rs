@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
 use std::thread;
 use std::time::Duration;
 
@@ -197,8 +197,8 @@ fn list_user_gists() -> Result<Option<Vec<Value>>, Box<dyn Error>> {
             900.0,
         )));
     }
-    let gh = env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
-    let Ok(output) = Command::new(gh).args(&args).output() else {
+    let gh = airc_core::gh_executable::resolve();
+    let Ok(output) = airc_core::process::background(gh).args(&args).output() else {
         return Ok(load_cached_gist_list(env_f64(
             "AIRC_GIST_LIST_STALE_SEC",
             900.0,
@@ -237,8 +237,8 @@ fn get_gist(gist_id: &str) -> Result<Option<Value>, Box<dyn Error>> {
     if !allowed {
         return Ok(None);
     }
-    let gh = env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
-    let Ok(output) = Command::new(gh).args(&args).output() else {
+    let gh = airc_core::gh_executable::resolve();
+    let Ok(output) = airc_core::process::background(gh).args(&args).output() else {
         return Ok(None);
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -291,8 +291,8 @@ fn create_new_with_args(args: &[String]) -> Result<Option<String>, Box<dyn Error
     if !allowed {
         return Ok(None);
     }
-    let gh = env::var("AIRC_GH_BIN").unwrap_or_else(|_| "gh".to_string());
-    let Ok(output) = Command::new(gh).args(args).output() else {
+    let gh = airc_core::gh_executable::resolve();
+    let Ok(output) = airc_core::process::background(gh).args(args).output() else {
         return Ok(None);
     };
     let stdout = String::from_utf8_lossy(&output.stdout);

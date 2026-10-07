@@ -31,11 +31,16 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 
 use airc_core::{PeerId, RoomId};
+use airc_diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSeverity, DiagnosticSink,
+    NoopDiagnosticSink,
+};
 
 use crate::clock::Clock;
 use crate::envelope::{Cursor, Envelope, Kind};
@@ -55,6 +60,12 @@ pub struct RouterConfig {
     /// Nominal per-channel hot-ring capacity. The §3.8 floor means a ring may
     /// temporarily exceed this while un-persisted `Durable` entries are pinned.
     pub ring_capacity: usize,
+    /// Per-channel hot-ring byte budget (payload + headers + coalesce key).
+    /// Bounds a channel of large envelopes the count cannot: 1 MiB keeps the
+    /// recent tail in RAM for chat-sized traffic while ~55 channels cost at
+    /// most ~55 MiB, where the count alone reached ~7.5 MB per channel. Older
+    /// replay falls through to the durable tier (§3.5). Same §3.8 floor.
+    pub ring_byte_budget: usize,
     /// Bound on each subscriber's live channel. Full = subscriber is lagged.
     pub subscriber_buffer: usize,
     /// Bound on the write-behind queue (§3.8 ≥ ring floor).
@@ -68,6 +79,7 @@ impl Default for RouterConfig {
         Self {
             shards: 16,
             ring_capacity: 256,
+            ring_byte_budget: 1 << 20,
             subscriber_buffer: 1024,
             write_behind_buffer: 1024,
             ephemeral_ttl_ms: 30_000,
@@ -95,10 +107,10 @@ struct ChannelState {
 }
 
 impl ChannelState {
-    fn new(ring_capacity: usize, ephemeral_ttl_ms: u64) -> Self {
+    fn new(config: &RouterConfig) -> Self {
         Self {
-            ring: HotRing::new(ring_capacity),
-            ephemeral: EphemeralCache::new(ephemeral_ttl_ms),
+            ring: HotRing::new(config.ring_capacity, config.ring_byte_budget),
+            ephemeral: EphemeralCache::new(config.ephemeral_ttl_ms),
             subscribers: SubscriberIndex::new(),
         }
     }
@@ -114,6 +126,9 @@ struct Shard {
 struct WriteBehindItem {
     env: Arc<Envelope>,
 }
+
+const WRITE_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const WRITE_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Capacity of the router's recent-event-ids window (card 4132f48c).
 /// Sized well past the per-channel ring capacity so a same-moment echo
@@ -280,12 +295,29 @@ pub struct EventRouter {
     inner: Arc<RouterInner>,
 }
 
+/// Scalar holder snapshot, not unique heap bytes or an atomic global census.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionSnapshot {
+    /// Live channel states (each holds one ring + ephemeral cache).
+    pub channel_count: usize,
+    pub ring_entries_total: usize,
+    /// Retained payload + header bytes across all rings (not allocator bytes).
+    pub ring_bytes_total: usize,
+    pub ring_pinned_total: usize,
+    /// Occupied admission slots, including reserved permits; excludes the
+    /// writer's retained in-flight/retry batch (at most MAX_BATCH entries).
+    pub write_behind_queued: usize,
+    pub subscriber_queue_depth_total: usize,
+    pub subscriber_queue_depth_max: usize,
+}
+
 struct RouterInner {
     shards: Vec<Shard>,
     config: RouterConfig,
     clock: Arc<dyn Clock>,
     seq: Arc<SeqSource>,
     sink: Arc<dyn DurableSink>,
+    diagnostics: Arc<dyn DiagnosticSink>,
     write_behind_tx: mpsc::Sender<WriteBehindItem>,
     /// Recently published event ids (card 4132f48c) — the in-memory leg of
     /// [`EventRouter::publish_if_new`]'s idempotency check. Every publish
@@ -356,6 +388,19 @@ impl EventRouter {
         seq: Arc<SeqSource>,
         sink: Arc<dyn DurableSink>,
     ) -> Self {
+        Self::new_with_diagnostics(config, clock, seq, sink, Arc::new(NoopDiagnosticSink))
+    }
+
+    /// Construct the same owner with host-supplied persistence diagnostics.
+    /// The host decides where failure/recovery events are recorded; the bus
+    /// never publishes them back into its own failing persistence queue.
+    pub fn new_with_diagnostics(
+        config: RouterConfig,
+        clock: Arc<dyn Clock>,
+        seq: Arc<SeqSource>,
+        sink: Arc<dyn DurableSink>,
+        diagnostics: Arc<dyn DiagnosticSink>,
+    ) -> Self {
         let shards = (0..config.shards.max(1))
             .map(|_| Shard {
                 channels: Mutex::new(HashMap::new()),
@@ -371,6 +416,7 @@ impl EventRouter {
             clock,
             seq,
             sink,
+            diagnostics,
             write_behind_tx,
             recent_ids: Mutex::new(RecentEventIds::with_capacity(RECENT_PUBLISH_IDS_CAPACITY)),
             forward_tx: Mutex::new(None),
@@ -403,6 +449,7 @@ impl EventRouter {
     /// Publish an envelope (§4 publish-hot). Returns the assigned [`Seq`].
     ///
     /// Steps, all synchronous up to the write-behind enqueue:
+    /// 0. Reserve durable queue capacity without waiting; reject before mutation.
     /// 1. Stamp owner metadata: `seq` (generational) + `occurred_at_ms`.
     /// 2. Under the shard lock: push to the ring (deliver-first), coalesce if
     ///    `EphemeralLatest`, fan out to matching subscribers via `try_send`
@@ -545,6 +592,24 @@ impl EventRouter {
         mut env: Envelope,
         origin: Option<PeerId>,
     ) -> crate::Result<crate::Seq> {
+        // Reserve persistence capacity before exposing the event to the ring,
+        // subscribers, or deduplication. Rejection must leave no pinned event
+        // with no writer responsible for it. This is nonblocking admission;
+        // the actual write still occurs asynchronously after live fan-out.
+        let durable_permit = if env.delivery.is_durable() {
+            match self.inner.write_behind_tx.try_reserve() {
+                Ok(permit) => Some(permit),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.inner.shed_count.fetch_add(1, Ordering::SeqCst);
+                    return Err(crate::BusError::WriteBehindSaturated);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(crate::BusError::Sink("write-behind task gone".into()));
+                }
+            }
+        } else {
+            None
+        };
         let seq = self.inner.seq.next();
         env.seq = seq;
         env.occurred_at_ms = self.inner.clock.now_ms();
@@ -573,12 +638,9 @@ impl EventRouter {
             let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             let key = env.channel.0.as_u128();
             let is_new = !map.contains_key(&key);
-            let state = map.entry(key).or_insert_with(|| {
-                ChannelState::new(
-                    self.inner.config.ring_capacity,
-                    self.inner.config.ephemeral_ttl_ms,
-                )
-            });
+            let state = map
+                .entry(key)
+                .or_insert_with(|| ChannelState::new(&self.inner.config));
             if is_new {
                 self.inner.channels_created.fetch_add(1, Ordering::SeqCst);
             }
@@ -646,27 +708,12 @@ impl EventRouter {
             );
         } // shard lock released here, before any await
 
-        // --- write-behind (durable only), off the hot lock ---
-        if env.delivery.is_durable() {
-            match self.inner.write_behind_tx.try_send(WriteBehindItem {
+        // Fill the reserved slot only after live fan-out, off the shard lock.
+        if let Some(permit) = durable_permit {
+            permit.send(WriteBehindItem {
                 env: Arc::clone(&env),
-            }) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // §3.8: bounded write-behind full. Slice-1 fire-and-forget
-                    // policy: shed + surface, never silently drop, never OOM.
-                    // (The `await_durable`/blocking publisher variant is a
-                    // later refinement; the default path sheds with a surfaced
-                    // error so the contract is explicit.)
-                    self.inner.shed_count.fetch_add(1, Ordering::SeqCst);
-                    return Err(crate::BusError::WriteBehindSaturated);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(crate::BusError::Sink("write-behind task gone".into()));
-                }
-            }
+            });
         }
-
         // Card 1998f6cb: the event is accepted locally (ring + fan-out,
         // and for durable also write-behind enqueued) — offer it to the
         // route layer so it traverses established LAN routes. Off the
@@ -771,8 +818,9 @@ impl EventRouter {
     }
 
     /// The write-behind drain loop (§3.3 deliver-first / persist-async, §3.8
-    /// ring-pinned-until-persisted). For each durable item: `sink.append` then
-    /// re-lock the shard and `mark_persisted` so the ring may evict it.
+    /// ring-pinned-until-persisted). Confirm each retained batch with
+    /// `sink.append_batch`, then re-lock its shards and `mark_persisted` so
+    /// the ring may evict the durables. Failure never abandons pinned work.
     async fn run_write_behind(inner: Arc<RouterInner>, mut rx: mpsc::Receiver<WriteBehindItem>) {
         // GROUP-COMMIT: when a burst is queued, drain everything immediately
         // available (up to MAX_BATCH) and persist it in ONE durable commit, so
@@ -792,17 +840,34 @@ impl EventRouter {
             }
 
             // append is the only point we touch the durable tier; no shard
-            // lock is held across it. The batch persists as a single multi-row
-            // INSERT (one atomic SQLite statement), so on error nothing is
-            // committed — the failure path below re-pins the whole batch.
+            // lock is held across it. Keep this batch until confirmed: the
+            // sink contract is idempotent by event_id, including implementations
+            // whose default append_batch partially succeeds before an error.
+            // Do not drain newer work while retrying. The existing bounded
+            // admission queue then refuses excess publishers BEFORE fan-out.
             let envs: Vec<&Envelope> = batch.iter().map(|i| i.env.as_ref()).collect();
-            if inner.sink.append_batch(&envs).await.is_err() {
-                // Batch append failed: leave EVERY ring entry pinned so the
-                // no-gap precondition still holds (events are still in RAM). A
-                // real sink would retry; the in-memory test sink never fails.
-                // (Same posture as the prior per-item failure path, applied to
-                // the whole batch since the insert is atomic.)
-                continue;
+            let mut failed_attempts = 0u64;
+            let mut retry_delay = WRITE_RETRY_INITIAL;
+            while let Err(error) = inner.sink.append_batch(&envs).await {
+                failed_attempts = failed_attempts.saturating_add(1);
+                // Log the first failure and exponentially spaced reminders,
+                // not one diagnostic per attempt during a prolonged outage.
+                if failed_attempts.is_power_of_two() {
+                    inner.diagnostics.emit(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Persistence,
+                            DiagnosticCode::WriteBehindBatchFailed,
+                            "durable batch retained for retry; publishers remain bounded",
+                        )
+                        .with_field("failed_attempts", failed_attempts)
+                        .with_field("batch_len", batch.len())
+                        .with_field("pinned_count", Self::pinned_count(&inner))
+                        .with_field("retry_ms", retry_delay.as_millis())
+                        .with_field("error", error),
+                    );
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(WRITE_RETRY_MAX);
             }
 
             // Confirmed persisted -> unpin each in its shard's ring.
@@ -815,7 +880,38 @@ impl EventRouter {
                     state.ring.mark_persisted(item.env.event_id);
                 }
             }
+            if failed_attempts != 0 {
+                inner.diagnostics.emit(
+                    DiagnosticEvent::new(
+                        DiagnosticSeverity::Info,
+                        DiagnosticComponent::Persistence,
+                        DiagnosticCode::WriteBehindBatchRecovered,
+                        "retained durable batch committed and unpinned",
+                    )
+                    .with_field("failed_attempts", failed_attempts)
+                    .with_field("batch_len", batch.len())
+                    .with_field("pinned_count", Self::pinned_count(&inner)),
+                );
+            }
         }
+    }
+
+    // Diagnostic snapshot only: acquire one shard at a time, never across an
+    // await. Keep counting off the healthy publish/persist hot paths.
+    fn pinned_count(inner: &RouterInner) -> usize {
+        inner
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .channels
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .values()
+                    .map(|state| state.ring.pinned_count())
+                    .sum::<usize>()
+            })
+            .sum()
     }
 
     /// **Card 7d5b6a65.** Return the cursor of the most-recent envelope
@@ -946,6 +1042,20 @@ impl EventRouter {
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
         self.durable_tail_filtered(channel, None, Some(kinds), limit)
+            .await
+    }
+
+    /// [`Self::durable_tail_before`] restricted to `kinds`: the newest `limit`
+    /// durable events of these kinds strictly before `before`. The backward
+    /// page of `Inbox { before, kinds }`.
+    pub async fn durable_tail_before_of_kinds(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        kinds: &[Kind],
+        limit: usize,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        self.durable_tail_filtered(channel, before, Some(kinds), limit)
             .await
     }
 
@@ -1093,9 +1203,9 @@ impl EventRouter {
             let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
             let key = channel.0.as_u128();
             let is_new = !map.contains_key(&key);
-            let state = map.entry(key).or_insert_with(|| {
-                ChannelState::new(inner.config.ring_capacity, inner.config.ephemeral_ttl_ms)
-            });
+            let state = map
+                .entry(key)
+                .or_insert_with(|| ChannelState::new(&inner.config));
             if is_new {
                 inner.channels_created.fetch_add(1, Ordering::SeqCst);
             }
@@ -1342,6 +1452,40 @@ impl EventRouter {
         let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
         map.get(&channel.0.as_u128())
             .map_or(0, |s| s.ring.pinned_count())
+    }
+
+    /// On-demand O(channels + registrations + ring entries) observation. One
+    /// shard lock at a time, no awaits or envelope clones. Counts overlap Arc
+    /// holders and exclude stream replay snapshots and the writer's retry batch.
+    pub fn retention_snapshot(&self) -> RetentionSnapshot {
+        let mut snapshot = RetentionSnapshot {
+            write_behind_queued: self
+                .inner
+                .write_behind_tx
+                .max_capacity()
+                .saturating_sub(self.inner.write_behind_tx.capacity()),
+            ..RetentionSnapshot::default()
+        };
+        for shard in &self.inner.shards {
+            let channels = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            snapshot.channel_count += channels.len();
+            for state in channels.values() {
+                snapshot.ring_entries_total += state.ring.len();
+                snapshot.ring_bytes_total += state.ring.retained_bytes();
+                snapshot.ring_pinned_total += state.ring.pinned_count();
+                for subscriber in state.subscribers.values() {
+                    // This owner only uses try_send, never outstanding permits.
+                    let depth = subscriber
+                        .tx
+                        .max_capacity()
+                        .saturating_sub(subscriber.tx.capacity());
+                    snapshot.subscriber_queue_depth_total += depth;
+                    snapshot.subscriber_queue_depth_max =
+                        snapshot.subscriber_queue_depth_max.max(depth);
+                }
+            }
+        }
+        snapshot
     }
 
     /// Test/diagnostic: snapshot the count of retained ring entries.

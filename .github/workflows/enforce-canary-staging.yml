@@ -23,8 +23,11 @@ jobs:
       - name: Check PR source against staging policy
         env:
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # Lowercase the title so 'HOTFIX', 'Hotfix', 'hotfix' all match.
@@ -34,6 +37,35 @@ jobs:
             echo "✓ PR source is canary — staging policy satisfied."
             exit 0
           fi
+
+          # A PROMOTION is canary's tree on top of main's history. main is
+          # squash-promoted, so canary does not contain main and a canary->main
+          # PR conflicts (#1550, 2026-10-07). Every promotion is therefore a
+          # promote/* branch: one commit on main whose tree IS canary's tree.
+          # It passes only if that holds byte for byte right now, which is
+          # exactly what "comes from canary" protects. Anything else on a
+          # promote/* head (a hand edit, a stale canary) still fails.
+          case "$HEAD_REF" in
+            promote/*)
+              head_tree="$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq .commit.tree.sha)"
+              canary_tree="$(gh api "repos/$REPO/commits/canary" --jq .commit.tree.sha)"
+              # FAIL CLOSED (BigMama on #1552): this guards main, so two empty or
+              # `null` answers must never compare equal. Both must be real tree shas.
+              for tree in "$head_tree" "$canary_tree"; do
+                if ! printf '%s' "$tree" | grep -qE '^[0-9a-f]{40}$'; then
+                  echo "::error::could not read a tree sha for ${HEAD_REF} or canary (got '${tree}'); refusing rather than guessing."
+                  exit 1
+                fi
+              done
+              if [ "$head_tree" = "$canary_tree" ]; then
+                echo "✓ promotion: ${HEAD_REF}'s tree ($head_tree) is canary's tree — staging policy satisfied."
+                exit 0
+              fi
+              echo "::error::${HEAD_REF} is a promotion branch, but its tree ($head_tree) is not canary's current tree ($canary_tree)."
+              echo "::error::Rebuild it from canary: git commit-tree origin/canary^{tree} -p origin/main."
+              exit 1
+              ;;
+          esac
 
           # Title-based bypass — case-insensitive match against:
           #   - 'hotfix' anywhere (urgent escape hatch)

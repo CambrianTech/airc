@@ -12,9 +12,9 @@ pub struct WorkspaceArgs {
 pub enum WorkspaceAction {
     /// Request a workspace lease for a claimed work card.
     Request {
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
-        /// Claim UUID returned by `work claim`.
+        /// Claim id returned by `work claim`: full, or the short form the board shows.
         claim_id: String,
         /// Repository key, e.g. `CambrianTech/airc`.
         #[arg(long)]

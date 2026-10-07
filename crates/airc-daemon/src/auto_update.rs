@@ -108,7 +108,7 @@ pub fn mesh_is_quiet(peers: impl IntoIterator<Item = (u32, bool)>) -> bool {
 /// it does NOT wait (the updater outlives this process).
 pub fn spawn_detached_update() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = airc_core::process::background(exe);
     cmd.arg("update").arg("--auto");
     #[cfg(unix)]
     {

@@ -19,11 +19,14 @@ use airc_lib::{
     WorkManagerRecommendationKind, WorkManagerStatus, WorkQueueStatus, WorkRosterStatus,
 };
 
+use airc_core::shown_id::{Shown, ShownIdError};
+
 use crate::lease;
 use crate::work_cli::{CliAvailabilityState, CliCardState, CliPriority};
 
 pub async fn run_create(
     home: &Path,
+    room: Option<String>,
     repo: String,
     title: String,
     body: Option<String>,
@@ -31,17 +34,25 @@ pub async fn run_create(
     priority: CliPriority,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
+    // Resolve ONCE, like `run_state`: `--room` names the project board the card belongs
+    // to without moving the scope's pointer. Without it, a card lands wherever that
+    // pointer is, which put Continuum cards on the org room's board (2026-10-04).
+    let room = room_or_current(&airc, room.as_deref(), "create a work card in").await?;
     let card_id = airc
-        .create_work_card(CreateWorkCard {
-            repo: RepoId::new(repo)?,
-            title,
-            body,
-            priority: priority.into(),
-            lane_id: parse_optional_lane_id(lane_id.as_deref())?,
-            reviews: None,
-        })
+        .create_work_card_in(
+            &room,
+            CreateWorkCard {
+                repo: RepoId::new(repo)?,
+                title,
+                body,
+                priority: priority.into(),
+                lane_id: parse_optional_lane_id(lane_id.as_deref())?,
+                reviews: None,
+            },
+        )
         .await?;
     println!("card_id: {card_id}");
+    println!("room:    {}", room.name);
     Ok(())
 }
 
@@ -107,19 +118,14 @@ pub async fn run_review(
     priority: Option<CliPriority>,
     body: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parent_card_id = parse_work_card_id(&parent_id)?;
+    let parent_shown = Shown::try_from(parent_id.as_str())?;
     let airc = crate::commands::attached_airc(home).await?;
 
     // Resolve once: parent lookup and sibling publication must share a room,
     // even if another client changes this scope's default during the command.
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "review work in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "review work in").await?;
     let board = airc.work_board_in(&room).await?;
+    let parent_card_id = card_on_board(&board, &parent_shown)?;
     let parent = board.card(parent_card_id).ok_or_else(|| {
         format!(
             "parent card {parent_card_id} not found in room {}; \
@@ -184,6 +190,7 @@ fn format_review_title(parent_title: &str) -> String {
 
 pub async fn run_claim(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     ttl_ms: u64,
     no_lease_required: bool,
@@ -257,14 +264,17 @@ pub async fn run_claim(
         }
     }
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
+    let room = room_or_current(&airc, room.as_deref(), "claim work in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
     let claim_id = airc
-        .claim_work_card_with_origin(
+        .claim_work_card_with_provenance_in(
+            &room,
             ClaimWorkCard {
                 card_id: card_uuid,
                 ttl_ms,
             },
             airc_work::ClaimOrigin::Explicit,
+            None,
         )
         .await?;
     println!("claim_id: {claim_id}");
@@ -275,7 +285,9 @@ pub async fn run_claim(
     // tell). Best-effort: a git failure does NOT undo the claim or
     // the lease — the claim is the authoritative record, the
     // worktree is convenience around it.
-    if let Err(error) = crate::work_commands_git::spawn_claim_worktree(&airc, card_uuid).await {
+    if let Err(error) =
+        crate::work_commands_git::spawn_claim_worktree(&airc, &room, card_uuid).await
+    {
         eprintln!("airc: worktree spawn skipped — {error}");
     }
     Ok(())
@@ -294,7 +306,7 @@ pub async fn run_claim(
 /// this returns Err, so the agent gets the explicit refusal rather
 /// than a silent success.
 fn cwd_is_project_root(cwd: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()?;
@@ -315,24 +327,29 @@ fn cwd_is_project_root(cwd: &std::path::Path) -> Result<bool, Box<dyn std::error
 
 pub async fn run_release(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     claim_id: Option<String>,
     reason: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
+    let room = room_or_current(&airc, room.as_deref(), "release a claim in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
     // Default: resolve THIS peer's active claim from the board so
     // callers don't have to track claim_ids the system already knows
     // (kink card acb8bfcd: release ergonomics).
     let claim_uuid = match claim_id {
-        Some(raw) => parse_claim_id(&raw)?,
+        Some(raw) => claim_in_room(&airc, &room, card_uuid, &raw).await?,
         None => resolve_my_active_claim(&airc, card_uuid).await?,
     };
-    airc.release_work_claim(ReleaseWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        reason,
-    })
+    airc.release_work_claim_in(
+        &room,
+        ReleaseWorkClaim {
+            card_id: card_uuid,
+            claim_id: claim_uuid,
+            reason,
+        },
+    )
     .await?;
     println!("released: card_id={card_id} claim_id={claim_uuid}");
     Ok(())
@@ -364,20 +381,39 @@ async fn resolve_my_active_claim(
     }
 }
 
+/// The room a work verb acts in: `--room` resolved by name or channel (refusing a
+/// room this scope is not subscribed to), else the scope's current room. ONE place
+/// for the choice every `--room` verb makes; it never moves the current-room pointer.
+async fn room_or_current(
+    airc: &airc_lib::Airc,
+    room: Option<&str>,
+    verb: &str,
+) -> Result<airc_lib::Room, Box<dyn std::error::Error>> {
+    Ok(match room {
+        Some(requested) => airc.room_by_name_or_channel(requested, verb).await?,
+        None => airc.current_room().await?,
+    })
+}
+
 pub async fn run_heartbeat(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     claim_id: String,
     ttl_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
-    let claim_uuid = parse_claim_id(&claim_id)?;
-    airc.heartbeat_work_claim(airc_lib::HeartbeatWorkClaim {
-        card_id: card_uuid,
-        claim_id: claim_uuid,
-        ttl_ms,
-    })
+    let room = room_or_current(&airc, room.as_deref(), "renew a claim in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
+    let claim_uuid = claim_in_room(&airc, &room, card_uuid, &claim_id).await?;
+    airc.heartbeat_work_claim_in(
+        &room,
+        airc_lib::HeartbeatWorkClaim {
+            card_id: card_uuid,
+            claim_id: claim_uuid,
+            ttl_ms,
+        },
+    )
     .await?;
     println!("claim_heartbeat: card_id={card_id} claim_id={claim_id} ttl_ms={ttl_ms}");
 
@@ -414,13 +450,15 @@ pub async fn run_heartbeat(
 /// idiom).
 pub async fn run_update(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     title: Option<String>,
     body: Option<String>,
     priority: Option<CliPriority>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let card_uuid = parse_work_card_id(&card_id)?;
     let airc = crate::commands::attached_airc(home).await?;
+    let room = room_or_current(&airc, room.as_deref(), "update a work card in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
 
     let mut request = UpdateWorkCard::amend(card_uuid);
     if let Some(title) = title {
@@ -433,7 +471,7 @@ pub async fn run_update(
         request = request.with_priority(priority.into());
     }
 
-    airc.update_work_card(request).await?;
+    airc.update_work_card_in(&room, request).await?;
     println!("card_updated: card_id={card_uuid}");
     Ok(())
 }
@@ -445,19 +483,13 @@ pub async fn run_state(
     state: CliCardState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
     let card_state = CardState::from(state);
 
     // Resolve ONCE, like `run_review` and `run_merge` (#1447): the close-gate board
     // read, the state change, the PR link and the review sibling all bind to THIS
     // room — even if another client moves this scope's default mid-command.
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "change work state in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "change work state in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
 
     // Card a1bc62b3 (substrate-target gate): refuse direct CLI writes
     // to states that should only come from substrate observers (e.g.
@@ -545,7 +577,8 @@ pub async fn run_state(
     // auto-spawn review card, board renderers) read one source of
     // truth.
     if card_state == CardState::Review {
-        if let Err(error) = crate::work_commands_gh::open_pr_and_link(&airc, &room, card_uuid).await
+        if let Err(error) =
+            crate::work_commands_gh::open_pr_and_link(&airc, home, &room, card_uuid).await
         {
             eprintln!("airc: gh pr create skipped — {error}");
         }
@@ -670,7 +703,7 @@ pub(crate) async fn mark_merged_and_reclaim(
 pub(crate) async fn cleanup_card_worktree(
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let short: String = card_id.to_string().chars().take(8).collect();
+    let short = card_id.shown();
     let lease_root = lease::lease_root()
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
     let parent = lease_root.join(&short);
@@ -713,7 +746,7 @@ pub(crate) async fn cleanup_card_worktree(
     }
 
     // Identify the worktree's branch so we can prune it after removal.
-    let branch_out = std::process::Command::new("git")
+    let branch_out = airc_core::process::background("git")
         .args(["-C", &worktree_str, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()?;
     let branch = if branch_out.status.success() {
@@ -724,7 +757,7 @@ pub(crate) async fn cleanup_card_worktree(
 
     // Resolve the main working tree's repo root so the `git worktree
     // remove` and branch-prune run from there.
-    let repo_root_out = std::process::Command::new("git")
+    let repo_root_out = airc_core::process::background("git")
         .args(["-C", &worktree_str, "rev-parse", "--git-common-dir"])
         .output()?;
     if !repo_root_out.status.success() {
@@ -741,7 +774,7 @@ pub(crate) async fn cleanup_card_worktree(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or(common_dir);
 
-    let remove_out = std::process::Command::new("git")
+    let remove_out = airc_core::process::background("git")
         .args([
             "-C",
             &repo_root,
@@ -765,7 +798,7 @@ pub(crate) async fn cleanup_card_worktree(
     // branch is gone (e.g. `gh pr merge --delete-branch` already
     // ran), this errors silently.
     if !branch.is_empty() && branch != "HEAD" {
-        let prune_out = std::process::Command::new("git")
+        let prune_out = airc_core::process::background("git")
             .args(["-C", &repo_root, "branch", "-d", &branch])
             .output()?;
         if prune_out.status.success() {
@@ -968,7 +1001,7 @@ pub async fn run_cleanup(
             .cards
             .iter()
             .find(|c| {
-                let card_short: String = c.card_id.to_string().chars().take(8).collect();
+                let card_short = c.card_id.shown();
                 card_short == short
             })
             .cloned();
@@ -1235,7 +1268,7 @@ fn probe_upstream_gone(path: &std::path::Path) -> bool {
     // Step 1: resolve the upstream tracking ref. No upstream = no
     // signal; return false and let the card-state classifier
     // handle it.
-    let upstream_out = match std::process::Command::new("git")
+    let upstream_out = match airc_core::process::background("git")
         .args(["-C", &path_str, "rev-parse", "--abbrev-ref", "@{u}"])
         .output()
     {
@@ -1260,7 +1293,7 @@ fn probe_upstream_gone(path: &std::path::Path) -> bool {
     // 0 when present, non-zero-non-2 on transport errors. We treat
     // "absent" as "gone" and anything else (present, transport
     // error) as "not gone" — keeping the safe default.
-    let ls_out = match std::process::Command::new("git")
+    let ls_out = match airc_core::process::background("git")
         .args([
             "-C",
             &path_str,
@@ -1380,7 +1413,7 @@ fn probe_dirty_status_at(path: &std::path::Path) -> DirtyStatus {
     let path_str = path.to_string_lossy().to_string();
 
     // Step 1: porcelain probe.
-    let porcelain_out = match std::process::Command::new("git")
+    let porcelain_out = match airc_core::process::background("git")
         .args(["-C", &path_str, "status", "--porcelain"])
         .output()
     {
@@ -1400,7 +1433,7 @@ fn probe_dirty_status_at(path: &std::path::Path) -> DirtyStatus {
     // Step 2: unpushed-commits probe. `git rev-list --count @{u}..HEAD`
     // counts commits reachable from HEAD but not from the upstream
     // tracking branch.
-    let unpushed_out = match std::process::Command::new("git")
+    let unpushed_out = match airc_core::process::background("git")
         .args(["-C", &path_str, "rev-list", "--count", "@{u}..HEAD"])
         .output()
     {
@@ -1505,7 +1538,7 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
         // local repo actually knows about. `rev-parse --verify` is
         // the cheap existence check — succeeds when the ref
         // resolves, fails (non-zero exit) when it doesn't.
-        let exists = std::process::Command::new("git")
+        let exists = airc_core::process::background("git")
             .args(["-C", path_str, "rev-parse", "--verify", candidate])
             .output()
             .map(|o| o.status.success())
@@ -1520,7 +1553,7 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
         // NOT present upstream (unique work). `- <sha>` = patch-id
         // IS present upstream (squash-merged or cherry-picked).
         // Empty output ⇒ HEAD equals upstream ⇒ trivially Clean.
-        let cherry_out = match std::process::Command::new("git")
+        let cherry_out = match airc_core::process::background("git")
             .args(["-C", path_str, "cherry", candidate])
             .output()
         {
@@ -1563,7 +1596,7 @@ fn is_clean_via_cherry_against_origin_head(path_str: &str) -> DirtyStatus {
             // range, cherry's verdict is incomplete — refuse to
             // delete rather than guess whether the merge brought in
             // unique resolution content.
-            let extra_merges = std::process::Command::new("git")
+            let extra_merges = airc_core::process::background("git")
                 .args([
                     "-C",
                     path_str,
@@ -1629,7 +1662,7 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
     // First find the repo's git-common-dir so `git worktree remove` runs
     // from the right place. Without `-C path`, git would refuse from the
     // worktree itself ("cannot remove main working tree").
-    let common_out = std::process::Command::new("git")
+    let common_out = airc_core::process::background("git")
         .args(["-C", &path_str, "rev-parse", "--git-common-dir"])
         .output()
         .map_err(|e| format!("spawn git rev-parse: {e}"))?;
@@ -1649,7 +1682,7 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| common_dir.clone());
-    let rm_out = std::process::Command::new("git")
+    let rm_out = airc_core::process::background("git")
         .args(["-C", &repo_root, "worktree", "remove", &path_str])
         .output()
         .map_err(|e| format!("spawn git worktree remove: {e}"))?;
@@ -1670,7 +1703,7 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
                 path.display()
             )
         })?;
-        let prune_out = std::process::Command::new("git")
+        let prune_out = airc_core::process::background("git")
             .args(["-C", &repo_root, "worktree", "prune"])
             .output()
             .map_err(|e| format!("spawn git worktree prune: {e}"))?;
@@ -1693,12 +1726,14 @@ fn git_worktree_remove(path: &std::path::Path) -> Result<(), String> {
 /// delegate.
 pub async fn run_link(
     home: &Path,
+    room: Option<String>,
     card_id: String,
     pr: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
-    crate::work_commands_gh::link_existing_pr(&airc, card_uuid, pr).await
+    let room = room_or_current(&airc, room.as_deref(), "link a pull request in").await?;
+    let card_uuid = card_in_room(&airc, &room, &card_id).await?;
+    crate::work_commands_gh::link_existing_pr(&airc, &room, card_uuid, pr).await
 }
 
 /// Card 09fddedd: `airc work relink <CARD_ID> --pr <number-or-url>` —
@@ -1711,9 +1746,228 @@ pub async fn run_relink(
     pr: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
+    let shown = Shown::<WorkCardId>::try_from(card_id.as_str())?;
+    let card_uuid = match shown.full() {
+        Some(id) => id,
+        None => card_on_board(
+            &airc
+                .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
+                .await?,
+            &shown,
+        )?,
+    };
     let pr_number = parse_pr_spec(&pr)?;
     crate::work_commands_gh::relink_card_pr(&airc, card_uuid, pr_number).await
+}
+
+/// `airc work submission-review <REVIEW_CARD> --outcome passed|failed --evidence-file F`:
+/// a peer review on a submission, filed under THIS scope's identity (an agent reviewing a
+/// citizen's work). The parent card and the claim come from the review card (it must be
+/// yours, claimed); the submission defaults to the parent's latest. airc-lib's
+/// `review_work_submission_in` had no verb, so no agent could file one from the CLI.
+/// `airc work submit`: publish a submission on a card the caller holds. continuum #4825's
+/// card went to Review with its PR linked, but no submission existed, so Kimi's verdict
+/// was refused ("no submission to review yet", 2026-10-06): the CLI had no way to publish
+/// one. airc-lib's `submit_work_in` validates the claim, the base and the instance.
+pub async fn run_submit(
+    home: &Path,
+    room: Option<String>,
+    card_id: String,
+    patch: std::path::PathBuf,
+    base: String,
+    instance: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes =
+        std::fs::read(&patch).map_err(|e| format!("patch file {}: {e}", patch.display()))?;
+    let base_sha = airc_work::GitObjectId::new(base.trim())
+        .map_err(|e| format!("--base `{base}`: {e} (give the FULL commit sha)"))?;
+    let airc = crate::commands::attached_airc(home).await?;
+    let shown = Shown::try_from(card_id.as_str())?;
+    let room = room_or_current(&airc, room.as_deref(), "submit work in").await?;
+    let board = airc.work_board_in(&room).await?;
+    let card_id = card_on_board(&board, &shown)?;
+    submit_patch(&airc, home, &room, card_id, &bytes, base_sha, instance).await
+}
+
+/// Publish `bytes` as a submission on `card_id`, under the caller as its holder: the
+/// one path behind `airc work submit` and the review transition's PR (BigMama,
+/// 2026-10-06: a PR opened with no submission left the reviewer's verdict nothing to
+/// attach to). Only the holder submits. The bytes are retained in the scope's blob store
+/// BEFORE their hash is published (BigMama on #1548): a reviewer, grader or lift reads a
+/// submission by hash, and the patch file can change after this call.
+pub(crate) async fn submit_patch(
+    airc: &airc_lib::Airc,
+    home: &Path,
+    room: &airc_lib::Room,
+    card_id: airc_lib::WorkCardId,
+    bytes: &[u8],
+    base_sha: airc_work::GitObjectId,
+    instance: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let board = airc.work_board_in(room).await?;
+    let card = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} is not on {}'s board", room.name))?;
+    let store = airc_blobs::FsStore::new(airc_lib::machine_account_home(home).join("blobs"))
+        .map_err(|e| format!("blob store: {e}"))?;
+    let claim_id = match (card.owner, card.claim_id) {
+        (Some(owner), Some(claim)) if owner == airc.peer_id() => claim,
+        (Some(owner), _) => {
+            return Err(format!(
+                "card {card_id} is held by {owner}, not by you: only its holder submits"
+            )
+            .into())
+        }
+        (None, _) => {
+            return Err(format!("card {card_id} is not claimed: `airc work claim` it first").into())
+        }
+    };
+    let artifact = retain_patch(&store, bytes)?;
+    let instance = instance.unwrap_or_else(|| card.repo.to_string());
+    let submission = airc
+        .submit_work_in(
+            room,
+            airc_lib::SubmitWork {
+                submission_id: airc_work::SubmissionId::new(),
+                card_id,
+                claim_id,
+                instance,
+                base_sha,
+                artifact,
+            },
+        )
+        .await?;
+    println!(
+        "submission: {} card={} size={} base={}",
+        submission.submission_id,
+        submission.card_id,
+        submission.artifact.size_bytes,
+        submission.base_sha
+    );
+    Ok(())
+}
+
+/// Retain a patch in `store` and return its artifact reference: the hash the store holds
+/// it under, its length, `text/x-patch`. An empty patch is refused: there is nothing to
+/// review. The same shape as continuum's `work/submit` (`retain_patch`).
+fn retain_patch(
+    store: &airc_blobs::FsStore,
+    bytes: &[u8],
+) -> Result<airc_work::SubmissionArtifact, String> {
+    use airc_blobs::ContentAddressedStore;
+    if bytes.is_empty() {
+        return Err("the patch file is empty: there is nothing to review".to_string());
+    }
+    let hash = store
+        .put(bytes)
+        .map_err(|e| format!("could not retain the patch: {e}"))?;
+    Ok(airc_work::SubmissionArtifact {
+        hash,
+        size_bytes: bytes.len() as u64,
+        mime: Some("text/x-patch".to_string()),
+    })
+}
+
+pub async fn run_submission_review(
+    home: &Path,
+    room: Option<String>,
+    review_card_id: String,
+    outcome: String,
+    evidence_file: std::path::PathBuf,
+    submission: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let outcome = parse_review_outcome(&outcome)?;
+    let evidence_text = std::fs::read_to_string(&evidence_file)
+        .map_err(|e| format!("evidence file {}: {e}", evidence_file.display()))?;
+    let evidence = evidence_artifact(&evidence_text)?;
+    let submission = submission.as_deref().map(Uuid::parse_str).transpose()?;
+    let airc = crate::commands::attached_airc(home).await?;
+    let review_shown = Shown::try_from(review_card_id.as_str())?;
+    let room = room_or_current(&airc, room.as_deref(), "review a submission in").await?;
+    let board = airc.work_board_in(&room).await?;
+    let review_card = card_on_board(&board, &review_shown)?;
+    let held = board
+        .card(review_card)
+        .ok_or_else(|| format!("review card {review_card} is not on {}'s board", room.name))?;
+    let card_id = held
+        .reviews
+        .ok_or_else(|| format!("card {review_card} is not a review card (it reviews nothing)"))?;
+    let review_claim_id = match (held.owner, held.claim_id) {
+        (Some(owner), Some(claim)) if owner == airc.peer_id() => claim,
+        (Some(owner), _) => {
+            return Err(format!(
+                "review card {review_card} is held by {owner}, not by you: only its holder reviews"
+            )
+            .into())
+        }
+        (None, _) => {
+            return Err(format!(
+                "review card {review_card} is not claimed: `airc work claim` it first"
+            )
+            .into())
+        }
+    };
+    let parent = board
+        .card(card_id)
+        .ok_or_else(|| format!("card {card_id} is not on {}'s board", room.name))?;
+    let chosen = match submission {
+        Some(id) => parent
+            .submissions
+            .iter()
+            .find(|s| s.submission_id.as_uuid() == id)
+            .ok_or_else(|| format!("card {card_id} has no submission {id}"))?,
+        None => parent
+            .submissions
+            .iter()
+            .max_by_key(|s| s.submitted_at_ms)
+            .ok_or_else(|| format!("card {card_id} has no submission to review yet"))?,
+    };
+    let review = airc
+        .review_work_submission_in(
+            &room,
+            airc_lib::ReviewWorkSubmission {
+                review_id: airc_work::WorkReviewId::from_uuid(Uuid::new_v4()),
+                card_id,
+                submission_id: chosen.submission_id,
+                artifact: chosen.artifact.clone(),
+                review_card_id: review_card,
+                review_claim_id,
+                outcome,
+                evidence,
+            },
+        )
+        .await?;
+    println!(
+        "review: {} card={} submission={} outcome={:?}",
+        review.review_id, review.card_id, review.submission_id, review.outcome
+    );
+    Ok(())
+}
+
+/// PURE: the verdict word, by name. Unknown is not a verdict a reviewer files.
+fn parse_review_outcome(word: &str) -> Result<airc_work::WorkReviewOutcome, String> {
+    match word.trim() {
+        "passed" => Ok(airc_work::WorkReviewOutcome::Passed),
+        "failed" => Ok(airc_work::WorkReviewOutcome::Failed),
+        other => Err(format!(
+            "--outcome must be `passed` or `failed`, got `{other}`"
+        )),
+    }
+}
+
+/// PURE: the evidence reference for what the reviewer wrote: SHA-256 over its bytes, its
+/// length, `text/plain`. Empty evidence is refused: a verdict without evidence is not one.
+fn evidence_artifact(text: &str) -> Result<airc_work::SubmissionArtifact, String> {
+    if text.trim().is_empty() {
+        return Err(
+            "the evidence file is empty: a verdict without evidence is not a verdict".to_string(),
+        );
+    }
+    Ok(airc_work::SubmissionArtifact {
+        hash: airc_blobs::ContentHash::from_bytes(text.as_bytes()),
+        size_bytes: text.len() as u64,
+        mime: Some("text/plain".to_string()),
+    })
 }
 
 /// Parse a `--pr` argument that is either a bare PR number (`1137`) or
@@ -1767,16 +2021,11 @@ pub async fn run_merge(
     use airc_work::model::CardState;
 
     let airc = crate::commands::attached_airc(home).await?;
-    let card_uuid = parse_work_card_id(&card_id)?;
+    let card_shown = Shown::try_from(card_id.as_str())?;
 
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "merge work in")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "merge work in").await?;
     let board = airc.work_board_in(&room).await?;
+    let card_uuid = card_on_board(&board, &card_shown)?;
     let card = board
         .card(card_uuid)
         .ok_or_else(|| format!("card {card_uuid} not visible in room {}", room.name))?;
@@ -1784,10 +2033,9 @@ pub async fn run_merge(
     if card.state != CardState::Review {
         return Err(format!(
             "refusing to merge card {card_uuid}: state is {actual:?}, but `airc work merge` \
-             requires Review (the card has been finished + PR opened + announced).\n\n\
-             Next step: `airc work state {card_uuid} review` to open + link the PR, then \
-             `airc work merge {card_uuid}` once CI is green.",
+             requires Review (the card has been finished + PR opened + announced).\n\n{next}",
             actual = card.state,
+            next = merge_refusal_next_step(card),
         )
         .into());
     }
@@ -1920,15 +2168,6 @@ pub(crate) fn close_transition_allowed_from_card(card: &WorkCard) -> bool {
     }
 }
 
-/// First 8 chars of a UUID-style id — enough to disambiguate at the
-/// board's typical scale, much easier on the eye than 36-char UUIDs.
-/// We deliberately do NOT shorten card_id in the board output because
-/// callers copy-paste it into `claim` / `state` / `close`; it's the
-/// API key, not a display field.
-fn short_id<T: std::fmt::Display>(id: T) -> String {
-    id.to_string().chars().take(8).collect()
-}
-
 /// Render a peer-id for the board: 'me' for self, the published alias
 /// when known (kink 6f111211 / card c397567a — looked up via
 /// Airc::peer_alias and pre-fetched into the map by run_board), else
@@ -1945,7 +2184,7 @@ fn format_peer(
     } else if let Some(alias) = aliases.get(&peer) {
         alias.clone()
     } else {
-        short_id(peer)
+        peer.shown()
     }
 }
 
@@ -2038,13 +2277,7 @@ pub async fn run_board(
     filter: BoardFilter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let room = match room {
-        Some(ref requested) => {
-            airc.room_by_name_or_channel(requested, "read the work board of")
-                .await?
-        }
-        None => airc.current_room().await?,
-    };
+    let room = room_or_current(&airc, room.as_deref(), "read the work board of").await?;
     // Continuum #154: the board is always the COMPLETE projection —
     // the old recent-window read lost every durable card to chat
     // traffic in busy rooms. `limit` now caps displayed rows only.
@@ -2223,6 +2456,33 @@ pub async fn run_availability(
     Ok(())
 }
 
+/// Which rows a capped board shows, as indices into `states` in their original order, by
+/// tier: HELD cards first (claimed, in progress, blocked, in review: someone's live work),
+/// then OPEN ones, then the newest finished (Merged, Closed) to fill; newest first within a
+/// tier when it alone exceeds what is left. A board that hides live work is wrong in the way
+/// that matters; one that hides old closed cards is only short (card 3e2b7f45; Fable on #1547:
+/// held before open, so the oldest claim is the last to go).
+fn rows_to_keep(states: &[airc_work::CardState], cap: usize) -> Vec<usize> {
+    use airc_work::CardState::{Closed, Merged, Open};
+    let tier = |s: &airc_work::CardState| match s {
+        Merged | Closed => 2,
+        Open => 1,
+        _ => 0,
+    };
+    let mut keep: Vec<usize> = Vec::with_capacity(cap.min(states.len()));
+    for t in 0..3 {
+        let room = cap.saturating_sub(keep.len());
+        keep.extend(
+            (0..states.len())
+                .rev()
+                .filter(|&i| tier(&states[i]) == t)
+                .take(room),
+        );
+    }
+    keep.sort_unstable();
+    keep
+}
+
 fn print_board(
     board: &WorkBoardProjection,
     me: airc_lib::PeerId,
@@ -2244,19 +2504,36 @@ fn print_board(
         .filter(|card| filter.matches(card, me, now))
         .collect();
     // Continuum #154: `limit` caps displayed ROWS of the complete
-    // projection (newest kept), never the event window the board is
-    // built from — truncation is announced, never silent.
+    // projection, never the event window the board is built from, and
+    // truncation is announced, never silent. The cap drops finished history
+    // first: newest-only kept a closed card from today and dropped Kimi's live
+    // claim from yesterday (BigMama, 2026-10-06, card 3e2b7f45).
     let matched = visible.len();
+    let live = |card: &&airc_work::WorkCard| {
+        !matches!(
+            card.state,
+            airc_work::CardState::Merged | airc_work::CardState::Closed
+        )
+    };
+    let live_matched = visible.iter().filter(|card| live(card)).count();
     if matched > limit.max(1) {
-        visible = visible.split_off(matched - limit.max(1));
+        let states: Vec<airc_work::CardState> = visible.iter().map(|card| card.state).collect();
+        let keep = rows_to_keep(&states, limit.max(1));
+        visible = keep.into_iter().map(|i| visible[i]).collect();
     }
+    let live_hidden = live_matched - visible.iter().filter(|card| live(card)).count();
     if !visible.is_empty() {
         if matches!(filter, BoardFilter::All) {
             if visible.len() < matched {
                 println!(
-                    "work cards: showing {} of {} (raise --limit for the rest)",
+                    "work cards: showing {} of {}, live cards first{} (raise --limit for the rest)",
                     visible.len(),
                     matched,
+                    if live_hidden > 0 {
+                        format!("; {live_hidden} LIVE not shown")
+                    } else {
+                        String::new()
+                    },
                 );
             } else {
                 println!("work cards: {}", visible.len());
@@ -2280,7 +2557,7 @@ fn print_board(
             .unwrap_or_else(|| "-".to_string());
         let claim = card
             .claim_id
-            .map(short_id)
+            .map(ClaimId::shown)
             .unwrap_or_else(|| "-".to_string());
         let lease = format_lease(card.claim_expires_at_ms, now);
         println!(
@@ -2314,7 +2591,7 @@ fn print_board(
                 "{card_id}  owner={owner}  claim={claim_id}  expired_at_ms={expired_at_ms}",
                 card_id = claim.card_id,
                 owner = format_peer(claim.owner, me, aliases),
-                claim_id = short_id(claim.claim_id),
+                claim_id = claim.claim_id.shown(),
                 expired_at_ms = claim.expired_at_ms,
             );
         }
@@ -2503,16 +2780,69 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
-    let uuid = Uuid::parse_str(input)
-        .map_err(|error| format!("work card id {input:?} is not a valid UUID: {error}"))?;
-    Ok(WorkCardId::from_uuid(uuid))
+/// What a caller does next when `airc work merge` refuses a card that is not in
+/// Review. A settled card has nothing left to merge; only an unfinished one is
+/// told to open its PR (card b1633915: a Merged card was told to `state review`).
+fn merge_refusal_next_step(card: &WorkCard) -> String {
+    let id = card.card_id;
+    let pr = card
+        .pull_request
+        .as_ref()
+        .map(|pr| format!(" (PR #{})", pr.number))
+        .unwrap_or_default();
+    match card.state {
+        CardState::Merged => format!("Nothing to do: card {id} is already merged{pr}."),
+        CardState::Closed => format!(
+            "Nothing to merge: card {id} is closed{pr}. Reopen it with \
+             `airc work state {id} open` if the work is live again."
+        ),
+        CardState::Open | CardState::Claimed | CardState::InProgress | CardState::Blocked => {
+            format!(
+                "Next step: `airc work state {id} review` to open + link the PR, then \
+                 `airc work merge {id}` once CI is green."
+            )
+        }
+        CardState::Review => format!("Card {id} is in Review; run `airc work merge {id}`."),
+    }
 }
 
-fn parse_claim_id(input: &str) -> Result<ClaimId, Box<dyn std::error::Error>> {
-    let uuid = Uuid::parse_str(input)
-        .map_err(|error| format!("claim id {input:?} is not a valid UUID: {error}"))?;
-    Ok(ClaimId::from_uuid(uuid))
+/// A card id as the caller typed it: the full id, or the short form the board
+/// shows, resolved against this board's cards (refused with the candidates when
+/// it names none or several). One rule for every work verb: `airc_core::shown_id`.
+fn card_on_board(
+    board: &WorkBoardProjection,
+    shown: &Shown<WorkCardId>,
+) -> Result<WorkCardId, ShownIdError> {
+    shown.resolve(board.card_ids())
+}
+
+/// [`card_on_board`] against `room`'s board, read only when the id is short.
+pub(crate) async fn card_in_room(
+    airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
+    raw: &str,
+) -> Result<WorkCardId, Box<dyn std::error::Error>> {
+    let shown = Shown::<WorkCardId>::try_from(raw)?;
+    if let Some(id) = shown.full() {
+        return Ok(id);
+    }
+    Ok(card_on_board(&airc.work_board_in(room).await?, &shown)?)
+}
+
+/// A claim id as the caller typed it, resolved against the card's live claim
+/// (the board shows it short: `claim=136f8174`).
+pub(crate) async fn claim_in_room(
+    airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
+    card_id: WorkCardId,
+    raw: &str,
+) -> Result<ClaimId, Box<dyn std::error::Error>> {
+    let shown = Shown::<ClaimId>::try_from(raw)?;
+    if let Some(id) = shown.full() {
+        return Ok(id);
+    }
+    let board = airc.work_board_in(room).await?;
+    Ok(shown.resolve(board.card(card_id).and_then(|card| card.claim_id))?)
 }
 
 fn parse_optional_lane_id(
@@ -2564,6 +2894,92 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
+    // what this catches (card 9c3ab08d; BigMama on #1548): a submission naming a hash that
+    // nothing holds, or an empty patch accepted as reviewable. The patch is retained first,
+    // the published hash reads its exact bytes back, and empty is refused.
+    #[test]
+    fn a_submitted_patch_is_retained_and_reads_back_by_its_hash() {
+        use airc_blobs::ContentAddressedStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = airc_blobs::FsStore::new(dir.path()).expect("store");
+        let patch = b"diff --git a/x b/x\n+one\n";
+        let artifact = super::retain_patch(&store, patch).expect("a patch");
+        assert_eq!(artifact.size_bytes, patch.len() as u64);
+        assert_eq!(artifact.mime.as_deref(), Some("text/x-patch"));
+        assert_eq!(
+            store.get(&artifact.hash).expect("held by its hash"),
+            patch.to_vec()
+        );
+        assert!(
+            super::retain_patch(&store, b"").is_err(),
+            "nothing to review"
+        );
+    }
+
+    // what this catches (card 3e2b7f45): a capped board that drops a LIVE card to keep newer
+    // finished ones (Kimi's claimed review card hidden at the default --limit 128 while
+    // closed cards showed). Live rows are kept first, in the board's order; finished history
+    // fills what is left; live rows beyond the cap keep the newest.
+    #[test]
+    fn a_capped_board_keeps_live_cards_before_finished_history() {
+        use airc_work::CardState::{Claimed, Closed, InProgress, Merged, Open, Review};
+        let states = [Claimed, Closed, Merged, Open, Closed, Review];
+        assert_eq!(
+            rows_to_keep(&states, 3),
+            vec![0, 3, 5],
+            "live first, original order"
+        );
+        assert_eq!(
+            rows_to_keep(&states, 4),
+            vec![0, 3, 4, 5],
+            "then the newest finished"
+        );
+        assert_eq!(
+            rows_to_keep(&[Open, InProgress, Claimed], 2),
+            vec![1, 2],
+            "newest live"
+        );
+        assert_eq!(rows_to_keep(&states, 2), vec![0, 5], "held before open");
+        assert_eq!(
+            rows_to_keep(&[Claimed, Open, Open, Open], 2),
+            vec![0, 3],
+            "the oldest claim outlasts newer open cards (Fable on #1547)"
+        );
+        assert_eq!(
+            rows_to_keep(&states, 6),
+            vec![0, 1, 2, 3, 4, 5],
+            "no cap, nothing dropped"
+        );
+    }
+
+    // what this catches: a submission review filed with a verdict word nobody meant
+    // ("pass", "ok", "unknown"), or with no evidence; and evidence whose reference does
+    // not name the exact bytes the reviewer wrote.
+    #[test]
+    fn a_submission_review_names_its_verdict_and_carries_real_evidence() {
+        assert!(matches!(
+            parse_review_outcome("passed"),
+            Ok(airc_work::WorkReviewOutcome::Passed)
+        ));
+        assert!(matches!(
+            parse_review_outcome("failed"),
+            Ok(airc_work::WorkReviewOutcome::Failed)
+        ));
+        assert!(parse_review_outcome("pass").is_err());
+        assert!(parse_review_outcome("unknown").is_err());
+        assert!(
+            evidence_artifact("  \n").is_err(),
+            "no evidence, no verdict"
+        );
+        let text = "read PR #2 end to end; npm test 12/12";
+        let evidence = evidence_artifact(text).expect("evidence");
+        assert_eq!(
+            evidence.hash,
+            airc_blobs::ContentHash::from_bytes(text.as_bytes())
+        );
+        assert_eq!(evidence.size_bytes, text.len() as u64);
+    }
+
     use super::*;
 
     // Card 09fddedd — `--pr <number-or-url>` parser for `airc work
@@ -2637,12 +3053,6 @@ mod tests {
         );
         // Sub-minute pads seconds with leading zero.
         assert_eq!(format_lease(Some(1_000 + 5_000), 1_000), "0m05s");
-    }
-
-    #[test]
-    fn short_id_truncates_to_8_chars() {
-        assert_eq!(short_id("cdff6a9d-e995-4b4a-a119-10bc1faf1747"), "cdff6a9d");
-        assert_eq!(short_id("short"), "short");
     }
 
     // Card c9b28925 — `airc work cleanup` classifier tests. Pure
@@ -2807,7 +3217,7 @@ mod tests {
         let clone = tmp.path().join("clone");
 
         let run = |args: &[&str], cwd: Option<&std::path::Path>| {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = airc_core::process::background("git");
             cmd.args(args);
             if let Some(d) = cwd {
                 cmd.current_dir(d);
@@ -2851,7 +3261,7 @@ mod tests {
                 None,
             );
             // Detect default branch (master vs main depending on git config)
-            let branch_out = std::process::Command::new("git")
+            let branch_out = airc_core::process::background("git")
                 .args([
                     "-C",
                     clone.to_str().unwrap(),
@@ -2915,7 +3325,7 @@ mod tests {
         // Make a clean commit but DON'T push it.
         std::fs::write(clone.join("local-only"), "committed but not pushed\n").expect("write");
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .args(args)
                 .current_dir(&clone)
                 .output()
@@ -2951,7 +3361,7 @@ mod tests {
         // Switch to a fresh branch that has no upstream configured
         // but starts from origin/HEAD — no unique content.
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .args(args)
                 .current_dir(&clone)
                 .output()
@@ -2983,7 +3393,7 @@ mod tests {
         let (clone, _tmp) = git_fixture_with_upstream(true);
 
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .args(args)
                 .current_dir(&clone)
                 .output()
@@ -3044,7 +3454,7 @@ mod tests {
         let nested = parent.join("src");
 
         // Init the nested path as a git worktree.
-        let init_out = std::process::Command::new("git")
+        let init_out = airc_core::process::background("git")
             .args(["init", nested.to_str().unwrap()])
             .output()
             .expect("git init");
@@ -3126,7 +3536,7 @@ mod tests {
         // Delete the upstream branch on origin — the universal "PR
         // merged / branch abandoned" signal probe_upstream_gone keys
         // off of.
-        let branch_out = std::process::Command::new("git")
+        let branch_out = airc_core::process::background("git")
             .args([
                 "-C",
                 nested.to_str().unwrap(),
@@ -3141,7 +3551,7 @@ mod tests {
             .trim()
             .to_string();
         let origin = real_tmp.path().join("origin.git");
-        let del = std::process::Command::new("git")
+        let del = airc_core::process::background("git")
             .args([
                 "-C",
                 origin.to_str().unwrap(),
@@ -3225,7 +3635,7 @@ mod tests {
         let other = tmp.path().join("other_clone");
 
         let run = |args: &[&str], cwd: Option<&std::path::Path>| {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = airc_core::process::background("git");
             cmd.args(args);
             if let Some(d) = cwd {
                 cmd.current_dir(d);
@@ -3242,7 +3652,7 @@ mod tests {
 
         // Detect default branch — fixture might be `main` or `master`
         // depending on the test host's git config.
-        let branch_out = std::process::Command::new("git")
+        let branch_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -3258,7 +3668,7 @@ mod tests {
         run(&["-C", &clone_str, "add", "feat.txt"], None);
         run(&["-C", &clone_str, "commit", "-m", "pr: add feat"], None);
         run(&["-C", &clone_str, "push", "-u", "origin", "pr-feat"], None);
-        let feat_sha_out = std::process::Command::new("git")
+        let feat_sha_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -3331,7 +3741,7 @@ mod tests {
         let other = tmp.path().join("other_clone");
 
         let run = |args: &[&str], cwd: Option<&std::path::Path>| {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = airc_core::process::background("git");
             cmd.args(args);
             if let Some(d) = cwd {
                 cmd.current_dir(d);
@@ -3345,7 +3755,7 @@ mod tests {
         };
         let clone_str = clone.to_str().unwrap().to_string();
         let other_str = other.to_str().unwrap().to_string();
-        let branch_out = std::process::Command::new("git")
+        let branch_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -3360,7 +3770,7 @@ mod tests {
         run(&["-C", &clone_str, "add", "feat.txt"], None);
         run(&["-C", &clone_str, "commit", "-m", "pr: add feat"], None);
         run(&["-C", &clone_str, "push", "-u", "origin", "pr-feat"], None);
-        let feat_sha_out = std::process::Command::new("git")
+        let feat_sha_out = airc_core::process::background("git")
             .args(["-C", &clone_str, "rev-parse", "HEAD"])
             .output()
             .expect("rev-parse");
@@ -3960,6 +4370,23 @@ mod tests {
     /// (d1b2798d's `spawn_claim_worktree`); if those two ever
     /// disagree, cleanup silently does the wrong thing — either
     /// missing the target or removing an unrelated dir.
+    // regression for card b1633915: merging an already-merged card told the
+    // caller to `state review` and open a PR.
+    // what this catches: a settled card is never sent back to open a PR.
+    #[test]
+    fn a_merge_refusal_names_the_right_next_step_for_the_state() {
+        let mut card = make_card(CardState::Merged, None, None, None);
+        let merged = merge_refusal_next_step(&card);
+        assert!(
+            merged.contains("already merged") && !merged.contains("state"),
+            "{merged}"
+        );
+        card.state = CardState::InProgress;
+        assert!(merge_refusal_next_step(&card).contains("review"));
+        card.state = CardState::Closed;
+        assert!(merge_refusal_next_step(&card).contains("closed"));
+    }
+
     #[test]
     fn cleanup_path_matches_spawn_convention() {
         let card_id = airc_lib::WorkCardId::new();
@@ -3974,10 +4401,10 @@ mod tests {
         // We can't easily mock lease_root in this binary-only test
         // module, but we CAN pin the substrate-level promise that
         // the short id matches what spawn_claim_worktree builds.
-        // (`short_id` lives in this file's helpers and already has its
-        // own test pinning the 8-char take. This test is the
-        // architectural cross-reference.)
-        assert_eq!(short_id(card_id.to_string()), expected_short);
+        // The board renders with `shown()`; the worktree directory must
+        // be the same string or an operator can't find it by eye.
+        assert_eq!(card_id.shown(), expected_short);
+        assert_eq!(airc_lib::work_worktree::short_id(card_id), expected_short);
     }
 
     // ---------------------------------------------------------------------
@@ -4021,10 +4448,11 @@ mod tests {
     /// 2026-09-21: two peers had reviewed a citizen's submission and the board showed
     /// zero, because the verdict never reached the card.
     ///
-    /// EXACTLY ONE un-scoped `.create_work_card(` is legitimate: `run_create`, where
-    /// "make a card in the room I am standing in" IS the intent. Every other creation
-    /// carries a resolved room. A maintainer who adds a second drops this to >1 and
-    /// breaks the test until they either pass a room or justify the exception here.
+    /// ZERO un-scoped `.create_work_card(` calls remain. `run_create` was the one
+    /// exception ("make a card in the room I am standing in"); since card 5f1d0f95 it
+    /// resolves that room too (the current room, or `--room`) and calls
+    /// `create_work_card_in`, so every creation names its board. A maintainer who adds
+    /// an un-scoped call breaks this test until they pass a resolved room.
     #[test]
     fn a_review_sibling_is_never_created_into_an_unresolved_room() {
         fn production_only(src: &str) -> &str {
@@ -4042,10 +4470,10 @@ mod tests {
                 .count();
 
         assert_eq!(
-            total, 1,
+            total, 0,
             "Found {total} un-scoped `.create_work_card(` calls in production across \
-             work_commands.rs + work_commands_gh.rs. Exactly one is allowed — \
-             `run_create`, where the current room is the intent.\n\n\
+             work_commands.rs + work_commands_gh.rs. None is allowed: even `run_create` \
+             resolves its room (current or `--room`) first.\n\n\
              If you added a card-creation path: resolve the room ONCE in the command \
              and call `create_work_card_in(&room, request)`, the way `run_review` and \
              `auto_spawn_review_card` do. A sibling minted into a room its parent is \
@@ -4157,7 +4585,7 @@ mod tests {
         // semantic.
         let cwd = std::env::current_dir().expect("cwd available");
         // Find the actual workspace root via git
-        let output = std::process::Command::new("git")
+        let output = airc_core::process::background("git")
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(&cwd)
             .output();
@@ -4183,7 +4611,7 @@ mod tests {
         // project root — gate must refuse `--no-lease-required`
         // claims from random sub-paths.
         let cwd = std::env::current_dir().expect("cwd available");
-        let output = std::process::Command::new("git")
+        let output = airc_core::process::background("git")
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(&cwd)
             .output();

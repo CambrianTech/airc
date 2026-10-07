@@ -13,6 +13,7 @@ name = "airc"
 path = "src/main.rs"
 
 [dependencies]
+airc-bus = { path = "../airc-bus" }
 airc-core = { path = "../airc-core" }
 airc-diagnostics = { path = "../airc-diagnostics" }
 airc-identity = { path = "../airc-identity" }
@@ -25,6 +26,7 @@ airc-daemon = { path = "../airc-daemon" }
 airc-store = { path = "../airc-store" }
 airc-lib = { path = "../airc-lib" }
 airc-work = { path = "../airc-work" }
+airc-blobs = { path = "../airc-blobs" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }

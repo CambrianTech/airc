@@ -31,6 +31,7 @@ pub struct DaemonTempDir {
     // daemons are reaped while their home still exists, then TempDir
     // deletes the tree.
     dir: tempfile::TempDir,
+    preserve_on_panic: bool,
 }
 
 /// The ONLY way tests get a home-bearing tempdir — returns the guarded
@@ -50,10 +51,17 @@ pub fn daemon_tempdir() -> DaemonTempDir {
     std::env::set_var("AIRC_NO_STALENESS", "1");
     DaemonTempDir {
         dir: tempfile::TempDir::new().expect("create guarded tempdir"),
+        preserve_on_panic: false,
     }
 }
 
 impl DaemonTempDir {
+    /// Opt-in failure evidence; daemon teardown still runs before preserving files.
+    pub fn preserve_on_panic(mut self) -> Self {
+        self.preserve_on_panic = true;
+        self
+    }
+
     pub fn path(&self) -> &Path {
         self.dir.path()
     }
@@ -62,6 +70,14 @@ impl DaemonTempDir {
 impl Drop for DaemonTempDir {
     fn drop(&mut self) {
         reap_daemons_under(self.dir.path());
+        if self.preserve_on_panic && std::thread::panicking() {
+            self.dir.disable_cleanup(true);
+            eprintln!(
+                "preserved failed fixture artifacts at {} (test pid {})",
+                self.dir.path().display(),
+                std::process::id()
+            );
+        }
     }
 }
 
@@ -201,9 +217,12 @@ fn reap_pid(pid: u32) {
 
 #[cfg(windows)]
 fn reap_pid(pid: u32) {
+    use std::os::windows::process::CommandExt;
+
     // Best-effort forced kill; `taskkill` is present on every
     // supported Windows. /T takes the daemon's children with it.
     let _ = std::process::Command::new("taskkill")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output();
 }
@@ -239,7 +258,10 @@ pub fn pid_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub fn pid_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+
     std::process::Command::new("tasklist")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))

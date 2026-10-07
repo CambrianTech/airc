@@ -35,10 +35,9 @@ use airc_work::WorkCardId;
 /// against this same constant rather than spelling the path again.
 pub const LEASE_ZONE_RELATIVE: &str = ".airc/worktrees";
 
-/// How many hex chars of the card id name the worktree directory. Matches the
-/// short id used in board output, so an operator reading the board can find
-/// the directory by eye.
-pub const SHORT_ID_LEN: usize = 8;
+/// How many hex chars of the card id name the worktree directory: the shown
+/// width, so an operator reading the board can find the directory by eye.
+pub use airc_core::shown_id::SHORT_ID_LEN;
 
 /// Git keeps refs/worktree/* private to each linked worktree. This immutable
 /// creation anchor survives branch movement and keeps its commit reachable.
@@ -53,7 +52,7 @@ pub fn creation_base(worktree: &Path) -> Result<String, String> {
 }
 
 fn resolve_commit(repo: &Path, revision: &str) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .current_dir(repo)
         .args([
             "rev-parse",
@@ -81,7 +80,7 @@ pub fn worktree_root() -> Option<PathBuf> {
 
 /// The directory name for a card: the first [`SHORT_ID_LEN`] chars of its id.
 pub fn short_id(card_id: WorkCardId) -> String {
-    card_id.to_string().chars().take(SHORT_ID_LEN).collect()
+    card_id.shown()
 }
 
 /// Where this card's worktree lives — a pure function of the card id, so a
@@ -143,7 +142,7 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
     // Resolve once before creation and give Git the immutable object, so a branch
     // moving concurrently cannot make the recorded base differ from the new tree.
     let base = resolve_commit(spec.clone_path, spec.start_point.unwrap_or("HEAD"))?;
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = airc_core::process::background("git");
     cmd.current_dir(spec.clone_path)
         .args(["worktree", "add", "-b", spec.branch])
         .arg(path.as_os_str())
@@ -160,7 +159,7 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
     }
     // Empty old-value means create-only: never overwrite an existing anchor.
     // Record before submodule initialization, whose failure leaves the tree reusable.
-    let recorded = std::process::Command::new("git")
+    let recorded = airc_core::process::background("git")
         .current_dir(&path)
         .args(["update-ref", CREATION_BASE_REF, &base, ""])
         .output()
@@ -202,7 +201,7 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
 /// A repo with no submodules is unaffected — the command is a successful no-op — so
 /// this is safe for every scope, not only continuum.
 fn init_submodules(worktree: &std::path::Path) -> Result<(), String> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .current_dir(worktree)
         .args(["submodule", "update", "--init", "--recursive"])
         .output()
@@ -293,7 +292,7 @@ mod tests {
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = airc_core::process::background("git")
             .current_dir(dir)
             .args(args)
             .output()

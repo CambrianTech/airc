@@ -139,7 +139,7 @@ fn check_channel_freshness(source_dir: &Path) -> Finding {
 /// Last-fetched tip of `origin/<channel>`, or `None` when this checkout has no
 /// such ref. No fetch — see [`check_channel_freshness`].
 fn channel_tip(source_dir: &Path, channel: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = airc_core::process::background("git")
         .arg("-C")
         .arg(source_dir)
         .args(["rev-parse", &format!("refs/remotes/origin/{channel}")])
@@ -157,7 +157,7 @@ fn source_tree_head() -> Option<(std::path::PathBuf, String)> {
     // install.sh, but we resolve it the same way `update_commands`
     // does so the two stay aligned.
     let source = crate::update_commands::install_source_dir().ok()?;
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .arg("-C")
         .arg(&source)
         .args(["rev-parse", "HEAD"])
@@ -299,7 +299,7 @@ fn source_ancestry(source_dir: &Path, binary: &str, source_head: &str) -> Ancest
 }
 
 fn commit_exists(source_dir: &Path, sha: &str) -> bool {
-    std::process::Command::new("git")
+    airc_core::process::background("git")
         .arg("-C")
         .arg(source_dir)
         .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
@@ -311,7 +311,7 @@ fn commit_exists(source_dir: &Path, sha: &str) -> bool {
 /// `Some(true)` if `ancestor` reaches `descendant`, `Some(false)` if it
 /// provably doesn't, `None` if git couldn't answer.
 fn is_ancestor(source_dir: &Path, ancestor: &str, descendant: &str) -> Option<bool> {
-    let output = std::process::Command::new("git")
+    let output = airc_core::process::background("git")
         .arg("-C")
         .arg(source_dir)
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
@@ -412,7 +412,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = airc_core::process::background("git")
                 .arg("-C")
                 .arg(root)
                 .args([

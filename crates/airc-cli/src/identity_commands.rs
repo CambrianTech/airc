@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use airc_core::identity::Identity;
 use airc_identity::LocalIdentity;
@@ -248,7 +247,9 @@ pub async fn run_push_continuum(home: &Path, handle: &str) -> Result<(), Box<dyn
             args.push(value);
         }
     }
-    let output = Command::new("continuum").args(&args).output()?;
+    let output = airc_core::process::background("continuum")
+        .args(&args)
+        .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);

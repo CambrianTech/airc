@@ -15,12 +15,23 @@ pub enum AgentRuntimeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeContext {
     InteractiveTerminal,
+    Supervisor,
     Agent {
         kind: AgentRuntimeKind,
         client_id: Option<String>,
     },
     Automation,
     TestHarness,
+}
+
+/// Startup intent is independent of whether this invocation streams. In
+/// particular NO_ATTACH must not turn a supervised recovery into operator consent.
+pub(crate) fn join_resumes_daemon(ensure_only: bool) -> bool {
+    join_resumes_with(ensure_only, |key| std::env::var_os(key).is_some())
+}
+
+fn join_resumes_with(ensure_only: bool, is_set: impl Fn(&str) -> bool) -> bool {
+    !ensure_only && !is_set("AIRC_SUPERVISOR") && !is_set("AIRC_CODEX_START_CHILD")
 }
 
 impl RuntimeContext {
@@ -41,12 +52,16 @@ impl RuntimeContext {
     }
 
     pub fn should_stream_join(&self) -> bool {
-        matches!(self, Self::InteractiveTerminal | Self::Agent { .. })
+        matches!(
+            self,
+            Self::InteractiveTerminal | Self::Supervisor | Self::Agent { .. }
+        )
     }
 
     pub fn runtime_label(&self) -> &'static str {
         match self {
             Self::InteractiveTerminal => "interactive",
+            Self::Supervisor => "supervisor",
             Self::Agent { kind, .. } => kind.label(),
             Self::Automation => "automation",
             Self::TestHarness => "test",
@@ -56,7 +71,9 @@ impl RuntimeContext {
     pub fn client_id(&self) -> Option<&str> {
         match self {
             Self::Agent { client_id, .. } => client_id.as_deref(),
-            Self::InteractiveTerminal | Self::Automation | Self::TestHarness => None,
+            Self::InteractiveTerminal | Self::Supervisor | Self::Automation | Self::TestHarness => {
+                None
+            }
         }
     }
 }
@@ -79,11 +96,13 @@ where
 {
     let mut saw_opt_out = false;
     let mut saw_cargo_context = false;
+    let mut saw_supervisor = false;
     let mut agent_marker = None;
 
     for (key, _value) in env {
         match key.as_ref() {
             "AIRC_NO_ATTACH" => saw_opt_out = true,
+            "AIRC_SUPERVISOR" => saw_supervisor = true,
             "CARGO_PKG_NAME" => saw_cargo_context = true,
             "CLAUDECODE" | "CLAUDE_CODE_SESSION_ID" => {
                 agent_marker.get_or_insert(AgentRuntimeKind::Claude);
@@ -109,6 +128,9 @@ where
     }
     if saw_cargo_context {
         return RuntimeContext::TestHarness;
+    }
+    if saw_supervisor {
+        return RuntimeContext::Supervisor;
     }
     if let Some(kind) = agent_marker {
         return RuntimeContext::Agent {
@@ -158,6 +180,19 @@ mod tests {
     use super::{classify_for_test, AgentRuntimeKind, RuntimeContext};
 
     #[test]
+    fn unattended_join_never_becomes_resume_when_streaming_is_disabled() {
+        for markers in [
+            vec!["AIRC_SUPERVISOR"],
+            vec!["AIRC_SUPERVISOR", "AIRC_NO_ATTACH"],
+            vec!["AIRC_CODEX_START_CHILD", "AIRC_NO_ATTACH"],
+        ] {
+            assert!(!super::join_resumes_with(false, |key| markers.contains(&key)));
+        }
+        assert!(!super::join_resumes_with(true, |_| false));
+        assert!(super::join_resumes_with(false, |key| key == "AIRC_NO_ATTACH"));
+    }
+
+    #[test]
     fn join_streams_for_codex_agent() {
         let context = classify_for_test([("CODEX_SESSION_ID", "thread-1")], false, None);
         assert_eq!(
@@ -188,6 +223,14 @@ mod tests {
         let context = classify_for_test(std::iter::empty::<(&str, &str)>(), true, None);
         assert_eq!(context, RuntimeContext::InteractiveTerminal);
         assert!(context.should_stream_join());
+    }
+
+    #[test]
+    fn windowless_startup_supervisor_keeps_the_join_feed_alive() {
+        let context = classify_for_test([("AIRC_SUPERVISOR", "1")], false, None);
+        assert_eq!(context, RuntimeContext::Supervisor);
+        assert!(context.should_stream_join());
+        assert_eq!(context.runtime_label(), "supervisor");
     }
 
     #[test]

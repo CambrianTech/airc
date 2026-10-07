@@ -142,8 +142,9 @@ fn resolve_socket_path(
     // `ensure_daemon_running`'s build-mismatch path then stopped the
     // real daemon (bite 3 of card b0a81c31; flagged by the #1119
     // sentinel).
-    let is_machine_account_scope =
-        machine_home != home || user_home.map(|uh| machine_home == uh.join(".airc")) == Some(true);
+    let is_machine_account_scope = normalized_path(machine_home) != normalized_path(home)
+        || user_home.map(|uh| normalized_path(machine_home) == normalized_path(&uh.join(".airc")))
+            == Some(true);
     let legacy_fallback =
         machine_home.join(format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION));
     if is_machine_account_scope {
@@ -271,6 +272,72 @@ fn read_user_home_from_env() -> Option<PathBuf> {
             }
         })
         .map(PathBuf::from)
+        .map(|path| normalized_path(&path))
+}
+
+pub(crate) fn normalized_path(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+
+    let Some((ancestor, mut resolved)) = path.ancestors().find_map(|ancestor| {
+        ancestor
+            .canonicalize()
+            .ok()
+            .map(|resolved| (ancestor, resolved))
+    }) else {
+        return path.to_path_buf();
+    };
+    // Canonicalize the existing prefix even when several descendants do not
+    // exist yet. In particular, Windows raw and verbatim paths must compare the
+    // same before and after a new scope directory is created.
+    let Ok(suffix) = path.strip_prefix(ancestor) else {
+        return path.to_path_buf();
+    };
+    for component in suffix.components() {
+        match component {
+            Component::Normal(name) => resolved.push(name),
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            // strip_prefix produces a relative suffix. Refuse to reinterpret a
+            // different root if that invariant ever changes.
+            Component::Prefix(_) | Component::RootDir => return path.to_path_buf(),
+        }
+        // A parent traversal can return to an existing directory and then enter
+        // a symlink. Resolve each step, rather than append an unchecked suffix
+        // whose lexical prefix could falsely claim an outside path as owned.
+        if let Ok(canonical) = resolved.canonicalize() {
+            resolved = canonical;
+        }
+    }
+    resolved
+}
+
+/// Bounded historical endpoints for this actual machine account only. Isolated
+/// scopes never probe siblings or their parent account during migration.
+pub fn legacy_socket_paths_in(home: &std::path::Path, canonical: &std::path::Path) -> Vec<PathBuf> {
+    let Some(user_home) = read_user_home_from_env() else {
+        return Vec::new();
+    };
+    legacy_socket_paths_for(&crate::machine_account_home(home), &user_home)
+        .into_iter()
+        .filter(|candidate| normalized_path(candidate) != normalized_path(canonical))
+        .collect()
+}
+
+fn legacy_socket_paths_for(
+    machine_home: &std::path::Path,
+    user_home: &std::path::Path,
+) -> Vec<PathBuf> {
+    let account = normalized_path(&user_home.join(".airc"));
+    if normalized_path(machine_home) != account {
+        return Vec::new();
+    }
+    let filename = format!("daemon-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION);
+    vec![
+        account.join(&filename),
+        normalized_path(user_home).join(filename),
+    ]
 }
 
 /// 16-char hex prefix of SHA-256(canonical(path)). Used to namespace
@@ -295,6 +362,88 @@ fn machine_account_key(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_aliases_share_canonical_socket_and_bounded_legacy_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let account = root.path().join(".airc");
+        std::fs::create_dir(&account).unwrap();
+        let alias = root.path().join(".").join(".airc");
+        let machine = account.canonicalize().unwrap();
+        let runtime = root.path().join("runtime");
+        let socket = resolve_socket_path(&alias, &machine, Some(root.path()), Some(&runtime), None);
+        assert!(socket
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("airc-machine-"));
+        let candidates = legacy_socket_paths_for(&machine, root.path());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].parent().unwrap(), machine);
+        assert_eq!(
+            candidates[1].parent().unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+        assert!(legacy_socket_paths_for(&root.path().join("foreign"), root.path()).is_empty());
+
+        // A new tab can resolve its endpoint before its directory exists. Its
+        // machine owner and endpoint must not change once that directory appears.
+        let scope = root.path().join("missing").join("nested");
+        let expected_owner = root.path().canonicalize().unwrap().join(".airc");
+        for created in [false, true] {
+            if created {
+                std::fs::create_dir_all(&scope).unwrap();
+            }
+            let owner =
+                crate::airc::machine_account_home_for(&scope, root.path(), Some(root.path()), None);
+            assert_eq!(owner, expected_owner);
+            assert_eq!(
+                resolve_socket_path(&scope, &owner, Some(root.path()), Some(&runtime), None),
+                socket
+            );
+            assert_eq!(
+                scope.exists(),
+                created,
+                "resolution must not create directories"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_path_normalization_resolves_parent_traversal_and_existing_links() {
+        let root = tempfile::tempdir().unwrap();
+        let account = root.path().join("account");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&account).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let escaped = account.join("missing/../../outside/nested");
+        let expected = outside.canonicalize().unwrap().join("nested");
+        assert_eq!(normalized_path(&escaped), expected);
+        assert_eq!(
+            crate::airc::machine_account_home_for(&escaped, root.path(), Some(&account), None,),
+            escaped,
+            "parent traversal outside the account must not acquire its ownership"
+        );
+        assert!(!account.join("missing").exists());
+
+        #[cfg(unix)]
+        {
+            let link = account.join("link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let through_link = account.join("missing/../link/nested");
+            assert_eq!(normalized_path(&through_link), expected);
+            assert_eq!(
+                crate::airc::machine_account_home_for(
+                    &through_link,
+                    root.path(),
+                    Some(&account),
+                    None,
+                ),
+                through_link,
+                "an existing symlink after parent traversal must not borrow account ownership"
+            );
+        }
+    }
 
     #[test]
     fn default_socket_path_is_versioned_by_ipc_protocol() {

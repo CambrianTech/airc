@@ -76,9 +76,19 @@ impl Body {
     /// neither of which can fail. Allowlisting rather than threading
     /// `Result` through 8 call sites for an impossible failure mode
     /// (card ef168afe, CI strict-gate re-green).
+    ///
+    /// RIGHT-SIZED: `serde_json::to_vec` grows its buffer by doubling, so a 140 KB body
+    /// comes back in a 256 KiB allocation, and `bytes::Bytes::from(Vec)` keeps that whole
+    /// allocation alive for as long as the envelope lives. Rings and queues hold envelopes
+    /// for minutes, so the spare capacity was the airc daemon's leak: 67-83% of live heap
+    /// on the IntelMac in 256 KiB blocks from this function (malloc_history, 2026-10-04,
+    /// card 309566f9). One shrink here, one copy per payload, so every caller holds only
+    /// the bytes it has.
     #[allow(clippy::expect_used)]
     pub fn to_payload(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("Body always serializes to JSON")
+        let mut payload = serde_json::to_vec(self).expect("Body always serializes to JSON");
+        payload.shrink_to_fit();
+        payload
     }
 
     /// Decode the opaque `payload` bytes of an `airc-bus` envelope back
@@ -103,6 +113,21 @@ mod tests {
         let bin = Body::Binary(vec![0, 1, 2, 255, 42]);
         let decoded = Body::from_payload(&bin.to_payload()).expect("binary payload decodes");
         assert_eq!(decoded, bin);
+    }
+
+    // what this catches: the airc daemon leak (card 309566f9). A payload kept the doubled
+    // capacity serde_json grew it to, and Bytes::from(Vec) pinned all of it, so each held
+    // envelope cost up to 2x its size. A payload's allocation must be its length.
+    #[test]
+    fn payload_allocation_is_its_length_not_the_serializers_growth() {
+        let large = Body::text("x".repeat(140 * 1024));
+        let payload = large.to_payload();
+        assert_eq!(
+            payload.capacity(),
+            payload.len(),
+            "no spare capacity is retained"
+        );
+        assert!(payload.len() > 140 * 1024);
     }
 
     #[test]

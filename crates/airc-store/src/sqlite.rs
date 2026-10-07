@@ -1155,13 +1155,28 @@ impl EventStore for SqliteEventStore {
         cursor: &TranscriptCursor,
         updated_at_ms: u64,
     ) -> Result<(), StoreError> {
+        let lamport = cursor.lamport as i64;
+        // The existing signed column round-trips all u64 lamports by cast.
+        // Negative stored values are the UPPER unsigned half, not older than
+        // positive ones. Preserve transcript order across that boundary too.
+        let older_lamport = if lamport < 0 {
+            Expr::col(runtime_cursor::Column::Lamport)
+                .gte(0)
+                .or(Expr::col(runtime_cursor::Column::Lamport).lt(lamport))
+        } else {
+            Expr::col(runtime_cursor::Column::Lamport)
+                .gte(0)
+                .and(Expr::col(runtime_cursor::Column::Lamport).lt(lamport))
+        };
         let active = runtime_cursor::ActiveModel {
             consumer_id: ActiveValue::Set(consumer_id.to_string()),
-            lamport: ActiveValue::Set(cursor.lamport as i64),
+            lamport: ActiveValue::Set(lamport),
             event_id: ActiveValue::Set(cursor.event_id.as_uuid()),
             updated_at_ms: ActiveValue::Set(updated_at_ms as i64),
         };
-        runtime_cursor::Entity::insert(active)
+        // Compare inside the upsert, not in a load-then-save window: two
+        // handles can checkpoint this consumer concurrently after reconnect.
+        match runtime_cursor::Entity::insert(active)
             .on_conflict(
                 OnConflict::column(runtime_cursor::Column::ConsumerId)
                     .update_columns([
@@ -1169,11 +1184,22 @@ impl EventStore for SqliteEventStore {
                         runtime_cursor::Column::EventId,
                         runtime_cursor::Column::UpdatedAtMs,
                     ])
+                    .action_and_where(
+                        older_lamport.or(Expr::col(runtime_cursor::Column::Lamport)
+                            .eq(lamport)
+                            .and(
+                                Expr::col(runtime_cursor::Column::EventId)
+                                    .lt(cursor.event_id.as_uuid()),
+                            )),
+                    )
                     .to_owned(),
             )
             .exec(&self.db)
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn load_subscriptions(&self) -> Result<Vec<StoredSubscription>, StoreError> {
@@ -1979,7 +2005,10 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_cursor_upserts_by_consumer_id() {
-        let store = SqliteEventStore::in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sqlite");
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        let memory = crate::memory::InMemoryEventStore::new();
         let first = TranscriptCursor {
             lamport: 7,
             event_id: EventId::from_u128(0x7),
@@ -1988,36 +2017,124 @@ mod tests {
             lamport: 9,
             event_id: EventId::from_u128(0x9),
         };
+        let tied = TranscriptCursor {
+            lamport: second.lamport,
+            event_id: EventId::from_u128(0xa),
+        };
 
-        assert!(store
-            .load_runtime_cursor("codex-hook:default")
-            .await
-            .unwrap()
-            .is_none());
+        // One contract scenario exercises the actual ORM and its in-memory
+        // adapter, including equal and backwards full-tuple checkpoints.
+        for backend in [&store as &dyn EventStore, &memory as &dyn EventStore] {
+            assert!(backend
+                .load_runtime_cursor("codex-hook:default")
+                .await
+                .unwrap()
+                .is_none());
+            backend
+                .save_runtime_cursor("join-feed:codex:thread-1", &first, 1)
+                .await
+                .unwrap();
+            for (saved, expected) in [
+                (&first, &first),
+                (&second, &second),
+                (&first, &second),
+                (&second, &second),
+                (&tied, &tied),
+                (&second, &tied),
+            ] {
+                backend
+                    .save_runtime_cursor("codex-hook:default", saved, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    backend
+                        .load_runtime_cursor("codex-hook:default")
+                        .await
+                        .unwrap(),
+                    Some(expected.clone())
+                );
+            }
+            assert_eq!(
+                backend
+                    .load_runtime_cursor("join-feed:codex:thread-1")
+                    .await
+                    .unwrap(),
+                Some(first.clone()),
+                "another consumer's progress is independent"
+            );
+        }
 
-        store
-            .save_runtime_cursor("codex-hook:default", &first, 1_700_000_000_000)
-            .await
-            .unwrap();
+        // Distinct pools race on the same durable row. The database must own
+        // the comparison so an older or equal-lamport save cannot win last.
+        let other_handle = SqliteEventStore::open_path(&path).await.unwrap();
+        let newest = TranscriptCursor {
+            lamport: 10,
+            event_id: EventId::from_u128(0xc),
+        };
+        let older_tie = TranscriptCursor {
+            lamport: newest.lamport,
+            event_id: EventId::from_u128(0xb),
+        };
+        let (high, low, tie) = tokio::join!(
+            store.save_runtime_cursor("codex-hook:default", &newest, 3),
+            other_handle.save_runtime_cursor("codex-hook:default", &first, 4),
+            other_handle.save_runtime_cursor("codex-hook:default", &older_tie, 5),
+        );
+        high.unwrap();
+        low.unwrap();
+        tie.unwrap();
+        drop(other_handle);
+        drop(store);
+        let reopened = SqliteEventStore::open_path(&path).await.unwrap();
         assert_eq!(
-            store
+            reopened
                 .load_runtime_cursor("codex-hook:default")
                 .await
                 .unwrap(),
-            Some(first.clone())
+            Some(newest),
+            "reopening retains the maximum tuple despite concurrent stale saves"
         );
-
-        store
-            .save_runtime_cursor("codex-hook:default", &second, 1_700_000_000_100)
-            .await
-            .unwrap();
         assert_eq!(
-            store
-                .load_runtime_cursor("codex-hook:default")
+            reopened
+                .load_runtime_cursor("join-feed:codex:thread-1")
                 .await
                 .unwrap(),
-            Some(second)
+            Some(first)
         );
+        let before_signed_boundary = TranscriptCursor {
+            lamport: i64::MAX as u64,
+            event_id: EventId::from_u128(0xf0),
+        };
+        let after_signed_boundary = TranscriptCursor {
+            lamport: i64::MAX as u64 + 1,
+            event_id: EventId::from_u128(0xf1),
+        };
+        let upper = TranscriptCursor {
+            lamport: u64::MAX,
+            event_id: EventId::from_u128(0xf2),
+        };
+        for backend in [&reopened as &dyn EventStore, &memory as &dyn EventStore] {
+            for (saved, expected) in [
+                (&before_signed_boundary, &before_signed_boundary),
+                (&after_signed_boundary, &after_signed_boundary),
+                (&before_signed_boundary, &after_signed_boundary),
+                (&upper, &upper),
+                (&after_signed_boundary, &upper),
+            ] {
+                backend
+                    .save_runtime_cursor("codex-hook:default", saved, 6)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    backend
+                        .load_runtime_cursor("codex-hook:default")
+                        .await
+                        .unwrap(),
+                    Some(expected.clone()),
+                    "the signed column must retain unsigned transcript order"
+                );
+            }
+        }
     }
 
     #[tokio::test]

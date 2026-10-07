@@ -53,7 +53,7 @@ use airc_protocol::{Frame, PeerKeyRegistry, PeerKeypair, Subscription};
 
 use crate::lan_tcp::adapter::connection::{handle_client_connection, handle_server_connection};
 use crate::lan_tcp::adapter::inner::{
-    DisconnectObserver, InboundObserver, Inner, Outbound, OutboundTx, SubscriberHandle,
+    InboundObserver, Inner, Outbound, OutboundTx, PeerSessionObserver, SubscriberHandle,
     MAX_FRAME_BYTES, SUBSCRIBER_CHANNEL_DEPTH,
 };
 use crate::lan_tcp::tls_config::{build_client_config, build_server_config};
@@ -81,11 +81,13 @@ impl LanTcpAdapter {
                 registry,
                 server_config,
                 connections: Mutex::new(HashMap::new()),
+                next_session_id: AtomicU64::new(0),
                 listening: Mutex::new(false),
                 subscribers: Mutex::new(Vec::new()),
                 next_sub_id: AtomicU64::new(0),
                 on_inbound: std::sync::Mutex::new(None),
                 on_disconnect: std::sync::Mutex::new(None),
+                on_connect: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -107,8 +109,17 @@ impl LanTcpAdapter {
     /// dropped-but-still-reachable peer is re-dialed at once instead of up to a
     /// full refresh interval later. Idempotent set-once; a later call replaces
     /// the observer.
-    pub fn set_disconnect_observer(&self, observer: DisconnectObserver) {
+    pub fn set_disconnect_observer(&self, observer: PeerSessionObserver) {
         if let Ok(mut guard) = self.inner.on_disconnect.lock() {
+            *guard = Some(observer);
+        }
+    }
+
+    /// Observe every authenticated session after its send channel is installed.
+    /// Covers both accepted and dialed connections, including the same peer
+    /// reconnecting. A later registration replaces the observer.
+    pub fn set_connect_observer(&self, observer: PeerSessionObserver) {
+        if let Ok(mut guard) = self.inner.on_connect.lock() {
             *guard = Some(observer);
         }
     }
@@ -123,11 +134,21 @@ impl LanTcpAdapter {
     /// whether a session existed. Fires the disconnect observer via the
     /// same path as an observed termination.
     pub async fn drop_connection(&self, peer: PeerId) -> bool {
-        if !self.inner.connections.lock().await.contains_key(&peer) {
-            return false;
+        let removed = {
+            let mut connections = self.inner.connections.lock().await;
+            let Some((physical_peer, _)) = self.session_for(&connections, peer) else {
+                return false;
+            };
+            connections
+                .remove(&physical_peer)
+                .map(|session| (physical_peer, session))
+        };
+        if let Some((physical_peer, session)) = removed {
+            session.end();
+            connection::notify_disconnect(&self.inner, physical_peer);
+            return true;
         }
-        connection::disconnect(&self.inner, peer).await;
-        true
+        false
     }
 
     /// Snapshot of currently-connected peers. Useful for diagnostics
@@ -142,6 +163,35 @@ impl LanTcpAdapter {
             .collect()
     }
 
+    // One authenticated lookup for unicast, discovery and duplicate-dial prevention.
+    fn session_for<'a>(
+        &self,
+        connections: &'a HashMap<PeerId, inner::Session>,
+        peer: PeerId,
+    ) -> Option<(PeerId, &'a inner::Session)> {
+        let authorized = |session: &inner::Session| {
+            self.inner
+                .registry
+                .has_key(peer, &session.authenticated_key)
+        };
+        connections
+            .get(&peer)
+            .filter(|session| authorized(session))
+            .map(|session| (peer, session))
+            .or_else(|| {
+                connections
+                    .iter()
+                    .find(|(_, session)| authorized(session))
+                    .map(|(id, session)| (*id, session))
+            })
+    }
+
+    /// Whether an enrolled identity has an authenticated session, including key aliases.
+    /// Unlike connected_peers this does not expand one physical connection into many IDs.
+    pub async fn is_connected(&self, peer: PeerId) -> bool {
+        self.session_for(&*self.inner.connections.lock().await, peer)
+            .is_some()
+    }
     /// Bind a TCP listener and accept incoming connections
     /// indefinitely. The returned `SocketAddr` is the actual bound
     /// address (useful when `bind_addr.port() == 0` and the OS
@@ -215,7 +265,7 @@ impl LanTcpAdapter {
     ) -> Result<(), LanTcpError> {
         {
             let connections = self.inner.connections.lock().await;
-            if connections.contains_key(&expected_peer) {
+            if self.session_for(&connections, expected_peer).is_some() {
                 return Err(LanTcpError::AlreadyConnectedTo(expected_peer));
             }
         }
@@ -267,9 +317,8 @@ impl LanTcpAdapter {
         }
         let tx = {
             let connections = self.inner.connections.lock().await;
-            connections
-                .get(&peer)
-                .cloned()
+            self.session_for(&connections, peer)
+                .map(|(_, session)| session.outbound.clone())
                 .ok_or(LanTcpError::NoActivePeers)?
         };
         let (flushed, flushed_rx) = oneshot::channel();
@@ -311,7 +360,7 @@ impl Transport for LanTcpAdapter {
             }
             connections
                 .iter()
-                .map(|(peer, tx)| (*peer, tx.clone()))
+                .map(|(peer, session)| (*peer, session.outbound.clone()))
                 .collect()
         };
 
@@ -474,6 +523,107 @@ mod tests {
         );
     }
 
+    // Regression: a daemon ACK names the signer, while TLS may index its same-key alias.
+    #[tokio::test]
+    async fn unicast_uses_authenticated_session_for_enrolled_alias_only() {
+        let (alice_id, alice, _bob_id, bob) = make_paired_adapters();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let mut received = alice
+            .subscribe(Subscription {
+                channel: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        bob.connect(bound, alice_id).await.unwrap();
+        // Enrol AFTER handshake, making the stored connection's original ID deterministic.
+        let alias = PeerId::from_u128(0xa2);
+        bob.inner
+            .registry
+            .enrol(alias, 0, alice.inner.keypair.public_bytes())
+            .unwrap();
+        assert!(bob.is_connected(alias).await);
+        assert!(
+            matches!(bob.connect(bound, alias).await, Err(LanTcpError::AlreadyConnectedTo(id)) if id == alias)
+        );
+        assert_eq!(bob.connected_peers().await.len(), 1);
+        let stranger = PeerId::from_u128(0xa3);
+        bob.inner
+            .registry
+            .enrol(stranger, 0, PeerKeypair::generate().public_bytes())
+            .unwrap();
+        let channel = RoomId::from_u128(0xc0ffee);
+        for refused in [stranger, PeerId::from_u128(0xa4)] {
+            assert!(bob
+                .send_to(refused, frame_at(80, channel, "must not send"))
+                .await
+                .is_err());
+        }
+        bob.send_to(alias, frame_at(81, channel, "alias ack"))
+            .await
+            .expect("same authenticated key must use the live session");
+        let frame = tokio::time::timeout(Duration::from_secs(3), received.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.envelope.lamport, 81);
+        assert!(!bob.drop_connection(stranger).await);
+        assert!(bob.is_connected(alias).await);
+        // Replacing trust must not retroactively change the key a session proved.
+        bob.inner
+            .registry
+            .enrol(alias, 0, PeerKeypair::generate().public_bytes())
+            .unwrap();
+        assert!(bob
+            .send_to(alias, frame_at(82, channel, "rotated alias"))
+            .await
+            .is_err());
+        bob.inner
+            .registry
+            .enrol(alice_id, 0, PeerKeypair::generate().public_bytes())
+            .unwrap();
+        assert!(bob
+            .send_to(alice_id, frame_at(83, channel, "rotated primary"))
+            .await
+            .is_err());
+        assert!(!bob.drop_connection(alias).await);
+        bob.inner.registry.remove_peer(alias);
+        assert!(bob
+            .send_to(alias, frame_at(82, channel, "revoked"))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn dropping_alias_retires_physical_session_and_notifies_once() {
+        let (alice_id, alice, _, bob) = make_paired_adapters();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        bob.connect(bound, alice_id).await.unwrap();
+        let alias = PeerId::from_u128(0xa2);
+        bob.inner
+            .registry
+            .enrol(alias, 0, alice.inner.keypair.public_bytes())
+            .unwrap();
+        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        bob.set_disconnect_observer(Arc::new(move |peer| sink.lock().unwrap().push(peer)));
+        assert!(bob.drop_connection(alias).await);
+        assert!(bob.connected_peers().await.is_empty());
+        assert!(!bob.is_connected(alias).await);
+        assert!(!bob.drop_connection(alias).await);
+        assert_eq!(*fired.lock().unwrap(), vec![alice_id]);
+        bob.connect(bound, alice_id)
+            .await
+            .expect("physical session can reconnect");
+        assert!(bob.is_connected(alias).await);
+    }
+
     // #240 event-driven heal: a terminated session must (1) drop the peer from
     // `connections` and (2) fire the registered disconnect observer with that
     // peer_id — the signal the daemon turns into a route-refresh wake nudge.
@@ -491,10 +641,20 @@ mod tests {
 
         // Stand in a live connection entry for bob, then terminate it.
         let (tx, _rx) = tokio::sync::mpsc::channel::<Outbound>(1);
-        alice.inner.connections.lock().await.insert(bob_id, tx);
+        let reader = tokio::spawn(std::future::pending::<()>());
+        alice.inner.connections.lock().await.insert(
+            bob_id,
+            super::inner::Session {
+                authenticated_key: _bob.inner.keypair.public_bytes(),
+                outbound: tx,
+                id: 0,
+                reader: reader.abort_handle(),
+                writer: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            },
+        );
         assert!(alice.inner.connections.lock().await.contains_key(&bob_id));
 
-        super::connection::disconnect(&alice.inner, bob_id).await;
+        assert!(alice.drop_connection(bob_id).await);
 
         assert!(
             !alice.inner.connections.lock().await.contains_key(&bob_id),
@@ -505,6 +665,149 @@ mod tests {
             &[bob_id],
             "the disconnect observer must fire once with the terminated peer's id"
         );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), reader)
+                .await
+                .expect("reader ended")
+                .unwrap_err()
+                .is_cancelled(),
+            "disconnect must abort the session's reader, which owns its socket half"
+        );
+    }
+
+    // what this catches (Astra's review of #1511): a session replaced while its writer is
+    // BLOCKED in write_all (the peer stopped reading, the buffer is full) kept its write half
+    // and the socket, because dropping the sender only ends a writer idle in recv. A 64-byte
+    // in-memory duplex whose far end never reads blocks the writer; after the redial the far
+    // end must see the stream fully released (a write into it fails), which only holds if
+    // the writer was aborted. The check never reads, so it cannot unblock the writer itself.
+    #[tokio::test]
+    async fn a_redial_releases_a_session_whose_writer_is_blocked() {
+        let (alice_id, alice, bob_id, _bob) = make_paired_adapters();
+        let _ = alice_id;
+        let (near, mut far) = tokio::io::duplex(64);
+        let (read_half, write_half) = tokio::io::split(near);
+        super::connection::install_and_spawn_loops(
+            alice.inner.clone(),
+            bob_id,
+            _bob.inner.keypair.public_bytes(),
+            read_half,
+            write_half,
+        )
+        .await;
+        // Queue more than the duplex holds, so the writer blocks in write_all.
+        let outbound = alice
+            .inner
+            .connections
+            .lock()
+            .await
+            .get(&bob_id)
+            .unwrap()
+            .outbound
+            .clone();
+        let (flushed, _flushed_rx) = tokio::sync::oneshot::channel();
+        outbound
+            .send(Outbound {
+                payload: vec![7u8; 4096],
+                flushed,
+            })
+            .await
+            .unwrap();
+        drop(outbound);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The redial: a new session for bob replaces the blocked one.
+        let (near2, _far2) = tokio::io::duplex(64);
+        let (r2, w2) = tokio::io::split(near2);
+        super::connection::install_and_spawn_loops(
+            alice.inner.clone(),
+            bob_id,
+            _bob.inner.keypair.public_bytes(),
+            r2,
+            w2,
+        )
+        .await;
+
+        use tokio::io::AsyncWriteExt;
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if far.write_all(b"x").await.is_err() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            released,
+            "the replaced session's blocked writer still holds its half of the stream"
+        );
+        assert_eq!(
+            alice.inner.connections.lock().await.len(),
+            1,
+            "only the new session remains"
+        );
+    }
+
+    // what this catches (M5 and BigMama, 2026-10-03): every redial of the same peer
+    // replaced its map entry but left the old read loop holding its TLS half, so the old
+    // socket never closed (56 ESTABLISHED on the M5, 69 on BigMama), and when such a stale
+    // reader finally ended it removed the NEW session. Three adapters with bob's identity
+    // dial alice in turn, as redials do: alice must keep exactly one session for bob, the
+    // two replaced dialers must see their sockets closed, and alice's live session must
+    // survive those closes.
+    #[tokio::test]
+    async fn a_redial_ends_the_replaced_session_and_a_stale_reader_cannot_end_the_new_one() {
+        ensure_crypto_provider();
+        let alice_id = PeerId::from_u128(0xa1);
+        let bob_id = PeerId::from_u128(0xb2);
+        let alice_kp = PeerKeypair::generate();
+        let bob_kp = PeerKeypair::generate();
+        let registry = PeerKeyRegistry::new();
+        registry
+            .enrol(alice_id, 0, alice_kp.public_bytes())
+            .unwrap();
+        registry.enrol(bob_id, 0, bob_kp.public_bytes()).unwrap();
+        let registry = Arc::new(registry);
+        let alice = LanTcpAdapter::new(alice_id, alice_kp, registry.clone()).unwrap();
+        let bound = alice
+            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+
+        let mut dialers = Vec::new();
+        for _ in 0..3 {
+            let bob = LanTcpAdapter::new(bob_id, bob_kp.clone(), registry.clone()).unwrap();
+            bob.connect(bound, alice_id).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            dialers.push(bob);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let replaced_closed = dialers[0].connected_peers().await.is_empty()
+                && dialers[1].connected_peers().await.is_empty();
+            if replaced_closed || tokio::time::Instant::now() >= deadline {
+                assert!(
+                    replaced_closed,
+                    "the replaced sessions' sockets must close, not linger"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            dialers[2].connected_peers().await,
+            vec![alice_id],
+            "the latest dial stays connected"
+        );
+        assert_eq!(
+            alice.connected_peers().await,
+            vec![bob_id],
+            "alice keeps exactly the live session for bob"
+        );
+        assert_eq!(alice.inner.connections.lock().await.len(), 1);
     }
 
     #[tokio::test]

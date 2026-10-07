@@ -31,6 +31,8 @@ mod collaboration_peers;
 mod commands;
 mod discovery;
 mod doctor;
+#[cfg(windows)]
+mod elevated_owner;
 mod envelope_cli;
 mod event_render;
 mod events_cli;
@@ -87,6 +89,10 @@ mod transport_cli;
 mod transport_commands;
 mod update_artifact;
 mod update_commands;
+mod update_legacy;
+mod update_rollback;
+#[cfg(windows)]
+mod update_session;
 mod update_shutdown;
 mod work_cli;
 mod work_commands;
@@ -202,6 +208,10 @@ async fn async_main() -> ExitCode {
                 return ExitCode::from(code);
             }
             if let Some(code) = identity_commands::command_exit_code(error.as_ref()) {
+                return ExitCode::from(code);
+            }
+            #[cfg(windows)]
+            if let Some(code) = update_session::exit_code(error.as_ref()) {
                 return ExitCode::from(code);
             }
             eprintln!("airc: {error}");
@@ -413,8 +423,15 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,
-        Command::Status { socket } => commands::run_status(&home, default_or(socket, &home)).await,
-        Command::Stop { socket } => commands::run_stop(default_or(socket, &home)).await,
+        Command::Status { socket, json } => {
+            let socket = default_or(socket, &home);
+            if json {
+                update_shutdown::print_status_json(&socket)
+            } else {
+                commands::run_status(&home, socket).await
+            }
+        }
+        Command::Stop { socket } => commands::run_stop(&home, default_or(socket, &home)).await,
 
         Command::Msg {
             socket,
@@ -592,6 +609,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Events(args) => match args.action {
+            EventsAction::Contains { event_id, json } => {
+                events_commands::run_contains(&home, event_id, json).await
+            }
             EventsAction::List {
                 kind,
                 header,
@@ -618,7 +638,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             GistAction::FileContent { filename } => gist_commands::run_file_content(&filename),
         },
 
-        Command::Join { room } => commands::run_join(&home, room).await,
+        Command::Join { room, ensure } => commands::run_join(&home, room, ensure).await,
 
         Command::Sos { action } => match action {
             SosAction::Send { message } => sos_commands::run_send(&home, &message).await,
@@ -628,21 +648,57 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Version => commands::run_version(),
 
-        Command::IpcEndpoint => {
+        #[cfg(windows)]
+        Command::SetupRecoverElevatedOwner {
+            probe,
+            endpoint,
+            caller_sid,
+            installed_binary,
+        } => {
+            if probe {
+                if elevated_owner::access_denied(&endpoint).await? {
+                    std::process::exit(5);
+                }
+                Ok(())
+            } else {
+                elevated_owner::recover(&endpoint, &caller_sid, &installed_binary).await
+            }
+        }
+
+        Command::IpcEndpoint { native } => {
             // Resolve-only: print the canonical socket path airc would
             // bind for this scope. No daemon required (callers probe
             // liveness via `status`/`ping`). This is the contract
             // Continuum's airc discovery depends on.
-            println!("{}", cli::default_socket_path_in(&home).display());
+            let path = cli::default_socket_path_in(&home);
+            if native {
+                println!("{}", airc_ipc::transport::native_endpoint(&path));
+            } else {
+                println!("{}", path.display());
+            }
             Ok(())
         }
 
-        Command::Update { auto } => {
+        Command::Update {
+            auto,
+            adopt_installed,
+        } => {
             let socket = cli::default_socket_path_in(&home);
-            if auto {
-                update_commands::run_update_auto(&home, socket)
+            if adopt_installed {
+                update_commands::adopt_installed(&home, socket)
             } else {
-                update_commands::run_update(&home, socket)
+                #[cfg(windows)]
+                {
+                    update_session::run(&home, auto)
+                }
+                #[cfg(not(windows))]
+                {
+                    if auto {
+                        update_commands::run_update_auto(&home, socket)
+                    } else {
+                        update_commands::run_update(&home, socket)
+                    }
+                }
             }
         }
 
@@ -819,12 +875,13 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Work(args) => match args.action {
             WorkAction::Create {
+                room,
                 repo,
                 title,
                 body,
                 lane_id,
                 priority,
-            } => work_commands::run_create(&home, repo, title, body, lane_id, priority).await,
+            } => work_commands::run_create(&home, room, repo, title, body, lane_id, priority).await,
             WorkAction::Seed {
                 repo,
                 title,
@@ -837,26 +894,30 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
             }
             WorkAction::Claim {
+                room,
                 card_id,
                 ttl_ms,
                 no_lease_required,
-            } => work_commands::run_claim(&home, card_id, ttl_ms, no_lease_required).await,
+            } => work_commands::run_claim(&home, room, card_id, ttl_ms, no_lease_required).await,
             WorkAction::Heartbeat {
+                room,
                 card_id,
                 claim_id,
                 ttl_ms,
-            } => work_commands::run_heartbeat(&home, card_id, claim_id, ttl_ms).await,
+            } => work_commands::run_heartbeat(&home, room, card_id, claim_id, ttl_ms).await,
             WorkAction::Release {
+                room,
                 card_id,
                 claim_id,
                 reason,
-            } => work_commands::run_release(&home, card_id, claim_id, reason).await,
+            } => work_commands::run_release(&home, room, card_id, claim_id, reason).await,
             WorkAction::Update {
+                room,
                 card_id,
                 title,
                 body,
                 priority,
-            } => work_commands::run_update(&home, card_id, title, body, priority).await,
+            } => work_commands::run_update(&home, room, card_id, title, body, priority).await,
             WorkAction::State {
                 room,
                 card_id,
@@ -955,9 +1016,35 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 work_commands::run_merge(&home, room, card_id, dry_run, pending_timeout_secs).await
             }
-            WorkAction::Link { card_id, pr } => work_commands::run_link(&home, card_id, pr).await,
+            WorkAction::Link { room, card_id, pr } => {
+                work_commands::run_link(&home, room, card_id, pr).await
+            }
             WorkAction::Relink { card_id, pr } => {
                 work_commands::run_relink(&home, card_id, pr).await
+            }
+            WorkAction::Submit {
+                card_id,
+                patch,
+                base,
+                instance,
+                room,
+            } => work_commands::run_submit(&home, room, card_id, patch, base, instance).await,
+            WorkAction::SubmissionReview {
+                review_card_id,
+                outcome,
+                evidence_file,
+                submission,
+                room,
+            } => {
+                work_commands::run_submission_review(
+                    &home,
+                    room,
+                    review_card_id,
+                    outcome,
+                    evidence_file,
+                    submission,
+                )
+                .await
             }
         },
 

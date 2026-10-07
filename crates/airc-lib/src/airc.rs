@@ -154,7 +154,7 @@ pub fn daemon_command(
     socket: &Path,
 ) -> std::process::Command {
     let daemon_home = machine_account_home(scope_home);
-    let mut command = std::process::Command::new(airc_exe);
+    let mut command = airc_core::process::background(airc_exe);
     command
         .arg("--home")
         .arg(&daemon_home)
@@ -165,6 +165,26 @@ pub fn daemon_command(
 }
 
 fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    machine_account_home_for(
+        scope_home,
+        &std::env::temp_dir(),
+        home.as_deref(),
+        profile.as_deref(),
+    )
+}
+
+/// Resolve ownership without mutating scope directories or process environment.
+/// Injected roots keep the before/after-creation contract testable in parallel.
+pub(crate) fn machine_account_home_for(
+    scope_home: &Path,
+    temp: &Path,
+    home: Option<&Path>,
+    profile: Option<&Path>,
+) -> PathBuf {
+    use crate::socket_path::normalized_path;
+
     // Temp-rooted scopes are their own account boundary on EVERY
     // platform. On Linux/macOS that falls out of `/tmp` living outside
     // `$HOME`, but on Windows `%TEMP%` is
@@ -182,42 +202,25 @@ fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
     // this) — its scopes legitimately share that simulated account, so
     // the temp guard must not fire. Real boxes never have a temp-rooted
     // home, so the b0a81c31 fix is unaffected.
-    let temp = std::env::temp_dir();
-    let normalized_temp = temp.canonicalize().unwrap_or(temp);
-    let normalized_scope_for_temp = scope_home
-        .canonicalize()
-        .unwrap_or_else(|_| scope_home.to_path_buf());
-    let home_var = std::env::var_os("HOME").map(PathBuf::from);
-    let profile_var = std::env::var_os("USERPROFILE").map(PathBuf::from);
-    let any_home_is_temp_rooted = [home_var.as_ref(), profile_var.as_ref()]
+    let normalized_temp = normalized_path(temp);
+    let normalized_scope = normalized_path(scope_home);
+    let any_home_is_temp_rooted = [home, profile]
         .into_iter()
         .flatten()
-        .any(|h| {
-            h.canonicalize()
-                .unwrap_or_else(|_| h.clone())
-                .starts_with(&normalized_temp)
-        });
-    if !any_home_is_temp_rooted && normalized_scope_for_temp.starts_with(&normalized_temp) {
+        .any(|home| normalized_path(home).starts_with(&normalized_temp));
+    if !any_home_is_temp_rooted && normalized_scope.starts_with(&normalized_temp) {
         return scope_home.to_path_buf();
     }
 
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        let normalized_home = home.canonicalize().unwrap_or(home);
-        let normalized_scope = scope_home
-            .canonicalize()
-            .unwrap_or_else(|_| scope_home.to_path_buf());
+    if let Some(home) = home {
+        let normalized_home = normalized_path(home);
         if normalized_scope.starts_with(&normalized_home) {
             return normalized_home.join(".airc");
         }
     }
     #[cfg(windows)]
-    if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        let userprofile = PathBuf::from(userprofile);
-        let normalized_userprofile = userprofile.canonicalize().unwrap_or(userprofile);
-        let normalized_scope = scope_home
-            .canonicalize()
-            .unwrap_or_else(|_| scope_home.to_path_buf());
+    if let Some(userprofile) = profile {
+        let normalized_userprofile = normalized_path(userprofile);
         if normalized_scope.starts_with(&normalized_userprofile) {
             return normalized_userprofile.join(".airc");
         }
@@ -276,11 +279,11 @@ pub struct Airc {
     pub(crate) inner: Arc<AircInner>,
 }
 
-/// #240 event-driven heal: the shared slot holding the optional peer-disconnect
-/// callback the daemon registers (see [`AircInner::on_disconnect`]). Aliased so
+/// Shared slot holding an optional peer-session
+/// callback (connect or disconnect). Aliased so
 /// the nested handle type doesn't trip clippy's `type_complexity` gate at the
 /// field and at every construction.
-pub(crate) type DisconnectCallbackSlot =
+pub(crate) type PeerSessionCallbackSlot =
     Arc<std::sync::Mutex<Option<Arc<dyn Fn(PeerId) + Send + Sync>>>>;
 
 pub(crate) struct AircInner {
@@ -328,7 +331,9 @@ pub(crate) struct AircInner {
     /// runs before or after the adapter is first built. Shared across daemon
     /// clones like `learned_ips`, so whichever handle owns the dropped session
     /// fires the same callback (the daemon's route-refresh wake nudge).
-    pub(crate) on_disconnect: DisconnectCallbackSlot,
+    pub(crate) on_disconnect: PeerSessionCallbackSlot,
+    /// Post-install authenticated LAN session notification, shared by clones.
+    pub(crate) on_connect: PeerSessionCallbackSlot,
     pub(crate) lamport_clock: AtomicU64,
     /// Epoch-ms of the last send-path peer-registry sync. Debounces the
     /// per-send disk load (see `sync_account_peer_registry_debounced`).
@@ -716,6 +721,7 @@ impl Airc {
                 advertised_endpoints_host: std::sync::Mutex::new(None),
                 learned_ips: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 on_disconnect: Arc::new(std::sync::Mutex::new(None)),
+                on_connect: Arc::new(std::sync::Mutex::new(None)),
                 lamport_clock: AtomicU64::new(0),
                 peer_sync_last_ms: AtomicU64::new(0),
                 lan_tcp: Mutex::new(None),
@@ -842,6 +848,15 @@ impl Airc {
     /// path that may diverge (card bf7c30e2 round 3).
     pub fn wire_root(&self) -> &Path {
         &self.inner.wire_root
+    }
+
+    /// Her mind store (her private records, sealed under her identity), opened with THIS
+    /// handle's own identity, so a caller never holds her key. Writes an `open` receipt.
+    pub fn mind_store(&self) -> Result<airc_identity::mind::MindStore, AircError> {
+        Ok(airc_identity::mind::MindStore::open(
+            &self.inner.home,
+            &self.inner.identity,
+        )?)
     }
 
     /// Return the local peer's stable identifier.
@@ -1649,6 +1664,7 @@ impl Airc {
             // inbound learned on any handle informs every handle's dialer.
             learned_ips: self.inner.learned_ips.clone(),
             on_disconnect: self.inner.on_disconnect.clone(),
+            on_connect: self.inner.on_connect.clone(),
             lamport_clock: AtomicU64::new(self.inner.lamport_clock.load(Ordering::Relaxed)),
             peer_sync_last_ms: AtomicU64::new(0),
             lan_tcp: Mutex::new(None),
@@ -2961,9 +2977,40 @@ mod room_trust_policy_tests {
     #[test]
     fn machine_account_home_keeps_temp_scopes_isolated() {
         let dir = tempfile::tempdir().unwrap();
-        let scope = dir.path().join("scope-home");
-        std::fs::create_dir(&scope).unwrap();
-        assert_eq!(super::machine_account_home(&scope).as_path(), scope);
+        let scope = dir.path().join("missing").join("nested");
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let canonical_scope = canonical_root.join("missing").join("nested");
+        let unrelated_home = dir.path().parent().unwrap().join("unrelated-account");
+        let expected_owner = canonical_root.join(".airc");
+
+        for created in [false, true] {
+            if created {
+                std::fs::create_dir_all(&scope).unwrap();
+            }
+            for alias in [&scope, &canonical_scope] {
+                // An actual temp scope stays isolated, including its original
+                // path spelling. A simulated temp account deliberately shares.
+                assert_eq!(
+                    super::machine_account_home_for(alias, dir.path(), Some(&unrelated_home), None,),
+                    *alias
+                );
+                assert_eq!(
+                    super::machine_account_home_for(alias, dir.path(), Some(dir.path()), None,),
+                    expected_owner,
+                    "missing scope and existing scope must have the same owner"
+                );
+                #[cfg(windows)]
+                assert_eq!(
+                    super::machine_account_home_for(alias, dir.path(), None, Some(dir.path())),
+                    expected_owner
+                );
+            }
+            assert_eq!(
+                scope.exists(),
+                created,
+                "resolution must not create scope directories"
+            );
+        }
     }
 }
 
@@ -2971,6 +3018,32 @@ mod room_trust_policy_tests {
 mod publish_identity_tests {
     use super::*;
     use tempfile::tempdir;
+
+    // what this catches: her mind store opened with anything but her OWN identity (a
+    // caller handing in a key), or a handle that cannot read back what an earlier handle
+    // on the same home sealed (her private space lost across a restart).
+    #[tokio::test]
+    async fn her_mind_store_opens_with_her_own_identity_across_handles() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("citizen/.airc");
+        let wire = dir.path().join("wire");
+        let id = {
+            let airc = Airc::open_with_wire_root_for_test(&home, &wire)
+                .await
+                .unwrap();
+            let store = airc.mind_store().unwrap();
+            let id = uuid::Uuid::new_v4();
+            store.put_at(id, "a private plan").unwrap();
+            id
+        };
+        let again = Airc::open_with_wire_root_for_test(&home, &wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.mind_store().unwrap().get(id).unwrap(),
+            "a private plan"
+        );
+    }
 
     // what this catches: publish_identity grounds a citizen BY NAME via
     // the agent-name floor. open_as sets a runtime agent_name but NOT a

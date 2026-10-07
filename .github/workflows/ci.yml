@@ -30,6 +30,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  AIRC_SKIP_AUTH: '1'
+
 jobs:
   clean-install-linux:
     runs-on: ubuntu-latest
@@ -179,6 +182,50 @@ jobs:
           fi
           echo "✓ airc stop clean"
 
+  setup-consent:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shared GitHub authorization behavior
+        shell: bash
+        run: |
+          # One policy lifecycle; the other hosts retain actual shell adapters.
+          case "$RUNNER_OS" in
+            Linux) bash test/setup-github-auth.sh ;;
+            *) bash test/setup-github-auth.sh --native-adapter ;;
+          esac
+      - name: Downloaded setup source compatibility
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) bash test/setup-source-acquisition.sh ;;
+            macOS) bash test/setup-source-acquisition.sh --posix-adapter ;;
+            # Keep direct Git Bash entry coverage as well as the native PS bridge.
+            Windows) bash test/setup-source-acquisition.sh ;;
+          esac
+          bash test/install-bin-directory.sh
+      - name: Native setup acquisition and remaining-work storage planning
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./windows/sync-bootstrap.ps1 -Check
+          # Isolate deliberate native failure cases and function mocks. The
+          # runner otherwise exits with a cancellation fixture's LASTEXITCODE.
+          foreach ($test in @('windows-setup-bridge', 'windows-storage-plan', 'windows-gh-acquisition', 'windows-firewall-process', 'windows-firewall-policy', 'windows-daemon-diagnostics')) {
+            & powershell -NoProfile -ExecutionPolicy RemoteSigned -File "test/$test.ps1"
+            if ($LASTEXITCODE -ne 0) { throw "$test failed (exit $LASTEXITCODE)" }
+          }
+      - name: Windows PATH boundary through shared installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash test/windows-setup-path.sh
+      - name: Actual Windows firewall provider acceptance
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./test/windows-firewall-live.ps1
   clean-install-windows:
     runs-on: windows-latest
     steps:
@@ -188,23 +235,8 @@ jobs:
       - name: Run install.ps1 (no skip — real install path via winget)
         shell: pwsh
         run: |
-          $env:AIRC_DIR = "$env:USERPROFILE\.airc\src"
-          New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
-          Copy-Item -Recurse -Force * $env:AIRC_DIR
-          # install.ps1 must work from default Windows PowerShell 5.1
-          # too; we test 5.1 path in a separate job below.
-          & "$env:AIRC_DIR\install.ps1"
-
-      - name: airc doctor (must report environment-clean)
-        shell: pwsh
-        run: |
-          $env:PATH = "$env:USERPROFILE\AppData\Local\Programs\airc;$env:PATH"
-          (Get-Command airc -ErrorAction SilentlyContinue) | Out-String
-          airc doctor
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "airc doctor failed with exit $LASTEXITCODE"
-            exit $LASTEXITCODE
-          }
+          ./test/windows-entry-token.ps1
+          ./test/windows-normal-install.ps1 -Engine pwsh
 
   clean-install-windows-ps5:
     # Validates the bootstrap path under Windows PowerShell 5.1 — the
@@ -222,6 +254,14 @@ jobs:
         shell: powershell
         run: ./test/windows-autostart.ps1
 
+      - name: Whole Windows updater owner and hidden Bash descendants
+        shell: powershell
+        run: ./test/windows-update-session.ps1 -CheckBash
+
+      - name: Elevated owner recovery adoption boundaries
+        shell: powershell
+        run: ./test/windows-recovery-test-contract.ps1
+
       - name: Update artifact handoff through Git Bash
         shell: powershell
         run: |
@@ -234,7 +274,5 @@ jobs:
       - name: Run install.ps1 under Windows PowerShell 5.1 (real install)
         shell: powershell
         run: |
-          $env:AIRC_DIR = "$env:USERPROFILE\.airc\src-ps5"
-          New-Item -ItemType Directory -Force -Path $env:AIRC_DIR | Out-Null
-          Copy-Item -Recurse -Force * $env:AIRC_DIR
-          & "$env:AIRC_DIR\install.ps1"
+          ./test/windows-entry-token.ps1
+          ./test/windows-normal-install.ps1 -Engine powershell

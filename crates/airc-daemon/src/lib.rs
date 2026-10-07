@@ -37,6 +37,7 @@ pub mod handlers;
 pub(crate) mod reclaim;
 pub mod route_refresh;
 pub mod server;
+mod shared_frames;
 pub mod state;
 pub mod store_retention;
 pub mod trust_refresh;

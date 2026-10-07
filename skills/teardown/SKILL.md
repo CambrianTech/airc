@@ -1,6 +1,6 @@
 ---
 name: airc:teardown
-description: Stop this scope's running airc daemon gracefully via `airc stop`. Scope-aware — never touches other scopes' daemons. State-wipe is not a CLI verb in the rust-rewrite.
+description: Stop this scope's owning account daemon via `airc stop` and retain operator intent until explicit resume. State is preserved.
 user-invocable: true
 allowed-tools: Bash
 argument-hint: ""
@@ -8,7 +8,7 @@ argument-hint: ""
 
 # airc teardown — stop the daemon
 
-Run this yourself — don't ask the user. It's idempotent and scope-safe.
+Run this yourself when asked to stop AIRC. It's idempotent and preserves state.
 
 In the rust-rewrite there is no `airc teardown` verb. Graceful daemon shutdown for
 the current scope is `airc stop`.
@@ -19,18 +19,21 @@ the current scope is `airc stop`.
 airc stop
 ```
 
-Asks the daemon for the current scope (its `--home` / `$AIRC_HOME`) to shut down
-gracefully. Only the daemon owning this scope's IPC socket is stopped — daemons in
-other scopes are untouched.
+Stops the account daemon owning the current scope (`--home` / `$AIRC_HOME`).
+Scopes sharing that account share the same daemon and stop intent. Other accounts
+are untouched; a `--socket` belonging to a different owner is refused.
 
 State (identity keys, peer records, subscriptions, event log) is preserved on disk.
-The next `airc join` re-attaches the same mesh.
+The stop intent survives command exit and machine restart. Ordinary commands,
+login supervisors, and `airc join --ensure` cannot clear it. An explicit
+`airc join` resumes the same mesh; explicit `airc update --adopt-installed` also
+resumes service. Ordinary `airc update` preserves stopped state.
 
 ## When to use
 
-- A previous `airc join` left a daemon you want to bounce (e.g. to pick up a new airc binary).
-- You're switching projects and want this scope's daemon stopped.
-- Before re-arming a fresh `airc join` Monitor after `airc update`.
+- You explicitly want AIRC to remain stopped until a later resume.
+- You want the account daemon stopped, including its subscribed project scopes.
+- For binary adoption, use the guarded updater described in `/update`; it owns its transient handoff.
 
 ## State-wipe (the old `--flush`)
 
@@ -44,10 +47,10 @@ The next `airc join` re-attaches the same mesh.
 ## Read the result
 
 - Daemon was running → it shuts down and `airc stop` returns.
-- No daemon for this scope → `airc stop` is a no-op; you were already stopped.
+- No daemon or starting child for this account → records the same durable stop intent successfully.
+- A child is still starting → retains stop intent and reports that shutdown is unconfirmed. The child rechecks intent before serving; do not treat this error as process absence.
 
 ## Scope-awareness
 
-`airc stop` targets only the daemon bound to this scope's IPC socket (derived from
-`--home` / `$AIRC_HOME`). A daemon another tab is running in a different scope is not
-affected.
+`airc stop` targets this scope's canonical account endpoint, derived from
+`--home` / `$AIRC_HOME`. It does not delete identities, subscriptions, or history.

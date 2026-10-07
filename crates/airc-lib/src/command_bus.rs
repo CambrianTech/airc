@@ -233,7 +233,7 @@ impl Airc {
         &self,
         room: Option<&crate::Room>,
         target: MentionTarget,
-        mut headers: Headers,
+        headers: Headers,
         body: Body,
         deadline: Duration,
     ) -> Result<PendingCommand, AircError> {
@@ -244,6 +244,21 @@ impl Airc {
             }
             None => self.current_room().await?,
         };
+        self.request_in_resolved_room(&room, target, headers, body, deadline)
+            .await
+    }
+
+    /// Shared request preparation after the caller has resolved room authority.
+    /// Public requests use scope subscriptions; daemon recovery uses its hosted
+    /// room bindings. Neither path changes the current room or auto-joins.
+    pub(crate) async fn request_in_resolved_room(
+        &self,
+        room: &crate::Room,
+        target: MentionTarget,
+        mut headers: Headers,
+        body: Body,
+        deadline: Duration,
+    ) -> Result<PendingCommand, AircError> {
         let correlation_id = Uuid::new_v4();
         let deadline_at_ms = now_ms()? + deadline.as_millis() as u64;
         let __sub = airc_diagnostics::timing::start();
@@ -268,7 +283,7 @@ impl Airc {
             target.clone(),
             body,
             headers,
-            &room,
+            room,
         )
         .await?;
         __send.stop("airc.req.send_frame");

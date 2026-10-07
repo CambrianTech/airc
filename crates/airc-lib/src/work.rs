@@ -586,9 +586,58 @@ impl Airc {
         origin: airc_work::ClaimOrigin,
         selected_at_ms: Option<u64>,
     ) -> Result<ClaimId, AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
-        self.ensure_work_card_unclaimed(request.card_id).await?;
+        let room = self.current_room().await?;
+        self.claim_work_card_with_provenance_in(&room, request, origin, selected_at_ms)
+            .await
+    }
+
+    /// Claim a card on a SPECIFIC room's board without moving the current-room
+    /// pointer (card ad19de1a; the claim sibling of `heartbeat_work_claim_in`).
+    /// Same guard, gate and owner-resume rule, scoped to `room`.
+    pub async fn claim_work_card_with_provenance_in(
+        &self,
+        room: &Room,
+        request: ClaimWorkCard,
+        origin: airc_work::ClaimOrigin,
+        selected_at_ms: Option<u64>,
+    ) -> Result<ClaimId, AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
+        match self.claim_gate_in(room, request.card_id).await? {
+            ClaimGate::Resume(claim_id) => {
+                // Her own card, her own claim: renew it, never re-claim it. A new
+                // CardClaimed would set the card's state to Claimed and take a Review
+                // card out of the merge gate.
+                self.heartbeat_work_claim_in(
+                    room,
+                    HeartbeatWorkClaim {
+                        card_id: request.card_id,
+                        claim_id,
+                        ttl_ms: request.ttl_ms,
+                    },
+                )
+                .await?;
+                return Ok(claim_id);
+            }
+            ClaimGate::Takeover { prev, owner } => {
+                // Joel, 2026-10-06: anyone may take a held card at any time. The handover
+                // is on the record: the holder's claim released BY the taker, typed with
+                // whom it was taken from (never an id spelled into the reason), then the
+                // taker's claim. The projection accepts a release from anyone.
+                self.publish_work_event_in(
+                    room,
+                    &WorkEvent::ClaimReleased(ClaimReleased {
+                        card_id: request.card_id,
+                        claim_id: prev,
+                        owner: self.peer_id(),
+                        reason: Some("taken over".into()),
+                        released_at_ms: now_ms()?,
+                        taken_over_from: owner,
+                    }),
+                )
+                .await?;
+            }
+            ClaimGate::Fresh => {}
+        }
         let claim_id = ClaimId::new();
         let event = WorkEvent::CardClaimed(WorkCardClaimed {
             selected_at_ms,
@@ -599,7 +648,7 @@ impl Airc {
             claimed_at_ms: now_ms()?,
             origin,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(claim_id)
     }
 
@@ -668,6 +717,7 @@ impl Airc {
             owner: self.peer_id(),
             reason: request.reason,
             released_at_ms: now_ms()?,
+            taken_over_from: None,
         });
         self.publish_work_event_in(room, &event).await?;
         Ok(())
@@ -688,8 +738,18 @@ impl Airc {
     /// silently target a card from a different room — same guard
     /// `change_work_card_state` uses.
     pub async fn update_work_card(&self, request: UpdateWorkCard) -> Result<(), AircError> {
-        self.ensure_work_card_in_current_room(request.card_id)
-            .await?;
+        let room = self.current_room().await?;
+        self.update_work_card_in(&room, request).await
+    }
+
+    /// Amend a card on a SPECIFIC room's board without moving the current-room
+    /// pointer (card ad19de1a). Same guard as [`Airc::update_work_card`].
+    pub async fn update_work_card_in(
+        &self,
+        room: &Room,
+        request: UpdateWorkCard,
+    ) -> Result<(), AircError> {
+        self.ensure_work_card_in_room(room, request.card_id).await?;
         let event = WorkEvent::CardUpdated(airc_work::event::CardUpdated {
             claim_selection: None,
             card_id: request.card_id,
@@ -699,7 +759,7 @@ impl Airc {
             updated_by: self.peer_id(),
             updated_at_ms: now_ms()?,
         });
-        self.publish_work_event(&event).await?;
+        self.publish_work_event_in(room, &event).await?;
         Ok(())
     }
 
@@ -1382,6 +1442,9 @@ impl Airc {
                 .find(|claim| claim.card_id == card.card_id)
                 .cloned();
             let open = card.state == airc_work::CardState::Open && card.claim_id.is_none();
+            // A lapsed lease is claimable by anyone (a takeover for a stranger, a resume for
+            // its owner). A LIVE claim is never offered here: a deliberate claim may take
+            // it, but the queue never hands someone's live turn to whoever pulls next.
             let stale_claimable = query.include_stale_claims
                 && stale_claim.is_some()
                 && !matches!(
@@ -1498,46 +1561,79 @@ impl Airc {
         })
     }
 
-    async fn ensure_work_card_unclaimed(&self, card_id: WorkCardId) -> Result<(), AircError> {
-        let room = self.current_room().await?;
+    /// Whether a claim on `card_id` in `room` is a fresh claim or the owner resuming her own.
+    async fn claim_gate_in(
+        &self,
+        room: &Room,
+        card_id: WorkCardId,
+    ) -> Result<ClaimGate, AircError> {
         let board = self
-            .project_room_work_board(&room, WORK_MUTATION_PAGE_SIZE)
+            .project_room_work_board(room, WORK_MUTATION_PAGE_SIZE)
             .await?;
         let Some(card) = board.card(card_id) else {
             return Err(AircError::WorkCardNotInCurrentRoom {
                 card_id,
-                room_name: room.name,
+                room_name: room.name.clone(),
                 room_id: room.channel,
             });
         };
-        // Settled work is history, not backlog: a Review/Merged/Closed card is
-        // past claiming regardless of lease status. Live evidence (2026-07-24):
-        // personas kept re-claiming already-completed cards because this guard
-        // only checked lease expiry — the board read as open work forever.
-        // Reopening is an explicit `airc work state` transition, never a claim.
-        // The predicate lives on CardState so the surfaces that ADVERTISE
-        // claimability answer with the same rule this gate enforces.
-        if card.state.is_settled() {
-            return Err(AircError::WorkCardNotClaimable {
-                card_id,
-                state: card.state,
-            });
-        }
-        let now_ms = now_ms()?;
-        if card.claim_id.is_none()
-            || card
-                .claim_expires_at_ms
-                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
-        {
-            return Ok(());
-        }
-
-        Err(AircError::WorkCardAlreadyClaimed {
-            card_id,
-            claim_id: card.claim_id,
-            owner: card.owner,
-        })
+        claim_gate_for(card, self.peer_id())
     }
+}
+
+/// The claim gate over one card, pure so every branch is testable without peers.
+///
+/// - the owner with her claim standing resumes it (card 4fee35cf);
+/// - settled work is past claiming for everyone else;
+/// - a card someone else holds, live lease or lapsed, is taken over (Joel, 2026-10-06:
+///   "allow anyone to take it at any time"; durable ownership, card d826e5f1, is gone).
+///   The takeover releases the holder's claim on the record before claiming.
+fn claim_gate_for(card: &WorkCard, me: airc_core::PeerId) -> Result<ClaimGate, AircError> {
+    if let Some(claim_id) = owner_resumes(card, me) {
+        return Ok(ClaimGate::Resume(claim_id));
+    }
+    // Settled work is history, not backlog: a Review/Merged/Closed card is past
+    // claiming. Reopening is an explicit `airc work state` transition, never a claim.
+    if card.state.is_settled() {
+        return Err(AircError::WorkCardNotClaimable {
+            card_id: card.card_id,
+            state: card.state,
+        });
+    }
+    Ok(match card.claim_id {
+        None => ClaimGate::Fresh,
+        Some(prev) => ClaimGate::Takeover {
+            prev,
+            owner: card.owner,
+        },
+    })
+}
+
+/// What a claim request turns into once the gate has read the board.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimGate {
+    /// Mint a new claim on a card nobody holds.
+    Fresh,
+    /// Someone else holds the card: release their claim, attributed to the taker, then
+    /// mint a new one.
+    Takeover {
+        prev: ClaimId,
+        owner: Option<airc_core::PeerId>,
+    },
+    /// The caller owns this card and it still carries her claim: renew that claim.
+    Resume(ClaimId),
+}
+
+/// Card 4fee35cf. The owner coming back to her own card is a lease renewal, never
+/// a refusal, in any state short of Merged/Closed. Kimi's lease on her Review card
+/// lapsed, and her re-claim got WorkCardNotClaimable (29 of her 42 board calls
+/// failed on 2026-10-04). A stranger gets no such pass: settled cards stay past
+/// claiming for everyone else.
+fn owner_resumes(card: &WorkCard, me: airc_core::PeerId) -> Option<ClaimId> {
+    if card.owner != Some(me) || matches!(card.state, CardState::Merged | CardState::Closed) {
+        return None;
+    }
+    card.claim_id
 }
 
 /// Card 09fddedd — pure relink gate, extracted from
@@ -1591,6 +1687,196 @@ fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: card ad19de1a. A card on room A's board is claimed and amended
+    // from a scope whose current room is B, without moving the current-room pointer;
+    // the current-room verbs still refuse it, so the room is an explicit choice.
+    #[tokio::test]
+    async fn claim_and_update_act_on_a_named_rooms_board_without_moving_the_pointer() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room_a = airc.join("board-a").await.unwrap();
+        let card = airc
+            .create_work_card(CreateWorkCard::new(
+                RepoId::new("fixture/room-scoped").unwrap(),
+                "a card on A",
+                Priority::P2,
+            ))
+            .await
+            .unwrap();
+        let room_b = airc.join("board-b").await.unwrap();
+        assert_eq!(airc.current_room().await.unwrap().channel, room_b.channel);
+
+        let request = ClaimWorkCard {
+            card_id: card,
+            ttl_ms: 600_000,
+        };
+        assert!(
+            airc.claim_work_card(request).await.is_err(),
+            "the current-room claim must not reach A's card from B"
+        );
+        let claim = airc
+            .claim_work_card_with_provenance_in(
+                &room_a,
+                request,
+                airc_work::ClaimOrigin::Explicit,
+                None,
+            )
+            .await
+            .expect("a claim on A's board by name");
+        airc.update_work_card_in(
+            &room_a,
+            UpdateWorkCard::amend(card).with_title("renamed on A"),
+        )
+        .await
+        .expect("an update on A's board by name");
+
+        let board = airc.work_board_in(&room_a).await.unwrap();
+        let on_a = board.card(card).unwrap();
+        assert_eq!(on_a.claim_id, Some(claim));
+        assert_eq!(on_a.title, "renamed on A");
+        assert_eq!(
+            airc.current_room().await.unwrap().channel,
+            room_b.channel,
+            "acting on A never moves the pointer off B"
+        );
+    }
+
+    // what this catches: card 4fee35cf. Kimi's lease on her own Review card lapsed and
+    // her re-claim was refused WorkCardNotClaimable (29 of 42 board calls failed on
+    // 2026-10-04). The owner's re-claim renews HER claim and leaves the card in Review:
+    // a fresh CardClaimed would set state=Claimed and drop it out of the merge gate.
+    #[tokio::test]
+    async fn owner_resumes_her_own_review_card_after_her_lease_lapses() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room = airc.join("owner-resume").await.unwrap();
+        let repo = RepoId::new("fixture/owner-resume").unwrap();
+        let card = airc
+            .create_work_card(CreateWorkCard::new(repo, "her task", Priority::P1))
+            .await
+            .unwrap();
+        let claim = airc
+            .claim_work_card(ClaimWorkCard {
+                card_id: card,
+                ttl_ms: 1,
+            })
+            .await
+            .unwrap();
+        airc.publish_work_event_in(
+            &room,
+            &WorkEvent::CardStateChanged(CardStateChanged {
+                card_id: card,
+                state: CardState::Review,
+                changed_by: airc.peer_id(),
+                changed_at_ms: now_ms().unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let resumed = airc
+            .claim_work_card(ClaimWorkCard {
+                card_id: card,
+                ttl_ms: 600_000,
+            })
+            .await
+            .expect("the owner resumes her own Review card");
+        assert_eq!(resumed, claim, "her claim is renewed, not replaced");
+        let board = airc.work_board().await.unwrap();
+        let after = board.card(card).unwrap();
+        assert_eq!(
+            after.state,
+            CardState::Review,
+            "a resume must not demote Review"
+        );
+        assert_eq!(after.claim_id, Some(claim));
+        assert!(
+            after.claim_expires_at_ms.unwrap() > now_ms().unwrap(),
+            "lease is live again"
+        );
+    }
+
+    // what this catches: Joel, 2026-10-06, "allow anyone to take it at any time": a card
+    // someone else holds is taken over whether her lease is live or lapsed, and the
+    // takeover names the claim it releases; the owner still resumes her own; a settled
+    // card stays past claiming; nobody's claim means a fresh one.
+    #[test]
+    fn anyone_takes_over_a_held_card_live_or_lapsed_and_the_owner_resumes() {
+        let alice = airc_core::PeerId::from_u128(7);
+        let bob = airc_core::PeerId::from_u128(8);
+        let claim = ClaimId::new();
+        let mut card: WorkCard = serde_json::from_value(serde_json::json!({
+            "card_id": WorkCardId::new(), "repo": "fixture/r", "title": "t",
+            "priority": "p1", "state": "claimed", "created_by": alice,
+            "created_at_ms": 1, "updated_at_ms": 1
+        }))
+        .unwrap();
+        card.owner = Some(alice);
+        card.claim_id = Some(claim);
+        let takeover = ClaimGate::Takeover {
+            prev: claim,
+            owner: Some(alice),
+        };
+        card.claim_expires_at_ms = Some(u64::MAX); // live
+        assert_eq!(claim_gate_for(&card, bob).unwrap(), takeover);
+        card.claim_expires_at_ms = Some(2); // long lapsed
+        assert_eq!(claim_gate_for(&card, bob).unwrap(), takeover);
+        assert_eq!(
+            claim_gate_for(&card, alice).unwrap(),
+            ClaimGate::Resume(claim)
+        );
+        card.state = CardState::Review;
+        assert!(matches!(
+            claim_gate_for(&card, bob),
+            Err(AircError::WorkCardNotClaimable { .. })
+        ));
+        card.owner = None;
+        card.claim_id = None;
+        card.state = CardState::Open;
+        assert_eq!(claim_gate_for(&card, bob).unwrap(), ClaimGate::Fresh);
+    }
+
+    // what this catches: the owner pass is hers alone and stops at terminal states.
+    #[test]
+    fn only_the_owner_resumes_and_never_a_terminal_card() {
+        let me = airc_core::PeerId::from_u128(7);
+        let stranger = airc_core::PeerId::from_u128(8);
+        let claim = ClaimId::new();
+        let mut card: WorkCard = serde_json::from_value(serde_json::json!({
+            "card_id": WorkCardId::new(), "repo": "fixture/r", "title": "t",
+            "priority": "p1", "state": "review", "created_by": me,
+            "created_at_ms": 1, "updated_at_ms": 1
+        }))
+        .unwrap();
+        card.owner = Some(me);
+        card.claim_id = Some(claim);
+        assert_eq!(owner_resumes(&card, me), Some(claim));
+        assert_eq!(
+            owner_resumes(&card, stranger),
+            None,
+            "strangers get no pass"
+        );
+        for terminal in [CardState::Merged, CardState::Closed] {
+            card.state = terminal;
+            assert_eq!(
+                owner_resumes(&card, me),
+                None,
+                "{terminal:?} is past resuming"
+            );
+        }
+    }
 
     // what this catches: card89af25c7 — the real SDK must sign as its caller,
     // preserve the chosen room, and return the first receipt after claim closure.

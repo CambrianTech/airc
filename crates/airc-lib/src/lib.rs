@@ -173,7 +173,7 @@ pub use mesh_identity::{
     Source as MeshIdentitySource, DEFAULT_TTL_MS as MESH_IDENTITY_TTL_MS,
 };
 pub use peers::{
-    classify_peer_prune, EnrolledPeer, PeerPruneAction, PeerPruneVerdict,
+    classify_peer_prune, peer_trust_snapshot, EnrolledPeer, PeerPruneAction, PeerPruneVerdict,
     DEFAULT_PEER_STALE_AFTER_MS,
 };
 pub use publish::{PublishReceipt, PublishTarget};

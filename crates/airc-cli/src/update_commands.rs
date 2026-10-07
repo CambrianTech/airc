@@ -3,11 +3,64 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::update_shutdown::{status as daemon_status, stop as stop_daemon};
+
+/// Public setup already built and installed the binary. Reuse the updater's
+/// guarded shutdown/start/verification instead of leaving an old daemon alive.
+/// Explicit installation starts the service, including recovery from an
+/// interrupted adoption. Ordinary `update` retains its stopped-state policy.
+pub fn adopt_installed(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let airc_exe = env::current_exe()?;
+    adopt_installed_with_executable(home, &socket, &airc_exe)
+}
+
+fn adopt_installed_with_executable(
+    home: &Path,
+    socket: &Path,
+    airc_exe: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = installed_binary_sha(airc_exe).ok_or("Cannot verify installed AIRC build")?;
+    let maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    maintenance.clear_operator_stop()?;
+    if daemon_is_running(socket)? {
+        if daemon_build_matches(airc_exe, home, socket, &expected)? {
+            println!("daemon: installed build already running.");
+            retire_legacy_endpoints(airc_exe, home, socket, &expected)?;
+            return Ok(());
+        }
+        stop_daemon(socket)?;
+    }
+    restart_daemon(airc_exe, home, socket)?;
+    wait_daemon_ready(home, socket)?;
+    verify_daemon_build(airc_exe, home, socket, &expected)?;
+    retire_legacy_endpoints(airc_exe, home, socket, &expected)?;
+    println!("daemon: adopted installed build {expected} (verified).");
+    Ok(())
+}
+
+fn retire_legacy_endpoints(
+    airc_exe: &Path,
+    home: &Path,
+    canonical: &Path,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for endpoint in crate::update_legacy::verified_endpoints(home, canonical)? {
+        stop_daemon(&endpoint)?;
+        println!(
+            "daemon: retired verified legacy endpoint {}",
+            endpoint.display()
+        );
+    }
+    verify_daemon_build(airc_exe, home, canonical, expected)
+}
+
 pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
     let airc_exe = env::current_exe()?;
-    let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
+    // Fail before preparation for an unknown owner, but never carry this
+    // observation across a build: maintenance re-reads current state and intent.
+    daemon_is_running(&socket)?;
 
     let channel = update_channel();
 
@@ -49,105 +102,26 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     // test is what makes skipping safe — unchanged source AND a binary that
     // already reports it means there is genuinely nothing to do.
     if nothing_to_install(&before, &after, || smoke_test_new_binary(&airc_exe, &after)) {
-        println!("Already at {after} on channel {channel} — daemon left running.");
+        reconcile_current_daemon(&airc_exe, home, &socket, &after)?;
+        println!("Already at {after} on channel {channel}; installed and daemon state verified.");
         return Ok(());
     }
 
-    let prepared =
-        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
-    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
-
-    // What the OPERATOR is holding, read before we replace it. `before`/`after`
-    // above describe the git checkout; this describes the tool. They are
-    // independent, and the summary at the end has to speak about this one.
-    // (Canary's #1332 moved `prepare_build_source` before the no-op gate;
-    // this read only has to precede installation, which is what replaces
-    // the binary.)
-    let binary_before = installed_binary_sha(&airc_exe);
-
-    prepared.install_after(|| {
-        if daemon_was_running {
-            stop_daemon(&airc_exe, home, &socket)?;
-        }
-        Ok(())
-    })?;
-
-    // Prove the BINARY became `after` before claiming anything about it (#354).
-    //
-    // Everything above this line is a statement about a git checkout; the
-    // operator reads the lines below as statements about the tool they are
-    // holding. Those were allowed to disagree silently — and did, on a live
-    // peer node on 2026-08-07: `airc update` printed "Already at 1e2f424 …
-    // daemon: restarted." and `airc --version` on the very next line said
-    // *3 commits behind*. Both true, neither lying, describing different
-    // objects.
-    //
-    // The check itself was never missing. `run_auto_update` has smoke-tested
-    // since it was written (`smoke_test_new_binary`, with rollback). It was
-    // simply never wired into the MANUAL path — the one the staleness banner
-    // tells you to run, and therefore the one a human or an agent actually
-    // reaches for. Built, correct, and not called where it mattered.
-    //
-    // Deliberately NOT mirroring the auto path's rollback here: this path is
-    // entered on purpose by someone who can re-run it, and a rollback needs
-    // its own backup anchor + failure modes. Verification is what was missing;
-    // silently rolling back an operator's explicit action is a separate call.
-    //
-    // Nor does this SELF-HEAL, unlike the daemon check below — and the
-    // asymmetry is the point, not an oversight. Heal what has a known-safe
-    // idempotent remedy; report what needs a human decision. A stale daemon is
-    // the former: stop it, start it, done. A binary that did not land is
-    // usually the installer writing somewhere other than what the shell
-    // resolves, and re-running an installer that already did its job cannot fix
-    // a PATH. Retrying there would be theatre — it would burn minutes, change
-    // nothing, and teach the operator that the check is noise.
-    if !smoke_test_new_binary(&airc_exe, &after) {
-        return Err(format!(
-            "update did NOT take: the source reached {after}, but the binary at \
-             {} does not report it. Nothing verified this before, so this printed \
-             a success line instead. Check `which -a airc` — the installer may be \
-             writing somewhere other than the path your shell resolves.",
-            airc_exe.display()
-        )
-        .into());
-    }
-
-    // Report the BINARY's transition, not the checkout's (#354 follow-up).
-    //
-    // #354 made the update VERIFY the binary but left the summary branching on
-    // `before == after` — two git refs. Those describe the checkout, and the
-    // checkout can already be current while the binary is stale, so the two
-    // most different outcomes printed the SAME line:
-    //
-    //   nothing happened                     -> "Already at a08f3d3 on channel canary."
-    //   your binary was just replaced        -> "Already at a08f3d3 on channel canary."
-    //
-    // Measured on BigMama 2026-08-07, immediately after #354 landed: source was
-    // already at a08f3d3 (a manual pull had moved it), the installed binary was
-    // still 35d40b1, `airc update` rebuilt and installed a08f3d3 — and printed
-    // "Already at". The verification worked; the sentence describing it did not.
-    // An operator reading "Already at" reasonably concludes no work was done and
-    // does not restart anything that embeds the binary.
-    //
-    // Same defect as #354, one layer down: #354 fixed which object we CHECK,
-    // this fixes which object we TALK ABOUT. Both halves have to point at the
-    // tool the operator is holding.
+    let prepared = crate::update_artifact::PreparedInstall::prepare(
+        std::ffi::OsStr::new("bash"),
+        &build_dir,
+        &after,
+        &airc_exe,
+    )?;
+    let installed = install_prepared_update(&prepared, &airc_exe, home, &socket, &after)?;
     println!(
         "{}",
-        update_summary(binary_before.as_deref(), &before, &after, &channel)
+        update_summary(Some(&installed.previous_build), &before, &after, &channel)
     );
-    if daemon_was_running {
-        restart_daemon(&airc_exe, home, &socket)?;
-        wait_daemon_ready(&airc_exe, home, &socket)?;
-        // The NEXT link in the chain. `wait_daemon_ready` proves a daemon
-        // answers; it does not prove it is the daemon we just built. A stale
-        // process that survived `stop_daemon` answers IPC perfectly, so
-        // "daemon: restarted." was true and useless — the exact shape
-        // `check_daemon_build` in doctor.rs was written for after it went
-        // undetected on a live node for hours. That check only runs under
-        // `doctor --health`; update restarts the daemon and never asked.
-        verify_daemon_build(&airc_exe, home, &socket, &after)?;
+    if installed.daemon_restarted {
         println!("daemon: restarted (build verified).");
+    } else {
+        println!("daemon: stopped (left stopped).");
     }
     Ok(())
 }
@@ -216,7 +190,7 @@ fn prepare_build_source(
     channel: &str,
 ) -> Result<(PathBuf, String, String), Box<dyn std::error::Error>> {
     run_checked(
-        Command::new("git")
+        airc_core::process::background("git")
             .arg("-C")
             .arg(source)
             .args(["fetch", "--quiet", "origin", channel]),
@@ -247,12 +221,10 @@ fn prepare_build_source(
         // bare pull was repeating it.
         let origin_ref = format!("origin/{channel}");
         run_checked(
-            Command::new("git").arg("-C").arg(source).args([
-                "merge",
-                "--ff-only",
-                "--quiet",
-                &origin_ref,
-            ]),
+            airc_core::process::background("git")
+                .arg("-C")
+                .arg(source)
+                .args(["merge", "--ff-only", "--quiet", &origin_ref]),
             "git merge --ff-only (channel)",
         )?;
         let after = git_text(source, ["rev-parse", "--short", "HEAD"])?;
@@ -268,7 +240,7 @@ fn prepare_build_source(
         // auto path's no-op compare stays meaningful across runs.
         let before = git_text(&wt, ["rev-parse", "--short", "HEAD"]).unwrap_or_default();
         run_checked(
-            Command::new("git")
+            airc_core::process::background("git")
                 .arg("-C")
                 .arg(&wt)
                 .args(["reset", "--hard", &origin_ref]),
@@ -282,7 +254,7 @@ fn prepare_build_source(
             // registration so `worktree add` can't refuse.
             std::fs::remove_dir_all(&wt)?;
         }
-        let _ = Command::new("git")
+        let _ = airc_core::process::background("git")
             .arg("-C")
             .arg(source)
             .args(["worktree", "prune"])
@@ -292,13 +264,10 @@ fn prepare_build_source(
             .ok_or("update worktree path is not valid UTF-8")?
             .to_string();
         run_checked(
-            Command::new("git").arg("-C").arg(source).args([
-                "worktree",
-                "add",
-                "--detach",
-                &wt_str,
-                &origin_ref,
-            ]),
+            airc_core::process::background("git")
+                .arg("-C")
+                .arg(source)
+                .args(["worktree", "add", "--detach", &wt_str, &origin_ref]),
             "git worktree add (update worktree)",
         )?;
         let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
@@ -314,30 +283,25 @@ fn prepare_build_source(
 /// the backup if the new build is broken. So an auto-update can never
 /// leave a peer with a binary that compiles-but-doesn't-run.
 ///
-/// Flow: fetch + ff-pull the channel → if HEAD unchanged, nothing to do
-/// (the daemon is NEVER touched — see below) → else prepare a verified artifact,
-/// back up the installed binary to `airc.prev`, stop and install, smoke-test
-/// (the new binary's `version` reports the pulled SHA), and on failure
-/// restore `airc.prev`.
+/// Flow: fetch the channel; if source and installed binary are current, leave
+/// a stopped daemon stopped or verify the running revision. A reachable stale
+/// owner adopts the installed binary without rebuilding. Otherwise prepare a
+/// verified artifact, retain the original in an owned transaction directory,
+/// stop/install/restart, and smoke-test. Failure restores the original file
+/// object without copying over the mapped executable.
 ///
-/// The no-op path must not restart the daemon: `git fetch`/`pull` only
-/// touch the source checkout, never the running binary, so only the
-/// rebuild+swap needs the daemon down. The pre-fix shape stopped the
-/// daemon BEFORE the SHA compare, which killed the transport owner every
-/// hourly "nothing to auto-update" tick — wiping in-process room state
-/// and blinding every subscribed client for the restart window
-/// (continuum blind-room incidents #2/#3, 2026-07-11/12).
+/// A matching-current daemon must not restart on a no-op update. The old
+/// stop-before-compare ordering caused recurring transport blackouts even when
+/// nothing changed. Running-build reconciliation is necessary too: a replaced
+/// file does not prove an already-running process adopted that file.
 ///
-/// Platform note: on Windows the live `airc.exe` is locked while this
-/// process runs, so the in-place reinstall (and thus the swap) inherits
-/// the same constraint as `run_update` — most valuable on the macOS /
-/// Linux grid nodes today. The rollback path is a no-op there because no
-/// swap occurred.
+/// Windows rollback restores the original file object by rename. It must not
+/// overwrite the executable from which this updater is still running.
 pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
     let airc_exe = env::current_exe()?;
-    let daemon_was_running = daemon_is_running(&airc_exe, home, &socket)?;
+    daemon_is_running(&socket)?;
 
     let channel = update_channel();
     // Channel-pinned build source: fetch/reset only ever touch the channel
@@ -353,11 +317,10 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     // and left the stale daemon running on every cadence. The smoke test asks
     // the binary on disk what it is; only its answer makes skipping safe.
     if nothing_to_install(&before, &after, || smoke_test_new_binary(&airc_exe, &after)) {
-        // Nothing pulled AND the installed binary reports it → nothing to
-        // rebuild → the daemon was never stopped and MUST NOT be restarted.
-        // Restart-on-no-op is the bug this ordering exists to prevent (hourly
-        // transport-owner death).
-        println!("Already at {after} on channel {channel} — nothing to auto-update.");
+        // The installed file is current; preserve a matching or stopped owner
+        // and adopt only a reachable stale owner under maintenance.
+        reconcile_current_daemon(&airc_exe, home, &socket, &after)?;
+        println!("Already at {after} on channel {channel}; installed and daemon state verified.");
         return Ok(());
     }
     if before == after {
@@ -366,116 +329,145 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
         );
     }
 
-    let prepared =
-        crate::update_artifact::PreparedInstall::prepare(&installer_shell(), &build_dir, &after)?;
-    let _maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    let prepared = crate::update_artifact::PreparedInstall::prepare(
+        std::ffi::OsStr::new("bash"),
+        &build_dir,
+        &after,
+        &airc_exe,
+    )?;
+    let installed = install_prepared_update(&prepared, &airc_exe, home, &socket, &after)?;
+    println!(
+        "Auto-updated: {} -> {after} (binary verified; previous file at {}).",
+        installed.previous_build,
+        installed.previous_path.display()
+    );
+    if installed.daemon_restarted {
+        println!("daemon: restarted (build verified).");
+    } else {
+        println!("daemon: stopped (left stopped).");
+    }
+    Ok(())
+}
 
-    // Back up the live binary BEFORE stopping the daemon — this is the rollback
-    // anchor. Copying a running exe for read is allowed on every platform.
-    let prev = airc_exe.with_file_name("airc.prev");
-    std::fs::copy(&airc_exe, &prev).map_err(|e| {
-        format!(
-            "could not back up the current binary to {}: {e}",
-            prev.display()
-        )
-    })?;
+/// Failed update with a verified restored transport owner. Only an internal
+/// owned session may use this typed outcome to preserve children on failure.
+#[derive(Debug)]
+struct RecoveredUpdateFailure(String);
+impl std::fmt::Display for RecoveredUpdateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for RecoveredUpdateFailure {}
+#[cfg(any(windows, test))]
+pub(crate) fn restored_runtime_verified(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.downcast_ref::<RecoveredUpdateFailure>().is_some()
+}
 
-    // Get the live exe OUT OF THE WAY before the installer writes.
-    //
-    // Windows refuses to overwrite a running executable (`Device or resource
-    // busy` / ERROR_SHARING_VIOLATION) — and `stop_daemon` above does not clear
-    // it, because other processes share this binary: other scopes' daemons, a
-    // `join` stream, the ACP bridge. Measured on BigMama: two `airc.exe` plus
-    // `airc-acp-bridge.exe` still holding it after a clean stop.
-    //
-    // So the installer's copy silently failed, the smoke-test then failed
-    // (correctly — the exe still reported the OLD sha), and the whole thing
-    // reported a ROLLBACK. `airc update` has never once updated a Windows box,
-    // and it never said so: the rollback branch's own comment concedes the
-    // reinstall "couldn't replace the locked live exe in the first place" and
-    // treats that as fine.
-    //
-    // Windows DOES allow renaming a running exe — the handle follows the inode,
-    // the process keeps running from the renamed file. That is the standard
-    // self-update idiom on this platform. Move it aside and the installer writes
-    // to a free path.
-    //
-    // Unix does not need this (write-over-running is legal there), but it is
-    // harmless and one code path beats two.
-    let displaced = airc_exe.with_file_name(format!("airc.old-{before}"));
-    let mut displaced_current = false;
+struct InstalledUpdate {
+    previous_build: String,
+    previous_path: PathBuf,
+    daemon_restarted: bool,
+}
+
+/// Both public update modes publish the same verified artifact transaction.
+/// Preparation remains outside the maintenance window; intentionally stopped
+/// daemons stay stopped. A failed publication restores and verifies the owned
+/// original before reporting the original installer failure.
+fn install_prepared_update(
+    prepared: &crate::update_artifact::PreparedInstall,
+    airc_exe: &Path,
+    home: &Path,
+    socket: &Path,
+    expected: &str,
+) -> Result<InstalledUpdate, Box<dyn std::error::Error>> {
+    let maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    // Preparation can outlive an operator stop or resume. Decide from current
+    // owner state only after acquiring maintenance, and retain that guard
+    // through publication and recovery so no newer intent can be overwritten.
+    let operator_stopped = maintenance.operator_stopped()?;
+    let daemon_was_running = daemon_is_running(socket)?;
+    let restart_owner = daemon_was_running && !operator_stopped;
+
+    let previous_build = installed_binary_sha(airc_exe)
+        .ok_or("cannot verify current binary before update; nothing displaced")?;
+    let mut swap = None;
+    let mut stopped = false;
     let installed = prepared.install_after(|| {
         if daemon_was_running {
-            stop_daemon(&airc_exe, home, &socket)?;
+            stop_daemon(socket)?;
+            stopped = true;
         }
-        let _ = std::fs::remove_file(&displaced); // a previous update's leftover
-        if let Err(e) = std::fs::rename(&airc_exe, &displaced) {
-            return Err(format!(
-                "could not move the live binary aside before installing ({e}). \
-             {} is still the running executable and nothing was changed. \
-             Something holds it that a rename cannot displace — check for \
-             other airc processes ({}).",
-                airc_exe.display(),
-                "airc.exe, airc-acp-bridge.exe"
-            )
-            .into());
-        }
-
-        displaced_current = true;
+        swap = Some(crate::update_rollback::BinarySwap::displace(
+            airc_exe,
+            prepared.artifact(),
+        )?);
         Ok(())
     });
-
-    // A failed stop or rename never entered installation. Preserve that error
-    // and the unchanged live binary instead of attempting installer rollback.
-    if !displaced_current {
-        return installed;
-    }
-
-    // If the installer did not produce a binary, put the original back NOW —
-    // otherwise the rename above has left the box with no `airc` on PATH at
-    // all, which is strictly worse than a stale one.
-    if installed.is_err() || !airc_exe.exists() {
-        let _ = std::fs::rename(&displaced, &airc_exe);
-    }
-
-    // Smoke-test: the new binary must RUN and report the SHA we pulled —
-    // a build that compiled but is broken (or didn't actually replace the
-    // binary) fails here and triggers rollback.
-    let smoke_ok = installed.is_ok() && smoke_test_new_binary(&airc_exe, &after);
-
-    if smoke_ok {
-        println!(
-            "Auto-updated: {before} -> {after} (smoke-test passed; backup at {}).",
-            prev.display()
-        );
-        if daemon_was_running {
-            restart_daemon(&airc_exe, home, &socket)?;
-            wait_daemon_ready(&airc_exe, home, &socket)?;
+    let Some(swap) = swap else {
+        // A failed stop or displacement did not publish a candidate. Do not
+        // overwrite the original with a backup or act on an unknown owner.
+        if stopped && restart_owner {
+            if let Err(ref failure) = installed {
+                restart_daemon(airc_exe, home, socket).map_err(|error|
+                    format!("update failed before displacement ({failure}); original daemon restart failed: {error}"))?;
+                wait_daemon_ready(home, socket)
+                    .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
+                    .map_err(|error| format!("update failed before displacement ({failure}); original daemon recovery verification failed: {error}"))?;
+                return Err(Box::new(RecoveredUpdateFailure(format!(
+                    "update failed before displacement ({failure}); original daemon restored and verified"
+                ))));
+            }
         }
-        Ok(())
-    } else {
-        eprintln!("⚠ new build did not pass the smoke-test — ROLLING BACK to the previous binary.");
-        // Restore the known-good binary. (No-op-safe on Windows where the
-        // reinstall couldn't replace the locked live exe in the first place.)
-        if let Err(e) = std::fs::copy(&prev, &airc_exe) {
-            return Err(format!(
-                "auto-update FAILED and rollback ALSO failed ({e}); \
-                 your previous binary is at {} — restore it manually",
-                prev.display()
-            )
-            .into());
-        }
-        if daemon_was_running {
-            // Restart on the rolled-back (known-good) binary.
-            let _ = restart_daemon(&airc_exe, home, &socket);
-            let _ = wait_daemon_ready(&airc_exe, home, &socket);
-        }
-        Err(format!(
-            "auto-update rolled back: the {after} build failed the smoke-test; \
-             restored the previous binary ({before})"
+        installed?;
+        return Err("installer returned without an owned binary transaction".into());
+    };
+
+    let failure = match installed {
+        Err(error) => Some(format!("installer failed: {error}")),
+        Ok(()) if !smoke_test_new_binary(airc_exe, expected) => Some(format!(
+            "installed binary does not run and report expected build {expected}"
+        )),
+        Ok(()) => None,
+    };
+    if let Some(failure) = failure {
+        eprintln!("Update failed ({failure}); restoring the owned previous binary.");
+        swap.rollback().map_err(|error| {
+            format!(
+            "update failed ({failure}); rollback failed ({error}); previous binary retained at {}",
+            swap.previous().display()
         )
-        .into())
+        })?;
+        if !smoke_test_new_binary(airc_exe, &previous_build) {
+            return Err(format!("update failed ({failure}); original file restored but build {previous_build} could not be verified").into());
+        }
+        if restart_owner {
+            restart_daemon(airc_exe, home, socket).map_err(|error| format!(
+                "update failed ({failure}); original build restored, but daemon restart failed: {error}"
+            ))?;
+            wait_daemon_ready(home, socket)
+                .and_then(|()| verify_daemon_build(airc_exe, home, socket, &previous_build))
+                .map_err(|error| format!("update failed ({failure}); original build restored, but daemon recovery verification failed: {error}"))?;
+            return Err(Box::new(RecoveredUpdateFailure(format!(
+                "update failed ({failure}); previous binary {previous_build} and daemon restored and verified"
+            ))));
+        }
+        return Err(format!(
+            "update failed ({failure}); previous binary {previous_build} restored and verified"
+        )
+        .into());
     }
+
+    if restart_owner {
+        restart_daemon(airc_exe, home, socket)?;
+        wait_daemon_ready(home, socket)?;
+        verify_daemon_build(airc_exe, home, socket, expected)?;
+    }
+    Ok(InstalledUpdate {
+        previous_build,
+        previous_path: swap.previous().to_owned(),
+        daemon_restarted: restart_owner,
+    })
 }
 
 /// THE skip rule, one place for `airc update` and `airc update --auto` (#354, and
@@ -496,7 +488,10 @@ fn nothing_to_install(
 /// and is the build we intended. Any failure (won't run, wrong/old SHA,
 /// unparseable) returns false → the caller rolls back.
 fn smoke_test_new_binary(airc_exe: &Path, expected_short: &str) -> bool {
-    let Ok(output) = Command::new(airc_exe).arg("version").output() else {
+    let Ok(output) = airc_core::process::background(airc_exe)
+        .arg("version")
+        .output()
+    else {
         return false;
     };
     if !output.status.success() {
@@ -514,7 +509,10 @@ fn smoke_test_new_binary(airc_exe: &Path, expected_short: &str) -> bool {
 /// exactly the case where an update matters most, so callers must treat `None`
 /// as "unknown", never as "unchanged".
 fn installed_binary_sha(airc_exe: &Path) -> Option<String> {
-    let output = Command::new(airc_exe).arg("version").output().ok()?;
+    let output = airc_core::process::background(airc_exe)
+        .arg("version")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -577,48 +575,32 @@ fn smoke_sha_matches(installed_sha: &str, expected_short: &str) -> bool {
         && (installed_sha.starts_with(expected_short) || expected_short.starts_with(installed_sha))
 }
 
-fn daemon_is_running(
-    airc_exe: &Path,
-    home: &Path,
-    socket: &Path,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    Ok(daemon_command(airc_exe, home, "ping", socket)
-        .output()?
-        .status
-        .success())
+fn daemon_is_running(socket: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(daemon_status(socket)?.is_some())
 }
 
-fn stop_daemon(
+/// A current installed file can coexist with an older running owner. Observe
+/// again under maintenance before acting; a deliberately stopped owner stays
+/// stopped, and a matching owner never pays a restart blackout.
+fn reconcile_current_daemon(
     airc_exe: &Path,
     home: &Path,
     socket: &Path,
+    expected: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Capture before requesting stop: the PID file is removed during graceful
-    // shutdown, and an open process handle avoids PID-reuse races on Windows.
-    #[cfg(windows)]
-    let exiting = crate::update_shutdown::DaemonExit::capture(
-        &airc_lib::machine_account_home(home).join("daemon.pid"),
-    )?;
-    let mut command = daemon_command(airc_exe, home, "stop", socket);
-    let stop_result = run_checked(&mut command, "airc stop before update");
-    #[cfg(not(windows))]
-    stop_result?;
-    #[cfg(windows)]
-    {
-        // Shutdown can close IPC before delivering its reply. Only the pinned
-        // process's confirmed exit permits proceeding after a failed response.
-        exiting.wait(Duration::from_secs(20))?;
-        if let Err(error) = stop_result {
-            eprintln!("Stop response failed ({error}), but the original daemon has exited.");
-        }
+    let maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    let operator_stopped = maintenance.operator_stopped()?;
+    if !daemon_is_running(socket)? {
+        println!("daemon: stopped (left stopped).");
+        return Ok(());
     }
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while daemon_is_running(airc_exe, home, socket)? {
-        if Instant::now() >= deadline {
-            return Err("daemon still answers after stop; update not installed".into());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    if operator_stopped {
+        stop_daemon(socket)?;
+        println!("daemon: stopped (operator stop retained).");
+        return Ok(());
     }
+    verify_daemon_build(airc_exe, home, socket, expected)?;
+    println!("daemon: running build {expected} verified.");
     Ok(())
 }
 
@@ -650,11 +632,7 @@ fn spawn_restarted_daemon(
     Ok(())
 }
 
-fn wait_daemon_ready(
-    airc_exe: &Path,
-    home: &Path,
-    socket: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_daemon_ready(home: &Path, socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // what this catches: the same cold-start-too-short bug #1211 fixed
     // for `ensure_daemon_running` (5s → 20s). A freshly rebuilt daemon
     // re-runs SQLite migrations + identity load + substrate `Airc::open`
@@ -665,7 +643,7 @@ fn wait_daemon_ready(
     // still surfacing a genuinely dead daemon.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if daemon_is_running(airc_exe, home, socket)? {
+        if daemon_is_running(socket)? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -788,7 +766,7 @@ fn verify_daemon_build(
     socket: &Path,
     expected: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if daemon_build_matches(airc_exe, home, socket, expected) {
+    if daemon_build_matches(airc_exe, home, socket, expected)? {
         return Ok(());
     }
 
@@ -797,10 +775,11 @@ fn verify_daemon_build(
          once more before reporting anything (a process that survived the stop \
          answers IPC just fine)."
     );
+    stop_daemon(socket)?;
     restart_daemon(airc_exe, home, socket)?;
-    wait_daemon_ready(airc_exe, home, socket)?;
+    wait_daemon_ready(home, socket)?;
 
-    if daemon_build_matches(airc_exe, home, socket, expected) {
+    if daemon_build_matches(airc_exe, home, socket, expected)? {
         eprintln!("✓ self-healed: the daemon is now running {expected}.");
         return Ok(());
     }
@@ -816,67 +795,28 @@ fn verify_daemon_build(
     .into())
 }
 
-/// Whether the daemon reachable on `socket` reports `expected` as its build.
-///
-/// `false` when it cannot be asked or reports nothing — an unverifiable daemon
-/// is not a verified one, and this is the predicate a heal decision hangs off,
-/// so "I don't know" must never read as "fine".
-fn daemon_build_matches(airc_exe: &Path, home: &Path, socket: &Path, expected: &str) -> bool {
-    let Ok(output) = daemon_command(airc_exe, home, "status", socket).output() else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    match parse_build_sha(&stdout) {
-        Some(sha) => smoke_sha_matches(&sha, expected),
-        None => false,
-    }
-}
-
-/// The shell used to run install.sh during `airc update`.
-///
-/// On Windows, a plain `bash` resolves to `C:\Windows\System32\bash.exe`
-/// — the WSL launcher — which fails with "Windows Subsystem for Linux has
-/// no installed distributions" when no distro is present, so `airc
-/// update` died at the reinstall step (caught live 2026-06-13). Prefer
-/// the Git-for-Windows bash derived from `git --exec-path` (git is an
-/// airc prereq). On Unix there is no `bin/bash.exe`, so this finds
-/// nothing and the caller falls back to plain `bash` — unchanged.
-fn installer_shell() -> std::ffi::OsString {
-    if let Some(bash) = git_bundled_bash() {
-        return bash.into_os_string();
-    }
-    std::ffi::OsString::from("bash")
-}
-
-fn git_bundled_bash() -> Option<PathBuf> {
-    let output = Command::new("git").arg("--exec-path").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let exec = String::from_utf8(output.stdout).ok()?;
-    bash_in_git_root(Path::new(exec.trim()))
-}
-
-/// Walk up from a git exec-path (e.g. `.../Git/mingw64/libexec/git-core`)
-/// looking for a bundled `bin/bash.exe` or `usr/bin/bash.exe` under any
-/// ancestor. Pure path logic so it is testable on every platform.
-fn bash_in_git_root(exec_path: &Path) -> Option<PathBuf> {
-    exec_path.ancestors().find_map(|root| {
-        ["bin/bash.exe", "usr/bin/bash.exe"]
-            .iter()
-            .map(|rel| root.join(rel))
-            .find(|candidate| candidate.is_file())
-    })
+/// IPC observation failures are errors, not stale-build signals authorizing
+/// a restart. A reachable owner predating revision metadata needs adoption.
+fn daemon_build_matches(
+    _airc_exe: &Path,
+    _home: &Path,
+    socket: &Path,
+    expected: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let status = daemon_status(socket)?.ok_or("daemon disappeared during build verification")?;
+    // Older reachable daemons predate build metadata. They need adoption too;
+    // unlike an IPC failure, a valid status response proves an owner exists.
+    Ok(status
+        .build_commit
+        .as_deref()
+        .is_some_and(|sha| smoke_sha_matches(sha, expected)))
 }
 
 fn git_text<const N: usize>(
     source: &Path,
     args: [&str; N],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
+    let output = airc_core::process::background("git")
         .arg("-C")
         .arg(source)
         .args(args)
@@ -913,10 +853,21 @@ fn command_error(label: &str, output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restored_owner_handoff_requires_typed_verified_failure() {
+        let error =
+            super::RecoveredUpdateFailure("installer failed; daemon restored and verified".into());
+        assert!(super::restored_runtime_verified(&error));
+        assert_eq!(
+            error.to_string(),
+            "installer failed; daemon restored and verified"
+        );
+        let unverified: Box<dyn std::error::Error> = "daemon restored and verified".into();
+        assert!(!super::restored_runtime_verified(unverified.as_ref()));
+    }
+
     use super::*;
 
-    // Regression for 2ec5d74f: a successful update exited, but its Windows daemon
-    // inherited captured pipe writers and kept the caller waiting for EOF.
     #[test]
     fn restarted_daemon_does_not_hold_updater_output_open() {
         use std::io::{Read, Write};
@@ -955,7 +906,7 @@ mod tests {
         }
 
         if env::var(MODE).as_deref() == Ok("launcher") {
-            let mut command = Command::new(env::current_exe().unwrap());
+            let mut command = airc_core::process::background(env::current_exe().unwrap());
             command
                 .args(["--exact", TEST, "--nocapture"])
                 .env(MODE, "daemon");
@@ -968,7 +919,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut launcher = Command::new(env::current_exe().unwrap());
+        let mut launcher = airc_core::process::background(env::current_exe().unwrap());
         launcher
             .args(["--exact", TEST, "--nocapture"])
             .env(MODE, "launcher")
@@ -977,11 +928,6 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            launcher.creation_flags(0x08000000); // CREATE_NO_WINDOW for the fixture caller.
-        }
         let child = launcher.spawn().unwrap();
         let (output_tx, output_rx) = mpsc::channel();
         let collector = std::thread::spawn(move || {
@@ -1172,32 +1118,6 @@ mod tests {
                 );
             },
         );
-    }
-
-    #[test]
-    fn bash_in_git_root_finds_bundled_bash() {
-        // what this catches: airc update finding Git-for-Windows' bash via
-        // git --exec-path instead of invoking the System32 WSL launcher
-        // (regression for the 2026-06-13 "WSL has no distributions" bug).
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path();
-        std::fs::create_dir_all(root.join("mingw64").join("libexec").join("git-core")).unwrap();
-        std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::fs::write(root.join("bin").join("bash.exe"), b"#!/bin/sh\n").unwrap();
-        let exec = root.join("mingw64").join("libexec").join("git-core");
-        assert_eq!(
-            bash_in_git_root(&exec).unwrap(),
-            root.join("bin").join("bash.exe")
-        );
-    }
-
-    #[test]
-    fn bash_in_git_root_none_when_absent() {
-        // what this catches: no false positive when no bundled bash exists,
-        // so installer_shell falls back to plain `bash` (Unix path).
-        let temp = tempfile::TempDir::new().unwrap();
-        let exec = temp.path().join("mingw64").join("libexec").join("git-core");
-        assert!(bash_in_git_root(&exec).is_none());
     }
 
     #[test]

@@ -454,7 +454,7 @@ pub(crate) fn baseline_failing_names(
     runs: &[crate::gh_client::GhCheck],
 ) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    for c in runs {
+    for c in current_runs(runs) {
         let conc_upper = c
             .conclusion
             .as_deref()
@@ -467,6 +467,36 @@ pub(crate) fn baseline_failing_names(
         }
     }
     set
+}
+
+/// The runs that speak for a revision: a check re-run on the same head
+/// supersedes its earlier runs of the same name, the rule GitHub's own
+/// required checks apply. Without it, a force-push's cancelled runs stayed
+/// "failing" beside their green successors forever (airc #1539: 13 cancelled,
+/// all 15 latest green, merge refused). Fail-closed: a run is dropped only
+/// for a same-named run that provably started later; a missing name or
+/// timestamp, or a tie, keeps both.
+fn current_runs(
+    runs: &[crate::gh_client::GhCheck],
+) -> impl Iterator<Item = &crate::gh_client::GhCheck> {
+    let started = |c: &crate::gh_client::GhCheck| {
+        c.started_at
+            .as_deref()
+            .and_then(airc_lib::gh::client::parse_iso_timestamp_ms)
+    };
+    runs.iter().filter(move |earlier| {
+        !runs.iter().any(|later| {
+            match (
+                later.name.as_deref(),
+                earlier.name.as_deref(),
+                started(later),
+                started(earlier),
+            ) {
+                (Some(a), Some(b), Some(l), Some(e)) => a == b && l > e,
+                _ => false,
+            }
+        })
+    })
 }
 
 /// Decide whether a PR is ready to merge, given the parsed `gh pr
@@ -538,7 +568,7 @@ pub(crate) fn evaluate_gh_view(
     let mut inherited_failures = 0usize;
     let mut active_pending = 0usize;
     let mut timed_out_pending = 0usize;
-    for c in rollup {
+    for c in current_runs(rollup) {
         match c.conclusion.as_deref() {
             Some("SUCCESS") | Some("NEUTRAL") | Some("SKIPPED") => {}
             Some("FAILURE") | Some("CANCELLED") | Some("TIMED_OUT") => {
@@ -967,6 +997,57 @@ mod tests {
         }));
         assert!(matches!(
             evaluate_gh_view(&view, &empty_baseline(), empty_policy()),
+            GateResult::NotReady(_)
+        ));
+    }
+
+    // regression for airc #1539: a force-push's cancelled runs stood beside
+    // their green re-runs and the gate refused "13 failing check(s)".
+    // what this catches: a superseded run no longer votes, a re-run that is
+    // still red still blocks, and a run without a timestamp is never dropped.
+    #[test]
+    fn only_the_latest_run_of_each_check_votes() {
+        let superseded = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"name": "cargo test", "conclusion": "CANCELLED", "status": "COMPLETED",
+                 "startedAt": "2026-10-05T15:59:40Z"},
+                {"name": "cargo test", "conclusion": "SUCCESS", "status": "COMPLETED",
+                 "startedAt": "2026-10-05T16:05:00Z"},
+            ]
+        }));
+        assert!(matches!(
+            evaluate_gh_view(&superseded, &empty_baseline(), empty_policy()),
+            GateResult::Green
+        ));
+
+        let rerun_still_red = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"name": "cargo test", "conclusion": "SUCCESS", "status": "COMPLETED",
+                 "startedAt": "2026-10-05T15:59:40Z"},
+                {"name": "cargo test", "conclusion": "FAILURE", "status": "COMPLETED",
+                 "startedAt": "2026-10-05T16:05:00Z"},
+            ]
+        }));
+        assert!(matches!(
+            evaluate_gh_view(&rerun_still_red, &empty_baseline(), empty_policy()),
+            GateResult::NotReady(_)
+        ));
+
+        let undated = parse(json!({
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"name": "cargo test", "conclusion": "CANCELLED", "status": "COMPLETED"},
+                {"name": "cargo test", "conclusion": "SUCCESS", "status": "COMPLETED",
+                 "startedAt": "2026-10-05T16:05:00Z"},
+            ]
+        }));
+        assert!(matches!(
+            evaluate_gh_view(&undated, &empty_baseline(), empty_policy()),
             GateResult::NotReady(_)
         ));
     }

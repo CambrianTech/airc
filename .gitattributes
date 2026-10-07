@@ -1,0 +1,2 @@
+# Git Bash executes shared setup directly; CRLF shell files are not executable.
+*.sh text eol=lf

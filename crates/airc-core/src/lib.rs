@@ -34,13 +34,16 @@ pub mod cursor;
 pub mod datetime;
 pub mod doctrine;
 pub mod filter;
+pub mod gh_executable;
 pub mod headers;
 pub mod humanhash;
 pub mod identity;
 pub mod ids;
 pub mod persona;
+pub mod process;
 pub mod receipt;
 pub mod scoped_state;
+pub mod shown_id;
 pub mod temp_home;
 pub mod transcript;
 

@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use airc_bus::DurableSink;
 use airc_lib::{Body, EventFilter, HeaderFilter, TranscriptEvent, TranscriptKind};
 use serde::Serialize;
 
@@ -11,6 +12,35 @@ use crate::events_cli::CliTranscriptKind;
 struct EventsListJson<'a> {
     count: usize,
     events: &'a [TranscriptEvent],
+}
+
+pub async fn run_contains(
+    home: &Path,
+    event_id: uuid::Uuid,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database = airc_lib::machine_account_home(home).join("events.sqlite");
+    let store = airc_store::SqliteDurableSink::open_read_only_path(&database).await?;
+    let present = store
+        .contains(airc_core::EventId::from_uuid(event_id))
+        .await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "event_id": event_id,
+                "database": database,
+                "present": present,
+            })
+        );
+    } else {
+        println!(
+            "event {event_id}: present={present} ({})",
+            database.display()
+        );
+    }
+    Ok(())
 }
 
 pub async fn run_list(
