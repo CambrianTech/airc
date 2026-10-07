@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use airc_ipc::DaemonClient;
+use airc_ipc::{ClientError, DaemonClient};
 
 use super::{short_sha, Check, CheckConfig, CheckContext, Finding};
 
@@ -54,6 +54,9 @@ async fn check_daemon(home: &Path) -> Vec<Finding> {
             "daemon",
             format!("responding on {}", socket.display()),
         )],
+        Err(error) if ipc_permission_denied(&error) => {
+            vec![inaccessible_daemon(&socket, &error)]
+        }
         Err(_) if socket.exists() => vec![Finding::warn(
             "daemon",
             format!(
@@ -70,6 +73,19 @@ async fn check_daemon(home: &Path) -> Vec<Finding> {
             "not running (`airc join` will spawn it)",
         )],
     }
+}
+
+fn ipc_permission_denied(error: &ClientError) -> bool {
+    matches!(error, ClientError::NotConnected(io) | ClientError::Io(io)
+        if io.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+fn inaccessible_daemon(socket: &Path, error: &ClientError) -> Finding {
+    Finding::blocked(
+        "daemon",
+        format!("IPC access denied at {}: {error}; daemon liveness is UNKNOWN", socket.display()),
+        "inspect the existing daemon's Windows account/session and IPC permissions; do not spawn a second daemon or delete identity/trust state",
+    )
 }
 
 /// Outcome of comparing the RUNNING daemon's reported build against the
@@ -159,6 +175,34 @@ pub(super) async fn check_daemon_build(home: &Path) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn inaccessible_daemon_is_not_eligible_for_socket_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let error =
+            ClientError::NotConnected(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let finding = inaccessible_daemon(&home.path().join("daemon.sock"), &error);
+        assert_eq!(finding.status, super::super::Status::Blocked);
+        assert!(finding.detail.contains("liveness is UNKNOWN"));
+        assert!(super::super::apply_fixes(home.path(), &[finding])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn inaccessible_daemon_is_not_an_absent_daemon() {
+        for error in [
+            ClientError::NotConnected(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            ClientError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ] {
+            assert!(ipc_permission_denied(&error));
+        }
+        assert!(!ipc_permission_denied(&ClientError::NotConnected(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        assert!(!ipc_permission_denied(&ClientError::Timeout));
+    }
 
     #[test]
     fn daemon_build_stale_when_daemon_lags_binary() {

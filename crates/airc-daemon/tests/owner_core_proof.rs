@@ -24,7 +24,7 @@ use airc_bus::envelope::{DeliveryClass, Envelope, Kind};
 use airc_core::{HeaderFilter, Headers, PeerId, RoomId};
 use airc_daemon::{run, DaemonRuntimeInfo, DaemonState};
 use airc_ipc::client::RpcPhase;
-use airc_ipc::codec::read_frame;
+use airc_ipc::codec::{read_frame, read_response_frame};
 use airc_ipc::{
     AttachRequest, DaemonClient, InboxRequest, IpcDelivery, IpcKind, IpcTarget, PublishRequest,
     Request, Response, SendRequest,
@@ -37,8 +37,109 @@ use tokio::task::JoinHandle;
 /// A live daemon on a Unix socket, owning a real router + SQLite ORM.
 struct TestDaemon {
     socket: PathBuf,
+    state: Arc<DaemonState>,
     handle: JoinHandle<()>,
     _home: tempfile::TempDir,
+}
+
+/// Serial in-memory codec costs; excludes IPC scheduling, routing and storage.
+/// Each phase includes its ordinary allocation/drop costs. Not a CPU profile.
+#[tokio::test]
+#[ignore = "manual codec phase measurement"]
+async fn bench_stream_codec_phases() {
+    use airc_ipc::codec::{encode_event_frame_payload, encode_frame_payload, write_frame};
+    use std::hint::black_box;
+
+    const REPEATS: u32 = 512;
+    for payload_len in [256usize, 65_536] {
+        let env = Envelope::new(
+            RoomId::new(),
+            (PeerId::new(), airc_core::ClientId::new()),
+            Kind::Event,
+            DeliveryClass::StreamChunk,
+            vec![0x42; payload_len].into(),
+        );
+        let encoded = airc_wire::encode(&env);
+        let response = Response::event_ref(&encoded);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &response).await.unwrap();
+        let decoded: Response = read_frame(&mut frame.as_slice()).await.unwrap().unwrap();
+        let Response::Event { envelope } = decoded else {
+            panic!("wrong response");
+        };
+        assert_eq!(airc_wire::decode(envelope.into()).unwrap(), env);
+
+        // Paired alternating measurements isolate buffer bookkeeping from the
+        // rest of the daemon. Equality is checked outside the timed region;
+        // normal allocation and drop are included, socket framing is excluded.
+        assert_eq!(encode_frame_payload(&response).unwrap(), frame[4..]);
+        assert_eq!(encode_event_frame_payload(&encoded).unwrap(), frame[4..]);
+        for _ in 0..16 {
+            black_box(encode_frame_payload(black_box(&response)).unwrap());
+            black_box(encode_event_frame_payload(black_box(&encoded)).unwrap());
+        }
+        let mut ordinary_samples = Vec::with_capacity(REPEATS as usize);
+        let mut bounded_samples = Vec::with_capacity(REPEATS as usize);
+        for iteration in 0..REPEATS {
+            for bounded in if iteration % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = Instant::now();
+                if bounded {
+                    black_box(encode_event_frame_payload(black_box(&encoded)).unwrap());
+                } else {
+                    black_box(encode_frame_payload(black_box(&response)).unwrap());
+                }
+                let nanos = start.elapsed().as_nanos();
+                if bounded {
+                    bounded_samples.push(nanos);
+                } else {
+                    ordinary_samples.push(nanos);
+                }
+            }
+        }
+        for (name, mut samples) in [
+            ("ordinary", ordinary_samples),
+            ("exact_event", bounded_samples),
+        ] {
+            samples.sort_unstable();
+            eprintln!("paired_cbor payload={payload_len} buffer={name} repeats={REPEATS} mean_ns={} p50_ns={} p95_ns={} min_ns={} max_ns={}",
+                samples.iter().sum::<u128>() / samples.len() as u128,
+                samples[samples.len() / 2], samples[(samples.len() - 1) * 95 / 100], samples[0], samples[samples.len() - 1]);
+        }
+
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            black_box(airc_wire::encode(black_box(&env)));
+        }
+        let wire_encode = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            let mut output = Vec::new();
+            write_frame(&mut output, black_box(&response))
+                .await
+                .unwrap();
+            black_box(output);
+        }
+        let cbor_encode = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            black_box(
+                read_frame::<_, Response>(&mut black_box(frame.as_slice()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let cbor_decode = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..REPEATS {
+            black_box(airc_wire::decode(black_box(encoded.clone())).unwrap());
+        }
+        let wire_decode = start.elapsed();
+        eprintln!("codec payload={payload_len} wire_bytes={} ipc_bytes={} repeats={REPEATS} mean_ns wire_encode={} cbor_frame_encode={} cbor_frame_decode={} wire_decode={}", encoded.len(), frame.len(), wire_encode.as_nanos() / u128::from(REPEATS), cbor_encode.as_nanos() / u128::from(REPEATS), cbor_decode.as_nanos() / u128::from(REPEATS), wire_decode.as_nanos() / u128::from(REPEATS));
+    }
 }
 
 fn unique_socket() -> PathBuf {
@@ -46,6 +147,111 @@ fn unique_socket() -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(format!("/tmp/airc-ocp-{}-{n}.sock", std::process::id()))
+}
+
+/// Real SQLite visibility after concurrent IPC publication. Observation begins
+/// after publishers finish, so drain time is an upper bound, not commit timing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual SQLite drain measurement"]
+async fn bench_daemon_sqlite_drain() {
+    use airc_bus::{Cursor, DurableSink, Seq};
+    use std::collections::HashSet;
+    for publishers in [16usize, 64] {
+        const PER: usize = 64;
+        let daemon = tokio::time::timeout(Duration::from_secs(30), start_daemon())
+            .await
+            .unwrap();
+        let channel = RoomId::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let result = tokio::time::timeout(Duration::from_secs(90), async {
+            let sink = airc_store::SqliteDurableSink::open_read_only_path(
+                &daemon._home.path().join("events.sqlite"),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let start = Instant::now();
+            for p in 0..publishers {
+                let socket = daemon.socket.clone();
+                tasks.spawn(async move {
+                    let client = DaemonClient::new(socket);
+                    let mut accepted = Vec::new();
+                    let mut errors = Vec::new();
+                    for n in 0..PER {
+                        match client
+                            .publish(durable_text(channel, &format!("drain {p} {n}")))
+                            .await
+                        {
+                            Ok(r) => accepted.push(r),
+                            Err(e) => errors.push(e.to_string()),
+                        }
+                    }
+                    (accepted, errors)
+                });
+            }
+            let mut accepted = Vec::new();
+            let mut errors = Vec::new();
+            while let Some(task) = tasks.join_next().await {
+                let (a, e) = task.map_err(|e| e.to_string())?;
+                accepted.extend(a);
+                errors.extend(e);
+            }
+            let publish_wall = start.elapsed();
+            let pinned = daemon.state.router.pinned_in_ring(channel);
+            let expected: HashSet<_> = accepted.iter().map(|r| r.event_id).collect();
+            if expected.len() != accepted.len() || accepted.is_empty() {
+                return Err("duplicate/empty accepted receipts".to_owned());
+            }
+            let last = accepted
+                .iter()
+                .map(|r| Cursor::new(Seq::new(r.epoch, r.counter), r.event_id))
+                .max_by_key(|cursor| cursor.seq)
+                .unwrap();
+            loop {
+                if sink.head_cursor(channel).await.map_err(|e| e.to_string())? == Some(last) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let tip_observed = start.elapsed();
+            loop {
+                let rows = sink
+                    .page(channel, None, publishers * PER + 1)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let found: HashSet<_> = rows.iter().map(|e| e.event_id).collect();
+                if !found.is_subset(&expected) || rows.len() != found.len() {
+                    return Err("SQLite unexpected/duplicate receipt IDs".to_owned());
+                }
+                // A high cursor can persist before an earlier concurrent
+                // publisher enqueues. Only the complete set proves drain.
+                if found == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let verified = start.elapsed();
+            Ok((
+                accepted.len(),
+                errors,
+                publish_wall,
+                tip_observed,
+                verified,
+                pinned,
+            ))
+        })
+        .await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        daemon.stop().await;
+        let (accepted, errors, publish, tip, verified, pinned) = result
+            .expect("bounded SQLite scenario")
+            .expect("SQLite receipt proof");
+        eprintln!("sqlite_drain publishers={publishers} attempts={} accepted={accepted} errors={} publish_ms={:.3} tip_observed_ms={:.3} exact_rows_verified_ms={:.3} pinned_at_publish={pinned} first_error={:?}",publishers*PER,errors.len(),publish.as_secs_f64()*1000.,tip.as_secs_f64()*1000.,verified.as_secs_f64()*1000.,errors.first());
+        assert!(
+            errors.is_empty(),
+            "publication errors are not successful throughput"
+        );
+    }
 }
 
 async fn start_daemon() -> TestDaemon {
@@ -78,25 +284,90 @@ async fn start_daemon() -> TestDaemon {
     let handle = tokio::spawn(async move {
         let _ = run(server_state, server_socket).await;
     });
+    // Own the task before the next await so cancelled setup cannot detach it.
+    let daemon = TestDaemon {
+        socket,
+        state,
+        handle,
+        _home: home,
+    };
     // Wait for the listener to bind (the socket file appears).
     for _ in 0..200 {
-        if socket.exists() {
+        if daemon.socket.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    TestDaemon {
-        socket,
-        handle,
-        _home: home,
-    }
+    daemon
 }
 
 impl TestDaemon {
-    async fn stop(self) {
+    async fn stop(mut self) {
         let _ = DaemonClient::new(self.socket.clone()).stop().await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.handle).await;
+        if tokio::time::timeout(Duration::from_secs(3), &mut self.handle)
+            .await
+            .is_err()
+        {
+            self.handle.abort();
+            let _ = (&mut self.handle).await;
+        }
     }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn startup_check_runs_only_after_bind_and_rejection_cleans_endpoint() {
+    use airc_daemon::server::run_with_startup_check;
+    use airc_ipc::transport::IpcListener;
+    use futures::FutureExt;
+
+    let mut daemon = start_daemon().await;
+    let state = daemon.state.clone();
+    let socket = daemon.socket.clone();
+    let mut checked = false;
+    let duplicate = run_with_startup_check(state.clone(), socket.clone(), || {
+        checked = true;
+        Ok(())
+    })
+    .await;
+    assert!(duplicate.is_err());
+    assert!(
+        !checked,
+        "failed bind must drop admission without calling it bound"
+    );
+    DaemonClient::new(socket.clone()).stop().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), &mut daemon.handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let rejected = run_with_startup_check(state, socket.clone(), || {
+        // The real platform bind is immediate. A second bind must already be
+        // refused when the startup owner relinquishes its lease.
+        let probe = IpcListener::bind(&socket).now_or_never().unwrap();
+        if let Ok(listener) = probe {
+            listener.cleanup();
+            panic!("startup check ran before actual endpoint bind");
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "operator stopped",
+        ))
+    })
+    .await;
+    assert!(rejected
+        .unwrap_err()
+        .to_string()
+        .contains("operator stopped"));
+    let clean = IpcListener::bind(&socket)
+        .await
+        .expect("rejected startup cleaned its endpoint");
+    clean.cleanup();
 }
 
 /// Attach to `channel`, confirm the `Ok` ack (which — subscribe-before-ack
@@ -113,7 +384,7 @@ async fn persona_collect(
         .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
-    match read_frame::<_, Response>(&mut stream).await {
+    match read_response_frame(&mut stream).await {
         Ok(Some(Response::Ok)) => {}
         other => panic!("expected Ok ack from attach, got {other:?}"),
     }
@@ -121,11 +392,7 @@ async fn persona_collect(
 
     let mut out = Vec::with_capacity(want);
     while out.len() < want {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            read_frame::<_, Response>(&mut stream),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(20), read_response_frame(&mut stream)).await
         {
             Ok(Ok(Some(Response::Event { envelope }))) => {
                 let env = airc_wire::decode(envelope.into()).expect("decode airc-wire event");
@@ -152,7 +419,7 @@ async fn collect_envelopes(
         .attach(AttachRequest::live(channel))
         .await
         .expect("attach");
-    match read_frame::<_, Response>(&mut stream).await {
+    match read_response_frame(&mut stream).await {
         Ok(Some(Response::Ok)) => {}
         other => panic!("expected Ok ack, got {other:?}"),
     }
@@ -160,11 +427,7 @@ async fn collect_envelopes(
 
     let mut out = Vec::with_capacity(want);
     while out.len() < want {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            read_frame::<_, Response>(&mut stream),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(20), read_response_frame(&mut stream)).await
         {
             Ok(Ok(Some(Response::Event { envelope }))) => {
                 out.push(airc_wire::decode(envelope.into()).expect("decode"));
@@ -302,6 +565,7 @@ async fn streamchunk_raw_bytes_route_live_byte_identical_and_never_persist() {
             channel: Some(channel),
             limit: Some(100),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox");
@@ -331,6 +595,7 @@ async fn durable_publishes_replay_via_inbox_in_order_and_page_by_cursor() {
             channel: Some(channel),
             limit: Some(100),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox");
@@ -347,6 +612,7 @@ async fn durable_publishes_replay_via_inbox_in_order_and_page_by_cursor() {
             channel: Some(channel),
             limit: Some(100),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox after cursor");
@@ -523,6 +789,7 @@ async fn continuum_webrtc_room_mixed_traffic_only_chat_persists() {
             channel: Some(channel),
             limit: Some(1000),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox");
@@ -559,6 +826,7 @@ async fn chat_send_is_durable_and_text_round_trips() {
             channel: Some(channel),
             limit: Some(10),
             kinds: None,
+            before: None,
         })
         .await
         .expect("inbox");
@@ -593,16 +861,14 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
             .await
             .expect("worker attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         worker_ready.wait().await;
         let cmd = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode command");
             }
@@ -641,16 +907,14 @@ async fn request_response_rpc_correlates_across_kind_filtered_sessions() {
             .await
             .expect("requester attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         req_ready.wait().await;
         let result = loop {
-            if let Ok(Ok(Some(Response::Event { envelope }))) = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            if let Ok(Ok(Some(Response::Event { envelope }))) =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
             {
                 break airc_wire::decode(envelope.into()).expect("decode result");
             }
@@ -723,17 +987,14 @@ async fn attach_header_filter_scopes_subscription_router_side() {
             .await
             .expect("attach");
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         r.wait().await;
         let mut got = Vec::new();
         while got.len() < 2 {
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                .await
             {
                 Ok(Ok(Some(Response::Event { envelope }))) => {
                     got.push(airc_wire::decode(envelope.into()).expect("decode"));
@@ -1029,7 +1290,7 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
             .await
             .unwrap();
         assert!(matches!(
-            read_frame::<_, Response>(&mut stream).await,
+            read_response_frame(&mut stream).await,
             Ok(Some(Response::Ok))
         ));
         streams.push(stream);
@@ -1071,14 +1332,12 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
         // every decoded frame through it, without a timer-based absence claim.
         let mut replies = 0;
         loop {
-            let frame = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut stream),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            let frame =
+                tokio::time::timeout(Duration::from_secs(10), read_response_frame(&mut stream))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
             let Response::Event { envelope } = frame else {
                 panic!("expected event")
             };
@@ -1102,4 +1361,91 @@ async fn concurrent_exact_reply_handles_exclude_bulk_before_ipc_decode() {
         "only selected replies and fences reach IPC decode"
     );
     daemon.stop().await;
+}
+
+/// Isolated streaming fan-out wall-time matrix. Includes IPC framing, per-reader
+/// encoding, consumer decode/copy and payload validation; this is not an
+/// allocator or CPU profile. Checks the first 64 frames, not trailing duplicates;
+/// the empty inbox is an immediate observation, not a long-term storage proof.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual streaming fan-out measurement"]
+async fn bench_stream_fanout_sizes() {
+    const FRAMES: usize = 64;
+    for payload_len in [256usize, 65_536] {
+        for readers in [1usize, 8, 32] {
+            let daemon = tokio::time::timeout(Duration::from_secs(30), start_daemon())
+                .await
+                .unwrap();
+            let channel = RoomId::new();
+            let frames: Vec<Vec<u8>> = (0..FRAMES)
+                .map(|i| {
+                    let mut bytes = vec![0x42; payload_len];
+                    bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    bytes
+                })
+                .collect();
+            let ready = Arc::new(Barrier::new(readers + 1));
+            let mut collectors = tokio::task::JoinSet::new();
+            for _ in 0..readers {
+                collectors.spawn(persona_collect(
+                    daemon.socket.clone(),
+                    channel,
+                    FRAMES,
+                    ready.clone(),
+                ));
+            }
+            let result = tokio::time::timeout(Duration::from_secs(60), async {
+                ready.wait().await;
+                let start = Instant::now();
+                let publisher = DaemonClient::new(daemon.socket.clone());
+                for frame in &frames {
+                    publisher
+                        .publish(PublishRequest {
+                            channel: channel.as_uuid(),
+                            from_peer: uuid::Uuid::from_u128(0x573EA3),
+                            from_client: uuid::Uuid::from_u128(0x573EAC),
+                            kind: IpcKind::Event,
+                            delivery: IpcDelivery::StreamChunk,
+                            target: IpcTarget::All,
+                            correlation_id: None,
+                            coalesce_key: None,
+                            payload: frame.clone(),
+                            headers: Headers::new(),
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                let publish_wall = start.elapsed();
+                while let Some(got) = collectors.join_next().await {
+                    let got = got.map_err(|e| e.to_string())?;
+                    if got != frames {
+                        return Err("stream payload/order/count mismatch".to_owned());
+                    }
+                }
+                let delivery_wall = start.elapsed();
+                let inbox = publisher
+                    .inbox(InboxRequest {
+                        since: None,
+                        channel: Some(channel),
+                        limit: Some(100),
+                        kinds: None,
+                        before: None,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !inbox.envelopes.is_empty() {
+                    return Err("stream entered transcript".to_owned());
+                }
+                Ok((publish_wall, delivery_wall))
+            })
+            .await;
+            collectors.abort_all();
+            while collectors.join_next().await.is_some() {}
+            daemon.stop().await;
+            let (publish_wall, delivery_wall) = result
+                .expect("bounded streaming scenario")
+                .expect("valid stream delivery");
+            eprintln!("stream payload={payload_len} readers={readers} frames={FRAMES} publish_us={} validated_consumers_us={} validated_MiB_per_sec={:.2}", publish_wall.as_micros(), delivery_wall.as_micros(), (payload_len * readers * FRAMES) as f64 / 1048576.0 / delivery_wall.as_secs_f64());
+        }
+    }
 }

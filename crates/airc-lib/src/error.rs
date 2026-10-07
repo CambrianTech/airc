@@ -37,6 +37,9 @@ pub enum AircError {
     #[error("room state: {0}")]
     Room(#[from] crate::room::RoomError),
 
+    #[error("mind store: {0}")]
+    Mind(#[from] airc_identity::mind::MindError),
+
     #[error("subscription state: {0}")]
     Subscription(#[from] crate::subscriptions::SubscriptionError),
 
@@ -156,16 +159,6 @@ pub enum AircError {
     WorkClaimNotCurrent {
         card_id: airc_work::WorkCardId,
         claim_id: airc_work::ClaimId,
-    },
-
-    /// Caller attempted to create a second active claim for a card
-    /// that already has one. Claims are leases; duplicate active
-    /// claims make manager/persona training data ambiguous.
-    #[error("work card {card_id} already has active claim {claim_id:?} owned by {owner:?}")]
-    WorkCardAlreadyClaimed {
-        card_id: airc_work::WorkCardId,
-        claim_id: Option<airc_work::ClaimId>,
-        owner: Option<airc_core::PeerId>,
     },
 
     /// Caller attempted to claim a card whose lifecycle state is past

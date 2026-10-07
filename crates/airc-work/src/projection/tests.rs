@@ -101,6 +101,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             owner,
             reason: None,
             released_at_ms: 202,
+            taken_over_from: None,
         }))
         .unwrap();
     assert!(restored.card(card_id).unwrap().claim_provenance.is_none());
@@ -119,6 +120,7 @@ fn card_claim_heartbeat_and_stale_detection_project_from_events() {
             owner,
             reason: None,
             released_at_ms: 204,
+            taken_over_from: None,
         }))
         .unwrap();
     assert_eq!(
@@ -348,6 +350,7 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
             owner,
             reason: Some("merged".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -392,6 +395,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             owner,
             reason: Some("first release".to_string()),
             released_at_ms: 120,
+            taken_over_from: None,
         }),
         WorkEvent::ClaimReleased(ClaimReleased {
             card_id,
@@ -399,6 +403,7 @@ fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
             owner,
             reason: Some("duplicate release".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -454,6 +459,7 @@ fn duplicate_active_claim_is_idempotent_and_keeps_original_owner() {
             owner: first_owner,
             reason: Some("release original claim".to_string()),
             released_at_ms: 130,
+            taken_over_from: None,
         }),
     ])
     .unwrap();
@@ -982,6 +988,7 @@ fn release_for_superseded_claim_does_not_poison_projection() {
             owner: owner_b,
             reason: None,
             released_at_ms: 4,
+            taken_over_from: None,
         }))
         .expect("release of superseded claim must be tolerated");
 
@@ -2019,4 +2026,123 @@ fn relink_for_unknown_card_errors_strict_and_skips_windowed() {
         Err(ProjectionError::UnknownCard(WorkCardId::from_u128(404)))
     );
     assert_eq!(projection.apply_windowed(&event), Ok(()));
+}
+
+fn durable_fixture(at: u64) -> (WorkBoardProjection, WorkCardId, ClaimId, PeerId) {
+    let card_id = WorkCardId::from_u128(41);
+    let alice_claim = ClaimId::from_u128(42);
+    let alice = peer(43);
+    let mut projection = WorkBoardProjection::new();
+    projection
+        .apply(&WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "her card".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: alice,
+            created_at_ms: at,
+            reviews: None,
+            origin: None,
+        }))
+        .unwrap();
+    projection
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
+            card_id,
+            claim_id: alice_claim,
+            owner: alice,
+            ttl_ms: 100,
+            claimed_at_ms: at + 1,
+            origin: ClaimOrigin::Explicit,
+        }))
+        .unwrap();
+    (projection, card_id, alice_claim, alice)
+}
+
+fn stranger_claims(projection: &mut WorkBoardProjection, card_id: WorkCardId, at: u64) -> ClaimId {
+    let bob_claim = ClaimId::from_u128(52);
+    projection
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
+            card_id,
+            claim_id: bob_claim,
+            owner: peer(53),
+            ttl_ms: 100,
+            claimed_at_ms: at,
+            origin: ClaimOrigin::Explicit,
+        }))
+        .unwrap();
+    bob_claim
+}
+
+// what this catches: a takeover that leaves no record. From the cutover on, a BARE
+// stranger's claim on a held card is dropped on every node, so every takeover is an
+// attributed release then a claim (the SDK gate does exactly that, card 667b7e0c);
+// before the cutover, history replays unchanged.
+#[test]
+fn a_takeover_is_release_then_claim_from_the_cutover_and_history_replays_unchanged() {
+    let cut = TAKEOVER_ON_RECORD_SINCE_MS;
+
+    let (mut after, card_id, alice_claim, alice) = durable_fixture(cut);
+    stranger_claims(&mut after, card_id, cut + 500); // her lease lapsed at cut + 101
+    let card = after.card(card_id).unwrap();
+    assert_eq!(card.owner, Some(alice), "a lapsed lease is not a handover");
+    assert_eq!(card.claim_id, Some(alice_claim));
+
+    let (mut before, card_id, _, _) = durable_fixture(1);
+    let bob_claim = stranger_claims(&mut before, card_id, 200);
+    assert_eq!(
+        before.card(card_id).unwrap().claim_id,
+        Some(bob_claim),
+        "pre-cutover history replays as it always did"
+    );
+
+    after
+        .apply(&WorkEvent::ClaimReleased(ClaimReleased {
+            card_id,
+            claim_id: alice_claim,
+            owner: peer(53),
+            reason: Some("handover: Alice is gone".into()),
+            released_at_ms: cut + 600,
+            taken_over_from: None,
+        }))
+        .unwrap();
+    let bob_claim = stranger_claims(&mut after, card_id, cut + 700);
+    assert_eq!(
+        after.card(card_id).unwrap().claim_id,
+        Some(bob_claim),
+        "explicit handover works"
+    );
+}
+
+// what this catches: the owner working her card is presence. Her own state change
+// renews her lease by the ttl she claimed with; a stranger's event does not.
+#[test]
+fn the_owners_own_events_renew_her_lease() {
+    let (mut projection, card_id, _, alice) = durable_fixture(1_000);
+    assert_eq!(
+        projection.card(card_id).unwrap().claim_expires_at_ms,
+        Some(1_101)
+    );
+    let change = |by: PeerId, at: u64| {
+        WorkEvent::CardStateChanged(CardStateChanged {
+            card_id,
+            state: CardState::InProgress,
+            changed_by: by,
+            changed_at_ms: at,
+        })
+    };
+    projection.apply(&change(alice, 1_090)).unwrap();
+    assert_eq!(
+        projection.card(card_id).unwrap().claim_expires_at_ms,
+        Some(1_190)
+    );
+    projection.apply(&change(peer(53), 1_150)).unwrap();
+    assert_eq!(
+        projection.card(card_id).unwrap().claim_expires_at_ms,
+        Some(1_190),
+        "a stranger's event is not her presence"
+    );
 }

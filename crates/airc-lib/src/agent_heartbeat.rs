@@ -351,6 +351,14 @@ impl Drop for HeartbeatTask {
     }
 }
 
+fn heartbeat_ticker(interval: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(interval);
+    // Presence is latest-state information. After an executor pause or a
+    // resume that advances its clock, emit once now, not every missed beat.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
+}
+
 impl Airc {
     /// Emit a single heartbeat. Useful for ad-hoc beats (e.g.
     /// `Leaving` on graceful shutdown) outside the periodic task.
@@ -528,7 +536,7 @@ impl Airc {
 
         let airc = self.clone();
         let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            let mut ticker = heartbeat_ticker(interval);
             // Skip the first tick since we already emitted above.
             ticker.tick().await;
             loop {
@@ -893,6 +901,35 @@ async fn refresh_coordination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_heartbeat_emits_once_then_returns_to_cadence() {
+        use futures::FutureExt;
+
+        let mut ticker = heartbeat_ticker(DEFAULT_HEARTBEAT_INTERVAL);
+        let started = ticker.tick().await; // immediate beat is already emitted
+        tokio::time::advance(Duration::from_secs(8 * 60 * 60 + 7)).await;
+
+        assert!(
+            ticker.tick().now_or_never().is_some(),
+            "resume owes one current beat"
+        );
+        assert!(
+            ticker.tick().now_or_never().is_none(),
+            "missed beats must not burst on resume"
+        );
+        tokio::time::advance(Duration::from_secs(52)).await;
+        assert!(
+            ticker.tick().now_or_never().is_none(),
+            "normal cadence must not fire early"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            ticker.tick().now_or_never(),
+            Some(started + Duration::from_secs(8 * 60 * 60 + 60)),
+            "the next beat retains the configured cadence"
+        );
+    }
 
     // what this catches: a question about room B being answered with room A's
     // roster. That is what every default-scoped presence read does today, and it

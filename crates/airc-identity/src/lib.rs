@@ -37,6 +37,9 @@ use serde::Deserialize;
 
 /// On-disk schema version for local identity rows. Bump when the
 /// stored shape changes incompatibly.
+/// Her private records, sealed (continuum PRIVACY-OF-THOUGHT.md step 2).
+pub mod mind;
+
 const IDENTITY_STATE_VERSION: u32 = 1;
 
 /// Environment override for selecting the local agent identity row.
@@ -519,7 +522,8 @@ async fn migrate_legacy_identity_json(
     Ok(Some(stored))
 }
 
-fn requested_agent_name(explicit: Option<&str>) -> Result<String, IdentityError> {
+/// Resolve the active identity name without loading or creating identity state.
+pub fn requested_agent_name(explicit: Option<&str>) -> Result<String, IdentityError> {
     if let Some(value) = explicit {
         return normalise_agent_name(value);
     }

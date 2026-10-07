@@ -241,6 +241,7 @@ async fn deep_room_tip_probe_matches_inbox_newest() {
                 channel: Some(channel),
                 limit: Some(1),
                 kinds: None,
+                before: None,
             })
             .await
             .expect("inbox");

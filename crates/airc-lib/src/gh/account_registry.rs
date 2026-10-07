@@ -397,11 +397,7 @@ impl GhAccountRegistryStore {
     /// ([`account_registry_block`]) on every publish/refresh.
     pub fn new(store: Arc<SqliteEventStore>, scope_home: impl Into<PathBuf>) -> Self {
         Self {
-            gh_bin: PathBuf::from(
-                std::env::var_os("AIRC_GH_BIN")
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "gh".into()),
-            ),
+            gh_bin: airc_core::gh_executable::resolve(),
             store,
             scope_home: scope_home.into(),
             token_override: None,
@@ -1025,13 +1021,7 @@ fn extract_gist_id(stdout: &str) -> Option<String> {
 /// No-op off Windows.
 #[inline]
 fn gh_no_window(cmd: &mut Command) {
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = cmd;
+    airc_core::process::configure_background(cmd.as_std_mut());
 }
 
 /// Budget for the `gh auth status` probe in [`gh_auth_ready`] (and the
@@ -1065,7 +1055,8 @@ pub async fn gh_auth_ready(gh_bin: Option<&Path>) -> bool {
 /// its keyring copy, so without the override the probe would keep
 /// failing on the daemon's immutable spawn-time snapshot.
 pub async fn gh_auth_ready_with_token(gh_bin: Option<&Path>, gh_token: Option<&str>) -> bool {
-    let bin = gh_bin.unwrap_or_else(|| Path::new("gh"));
+    let resolved = airc_core::gh_executable::resolve();
+    let bin = gh_bin.unwrap_or(&resolved);
     let mut cmd = Command::new(bin);
     cmd.args(["auth", "status"])
         .stdout(Stdio::null())
@@ -1108,7 +1099,8 @@ pub async fn gh_auth_ready_with_token(gh_bin: Option<&Path>, gh_token: Option<&s
 /// caller falls through to the existing loud skip diagnostic — one
 /// extra recovery attempt, no new failure modes.
 pub async fn re_resolve_gh_token(gh_bin: Option<&Path>) -> Option<String> {
-    let bin = gh_bin.unwrap_or_else(|| Path::new("gh"));
+    let resolved = airc_core::gh_executable::resolve();
+    let bin = gh_bin.unwrap_or(&resolved);
     let mut cmd = Command::new(bin);
     cmd.args(["auth", "token"])
         .env_remove("GH_TOKEN")

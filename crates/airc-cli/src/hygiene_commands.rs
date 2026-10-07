@@ -3,7 +3,6 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -152,7 +151,7 @@ fn run_clean(
         if dry_run {
             println!("- docker: would run docker system prune -af");
         } else {
-            let _ = Command::new("docker")
+            let _ = airc_core::process::background("docker")
                 .args(["system", "prune", "-af"])
                 .status();
         }
@@ -315,7 +314,7 @@ fn print_report(path: &Path, policy: &HygienePolicy, candidates: &[CleanupCandid
 
 fn repo_root() -> Result<PathBuf, Box<dyn Error>> {
     let current = std::env::current_dir()?;
-    let output = Command::new("git")
+    let output = airc_core::process::background("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&current)
         .output();
@@ -467,7 +466,7 @@ fn memory_available_gb_linux() -> Option<f64> {
 }
 
 fn memory_available_gb_macos() -> Option<f64> {
-    let output = Command::new("vm_stat").output().ok()?;
+    let output = airc_core::process::background("vm_stat").output().ok()?;
     if !output.status.success() {
         return None;
     }

@@ -41,6 +41,7 @@ sea-orm-migration = { version = "1", default-features = false, features = [
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [dev-dependencies]
+airc-diagnostics = { path = "../airc-diagnostics" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tempfile = "3"
 # The owner-core router, exercised against the real SQLite durable tier in

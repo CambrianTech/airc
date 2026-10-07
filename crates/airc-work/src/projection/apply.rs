@@ -10,6 +10,31 @@ use crate::event::{
 use crate::ids::{WorkCardId, WorkspaceId};
 use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
 
+/// From this instant on, a takeover is on the record: a BARE claim by anyone else
+/// while the holder's claim stands is dropped, lapsed lease or not. Anyone may take
+/// a card at any time (Joel, 2026-10-06), and the SDK gate does it as a
+/// `ClaimReleased` of the holder's claim, attributed to the taker with a reason,
+/// then the claim (card 667b7e0c). Claims before this instant replay as they always
+/// did, so no historical board is rewritten.
+pub const TAKEOVER_ON_RECORD_SINCE_MS: u64 = 1_791_129_600_000; // 2026-10-04T16:00:00Z
+
+/// The owner acting on her own claimed card is presence: renew her lease by the
+/// ttl she claimed with. Kimi's lease lapsed while she was working the card, and
+/// the lapse is what made her card look abandoned.
+fn renew_owner_lease(card: &mut WorkCard, actor: airc_core::PeerId, at_ms: u64) {
+    if card.owner != Some(actor) || card.claim_id.is_none() {
+        return;
+    }
+    let (Some(expires), Some(beat)) = (card.claim_expires_at_ms, card.last_heartbeat_at_ms) else {
+        return;
+    };
+    let renewed = at_ms.saturating_add(expires.saturating_sub(beat));
+    if renewed > expires {
+        card.claim_expires_at_ms = Some(renewed);
+        card.last_heartbeat_at_ms = Some(at_ms);
+    }
+}
+
 use super::{
     pull_request_key, AgentAvailabilityRecord, BoardSnapshot, BranchTrackingRecord, LaneRecord,
     ManagerHat, ProjectionError, PullRequestRecord, RepoTrackingRecord, StaleClaim,
@@ -152,6 +177,12 @@ impl WorkBoardProjection {
         self.cards.get(&card_id)
     }
 
+    /// Every card id on this board: the candidates a shown (short) card id
+    /// resolves against.
+    pub fn card_ids(&self) -> impl Iterator<Item = WorkCardId> + '_ {
+        self.cards.keys().copied()
+    }
+
     pub fn workspace(&self, workspace_id: WorkspaceId) -> Option<&WorkspaceRecord> {
         self.workspaces.get(&workspace_id)
     }
@@ -232,6 +263,14 @@ impl WorkBoardProjection {
         {
             return Ok(());
         }
+        if e.claimed_at_ms >= TAKEOVER_ON_RECORD_SINCE_MS
+            && card.claim_id.is_some()
+            && card.owner.is_some_and(|owner| owner != e.owner)
+            && !matches!(card.state, CardState::Merged | CardState::Closed)
+        {
+            // Her card stays hers while she is away; a stranger's claim is not a handover.
+            return Ok(());
+        }
         card.state = CardState::Claimed;
         card.owner = Some(e.owner);
         card.claim_id = Some(e.claim_id);
@@ -259,6 +298,9 @@ impl WorkBoardProjection {
             // Transcript order, not a caller-controlled wall clock, selects newest.
             card.submissions.insert(0, e.clone());
             card.updated_at_ms = card.updated_at_ms.max(e.submitted_at_ms);
+            if card.claim_id == Some(e.claim_id) {
+                renew_owner_lease(card, e.publisher, e.submitted_at_ms);
+            }
         }
         Ok(())
     }
@@ -372,6 +414,7 @@ impl WorkBoardProjection {
         let card = self.card_mut(e.card_id)?;
         card.state = e.state;
         card.updated_at_ms = e.changed_at_ms;
+        renew_owner_lease(card, e.changed_by, e.changed_at_ms);
         Ok(())
     }
 

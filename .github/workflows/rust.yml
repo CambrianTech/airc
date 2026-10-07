@@ -1,8 +1,8 @@
 name: rust
 
-# Quality gates for the airc-rust workspace (anything under `crates/`).
+# Quality gates for the Rust workspace and shared runtime scripts.
 #
-# Three jobs on every PR + push touching Rust:
+# Existing named gates on every relevant PR + push:
 #   fmt      — `cargo fmt --check` (no formatter drift)
 #   clippy   — regular all-target warning gate plus a production-only
 #              no-silent-fallback gate. Tests may stay concise, but
@@ -13,12 +13,12 @@ name: rust
 #              fallback/cutover command surfaces
 #
 # Per Joel's direction (2026-05-18): "use rust conventions and obsession
-# with tests. clippy, fmt etc." These three gates are the substrate-quality
+# with tests. clippy, fmt etc." These gates are the substrate-quality
 # bar every airc-rust PR clears before merge.
 #
 # The clean-install / install.sh smoke jobs in ci.yml continue to validate
-# the Python+bash install path; this workflow specifically gates the
-# Rust workspace as it grows.
+# public installation path and installed-command proof; this workflow owns
+# Rust quality and fast shell/cutover checks without another duplicate build.
 
 on:
   # NO `paths` filter on pull_request — on purpose. The required contexts
@@ -31,13 +31,13 @@ on:
   # 2026-06-13 — #1164/#1165 stuck with no way in, not even --admin).
   # The `changes` job below decides whether the heavy jobs do real work;
   # non-Rust PRs SKIP them (a skipped required check counts as satisfied)
-  # so the self-hosted runner stays free. merge_group always runs the
+  # so hosted runners stay free. merge_group always runs the
   # real legs regardless (see below).
   pull_request:
   # Merge queue: GitHub builds the queued PR(s) on top of the latest
   # rust-rewrite on a `gh-readonly-queue/...` ref and emits a
   # `merge_group` event. The heavy jobs run UNCONDITIONALLY on
-  # merge_group (their `if` short-circuits on event != pull_request), so
+  # merge_group (the classifier sets both outputs true), so
   # the rust legs always validate the COMBINED queued result — the gate
   # that catches the merge-race class that broke rust-rewrite on
   # 2026-06-11 (#1127×#1137 each green alone, broken combined).
@@ -48,6 +48,18 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "integrations/acp/**"
+      - "integrations/embedding-facility/bridge/**"
+      - "integrations/generate-facility/bridge/**"
+      - "airc"
+      - "airc.shim"
+      - "install.sh"
+      - "uninstall.sh"
+      - "lib/airc_bash/**"
+      - "test/public_installed_runtime_proof.sh"
+      - "test/rust_cutover_guard.sh"
+      - "docker/mesh-converge.sh"
+      - ".github/workflows/ci.yml"
       - "test/rust_quality_guard.sh"
       - ".github/workflows/rust.yml"
 
@@ -66,42 +78,67 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Detect whether this PR touches Rust-relevant files. Drives the `if`
-  # on the real jobs so non-Rust PRs skip the heavy work (reporting the
-  # required contexts as skipped = satisfied) while the contexts still
-  # exist so the merge queue can ingest the PR. Only meaningful on
-  # pull_request; on merge_group/push the heavy jobs run unconditionally.
+  # Classify PRs and pushes without another checkout. Merge groups validate
+  # the whole combined tree. Missing classifier output fails closed: the
+  # required jobs run unless their relevant output is explicitly false.
   changes:
     name: detect rust-relevant changes
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      runtime: ${{ steps.filter.outputs.runtime }}
     steps:
-      # No checkout, no third-party action: ask the API for the PR's
-      # changed files and grep for Rust-relevant paths. `gh` + the
-      # built-in token are always present on GitHub-hosted runners.
+      # Compare responses cap their file list at 300; conservatively run all
+      # gates at that boundary instead of silently omitting a relevant path.
       - id: filter
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files="$(gh api --paginate \
-            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --jq '.[].filename')"
-          if printf '%s\n' "$files" | grep -qE '^(crates/|Cargo\.(toml|lock)$|test/rust_quality_guard\.sh$|\.github/workflows/rust\.yml$)'; then
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              files="$(gh api --paginate \
+                "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --jq '.[] | .filename, (.previous_filename // empty)')" ;;
+            push)
+              if [ "${{ github.event.before }}" = 0000000000000000000000000000000000000000 ]; then
+                printf 'rust=true\nruntime=true\n' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              files="$(gh api \
+                "repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.sha }}" \
+                --jq 'if .status == "ahead" and (.files | length) > 0 and (.files | length) < 300 then .files[] | .filename, (.previous_filename // empty) else "__AIRC_FULL_CHECKS__" end')"
+              if [ "$(printf '%s\n' "$files" | wc -l)" -ge 300 ]; then
+                printf 'rust=true\nruntime=true\n' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi ;;
+            *)
+              printf 'rust=true\nruntime=true\n' >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          if [ -z "$files" ] || [ "$files" = __AIRC_FULL_CHECKS__ ]; then
+            printf 'rust=true\nruntime=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(printf '%s\n' "$files" | wc -l)" -ge 3000 ]; then
+            printf 'rust=true\nruntime=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if printf '%s\n' "$files" | grep -E '^(crates/|integrations/(acp/|embedding-facility/bridge/|generate-facility/bridge/)|Cargo\.(toml|lock)$|test/rust_quality_guard\.sh$|\.github/workflows/rust\.yml$)' >/dev/null; then
             echo "rust=true"  >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
           fi
+          if printf '%s\n' "$files" | grep -E '^(airc|airc\.shim|install\.sh|uninstall\.sh|test/(public_installed_runtime_proof|rust_cutover_guard|rust_quality_guard)\.sh|docker/mesh-converge\.sh|\.github/workflows/(ci|rust|runtime-guards)\.yml)$|^lib/airc_bash/' >/dev/null; then
+            echo "runtime=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "runtime=false" >> "$GITHUB_OUTPUT"
+          fi
 
   fmt:
     name: cargo fmt --check
-    # Run on merge_group/push always; on a PR only when Rust changed.
-    # `!cancelled()` lets this run even though `changes` is skipped on
-    # non-pull_request events (a skipped dependency would otherwise skip
-    # this job too).
+    # Keep the required context while skipping explicitly non-Rust changes.
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     steps:
       # Self-defending guard (sentinel ask on #1116): the self-hosted leg
@@ -128,7 +165,7 @@ jobs:
   clippy:
     name: cargo clippy (deny warnings)
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     steps:
       # Self-defending guard (sentinel ask on #1116): the self-hosted leg
@@ -174,12 +211,23 @@ jobs:
   quality:
     name: rust quality guard
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.runtime != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Rust quality guard
         run: bash test/rust_quality_guard.sh
+      - name: Shell syntax and Rust cutover guards
+        run: |
+          bash -n install.sh uninstall.sh docker/mesh-converge.sh
+          bash test/rust_cutover_guard.sh
+      # canary/main run this exact proof against real installed binaries in
+      # ci.yml (Linux + macOS). Only the legacy branch lacks that workflow.
+      - name: Public runtime proof on rust-rewrite
+        if: github.base_ref == 'rust-rewrite' || github.ref == 'refs/heads/rust-rewrite'
+        run: |
+          cargo build --manifest-path Cargo.toml -p airc-cli
+          AIRC_BIN="$PWD/target/debug/airc" AIRC_EXPECT_BIN="$PWD/target/debug/airc" bash test/public_installed_runtime_proof.sh
 
   # The REQUIRED `cargo test (ubuntu-latest)` context — pulled out of the
   # matrix ON PURPOSE. A skipped MATRIX job reports a single check named
@@ -195,7 +243,7 @@ jobs:
   test-ubuntu:
     name: cargo test (ubuntu-latest)
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -258,14 +306,13 @@ jobs:
     # (like the named-pipe IPC concurrent-bind test) only execute on
     # Windows.
     name: cargo test (${{ matrix.display }})
-    # Gate as fmt/clippy: skip on non-Rust PRs (keeps the contended
-    # self-hosted Windows leg free), run real on merge_group/push and
-    # Rust PRs. These legs are NOT required contexts (the required ubuntu
+    # Gate as fmt/clippy: skip explicitly non-Rust changes, run on all
+    # merge groups. These legs are NOT required contexts (the required ubuntu
     # leg is test-ubuntu), so the template-named skipped check here is
     # harmless; merge_group still runs the real matrix on the candidate
     # (the cross-platform merge-race guard).
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ${{ matrix.os }}
     # Defense-in-depth: a hung test must never pin a runner indefinitely.
     # On 2026-06-11 a single windows-self-hosted job hung for ~18h on a

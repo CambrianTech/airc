@@ -5,7 +5,6 @@
 //! when to call it and how to persist the returned snapshot.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use airc_core::PeerId;
 
@@ -40,7 +39,7 @@ pub struct CommandGitRunner;
 
 impl GitCommandRunner for CommandGitRunner {
     fn run_git(&self, repo_path: &Path, args: &[&str]) -> Result<String, LocalGitError> {
-        let output = Command::new("git")
+        let output = airc_core::process::background("git")
             .arg("-C")
             .arg(repo_path)
             .args(args)

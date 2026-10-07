@@ -1,5 +1,5 @@
 //! GitHub operations — PR creation + linking + base-branch resolution.
-//! Currently shells out via `std::process::Command::new("gh")`; card
+//! Currently shells out via `airc_core::process::background(airc_core::gh_executable::resolve())`; card
 //! dec35ec7 will migrate these to the typed `GhClient` trait from
 //! `airc-lib::tools` once that lands.
 //!
@@ -25,6 +25,7 @@ use crate::lease;
 /// transition.
 pub(crate) async fn open_pr_and_link(
     airc: &airc_lib::Airc,
+    home: &std::path::Path,
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -43,7 +44,7 @@ pub(crate) async fn open_pr_and_link(
         return Ok(());
     }
 
-    let short: String = card.card_id.to_string().chars().take(8).collect();
+    let short = card.card_id.shown();
     let lease_root = lease::lease_root()
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
     let worktree_path = lease_root.join(&short);
@@ -89,7 +90,7 @@ pub(crate) async fn open_pr_and_link(
         Some(base) => base,
         None => gh_default_branch(&worktree_str)?,
     };
-    let create_out = std::process::Command::new("gh")
+    let create_out = airc_core::process::background(airc_core::gh_executable::resolve())
         .current_dir(&worktree_str)
         .args([
             "pr",
@@ -123,7 +124,7 @@ pub(crate) async fn open_pr_and_link(
         repo: card.repo.clone(),
         number: pr_number,
         head: BranchName::new(head_branch)?,
-        base: BranchName::new(base_branch)?,
+        base: BranchName::new(base_branch.clone())?,
     };
     airc.link_card_pull_request_in(
         room,
@@ -135,6 +136,30 @@ pub(crate) async fn open_pr_and_link(
     .await?;
 
     println!("pull_request: {pr_url}");
+
+    // THE PR'S PATCH IS ITS SUBMISSION (BigMama, 2026-10-06): Kimi's verdicts on continuum
+    // #4825 and #4840 were refused "no submission to review yet", because opening a PR
+    // published none. Submitted before the review card spawns, so its reviewer finds a
+    // candidate. Best-effort like the PR: a failure warns, never undoes the transition.
+    // Errors become text before the await, so no `dyn Error` is held across it.
+    let submitted = crate::work_commands_git::pr_patch(&worktree_str, &base_branch)
+        .map_err(|e| e.to_string())
+        .and_then(|(base, patch)| {
+            airc_work::GitObjectId::new(base.as_str())
+                .map(|base| (base, patch))
+                .map_err(|e| format!("merge-base `{base}`: {e}"))
+        });
+    match submitted {
+        Ok((base, patch)) => {
+            if let Err(error) =
+                crate::work_commands::submit_patch(airc, home, room, card_id, &patch, base, None)
+                    .await
+            {
+                eprintln!("airc: submission skipped — {error}");
+            }
+        }
+        Err(error) => eprintln!("airc: submission skipped — {error}"),
+    }
 
     // Card ad7e100b Sub-C: with PR linked, spawn a sibling review
     // card so any peer (other than the author) can claim it and
@@ -210,17 +235,16 @@ pub(crate) fn configured_base_branch(repo: &airc_work::RepoId) -> Option<String>
 /// Idempotent: re-linking a card that already has a PR is a no-op.
 pub(crate) async fn link_existing_pr(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
     pr_number: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_work::model::{BranchName, PullRequestRef};
 
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
-        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+        .ok_or_else(|| format!("card {card_id} not visible in room {}'s board", room.name))?;
     if let Some(existing) = &card.pull_request {
         println!(
             "pull_request already linked: card={card_id} pr=#{} ({})",
@@ -234,7 +258,7 @@ pub(crate) async fn link_existing_pr(
     // Read the PR's actual head/base/state from GitHub. `--repo` is
     // explicit (not cwd-derived) so this works from anywhere, including
     // a card whose worktree was already cleaned up.
-    let out = std::process::Command::new("gh")
+    let out = airc_core::process::background(airc_core::gh_executable::resolve())
         .args([
             "pr",
             "view",
@@ -280,10 +304,13 @@ pub(crate) async fn link_existing_pr(
         head: BranchName::new(head)?,
         base: BranchName::new(base)?,
     };
-    airc.link_card_pull_request(airc_lib::LinkCardPullRequest {
-        card_id,
-        pull_request,
-    })
+    airc.link_card_pull_request_in(
+        room,
+        airc_lib::LinkCardPullRequest {
+            card_id,
+            pull_request,
+        },
+    )
     .await?;
     println!("pull_request_linked: card={card_id} pr=#{pr_number}");
     Ok(())
@@ -325,7 +352,7 @@ pub(crate) async fn relink_card_pr(
 
     // Read the successor PR's actual head/base/state from GitHub —
     // typed JSON, explicit --repo, never parsed from human output.
-    let out = std::process::Command::new("gh")
+    let out = airc_core::process::background(airc_core::gh_executable::resolve())
         .args([
             "pr",
             "view",
@@ -398,7 +425,7 @@ pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::e
     // Card a4fe899f: `gh` does NOT accept `-C`; set cwd via
     // `Command::current_dir(...)` so `gh repo view` resolves the
     // worktree's origin remote, not the shell cwd's.
-    let out = std::process::Command::new("gh")
+    let out = airc_core::process::background(airc_core::gh_executable::resolve())
         .current_dir(worktree)
         .args([
             "repo",

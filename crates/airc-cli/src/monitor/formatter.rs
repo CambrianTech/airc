@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -154,7 +154,7 @@ impl Formatter {
         if let Some(ping_id) = marker_uuid(msg, "PING") {
             let to = string_field(message, "to", "");
             if to == self.scope.current_name() {
-                let mut command = Command::new("airc");
+                let mut command = airc_core::process::background("airc");
                 command.arg("send").arg("--plaintext");
                 let channel = string_field(message, "channel", "");
                 if !channel.is_empty() {

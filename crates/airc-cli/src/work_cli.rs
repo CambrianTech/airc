@@ -10,8 +10,12 @@ pub struct WorkArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkAction {
-    /// Create a typed work card in the current room.
+    /// Create a typed work card in the current room, or in `--room`.
     Create {
+        /// Subscribed room whose board gets the card; does not change the current room.
+        /// Without it the card lands wherever the scope's pointer is.
+        #[arg(long)]
+        room: Option<String>,
         /// Repository key, e.g. `CambrianTech/airc`.
         #[arg(long)]
         repo: String,
@@ -56,7 +60,10 @@ pub enum WorkAction {
     /// `--no-lease-required` to override — useful for one-shot
     /// admin claims from the main checkout.
     Claim {
-        /// Work card UUID.
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// Claim lease duration.
         #[arg(long, default_value_t = 600_000)]
@@ -68,9 +75,12 @@ pub enum WorkAction {
     },
     /// Extend this peer's claim lease on a work card.
     Heartbeat {
-        /// Work card UUID.
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
-        /// Claim UUID returned by `work claim`.
+        /// Claim id returned by `work claim`: full, or the short form the board shows.
         claim_id: String,
         /// New lease duration from this heartbeat.
         #[arg(long, default_value_t = 600_000)]
@@ -89,9 +99,12 @@ pub enum WorkAction {
     /// holds, regardless of cwd. So there is no `--no-lease-required`
     /// flag here; release is unconditionally permitted.
     Release {
-        /// Work card UUID.
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
-        /// Claim UUID returned by `work claim`. Optional — see command help.
+        /// Claim id returned by `work claim`: full, or the short form the board shows. Optional — see command help.
         claim_id: Option<String>,
         /// Optional release reason.
         #[arg(long)]
@@ -113,7 +126,10 @@ pub enum WorkAction {
     /// To clear a body, pass `--body ""` (empty string is the
     /// canonical "no body" idiom for markdown).
     Update {
-        /// Work card UUID.
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// New title (omit to leave unchanged).
         #[arg(long)]
@@ -130,7 +146,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// New lifecycle state.
         #[arg(value_enum)]
@@ -141,7 +157,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
     },
     /// Prune worktrees whose work card has reached a terminal state
@@ -288,7 +304,7 @@ pub enum WorkAction {
         /// Subscribed room containing the parent; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Parent card UUID being reviewed.
+        /// Parent card id (full, or the short form the board shows) being reviewed.
         parent_id: String,
         /// Optional pull-request URL the reviewer should consult. The
         /// body includes it explicitly so reviewers can find it
@@ -347,7 +363,7 @@ pub enum WorkAction {
         /// Subscribed room containing the card; does not change the current room.
         #[arg(long)]
         room: Option<String>,
-        /// Work card UUID.
+        /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// Print the gate decision (Green / NotReady reason) without
         /// calling `gh pr merge`. Useful before committing.
@@ -367,7 +383,10 @@ pub enum WorkAction {
     /// head/base from `gh` and emits `PullRequestLinked` so the merger
     /// gate picks it up. Idempotent on an already-linked card.
     Link {
-        /// Work card UUID to link the PR to.
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
+        /// Work card id (full, or the short form the board shows) to link the PR to.
         card_id: String,
         /// GitHub PR number to link (e.g. 1471).
         #[arg(long)]
@@ -385,12 +404,52 @@ pub enum WorkAction {
     /// PR, or the successor doesn't exist / targets a different base
     /// than the link it supersedes (validated via `gh --json`).
     Relink {
-        /// Work card UUID whose PR link to supersede.
+        /// Work card id (full, or the short form the board shows) whose PR link to supersede.
         card_id: String,
         /// Successor PR: a number (e.g. 1137) or a full GitHub PR URL
         /// (e.g. https://github.com/CambrianTech/airc/pull/1137).
         #[arg(long)]
         pr: String,
+    },
+    /// Publish a submission on a card you hold: the patch's content hash, size and base,
+    /// under YOUR identity, so a reviewer's verdict has a candidate to attach to. Moving a
+    /// card to Review links its PR; only a submission makes it reviewable.
+    Submit {
+        /// The card you hold (full id, or the short form the board shows).
+        card_id: String,
+        /// The patch file (e.g. `git diff <base> HEAD > p.patch`): its bytes are hashed.
+        #[arg(long)]
+        patch: std::path::PathBuf,
+        /// The FULL commit sha the patch applies to (`git merge-base HEAD origin/<base>`).
+        #[arg(long)]
+        base: String,
+        /// What the patch is for (default: the card's repo).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Room whose board holds the card (default: the current room).
+        #[arg(long)]
+        room: Option<String>,
+    },
+    /// File a peer review on a submission, as the holder of its review card: the
+    /// verdict and its evidence go to the board under YOUR identity. Spawn the review
+    /// card with `airc work review <card>`, claim it, then run this. The parent card
+    /// and your claim are read from the review card; the submission defaults to the
+    /// card's latest.
+    SubmissionReview {
+        /// The review card you claimed.
+        review_card_id: String,
+        /// `passed` or `failed`.
+        #[arg(long)]
+        outcome: String,
+        /// A file saying what you read, ran and saw: the verdict's evidence.
+        #[arg(long)]
+        evidence_file: std::path::PathBuf,
+        /// The submission to review (default: the card's latest).
+        #[arg(long)]
+        submission: Option<String>,
+        /// Room whose board holds the cards (default: the current room).
+        #[arg(long)]
+        room: Option<String>,
     },
 }
 

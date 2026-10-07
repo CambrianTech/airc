@@ -27,6 +27,7 @@ pub mod handshake;
 pub mod headers_keys;
 pub mod keypair;
 pub mod media;
+pub mod mind_seal;
 pub mod policy;
 pub mod rtc_signal;
 pub mod session;

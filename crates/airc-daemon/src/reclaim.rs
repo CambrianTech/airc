@@ -122,7 +122,7 @@ fn kill_with_escalation(pid: u32) {
     // `kill` binary instead of libc — same semantics, no unsafe block.
     // `kill -0` is the liveness probe (no side effects).
     let signal = |sig: &str| {
-        std::process::Command::new("kill")
+        airc_core::process::background("kill")
             .args([sig, &pid.to_string()])
             .output()
     };
@@ -150,7 +150,7 @@ fn kill_with_escalation(pid: u32) {
     // taskkill is present on every supported Windows; /T takes the
     // daemon's children, /F forces — the wedged holder already proved
     // it won't exit politely (#277: `airc stop` leaves it standing).
-    let _ = std::process::Command::new("taskkill")
+    let _ = airc_core::process::background("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output();
     std::thread::sleep(Duration::from_millis(500));

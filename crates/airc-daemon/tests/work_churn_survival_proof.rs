@@ -1,3 +1,12 @@
+//! CONTRACT (card 667b7e0c, Joel 2026-10-06: "allow anyone to take it at any time"):
+//! a claim on a card someone else holds is a takeover. The SDK gate emits an
+//! attributed `ClaimReleased` of the holder's claim, then the taker's claim. From
+//! `TAKEOVER_ON_RECORD_SINCE_MS` on, the projection still drops a BARE stranger's
+//! claim (Bob's implicit reclaim below), so a takeover is always release-then-claim
+//! on the record. This file's transcript uses t=1..301, before that cutover, so it
+//! proves HISTORICAL boards replay unchanged. The takeover itself is pinned by
+//! airc-lib `a_second_peer_takes_a_live_held_card_and_the_holders_claim_is_released`.
+//!
 //! Card 75b54d0a — flywheel continuity under agent/machine churn:
 //!
 //! > Work must outlive any participant.
@@ -303,6 +312,7 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
             owner: bob,
             reason: None,
             released_at_ms: bob_released_at,
+            taken_over_from: None,
         }),
     ];
     assert_eq!(transcript.len(), EVENTS);

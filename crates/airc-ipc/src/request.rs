@@ -197,6 +197,12 @@ pub struct InboxRequest {
     /// ignore the field; old clients omit it (`skip_serializing_if`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<IpcKind>>,
+    /// History, BACKWARD: the newest `limit` events strictly before this
+    /// cursor, oldest first. How a consumer reads past the one page an
+    /// attach streams (Joel, 2026-10-06: attach anchors at now and pages
+    /// back on demand). Exclusive with `since`. Wire-compatible both ways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<IpcCursor>,
 }
 
 /// Parameters for `RoomTip` (card a1562dbc). The channel is mandatory:
@@ -238,14 +244,16 @@ pub enum AttachStart {
     /// after the subscription is registered. The subscribe contract.
     #[default]
     Live,
-    /// Resume strictly after this cursor — replay the gap the client
-    /// missed while detached, then continue live with no duplicate at
-    /// the seam.
+    /// A bookmark: the stream opens with ONE page of the newest events
+    /// after this cursor (at most the daemon's page, 10), then a
+    /// `AttachCursorAdvanced` summary when it left older unread out, then
+    /// live. The gap is never replayed (Joel, 2026-10-06: "it should be
+    /// impossible"); older history is paged backward with
+    /// `Inbox { before }`.
     After(IpcCursor),
-    /// Replay the full transcript before going live. Audit/replay
-    /// tools only — on a long-lived room this is days of backlog, so
-    /// pair it with [`AttachRequest::with_coalesced_backlog`] unless
-    /// every historical envelope is genuinely wanted.
+    /// The same one page, of the room's newest events, then the summary,
+    /// then live. Never the full transcript: page back with
+    /// `Inbox { before }` for history.
     FromTranscriptStart,
 }
 
@@ -274,24 +282,14 @@ pub struct AttachRequest {
     /// [`Self::start`] — the precedence lives there, nowhere else.
     #[serde(default, skip_serializing_if = "is_false")]
     from_now: bool,
-    /// **Card 7d5b6a65.** When `true`, the daemon emits ONE
-    /// [`Response::AttachCursorAdvanced`] summary frame at the end of
-    /// the backlog catch-up phase instead of streaming each historical
-    /// event individually, then transitions to live tail. Orthogonal to
-    /// [`AttachStart`]: it shapes how backlog is delivered, not where
-    /// the stream starts, and is a no-op when there is no backlog
-    /// (`Live`, or a cursor already at head).
+    /// **Card 7d5b6a65, now implied.** The daemon serves every start in
+    /// the past as one page plus a summary whether or not this is set; it
+    /// is kept on the wire so older clients' requests still decode.
     #[serde(default, skip_serializing_if = "is_false")]
     coalesce_backlog: bool,
-    /// Pairs with [`Self::with_coalesced_backlog`] (card 7d5b6a65
-    /// extension): the N most-recent backlog events are streamed as
-    /// normal `Event` frames at the catch-up seam, and only the OLDER
-    /// history is collapsed into the summary frame — the Discord "one
-    /// page back" shape instead of all-or-nothing. `coalesce_backlog`
-    /// remains the gate: without it this field is a no-op (legacy
-    /// replay already delivers everything). Wire-compat: omitted when
-    /// unset, so old daemons ignore the unknown field and old clients
-    /// simply never send it.
+    /// **Now ignored.** The page an attach streams is the daemon's own
+    /// (10 events), not the client's ask: a request can no longer widen
+    /// it. Kept on the wire so older clients' requests still decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     backlog_tail: Option<u32>,
     /// When `true`, the daemon emits a throttled (1 Hz) live
@@ -316,9 +314,70 @@ pub struct AttachRequest {
     /// all; consumers scope by their `forge.*` projection headers.
     #[serde(default)]
     headers: HeaderFilter,
+    /// A CHANNEL SET served on this one stream, each room with its own
+    /// resume point. The daemon fans the set out router-side and routes
+    /// every `Event` frame by the envelope's own `channel`, so one
+    /// subscriber holds ONE socket for all its rooms instead of one per
+    /// room (measured 2026-10-04: a 15-subscriber core held ~960 attach
+    /// sockets to its daemon). Wire-compat: omitted when unset, so an
+    /// older daemon ignores it and rejects the channel-less request as
+    /// it always did; a client picks this shape only when the daemon's
+    /// status reports `attach_channel_sets`. When set, `channel` /
+    /// `from` / `from_now` are not consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channels: Option<Vec<ChannelAttach>>,
+}
+
+/// One room of a channel-set attach: the room and where its stream
+/// starts. `from: None` is the live edge; `Some` resumes strictly after
+/// that cursor, replaying the durable gap exactly as a single-channel
+/// [`AttachStart::After`] does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelAttach {
+    pub channel: airc_core::RoomId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<IpcCursor>,
+}
+
+impl ChannelAttach {
+    /// The typed start this entry encodes. A set entry has no
+    /// `from_now` flag: no cursor IS the live edge, never the transcript
+    /// start — a set exists for live subscribers that track their own
+    /// cursors, and a full-history replay of N rooms on one socket is
+    /// not a shape anyone asked for.
+    pub fn start(&self) -> AttachStart {
+        match self.from {
+            Some(cursor) => AttachStart::After(cursor),
+            None => AttachStart::Live,
+        }
+    }
 }
 
 impl AttachRequest {
+    /// Attach to a CHANNEL SET on one stream. Each entry carries its
+    /// own start; filters apply to every room in the set. An empty set
+    /// is rejected by the daemon. See [`Self::channels`] for the
+    /// version contract.
+    pub fn channel_set(channels: Vec<ChannelAttach>) -> Self {
+        Self {
+            channel: None,
+            from: None,
+            from_now: false,
+            coalesce_backlog: false,
+            backlog_tail: None,
+            cursor_heartbeat: false,
+            kinds: None,
+            delivery: None,
+            headers: HeaderFilter::default(),
+            channels: Some(channels),
+        }
+    }
+
+    /// The channel set this request attaches to, if it is a set attach.
+    pub fn channels(&self) -> Option<&[ChannelAttach]> {
+        self.channels.as_deref()
+    }
+
     /// Attach to `channel`, starting at `start`. No filters: every
     /// event class on the channel is delivered. Narrow with the
     /// `with_*` builders.
@@ -338,6 +397,7 @@ impl AttachRequest {
             kinds: None,
             delivery: None,
             headers: HeaderFilter::default(),
+            channels: None,
         }
     }
 
@@ -394,16 +454,15 @@ impl AttachRequest {
         self
     }
 
-    /// Collapse backlog catch-up into one summary frame (card 7d5b6a65).
+    /// Implied since every past start is served as one page plus a
+    /// summary; kept so existing callers and older wire shapes still work.
     pub fn with_coalesced_backlog(mut self) -> Self {
         self.coalesce_backlog = true;
         self
     }
 
-    /// Pairs with [`Self::with_coalesced_backlog`]: stream the `n`
-    /// most-recent backlog events at the catch-up seam and summarize
-    /// only the older history ("one page back"). A no-op unless
-    /// coalescing is enabled.
+    /// Ignored by the daemon: the page an attach streams is the daemon's
+    /// own (10 events). Kept so older wire shapes still decode.
     pub fn with_backlog_tail(mut self, n: u32) -> Self {
         self.backlog_tail = Some(n);
         self
@@ -437,6 +496,7 @@ impl AttachRequest {
             kinds: self.kinds,
             delivery: self.delivery,
             headers: self.headers,
+            channels: self.channels,
         }
     }
 }
@@ -453,6 +513,9 @@ pub struct AttachParts {
     pub kinds: Option<Vec<IpcKind>>,
     pub delivery: Option<Vec<IpcDelivery>>,
     pub headers: HeaderFilter,
+    /// See [`AttachRequest::channel_set`]. `Some` makes this a set
+    /// attach; `channel` / `start` are then not consulted.
+    pub channels: Option<Vec<ChannelAttach>>,
 }
 
 #[inline]
@@ -627,6 +690,47 @@ mod tests {
         assert_eq!(decoded.start(), AttachStart::Live);
     }
 
+    // what this catches: the channel-set attach's wire contract. (a) The
+    // set and each room's own cursor survive the round-trip. (b) A
+    // single-channel request still omits `channels` entirely, so an older
+    // daemon that knows nothing of sets sees byte-identical requests from
+    // a newer client that chose the legacy shape. (c) A set entry with no
+    // cursor starts LIVE, never at the transcript start — N rooms of full
+    // history on one socket is not a shape a subscriber ever asked for.
+    #[test]
+    fn a_channel_set_attach_carries_each_rooms_own_cursor_and_hides_from_old_daemons() {
+        let a = airc_core::RoomId(Uuid::from_u128(1));
+        let b = airc_core::RoomId(Uuid::from_u128(2));
+        let request = AttachRequest::channel_set(vec![
+            ChannelAttach {
+                channel: a,
+                from: None,
+            },
+            ChannelAttach {
+                channel: b,
+                from: Some(cursor(9)),
+            },
+        ]);
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: AttachRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let set = decoded.channels().expect("a set attach");
+        assert_eq!(set[0].start(), AttachStart::Live);
+        assert_eq!(set[1].start(), AttachStart::After(cursor(9)));
+        assert!(
+            decoded.channel().is_none(),
+            "a set attach names no single channel"
+        );
+        let parts = decoded.into_parts();
+        assert_eq!(parts.channels.as_ref().map(Vec::len), Some(2));
+
+        let single = serde_json::to_string(&AttachRequest::live(a)).unwrap();
+        assert!(
+            !single.contains("channels"),
+            "legacy shape must not mention the set: {single}"
+        );
+    }
+
     /// Card c0cb6cdc: the dangerous start must be named — the safe
     /// default of the typed enum is `Live`.
     #[test]
@@ -752,6 +856,7 @@ mod tests {
             channel: Some(airc_core::RoomId::from_u128(0x42)),
             limit: Some(64),
             kinds: None,
+            before: None,
         });
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
@@ -770,6 +875,7 @@ mod tests {
             channel: Some(airc_core::RoomId::from_u128(0x42)),
             limit: Some(50),
             kinds: None,
+            before: None,
         });
         let encoded = serde_json::to_string(&unfiltered).unwrap();
         assert!(
@@ -782,6 +888,7 @@ mod tests {
             channel: Some(airc_core::RoomId::from_u128(0x42)),
             limit: Some(50),
             kinds: Some(vec![IpcKind::Message, IpcKind::Event]),
+            before: None,
         });
         let decoded: Request =
             serde_json::from_str(&serde_json::to_string(&filtered).unwrap()).unwrap();
@@ -838,6 +945,7 @@ mod tests {
                 channel: Some(airc_core::RoomId::from_u128(0x42)),
                 limit: Some(1),
                 kinds: None,
+                before: None,
             })
         );
     }

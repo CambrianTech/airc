@@ -10,7 +10,16 @@
 //! find an event that is neither in the ring nor in the ORM yet. The ring
 //! therefore enforces a **capacity floor ≥ max un-persisted backlog**: if the
 //! oldest entry is still pinned when we need room, the ring grows past nominal
-//! capacity rather than drop an unpersisted `Durable` event.
+//! capacity rather than drop an unpersisted `Durable` event. A pinned floor
+//! does not retain an unlimited non-durable tail: those lossy cache entries
+//! remain evictable without punching a hole in the durable suffix.
+//!
+//! The ring is bounded twice: by entry count AND by retained bytes. A count
+//! alone let one channel of large envelopes hold tens of MB (measured on
+//! IntelMac 2026-10-04: 435 MB plateau at 14,687 entries, ~30 KB each, ~55
+//! channels each at their 256-entry count). The byte budget evicts by the same
+//! pinned/durable rules as the count, and never empties the ring: the newest
+//! entry always stays so the live-edge cursor survives one oversized event.
 //!
 //! This type is **not** internally synchronized — the router owns it behind a
 //! shard mutex and never holds that lock across an `.await`.
@@ -33,16 +42,35 @@ struct Slot {
 pub struct HotRing {
     slots: VecDeque<Slot>,
     capacity: usize,
+    byte_budget: usize,
+    /// Sum of [`retained_bytes`] over `slots`, maintained on every push/evict.
+    bytes: usize,
+}
+
+/// The bytes one envelope keeps alive beyond its fixed-size fields: the opaque
+/// payload, the routing headers and the coalescing key. This is what grows
+/// with traffic; the fixed fields are a constant per slot.
+fn retained_bytes(env: &Envelope) -> usize {
+    env.payload.len()
+        + env
+            .headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+        + env.coalesce_key.as_ref().map_or(0, String::len)
 }
 
 impl HotRing {
-    /// Construct with nominal `capacity`. The ring may temporarily exceed this
-    /// when the oldest entries are pinned (un-persisted `Durable`), preserving
-    /// the §3.8 floor. `capacity` must be ≥ 1.
-    pub fn new(capacity: usize) -> Self {
+    /// Construct with nominal `capacity` entries and `byte_budget` retained
+    /// bytes. The ring may temporarily exceed either when the oldest entries
+    /// are pinned (un-persisted `Durable`), preserving the §3.8 floor.
+    /// `capacity` must be ≥ 1.
+    pub fn new(capacity: usize, byte_budget: usize) -> Self {
         Self {
-            slots: VecDeque::with_capacity(capacity.max(1)),
+            slots: VecDeque::new(),
             capacity: capacity.max(1),
+            byte_budget,
+            bytes: 0,
         }
     }
 
@@ -53,6 +81,7 @@ impl HotRing {
     /// always replayable from RAM until it's in the sink.
     pub fn push(&mut self, env: Arc<Envelope>) {
         let pinned = env.delivery.is_durable();
+        self.bytes += retained_bytes(&env);
         self.slots.push_back(Slot { env, pinned });
         self.evict_to_capacity();
     }
@@ -69,19 +98,49 @@ impl HotRing {
         self.evict_to_capacity();
     }
 
-    /// Drop oldest entries until at nominal capacity, but **never** evict a
-    /// pinned (un-persisted `Durable`) entry — that would violate the no-gap
-    /// precondition. Eviction stops at the first pinned entry from the front.
+    /// Over either bound: more entries than `capacity`, or more retained bytes
+    /// than `byte_budget` while more than the newest entry is held.
+    fn over_bounds(&self) -> bool {
+        self.slots.len() > self.capacity || (self.slots.len() > 1 && self.bytes > self.byte_budget)
+    }
+
+    /// Remove the slot at `index`, keeping the byte total in step.
+    fn remove_at(&mut self, index: usize) {
+        if let Some(slot) = self.slots.remove(index) {
+            self.bytes -= retained_bytes(&slot.env);
+        }
+    }
+
+    /// Drop the oldest safe entries until within both bounds. Behind a pinned
+    /// head, ONLY non-durable entries may be reclaimed: removing a persisted
+    /// durable there would punch a hole in the durable suffix that the router's
+    /// ring/deep-replay merge assumes is complete. The retained writer batch
+    /// plus its bounded queue bound the unpersisted durable floor separately.
     fn evict_to_capacity(&mut self) {
-        while self.slots.len() > self.capacity {
+        while self.over_bounds() {
             match self.slots.front() {
                 // Front is unpinned -> safe to drop.
                 Some(slot) if !slot.pinned => {
-                    self.slots.pop_front();
+                    self.remove_at(0);
                 }
-                // Front is pinned -> floor reached; stop. The ring exceeds
-                // nominal capacity until write-behind confirms (§3.8 floor).
-                _ => break,
+                // A failed/slow write must not pin an unbounded lossy tail.
+                // Live fan-out is independent of this bounded recent cache;
+                // these classes are outside the durable replay guarantee.
+                Some(_) => match self
+                    .slots
+                    .iter()
+                    .position(|slot| !slot.env.delivery.is_durable())
+                {
+                    // Never the newest entry: the live edge stays in RAM.
+                    Some(index)
+                        if index + 1 < self.slots.len() || self.slots.len() > self.capacity =>
+                    {
+                        self.remove_at(index);
+                    }
+                    Some(_) => break,
+                    None => break, // only the durable floor remains
+                },
+                None => break,
             }
         }
     }
@@ -141,6 +200,11 @@ impl HotRing {
         self.slots.len()
     }
 
+    /// Retained bytes (payload + headers + coalesce key) across all entries.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// True iff the ring holds no entries.
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
@@ -174,9 +238,77 @@ mod tests {
         e
     }
 
+    fn env_sized(counter: u64, delivery: DeliveryClass, payload_len: usize) -> Envelope {
+        let mut e = env_at(counter, delivery);
+        e.payload = Bytes::from(vec![0u8; payload_len]);
+        e
+    }
+
+    // what this catches: the airc daemon RSS plateau (card 309566f9). A ring bounded
+    // only by count held 256 large envelopes per channel; the byte budget must evict
+    // under it, keep the byte total exact as entries leave, and never drop the newest
+    // entry (the live-edge cursor) even when that one entry alone exceeds the budget.
+    #[test]
+    fn byte_budget_evicts_oldest_and_keeps_the_newest() {
+        let mut ring = HotRing::new(256, 1000);
+        for c in 0..10 {
+            ring.push(Arc::new(env_sized(c, DeliveryClass::EphemeralWindow, 300)));
+        }
+        assert_eq!(
+            ring.len(),
+            3,
+            "300-byte entries under a 1000-byte budget keep three"
+        );
+        assert_eq!(ring.retained_bytes(), 900);
+        assert_eq!(ring.oldest_cursor().unwrap().seq.counter, 7);
+
+        ring.push(Arc::new(env_sized(
+            10,
+            DeliveryClass::EphemeralWindow,
+            5000,
+        )));
+        assert_eq!(
+            ring.len(),
+            1,
+            "an oversized newest entry evicts everything older"
+        );
+        assert_eq!(ring.retained_bytes(), 5000);
+        assert_eq!(
+            ring.newest_cursor().unwrap().seq.counter,
+            10,
+            "the live edge survives"
+        );
+    }
+
+    // what this catches: the byte budget must not weaken the §3.8 floor. Pinned
+    // (unpersisted durable) entries stay however many bytes they hold; once
+    // persisted they become evictable and the budget reclaims them.
+    #[test]
+    fn byte_budget_never_drops_a_pinned_durable() {
+        let mut ring = HotRing::new(256, 1000);
+        for c in 0..4 {
+            ring.push(Arc::new(env_sized(c, DeliveryClass::Durable, 600)));
+        }
+        assert_eq!(
+            ring.len(),
+            4,
+            "2400 bytes over budget, but every entry is pinned"
+        );
+        assert_eq!(ring.pinned_count(), 4);
+        for id in 1..=4 {
+            ring.mark_persisted(EventId::from_u128(id));
+        }
+        assert_eq!(
+            ring.len(),
+            1,
+            "persisted entries reclaim down to the newest"
+        );
+        assert_eq!(ring.retained_bytes(), 600);
+    }
+
     #[test]
     fn evicts_unpinned_to_capacity() {
-        let mut ring = HotRing::new(3);
+        let mut ring = HotRing::new(3, usize::MAX);
         for c in 0..5 {
             ring.push(Arc::new(env_at(c, DeliveryClass::EphemeralWindow)));
         }
@@ -187,7 +319,7 @@ mod tests {
 
     #[test]
     fn pinned_durable_is_not_evicted_until_persisted() {
-        let mut ring = HotRing::new(2);
+        let mut ring = HotRing::new(2, usize::MAX);
         // Two durable, both unpersisted -> both pinned.
         ring.push(Arc::new(env_at(0, DeliveryClass::Durable)));
         ring.push(Arc::new(env_at(1, DeliveryClass::Durable)));
@@ -200,6 +332,28 @@ mod tests {
         );
         assert_eq!(ring.pinned_count(), 3);
 
+        // A later confirmed durable MUST stay behind the pinned head: deep
+        // replay reads only before the oldest ring cursor. Lossy traffic may
+        // be reclaimed instead, regardless of its live delivery class.
+        ring.mark_persisted(EventId::from_u128(3)); // counter 2
+        for (counter, delivery) in [
+            (3, DeliveryClass::EphemeralWindow),
+            (4, DeliveryClass::StreamChunk),
+            (5, DeliveryClass::RequestResponse),
+        ] {
+            ring.push(Arc::new(env_at(counter, delivery)));
+            assert_eq!(ring.len(), 3, "lossy traffic cannot grow the durable floor");
+        }
+        assert_eq!(
+            ring.replay_after(None)
+                .iter()
+                .map(|env| env.seq.counter)
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+            "pinned and later persisted durables form an intact suffix"
+        );
+        assert_eq!(ring.pinned_count(), 2);
+
         // Confirm persistence of the oldest -> now evictable.
         ring.mark_persisted(EventId::from_u128(1)); // counter 0
         assert_eq!(ring.len(), 2, "unpinned oldest reclaimed back to capacity");
@@ -211,7 +365,7 @@ mod tests {
     /// the transcript tip) and is `None` when no durable is retained.
     #[test]
     fn newest_durable_cursor_skips_non_durable_tail() {
-        let mut ring = HotRing::new(10);
+        let mut ring = HotRing::new(10, usize::MAX);
         assert_eq!(ring.newest_durable_cursor(), None, "empty ring");
 
         ring.push(Arc::new(env_at(0, DeliveryClass::StreamChunk)));
@@ -236,7 +390,7 @@ mod tests {
 
     #[test]
     fn replay_after_returns_strictly_newer_in_order() {
-        let mut ring = HotRing::new(10);
+        let mut ring = HotRing::new(10, usize::MAX);
         for c in 0..5 {
             ring.push(Arc::new(env_at(c, DeliveryClass::Durable)));
         }

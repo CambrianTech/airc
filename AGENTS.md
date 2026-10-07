@@ -17,6 +17,23 @@ For the deeper design layers, see [`docs/lane-kanban-protocol.md`](docs/lane-kan
 
 ## 0. You are engineering staff, not an assistant
 
+### Installation investigations must become installer behavior
+
+Track every manual installation step and investigation in the repository:
+failure, intervention, diagnosis, owner, installer change, regression coverage,
+and end-to-end install receipt. Once understood, automate the case in the
+supported installer or its existing shared modules. Human consent remains
+explicit; detecting, presenting, waiting for, and resuming after consent belongs
+in the installer.
+
+Keep each case OPEN until normal installation exercises the repair end to end.
+A hand-repaired machine, passing unit test, documentation update, or rerun that
+skips manually satisfied prerequisites does not close it. Distinguish exercised
+behavior from skipped prerequisites; never destroy a working setup to fabricate
+a clean-install result. Review this ledger alongside the installer diff before
+declaring installation fixed. These are Joel's acceptance requirements, not
+optional follow-up work.
+
 You — every agent attaching to this room, from Claude tabs to lesser
 persona intelligences — are the engineering team. The human (Joel)
 provides *direction* + *occasional commentary*; everything else is
@@ -151,12 +168,21 @@ airc work create  --repo … --title … [--priority p0|p1|p2|p3] [--body …]
 States flow: `Open → Claimed → InProgress → Review → Merged/Closed`.
 `Blocked` is valid mid-flight when waiting on another card.
 
-**Lease + heartbeat keep the flywheel alive across churn.** A claim
-expires after `--ttl-ms` (default 10 minutes). Heartbeat to extend
-while you're actively working. If you go offline mid-claim, the lease
-decays and another peer can reclaim — work outlives any single
-participant, by design. See `lease=` column on the board (`<STALE>` =
-reclaim-eligible).
+**Anyone may take a card at any time; the lease is presence** (Joel,
+2026-10-06: "allow anyone to take it at any time ... Last thing we want is
+stopped flywheel"). A claim's lease (`--ttl-ms`, default 10 minutes) says
+whether its holder is here. Your heartbeats, your submissions and your state
+changes on the card all renew it, and `airc work claim` on your own card
+resumes your claim (even in Review).
+
+`airc work claim` on a card someone else holds, live lease or lapsed, takes it
+over. The takeover is on the record: their claim is released by you, typed
+with whom it was taken from (`taken_over_from`), then your claim lands. `airc work
+next` offers open cards and lapsed claims, never a live one, so nobody's turn
+is pulled by a scheduler; taking a live card is a deliberate claim. Settled
+cards (Review, Merged, Closed) stay past claiming for everyone but their owner.
+(Card d826e5f1's durable ownership, 2026-10-04, was never Joel's rule and is
+gone.)
 
 ---
 

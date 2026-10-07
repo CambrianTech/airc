@@ -5,8 +5,8 @@ use std::path::Path;
 use uuid::Uuid;
 
 use airc_lib::{
-    AllocateWorkspace, BranchName, ClaimId, HeartbeatWorkspace, ReleaseWorkspace, RepoId,
-    RequestWorkspace, WorkBoardProjection, WorkCardId, WorkspaceId,
+    AllocateWorkspace, BranchName, HeartbeatWorkspace, ReleaseWorkspace, RepoId, RequestWorkspace,
+    WorkBoardProjection, WorkspaceId,
 };
 
 pub async fn run_request(
@@ -34,10 +34,13 @@ pub async fn run_request(
             )
         })?,
     };
+    let room = airc.current_room().await?;
+    let card_id = crate::work_commands::card_in_room(&airc, &room, &card_id).await?;
+    let claim_id = crate::work_commands::claim_in_room(&airc, &room, card_id, &claim_id).await?;
     let workspace_id = airc
         .request_workspace(RequestWorkspace {
-            card_id: parse_work_card_id(&card_id)?,
-            claim_id: parse_claim_id(&claim_id)?,
+            card_id,
+            claim_id,
             repo,
             branch: BranchName::new(branch)?,
             base: BranchName::new(base)?,
@@ -123,18 +126,6 @@ fn print_workspaces(board: &WorkBoardProjection) {
             path = lease.path,
         );
     }
-}
-
-fn parse_work_card_id(input: &str) -> Result<WorkCardId, Box<dyn std::error::Error>> {
-    let uuid = Uuid::parse_str(input)
-        .map_err(|error| format!("work card id {input:?} is not a valid UUID: {error}"))?;
-    Ok(WorkCardId::from_uuid(uuid))
-}
-
-fn parse_claim_id(input: &str) -> Result<ClaimId, Box<dyn std::error::Error>> {
-    let uuid = Uuid::parse_str(input)
-        .map_err(|error| format!("claim id {input:?} is not a valid UUID: {error}"))?;
-    Ok(ClaimId::from_uuid(uuid))
 }
 
 fn parse_workspace_id(input: &str) -> Result<WorkspaceId, Box<dyn std::error::Error>> {

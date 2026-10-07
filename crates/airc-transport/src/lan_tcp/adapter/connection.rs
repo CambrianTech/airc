@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
@@ -20,7 +20,9 @@ use airc_protocol::Frame;
 
 use crate::lan_tcp::adapter::dispatch::dispatch_to_subscribers;
 use crate::lan_tcp::adapter::error::LanTcpError;
-use crate::lan_tcp::adapter::inner::{Inner, Outbound, MAX_FRAME_BYTES, OUTBOUND_CHANNEL_DEPTH};
+use crate::lan_tcp::adapter::inner::{
+    Inner, Outbound, Session, MAX_FRAME_BYTES, OUTBOUND_CHANNEL_DEPTH,
+};
 use crate::lan_tcp::cert::extract_ed25519_pubkey;
 
 /// Post-handshake server-side connection handler: bind the peer
@@ -32,7 +34,7 @@ pub(super) async fn handle_server_connection(
     tls_stream: ServerTlsStream<TcpStream>,
     peer_addr: std::net::SocketAddr,
 ) -> Result<(), LanTcpError> {
-    let peer_id = resolve_peer_from_server_stream(&inner, &tls_stream)
+    let (peer_id, authenticated_key) = resolve_peer_from_server_stream(&inner, &tls_stream)
         .ok_or(LanTcpError::PeerNotInRegistry)?;
     // #9: the peer just proved (via the authenticated handshake) it's
     // reachable at `peer_addr.ip()`. Report it to the learn-observer if one
@@ -46,7 +48,7 @@ pub(super) async fn handle_server_connection(
         observer(peer_id, peer_addr.ip());
     }
     let (read_half, write_half) = tokio::io::split(tls_stream);
-    install_and_spawn_loops(inner, peer_id, read_half, write_half).await;
+    install_and_spawn_loops(inner, peer_id, authenticated_key, read_half, write_half).await;
     Ok(())
 }
 
@@ -58,37 +60,37 @@ pub(super) async fn handle_client_connection(
     inner: Arc<Inner>,
     tls_stream: ClientTlsStream<TcpStream>,
 ) -> Result<(), LanTcpError> {
-    let peer_id = resolve_peer_from_client_stream(&inner, &tls_stream)
+    let (peer_id, authenticated_key) = resolve_peer_from_client_stream(&inner, &tls_stream)
         .ok_or(LanTcpError::PeerNotInRegistry)?;
     let (read_half, write_half) = tokio::io::split(tls_stream);
-    install_and_spawn_loops(inner, peer_id, read_half, write_half).await;
+    install_and_spawn_loops(inner, peer_id, authenticated_key, read_half, write_half).await;
     Ok(())
 }
 
 fn resolve_peer_from_server_stream(
     inner: &Arc<Inner>,
     tls_stream: &ServerTlsStream<TcpStream>,
-) -> Option<PeerId> {
+) -> Option<(PeerId, [u8; 32])> {
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
     inner
         .registry
         .find_peer(&pubkey)
-        .map(|(peer, _key_id)| peer)
+        .map(|(peer, _key_id)| (peer, pubkey))
 }
 
 fn resolve_peer_from_client_stream(
     inner: &Arc<Inner>,
     tls_stream: &ClientTlsStream<TcpStream>,
-) -> Option<PeerId> {
+) -> Option<(PeerId, [u8; 32])> {
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
     inner
         .registry
         .find_peer(&pubkey)
-        .map(|(peer, _key_id)| peer)
+        .map(|(peer, _key_id)| (peer, pubkey))
 }
 
 /// Install the outbound channel into `inner` **before** spawning the
@@ -97,9 +99,14 @@ fn resolve_peer_from_client_stream(
 /// set inside a spawned task, so callers (and the CLI) could call
 /// `send()` after `connect()` returned and find no connection
 /// installed yet. Now the install is awaited inline.
-async fn install_and_spawn_loops<R, W>(
+///
+/// A session it replaces (the same peer, redialed) is ended here, not left running: its
+/// outbound sender drops with the map entry (closing its write loop) and its reader is
+/// aborted, so both halves of the old TLS stream drop and the socket closes.
+pub(super) async fn install_and_spawn_loops<R, W>(
     inner: Arc<Inner>,
     peer_id: PeerId,
+    authenticated_key: [u8; 32],
     read_half: R,
     write_half: W,
 ) where
@@ -107,23 +114,61 @@ async fn install_and_spawn_loops<R, W>(
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_CHANNEL_DEPTH);
+    let id = inner
+        .next_session_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let writer = tokio::spawn(write_loop(write_half, outbound_rx));
+    // The reader starts only once its session is in the map, so a read that ends at once
+    // cannot remove an entry that does not exist yet and leave a dead session installed.
+    let (installed_tx, installed_rx) = oneshot::channel::<()>();
+    let reader = tokio::spawn(read_loop(
+        Arc::clone(&inner),
+        peer_id,
+        id,
+        read_half,
+        installed_rx,
+    ));
     // Install synchronously — when this function returns, the
     // connection IS ready to receive sends.
-    inner.connections.lock().await.insert(peer_id, outbound_tx);
-
-    // Spawn the I/O loops; they continue to drive the wire after
-    // this function returns.
-    tokio::spawn(write_loop(write_half, outbound_rx));
-    tokio::spawn(read_loop(inner, peer_id, read_half));
+    let replaced = inner.connections.lock().await.insert(
+        peer_id,
+        Session {
+            authenticated_key,
+            outbound: outbound_tx,
+            id,
+            reader: reader.abort_handle(),
+            writer: writer.abort_handle(),
+        },
+    );
+    let _ = installed_tx.send(());
+    if let Some(old) = replaced {
+        old.end();
+    }
+    let observer = inner.on_connect.lock().ok().and_then(|guard| guard.clone());
+    if let Some(observer) = observer {
+        observer(peer_id);
+    }
 }
 
-/// #240: terminate this peer's live session — drop it from `connections` and
-/// fire the disconnect observer (if the layer above registered one) so a
-/// dropped-but-still-reachable peer can be re-dialed at once. The connections
-/// lock is released BEFORE the observer runs (never held across the callback,
-/// mirroring the accept path's `on_inbound` discipline).
-pub(super) async fn disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
-    inner.connections.lock().await.remove(&peer_id);
+/// A read loop ending on its own: remove this peer's entry only if it is still THIS session.
+/// A newer session for the same peer (a redial) is not this reader's to end.
+async fn disconnect_session(inner: &Arc<Inner>, peer_id: PeerId, id: u64) {
+    let removed = {
+        let mut connections = inner.connections.lock().await;
+        match connections.get(&peer_id) {
+            Some(session) if session.id == id => connections.remove(&peer_id),
+            _ => None,
+        }
+    };
+    if let Some(session) = removed {
+        // The reader is this very task and is ending anyway; the writer may be blocked on
+        // a peer that stopped reading, so it is aborted rather than left holding its half.
+        session.writer.abort();
+        notify_disconnect(inner, peer_id);
+    }
+}
+
+pub(super) fn notify_disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
     let observer = inner
         .on_disconnect
         .lock()
@@ -138,25 +183,31 @@ pub(super) async fn disconnect(inner: &Arc<Inner>, peer_id: PeerId) {
 /// and fan out to subscribers per the Transport trait's lag policy.
 /// Removes this peer's entry from `connections` on any termination
 /// (clean EOF, I/O error, malformed payload, oversized frame).
-async fn read_loop<R>(inner: Arc<Inner>, peer_id: PeerId, mut read_half: R)
-where
+async fn read_loop<R>(
+    inner: Arc<Inner>,
+    peer_id: PeerId,
+    id: u64,
+    mut read_half: R,
+    installed: oneshot::Receiver<()>,
+) where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
 {
+    let _ = installed.await;
     loop {
         // Read 4-byte BE length prefix.
         let mut len_bytes = [0u8; 4];
         if read_half.read_exact(&mut len_bytes).await.is_err() {
-            disconnect(&inner, peer_id).await;
+            disconnect_session(&inner, peer_id, id).await;
             return;
         }
         let len = u32::from_be_bytes(len_bytes);
         if len > MAX_FRAME_BYTES {
-            disconnect(&inner, peer_id).await;
+            disconnect_session(&inner, peer_id, id).await;
             return;
         }
         let mut payload = vec![0u8; len as usize];
         if read_half.read_exact(&mut payload).await.is_err() {
-            disconnect(&inner, peer_id).await;
+            disconnect_session(&inner, peer_id, id).await;
             return;
         }
 
@@ -179,7 +230,7 @@ where
                     .with_field("payload_bytes", payload.len())
                     .with_field("error", error),
                 );
-                disconnect(&inner, peer_id).await;
+                disconnect_session(&inner, peer_id, id).await;
                 return;
             }
         };

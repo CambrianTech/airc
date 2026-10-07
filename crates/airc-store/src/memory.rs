@@ -174,7 +174,14 @@ impl EventStore for InMemoryEventStore {
             .runtime_cursors
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
-        cursors.insert(consumer_id.to_string(), cursor.clone());
+        cursors
+            .entry(consumer_id.to_string())
+            .and_modify(|previous| {
+                if (cursor.lamport, cursor.event_id.0) > (previous.lamport, previous.event_id.0) {
+                    *previous = cursor.clone();
+                }
+            })
+            .or_insert_with(|| cursor.clone());
         Ok(())
     }
 

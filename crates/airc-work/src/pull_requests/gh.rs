@@ -16,7 +16,6 @@
 //! `PullRequestReviewSubmitted` events from this path yet.
 
 use std::collections::HashMap;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +47,9 @@ pub struct CommandGhRunner;
 
 impl GhCommandRunner for CommandGhRunner {
     fn run_gh(&self, args: &[&str]) -> Result<String, GhRunnerError> {
-        let output = Command::new("gh").args(args).output()?;
+        let output = airc_core::process::background(airc_core::gh_executable::resolve())
+            .args(args)
+            .output()?;
         if !output.status.success() {
             return Err(GhRunnerError::NonZero {
                 status: output.status.code(),

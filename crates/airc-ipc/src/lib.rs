@@ -29,6 +29,9 @@ pub mod response;
 pub mod sdk_conversions;
 pub mod transport;
 
+#[cfg(windows)]
+mod windows_pipe_security;
+
 /// Local daemon IPC ABI version.
 ///
 /// Bump this when the request/response wire encoding changes in a way
@@ -42,9 +45,9 @@ pub const IPC_PROTOCOL_VERSION: u16 = 5;
 
 pub use client::{ClientError, DaemonClient};
 pub use request::{
-    AddPeerRequest, AttachParts, AttachRequest, AttachStart, InboxRequest, IpcCursor, IpcDelivery,
-    IpcKind, IpcTarget, PeerIdentityCardRequest, PresenceRequest, PublishRequest,
-    RemovePeerRequest, Request, RoomTipRequest, SendRequest,
+    AddPeerRequest, AttachParts, AttachRequest, AttachStart, ChannelAttach, InboxRequest,
+    IpcCursor, IpcDelivery, IpcKind, IpcTarget, PeerIdentityCardRequest, PresenceRequest,
+    PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 pub use response::{
     DeliveryStatsResponse, InboxResponse, IpcIdentityCard, IpcPeerDeliveryStats, IpcRoomInfo,
