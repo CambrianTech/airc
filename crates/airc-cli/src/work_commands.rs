@@ -577,7 +577,8 @@ pub async fn run_state(
     // auto-spawn review card, board renderers) read one source of
     // truth.
     if card_state == CardState::Review {
-        if let Err(error) = crate::work_commands_gh::open_pr_and_link(&airc, &room, card_uuid).await
+        if let Err(error) =
+            crate::work_commands_gh::open_pr_and_link(&airc, home, &room, card_uuid).await
         {
             eprintln!("airc: gh pr create skipped — {error}");
         }
@@ -1778,12 +1779,6 @@ pub async fn run_submit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes =
         std::fs::read(&patch).map_err(|e| format!("patch file {}: {e}", patch.display()))?;
-    // Retain the exact bytes BEFORE publishing their identity (BigMama on #1548): a reviewer,
-    // grader or lift reads a submission by hash, and the patch file can change after this
-    // call. The scope's content-addressed store holds them; its hash is the one published.
-    let store = airc_blobs::FsStore::new(airc_lib::machine_account_home(home).join("blobs"))
-        .map_err(|e| format!("blob store: {e}"))?;
-    let artifact = retain_patch(&store, &bytes)?;
     let base_sha = airc_work::GitObjectId::new(base.trim())
         .map_err(|e| format!("--base `{base}`: {e} (give the FULL commit sha)"))?;
     let airc = crate::commands::attached_airc(home).await?;
@@ -1791,9 +1786,30 @@ pub async fn run_submit(
     let room = room_or_current(&airc, room.as_deref(), "submit work in").await?;
     let board = airc.work_board_in(&room).await?;
     let card_id = card_on_board(&board, &shown)?;
+    submit_patch(&airc, home, &room, card_id, &bytes, base_sha, instance).await
+}
+
+/// Publish `bytes` as a submission on `card_id`, under the caller as its holder: the
+/// one path behind `airc work submit` and the review transition's PR (BigMama,
+/// 2026-10-06: a PR opened with no submission left the reviewer's verdict nothing to
+/// attach to). Only the holder submits. The bytes are retained in the scope's blob store
+/// BEFORE their hash is published (BigMama on #1548): a reviewer, grader or lift reads a
+/// submission by hash, and the patch file can change after this call.
+pub(crate) async fn submit_patch(
+    airc: &airc_lib::Airc,
+    home: &Path,
+    room: &airc_lib::Room,
+    card_id: airc_lib::WorkCardId,
+    bytes: &[u8],
+    base_sha: airc_work::GitObjectId,
+    instance: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} is not on {}'s board", room.name))?;
+    let store = airc_blobs::FsStore::new(airc_lib::machine_account_home(home).join("blobs"))
+        .map_err(|e| format!("blob store: {e}"))?;
     let claim_id = match (card.owner, card.claim_id) {
         (Some(owner), Some(claim)) if owner == airc.peer_id() => claim,
         (Some(owner), _) => {
@@ -1806,10 +1822,11 @@ pub async fn run_submit(
             return Err(format!("card {card_id} is not claimed: `airc work claim` it first").into())
         }
     };
+    let artifact = retain_patch(&store, bytes)?;
     let instance = instance.unwrap_or_else(|| card.repo.to_string());
     let submission = airc
         .submit_work_in(
-            &room,
+            room,
             airc_lib::SubmitWork {
                 submission_id: airc_work::SubmissionId::new(),
                 card_id,
