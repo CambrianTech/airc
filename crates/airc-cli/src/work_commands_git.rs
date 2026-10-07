@@ -185,6 +185,7 @@ pub(crate) fn git_rev_parse_branch(worktree: &str) -> Result<String, Box<dyn std
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
+
 /// The patch a PR carries, as its reviewer reads it: `worktree`'s HEAD against its
 /// merge-base with `base_branch` on origin. Returns that merge-base's full sha (the
 /// submission's base) and the diff bytes. The base is fetched first, so a clone that has
@@ -294,6 +295,8 @@ pub(crate) fn worktree_skip_reason(
 mod tests {
     use super::*;
     use airc_core::PeerId;
+    use airc_work::ids::{RepoId, WorkCardId};
+    use airc_work::model::{BranchName, CardState, Priority, PullRequestRef, WorkCard};
 
     /// what this catches: a submission whose patch or base is not what the PR carries.
     /// The reviewer's verdict attaches to this submission, so a diff against a stale local
@@ -362,8 +365,6 @@ mod tests {
             "origin's later commit is not the PR's: {patch}"
         );
     }
-    use airc_work::ids::{RepoId, WorkCardId};
-    use airc_work::model::{BranchName, CardState, Priority, PullRequestRef, WorkCard};
 
     /// Build a minimal `WorkCard` with the optional `pr` already
     /// linked or not. Pure constructor — no clock, no IDs from the
