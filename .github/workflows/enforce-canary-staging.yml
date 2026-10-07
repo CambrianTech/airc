@@ -49,6 +49,14 @@ jobs:
             promote/*)
               head_tree="$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq .commit.tree.sha)"
               canary_tree="$(gh api "repos/$REPO/commits/canary" --jq .commit.tree.sha)"
+              # FAIL CLOSED (BigMama on #1552): this guards main, so two empty or
+              # `null` answers must never compare equal. Both must be real tree shas.
+              for tree in "$head_tree" "$canary_tree"; do
+                if ! printf '%s' "$tree" | grep -qE '^[0-9a-f]{40}$'; then
+                  echo "::error::could not read a tree sha for ${HEAD_REF} or canary (got '${tree}'); refusing rather than guessing."
+                  exit 1
+                fi
+              done
               if [ "$head_tree" = "$canary_tree" ]; then
                 echo "✓ promotion: ${HEAD_REF}'s tree ($head_tree) is canary's tree — staging policy satisfied."
                 exit 0
