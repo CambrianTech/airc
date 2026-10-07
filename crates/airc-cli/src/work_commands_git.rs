@@ -185,6 +185,38 @@ pub(crate) fn git_rev_parse_branch(worktree: &str) -> Result<String, Box<dyn std
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
+/// The patch a PR carries, as its reviewer reads it: `worktree`'s HEAD against its
+/// merge-base with `base_branch` on origin. Returns that merge-base's full sha (the
+/// submission's base) and the diff bytes. The base is fetched first, so a clone that has
+/// not seen origin's branch since it was cut still diffs against what the PR targets.
+pub(crate) fn pr_patch(
+    worktree: &str,
+    base_branch: &str,
+) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+    let git = |args: &[&str]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let out = airc_core::process::background("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .output()?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        Ok(out.stdout)
+    };
+    git(&["fetch", "--quiet", "origin", base_branch])?;
+    let base = String::from_utf8(git(&["merge-base", "HEAD", "FETCH_HEAD"])?)?
+        .trim()
+        .to_string();
+    let patch = git(&["diff", "--binary", &base, "HEAD"])?;
+    Ok((base, patch))
+}
+
 /// `git show -s --format=<format> HEAD` from inside `worktree`. Used
 /// to read the HEAD commit's subject (%s) and body (%b) to pass as
 /// `gh pr create --title` / `--body`, since `gh pr create --fill`'s
@@ -262,6 +294,74 @@ pub(crate) fn worktree_skip_reason(
 mod tests {
     use super::*;
     use airc_core::PeerId;
+
+    /// what this catches: a submission whose patch or base is not what the PR carries.
+    /// The reviewer's verdict attaches to this submission, so a diff against a stale local
+    /// base (the clone never fetched the PR's base) or against the wrong commit would hand
+    /// her someone else's change. The patch is HEAD against the merge-base with origin's
+    /// base branch, and the base is that merge-base's full sha.
+    #[test]
+    fn pr_patch_is_head_against_the_merge_base_with_origins_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let out = airc_core::process::background("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let origin = dir.path().join("origin");
+        std::fs::create_dir(&origin).expect("origin dir");
+        run(&origin, &["init", "--quiet", "--initial-branch=canary"]);
+        run(&origin, &["config", "user.email", "t@t"]);
+        run(&origin, &["config", "user.name", "t"]);
+        std::fs::write(origin.join("lib.rs"), "fn a() {}\n").expect("write");
+        run(&origin, &["add", "."]);
+        run(&origin, &["commit", "--quiet", "-m", "base"]);
+        let base = run(&origin, &["rev-parse", "HEAD"]);
+
+        let clone = dir.path().join("clone");
+        run(
+            dir.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin.to_str().expect("utf8"),
+                clone.to_str().expect("utf8"),
+            ],
+        );
+        run(&clone, &["config", "user.email", "t@t"]);
+        run(&clone, &["config", "user.name", "t"]);
+        run(&clone, &["checkout", "--quiet", "-b", "fix"]);
+        std::fs::write(clone.join("lib.rs"), "fn a() { fixed() }\n").expect("write");
+        run(&clone, &["commit", "--quiet", "-am", "the fix"]);
+        // origin's base moves on after the clone was cut: the merge-base stays the base.
+        std::fs::write(origin.join("other.rs"), "fn b() {}\n").expect("write");
+        run(&origin, &["add", "."]);
+        run(&origin, &["commit", "--quiet", "-m", "unrelated"]);
+
+        let (got_base, patch) =
+            pr_patch(clone.to_str().expect("utf8"), "canary").expect("pr_patch");
+        let patch = String::from_utf8(patch).expect("utf8 patch");
+        assert_eq!(
+            got_base, base,
+            "the base is the merge-base, not origin's moved tip"
+        );
+        assert!(
+            patch.contains("+fn a() { fixed() }"),
+            "the PR's change: {patch}"
+        );
+        assert!(
+            !patch.contains("other.rs"),
+            "origin's later commit is not the PR's: {patch}"
+        );
+    }
     use airc_work::ids::{RepoId, WorkCardId};
     use airc_work::model::{BranchName, CardState, Priority, PullRequestRef, WorkCard};
 

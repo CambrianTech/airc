@@ -25,6 +25,7 @@ use crate::lease;
 /// transition.
 pub(crate) async fn open_pr_and_link(
     airc: &airc_lib::Airc,
+    home: &std::path::Path,
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -123,7 +124,7 @@ pub(crate) async fn open_pr_and_link(
         repo: card.repo.clone(),
         number: pr_number,
         head: BranchName::new(head_branch)?,
-        base: BranchName::new(base_branch)?,
+        base: BranchName::new(base_branch.clone())?,
     };
     airc.link_card_pull_request_in(
         room,
@@ -135,6 +136,30 @@ pub(crate) async fn open_pr_and_link(
     .await?;
 
     println!("pull_request: {pr_url}");
+
+    // THE PR'S PATCH IS ITS SUBMISSION (BigMama, 2026-10-06): Kimi's verdicts on continuum
+    // #4825 and #4840 were refused "no submission to review yet", because opening a PR
+    // published none. Submitted before the review card spawns, so its reviewer finds a
+    // candidate. Best-effort like the PR: a failure warns, never undoes the transition.
+    // Errors become text before the await, so no `dyn Error` is held across it.
+    let submitted = crate::work_commands_git::pr_patch(&worktree_str, &base_branch)
+        .map_err(|e| e.to_string())
+        .and_then(|(base, patch)| {
+            airc_work::GitObjectId::new(base.as_str())
+                .map(|base| (base, patch))
+                .map_err(|e| format!("merge-base `{base}`: {e}"))
+        });
+    match submitted {
+        Ok((base, patch)) => {
+            if let Err(error) =
+                crate::work_commands::submit_patch(airc, home, room, card_id, &patch, base, None)
+                    .await
+            {
+                eprintln!("airc: submission skipped — {error}");
+            }
+        }
+        Err(error) => eprintln!("airc: submission skipped — {error}"),
+    }
 
     // Card ad7e100b Sub-C: with PR linked, spawn a sibling review
     // card so any peer (other than the author) can claim it and
