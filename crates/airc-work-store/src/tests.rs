@@ -401,6 +401,7 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
     assert!(review.validate().is_ok());
     for invalid in [
         "different".to_string(),
+        words.to_uppercase(),
         "x".repeat(32 * 1024 + 1),
         " ".into(),
     ] {
