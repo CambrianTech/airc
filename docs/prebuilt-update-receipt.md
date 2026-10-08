@@ -113,7 +113,7 @@ still requires credential recovery; daemon ACK acceptance remains open.
 
 Subsequent recovery acceptance: after the authenticated dials and normal refresh,
 M5 reports one live LAN peer, Windows three. Windows doctor recorded M5 delivery
-43/43 acknowledged, RTT33ms,8seconds old. Thus the live route recovered without
+47/47 acknowledged, RTT22ms,13seconds old. Thus the live route recovered without
 a daemon/core restart; the preceding empty snapshot describes the before state.
 Credential recovery remains necessary for durable rendezvous. Transport ACK
 still does not prove agent action. Evidence:20261008-airc-restored-delivery.txt.
