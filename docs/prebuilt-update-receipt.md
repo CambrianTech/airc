@@ -87,3 +87,26 @@ Raw evidence retained under the team-proof state directory:
 20261008-airc-resume-first.txt and20261008-airc-resume-repeat.txt.
 Automatic artifact discovery/download is still open; explicit verified input
 is the supported bridge. No runtime audio/video harness was involved.
+
+
+Final M5 `doctor --health` clarifies the connection counts: its daemon snapshot
+was1second old, with **no connected LAN peers and an empty delivery ledger**.
+The703 connections above are IPC liveness, not confirmed mesh delivery. The
+store warning was1073MB plus124MB WAL. Matching builds and capacity recovery
+must not be presented as grid transport health. Evidence:
+20261008-m5-airc-health.txt. No blind doctor --fix or state cleanup was run.
+
+Windows and Intel route snapshots do show recent acknowledged peer delivery:
+Windows→Intel83/83 acknowledgments, RTT81ms,41seconds old; Intel→Windows180/181,
+RTT23ms,14seconds old. Each had2 connected LAN peers and also acknowledged
+peer0121d959. These are transport acknowledgments, not proof an agent read or
+acted on a message. The empty-route gap is specifically M5 in these samples.
+
+Follow-up diagnosis: the M5 GitHub CLI reports its active joelteply credential
+invalid, and public registry sync skips unauthenticated even with Homebrew PATH.
+The Windows address book had M5 port50189 while its live daemon advertises57958.
+The existing key/tier was preserved while updating that endpoint through peer add;
+manual authenticated dial succeeded in both directions. These short-lived CLI
+handshakes prove reachability, not sustained daemon routing. No credential was
+copied, no core restarted, and no store was edited directly. Durable discovery
+still requires credential recovery; daemon ACK acceptance remains open.
