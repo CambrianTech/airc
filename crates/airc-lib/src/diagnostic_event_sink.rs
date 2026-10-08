@@ -241,6 +241,7 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
     match code {
         DiagnosticCode::ConnectionError => "connection_error",
         DiagnosticCode::IpcAcceptFailed => "ipc_accept_failed",
+        DiagnosticCode::DaemonFileCapacity => "daemon_file_capacity",
         DiagnosticCode::FrameVerificationFailed => "frame_verification_failed",
         DiagnosticCode::StoreAppendFailed => "store_append_failed",
         DiagnosticCode::WriteBehindBatchFailed => "write_behind_batch_failed",

@@ -138,6 +138,8 @@ impl DaemonState {
         coordinator_store: Arc<dyn EventStore>,
         runtime: DaemonRuntimeInfo,
     ) -> Result<Self, BusError> {
+        #[cfg(unix)]
+        crate::file_capacity::prepare();
         let sink = Arc::new(SqliteDurableSink::open_path(db_path).await?);
         let epoch_store = sink.bump_epoch().await?;
         let seq = Arc::new(SeqSource::start(&epoch_store));
