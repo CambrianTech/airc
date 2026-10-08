@@ -1133,22 +1133,24 @@ fi
 # no GitHub calls, no log-tail polling in the model, and no dependence
 # on the agent remembering the turn contract.
 
+# Integration setup consumes the verified installation, never an unrelated
+# Cargo output or PATH binary. Source and prebuilt installs share this owner.
+_installed_airc_binary() {
+  local binary="$BIN_DIR/airc"
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) binary="$BIN_DIR/airc.exe" ;; esac
+  [ -x "$binary" ] || return 1
+  printf '%s\n' "$binary"
+}
+
 _install_airc_codex_hooks() {
   [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
-  local _airc=""
-  local _tdir; _tdir="$(_airc_target_dir)" || fail 'Cannot resolve Cargo output for bridge installation.'
-  if [ -x "$_tdir/release/airc" ]; then
-    _airc="$_tdir/release/airc"
-  elif [ -x "$_tdir/debug/airc" ]; then
-    _airc="$_tdir/debug/airc"
-  elif command -v airc >/dev/null 2>&1; then
-    _airc=$(command -v airc)
-  else
-    warn "Could not install Codex AIRC hook: airc binary not found"
+  local _airc
+  _airc="$(_installed_airc_binary)" || {
+    warn "Could not install Codex AIRC hook: installed airc binary not found"
     return 0
-  fi
+  }
 
   local out
   if out=$("$_airc" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
@@ -1289,15 +1291,11 @@ _install_airc_codex_gh_token() {
   local token; token=$(gh auth token 2>/dev/null) || return 0
   [ -z "$token" ] && return 0
 
-  local _airc=""
-  if [ -x "$BIN_DIR/airc.exe" ]; then
-    _airc="$BIN_DIR/airc.exe"
-  elif [ -x "$BIN_DIR/airc" ]; then
-    _airc="$BIN_DIR/airc"
-  else
+  local _airc
+  _airc="$(_installed_airc_binary)" || {
     warn "Cannot update Codex token: parser-capable airc binary unavailable"
     return 0
-  fi
+  }
   if printf '%s' "$token" | "$_airc" codex-hook configure-installer --codex-home "$HOME/.codex" --token-stdin; then
     ok "Codex token configuration updated through the TOML parser"
   else
@@ -1332,15 +1330,11 @@ _install_airc_codex_command_rules() {
   local config="$HOME/.codex/config.toml"
   [ "${AIRC_SKIP_CODEX_RULES:-0}" = "1" ] && return 0
   [ -f "$config" ] || return 0
-  local _airc=""
-  if [ -x "$BIN_DIR/airc.exe" ]; then
-    _airc="$BIN_DIR/airc.exe"
-  elif [ -x "$BIN_DIR/airc" ]; then
-    _airc="$BIN_DIR/airc"
-  else
+  local _airc
+  _airc="$(_installed_airc_binary)" || {
     warn "Cannot configure Codex rules: parser-capable airc binary unavailable"
     return 0
-  fi
+  }
   if "$_airc" codex-hook configure-installer --codex-home "$HOME/.codex" --command-rules; then
     ok "Codex rules configuration checked; existing user rules preserved"
   else
