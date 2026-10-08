@@ -33,6 +33,8 @@
 #![deny(unsafe_code)]
 
 pub mod auto_update;
+#[cfg(unix)]
+mod file_capacity;
 pub mod handlers;
 pub(crate) mod reclaim;
 pub mod route_refresh;

@@ -46,6 +46,8 @@ pub enum DiagnosticCode {
     ConnectionError,
     /// IPC listener failure with its accept stage and original OS error.
     IpcAcceptFailed,
+    /// Startup descriptor capacity, including restricted hard limits.
+    DaemonFileCapacity,
     FrameVerificationFailed,
     StoreAppendFailed,
     /// The owner writer retains this batch and retries; its durable ring

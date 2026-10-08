@@ -48,3 +48,6 @@ tempfile = "3"
 # (card 625abe6d slice 2) — dev-only; the daemon itself runs on the
 # real clock.
 tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
