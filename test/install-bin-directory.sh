@@ -100,7 +100,7 @@ mkdir -p "$fixture/publisher" "$fixture/download"
 printf '#!/bin/sh\nprintf "build: 1234567890123456789012345678901234567890\\n"\n' > "$fixture/publisher/airc"
 asset="airc-canary-$revision-x86_64-unknown-linux-gnu.tar.gz"
 tar -czf "$fixture/publisher/$asset" -C "$fixture/publisher" airc
-(cd "$fixture/publisher" && sha256sum "$asset" > "$asset.sha256")
+(cd "$fixture/publisher" && { if command -v sha256sum >/dev/null; then sha256sum "$asset"; else shasum -a 256 "$asset"; fi; } > "$asset.sha256")
 git() { case "$*" in *describe*) return 1 ;; *rev-parse*) printf '%s\n' "$publisher_revision" ;; *) return 99 ;; esac; }
 uname() { case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac; }
 curl() {

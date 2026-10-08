@@ -39,3 +39,12 @@ the coordinated shared compiler slot was released, and no cache cleanup occurred
 Both public wrappers require the published-artifact helper when selecting a
 compatible source checkout; existing source-acquisition and native setup fixtures
 passed again after that compatibility check.
+
+CI follow-up: macOS lacked sha256sum in the publication fixture; fixture checksum
+creation now uses the same available sha256sum/shasum choice as production. The
+Windows PS5 job installed and observed a Medium-token daemon successfully, then
+public Stop timed out waiting for that daemon to exit. This remains a real
+failure; the existing fixture now prints its bounded owned-daemon log on teardown
+failure without suppressing the Stop or process-exit check. The timeout's daemon
+phase is not yet established. Local normal publication fixture and PowerShell
+syntax checks pass; native macOS fallback and Windows acceptance await CI.
