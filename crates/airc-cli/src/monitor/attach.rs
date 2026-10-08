@@ -171,7 +171,33 @@ pub(crate) async fn run(
     println!("airc: attached to Rust event stream for subscribed channels");
     std::io::stdout().flush()?;
 
-    while let Some(frame) = rx.recv().await {
+    // Reuse this already-running runtime monitor; no independent timer daemon.
+    // Its first tick supplies resume context, later ticks obey the saved cadence.
+    let resume_consumer = format!(
+        "claude-monitor:{}",
+        client_id.as_deref().unwrap_or("default")
+    );
+    let mut resume_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let frame = tokio::select! {
+            frame = rx.recv() => match frame { Some(frame) => frame, None => break },
+            _ = resume_tick.tick() => {
+                match crate::agent_resume::prepare(&airc, &resume_consumer, false).await {
+                    Ok(Some(delivery)) => {
+                        sandbox.emit_contract_once();
+                        println!("{}", resume_frame(&delivery.text, &sandbox));
+                        std::io::stdout().flush()?;
+                        if let Err(error) = crate::agent_resume::acknowledge(&airc, delivery).await {
+                            eprintln!("airc: resume acknowledgment failed; context remains due: {error}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("airc: resume context unavailable: {error}"),
+                }
+                continue;
+            }
+        };
         match frame {
             MonitorFrame::Event(event) => {
                 let event = *event;
@@ -198,6 +224,15 @@ pub(crate) async fn run(
         }
     }
     Ok(())
+}
+
+fn resume_frame(text: &str, sandbox: &Sandbox) -> String {
+    format!(
+        "<resume-{}>{}</resume-{}>",
+        sandbox.nonce,
+        xml_escape(text),
+        sandbox.nonce
+    )
 }
 
 fn render_event(
@@ -265,6 +300,14 @@ mod tests {
     /// initial step and saturate at the cap — never overflow-panic and
     /// never exceed the cap (which would let a dead daemon go un-retried
     /// for an unbounded time, the exact "permanent dark" this card ends).
+    #[test]
+    fn resume_frame_escapes_board_data_in_monitor_envelope() {
+        let sandbox = Sandbox::new();
+        let frame = resume_frame("saved brief & <untrusted card title>", &sandbox);
+        assert!(frame.contains("&amp; &lt;untrusted card title&gt;"));
+        assert!(frame.starts_with(&format!("<resume-{}>", sandbox.nonce)));
+    }
+
     #[test]
     fn reconnect_backoff_doubles_then_caps() {
         assert_eq!(next_reconnect_backoff_ms(RECONNECT_INITIAL_BACKOFF_MS), 500);

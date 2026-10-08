@@ -68,7 +68,23 @@ async fn run_hook(
     let consumer_id = consumer_id(runtime_client.as_deref());
     let events = unread_events(&airc, &consumer_id, filter, count).await?;
 
-    let work_context = work_context(&airc, &events).await?;
+    let resume = match crate::agent_resume::prepare(
+        &airc,
+        &consumer_id,
+        event_name == "PostToolUse",
+    )
+    .await
+    {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            eprintln!("airc: resume context unavailable: {error}");
+            None
+        }
+    };
+    let work_context = match resume.as_ref() {
+        Some(delivery) => Some(delivery.text.clone()),
+        None => work_context(&airc, &events).await?,
+    };
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
     let visible: Vec<_> = events
         .iter()
@@ -76,6 +92,12 @@ async fn run_hook(
         .collect();
     if let Some(context) = render_context(&visible, max_items, raw, work_context) {
         print_hook_payload(&context, event_name)?;
+        std::io::stdout().flush()?;
+        if let Some(delivery) = resume {
+            if let Err(error) = crate::agent_resume::acknowledge(&airc, delivery).await {
+                eprintln!("airc: resume acknowledgment failed; context remains due: {error}");
+            }
+        }
     }
     if let Some(newest) = events.last() {
         airc.save_runtime_cursor_for_event(&consumer_id, newest)
