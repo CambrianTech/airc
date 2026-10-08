@@ -27,3 +27,12 @@ changing the parallel test runner's process limits. Mac tests2/2 pass; Windows
 strict daemon all-targets Clippy passes. CI and installed low-limit restart
 acceptance remain OPEN until the merged prebuilt is adopted without the manual
 shell adjustment. The recovery intervention alone does not close the gap.
+
+Windows CI run37801319391 failed an existing stdin-timeout fixture after the
+hook exited successfully and emitted its expected5second timeout diagnostic.
+The final duplicate elapsed<15 assertion measured15.0489645seconds. The fixture
+also included cold daemon setup in that measurement. Its normal hook now warms
+the owned fixture before timing the held-open stdin; its original15second
+watchdog still kills/reaps a child that remains running. The redundant strict
+post-success timing assertion is removed; production timeout and watchdog
+budget are unchanged, success and deadline diagnostic assertions remain.
