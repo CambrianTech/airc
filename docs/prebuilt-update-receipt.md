@@ -117,3 +117,22 @@ M5 reports one live LAN peer, Windows three. Windows doctor recorded M5 delivery
 a daemon/core restart; the preceding empty snapshot describes the before state.
 Credential recovery remains necessary for durable rendezvous. Transport ACK
 still does not prove agent action. Evidence:20261008-airc-restored-delivery.txt.
+
+### Signed-review contract follow-up: cfff7ea
+
+Build-only workflow37815342673 produced checksum-sidecar artifacts for merged
+cfff7ea0684e05be02f2a39b2ce2de18a741e5f1. Windows and Intel then exercised the
+supported updater with verified extracted prebuilt input: both reported
+1f9a787→cfff7ea and verified daemon adoption. Windows retained its saved409character
+brief/repeat600000ms and reported3LAN peers immediately after adoption. Intel
+retained an unset brief and corePID96297. Evidence files:
+20261008-airc-windows-cfff-update.log and20261008-airc-intel-cfff-update.log.
+
+M5 had independently adoptedcfff7ea before the downloaded artifact was applied;
+its corePID80117 remained unchanged. The existing daemon auto_update responsibility
+(default-on quiet-mesh trigger spawning update --auto) explains the competing
+source updater; its LaunchAgent only runs airc join. No unknown job was disabled.
+Automatic prebuilt discovery remains open. The invalid M5 GitHub credential
+requires interactive owner recovery with /opt/homebrew/bin/gh auth login -h github.com.
+No credential was copied. Signed-review consumer acceptance belongs to the
+subsequent Continuum deployment; matching AIRC revisions alone do not prove it.
