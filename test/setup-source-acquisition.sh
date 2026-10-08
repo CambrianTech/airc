@@ -21,6 +21,8 @@ printf '%s\n' "$*" >> "$AIRC_FIXTURE_CALLS"
 [ "$1" = clone ] || exit 92
 destination="${!#}"
 mkdir -p "$destination/setup" "$destination/.git"
+mkdir -p "$destination/scripts"
+printf '# published artifact owner fixture\n' > "$destination/scripts/release-artifact.sh"
 printf 'new fixture source\n' > "$destination/Cargo.toml"
 printf '#!/usr/bin/env bash\necho compatible-auth-stage\n' > "$destination/setup/github-auth.sh"
 if [ "${AIRC_FIXTURE_WINDOWS:-0}" = 1 ]; then

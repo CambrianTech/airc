@@ -180,6 +180,7 @@ SKILLS_TARGET="$(_to_bash_path "$SKILLS_TARGET")"
 _compatible_setup_layout() {
   local directory="$1" relative
   [ -f "$directory/setup/github-auth.sh" ] || return 1
+  [ -f "$directory/scripts/release-artifact.sh" ] || return 1
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
       for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 adopt-installed.ps1 sync-bootstrap.ps1 setup-entrypoint.ps1; do

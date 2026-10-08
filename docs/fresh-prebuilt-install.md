@@ -34,4 +34,8 @@ fixture passed; standalone update-handoff fixture passed 6 tests, 2 ignored,
 in 10.55s; Windows setup-path, PowerShell 5.1 setup-bridge/storage-plan passed.
 Bash syntax, PowerShell parsing and diff whitespace checks passed. The source
 handoff fixture explicitly selects developer mode so its Cargo failure scenarios
-remain covered. No shared Cargo build or cache cleanup was performed.
+remain covered. Cargo formatting and strict all-target Clippy passed (49.16s);
+the coordinated shared compiler slot was released, and no cache cleanup occurred.
+Both public wrappers require the published-artifact helper when selecting a
+compatible source checkout; existing source-acquisition and native setup fixtures
+passed again after that compatibility check.
