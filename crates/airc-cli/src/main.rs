@@ -20,6 +20,7 @@
 //! auto-generate missing identity material. `VerificationPolicy::Strict`
 //! is the only policy used in CLI paths — no `AllowUnsigned` opt-in.
 
+mod agent_resume;
 mod build_info;
 mod channel_gist_cli;
 mod channel_gist_commands;
@@ -1096,6 +1097,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 field,
             } => worktree_lane_commands::run_find(&registry, &target, &field),
         },
+
+        Command::AgentResume(args) => agent_resume::run(&home, args).await,
 
         Command::Monitor(args) => match args.action {
             MonitorAction::Format { peers_dir, my_name } => {

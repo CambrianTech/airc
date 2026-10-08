@@ -731,6 +731,9 @@ pub enum Command {
     /// Queue-card parsing and mutation primitives during Rust cutover.
     QueueCard(crate::queue_card_cli::QueueCardArgs),
 
+    /// Save and deliver per-agent resume context through existing runtimes.
+    AgentResume(crate::agent_resume::ResumeArgs),
+
     /// Format monitor events for AI/runtime consumers.
     Monitor(crate::monitor::MonitorArgs),
 

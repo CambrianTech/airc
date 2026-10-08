@@ -630,6 +630,62 @@ fn codex_hook_uninstaller_removes_managed_hooks_only() {
     assert!(!commands.contains(&"airc-core codex-hook user-prompt-submit".to_string()));
 }
 
+#[test]
+fn saved_resume_brief_delivers_at_prompt_boundary_but_not_during_tools() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    run_ok(
+        &home,
+        &[
+            "agent-resume",
+            "set",
+            "--brief",
+            "Finish current owner task",
+            "--manual",
+            "AGENTS.md",
+        ],
+    );
+    let active = run_hook_with_client(
+        &home,
+        "codex:resume-a",
+        &["codex-hook", "post-tool-use"],
+        "{}",
+    );
+    assert!(!active.contains("Finish current owner task"));
+    let first = run_hook_with_client(
+        &home,
+        "codex:resume-a",
+        &["codex-hook", "user-prompt-submit"],
+        "{}",
+    );
+    let context = additional_context(&first);
+    assert!(context.contains("Finish current owner task"));
+    assert!(context.contains("Manual/skill: AGENTS.md"));
+    let second = run_hook_with_client(
+        &home,
+        "codex:resume-a",
+        &["codex-hook", "user-prompt-submit"],
+        "{}",
+    );
+    assert!(!second.contains("Finish current owner task"));
+    let independent = run_hook_with_client(
+        &home,
+        "codex:resume-b",
+        &["codex-hook", "user-prompt-submit"],
+        "{}",
+    );
+    assert!(additional_context(&independent).contains("Finish current owner task"));
+    run_ok(&home, &["agent-resume", "clear"]);
+    let disabled = run_hook_with_client(
+        &home,
+        "codex:resume-c",
+        &["codex-hook", "user-prompt-submit"],
+        "{}",
+    );
+    assert!(!disabled.contains("Finish current owner task"));
+}
+
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let output = command_for_home(home)
         .args(["--home"])

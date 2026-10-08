@@ -1,30 +1,31 @@
 ---
 name: airc:reminder
-description: "⚠️ Not available in rust-rewrite: there is no `airc reminder` verb and no silence-nudge timer. No CLI equivalent exists."
+description: "Save a compact per-agent resume brief and deliver due work reminders through existing hooks, Claude Monitor, or an explicitly scheduled poll."
 user-invocable: true
 allowed-tools: Bash
-argument-hint: ""
+argument-hint: "brief and manual reference"
 ---
 
-# airc reminder
+# AIRC agent resume reminders
 
-> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
-> command). There is no `airc reminder` verb, and the silence-reminder nudge timer
-> (`airc reminder 300 | off | pause`) does not exist in the rust-rewrite. There is **no
-> CLI equivalent.**
+Use the supported `agent-resume` command. There is no `airc reminder` alias.
 
-Run this yourself — don't ask the user.
+```sh
+airc agent-resume set --brief "Resume the agreed task and resolve actionable AIRC issues." --manual "AGENTS.md" --repeat-seconds 600
+airc agent-resume show
+airc agent-resume poll --consumer my-runtime-task
+airc agent-resume clear
+```
 
-## What there is instead
+Write the brief from the user's actual task. The brief plus manual reference must
+fit 1024 characters. Derived board and local maintenance issues are separate.
+Do not claim that saving a brief creates a wake-up task: Codex hooks only deliver
+at runtime boundaries, Claude uses its already-running Monitor, and idle Codex
+requires the runtime's supported scheduler. Only configure a schedule when the
+user requests it. See `docs/agent-resume-context.md` for adapter details.
 
-Nothing maps directly. The rust-rewrite has no per-scope idle-nudge timer surfaced
-through the CLI. The closest related verb is `airc monitor`, which only *formats*
-monitor events for AI/runtime consumers — it does not arm a silence reminder.
-
-## When this comes up
-
-- "Remind me if the room goes quiet for N seconds" — explain that idle-reminder timing is not a CLI feature in the rust-rewrite. If you need idle awareness, the runtime's own loop (Claude Monitor / Codex poll) is where that lives, not an `airc` subcommand.
-
-## Notes
-
-- Do not invent `airc reminder` — it does not exist in the rust-rewrite.
+Avoid interrupting active work: PostToolUse suppresses these reminders, a caller
+can pass `--busy`, and an unexpired explicit busy/away availability report also
+suppresses them. A claim or presence heartbeat alone is not active inference.
+Unresolved issues may repeat at the saved cadence; quiet unchanged state stays
+silent. Saving or clearing the brief does not stop jobs or services.
