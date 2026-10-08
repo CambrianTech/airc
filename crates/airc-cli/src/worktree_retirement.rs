@@ -73,29 +73,21 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
             path.to_str().ok_or("non-UTF8 worktree path")?,
         ],
     )?;
-    // A branch can be shared with another checkout via git worktree add --force.
-    // Never retire its ref while that checkout still uses it.
-    if git(repo, &["worktree", "list", "--porcelain"])?
-        .lines()
-        .any(|line| line == branch_line)
-    {
-        return Err(format!(
-            "checkout removed; branch {branch} retained in another worktree; recovery: {recovery}"
-        ));
-    }
-    // Compare-and-delete prevents deleting a branch advanced concurrently. The
-    // saved ref also makes squash-merged history recoverable without cluttering
-    // `git branch`. No remote branch is changed.
-    git(
-        repo,
-        &["update-ref", "-d", &format!("refs/heads/{branch}"), &head],
-    )?;
-    // Remove the old tracking configuration only after the ref is retired.
-    let _ = git(
-        repo,
-        &["config", "--remove-section", &format!("branch.{branch}")],
-    );
+    retire_branch(repo, &branch, &head).map_err(|error| {
+        format!("checkout removed; branch {branch} retained: {error}; recovery: {recovery}")
+    })?;
     println!("retired: {branch}; recovery: {recovery}");
+    Ok(())
+}
+
+/// Use Git's branch operation, not raw ref deletion: a checkout can appear
+/// after the earlier registration probe. Git also retains histories it cannot
+/// prove merged (including squash histories without a suitable upstream).
+fn retire_branch(repo: &Path, branch: &str, expected_head: &str) -> Result<(), String> {
+    if git(repo, &["rev-parse", &format!("refs/heads/{branch}")])? != expected_head {
+        return Err("branch advanced since recovery snapshot".into());
+    }
+    git(repo, &["branch", "-d", "--", branch])?;
     Ok(())
 }
 
@@ -164,7 +156,7 @@ mod tests {
         );
     }
     #[test]
-    fn retires_squash_equivalent_without_upstream_and_keeps_original_history() {
+    fn retains_squash_branch_without_upstream_and_keeps_original_history() {
         let f = Fixture::new();
         std::fs::write(f.tree.join("change"), "fix").unwrap();
         git(&f.tree, &["add", "change"]).unwrap();
@@ -178,8 +170,13 @@ mod tests {
         )
         .unwrap();
         assert_ne!(original, git(&f.repo, &["rev-parse", "HEAD"]).unwrap());
-        retire(&f.tree, &f.root).unwrap();
+        let error = retire(&f.tree, &f.root).unwrap_err();
+        assert!(error.contains("branch aabbccdd/fix retained"), "{error}");
         assert!(!f.tree.exists());
+        assert_eq!(
+            git(&f.repo, &["rev-parse", "refs/heads/aabbccdd/fix"]).unwrap(),
+            original
+        );
         assert_eq!(
             git(
                 &f.repo,
@@ -190,6 +187,27 @@ mod tests {
             )
             .unwrap(),
             original
+        );
+    }
+
+    #[test]
+    fn preserves_branch_checked_out_after_original_worktree_removal() {
+        let f = Fixture::new();
+        let head = git(&f.tree, &["rev-parse", "HEAD"]).unwrap();
+        git(&f.repo, &["worktree", "remove", f.tree.to_str().unwrap()]).unwrap();
+        // Deterministically model another agent taking the branch between the
+        // checkout removal / registration probe and the final branch operation.
+        let other = f.root.join("late-checkout");
+        git(
+            &f.repo,
+            &["worktree", "add", other.to_str().unwrap(), "aabbccdd/fix"],
+        )
+        .unwrap();
+        assert!(retire_branch(&f.repo, "aabbccdd/fix", &head).is_err());
+        assert_eq!(git(&other, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(
+            git(&f.repo, &["rev-parse", "refs/heads/aabbccdd/fix"]).unwrap(),
+            head
         );
     }
 

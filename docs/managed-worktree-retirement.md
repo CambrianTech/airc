@@ -12,8 +12,11 @@ local branches.
 
 Before removing a clean managed checkout, AIRC saves its exact commit at
 `refs/airc/retired/<branch>/<commit>`. It then removes the checkout without forcing
-Git and retires its local branch using the observed commit as a compare-and-delete
-condition. These recovery refs preserve history without cluttering `git branch`.
+Git and attempts to retire its local branch using `git branch -d`. Git's own
+checked-out and merged-history guards remain in force. If the branch advanced
+since the snapshot, or Git refuses retirement, it remains with an explicit
+diagnostic and recovery ref. These recovery refs preserve history without
+cluttering `git branch`.
 
 Inspect and restore a retained commit:
 
@@ -23,7 +26,9 @@ git branch recovered-work refs/airc/retired/BRANCH/COMMIT
 ```
 
 A squash-equivalent patch can pass the existing integration-ref proof even when
-its original tracking ref is gone. Ambiguous multi-commit squash histories stay
-retained; deleting an upstream alone never proves them disposable. Standalone
+its original tracking ref is gone, allowing checkout removal. Its branch still
+remains when Git cannot establish merged ancestry; no forced deletion follows.
+Ambiguous multi-commit squash histories retain their checkouts too. Deleting an
+upstream alone never proves them disposable. Standalone
 branches whose worktrees were removed by older versions are not automatically
 attributed to a card or swept. Recovery refs have no automatic expiration.
