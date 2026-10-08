@@ -789,47 +789,56 @@ exit 1
     // proves the pinned-shutdown wiring (bounded by the 1s test budget).
     #[tokio::test]
     async fn run_loop_exits_on_shutdown() {
-        let dir = tempdir().unwrap();
-        let machine = dir.path().join("machine/.airc");
-        let wire = dir.path().join("wire");
-        write_identity(&wire).await;
-        let store = sqlite_registry_store_at(&dir.path().join("rendezvous")).await;
-        let airc = Airc::open_with_wire_root_for_test(&machine, &wire)
-            .await
-            .unwrap();
+        for stop_during_initialization in [false, true] {
+            let dir = tempdir().unwrap();
+            let machine = dir.path().join("machine/.airc");
+            let wire = dir.path().join("wire");
+            write_identity(&wire).await;
+            let store = sqlite_registry_store_at(&dir.path().join("rendezvous")).await;
+            let airc = Airc::open_with_wire_root_for_test(&machine, &wire)
+                .await
+                .unwrap();
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let config = RegistryRefreshConfig {
-            // Tick almost immediately so the loop body runs at least once.
-            first_tick: Duration::from_millis(10),
-            cadence: Duration::from_secs(3600),
-        };
-        let handle = tokio::spawn(async move {
-            let resync = tokio::sync::Notify::new();
-            let route_wake = tokio::sync::Notify::new();
-            run_loop(
-                airc,
-                store,
-                RegistryRefreshGate::Always,
-                config,
-                &resync,
-                &route_wake,
-                async move {
-                    let _ = rx.await;
-                },
-            )
-            .await;
-        });
-        // Let one tick land, then signal shutdown and assert the loop
-        // returns inside a bounded window.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("loop must exit promptly on shutdown")
-            .unwrap();
+            // Same ownership boundary as daemon startup: subscribe before the
+            // task is spawned, then preserve that future through initialization.
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            let shutdown_waiter = shutdown.clone().notified_owned();
+            let (initialized, initialization) = tokio::sync::oneshot::channel::<()>();
+            let config = RegistryRefreshConfig {
+                first_tick: Duration::from_millis(10),
+                cadence: Duration::from_secs(3600),
+            };
+            let handle = tokio::spawn(async move {
+                initialization.await.unwrap();
+                let resync = tokio::sync::Notify::new();
+                let route_wake = tokio::sync::Notify::new();
+                run_loop(
+                    airc,
+                    store,
+                    RegistryRefreshGate::Always,
+                    config,
+                    &resync,
+                    &route_wake,
+                    shutdown_waiter,
+                )
+                .await;
+            });
+            if stop_during_initialization {
+                // Deterministic lost-wakeup regression: no loop exists yet,
+                // and notify_waiters has no permit for a later subscriber.
+                shutdown.notify_waiters();
+                initialized.send(()).unwrap();
+            } else {
+                initialized.send(()).unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                shutdown.notify_waiters();
+            }
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("loop must honor Stop during initialization or steady state")
+                .unwrap();
+        }
     }
-
     #[tokio::test]
     async fn shutdown_interrupts_registry_backoff_without_retrying() {
         use crate::account_registry::{AccountRegistryDocument, AccountRegistryError};

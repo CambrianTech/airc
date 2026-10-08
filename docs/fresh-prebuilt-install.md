@@ -48,3 +48,19 @@ failure; the existing fixture now prints its bounded owned-daemon log on teardow
 failure without suppressing the Stop or process-exit check. The timeout's daemon
 phase is not yet established. Local normal publication fixture and PowerShell
 syntax checks pass; native macOS fallback and Windows acceptance await CI.
+
+Concurrent source review found an independent lost-Stop race: registry startup
+created its shutdown future only after asynchronous LAN/store initialization,
+although the IPC listener could already accept Stop. The registry join could then
+wait forever for a notification that had no subscriber. The daemon now retains
+an owned shutdown future created before spawning registry startup. The existing
+registry shutdown test covers both steady state and a deterministically delayed
+initialization receiving Stop before the loop starts. Admitted registry writes
+still drain normally. This source finding is not proof of the earlier CI timeout's
+specific cause; the failed-job evidence did not include the daemon's final phase.
+
+Race regression passed locally: registry_refresh::tests::run_loop_exits_on_shutdown
+1/1 in 0.24s (both initialization and steady-state scenarios), strict all-target
+Clippy 7.68s and formatting passed. Before this runtime change, the diagnostic-only
+94c91b8 CI Windows PS5 rerun passed installation and Stop, confirming the earlier
+failure is intermittent rather than proving the source race was its cause.

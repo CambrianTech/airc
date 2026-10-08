@@ -54,7 +54,7 @@ pub struct DaemonState {
     /// trust; same-machine publishers are in-process trusted).
     pub trusted_roots: Mutex<HashMap<PathBuf, ()>>,
     /// Notified when the daemon should stop accepting + exit cleanly.
-    pub shutdown: Notify,
+    pub shutdown: Arc<Notify>,
     /// Runtime metadata reported through IPC status so clients can
     /// replace stale daemons after updates.
     pub runtime: DaemonRuntimeInfo,
@@ -162,7 +162,7 @@ impl DaemonState {
             router,
             coordinator_store,
             trusted_roots: Mutex::new(HashMap::new()),
-            shutdown: Notify::new(),
+            shutdown: Arc::new(Notify::new()),
             runtime,
             route_endpoints: RwLock::new(Vec::new()),
             connected_lan_peers: Arc::new(AtomicUsize::new(0)),

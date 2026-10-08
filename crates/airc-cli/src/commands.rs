@@ -2067,6 +2067,10 @@ pub async fn run_daemon(
     // Self-healing join: the registry task fills this once the
     // rendezvous store is resolved (see `rendezvous_for_heal` above).
     let heal_slot = rendezvous_for_heal.clone();
+    // Capture before spawning or accepting IPC: Stop may arrive while registry
+    // initialization awaits LAN/store setup. notify_waiters does not retain a
+    // permit for a future created after that Stop.
+    let registry_shutdown = state.shutdown.clone().notified_owned();
     let registry_handle = tokio::spawn(async move {
         // HERMETIC GATE (card d793c242): test/temp daemons inherit the
         // operator's working gh auth, so without this gate they publish
@@ -2292,7 +2296,7 @@ pub async fn run_daemon(
             // instant an import lands fresh endpoints so they are dialed
             // NOW, not up to a full route-refresh interval later.
             &registry_state.route_wake,
-            registry_state.shutdown.notified(),
+            registry_shutdown,
         )
         .await;
     });
