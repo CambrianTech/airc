@@ -1976,7 +1976,11 @@ mod tests {
             .unwrap();
         let current = airc.work_board_in(&room).await.unwrap();
         assert_eq!(current.card(parent).unwrap().submissions[0], corrected);
-        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(
+            airc.home(),
+            room.channel,
+            WorkBoardCacheSource::Store,
+        );
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
         legacy["version"] = 3.into();
@@ -2033,7 +2037,11 @@ mod tests {
         );
         // A legacy reader advanced its cursor over an unfamiliar review hint.
         // Upgrade must replay it, not accept that apparently current old cache.
-        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(
+            airc.home(),
+            room.channel,
+            WorkBoardCacheSource::Store,
+        );
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
         legacy["version"] = 2.into();
