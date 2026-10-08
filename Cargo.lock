@@ -525,6 +525,7 @@ dependencies = [
 name = "airc-work-store"
 version = "0.1.0"
 dependencies = [
+ "airc-blobs",
  "airc-core",
  "airc-protocol",
  "airc-store",
