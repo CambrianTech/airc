@@ -1618,6 +1618,7 @@ pub async fn run_submission_review(
         .review_work_submission_in(
             &room,
             airc_lib::ReviewWorkSubmission {
+                evidence_text: Some(evidence_text),
                 review_id: airc_work::WorkReviewId::from_uuid(Uuid::new_v4()),
                 card_id,
                 submission_id: chosen.submission_id,

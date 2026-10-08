@@ -150,6 +150,9 @@ pub struct WorkSubmissionReview {
     pub reviewer: PeerId,
     pub outcome: WorkReviewOutcome,
     pub evidence: airc_blobs::MediaRef,
+    /// Signed, bounded reviewer words; absent on legacy hash-only receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_text: Option<String>,
     /// Signed author's clock, like WorkSubmission::submitted_at_ms. This is
     /// checked against the historical claim; it is not trusted global time.
     pub reviewed_at_ms: u64,
@@ -172,7 +175,7 @@ pub enum WorkReviewRejectionReason {
     ExpiredClaim,
     #[error("review card is already settled")]
     SettledReviewCard,
-    #[error("review evidence is empty or has an oversized MIME hint")]
+    #[error("review evidence is empty, has an oversized MIME hint, or inline text exceeds 32 KiB or differs from its hash/size")]
     InvalidEvidence,
     #[error("review id was already used for different immutable content")]
     ConflictingId,
@@ -198,6 +201,7 @@ impl WorkSubmissionReview {
             && self.reviewer == other.reviewer
             && self.outcome == other.outcome
             && self.evidence == other.evidence
+            && self.evidence_text == other.evidence_text
     }
 
     pub fn validate(&self) -> Result<(), WorkReviewRejectionReason> {
@@ -209,6 +213,15 @@ impl WorkSubmissionReview {
                 .is_some_and(|mime| mime.len() > 128)
         {
             return Err(WorkReviewRejectionReason::InvalidEvidence);
+        }
+        if let Some(text) = &self.evidence_text {
+            if text.trim().is_empty()
+                || text.len() > 32 * 1024
+                || text.len() as u64 != self.evidence.size_bytes
+                || airc_blobs::ContentHash::from_bytes(text.as_bytes()) != self.evidence.hash
+            {
+                return Err(WorkReviewRejectionReason::InvalidEvidence);
+            }
         }
         Ok(())
     }

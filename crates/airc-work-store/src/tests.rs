@@ -371,6 +371,7 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
         created.reviews = Some(parent);
     }
     let review = WorkSubmissionReview {
+        evidence_text: None,
         review_id: WorkReviewId::from_u128(700),
         card_id: parent,
         submission_id: candidate.submission_id,
@@ -382,6 +383,36 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
         evidence: candidate.artifact.clone(),
         reviewed_at_ms: 7000,
     };
+    // Legacy hash-only receipts remain readable; new signed words must match their reference.
+    let legacy = serde_json::to_value(&review).unwrap();
+    assert!(legacy.get("evidence_text").is_none());
+    assert_eq!(
+        serde_json::from_value::<WorkSubmissionReview>(legacy).unwrap(),
+        review
+    );
+    let mut review = review;
+    let words = "Changes requested: compare the selected branch, not HEAD.";
+    review.evidence = airc_blobs::MediaRef {
+        hash: airc_blobs::ContentHash::from_bytes(words.as_bytes()),
+        size_bytes: words.len() as u64,
+        mime: Some("text/plain".into()),
+    };
+    review.evidence_text = Some(words.into());
+    assert!(review.validate().is_ok());
+    for invalid in [
+        "different".to_string(),
+        words.to_uppercase(),
+        "x".repeat(32 * 1024 + 1),
+        " ".into(),
+    ] {
+        let mut bad = review.clone();
+        bad.evidence_text = Some(invalid);
+        assert_eq!(
+            bad.validate(),
+            Err(airc_work::WorkReviewRejectionReason::InvalidEvidence)
+        );
+        assert!(!bad.same_judgement(&review));
+    }
     let (headers, _) =
         encode_work_event(&WorkEvent::WorkSubmissionReviewed(review.clone())).unwrap();
     let legacy_filter = airc_core::HeaderFilter::Exact {
