@@ -9,7 +9,8 @@ param(
     [string]$AircPath,
     [string]$PrepareArtifact,
     [string]$PrebuiltArtifact,
-    [string]$ExpectedBuild
+    [string]$ExpectedBuild,
+    [switch]$DeveloperBuild
 )
 $ErrorActionPreference = 'Stop'
 # BEGIN GENERATED SHARED SETUP BOOTSTRAP
@@ -225,6 +226,7 @@ $source = if ($env:AIRC_DIR) { $env:AIRC_DIR } elseif ($PSScriptRoot -and (Test-
 } else { Join-Path $env:USERPROFILE '.airc\src' }
 $channel = if ($env:AIRC_CHANNEL) { $env:AIRC_CHANNEL } else { 'canary' }
 function Test-SetupLayout([string]$Directory) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Directory 'scripts/release-artifact.sh') -PathType Leaf)) { return $false }
     foreach ($relative in @('install.sh','setup\github-auth.sh','windows\install-prereqs.ps1','windows\run-powershell.sh','windows\register-bin-path.ps1','windows\configure-firewall.ps1','windows\shared-setup.ps1','windows\setup-artifacts.lock.json','windows\install-session.ps1','windows\adopt-installed.ps1','windows\sync-bootstrap.ps1','windows\setup-entrypoint.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Directory $relative))) { return $false }
     }
@@ -286,6 +288,7 @@ try {
     # Cancellation owns the build subtree; only a completed successful
     # coordinator may hand off its persistent daemon.
     $arguments = @('--noprofile', '--norc', ((Join-Path $source 'install.sh') -replace '\\','/'))
+    if ($DeveloperBuild) { $arguments += '--developer-build' }
     if ($PrepareArtifact) { $arguments += @('--prepare-artifact', ($PrepareArtifact -replace '\\','/')) }
     if ($PrebuiltArtifact) { $arguments += @('--prebuilt', ($PrebuiltArtifact -replace '\\','/')) }
     if ($ExpectedBuild) { $arguments += @('--expected-build', $ExpectedBuild) }

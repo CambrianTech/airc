@@ -77,6 +77,8 @@ Maintenance, rollback, operator-stop intent and daemon revision verification
 remain owned by the existing updater. Do not call installer `--prebuilt` directly
 against a running installation: that phase assumes updater-owned maintenance.
 
-Artifact discovery/download is still external to `airc update`; without explicit
-prebuilt input it retains the contributor source-build behavior. This is not yet
-a complete end-user release downloader.
+Without explicit artifact input, preparation downloads the checkout's published
+stable-tag or immutable canary-revision artifact and verifies its checksum and
+build identity through the shared installer. An unpublished revision refuses
+before maintenance; it never falls back to compilation. Contributors may opt
+into source preparation with invocation-scoped `AIRC_DEVELOPER_BUILD=1`.
