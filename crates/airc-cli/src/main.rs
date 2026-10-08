@@ -103,6 +103,7 @@ mod workspace_cli;
 mod workspace_commands;
 mod worktree_lane_cli;
 mod worktree_lane_commands;
+mod worktree_retirement;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
