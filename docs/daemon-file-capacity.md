@@ -36,3 +36,6 @@ the owned fixture before timing the held-open stdin; its original15second
 watchdog still kills/reaps a child that remains running. The redundant strict
 post-success timing assertion is removed; production timeout and watchdog
 budget are unchanged, success and deadline diagnostic assertions remain.
+
+
+Installed acceptance: see [fleet receipt](prebuilt-update-receipt.md#installed-acceptance-2026-10-08-card-ed2598ed). The installed M5 binary was observed raising256to4096 in a stopped-after-use isolated daemon; production remained serving.

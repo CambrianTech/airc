@@ -48,3 +48,42 @@ Cargo-output lookup and two duplicate selectors were deleted. Existing handoff
 coverage now enables hook setup with deliberately broken metadata and stale
 Cargo outputs. Windows6pass/2ignored and Mac2pass. This must still be exercised
 through a normal update before the Mac installer gap can close.
+
+
+## Installed acceptance, 2026-10-08 (card ed2598ed)
+
+All three installed CLIs and production daemons report `1f9a78793461`:
+Windows peer e85a5bb3, M5 peer 2f0aed7f, Intel peer 5159a48b. Windows
+returned to58connections at81seconds uptime; M5 retained703 at458seconds;
+Intel reported71 at257seconds. Continuum core PIDs80117 (M5) and96297 (Intel)
+were unchanged. Windows feature checkout stayed clean on feat/msg-to-peer.
+
+Windows consumed the checksum-verified CI artifact from build-only run
+37807242725 through normal `airc update` with explicit prebuilt input. Installed
+and daemon revision were verified; no local compilation. Its saved409-character
+Codex coordination brief and600second cadence remained unchanged. Earlier live
+CLI consumer proof verified busy suppression,2467byte first delivery and0byte
+immediate repeat. This proves delivery/cursor behavior, not agent action.
+
+Both Macs independently advanced to source-build-labelled HEAD revision1f9a787
+while CI artifacts were building (build1111,16:19Z). The later M5 public update
+therefore returned a verified no-op. Their successful transitions must not be
+attributed to this operator's prebuilt path. Mac prebuilt transaction provenance
+remains open; neither Mac brief was configured (both null). No redundant
+production restart was performed to manufacture evidence.
+
+The installed M5 binary was separately invoked in a fresh, explicit temporary
+home from ordinary SSH soft limit256. Its typed startup diagnostic reported
+before_soft256,actual_soft4096,hard unlimited; status answered with revision
+1f9a787. That isolated proof daemon was stopped and its process absence checked.
+Production remained serving703connections. This closes the installed Unix
+capacity adapter observation; it is not a claim about the independent updater's
+launch environment (production startup reported4096before and after).
+
+Raw evidence retained under the team-proof state directory:
+20261008-airc-windows-1f9-update.log,
+20261008-m5-installed-capacity.log,
+20261008-m5-installed-capacity-status.txt,
+20261008-airc-resume-first.txt and20261008-airc-resume-repeat.txt.
+Automatic artifact discovery/download is still open; explicit verified input
+is the supported bridge. No runtime audio/video harness was involved.
