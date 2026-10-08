@@ -45,6 +45,7 @@ pub struct ReviewWorkSubmission {
     pub review_claim_id: ClaimId,
     pub outcome: airc_work::WorkReviewOutcome,
     pub evidence: airc_work::SubmissionArtifact,
+    pub evidence_text: Option<String>,
 }
 
 /// Canonical pagination size for complete work-board projections.
@@ -472,6 +473,7 @@ impl Airc {
             reviewer: self.peer_id(),
             outcome: request.outcome,
             evidence: request.evidence,
+            evidence_text: request.evidence_text,
             reviewed_at_ms: now_ms()?,
         };
         review.validate_for_board(&board)?;
@@ -2002,6 +2004,7 @@ mod tests {
             .unwrap();
         let other_room = airc.join("unrelated").await.unwrap();
         let request = ReviewWorkSubmission {
+            evidence_text: None,
             review_id: airc_work::WorkReviewId::new(),
             card_id: parent,
             submission_id: submission.submission_id,
