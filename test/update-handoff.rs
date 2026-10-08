@@ -78,6 +78,7 @@ fi
 case "$1" in
   version) echo 'build: abcdef1234567890' ;;
   --version) echo 'airc 0.1.0' ;;
+  codex-hook) echo hook >> "$AIRC_FIXTURE_ROOT/events" ;;
   update)
     [ "$selected_scope" = 1 ] || exit 94
     [ "$2" = '--adopt-installed' ] || exit 92
@@ -254,6 +255,13 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
             &home.join("bin/airc"),
         )
         .unwrap();
+        // Enable the real integration phase while Cargo metadata is broken.
+        // It must use the installed snapshot, not either stale Cargo output.
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        write(&home.join(".codex/config.toml"), "# fixture");
+        write(&tools.join("codex"), "#!/bin/sh\nexit 0\n");
+        write(&root.join("metadata-case"), "failure");
+        std::env::remove_var("AIRC_SKIP_CODEX_HOOKS");
         // Replacing the input after prepare must not affect the installation.
         write(&input, "#!/bin/sh\necho 'build: deadbee'\n");
         prepared
@@ -267,6 +275,13 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
             good
         );
         std::fs::remove_file(root.join("stopped")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("events")).unwrap(),
+            format!("{before}hook\n")
+        );
+        std::env::set_var("AIRC_SKIP_CODEX_HOOKS", "1");
+        std::fs::remove_file(root.join("metadata-case")).unwrap();
+        let before = std::fs::read_to_string(root.join("events")).unwrap();
         // Hash valid for wrong revision: verified bytes alone are insufficient.
         let wrong_hash = process::background(&normal_shell)
             .args(["-c", "if command -v sha256sum >/dev/null; then sha256sum \"$AIRC_PREBUILT_ARTIFACT\"; else shasum -a 256 \"$AIRC_PREBUILT_ARTIFACT\"; fi"])
