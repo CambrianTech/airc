@@ -21,6 +21,8 @@ remain independent. Existing corruption, wrong-source/channel, concurrency and
 board replay tests retain their responsibility. This is not same-version
 singleflight, automatic old-cache collection, or a promised installed speedup.
 
-Validation pending compiler ownership and independent review. Live processes,
+Validation: Windows shared-cache runs passed nine cache unit tests, five real-daemon
+board integration tests, one wall resume integration test, and the existing signed
+review replay fixture. Independent review and CI remain required. Live processes,
 caches and serving remain untouched. Raw diagnosis is retained in the team-proof
 state receipt20261008-cache-writer-collision.md. No installation claimed.
