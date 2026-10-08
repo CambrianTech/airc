@@ -129,6 +129,7 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
         write(&root.join("bash-env"), "fixture_root=\"$(cd \"$AIRC_FIXTURE_ROOT\" && pwd)\"\nexport PATH=\"$fixture_root/tools:$PATH\"\n");
         std::env::set_var("BASH_ENV", root.join("bash-env"));
         for key in [
+            "AIRC_DEVELOPER_BUILD", // This fixture deliberately exercises source/Cargo failures.
             "AIRC_SKIP_PREREQS",
             "AIRC_SKIP_GIT_HOOKS",
             "AIRC_SKIP_CODEX_CONFIG",

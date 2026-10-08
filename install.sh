@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 #
-# AIRC installer — DEV PATH ONLY (zero-friction doctrine,
-# docs/ZERO-FRICTION-PATH.md): users get prebuilt signed binaries and
-# never see this script or a compiler. This source-build path serves
-# contributors, grid operators on unreleased branches, and CI; it moves
-# behind --dev once the release pipeline lands.
+# AIRC installer: verified published artifacts by default. Contributors may
+# explicitly choose --developer-build; absent artifacts never imply compilation.
+# Platform signing remains conditional on the publisher's configured identity.
 #
 # curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 #
@@ -46,8 +44,10 @@ fail()  { printf '  \033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 PREPARE_ARTIFACT=""
 PREBUILT_ARTIFACT=""
 EXPECTED_BUILD=""
+export AIRC_DEVELOPER_BUILD="${AIRC_DEVELOPER_BUILD:-0}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --developer-build) export AIRC_DEVELOPER_BUILD=1; shift ;;
     --prepare-artifact|--prebuilt|--expected-build)
       [ "$#" -ge 2 ] && [ -n "$2" ] || fail "Missing value for $1"
       case "$1" in
@@ -58,7 +58,7 @@ while [ "$#" -gt 0 ]; do
       shift 2 ;;
     --help)
       printf '%s\n' 'Usage: bash install.sh [--prepare-artifact PATH | --prebuilt PATH] --expected-build GIT_SHA' \
-        'Without arguments, build and install normally. Handoff modes use the current checkout without pulling.'
+        'Default: verified published artifact; --developer-build explicitly compiles source. Handoff modes never pull.'
       exit 0 ;;
     *) fail "Unknown installer argument: $1" ;;
   esac
@@ -427,7 +427,9 @@ ensure_prereqs() {
   local missing=() pkgs=() unmappable=()
   # The full prereq set is exactly these four. JSON handling, Ed25519
   # identity/signing, hooks, and config mutation are all Rust-owned.
-  for cmd in git gh ssh-keygen cargo; do
+  local required=(git gh ssh-keygen)
+  [ "$AIRC_DEVELOPER_BUILD" != 1 ] || required+=(cargo)
+  for cmd in "${required[@]}"; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # git/gh/cargo support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
@@ -491,7 +493,7 @@ ensure_prereqs() {
     fi
   fi
 
-  _ensure_macos_build_toolchain
+  [ "$AIRC_DEVELOPER_BUILD" != 1 ] || _ensure_macos_build_toolchain
 
   # Identity gen + signing live in Rust — there is no crypto bootstrap to
   # do here; system package state is irrelevant to airc install correctness.
@@ -884,9 +886,34 @@ _setup_windows_autostart() {
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
   local built target_dir
+  if [ "$AIRC_DEVELOPER_BUILD" != 1 ] && [ -z "$PREBUILT_ARTIFACT${AIRC_PREBUILT_ARTIFACT:-}" ]; then
+    # Fresh install and the updater's prepare phase share this artifact owner.
+    # Preserve the original handoff marker: fresh installation still adopts via
+    # the existing guarded lifecycle at the end of this coordinator.
+    local revision original_expected="$EXPECTED_BUILD"
+    revision="$(git -C "$CLONE_DIR" rev-parse HEAD)" || fail 'Cannot resolve published revision'
+    source "$CLONE_DIR/scripts/release-artifact.sh"
+    AIRC_PUBLISHED_TEMP="$(mktemp -d)"
+    trap 'rm -rf "$AIRC_PUBLISHED_TEMP"' EXIT
+    built="$AIRC_PUBLISHED_TEMP/airc"
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) built="$built.exe" ;; esac
+    airc_release_artifact "$built" "$revision" "$CLONE_DIR" || fail 'Published artifact preparation failed'
+    EXPECTED_BUILD="${EXPECTED_BUILD:-$revision}"
+    _verify_artifact "$built"
+    EXPECTED_BUILD="$original_expected"
+    if [ -n "$PREPARE_ARTIFACT" ]; then
+      local prepared; prepared="$(_to_bash_path "$PREPARE_ARTIFACT")"
+      [ ! -e "$prepared" ] || fail 'Artifact destination already exists'
+      cp "$built" "$prepared"
+      chmod +x "$prepared"
+      _verify_artifact "$prepared"
+      exit 0
+    fi
+    PREBUILT_ARTIFACT="$built"
+  fi
   if [ -n "$PREBUILT_ARTIFACT" ]; then
     built="$(_to_bash_path "$PREBUILT_ARTIFACT")"
-    _verify_artifact "$built"
+    if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$built"; fi
     info "Installing verified prebuilt artifact: $built"
   elif [ -n "${AIRC_PREBUILT_ARTIFACT:-}" ]; then
     local prepared digest

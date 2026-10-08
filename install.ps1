@@ -9,7 +9,8 @@ param(
     [string]$AircPath,
     [string]$PrepareArtifact,
     [string]$PrebuiltArtifact,
-    [string]$ExpectedBuild
+    [string]$ExpectedBuild,
+    [switch]$DeveloperBuild
 )
 $ErrorActionPreference = 'Stop'
 # BEGIN GENERATED SHARED SETUP BOOTSTRAP
@@ -286,6 +287,7 @@ try {
     # Cancellation owns the build subtree; only a completed successful
     # coordinator may hand off its persistent daemon.
     $arguments = @('--noprofile', '--norc', ((Join-Path $source 'install.sh') -replace '\\','/'))
+    if ($DeveloperBuild) { $arguments += '--developer-build' }
     if ($PrepareArtifact) { $arguments += @('--prepare-artifact', ($PrepareArtifact -replace '\\','/')) }
     if ($PrebuiltArtifact) { $arguments += @('--prebuilt', ($PrebuiltArtifact -replace '\\','/')) }
     if ($ExpectedBuild) { $arguments += @('--expected-build', $ExpectedBuild) }

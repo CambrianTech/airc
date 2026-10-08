@@ -89,3 +89,48 @@ _add_path_entry "$fixture/second bin"
 [ "$PATH" = "$before" ]
 [ "$(grep -c '# airc$' "$HOME/.bashrc")" = 1 ]
 echo 'PASS: shared install destination and PATH convergence'
+
+# Regression fcec2452: fresh install and updater prepare consume the same
+# checksum-bound publication; a bad/missing publication never invokes Cargo.
+source "$repo/scripts/release-artifact.sh"
+fixture_platform=Linux
+revision=1234567890123456789012345678901234567890
+publisher_revision="$revision"
+mkdir -p "$fixture/publisher" "$fixture/download"
+printf '#!/bin/sh\nprintf "build: 1234567890123456789012345678901234567890\\n"\n' > "$fixture/publisher/airc"
+asset="airc-canary-$revision-x86_64-unknown-linux-gnu.tar.gz"
+tar -czf "$fixture/publisher/$asset" -C "$fixture/publisher" airc
+(cd "$fixture/publisher" && sha256sum "$asset" > "$asset.sha256")
+git() { case "$*" in *describe*) return 1 ;; *rev-parse*) printf '%s\n' "$publisher_revision" ;; *) return 99 ;; esac; }
+uname() { case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac; }
+curl() {
+  local url='' destination=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in https:*) url="$1"; shift ;; -o) destination="$2"; shift 2 ;; *) shift ;; esac
+  done
+  cp "$fixture/publisher/${url##*/}" "$destination"
+}
+cargo() { echo 'BUG: prebuilt path invoked Cargo' >&2; return 97; }
+airc_release_artifact "$fixture/download/airc" "$revision" "$repo"
+cmp "$fixture/publisher/airc" "$fixture/download/airc"
+eval "$(sed -n '/^_verify_artifact()/,/^}/p' "$repo/install.sh")"
+EXPECTED_BUILD="$revision"
+_verify_artifact "$fixture/download/airc"
+eval "$(sed -n '/^_install_airc_binary()/,/^}/p' "$repo/install.sh")"
+(
+  unset AIRC_SKIP_RUST_BUILD AIRC_PREBUILT_ARTIFACT AIRC_PREBUILT_SHA256
+  AIRC_DEVELOPER_BUILD=0
+  CLONE_DIR="$repo"
+  PREBUILT_ARTIFACT=''
+  PREPARE_ARTIFACT="$fixture/download/prepared"
+  _install_airc_binary
+)
+cmp "$fixture/publisher/airc" "$fixture/download/prepared"
+EXPECTED_BUILD=ffffffffffffffffffffffffffffffffffffffff
+if ( _verify_artifact "$fixture/download/airc" ) 2>/dev/null; then fail 'Wrong executable revision accepted'; fi
+printf '%064d  %s\n' 0 "$asset" > "$fixture/publisher/$asset.sha256"
+if airc_release_artifact "$fixture/download/rejected" "$revision" "$repo" 2>/dev/null; then fail 'Bad checksum accepted'; fi
+[ ! -e "$fixture/download/rejected" ]
+rm "$fixture/publisher/$asset.sha256"
+if airc_release_artifact "$fixture/download/absent" "$revision" "$repo" 2>/dev/null; then fail 'Missing publication accepted'; fi
+echo 'PASS: shared published preparation verifies bytes and revision without a compiler fallback'

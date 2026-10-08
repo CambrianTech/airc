@@ -32,6 +32,10 @@ concurrency:
 
 env:
   AIRC_SKIP_AUTH: '1'
+  # PR revisions are not public releases. These existing lifecycle smoke jobs
+  # explicitly validate contributor builds; they are not prebuilt delivery proof.
+  # Published preparation is exercised by the shared installer fixture below.
+  AIRC_DEVELOPER_BUILD: '1'
 
 jobs:
   clean-install-linux:
