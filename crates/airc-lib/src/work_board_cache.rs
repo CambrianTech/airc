@@ -105,8 +105,19 @@ pub(crate) struct ProjectionCache<P> {
 }
 
 impl<P: CachedProjection> ProjectionCache<P> {
-    pub fn path(home: &Path, channel: RoomId) -> PathBuf {
-        home.join(P::DIR).join(format!("{channel}.json"))
+    pub fn path(home: &Path, channel: RoomId, source: WorkBoardCacheSource) -> PathBuf {
+        // Live embedded clients and old join processes survive a daemon update.
+        // They must not replace another format/read source's resume cursor.
+        // Leave the legacy unqualified path untouched; the first read rebuilds
+        // once from the authoritative log rather than migrating incompatible data.
+        let source = match source {
+            WorkBoardCacheSource::Daemon => "daemon",
+            WorkBoardCacheSource::Store => "store",
+        };
+        home.join(P::DIR)
+            .join(format!("v{}", P::VERSION))
+            .join(source)
+            .join(format!("{channel}.json"))
     }
 
     /// Load the snapshot for `channel`, or `None` when the caller must
@@ -115,7 +126,7 @@ impl<P: CachedProjection> ProjectionCache<P> {
     /// version/channel/source mismatch — is loud, because it means a
     /// snapshot existed and is being discarded.
     pub fn load(home: &Path, channel: RoomId, source: WorkBoardCacheSource) -> Option<Self> {
-        let path = Self::path(home, channel);
+        let path = Self::path(home, channel, source);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -175,7 +186,7 @@ impl<P: CachedProjection> ProjectionCache<P> {
     /// loud but non-fatal: the projection just returned to the caller
     /// is correct either way; only the next read's fast path is lost.
     pub fn save(&self, home: &Path) {
-        let path = Self::path(home, self.channel);
+        let path = Self::path(home, self.channel, self.source);
         if let Err(error) = self.try_save(&path) {
             eprintln!(
                 "{}: failed to persist snapshot {} ({error}) — next read rebuilds from scratch",
@@ -254,7 +265,11 @@ mod tests {
                     let home = home.path();
                     scope.spawn(move || {
                         let cache = sample(channel);
-                        cache.try_save(&ProjectionCache::<WorkBoardProjection>::path(home, channel))
+                        cache.try_save(&ProjectionCache::<WorkBoardProjection>::path(
+                            home,
+                            channel,
+                            WorkBoardCacheSource::Daemon,
+                        ))
                     })
                 })
                 .collect::<Vec<_>>()
@@ -288,7 +303,11 @@ mod tests {
     fn corrupt_json_is_discarded() {
         let home = tempfile::tempdir().expect("tempdir");
         let channel = RoomId::from_u128(1);
-        let path = ProjectionCache::<WorkBoardProjection>::path(home.path(), channel);
+        let path = ProjectionCache::<WorkBoardProjection>::path(
+            home.path(),
+            channel,
+            WorkBoardCacheSource::Daemon,
+        );
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, b"{ not json").expect("write garbage");
         assert!(ProjectionCache::<WorkBoardProjection>::load(
@@ -320,7 +339,11 @@ mod tests {
         let written = RoomId::from_u128(1);
         let cache = sample(written);
         // Force the file under a DIFFERENT channel's name.
-        let path = ProjectionCache::<WorkBoardProjection>::path(home.path(), RoomId::from_u128(2));
+        let path = ProjectionCache::<WorkBoardProjection>::path(
+            home.path(),
+            RoomId::from_u128(2),
+            WorkBoardCacheSource::Daemon,
+        );
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, serde_json::to_vec(&cache).expect("encode")).expect("write");
         assert!(ProjectionCache::<WorkBoardProjection>::load(
@@ -335,13 +358,87 @@ mod tests {
     fn source_mismatch_is_discarded() {
         let home = tempfile::tempdir().expect("tempdir");
         let channel = RoomId::from_u128(1);
-        sample(channel).save(home.path());
+        let cache = sample(channel);
+        let wrong_path = ProjectionCache::<WorkBoardProjection>::path(
+            home.path(),
+            channel,
+            WorkBoardCacheSource::Store,
+        );
+        cache
+            .try_save(&wrong_path)
+            .expect("write mismatched source");
         assert!(ProjectionCache::<WorkBoardProjection>::load(
             home.path(),
             channel,
             WorkBoardCacheSource::Store
         )
         .is_none());
+    }
+
+    // One generic contract for board and wall caches: incompatible live writers
+    // retain independent cursors, including an old binary at the legacy path.
+    #[test]
+    fn incompatible_writers_coexist_and_resume_their_own_cursor() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct Counter<const V: u32>(u64);
+        impl<const V: u32> CachedProjection for Counter<V> {
+            const DIR: &'static str = "contract-cache";
+            const LABEL: &'static str = "contract";
+            const VERSION: u32 = V;
+        }
+        fn write<const V: u32>(home: &Path, channel: RoomId, source: WorkBoardCacheSource, n: u64) {
+            ProjectionCache {
+                version: V,
+                channel,
+                source,
+                cursor: TranscriptCursor {
+                    lamport: n,
+                    event_id: EventId::from_u128(n as u128),
+                },
+                projection: Counter::<V>(n),
+            }
+            .save(home);
+        }
+        let home = tempfile::tempdir().unwrap();
+        let channel = RoomId::from_u128(1);
+        write::<1>(home.path(), channel, WorkBoardCacheSource::Daemon, 10);
+        write::<2>(home.path(), channel, WorkBoardCacheSource::Daemon, 20);
+        write::<2>(home.path(), channel, WorkBoardCacheSource::Store, 30);
+        let legacy = home
+            .path()
+            .join("contract-cache")
+            .join(format!("{channel}.json"));
+        std::fs::write(&legacy, b"old binary's incompatible snapshot").unwrap();
+        let mut current =
+            ProjectionCache::<Counter<2>>::load(home.path(), channel, WorkBoardCacheSource::Daemon)
+                .unwrap();
+        assert_eq!(current.cursor.lamport, 20);
+        assert_eq!(current.projection, Counter::<2>(20));
+        current.cursor.lamport = 21;
+        current.projection.0 += 1;
+        current.save(home.path());
+        write::<1>(home.path(), channel, WorkBoardCacheSource::Daemon, 11);
+        std::fs::write(&legacy, b"old writer runs again").unwrap();
+        assert_eq!(
+            ProjectionCache::<Counter<2>>::load(home.path(), channel, WorkBoardCacheSource::Daemon)
+                .unwrap(),
+            current
+        );
+        assert_eq!(
+            ProjectionCache::<Counter<1>>::load(home.path(), channel, WorkBoardCacheSource::Daemon)
+                .unwrap()
+                .cursor
+                .lamport,
+            11
+        );
+        assert_eq!(
+            ProjectionCache::<Counter<2>>::load(home.path(), channel, WorkBoardCacheSource::Store)
+                .unwrap()
+                .cursor
+                .lamport,
+            30
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"old writer runs again");
     }
 
     #[test]

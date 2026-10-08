@@ -38,19 +38,7 @@ async fn create_card(airc: &Airc, title: &str) -> airc_lib::WorkCardId {
 
 /// The single snapshot file this scope's board reads persisted.
 fn cache_file(airc: &Airc) -> std::path::PathBuf {
-    let dir = airc.home().join(CACHE_DIR);
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .expect("cache dir exists after a board read")
-        .map(|entry| entry.expect("cache dir entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    assert_eq!(
-        entries.len(),
-        1,
-        "expected exactly one room snapshot in {}",
-        dir.display()
-    );
-    entries.pop().expect("one entry")
+    common::projection_cache::only_snapshot(&airc.home().join(CACHE_DIR))
 }
 
 fn card_titles(board: &airc_lib::WorkBoardProjection) -> Vec<String> {
