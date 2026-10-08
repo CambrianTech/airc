@@ -3,10 +3,10 @@
 extern crate self as airc_core;
 #[path = "../crates/airc-core/src/process.rs"]
 mod process;
-#[path = "../crates/airc-cli/src/update_artifact.rs"]
-mod update_artifact;
 #[path = "../crates/airc-cli/src/update_shutdown/process_exit.rs"]
 mod process_exit;
+#[path = "../crates/airc-cli/src/update_artifact.rs"]
+mod update_artifact;
 
 use std::path::Path;
 
@@ -94,7 +94,9 @@ esac
             // PreparedInstall must select the native adapter even though its
             // legacy shell argument is deliberately unusable on Windows.
             std::env::set_var("AIRC_HANDOFF_BASH", &bash);
-            write(&source.join("install.ps1"), r#"
+            write(
+                &source.join("install.ps1"),
+                r#"
 param([string]$PrepareArtifact,[string]$PrebuiltArtifact,[string]$ExpectedBuild)
 $mode=if($PrepareArtifact){'--prepare-artifact'}else{'--prebuilt'}
 $artifact=if($PrepareArtifact){$PrepareArtifact}else{$PrebuiltArtifact}
@@ -105,7 +107,8 @@ $start.UseShellExecute=$false;$start.CreateNoWindow=$true
 $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
 $child=[Diagnostics.Process]::Start($start)
 try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadToEndAsync();$child.WaitForExit();[Console]::Out.Write($out.Result);[Console]::Error.Write($err.Result);exit $child.ExitCode}finally{$child.Dispose()}
-"#);
+"#,
+            );
         }
         #[cfg(windows)]
         let bash = std::ffi::OsString::from("unusable-wsl-fixture.exe");
@@ -213,6 +216,85 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
         )
         .is_err());
         assert!(!root.join("stopped").exists());
+        // Explicit prebuilt input snapshots and verifies before maintenance,
+        // even when compilation is unavailable. Both checksum and revision
+        // failures refuse without falling back to Cargo.
+        let input = root.join("downloaded binary");
+        write(&input, good);
+        let normal_shell = std::env::var_os("AIRC_HANDOFF_BASH").unwrap_or_else(|| bash.clone());
+        let hash = process::background(&normal_shell)
+            .args(["-c", "if command -v sha256sum >/dev/null; then sha256sum \"$AIRC_PREBUILT_ARTIFACT\"; else shasum -a 256 \"$AIRC_PREBUILT_ARTIFACT\"; fi"])
+            .env("AIRC_PREBUILT_ARTIFACT", &input)
+            .output().unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .trim_start_matches('\\')
+            .to_owned();
+        std::env::set_var("AIRC_PREBUILT_ARTIFACT", &input);
+        let before = std::fs::read_to_string(root.join("events")).unwrap();
+        for checksum in ["invalid".to_owned(), "0".repeat(64)] {
+            std::env::set_var("AIRC_PREBUILT_SHA256", checksum);
+            assert!(update_artifact::PreparedInstall::prepare(
+                &bash,
+                &source,
+                "abcdef1234567890",
+                &home.join("bin/airc")
+            )
+            .is_err());
+        }
+        std::env::set_var("AIRC_PREBUILT_SHA256", &hash);
+        let prepared = update_artifact::PreparedInstall::prepare(
+            &bash,
+            &source,
+            "abcdef1234567890",
+            &home.join("bin/airc"),
+        )
+        .unwrap();
+        // Replacing the input after prepare must not affect the installation.
+        write(&input, "#!/bin/sh\necho 'build: deadbee'\n");
+        prepared
+            .install_after(|| {
+                std::fs::write(root.join("stopped"), "daemon maintenance")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join("bin/airc")).unwrap(),
+            good
+        );
+        std::fs::remove_file(root.join("stopped")).unwrap();
+        // Hash valid for wrong revision: verified bytes alone are insufficient.
+        let wrong_hash = process::background(&normal_shell)
+            .args(["-c", "if command -v sha256sum >/dev/null; then sha256sum \"$AIRC_PREBUILT_ARTIFACT\"; else shasum -a 256 \"$AIRC_PREBUILT_ARTIFACT\"; fi"])
+            .output().unwrap();
+        assert!(wrong_hash.status.success());
+        std::env::set_var(
+            "AIRC_PREBUILT_SHA256",
+            String::from_utf8(wrong_hash.stdout)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_start_matches('\\'),
+        );
+        assert!(update_artifact::PreparedInstall::prepare(
+            &bash,
+            &source,
+            "abcdef1234567890",
+            &home.join("bin/airc")
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("events")).unwrap(),
+            before
+        );
+        assert!(!root.join("stopped").exists());
+        std::env::remove_var("AIRC_PREBUILT_ARTIFACT");
+        std::env::remove_var("AIRC_PREBUILT_SHA256");
         // Wrong expected source SHA is rejected before any build.
         let before = std::fs::read_to_string(root.join("events")).unwrap();
         assert!(update_artifact::PreparedInstall::prepare(
@@ -237,7 +319,8 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
             if fails {
                 write(&root.join("fail-adopt"), "fail");
             }
-            let normal_shell = std::env::var_os("AIRC_HANDOFF_BASH").unwrap_or_else(|| bash.clone());
+            let normal_shell =
+                std::env::var_os("AIRC_HANDOFF_BASH").unwrap_or_else(|| bash.clone());
             let output = process::background(normal_shell)
                 .arg(source.join("install.sh"))
                 .env("AIRC_DIR", &source)

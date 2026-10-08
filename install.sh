@@ -70,6 +70,15 @@ if [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT$EXPECTED_BUILD" ]; then
   [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ] || fail 'Handoff cannot skip artifact validation'
 fi
 
+# Explicit prebuilt input is consumed only by the updater's prepare phase.
+# The old updater passes its environment to the current installer, so adoption
+# still uses its existing maintenance, rollback and native session owner.
+if [ -n "${AIRC_PREBUILT_ARTIFACT:-}${AIRC_PREBUILT_SHA256:-}" ]; then
+  [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT" ] || fail 'Prebuilt input requires the guarded update handoff'
+  [ -n "${AIRC_PREBUILT_ARTIFACT:-}" ] || fail 'AIRC_PREBUILT_ARTIFACT is required'
+  [[ "${AIRC_PREBUILT_SHA256:-}" =~ ^[0-9a-fA-F]{64}$ ]] || fail 'AIRC_PREBUILT_SHA256 must be the binary SHA-256'
+fi
+
 # BEGIN GENERATED WINDOWS TOKEN CHECK
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*)
   powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command 'function Test-IsAdmin {
@@ -502,7 +511,7 @@ ensure_prereqs() {
 # applying Windows packages; other platforms retain their package-manager path.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) ;;
-  *) if [ -z "$PREBUILT_ARTIFACT" ]; then ensure_prereqs; fi ;;
+  *) if [ -z "$PREBUILT_ARTIFACT${AIRC_PREBUILT_ARTIFACT:-}" ]; then ensure_prereqs; fi ;;
 esac
 
 # ── Clone or update ─────────────────────────────────────────────────────
@@ -623,7 +632,7 @@ case "$(uname -s)" in
       ( source "$CLONE_DIR/windows/run-powershell.sh" "${session_args[@]}" ) || result=$?
       exit "$result"
     fi
-    if [ -z "$PREBUILT_ARTIFACT" ] && [ "${AIRC_SKIP_PREREQS:-0}" != 1 ]; then
+    if [ -z "$PREBUILT_ARTIFACT${AIRC_PREBUILT_ARTIFACT:-}" ] && [ "${AIRC_SKIP_PREREQS:-0}" != 1 ]; then
       environment_file="$(mktemp)"
       if ! ( source "$CLONE_DIR/windows/run-powershell.sh" -NoProfile -ExecutionPolicy RemoteSigned \
           -File "$(_to_win_path "$CLONE_DIR/windows/install-prereqs.ps1")" \
@@ -879,6 +888,25 @@ _install_airc_binary() {
     built="$(_to_bash_path "$PREBUILT_ARTIFACT")"
     _verify_artifact "$built"
     info "Installing verified prebuilt artifact: $built"
+  elif [ -n "${AIRC_PREBUILT_ARTIFACT:-}" ]; then
+    local prepared digest
+    prepared="$(_to_bash_path "$PREPARE_ARTIFACT")"
+    [ ! -e "$prepared" ] || fail 'Artifact destination already exists'
+    # Hash the owned copy, not the mutable input; nothing executes before this.
+    cp "$(_to_bash_path "$AIRC_PREBUILT_ARTIFACT")" "$prepared" || fail 'Cannot snapshot prebuilt artifact'
+    if command -v sha256sum >/dev/null 2>&1; then
+      digest="$(sha256sum "$prepared")" || fail 'Cannot checksum prebuilt artifact'
+    elif command -v shasum >/dev/null 2>&1; then
+      digest="$(shasum -a 256 "$prepared")" || fail 'Cannot checksum prebuilt artifact'
+    else
+      fail 'SHA-256 verifier required; refusing compilation fallback'
+    fi
+    digest="${digest%% *}"
+    [ "$(printf '%s' "$digest" | tr 'A-F' 'a-f')" = "$(printf '%s' "$AIRC_PREBUILT_SHA256" | tr 'A-F' 'a-f')" ] || fail 'Prebuilt checksum mismatch'
+    chmod +x "$prepared"
+    _verify_artifact "$prepared"
+    ok "Prepared verified prebuilt artifact: $prepared"
+    exit 0
   else
   # Belt-and-suspenders: even when prereq install was skipped (AIRC_SKIP_PREREQS)
   # the build still needs cargo on PATH. On macOS that means sourcing brew env.
