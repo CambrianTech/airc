@@ -5,7 +5,7 @@
 //!
 //! Card c0bd865c phase 4 (c7bdf2df). The extracted handlers:
 //!
-//!   - `open_pr_and_link` — best-effort: from a card's worktree,
+//!   - `open_pr_and_link` — from a card's worktree,
 //!     run `gh pr create` against the configured base, parse the
 //!     created PR's URL/number, and emit `PullRequestLinked` so the
 //!     projection picks it up.
@@ -19,10 +19,8 @@
 
 use crate::lease;
 
-/// Best-effort: open a GitHub PR for the work card's worktree branch
-/// and link it via `WorkEvent::PullRequestLinked`. Returns Err so
-/// run_state can surface as a warning without aborting the state
-/// transition.
+/// Open and link a PR before the caller advertises Review. Prerequisite failures
+/// leave the card in its current state and are returned to the caller.
 pub(crate) async fn open_pr_and_link(
     airc: &airc_lib::Airc,
     home: &std::path::Path,
@@ -37,10 +35,8 @@ pub(crate) async fn open_pr_and_link(
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
-    if card.pull_request.is_some() {
-        // Already linked; nothing to do. Re-running `state review` on
-        // a card that's already been reviewed is a no-op for the PR
-        // side.
+    if card.reviews.is_some() || card.pull_request.is_some() {
+        // Review-only verdicts and already-linked PRs keep their existing path.
         return Ok(());
     }
 
@@ -56,6 +52,7 @@ pub(crate) async fn open_pr_and_link(
         .into());
     }
     let worktree_str = worktree_path.to_string_lossy().to_string();
+    let head_branch = crate::work_commands_git::require_pushed_head(&worktree_str)?;
 
     // gh pr create — pass --title + --body explicitly from the HEAD
     // commit's metadata. `--fill` SOUNDS right but its heuristic
@@ -101,6 +98,8 @@ pub(crate) async fn open_pr_and_link(
             body.trim(),
             "--base",
             base_branch.as_str(),
+            "--head",
+            head_branch.as_str(),
         ])
         .output()?;
     if !create_out.status.success() {
@@ -118,8 +117,6 @@ pub(crate) async fn open_pr_and_link(
     // Resolve head from the worktree's git state. Base is the same
     // pinned value we passed to gh — the projection must record what
     // we actually opened the PR against, not gh's repo default.
-    let head_branch = crate::work_commands_git::git_rev_parse_branch(&worktree_str)?;
-
     let pull_request = PullRequestRef {
         repo: card.repo.clone(),
         number: pr_number,

@@ -186,6 +186,44 @@ pub(crate) fn git_rev_parse_branch(worktree: &str) -> Result<String, Box<dyn std
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
+/// Confirm the PR will expose this exact commit, not an absent or stale remote
+/// branch. Read the remote itself: a local tracking ref can outlive a deletion.
+pub(crate) fn require_pushed_head(worktree: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let branch = git_rev_parse_branch(worktree)?;
+    if branch == "HEAD" || branch.is_empty() {
+        return Err("review requires a named branch; check out the card branch first".into());
+    }
+    let head = git_show_format(worktree, "%H")?;
+    let remote_ref = format!("refs/heads/{branch}");
+    let out = airc_core::process::background("git")
+        .args([
+            "-C",
+            worktree,
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &remote_ref,
+        ])
+        .output()?;
+    if !out.status.success() && out.status.code() != Some(2) {
+        return Err(format!(
+            "cannot verify pushed branch: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    let published = String::from_utf8(out.stdout)?;
+    let matches = published.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(sha, name)| sha == head.trim() && name == remote_ref)
+    });
+    if !matches {
+        return Err(format!("review refused: branch {branch} has not been pushed at HEAD; run `git push -u origin HEAD`, then retry `airc work state <card> review`").into());
+    }
+    Ok(branch)
+}
+
 /// The patch a PR carries, as its reviewer reads it: `worktree`'s HEAD against its
 /// merge-base with `base_branch` on origin. Returns that merge-base's full sha (the
 /// submission's base) and the diff bytes. The base is fetched first, so a clone that has
@@ -344,6 +382,24 @@ mod tests {
         run(&clone, &["checkout", "--quiet", "-b", "fix"]);
         std::fs::write(clone.join("lib.rs"), "fn a() { fixed() }\n").expect("write");
         run(&clone, &["commit", "--quiet", "-am", "the fix"]);
+        // adbe0177: no branch on origin, then a pushed tip, then a new local
+        // revision and a remote deletion despite a retained tracking ref.
+        let path = clone.to_str().expect("utf8");
+        assert!(require_pushed_head(path)
+            .unwrap_err()
+            .to_string()
+            .contains("git push"));
+        run(&clone, &["push", "--quiet", "-u", "origin", "HEAD"]);
+        assert_eq!(require_pushed_head(path).unwrap(), "fix");
+        run(
+            &clone,
+            &["commit", "--quiet", "--allow-empty", "-m", "revision"],
+        );
+        assert!(require_pushed_head(path).is_err());
+        run(&clone, &["push", "--quiet", "origin", "HEAD"]);
+        assert!(require_pushed_head(path).is_ok());
+        run(&origin, &["update-ref", "-d", "refs/heads/fix"]);
+        assert!(require_pushed_head(path).is_err());
         // origin's base moves on after the clone was cut: the merge-base stays the base.
         std::fs::write(origin.join("other.rs"), "fn b() {}\n").expect("write");
         run(&origin, &["add", "."]);

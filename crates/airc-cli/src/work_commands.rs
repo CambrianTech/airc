@@ -557,6 +557,12 @@ pub async fn run_state(
         }
     }
 
+    // Review must not be advertised before its PR prerequisites succeed. The
+    // link event also projects Review, so errors must propagate, not be swallowed.
+    if card_state == CardState::Review {
+        crate::work_commands_gh::open_pr_and_link(&airc, home, &room, card_uuid).await?;
+    }
+
     airc.change_work_card_state_in(
         &room,
         ChangeWorkCardState {
@@ -566,23 +572,6 @@ pub async fn run_state(
     )
     .await?;
     println!("card_state_changed: card_id={card_uuid} state={card_state:?}");
-
-    // Card 820629e9: on transition to Review, open a PR via `gh` from
-    // the card's worktree and link it to the card. Best-effort — a gh
-    // failure (no commits, no remote, gh not installed) prints a
-    // warning but does not undo the state transition. The link is
-    // recorded as a separate WorkEvent::PullRequestLinked, whose
-    // projection re-sets state=Review idempotently and populates
-    // card.pull_request — so downstream consumers (ad7e100b Sub-C
-    // auto-spawn review card, board renderers) read one source of
-    // truth.
-    if card_state == CardState::Review {
-        if let Err(error) =
-            crate::work_commands_gh::open_pr_and_link(&airc, home, &room, card_uuid).await
-        {
-            eprintln!("airc: gh pr create skipped — {error}");
-        }
-    }
 
     // Card abe9fe4c: on transition to Closed (the terminal state),
     // remove the per-card worktree spawned by d1b2798d and prune the
