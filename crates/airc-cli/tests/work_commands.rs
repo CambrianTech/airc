@@ -608,6 +608,68 @@ fn work_board_empty_state_is_explicit() {
     );
 }
 
+// adbe0177: review used to mutate the board before gh refused an unpushed branch.
+#[test]
+fn unpushed_review_preserves_in_progress_card() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "unpushed review regression",
+        ],
+    );
+    let card = extract_field(&create, "card_id:").unwrap();
+    run_ok(&home, &["work", "claim", card, "--no-lease-required"]);
+    run_ok(&home, &["work", "state", card, "in-progress"]);
+    let origin = workspace.path().join("origin.git");
+    let tree = workspace.path().join(".airc/worktrees").join(&card[..8]);
+    std::fs::create_dir_all(&tree).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&tree)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "--bare", origin.to_str().unwrap()]);
+    git(&["init", "--initial-branch=card-work"]);
+    git(&["config", "user.name", "Regression"]);
+    git(&["config", "user.email", "regression@example.invalid"]);
+    git(&["commit", "--allow-empty", "-m", "unpublished work"]);
+    git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+    let before = run_ok(&home, &["work", "board"]);
+    let error = run_expect_failure(&home, &["work", "state", card, "review"]);
+    assert!(error.contains("git push -u origin HEAD"), "{error}");
+    let after = run_ok(&home, &["work", "board"]);
+    let card_line = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with(card))
+            .unwrap()
+            .split("lease=")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(card_line(&before), card_line(&after));
+    assert!(after.contains("InProgress"), "{after}");
+    assert!(
+        !after.contains("review: unpushed review regression"),
+        "{after}"
+    );
+}
+
 fn run_ok(home: &Path, args: &[&str]) -> String {
     let machine_home = home.parent().unwrap_or(home);
     // Card 303f2384: --no-lease-required is gated on cwd being a
