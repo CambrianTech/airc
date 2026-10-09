@@ -7,6 +7,9 @@ param(
     [string]$UserHome = $env:USERPROFILE,
     [switch]$Elevated,
     [switch]$ExistingOnly,
+    # Change nothing: succeed when the task is registered, enabled, runs this airc
+    # under the user's normal token and has current runners; otherwise throw the drift.
+    [switch]$Check,
     [switch]$RestartRequired
 )
 . (Join-Path $PSScriptRoot 'setup-entrypoint.ps1')
@@ -64,6 +67,7 @@ $pending = $runner + '.restart-required'
 $logs = Join-Path $UserHome '.airc\logs'
 $shell = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $existing = Get-AircStartupTask
+if ($Check -and -not $existing) { throw 'airc-join is not registered' }
 if ($ExistingOnly -and -not $existing) { return }
 if ($existing) {
     $ownerSid = Get-AircStartupOwnerSid $existing
@@ -81,6 +85,13 @@ $unchanged = (Test-AircStartupToken $existing) -and @($existing.Actions).Count -
     $existing.Actions[0].WorkingDirectory -eq $action.WorkingDirectory
 $restart = $restart -or ($existing -and $existing.State -eq 'Running' -and
     (-not $unchanged -or $runnerChanged -or (Test-Path -LiteralPath $pending)))
+if ($Check) {
+    if (-not $existing.Settings.Enabled) { throw 'airc-join is registered but disabled' }
+    if (-not $unchanged) { throw 'airc-join runs a different action, principal or run level than this airc' }
+    if ($runnerChanged) { throw 'airc-join runner scripts are stale' }
+    Write-Output 'airc-join converged'
+    return
+}
 if ($unchanged -and -not $runnerChanged -and -not $restart) { return }
 if ($runnerChanged) {
     Copy-Item -LiteralPath $source -Destination $runner -Force
@@ -134,7 +145,8 @@ Remove-Item -LiteralPath $pending -ErrorAction SilentlyContinue
     $accessDenied = $_.CategoryInfo.Category -eq 'PermissionDenied' -or
         $_.Exception -is [UnauthorizedAccessException] -or $_.Exception.HResult -eq -2147024891 -or
         $_.Exception.StatusCode -eq 'AccessDenied'
-    if (-not $accessDenied -or $Elevated) { throw }
+    # A check never elevates: reading is not a repair.
+    if (-not $accessDenied -or $Elevated -or $Check) { throw }
     Write-Host 'Windows requires elevation to repair the existing AIRC startup task. Only startup repair will run elevated.'
     $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'RemoteSigned', '-File',
         $PSCommandPath, '-AircPath', $AircPath,
