@@ -7,8 +7,8 @@ prepared while service remained available, then completed its own maintenance
 handoff. CLI and daemon both reported af64b67e033b; no manual stop/join was used.
 
 Identity e85a5bb3-74f0-4325-87df-7d5f27637063 and the saved Codex coordination brief
-(repeat 600000ms) were retained. An explicit resume consumer received that brief
-and actionable board/maintenance issues; immediate polling of the same consumer
+(repeat 600000ms) were retained. The operator-visible tool output showed an explicit resume consumer receiving that brief
+and actionable board/maintenance issues (that initial output was not saved as a raw file); immediate polling of the same consumer
 returned zero bytes. Installed update skill now describes automatic verified
 prebuilt discovery and no compiler fallback.
 
