@@ -133,7 +133,7 @@ impl std::fmt::Display for GateBlock {
 impl RegistryRefreshGate {
     /// Returns `None` if a tick should proceed, or the reason it must
     /// not. The hermetic gate is checked FIRST: a hermetic scope must
-    /// not even probe `gh auth status`. Public so the manual `registry
+    /// not even probe the authenticated API. Public so the manual `registry
     /// sync` CLI verb can order its checks intentionally: gate first,
     /// THEN the dialable-endpoint requirement (card 4b6a0ffa / #33) —
     /// a gh-unauthed box must hear "gh not ready", not a misleading
@@ -593,7 +593,7 @@ mod tests {
     // stale must NOT skip the tick — the gate makes ONE re-resolve
     // (`gh auth token`, stale env stripped) + re-probe, and the
     // recovered token lands in the shared slot for the store's gh
-    // spawns. The stub mirrors real gh: `auth status` passes only with
+    // spawns. The stub mirrors real gh: `api user` passes only with
     // the fresh token in GH_TOKEN; `auth token` echoes an env token
     // when one is present (so only an env-stripped spawn reaches the
     // keyring copy). The test process has no fresh token in ITS env —
@@ -610,8 +610,8 @@ mod tests {
             &bin,
             r#"#!/bin/sh
 case "$1 $2" in
-  "auth status")
-    [ "$3 $4" = "--active --hostname" ] || exit 1
+  "api user")
+    [ "$3 $4" = "--silent --hostname" ] || exit 1
     [ "${GH_TOKEN-}" = "fresh-token" ] && exit 0
     exit 1
     ;;
@@ -660,7 +660,7 @@ exit 1
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let bin = dir.path().join("gh");
-        // auth status always fails; auth token would "succeed" — but
+        // The authenticated probe always fails; auth token would "succeed" — but
         // with no slot the gate must never even try it.
         std::fs::write(
             &bin,

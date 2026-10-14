@@ -1041,7 +1041,7 @@ fn gh_no_window(cmd: &mut Command) {
 pub const GH_AUTH_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Probe whether the local `gh` is authenticated against GitHub.
-/// Returns true if the effective host/account passes `gh auth status` within
+/// Returns true if the effective credential passes an authenticated `GET /user` within
 /// [`GH_AUTH_READY_TIMEOUT`]. Used by callers (e.g.,
 /// `Airc::join_default_context`) to skip publish/refresh cleanly when
 /// the operator isn't logged in.
@@ -1080,11 +1080,13 @@ pub async fn gh_auth_ready_with_token(gh_bin: Option<&Path>, gh_token: Option<&s
 /// Probe the account gh will actually use for registry requests. The default
 /// status command validates every saved account, so an expired INACTIVE token
 /// can otherwise prevent a valid environment token from ever reaching the store.
+/// Use the authenticated user endpoint supported by old and new gh versions;
+/// `auth status --active` is unavailable on older installed clients.
 /// Match gh API host selection and let gh own credential precedence; never parse
 /// human-readable status text or treat JSON-mode exit zero as authentication.
 fn auth_probe_command(bin: &Path, host: Option<&str>) -> Command {
     let mut cmd = Command::new(bin);
-    cmd.args(["auth", "status", "--active", "--hostname"])
+    cmd.args(["api", "user", "--silent", "--hostname"])
         .arg(host.filter(|host| !host.is_empty()).unwrap_or("github.com"));
     cmd
 }
@@ -1909,7 +1911,7 @@ exit 0
                 .get_args()
                 .map(|arg| arg.to_str().unwrap())
                 .collect();
-            assert_eq!(args, ["auth", "status", "--active", "--hostname", expected]);
+            assert_eq!(args, ["api", "user", "--silent", "--hostname", expected]);
         }
     }
 
@@ -1935,18 +1937,29 @@ exit 0
         // succeeds, and an invalid effective override must still fail closed.
         #[tokio::test]
         async fn gate_ignores_inactive_credentials_but_validates_effective_token() {
-            let dir = tempfile::tempdir().unwrap();
-            let bin = install_stub(
-                dir.path(),
-                "gh",
-                r#"#!/bin/sh
-if [ "$1 $2 $3 $4" != "auth status --active --hostname" ]; then exit 1; fi
-if [ "${GH_TOKEN-}" = "valid-effective-token" ]; then exit 0; fi
+            for status_error in [
+                "unknown flag: --active",
+                "inactive saved credential expired",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let script = format!(
+                    r#"#!/bin/sh
+if [ "$1 $2" = "auth status" ]; then echo "{status_error}" >&2; exit 1; fi
+if [ "$1 $2 $3 $4" != "api user --silent --hostname" ]; then exit 1; fi
+if [ "${{GH_TOKEN-}}" = "valid-effective-token" ]; then exit 0; fi
 exit 1
-"#,
-            );
-            assert!(gh_auth_ready_with_token(Some(&bin), Some("valid-effective-token")).await);
-            assert!(!gh_auth_ready_with_token(Some(&bin), Some("expired-effective-token")).await);
+"#
+                );
+                let bin = install_stub(dir.path(), "gh", &script);
+                assert!(
+                    gh_auth_ready_with_token(Some(&bin), Some("valid-effective-token")).await,
+                    "{status_error}"
+                );
+                assert!(
+                    !gh_auth_ready_with_token(Some(&bin), Some("expired-effective-token")).await,
+                    "{status_error}"
+                );
+            }
         }
 
         // THE #1145 PIN: a gh that takes ~1s to answer but IS
