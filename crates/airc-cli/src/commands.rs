@@ -690,9 +690,7 @@ pub async fn ensure_daemon_running(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    inject_gh_token(&mut command);
-    detach_daemon(&mut command);
-    let child = command.spawn()?;
+    let child = spawn_daemon(command)?;
     let daemon_pid = child.id();
 
     let client = DaemonClient::new(socket.clone());
@@ -775,6 +773,15 @@ async fn wait_for_daemon_exit(client: &DaemonClient, max_wait: Duration) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Shared daemon spawn boundary for normal startup and verified update adoption.
+/// Callers own scope, lifecycle guards and log streams; this boundary owns the
+/// credential handoff and platform detachment before creating the process.
+pub(crate) fn spawn_daemon(mut command: Command) -> std::io::Result<std::process::Child> {
+    inject_gh_token(&mut command);
+    detach_daemon(&mut command);
+    command.spawn()
 }
 
 /// Hand the spawned daemon a `GH_TOKEN` so its account-registry loop can
@@ -943,7 +950,7 @@ fn resolve_gh_bin_with(override_bin: Option<std::path::PathBuf>) -> Option<std::
 }
 
 #[cfg(unix)]
-pub(crate) fn detach_daemon(command: &mut Command) {
+fn detach_daemon(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: this closure runs in the child just before exec and
     // only calls setsid, which is async-signal-safe.
@@ -958,7 +965,7 @@ pub(crate) fn detach_daemon(command: &mut Command) {
 }
 
 #[cfg(windows)]
-pub(crate) fn detach_daemon(command: &mut Command) {
+fn detach_daemon(command: &mut Command) {
     airc_core::process::configure_detached(command);
 
     // Stop the detached daemon from inheriting THIS process's standard

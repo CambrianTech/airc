@@ -627,8 +627,7 @@ fn spawn_restarted_daemon(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    crate::commands::detach_daemon(&mut command);
-    command.spawn()?;
+    crate::commands::spawn_daemon(command)?;
     Ok(())
 }
 
@@ -881,6 +880,7 @@ mod tests {
             "update_commands::tests::restarted_daemon_does_not_hold_updater_output_open";
 
         if env::var(MODE).as_deref() == Ok("daemon") {
+            assert_eq!(env::var("GH_TOKEN").as_deref(), Ok("fixture-daemon-token"));
             println!("fixture daemon stdout");
             eprintln!("fixture daemon stderr");
             std::io::stdout().flush().unwrap();
@@ -928,6 +928,21 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Hermetic credential: Windows exercises inherited env; Unix exercises
+        // keyring extraction via an isolated gh stub, never the real keychain.
+        launcher
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("AIRC_NO_GH_TOKEN_INJECT");
+        #[cfg(windows)]
+        launcher.env("GH_TOKEN", "fixture-daemon-token");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let gh = home.path().join("gh");
+            std::fs::write(&gh, "#!/bin/sh\nprintf 'fixture-daemon-token\\n'\n").unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            launcher.env_remove("GH_TOKEN").env("AIRC_GH_BIN", gh);
+        }
         let child = launcher.spawn().unwrap();
         let (output_tx, output_rx) = mpsc::channel();
         let collector = std::thread::spawn(move || {
