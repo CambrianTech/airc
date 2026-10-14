@@ -2334,7 +2334,7 @@ fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::Join
     let connected = state.connected_lan_peers.clone();
     let delivery_stats = state.delivery_stats.clone();
     let endpoint_resync = state.endpoint_resync.clone();
-    let failed_routes = std::sync::Mutex::new(Vec::new());
+    let failed_routes = tokio::sync::Mutex::new(Vec::new());
     tokio::spawn(async move {
         // The registry task applies this same isolation policy before starting
         // automatic listeners. Keep the refresh clock and stored peer dials
@@ -2408,7 +2408,7 @@ async fn refresh_routes_once(
     connected_lan_peers: &std::sync::atomic::AtomicUsize,
     delivery_stats: &tokio::sync::RwLock<airc_ipc::DeliveryStatsResponse>,
     endpoint_resync: &tokio::sync::Notify,
-    failed_routes: &std::sync::Mutex<Vec<(airc_lib::PeerId, airc_lib::RouteEndpoint)>>,
+    failed_routes: &tokio::sync::Mutex<Vec<(airc_lib::PeerId, airc_lib::RouteEndpoint)>>,
     allow_advertising: bool,
 ) {
     // Adaptable-router reflex: re-detect this node's own routable LAN +
@@ -2477,7 +2477,7 @@ async fn refresh_routes_once(
             // Remote discovery has one owner. Repeated failures (including
             // quarantined endpoints) must not feed each imported snapshot
             // back into another remote sweep.
-            if observe_failed_routes(&mut failed_routes.lock().unwrap(), &snapshot) {
+            if observe_failed_routes(&mut *failed_routes.lock().await, &snapshot) {
                 endpoint_resync.notify_one();
             }
 
