@@ -58,7 +58,7 @@ impl CommandGitRunner {
         use std::process::Stdio;
         let mut command = airc_core::process::background("git");
         command.arg("-C").arg(repo_path).args(args);
-        let output = if let Some(input) = input {
+        let (output, input_error) = if let Some(input) = input {
             let mut child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -81,31 +81,32 @@ impl CommandGitRunner {
                     Err(error) => {
                         // Failed thread creation must not abandon the Git child.
                         let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(error);
+                        return child
+                            .wait_with_output()
+                            .map(|output| (output, Some(error.to_string())));
                     }
                 };
                 let output = child.wait_with_output();
-                let written = writer
-                    .join()
-                    .map_err(|_| std::io::Error::other("git stdin writer panicked"))?;
-                written?;
-                output
+                let input_error = match writer.join() {
+                    Ok(result) => result.err().map(|error| error.to_string()),
+                    Err(_) => Some("git stdin writer panicked".to_owned()),
+                };
+                output.map(|output| (output, input_error))
             })
         } else {
-            command.output()
+            command.output().map(|output| (output, None))
         }
         .map_err(|source| LocalGitError::GitSpawn {
             repo_path: repo_path.to_path_buf(),
             source,
         })?;
 
-        if !output.status.success() {
+        if !output.status.success() || input_error.is_some() {
             return Err(LocalGitError::GitCommand {
                 repo_path: repo_path.to_path_buf(),
                 args: args.iter().map(|arg| (*arg).to_string()).collect(),
-                status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                output: Box::new(output),
+                input_error,
             });
         }
 
@@ -260,12 +261,12 @@ pub enum LocalGitError {
         repo_path: PathBuf,
         source: std::io::Error,
     },
-    #[error("git command failed in {repo_path}: git {args:?} exited {status:?}: {stderr}")]
+    #[error("git command failed in {repo_path}: git {args:?} exited {}: {}; stdin={input_error:?}", .output.status, String::from_utf8_lossy(&.output.stderr))]
     GitCommand {
         repo_path: PathBuf,
         args: Vec<String>,
-        status: Option<i32>,
-        stderr: String,
+        output: Box<std::process::Output>,
+        input_error: Option<String>,
     },
     #[error(transparent)]
     BranchName(#[from] crate::model::BranchNameError),
@@ -309,16 +310,34 @@ mod tests {
                 Some(Err(stderr)) => Err(LocalGitError::GitCommand {
                     repo_path: repo_path.to_path_buf(),
                     args: key,
-                    status: Some(128),
-                    stderr: stderr.clone(),
+                    output: Box::new(failed_output(128, stderr)),
+                    input_error: None,
                 }),
                 None => Err(LocalGitError::GitCommand {
                     repo_path: repo_path.to_path_buf(),
                     args: key,
-                    status: Some(1),
-                    stderr: "missing fake output".to_string(),
+                    output: Box::new(failed_output(1, "missing fake output")),
+                    input_error: None,
                 }),
             }
+        }
+    }
+
+    fn failed_output(code: u32, stderr: &str) -> std::process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw((code as i32) << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code)
+        };
+        std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
         }
     }
 

@@ -167,6 +167,16 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
             }
         },
     };
+    if spec.start_point.is_none() {
+        use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+        let branch = integration_base
+            .as_deref()
+            .ok_or_else(|| "selected integration base is unavailable".to_owned())?;
+        let refspec = format!("refs/heads/{branch}:{start_ref}");
+        CommandGitRunner
+            .run_git(spec.clone_path, &["fetch", "--no-tags", "origin", &refspec])
+            .map_err(|e| format!("refresh integration base before allocation: {e}"))?;
+    }
     let base = resolve_commit(spec.clone_path, &start_ref)?;
     let mut cmd = airc_core::process::background("git");
     cmd.current_dir(spec.clone_path)
@@ -430,10 +440,18 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        let integration = resolve_commit(&repo, "HEAD").unwrap();
+        let old_integration = resolve_commit(&repo, "HEAD").unwrap();
+        git(&repo, &["remote", "add", "origin", repo.to_str().unwrap()]);
+        git(&repo, &["checkout", "-qb", "canary"]);
         git(
             &repo,
-            &["update-ref", "refs/remotes/origin/canary", &integration],
+            &["commit", "--allow-empty", "-qm", "remote advanced"],
+        );
+        let integration = resolve_commit(&repo, "HEAD").unwrap();
+        git(&repo, &["checkout", "-q", "main"]);
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/canary", &old_integration],
         );
         git(&repo, &["commit", "--allow-empty", "-qm", "unrelated main"]);
         let main = resolve_commit(&repo, "HEAD").unwrap();
@@ -458,7 +476,11 @@ mod tests {
                 assert_eq!(evidence.start_ref, "refs/remotes/origin/canary");
                 assert_eq!(evidence.creation_sha, integration);
                 // An unavailable configured ref must not fall back to unrelated main.
-                git(&repo, &["update-ref", "-d", "refs/remotes/origin/canary"]);
+                git(&repo, &["branch", "-D", "canary"]);
+                assert_eq!(
+                    ensure_worktree(&spec).unwrap(),
+                    WorktreeOutcome::Reused(path)
+                );
                 let missing = WorktreeSpec {
                     card_id: WorkCardId::from_uuid(uuid::Uuid::new_v4()),
                     branch: "missing",
@@ -466,7 +488,7 @@ mod tests {
                 };
                 assert!(ensure_worktree(&missing)
                     .unwrap_err()
-                    .contains("resolve commit"));
+                    .contains("refresh integration base"));
                 assert!(!worktree_path_for(missing.card_id).unwrap().exists());
                 let unknown = WorktreeSpec {
                     card_id: WorkCardId::from_uuid(uuid::Uuid::new_v4()),
@@ -480,12 +502,13 @@ mod tests {
                 assert!(!worktree_path_for(unknown.card_id).unwrap().exists());
                 // Generic repositories use their recorded remote default, even
                 // when it has an unfamiliar name and the clone is on main.
+                git(&repo, &["branch", "trunk/custom", &integration]);
                 git(
                     &repo,
                     &[
                         "update-ref",
                         "refs/remotes/origin/trunk/custom",
-                        &integration,
+                        &old_integration,
                     ],
                 );
                 git(
@@ -505,7 +528,7 @@ mod tests {
                 // its configured branch is absent.
                 assert!(ensure_worktree(&missing)
                     .unwrap_err()
-                    .contains("resolve commit"));
+                    .contains("refresh integration base"));
             },
         );
     }
@@ -527,9 +550,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, expected.as_bytes());
-        assert!(CommandGitRunner
-            .run_git_input(tmp.path(), &["not-a-command"], Some(request.as_bytes()))
-            .is_err());
+        let error = CommandGitRunner
+            .run_git_input(
+                tmp.path(),
+                &[
+                    "-c",
+                    "alias.reject-input=!echo retained-output; echo rejected-input >&2; exit 7",
+                    "reject-input",
+                ],
+                Some(request.as_bytes()),
+            )
+            .unwrap_err();
+        match error {
+            airc_work::local_git::LocalGitError::GitCommand {
+                output,
+                input_error,
+                ..
+            } => {
+                assert_eq!(output.status.code(), Some(7));
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap().trim(),
+                    "retained-output"
+                );
+                assert!(String::from_utf8(output.stderr)
+                    .unwrap()
+                    .contains("rejected-input"));
+                assert!(
+                    input_error.is_some(),
+                    "the rejected large input must remain visible beside exit/output"
+                );
+            }
+            other => panic!("lost completed process outcome: {other:?}"),
+        }
     }
 
     // what this catches: `git worktree add` leaving submodules EMPTY, so a lease
