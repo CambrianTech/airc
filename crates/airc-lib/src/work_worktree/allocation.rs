@@ -18,35 +18,21 @@ pub struct AllocationEvidence {
 
 /// Legacy trees without an allocation record return `None`; never backfill from HEAD.
 pub fn allocation_evidence(worktree: &Path) -> Result<Option<AllocationEvidence>, String> {
-    let output = airc_core::process::background("git")
-        .current_dir(worktree)
-        .args(["for-each-ref", "--format=%(objectname)", ALLOCATION_REF])
-        .output()
-        .map_err(|e| format!("read allocation ref: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "read allocation ref: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let object = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    if object.trim().is_empty() {
+    use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+    let object = CommandGitRunner
+        .run_git(
+            worktree,
+            &["for-each-ref", "--format=%(objectname)", ALLOCATION_REF],
+        )
+        .map_err(|e| e.to_string())?;
+    if object.is_empty() {
         return Ok(None);
     }
-    let output = airc_core::process::background("git")
-        .current_dir(worktree)
-        .args(["cat-file", "blob", object.trim()])
-        .output()
-        .map_err(|e| format!("read allocation object: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "read allocation object: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    decode_allocation_evidence(&output.stdout, &creation_base(worktree)?).map(Some)
+    let bytes = CommandGitRunner
+        .run_git_input(worktree, &["cat-file", "blob", &object], None)
+        .map_err(|e| e.to_string())?;
+    decode_allocation_evidence(&bytes, &creation_base(worktree)?).map(Some)
 }
-
 /// Async consumers can read Git through their process owner, then use this same
 /// decoder with the recorded creation anchor (never the mutable current HEAD).
 pub fn decode_allocation_evidence(
@@ -61,53 +47,27 @@ pub fn decode_allocation_evidence(
     Ok(evidence)
 }
 
-// Git consumes finite metadata on stdin. Always close and reap, including a failed write.
-fn git_metadata(worktree: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
-    use std::io::Write;
-    use std::process::Stdio;
-    let mut child = airc_core::process::background("git")
-        .current_dir(worktree)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("git metadata spawn: {e}"))?;
-    let written = child
-        .stdin
-        .take()
-        .ok_or_else(|| "git metadata stdin unavailable".to_owned())
-        .and_then(|mut stdin| {
-            stdin
-                .write_all(input)
-                .map_err(|e| format!("git metadata write: {e}"))
-        });
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("git metadata wait: {e}"))?;
-    written?;
-    if !output.status.success() {
-        return Err(format!(
-            "git metadata {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|e| e.to_string())
-}
-
 pub(super) fn record(worktree: &Path, evidence: &AllocationEvidence) -> Result<(), String> {
+    use airc_work::local_git::CommandGitRunner;
     let base = &evidence.creation_sha;
     let bytes = serde_json::to_vec(evidence).map_err(|e| e.to_string())?;
-    let object = git_metadata(worktree, &["hash-object", "-w", "--stdin"], &bytes)?;
+    let object = CommandGitRunner
+        .run_git_input(worktree, &["hash-object", "-w", "--stdin"], Some(&bytes))
+        .map_err(|e| e.to_string())?;
+    let object = String::from_utf8(object).map_err(|e| e.to_string())?;
     // One create-only ref transaction publishes both pieces of allocation evidence.
-    git_metadata(
-        worktree,
-        &["update-ref", "--stdin"],
-        format!(
-            "create {CREATION_BASE_REF} {base}\ncreate {ALLOCATION_REF} {}\n",
-            object.trim()
+    CommandGitRunner
+        .run_git_input(
+            worktree,
+            &["update-ref", "--stdin"],
+            Some(
+                format!(
+                    "create {CREATION_BASE_REF} {base}\ncreate {ALLOCATION_REF} {}\n",
+                    object.trim()
+                )
+                .as_bytes(),
+            ),
         )
-        .as_bytes(),
-    )?;
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

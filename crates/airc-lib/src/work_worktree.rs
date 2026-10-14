@@ -58,24 +58,18 @@ pub fn creation_base(worktree: &Path) -> Result<String, String> {
 }
 
 fn resolve_commit(repo: &Path, revision: &str) -> Result<String, String> {
-    let out = airc_core::process::background("git")
-        .current_dir(repo)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{revision}^{{commit}}"),
-        ])
-        .output()
-        .map_err(|e| format!("resolve commit in {}: {e}", repo.display()))?;
-    if !out.status.success() {
-        return Err(format!(
-            "resolve commit {revision} in {}: {}",
-            repo.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+    CommandGitRunner
+        .run_git(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{revision}^{{commit}}"),
+            ],
+        )
+        .map_err(|e| format!("resolve commit {revision}: {e}"))
 }
 
 /// `~/.airc/worktrees`, or `None` when neither `$HOME` nor `$USERPROFILE` is
@@ -125,7 +119,7 @@ pub struct WorktreeSpec<'a> {
     pub branch: &'a str,
     /// Branch/commit the new branch starts from (e.g. `origin/canary`).
     /// `None` resolves the configured repository integration branch's remote ref.
-    /// Repositories without a configured base require an explicit start point.
+    /// Otherwise use the remote's recorded symbolic default (`origin/HEAD`).
     pub start_point: Option<&'a str>,
 }
 
@@ -147,16 +141,31 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
 
     // Resolve once before creation and give Git the immutable object, so a branch
     // moving concurrently cannot make the recorded base differ from the new tree.
-    let integration_base = crate::work_repository::configured_base_branch(spec.repo);
+    let mut integration_base = crate::work_repository::configured_base_branch(spec.repo);
     let start_ref = match spec.start_point {
         Some(explicit) => explicit.to_owned(),
-        None => format!(
-            "refs/remotes/origin/{}",
-            integration_base.as_deref().ok_or_else(|| format!(
-                "no integration base configured for {}; supply start_point explicitly",
-                spec.repo.as_str()
-            ))?
-        ),
+        None => match integration_base.as_deref() {
+            Some(base) => format!("refs/remotes/origin/{base}"),
+            None => {
+                use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+                let remote_default = CommandGitRunner
+                    .run_git(
+                        spec.clone_path,
+                        &["symbolic-ref", "refs/remotes/origin/HEAD"],
+                    )
+                    .map_err(|e| {
+                        format!("remote default unavailable; supply start_point explicitly: {e}")
+                    })?;
+                let branch = remote_default
+                    .strip_prefix("refs/remotes/origin/")
+                    .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+                    .ok_or_else(|| {
+                        format!("remote default is not an origin branch: {remote_default}")
+                    })?;
+                integration_base = Some(branch.to_owned());
+                remote_default
+            }
+        },
     };
     let base = resolve_commit(spec.clone_path, &start_ref)?;
     let mut cmd = airc_core::process::background("git");
@@ -469,8 +478,58 @@ mod tests {
                     .unwrap_err()
                     .contains("supply start_point"));
                 assert!(!worktree_path_for(unknown.card_id).unwrap().exists());
+                // Generic repositories use their recorded remote default, even
+                // when it has an unfamiliar name and the clone is on main.
+                git(
+                    &repo,
+                    &[
+                        "update-ref",
+                        "refs/remotes/origin/trunk/custom",
+                        &integration,
+                    ],
+                );
+                git(
+                    &repo,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/trunk/custom",
+                    ],
+                );
+                let generic = ensure_worktree(&unknown).unwrap().path().to_owned();
+                assert_eq!(resolve_commit(&generic, "HEAD").unwrap(), integration);
+                let evidence = allocation_evidence(&generic).unwrap().unwrap();
+                assert_eq!(evidence.integration_base.as_deref(), Some("trunk/custom"));
+                assert_eq!(evidence.start_ref, "refs/remotes/origin/trunk/custom");
+                // A known policy must not quietly use that generic default if
+                // its configured branch is absent.
+                assert!(ensure_worktree(&missing)
+                    .unwrap_err()
+                    .contains("resolve commit"));
             },
         );
+    }
+
+    #[test]
+    fn shared_git_runner_drains_output_while_writing_finite_input() {
+        use airc_work::local_git::CommandGitRunner;
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        // Both pipes exceed ordinary platform pipe capacity. Writing all stdin
+        // before reading stdout would deadlock this real Git batch operation.
+        let request = "nonexistent-object\n".repeat(32768);
+        let expected = "nonexistent-object missing\n".repeat(32768);
+        let result = CommandGitRunner
+            .run_git_input(
+                tmp.path(),
+                &["cat-file", "--batch"],
+                Some(request.as_bytes()),
+            )
+            .unwrap();
+        assert_eq!(result, expected.as_bytes());
+        assert!(CommandGitRunner
+            .run_git_input(tmp.path(), &["not-a-command"], Some(request.as_bytes()))
+            .is_err());
     }
 
     // what this catches: `git worktree add` leaving submodules EMPTY, so a lease

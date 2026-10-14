@@ -39,15 +39,66 @@ pub struct CommandGitRunner;
 
 impl GitCommandRunner for CommandGitRunner {
     fn run_git(&self, repo_path: &Path, args: &[&str]) -> Result<String, LocalGitError> {
-        let output = airc_core::process::background("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args(args)
-            .output()
-            .map_err(|source| LocalGitError::GitSpawn {
-                repo_path: repo_path.to_path_buf(),
-                source,
-            })?;
+        let bytes = self.run_git_input(repo_path, args, None)?;
+        Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+    }
+}
+
+impl CommandGitRunner {
+    /// Run a finite Git operation, optionally feeding metadata on stdin. The input
+    /// writer runs alongside output draining, so pipe capacity cannot deadlock them.
+    /// The child and writer are both joined, including failed input writes.
+    pub fn run_git_input(
+        &self,
+        repo_path: &Path,
+        args: &[&str],
+        input: Option<&[u8]>,
+    ) -> Result<Vec<u8>, LocalGitError> {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut command = airc_core::process::background("git");
+        command.arg("-C").arg(repo_path).args(args);
+        let output = if let Some(input) = input {
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|source| LocalGitError::GitSpawn {
+                    repo_path: repo_path.to_path_buf(),
+                    source,
+                })?;
+            let stdin = child.stdin.take();
+            std::thread::scope(|scope| {
+                let writer = std::thread::Builder::new().spawn_scoped(scope, move || {
+                    let mut stdin = stdin.ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "git stdin unavailable")
+                    })?;
+                    stdin.write_all(input)
+                });
+                let writer = match writer {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        // Failed thread creation must not abandon the Git child.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                };
+                let output = child.wait_with_output();
+                let written = writer
+                    .join()
+                    .map_err(|_| std::io::Error::other("git stdin writer panicked"))?;
+                written?;
+                output
+            })
+        } else {
+            command.output()
+        }
+        .map_err(|source| LocalGitError::GitSpawn {
+            repo_path: repo_path.to_path_buf(),
+            source,
+        })?;
 
         if !output.status.success() {
             return Err(LocalGitError::GitCommand {
@@ -58,7 +109,7 @@ impl GitCommandRunner for CommandGitRunner {
             });
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(output.stdout)
     }
 }
 
