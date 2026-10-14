@@ -324,6 +324,10 @@ pub async fn run_loop<S>(
             _ = ticker.tick() => {
             }
         }
+        // The selected tick covers every request already pending. Requests
+        // arriving during the sweep retain their permit for a subsequent run.
+        use futures::FutureExt;
+        let _ = resync.notified().now_or_never();
         // Finish an admitted registry write before exiting. Backoff, however,
         // owns no write: waiting out a 60s denial during shutdown exceeds the
         // updater's process-exit deadline and leaves service stopped.
@@ -332,6 +336,13 @@ pub async fn run_loop<S>(
             biased;
             _ = &mut shutdown => break,
             _ = honor(outcome, route_wake) => {}
+        }
+        // Cadence is measured from completed work, including event-triggered
+        // sweeps. A denial retries when its shared backoff expires.
+        if matches!(outcome, TickOutcome::RateLimited { .. }) {
+            ticker.reset_immediately();
+        } else {
+            ticker.reset();
         }
     }
 }
@@ -786,6 +797,121 @@ exit 1
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 
+    #[tokio::test]
+    async fn periodic_and_healing_requests_coalesce_but_new_work_is_retained() {
+        use crate::account_registry::{AccountRegistryDocument, AccountRegistryError};
+        use crate::subscriptions::MeshIdentity;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountedStore {
+            calls: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Semaphore>,
+            imported: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl AccountRegistryStore for CountedStore {
+            async fn publish(
+                &self,
+                _: &AccountRegistryDocument,
+            ) -> Result<(), AccountRegistryError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn refresh(
+                &self,
+                _: &MeshIdentity,
+            ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+                self.imported.notify_one();
+                Ok(None)
+            }
+        }
+        let dir = tempdir().unwrap();
+        let wire = dir.path().join("wire");
+        write_identity(&wire).await;
+        let airc = Airc::open_with_wire_root_for_test(&dir.path().join("machine/.airc"), &wire)
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let imported = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let store = CountedStore {
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            imported: imported.clone(),
+        };
+        let resync = Arc::new(tokio::sync::Notify::new());
+        resync.notify_one();
+        resync.notify_one();
+        let trigger = resync.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            run_loop(
+                airc,
+                store,
+                RegistryRefreshGate::Always,
+                RegistryRefreshConfig {
+                    first_tick: Duration::ZERO,
+                    cadence: Duration::from_secs(3600),
+                },
+                &trigger,
+                &tokio::sync::Notify::new(),
+                async {
+                    let _ = rx.await;
+                },
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        release.add_permits(1);
+        imported.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        resync.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // These arrive while refresh is suspended, not after import.
+        resync.notify_one();
+        resync.notify_one();
+        release.add_permits(1);
+        imported.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "work arriving during sweep survives"
+        );
+        release.add_permits(1);
+        imported.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "periodic convergence continues without new failures"
+        );
+        release.add_permits(1);
+        imported.notified().await;
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
     // The loop honors shutdown promptly even with a long cadence —
     // proves the pinned-shutdown wiring (bounded by the 1s test budget).
     #[tokio::test]
@@ -884,6 +1010,8 @@ exit 1
             attempts: attempts.clone(),
             entered: entered.clone(),
         };
+        let resync = Arc::new(tokio::sync::Notify::new());
+        let loop_resync = resync.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             run_loop(
@@ -894,7 +1022,7 @@ exit 1
                     first_tick: Duration::ZERO,
                     cadence: Duration::from_secs(3600),
                 },
-                &tokio::sync::Notify::new(),
+                &loop_resync,
                 &tokio::sync::Notify::new(),
                 async {
                     let _ = rx.await;
@@ -905,6 +1033,13 @@ exit 1
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .expect("registry publish must run");
+        resync.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "healing requests cannot bypass registry backoff"
+        );
         tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await

@@ -1090,6 +1090,15 @@ fn one_beacon_doc(
 /// live connection.
 #[tokio::test]
 async fn heal_failed_dials_rereads_rendezvous_and_dials_fresh_endpoint() {
+    prove_fresh_endpoint_recovery(false).await;
+}
+
+#[tokio::test]
+async fn registry_owner_import_is_applied_by_next_route_pass() {
+    prove_fresh_endpoint_recovery(true).await;
+}
+
+async fn prove_fresh_endpoint_recovery(through_registry_owner: bool) {
     let tmp_a = TempDir::new().expect("alice tempdir");
     let tmp_b = TempDir::new().expect("bob tempdir");
     let alice = Airc::open(tmp_a.path().join(".airc"))
@@ -1156,11 +1165,19 @@ async fn heal_failed_dials_rereads_rendezvous_and_dials_fresh_endpoint() {
         vec![RouteEndpoint::LanTcp { addr: live_addr }],
         now_ms,
     ));
-    let healed = bob
-        .heal_failed_dials(&stub, &snapshot.peer_dial_failures)
-        .await
-        .expect("heal with fresh rendezvous")
-        .expect("a fresher endpoint must trigger the re-dial pass");
+    let healed = if through_registry_owner {
+        airc_lib::registry_refresh::sync_once(&bob, &stub, &airc_lib::RegistryRefreshGate::Always)
+            .await
+            .expect("registry owner imports changed generation");
+        bob.refresh_route_discovery()
+            .await
+            .expect("route consumer applies imported endpoints")
+    } else {
+        bob.heal_failed_dials(&stub, &snapshot.peer_dial_failures)
+            .await
+            .expect("heal with fresh rendezvous")
+            .expect("a fresher endpoint must trigger the re-dial pass")
+    };
     assert!(
         healed.connected_lan_peers.contains(&alice.peer_id()),
         "heal must dial the FRESH endpoint and connect; connected: {:?}, failures: {:?}",

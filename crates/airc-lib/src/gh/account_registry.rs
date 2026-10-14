@@ -882,19 +882,10 @@ impl AccountRegistryStore for GhAccountRegistryStore {
         if let Some(id) = self.load_gist_id(&document.mesh_identity).await? {
             match self.probe_gist(&id).await? {
                 GistProbe::Found(filename) => {
-                    return match self.edit_gist(&id, &filename, &body).await {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            // Edit failed on a gist that just probed as
-                            // present — clear the sentinel so the next
-                            // publish runs find-or-create, and surface
-                            // the failure loudly.
-                            let _ = self.clear_gist_id(&document.mesh_identity).await;
-                            Err(AccountRegistryError::Adapter(format!(
-                                "{error}; sentinel cleared so next publish will re-find or recreate"
-                            )))
-                        }
-                    };
+                    // A transient edit failure does not invalidate a proven
+                    // existing gist. Preserve both the sentinel and typed
+                    // governor backoff; the next probe detects real deletion.
+                    return self.edit_gist(&id, &filename, &body).await;
                 }
                 GistProbe::Gone => {
                     // Deleted out-of-band; fall through to find-or-create.
@@ -1311,6 +1302,10 @@ case "$1" in
       printf '%s' "$fn" > "$S/$id.filename"
       echo "https://gist.github.com/stub/$id"
     elif [ "$2" = "edit" ]; then
+      if [ -f "$S/edit-failure" ]; then
+        echo "HTTP 502: temporary upstream failure" >&2
+        exit 1
+      fi
       id="$3"
       if [ ! -f "$S/$id.filename" ]; then
         echo "HTTP 404: Not Found" >&2
@@ -1602,6 +1597,76 @@ exit 0
             assert_eq!(
                 std::fs::read_to_string(stub.state.join("stubgist1.filename")).unwrap(),
                 writer_filename()
+            );
+        }
+
+        #[tokio::test]
+        async fn transient_edit_retains_sentinel_and_missing_gist_recreates() {
+            let dir = tempfile::tempdir().unwrap();
+            let stub = StubGh::install(dir.path());
+            let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
+            let doc = document(1_000, Vec::new());
+            store.publish(&doc).await.unwrap();
+            std::fs::write(stub.state.join("edit-failure"), "").unwrap();
+            assert!(store.publish(&doc).await.is_err());
+            assert_eq!(
+                store
+                    .load_gist_id(&doc.mesh_identity)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("stubgist1")
+            );
+            std::fs::remove_file(stub.state.join("edit-failure")).unwrap();
+            store.publish(&doc).await.unwrap();
+            assert_eq!(stub.create_count(), 1);
+            std::fs::remove_file(stub.state.join("stubgist1.filename")).unwrap();
+            store.publish(&doc).await.unwrap();
+            assert_eq!(stub.create_count(), 2);
+            assert_eq!(
+                store
+                    .load_gist_id(&doc.mesh_identity)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("stubgist2")
+            );
+        }
+
+        #[tokio::test]
+        async fn denied_edit_preserves_typed_backoff_and_sentinel() {
+            use crate::gh::governor::{now_seconds, GhBudget, GhClass};
+            let dir = tempfile::tempdir().unwrap();
+            let stub = StubGh::install(dir.path());
+            let store = store_at(&stub, &dir.path().join("db"), "/machine/prod/.airc").await;
+            let doc = document(1_000, Vec::new());
+            store.publish(&doc).await.unwrap();
+            let budget = GhBudget::at(stub.state.join("governor"));
+            let (mut used, limit) = budget.snapshot(now_seconds()).unwrap();
+            let registry_limit = crate::gh::governor::request_limit_for(GhClass::Registry, limit);
+            while used < registry_limit - 1 {
+                assert!(budget
+                    .reserve_class(
+                        &["api".into(), "/user".into()],
+                        now_seconds(),
+                        GhClass::Registry
+                    )
+                    .unwrap()
+                    .allowed());
+                used += 1;
+            }
+            // Probe takes the last reservation; edit must retain the denial.
+            assert!(matches!(
+                store.publish(&doc).await,
+                Err(AccountRegistryError::RateLimited { .. })
+            ));
+            assert_eq!(
+                store
+                    .load_gist_id(&doc.mesh_identity)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("stubgist1")
             );
         }
 
