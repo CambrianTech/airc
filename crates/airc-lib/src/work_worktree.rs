@@ -559,6 +559,27 @@ mod tests {
         );
     }
 
+    // what this catches (card d3c914d8): the shared runner let git prompt for
+    // credentials, so a claim's allocation fetch from a remote that wanted them
+    // blocked on a terminal prompt nobody would answer. Git itself reports what it sees.
+    #[test]
+    fn shared_git_runner_never_prompts_for_credentials() {
+        use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let seen = CommandGitRunner
+            .run_git(
+                tmp.path(),
+                &[
+                    "-c",
+                    "alias.show-prompt=!printf %s \"$GIT_TERMINAL_PROMPT\"",
+                    "show-prompt",
+                ],
+            )
+            .unwrap();
+        assert_eq!(seen, "0");
+    }
+
     #[test]
     fn shared_git_runner_drains_output_while_writing_finite_input() {
         use airc_work::local_git::CommandGitRunner;

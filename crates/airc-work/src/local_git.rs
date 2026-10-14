@@ -57,7 +57,14 @@ impl CommandGitRunner {
         use std::io::Write;
         use std::process::Stdio;
         let mut command = airc_core::process::background("git");
-        command.arg("-C").arg(repo_path).args(args);
+        command
+            .arg("-C")
+            .arg(repo_path)
+            .args(args)
+            // A background git has no terminal: a remote that wants credentials must
+            // fail by name, not block the caller (a claim's allocation fetch) on a
+            // prompt nobody will answer (card d3c914d8).
+            .env("GIT_TERMINAL_PROMPT", "0");
         let (output, input_error) = if let Some(input) = input {
             let mut child = command
                 .stdin(Stdio::piped())
