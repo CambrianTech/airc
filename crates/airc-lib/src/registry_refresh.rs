@@ -611,6 +611,7 @@ mod tests {
             r#"#!/bin/sh
 case "$1 $2" in
   "auth status")
+    [ "$3 $4" = "--active --hostname" ] || exit 1
     [ "${GH_TOKEN-}" = "fresh-token" ] && exit 0
     exit 1
     ;;
