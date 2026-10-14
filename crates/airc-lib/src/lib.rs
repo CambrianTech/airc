@@ -84,6 +84,7 @@ pub mod webrtc_signaling;
 pub mod work;
 pub(crate) mod work_board_cache;
 pub mod work_manager;
+pub mod work_repository;
 pub mod work_roster;
 pub mod work_subscription;
 pub mod work_worktree;

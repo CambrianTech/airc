@@ -3935,7 +3935,7 @@ mod tests {
     fn airc_pr_base_targets_the_working_branch_never_main() {
         std::env::remove_var("AIRC_PR_BASE");
         let airc_repo = airc_work::RepoId::new("CambrianTech/airc").expect("valid repo key");
-        let base = crate::work_commands_gh::configured_base_branch(&airc_repo);
+        let base = airc_lib::work_repository::configured_base_branch(&airc_repo);
         assert_eq!(
             base.as_deref(),
             Some("canary"),
