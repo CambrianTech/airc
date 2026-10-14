@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use airc_work::WorkCardId;
+use airc_work::{RepoId, WorkCardId};
 
 /// The lease zone, relative to the user's home: `~/.airc/worktrees`.
 /// One source of truth for the location; `airc-cli`'s lease policy compares
@@ -43,6 +43,12 @@ pub use airc_core::shown_id::SHORT_ID_LEN;
 /// creation anchor survives branch movement and keeps its commit reachable.
 pub const CREATION_BASE_REF: &str = "refs/worktree/airc-creation-base";
 
+mod allocation;
+
+pub use allocation::{
+    allocation_evidence, decode_allocation_evidence, AllocationEvidence, ALLOCATION_REF,
+};
+
 /// Read only the recorded creation base. Legacy worktrees have no anchor: callers
 /// must ask for an explicit base rather than infer one from HEAD or a remote.
 pub fn creation_base(worktree: &Path) -> Result<String, String> {
@@ -52,24 +58,18 @@ pub fn creation_base(worktree: &Path) -> Result<String, String> {
 }
 
 fn resolve_commit(repo: &Path, revision: &str) -> Result<String, String> {
-    let out = airc_core::process::background("git")
-        .current_dir(repo)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{revision}^{{commit}}"),
-        ])
-        .output()
-        .map_err(|e| format!("resolve commit in {}: {e}", repo.display()))?;
-    if !out.status.success() {
-        return Err(format!(
-            "resolve commit {revision} in {}: {}",
-            repo.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+    CommandGitRunner
+        .run_git(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{revision}^{{commit}}"),
+            ],
+        )
+        .map_err(|e| format!("resolve commit {revision}: {e}"))
 }
 
 /// `~/.airc/worktrees`, or `None` when neither `$HOME` nor `$USERPROFILE` is
@@ -112,14 +112,14 @@ impl WorktreeOutcome {
 #[derive(Debug, Clone)]
 pub struct WorktreeSpec<'a> {
     pub card_id: WorkCardId,
+    pub repo: &'a RepoId,
     /// Local clone of the card's repo that the worktree branches from.
     pub clone_path: &'a Path,
     /// Branch to create for the work.
     pub branch: &'a str,
     /// Branch/commit the new branch starts from (e.g. `origin/canary`).
-    /// `None` means git's default — the clone's current HEAD — which is what
-    /// the operator CLI has always done from inside a checkout. A citizen,
-    /// whose clone may be parked anywhere, should pass one explicitly.
+    /// `None` resolves the configured repository integration branch's remote ref.
+    /// Otherwise use the remote's recorded symbolic default (`origin/HEAD`).
     pub start_point: Option<&'a str>,
 }
 
@@ -141,7 +141,45 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
 
     // Resolve once before creation and give Git the immutable object, so a branch
     // moving concurrently cannot make the recorded base differ from the new tree.
-    let base = resolve_commit(spec.clone_path, spec.start_point.unwrap_or("HEAD"))?;
+    let mut integration_base = crate::work_repository::configured_base_branch(spec.repo);
+    let start_ref = match spec.start_point {
+        Some(explicit) => explicit.to_owned(),
+        None => match integration_base.as_deref() {
+            Some(base) => format!("refs/remotes/origin/{base}"),
+            None => {
+                use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+                let remote_default = CommandGitRunner
+                    .run_git(
+                        spec.clone_path,
+                        &["symbolic-ref", "refs/remotes/origin/HEAD"],
+                    )
+                    .map_err(|e| {
+                        format!("remote default unavailable; supply start_point explicitly: {e}")
+                    })?;
+                let branch = remote_default
+                    .strip_prefix("refs/remotes/origin/")
+                    .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+                    .ok_or_else(|| {
+                        format!("remote default is not an origin branch: {remote_default}")
+                    })?;
+                integration_base = Some(branch.to_owned());
+                remote_default
+            }
+        },
+    };
+    if spec.start_point.is_none() {
+        use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+        let branch = integration_base
+            .as_deref()
+            .ok_or_else(|| "selected integration base is unavailable".to_owned())?;
+        // Only the remote-tracking ref follows upstream rewrites. Existing
+        // worktrees and their immutable creation anchors are never reset.
+        let refspec = format!("+refs/heads/{branch}:{start_ref}");
+        CommandGitRunner
+            .run_git(spec.clone_path, &["fetch", "--no-tags", "origin", &refspec])
+            .map_err(|e| format!("refresh integration base before allocation: {e}"))?;
+    }
+    let base = resolve_commit(spec.clone_path, &start_ref)?;
     let mut cmd = airc_core::process::background("git");
     cmd.current_dir(spec.clone_path)
         .args(["worktree", "add", "-b", spec.branch])
@@ -157,20 +195,16 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // Empty old-value means create-only: never overwrite an existing anchor.
+    // Create-only publication never overwrites an existing anchor.
     // Record before submodule initialization, whose failure leaves the tree reusable.
-    let recorded = airc_core::process::background("git")
-        .current_dir(&path)
-        .args(["update-ref", CREATION_BASE_REF, &base, ""])
-        .output()
-        .map_err(|e| format!("record creation base in {}: {e}", path.display()))?;
-    if !recorded.status.success() {
-        return Err(format!(
-            "worktree {} was created but recording its creation base failed: {}",
-            path.display(),
-            String::from_utf8_lossy(&recorded.stderr).trim()
-        ));
-    }
+    let evidence = AllocationEvidence {
+        repo: spec.repo.clone(),
+        requested_branch: spec.branch.to_owned(),
+        integration_base,
+        start_ref,
+        creation_sha: base.clone(),
+    };
+    allocation::record(&path, &evidence)?;
     init_submodules(&path)?;
     Ok(WorktreeOutcome::Created(path))
 }
@@ -278,6 +312,7 @@ mod tests {
 
             let spec = WorktreeSpec {
                 card_id: id,
+                repo: &RepoId::new("Example/repo").unwrap(),
                 clone_path: tmp.path(),
                 branch: "irrelevant",
                 start_point: None,
@@ -329,12 +364,25 @@ mod tests {
         temp_env::with_var("HOME", Some(&home), || {
             let spec = WorktreeSpec {
                 card_id: card_id(),
+                repo: &RepoId::new("Example/repo").unwrap(),
                 clone_path: &repo,
                 branch: "first",
                 start_point: Some("main"),
             };
             let first = ensure_worktree(&spec).unwrap().path().to_owned();
             assert_eq!(creation_base(&first).unwrap(), original);
+            let allocated = allocation_evidence(&first).unwrap().unwrap();
+            assert_eq!(allocated.repo, *spec.repo);
+            assert_eq!(allocated.requested_branch, "first");
+            assert_eq!(allocated.start_ref, "main");
+            assert_eq!(allocated.creation_sha, original);
+            let mut replacement = allocated.clone();
+            replacement.requested_branch = "different intent".into();
+            assert!(allocation::record(&first, &replacement).is_err());
+            assert_eq!(
+                allocation_evidence(&first).unwrap(),
+                Some(allocated.clone())
+            );
             git(
                 &repo,
                 &["commit", "--allow-empty", "-qm", "integration moved"],
@@ -362,10 +410,19 @@ mod tests {
                 WorktreeOutcome::Reused(first.clone())
             );
             assert_eq!(creation_base(&first).unwrap(), original);
+            assert_eq!(allocation_evidence(&first).unwrap(), Some(allocated));
             assert!(
                 creation_base(&repo).is_err(),
                 "main checkout must not inherit linked anchor"
             );
+            assert_eq!(allocation_evidence(&repo).unwrap(), None);
+            git(&first, &["update-ref", CREATION_BASE_REF, &advanced]);
+            assert!(allocation_evidence(&first)
+                .unwrap_err()
+                .contains("does not match"));
+            git(&first, &["update-ref", CREATION_BASE_REF, &original]);
+            git(&first, &["update-ref", "-d", ALLOCATION_REF]);
+            assert_eq!(allocation_evidence(&first).unwrap(), None);
             git(&first, &["update-ref", "-d", CREATION_BASE_REF]);
             assert!(matches!(
                 ensure_worktree(&spec).unwrap(),
@@ -375,7 +432,182 @@ mod tests {
                 creation_base(&first).unwrap_err().contains("pass base_sha"),
                 "reusing a legacy tree must not record its changed HEAD as the base"
             );
+            assert_eq!(allocation_evidence(&first).unwrap(), None);
         });
+    }
+
+    #[test]
+    fn default_allocation_uses_repository_policy_not_clone_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let old_integration = resolve_commit(&repo, "HEAD").unwrap();
+        git(&repo, &["remote", "add", "origin", repo.to_str().unwrap()]);
+        git(&repo, &["checkout", "-qb", "canary"]);
+        git(
+            &repo,
+            &["commit", "--allow-empty", "-qm", "remote advanced"],
+        );
+        let integration = resolve_commit(&repo, "HEAD").unwrap();
+        git(&repo, &["checkout", "-q", "main"]);
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/canary", &old_integration],
+        );
+        git(&repo, &["commit", "--allow-empty", "-qm", "unrelated main"]);
+        let main = resolve_commit(&repo, "HEAD").unwrap();
+        assert_ne!(integration, main);
+        temp_env::with_vars(
+            [
+                ("HOME", Some(tmp.path().as_os_str())),
+                ("AIRC_PR_BASE", None),
+            ],
+            || {
+                let spec = WorktreeSpec {
+                    card_id: card_id(),
+                    repo: &RepoId::new("CambrianTech/continuum").unwrap(),
+                    clone_path: &repo,
+                    branch: "work",
+                    start_point: None,
+                };
+                let path = ensure_worktree(&spec).unwrap().path().to_owned();
+                assert_eq!(resolve_commit(&path, "HEAD").unwrap(), integration);
+                let evidence = allocation_evidence(&path).unwrap().unwrap();
+                assert_eq!(evidence.integration_base.as_deref(), Some("canary"));
+                assert_eq!(evidence.start_ref, "refs/remotes/origin/canary");
+                assert_eq!(evidence.creation_sha, integration);
+                // Upstream can rewrite its integration history. A new allocation
+                // follows that non-FF move while the prior allocation stays pinned.
+                git(&repo, &["branch", "-f", "canary", &main]);
+                let rewritten_spec = WorktreeSpec {
+                    card_id: WorkCardId::from_uuid(uuid::Uuid::new_v4()),
+                    branch: "after-upstream-rewrite",
+                    ..spec.clone()
+                };
+                let rewritten = ensure_worktree(&rewritten_spec).unwrap().path().to_owned();
+                assert_eq!(
+                    resolve_commit(&repo, "refs/remotes/origin/canary").unwrap(),
+                    main
+                );
+                assert_eq!(creation_base(&rewritten).unwrap(), main);
+                assert_eq!(
+                    allocation_evidence(&rewritten)
+                        .unwrap()
+                        .unwrap()
+                        .creation_sha,
+                    main
+                );
+                assert_eq!(resolve_commit(&path, "HEAD").unwrap(), integration);
+                assert_eq!(creation_base(&path).unwrap(), integration);
+                assert_eq!(resolve_commit(&repo, "HEAD").unwrap(), main);
+                // An unavailable configured ref must not fall back to unrelated main.
+                git(&repo, &["branch", "-D", "canary"]);
+                assert_eq!(
+                    ensure_worktree(&spec).unwrap(),
+                    WorktreeOutcome::Reused(path)
+                );
+                let missing = WorktreeSpec {
+                    card_id: WorkCardId::from_uuid(uuid::Uuid::new_v4()),
+                    branch: "missing",
+                    ..spec.clone()
+                };
+                assert!(ensure_worktree(&missing)
+                    .unwrap_err()
+                    .contains("refresh integration base"));
+                assert!(!worktree_path_for(missing.card_id).unwrap().exists());
+                let unknown = WorktreeSpec {
+                    card_id: WorkCardId::from_uuid(uuid::Uuid::new_v4()),
+                    repo: &RepoId::new("Example/unknown").unwrap(),
+                    branch: "unknown",
+                    ..spec
+                };
+                assert!(ensure_worktree(&unknown)
+                    .unwrap_err()
+                    .contains("supply start_point"));
+                assert!(!worktree_path_for(unknown.card_id).unwrap().exists());
+                // Generic repositories use their recorded remote default, even
+                // when it has an unfamiliar name and the clone is on main.
+                git(&repo, &["branch", "trunk/custom", &integration]);
+                git(
+                    &repo,
+                    &[
+                        "update-ref",
+                        "refs/remotes/origin/trunk/custom",
+                        &old_integration,
+                    ],
+                );
+                git(
+                    &repo,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/trunk/custom",
+                    ],
+                );
+                let generic = ensure_worktree(&unknown).unwrap().path().to_owned();
+                assert_eq!(resolve_commit(&generic, "HEAD").unwrap(), integration);
+                let evidence = allocation_evidence(&generic).unwrap().unwrap();
+                assert_eq!(evidence.integration_base.as_deref(), Some("trunk/custom"));
+                assert_eq!(evidence.start_ref, "refs/remotes/origin/trunk/custom");
+                // A known policy must not quietly use that generic default if
+                // its configured branch is absent.
+                assert!(ensure_worktree(&missing)
+                    .unwrap_err()
+                    .contains("refresh integration base"));
+            },
+        );
+    }
+
+    #[test]
+    fn shared_git_runner_drains_output_while_writing_finite_input() {
+        use airc_work::local_git::CommandGitRunner;
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        // Both pipes exceed ordinary platform pipe capacity. Writing all stdin
+        // before reading stdout would deadlock this real Git batch operation.
+        let request = "nonexistent-object\n".repeat(32768);
+        let expected = "nonexistent-object missing\n".repeat(32768);
+        let result = CommandGitRunner
+            .run_git_input(
+                tmp.path(),
+                &["cat-file", "--batch"],
+                Some(request.as_bytes()),
+            )
+            .unwrap();
+        assert_eq!(result, expected.as_bytes());
+        let error = CommandGitRunner
+            .run_git_input(
+                tmp.path(),
+                &[
+                    "-c",
+                    "alias.reject-input=!echo retained-output; echo rejected-input >&2; exit 7",
+                    "reject-input",
+                ],
+                Some(request.as_bytes()),
+            )
+            .unwrap_err();
+        match error {
+            airc_work::local_git::LocalGitError::GitCommand {
+                output,
+                input_error,
+                ..
+            } => {
+                assert_eq!(output.status.code(), Some(7));
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap().trim(),
+                    "retained-output"
+                );
+                assert!(String::from_utf8(output.stderr)
+                    .unwrap()
+                    .contains("rejected-input"));
+                assert!(
+                    input_error.is_some(),
+                    "the rejected large input must remain visible beside exit/output"
+                );
+            }
+            other => panic!("lost completed process outcome: {other:?}"),
+        }
     }
 
     // what this catches: `git worktree add` leaving submodules EMPTY, so a lease
@@ -424,6 +656,7 @@ mod tests {
             temp_env::with_var("GIT_ALLOW_PROTOCOL", Some("file"), || {
                 let spec = WorktreeSpec {
                     card_id: card_id(),
+                    repo: &RepoId::new("Example/repo").unwrap(),
                     clone_path: &main,
                     branch: "lease-branch",
                     start_point: Some("main"),

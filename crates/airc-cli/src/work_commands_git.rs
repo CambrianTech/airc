@@ -97,10 +97,10 @@ pub(crate) async fn spawn_claim_worktree(
     let outcome =
         airc_lib::work_worktree::ensure_worktree(&airc_lib::work_worktree::WorktreeSpec {
             card_id: card.card_id,
+            repo: &card.repo,
             clone_path: std::path::Path::new(&repo_root),
             branch: &branch,
-            // None = the clone's current HEAD, which is what this path has always
-            // done from inside an operator's checkout.
+            // Resolve the repository integration base through the shared SDK policy.
             start_point: None,
         })?;
 
