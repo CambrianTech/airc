@@ -172,7 +172,9 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
         let branch = integration_base
             .as_deref()
             .ok_or_else(|| "selected integration base is unavailable".to_owned())?;
-        let refspec = format!("refs/heads/{branch}:{start_ref}");
+        // Only the remote-tracking ref follows upstream rewrites. Existing
+        // worktrees and their immutable creation anchors are never reset.
+        let refspec = format!("+refs/heads/{branch}:{start_ref}");
         CommandGitRunner
             .run_git(spec.clone_path, &["fetch", "--no-tags", "origin", &refspec])
             .map_err(|e| format!("refresh integration base before allocation: {e}"))?;
@@ -475,6 +477,30 @@ mod tests {
                 assert_eq!(evidence.integration_base.as_deref(), Some("canary"));
                 assert_eq!(evidence.start_ref, "refs/remotes/origin/canary");
                 assert_eq!(evidence.creation_sha, integration);
+                // Upstream can rewrite its integration history. A new allocation
+                // follows that non-FF move while the prior allocation stays pinned.
+                git(&repo, &["branch", "-f", "canary", &main]);
+                let rewritten_spec = WorktreeSpec {
+                    card_id: WorkCardId::from_uuid(uuid::Uuid::new_v4()),
+                    branch: "after-upstream-rewrite",
+                    ..spec.clone()
+                };
+                let rewritten = ensure_worktree(&rewritten_spec).unwrap().path().to_owned();
+                assert_eq!(
+                    resolve_commit(&repo, "refs/remotes/origin/canary").unwrap(),
+                    main
+                );
+                assert_eq!(creation_base(&rewritten).unwrap(), main);
+                assert_eq!(
+                    allocation_evidence(&rewritten)
+                        .unwrap()
+                        .unwrap()
+                        .creation_sha,
+                    main
+                );
+                assert_eq!(resolve_commit(&path, "HEAD").unwrap(), integration);
+                assert_eq!(creation_base(&path).unwrap(), integration);
+                assert_eq!(resolve_commit(&repo, "HEAD").unwrap(), main);
                 // An unavailable configured ref must not fall back to unrelated main.
                 git(&repo, &["branch", "-D", "canary"]);
                 assert_eq!(
