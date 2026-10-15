@@ -55,6 +55,24 @@ impl WorkBoardProjection {
             WorkEvent::ClaimReleased(e) => self.apply_claim_released(e),
             WorkEvent::CardStateChanged(e) => self.apply_card_state_changed(e),
             WorkEvent::WorkSubmitted(e) => self.apply_work_submitted(e),
+            WorkEvent::SubmissionReviewRequested(e) => {
+                match e.validate_for_board(self) {
+                    Ok(()) => {
+                        if !self.cards.contains_key(&e.card.card_id) {
+                            self.apply_card_created(&e.card)?;
+                            self.review_requests.insert(e.card.card_id, e.clone());
+                        }
+                        // A retry preserves reviewer custody; acceptance clears a
+                        // prior refusal rather than presenting it as current.
+                        self.review_request_rejections.remove(&e.card.card_id);
+                    }
+                    Err(reason) => {
+                        self.review_request_rejections
+                            .insert(e.card.card_id, reason);
+                    }
+                }
+                Ok(())
+            }
             WorkEvent::WorkSubmissionReviewed(e) => {
                 match e.validate_for_board(self) {
                     Ok(()) => {
