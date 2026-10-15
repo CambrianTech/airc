@@ -340,7 +340,7 @@ pub async fn run_release(
     // (kink card acb8bfcd: release ergonomics).
     let claim_uuid = match claim_id {
         Some(raw) => claim_in_room(&airc, &room, card_uuid, &raw).await?,
-        None => resolve_my_active_claim(&airc, card_uuid).await?,
+        None => resolve_my_active_claim(&airc, &room, card_uuid).await?,
     };
     airc.release_work_claim_in(
         &room,
@@ -356,16 +356,17 @@ pub async fn run_release(
 }
 
 /// Look up the active claim on `card_id` held by this peer via the
-/// board projection. Surfaces clear errors when there is no claim, or
-/// the claim is held by another peer — so the default never silently
-/// releases someone else's work.
+/// board projection of `room` — the room the release acts in, not the
+/// scope's current room (a card claimed under `--room` was unreleasable,
+/// and so unclosable, from any other current room). Surfaces clear errors
+/// when there is no claim, or the claim is held by another peer — so the
+/// default never silently releases someone else's work.
 async fn resolve_my_active_claim(
     airc: &airc_lib::Airc,
+    room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
 ) -> Result<airc_lib::ClaimId, Box<dyn std::error::Error>> {
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not present in the board projection"))?;
