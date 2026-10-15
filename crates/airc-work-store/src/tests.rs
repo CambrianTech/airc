@@ -357,6 +357,99 @@ fn submission(card_id: WorkCardId) -> airc_work::WorkSubmission {
     .unwrap()
 }
 
+// what this catches: d4955232 — retryable handoffs must not poison legacy
+// replay, reset a reviewer claim, or materialize under a forged author.
+#[test]
+fn review_handoff_replays_once_with_candidate_and_author_custody() {
+    let room = RoomId::from_u128(10);
+    let parent = WorkCardId::from_u128(20);
+    let submitted = submission(parent);
+    let id = airc_work::submission_review_card_id(parent, submitted.submission_id);
+    let WorkEvent::CardCreated(mut card) = card_created(id) else {
+        unreachable!()
+    };
+    card.reviews = Some(parent);
+    card.created_by = submitted.publisher;
+    let request = airc_work::SubmissionReviewRequested {
+        card,
+        submission_id: submitted.submission_id,
+    };
+    let prefix = vec![
+        work_transcript(1, room, 1, &card_created(parent)),
+        work_transcript(2, room, 2, &card_claimed(parent, 90, 2, 5000)),
+        work_transcript(3, room, 3, &WorkEvent::WorkSubmitted(submitted.clone())),
+    ];
+    let mut wire = work_transcript(
+        4,
+        room,
+        4,
+        &WorkEvent::SubmissionReviewRequested(request.clone()),
+    );
+    wire.peer_id = submitted.publisher;
+    let legacy_filter = airc_core::HeaderFilter::Exact {
+        key: airc_protocol::HEADER_FORGE_BODY_HINT.into(),
+        value: airc_work::BODY_HINT_FORGE_WORK_EVENT.into(),
+    };
+    assert!(!legacy_filter.matches(&wire.headers));
+    let mut events = prefix.clone();
+    events.push(wire.clone());
+    events.push(work_transcript(5, room, 5, &card_claimed(id, 91, 3, 6000)));
+    let mut retry = wire.clone();
+    retry.event_id = EventId::from_u128(6);
+    retry.lamport = 6;
+    events.push(retry);
+    let full = project_transcripts(events.clone()).unwrap();
+    assert_eq!(
+        full.card(id).unwrap().claim_id,
+        Some(airc_work::ClaimId::from_u128(91))
+    );
+    assert_eq!(full.review_cards_for(parent).count(), 1);
+    assert_eq!(full.candidate_for_review(id, None).unwrap(), &submitted);
+    for split in 0..=events.len() {
+        let before = project_transcripts(events[..split].to_vec()).unwrap();
+        let mut restored: WorkBoardProjection =
+            serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+        apply_transcripts(&mut restored, events[split..].to_vec()).unwrap();
+        assert_eq!(restored, full, "split {split}");
+    }
+    let legacy = project_transcripts(
+        events
+            .into_iter()
+            .filter(|e| legacy_filter.matches(&e.headers))
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(legacy.card(parent), full.card(parent));
+    assert!(legacy.card(id).is_none());
+    wire.peer_id = PeerId::from_u128(999);
+    let mut forged = project_transcripts(prefix.clone()).unwrap();
+    apply_transcripts(&mut forged, vec![wire]).unwrap();
+    assert!(forged.card(id).is_none());
+    let mut wrong = request.clone();
+    wrong.card.created_by = PeerId::from_u128(999);
+    let mut signed_wrong =
+        work_transcript(7, room, 7, &WorkEvent::SubmissionReviewRequested(wrong));
+    signed_wrong.peer_id = PeerId::from_u128(999);
+    apply_transcripts(&mut forged, vec![signed_wrong]).unwrap();
+    assert_eq!(
+        forged.review_request_rejection(id),
+        Some(airc_work::WorkReviewRejectionReason::RequestorMismatch)
+    );
+    assert!(forged.card(id).is_none());
+    apply_transcripts(
+        &mut forged,
+        vec![work_transcript(
+            8,
+            room,
+            8,
+            &WorkEvent::SubmissionReviewRequested(request),
+        )],
+    )
+    .unwrap();
+    assert!(forged.card(id).is_some());
+    assert!(forged.review_request_rejection(id).is_none());
+}
+
 // what this catches: card89af25c7 — only the signed reviewer and the claim at
 // review time can attest an exact artifact; snapshot/replay cannot regrade it.
 #[tokio::test]
@@ -461,6 +554,15 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
         .collect();
     let full = project_transcripts(transcripts.clone()).unwrap();
     assert_eq!(full.submission_review(review.review_id), Some(&review));
+    assert_eq!(full.snapshot().submission_reviews, vec![review.clone()]);
+    let mut legacy_snapshot = serde_json::to_value(full.snapshot()).unwrap();
+    legacy_snapshot
+        .as_object_mut()
+        .unwrap()
+        .remove("submission_reviews");
+    let restored: airc_work::BoardSnapshot = serde_json::from_value(legacy_snapshot).unwrap();
+    assert!(restored.submission_reviews.is_empty());
+    assert_eq!(restored.cards, full.snapshot().cards);
     assert_eq!(full.submission_reviews_for(review.submission_id).count(), 1);
     assert_eq!(
         full.last_review_rejection(parent).unwrap().reason,

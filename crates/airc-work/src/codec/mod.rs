@@ -38,9 +38,9 @@ pub(crate) fn is_work_event_hint(hint: &str) -> bool {
 
 pub(crate) fn work_event_body_hint(event: &WorkEvent) -> &'static str {
     match event {
-        WorkEvent::WorkSubmissionReviewed(_) | WorkEvent::ReviewRejected(_) => {
-            BODY_HINT_FORGE_WORK_REVIEW
-        }
+        WorkEvent::WorkSubmissionReviewed(_)
+        | WorkEvent::SubmissionReviewRequested(_)
+        | WorkEvent::ReviewRejected(_) => BODY_HINT_FORGE_WORK_REVIEW,
         WorkEvent::CardCreated(_)
         | WorkEvent::CardUpdated(_)
         | WorkEvent::CardClaimed(_)
@@ -80,6 +80,8 @@ pub(crate) fn work_event_body_hint(event: &WorkEvent) -> &'static str {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkEventCodecError {
+    #[error("review request creator differs from signed transcript author")]
+    ReviewRequestAuthorMismatch,
     #[error("work event body is missing")]
     MissingBody,
     #[error("work event body must be JSON")]
@@ -165,6 +167,7 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::CardStateChanged(_) => "card_state_changed",
         WorkEvent::WorkSubmitted(_) => "work_submitted",
         WorkEvent::WorkSubmissionReviewed(_) => "work_submission_reviewed",
+        WorkEvent::SubmissionReviewRequested(_) => "submission_review_requested",
         WorkEvent::SubmissionRejected(_) => "submission_rejected",
         WorkEvent::ReviewRejected(_) => "review_rejected",
         WorkEvent::LaneCreated(_) => "lane_created",

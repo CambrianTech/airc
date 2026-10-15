@@ -1588,21 +1588,10 @@ pub async fn run_submission_review(
             .into())
         }
     };
-    let parent = board
-        .card(card_id)
-        .ok_or_else(|| format!("card {card_id} is not on {}'s board", room.name))?;
-    let chosen = match submission {
-        Some(id) => parent
-            .submissions
-            .iter()
-            .find(|s| s.submission_id.as_uuid() == id)
-            .ok_or_else(|| format!("card {card_id} has no submission {id}"))?,
-        None => parent
-            .submissions
-            .iter()
-            .max_by_key(|s| s.submitted_at_ms)
-            .ok_or_else(|| format!("card {card_id} has no submission to review yet"))?,
-    };
+    let chosen = board.candidate_for_review(
+        review_card,
+        submission.map(airc_work::SubmissionId::from_uuid),
+    )?;
     let review = airc
         .review_work_submission_in(
             &room,
