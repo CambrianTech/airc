@@ -129,6 +129,17 @@ fn one_daemon_serves_many_tabs_through_a_full_room_lifecycle() {
     );
     let launched = daemon_id(acct, "claude");
     let launched_pid = common::find_daemon_pid_under(acct).expect("first daemon PID");
+    // what this catches (card 551fe5ae): the spawn opened the log in the CALLER's
+    // scope while the daemon ran as the machine account, so its whole output landed
+    // in whichever scope started it (548 MB in a project `.airc` on IntelMac).
+    assert!(
+        acct.join(".airc/airc-daemon.log").is_file(),
+        "the machine daemon logs in its own home"
+    );
+    assert!(
+        !acct.join("claude/airc-daemon.log").exists(),
+        "the spawning scope holds no daemon log"
+    );
 
     // --- Convergence: a different tab on the same machine shares the
     // one daemon and sees the first tab's message. ---

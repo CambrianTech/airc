@@ -670,16 +670,8 @@ fn spawn_restarted_daemon(
     home: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(home)?;
-    let log = home.join("airc-daemon.log");
-    let stdout = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)?;
-    let stderr = stdout.try_clone()?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+    let (stdout, stderr) = crate::commands::daemon_log_stdio(home)?;
+    command.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
     crate::commands::spawn_daemon(command)?;
     Ok(())
 }
