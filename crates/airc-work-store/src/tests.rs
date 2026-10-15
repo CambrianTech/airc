@@ -554,6 +554,15 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
         .collect();
     let full = project_transcripts(transcripts.clone()).unwrap();
     assert_eq!(full.submission_review(review.review_id), Some(&review));
+    assert_eq!(full.snapshot().submission_reviews, vec![review.clone()]);
+    let mut legacy_snapshot = serde_json::to_value(full.snapshot()).unwrap();
+    legacy_snapshot
+        .as_object_mut()
+        .unwrap()
+        .remove("submission_reviews");
+    let restored: airc_work::BoardSnapshot = serde_json::from_value(legacy_snapshot).unwrap();
+    assert!(restored.submission_reviews.is_empty());
+    assert_eq!(restored.cards, full.snapshot().cards);
     assert_eq!(full.submission_reviews_for(review.submission_id).count(), 1);
     assert_eq!(
         full.last_review_rejection(parent).unwrap().reason,

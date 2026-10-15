@@ -169,6 +169,10 @@ impl WorkBoardProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardSnapshot {
     pub cards: Vec<WorkCard>,
+    /// Accepted signed verdicts, from the same room projection as the cards.
+    /// Missing on older snapshots; never infer a verdict from card state.
+    #[serde(default)]
+    pub submission_reviews: Vec<crate::WorkSubmissionReview>,
     pub lanes: Vec<LaneRecord>,
     pub workspaces: Vec<WorkspaceRecord>,
     pub repo_tracking: Vec<RepoTrackingRecord>,

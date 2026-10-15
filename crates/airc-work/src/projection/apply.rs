@@ -181,6 +181,7 @@ impl WorkBoardProjection {
     pub fn snapshot(&self) -> BoardSnapshot {
         BoardSnapshot {
             cards: self.cards.values().cloned().collect(),
+            submission_reviews: self.submission_reviews.values().cloned().collect(),
             lanes: self.lanes.values().cloned().collect(),
             workspaces: self.workspaces.values().cloned().collect(),
             repo_tracking: self.repo_tracking.values().cloned().collect(),

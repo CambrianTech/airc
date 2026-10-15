@@ -275,6 +275,7 @@ mod tests {
 
     fn empty_board() -> BoardSnapshot {
         BoardSnapshot {
+            submission_reviews: Vec::new(),
             cards: vec![],
             lanes: vec![],
             workspaces: vec![],
