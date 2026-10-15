@@ -1191,6 +1191,21 @@ impl Airc {
             .await
     }
 
+    /// The complete work board of every room this scope subscribes to. For a
+    /// caller that owns per-card state independent of where the agent stands —
+    /// a claim worktree belongs to its card, wherever the card lives, so
+    /// classifying worktrees against one room's board leaves every other
+    /// room's worktrees looking orphaned and never reclaimed.
+    pub async fn work_boards_in_subscribed_rooms(
+        &self,
+    ) -> Result<Vec<WorkBoardProjection>, AircError> {
+        let mut boards = Vec::new();
+        for subscription in self.subscriptions().await? {
+            boards.push(self.work_board_in(&subscription.as_room()).await?);
+        }
+        Ok(boards)
+    }
+
     /// Rebuild the current room's complete work board. Scheduling and
     /// mutation paths use this so old active cards do not disappear just
     /// because chat/status traffic pushed their creation event outside a

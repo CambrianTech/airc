@@ -813,9 +813,15 @@ pub async fn run_cleanup(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = crate::commands::attached_airc(home).await?;
-    let board = airc
-        .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
-        .await?;
+    // A worktree belongs to its card wherever the card lives: read every
+    // subscribed room, or a card claimed outside the current room reads as
+    // an orphan and its worktree is never reclaimed (card 3ed41b1b).
+    let cards: Vec<_> = airc
+        .work_boards_in_subscribed_rooms()
+        .await?
+        .iter()
+        .flat_map(|board| board.snapshot().cards)
+        .collect();
 
     let lease_root = lease::lease_root()
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
@@ -840,15 +846,7 @@ pub async fn run_cleanup(
         let Some(short) = parse_worktree_short_id(&basename) else {
             continue;
         };
-        let card = board
-            .snapshot()
-            .cards
-            .iter()
-            .find(|c| {
-                let card_short = c.card_id.shown();
-                card_short == short
-            })
-            .cloned();
+        let card = cards.iter().find(|c| c.card_id.shown() == short).cloned();
         let card_state = card.as_ref().map(|c| c.state);
         let pr_number = card
             .as_ref()

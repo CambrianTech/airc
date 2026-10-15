@@ -141,6 +141,43 @@ fn work_release_defaults_to_my_claim_in_the_named_room_not_the_current_one() {
     );
 }
 
+// what this catches: `work cleanup` classified worktrees against the CURRENT
+// room's board only, so the worktree of a card that closed in another room
+// read as "unknown card" (an orphan, never removed) and ~/.airc/worktrees grew
+// without a drain (card 3ed41b1b).
+#[test]
+fn work_cleanup_classifies_worktrees_of_cards_in_every_subscribed_room() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(&home, &["room", "review"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "closed in review",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+    run_ok(&home, &["work", "close", card_id]);
+    run_ok(&home, &["room", "general"]);
+
+    let short = &card_id[..8];
+    std::fs::create_dir_all(workspace.path().join(".airc/worktrees").join(short))
+        .expect("worktree dir");
+    let cleanup = run_ok(&home, &["work", "cleanup"]);
+    let line = cleanup
+        .lines()
+        .find(|line| line.trim_start().starts_with(short))
+        .unwrap_or_else(|| panic!("cleanup lists {short}: {cleanup}"));
+    assert!(line.contains("Closed"), "{cleanup}");
+}
+
 #[test]
 fn work_seed_is_idempotent_for_manager_candidates() {
     let workspace = common::daemon_tempdir();
