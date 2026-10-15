@@ -846,15 +846,22 @@ pub async fn run_cleanup(
         let Some(short) = parse_worktree_short_id(&basename) else {
             continue;
         };
-        let card = cards.iter().find(|c| c.card_id.shown() == short).cloned();
+        let matched = worktree_card(&cards, &short);
+        let card = match matched {
+            WorktreeCard::One(card) => Some(card.clone()),
+            WorktreeCard::NoCard | WorktreeCard::Ambiguous => None,
+        };
         let card_state = card.as_ref().map(|c| c.state);
         let pr_number = card
             .as_ref()
             .and_then(|c| c.pull_request.as_ref().map(|pr| pr.number));
         let repo = card.as_ref().map(|c| c.repo.to_string());
 
-        let (effective, dirty_status, disposition) =
+        let (effective, dirty_status, mut disposition) =
             classify_worktree_path(&path, card_state.as_ref());
+        if matches!(matched, WorktreeCard::Ambiguous) {
+            disposition = Disposition::SkipAmbiguousCard;
+        }
 
         classifications.push(WorktreeClassification {
             short,
@@ -976,6 +983,32 @@ pub(crate) enum Disposition {
     /// No card matches the worktree's short id. Orphan — surface but
     /// don't touch; could be from a deleted card or a different scope.
     SkipUnknownCard,
+    /// The short id names more than one card across the boards read. Fail
+    /// closed: cleanup never guesses which card a worktree belongs to.
+    SkipAmbiguousCard,
+}
+
+/// Which card a worktree belongs to, by the 8-hex short id its directory carries.
+pub(crate) enum WorktreeCard<'a> {
+    NoCard,
+    One(&'a airc_work::WorkCard),
+    /// Two distinct cards share the short id — reading every subscribed room
+    /// (card 3ed41b1b) makes a collision possible, and the first match could be a
+    /// Closed card while the worktree is an active card's (Codex review, airc#1574).
+    Ambiguous,
+}
+
+/// Match `short` against every card read; the same card seen twice is one match.
+pub(crate) fn worktree_card<'a>(cards: &'a [airc_work::WorkCard], short: &str) -> WorktreeCard<'a> {
+    let mut found: Option<&airc_work::WorkCard> = None;
+    for card in cards.iter().filter(|c| c.card_id.shown() == short) {
+        match found {
+            Some(first) if first.card_id != card.card_id => return WorktreeCard::Ambiguous,
+            Some(_) => {}
+            None => found = Some(card),
+        }
+    }
+    found.map_or(WorktreeCard::NoCard, WorktreeCard::One)
 }
 
 impl Disposition {
@@ -987,6 +1020,7 @@ impl Disposition {
             Disposition::SkipDirty => 2,
             Disposition::SkipNotGit => 3,
             Disposition::SkipUnknownCard => 4,
+            Disposition::SkipAmbiguousCard => 5,
         }
     }
 
@@ -997,6 +1031,7 @@ impl Disposition {
             Disposition::SkipDirty => "SkipDirty",
             Disposition::SkipNotGit => "SkipNotGit",
             Disposition::SkipUnknownCard => "SkipUnknownCard",
+            Disposition::SkipAmbiguousCard => "SkipAmbiguousCard",
         }
     }
 
@@ -1007,6 +1042,7 @@ impl Disposition {
             Disposition::SkipDirty => "  uncommitted or unpushed work",
             Disposition::SkipNotGit => "  not a git worktree",
             Disposition::SkipUnknownCard => "  no matching card on board",
+            Disposition::SkipAmbiguousCard => "  short id matches more than one card",
         }
     }
 }
@@ -3466,6 +3502,38 @@ mod tests {
             updated_at_ms: 0,
             reviews: None,
         }
+    }
+
+    // what this catches (Codex review, airc#1574): reading every subscribed room, a
+    // short id shared by a Closed card and an active one matched whichever came first,
+    // and the active card's worktree could be removed. A collision matches neither.
+    #[test]
+    fn worktree_card_fails_closed_on_a_short_id_two_cards_share() {
+        let id = |n: u128| WorkCardId::from_u128(n);
+        let mut closed = make_card(CardState::Closed, None, None, None);
+        let mut active = make_card(CardState::InProgress, None, None, None);
+        closed.card_id = id(0xabcd_ef01_0000_0000_0000_0000_0000_0001);
+        active.card_id = id(0xabcd_ef01_0000_0000_0000_0000_0000_0002);
+        let short = closed.card_id.shown();
+        assert_eq!(
+            short,
+            active.card_id.shown(),
+            "fixture: the two ids collide"
+        );
+
+        let both = [closed.clone(), active];
+        assert!(matches!(
+            worktree_card(&both, &short),
+            WorktreeCard::Ambiguous
+        ));
+        let once = [closed.clone(), closed.clone()];
+        assert!(
+            matches!(worktree_card(&once, &short), WorktreeCard::One(c) if c.card_id == closed.card_id)
+        );
+        assert!(matches!(
+            worktree_card(&once, "00000000"),
+            WorktreeCard::NoCard
+        ));
     }
 
     #[test]
