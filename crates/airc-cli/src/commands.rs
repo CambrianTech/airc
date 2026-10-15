@@ -647,12 +647,7 @@ pub async fn ensure_daemon_running(
 
     // 3. Spawn a fresh daemon at the home-resolved socket.
     std::fs::create_dir_all(home)?;
-    let log = home.join("airc-daemon.log");
-    let stdout = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)?;
-    let stderr = stdout.try_clone()?;
+    let (stdout, stderr) = daemon_log_stdio(home)?;
     let exe = std::env::current_exe()?;
     // The daemon's HOME must be the home that OWNS the socket, not the
     // caller's scope.
@@ -686,10 +681,7 @@ pub async fn ensure_daemon_running(
     // where it was missed, which is how `airc update` started taking nodes
     // dark (#1352). A rule with two implementations has one that is wrong.
     let mut command = airc_lib::daemon_command(&exe, home, "daemon", &socket);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+    command.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
     let child = spawn_daemon(command)?;
     let daemon_pid = child.id();
 
@@ -724,7 +716,11 @@ pub async fn ensure_daemon_running(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("daemon did not become ready; see {}", log.display()).into())
+    Err(format!(
+        "daemon did not become ready; see {}",
+        airc_lib::daemon_log_path(home).display()
+    )
+    .into())
 }
 
 /// Read `peer_id`/`build` from the freshly-ready daemon and write a
@@ -772,6 +768,46 @@ async fn wait_for_daemon_exit(client: &DaemonClient, max_wait: Duration) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A spawned daemon's log is rotated (renamed to `airc-daemon.log.1`, replacing the
+/// previous predecessor) when it is already over this size at spawn. The value is the
+/// segment size continuum's capped appenders use for prompt captures (two 64 MiB
+/// segments), not a measurement of airc's output; history is bounded to one
+/// predecessor plus the live run's output.
+const DAEMON_LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The daemon's stdout + stderr: ITS home's log ([`airc_lib::daemon_log_path`]), never
+/// the spawning scope's, rotated at spawn when over [`DAEMON_LOG_ROTATE_BYTES`]. The one
+/// place both spawn paths (attach and update) open it.
+pub(crate) fn daemon_log_stdio(scope_home: &Path) -> std::io::Result<(Stdio, Stdio)> {
+    let log = airc_lib::daemon_log_path(scope_home);
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    rotate_daemon_log(&log, DAEMON_LOG_ROTATE_BYTES);
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)?;
+    let stderr = stdout.try_clone()?;
+    Ok((Stdio::from(stdout), Stdio::from(stderr)))
+}
+
+/// Rotate `log` to its `.1` predecessor when it is over `cap`. A failed rename (a
+/// still-running predecessor holding it open on Windows) is reported and the spawn
+/// proceeds: the log keeps growing until the next spawn, but the daemon starts.
+fn rotate_daemon_log(log: &Path, cap: u64) {
+    if !std::fs::metadata(log).is_ok_and(|meta| meta.len() > cap) {
+        return;
+    }
+    let predecessor = log.with_extension("log.1");
+    if let Err(error) = std::fs::rename(log, &predecessor) {
+        eprintln!(
+            "airc: daemon log {} is over {cap} bytes and could not be rotated: {error}",
+            log.display()
+        );
     }
 }
 
@@ -3647,6 +3683,35 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+
+    // what this catches (card 551fe5ae): the daemon log had no drain — every spawn
+    // appended to one file forever. Over the cap it rotates to one `.1` predecessor
+    // (replacing the older one); under the cap it is left alone.
+    #[test]
+    fn daemon_log_rotates_to_one_predecessor_only_when_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("airc-daemon.log");
+        let predecessor = dir.path().join("airc-daemon.log.1");
+        std::fs::write(&log, b"small").unwrap();
+        rotate_daemon_log(&log, 16);
+        assert!(
+            log.exists() && !predecessor.exists(),
+            "under the cap: untouched"
+        );
+
+        std::fs::write(&predecessor, b"older run").unwrap();
+        std::fs::write(&log, vec![b'x'; 17]).unwrap();
+        rotate_daemon_log(&log, 16);
+        assert!(
+            !log.exists(),
+            "over the cap: the live name is free for the new run"
+        );
+        assert_eq!(
+            std::fs::read(&predecessor).unwrap().len(),
+            17,
+            "one predecessor, the newest"
+        );
+    }
     #[test]
     fn failed_route_observations_do_not_feed_registry_imports_back() {
         let peer = airc_lib::PeerId::new();
