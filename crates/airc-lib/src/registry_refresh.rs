@@ -196,13 +196,15 @@ impl RegistryRefreshGate {
 /// condition ([`RefusalRun`]), where reporting each retry turned one spent budget into
 /// thousands of log lines (card e4e99c73).
 fn rate_limited(error: &crate::error::AircError) -> Option<u64> {
-    match error {
-        crate::AircError::AccountRegistry(
-            crate::account_registry::AccountRegistryError::RateLimited {
-                retry_after_secs, ..
-            },
-        ) => Some(*retry_after_secs),
-        _ => None,
+    if let crate::AircError::AccountRegistry(
+        crate::account_registry::AccountRegistryError::RateLimited {
+            retry_after_secs, ..
+        },
+    ) = error
+    {
+        Some(*retry_after_secs)
+    } else {
+        None
     }
 }
 
