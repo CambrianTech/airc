@@ -58,6 +58,12 @@ pub enum DiagnosticCode {
     TrustRefreshFailed,
     AccountRegistryPublishFailed,
     AccountRegistryRefreshFailed,
+    /// The gh governor refused registry calls (its budget is spent). Reported when the
+    /// refusal starts and then at doubling counts while it persists, never per retry
+    /// (card e4e99c73: one refusal had logged ~6.5k lines in one burst on IntelMac).
+    AccountRegistryRateLimited,
+    /// A governor refusal run ended: the next registry call was admitted.
+    AccountRegistryRateLimitCleared,
     /// Card d793c242: the account-registry gh transport was
     /// intentionally suppressed — `AIRC_DISABLE_ACCOUNT_REGISTRY` is
     /// set, or the scope home is temp-rooted (hermetic test daemon).
