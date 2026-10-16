@@ -249,6 +249,8 @@ fn code_header_value(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::TrustRefreshFailed => "trust_refresh_failed",
         DiagnosticCode::AccountRegistryPublishFailed => "account_registry_publish_failed",
         DiagnosticCode::AccountRegistryRefreshFailed => "account_registry_refresh_failed",
+        DiagnosticCode::AccountRegistryRateLimited => "account_registry_rate_limited",
+        DiagnosticCode::AccountRegistryRateLimitCleared => "account_registry_rate_limit_cleared",
         DiagnosticCode::AccountRegistryHermeticSkip => "account_registry_hermetic_skip",
         DiagnosticCode::AccountRegistryTempBeaconsIgnored => {
             "account_registry_temp_beacons_ignored"
@@ -316,6 +318,8 @@ mod tests {
             DiagnosticCode::TrustRefreshFailed,
             DiagnosticCode::AccountRegistryPublishFailed,
             DiagnosticCode::AccountRegistryRefreshFailed,
+            DiagnosticCode::AccountRegistryRateLimited,
+            DiagnosticCode::AccountRegistryRateLimitCleared,
             DiagnosticCode::WireLostEmitFailed,
             DiagnosticCode::MalformedReplayFrameSkipped,
             DiagnosticCode::UnverifiableReplayFrameSkipped,
