@@ -90,6 +90,57 @@ pub fn worktree_path_for(card_id: WorkCardId) -> Option<PathBuf> {
     worktree_root().map(|root| root.join(short_id(card_id)))
 }
 
+/// The lifecycle lock for one card's worktree: publishing a claim or a state change and
+/// creating/reusing the worktree, versus retirement's board re-read and removal, are
+/// mutually exclusive on this machine (card bac19e3c). It serializes LIFECYCLE steps only:
+/// a process already working inside the worktree holds nothing, so this is not custody of
+/// the files, and retirement must still prove the tree quiescent on its own.
+///
+/// Keyed by the FULL card id, never the shown prefix two cards can share. The file lives in
+/// `~/.airc/worktrees/.locks/`, outside every worktree, so removing a worktree never deletes
+/// a lock another process holds (`.locks` is not a short id, so cleanup's scan skips it).
+#[derive(Debug)]
+pub struct WorktreeLifecycleLock {
+    _file: std::fs::File,
+}
+
+fn lifecycle_lock_file(card_id: WorkCardId) -> Result<std::fs::File, String> {
+    let dir = worktree_root()
+        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?
+        .join(".locks");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{card_id}.lock"));
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))
+}
+
+/// Take the card's lifecycle lock, waiting for a holder to finish. Blocking: async callers
+/// run it on the blocking pool.
+pub fn lifecycle_lock(card_id: WorkCardId) -> Result<WorktreeLifecycleLock, String> {
+    use fs2::FileExt;
+    let file = lifecycle_lock_file(card_id)?;
+    file.lock_exclusive()
+        .map_err(|e| format!("lock worktree lifecycle of {card_id}: {e}"))?;
+    Ok(WorktreeLifecycleLock { _file: file })
+}
+
+/// Take the card's lifecycle lock only if nobody holds it: `None` means a claim or a state
+/// change is in flight, and a retirement must retain rather than wait on it.
+pub fn try_lifecycle_lock(card_id: WorkCardId) -> Result<Option<WorktreeLifecycleLock>, String> {
+    use fs2::FileExt;
+    let file = lifecycle_lock_file(card_id)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(WorktreeLifecycleLock { _file: file })),
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
+        Err(e) => Err(format!("lock worktree lifecycle of {card_id}: {e}")),
+    }
+}
+
 /// What [`ensure_worktree`] did. Reuse is a success, not a no-op failure:
 /// re-claiming a card an agent is already working must not disturb the work.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +317,48 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (card bac19e3c): claim/reopen and worktree retirement were not
+    // exclusive, so a retirement's board read could be overtaken by a new claim before it
+    // removed the tree. The lifecycle lock makes them exclusive per card: while one holder has
+    // it, a retirement's try-lock sees it held; once released it is free. It is keyed by the
+    // FULL card id, so two cards sharing an 8-hex prefix never contend.
+    #[test]
+    fn the_lifecycle_lock_is_exclusive_per_full_card_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        temp_env::with_var("HOME", Some(tmp.path()), || {
+            let a = WorkCardId::from_u128(0xabcd_ef01_0000_0000_0000_0000_0000_0001);
+            let b = WorkCardId::from_u128(0xabcd_ef01_0000_0000_0000_0000_0000_0002);
+            assert_eq!(
+                short_id(a),
+                short_id(b),
+                "fixture: the two ids share a short id"
+            );
+            let held = lifecycle_lock(a).expect("first holder takes it");
+            assert!(
+                try_lifecycle_lock(a).unwrap().is_none(),
+                "held: a retirement must not take it"
+            );
+            assert!(
+                try_lifecycle_lock(b).unwrap().is_some(),
+                "same prefix, different card: free"
+            );
+            drop(held);
+            assert!(
+                try_lifecycle_lock(a).unwrap().is_some(),
+                "released: free again"
+            );
+            let locks = tmp.path().join(LEASE_ZONE_RELATIVE).join(".locks");
+            assert!(
+                locks.join(format!("{a}.lock")).exists(),
+                "outside every worktree"
+            );
+            assert!(
+                worktree_path_for(a).unwrap().parent() == locks.parent(),
+                "beside the worktrees"
+            );
+        });
+    }
 
     fn card_id() -> WorkCardId {
         WorkCardId::from_uuid(
