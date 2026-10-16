@@ -503,8 +503,10 @@ impl GhAccountRegistryStore {
                 // Typed, not formatted — the caller must be able to HONOR
                 // the wait, which it cannot do with a message string.
                 // A refused REGISTRY call starves the mesh (peers cannot find this
-                // node); it is a warn, and the reason rides the error as data.
-                tracing::warn!(
+                // node); the reason rides the error as data, and the caller reports the
+                // refusal once per run (registry_refresh::RefusalRun). A per-request warn
+                // here doubled every retry's line (card e4e99c73), so this one is debug.
+                tracing::debug!(
                     target: "airc::gh",
                     retry_after_secs,
                     %reason,
