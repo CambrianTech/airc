@@ -178,6 +178,72 @@ fn work_cleanup_classifies_worktrees_of_cards_in_every_subscribed_room() {
     assert!(line.contains("Closed"), "{cleanup}");
 }
 
+// what this catches (card bac19e3c, Codex b1fe8f13): `work close` holds the card's
+// lifecycle lock across the state change, and its automatic worktree retirement tried to take
+// the same lock again, saw itself as the holder, and refused, so every close kept its
+// worktree. The held guard is now passed through: a clean, merged checkout is retired on close.
+#[test]
+fn work_close_retires_the_cards_clean_worktree_through_its_own_lifecycle_lock() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "close retires",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+
+    let git = |dir: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=F", "-c", "user.email=f@e.t"])
+            .args(args)
+            .output()
+            .expect("git spawns");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let repo = workspace.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "base"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/canary", "HEAD"]);
+    let tree = workspace.path().join(".airc/worktrees").join(&card_id[..8]);
+    let branch = format!("{}/fix", &card_id[..8]);
+    git(
+        &repo,
+        &["worktree", "add", "-b", &branch, tree.to_str().unwrap()],
+    );
+    assert!(tree.exists());
+
+    let output = Command::new(airc_core())
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env("USERPROFILE", workspace.path())
+        .arg("--home")
+        .arg(&home)
+        .args(["work", "close", card_id])
+        .output()
+        .expect("airc spawns");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "close failed: {stderr}");
+    assert!(!stderr.contains("worktree cleanup skipped"), "{stderr}");
+    assert!(
+        !tree.exists(),
+        "the clean checkout retires on close: {stderr}"
+    );
+}
+
 #[test]
 fn work_seed_is_idempotent_for_manager_candidates() {
     let workspace = common::daemon_tempdir();

@@ -593,7 +593,7 @@ pub async fn run_state(
     // side-effectful path. The CLI is the right place because it's
     // already the orchestration layer that publishes the event.
     if card_state == CardState::Closed {
-        if let Err(error) = cleanup_card_worktree(&airc, card_uuid).await {
+        if let Err(error) = cleanup_card_worktree(&airc, card_uuid, Some(&_lifecycle)).await {
             eprintln!("airc: worktree cleanup skipped — {error}");
         }
     }
@@ -648,7 +648,7 @@ pub(crate) async fn mark_merged_and_reclaim(
         %card_id,
         "worktree reclaim attempted after MarkPullRequestMerged",
     );
-    if let Err(error) = cleanup_card_worktree(airc, card_id).await {
+    if let Err(error) = cleanup_card_worktree(airc, card_id, None).await {
         eprintln!("airc: worktree cleanup skipped for {card_id} — {error}");
     }
     Ok(())
@@ -656,14 +656,17 @@ pub(crate) async fn mark_merged_and_reclaim(
 
 /// Retire a terminal card's managed checkout and branch through the same
 /// guarded path as manual cleanup. Missing checkouts are already retired.
+/// `held` is the card's lifecycle lock when the caller already holds it (a state change
+/// closing the card); `None` makes retirement try to take it itself.
 pub(crate) async fn cleanup_card_worktree(
     airc: &airc_lib::Airc,
     card_id: airc_lib::WorkCardId,
+    held: Option<&airc_lib::work_worktree::WorktreeLifecycleLock>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = lease::lease_root().ok_or("cannot resolve managed worktree root")?;
     let parent = root.join(card_id.shown());
     if parent.exists() {
-        retire_under_lifecycle(airc, card_id, &resolve_worktree_path(&parent), &root).await?;
+        retire_under_lifecycle(airc, card_id, &resolve_worktree_path(&parent), &root, held).await?;
     }
     Ok(())
 }
@@ -681,18 +684,29 @@ async fn hold_lifecycle(
 
 /// Retire `path` only while holding the card's lifecycle lock, and only if the board, re-read
 /// under that lock, still shows the card Merged or Closed — never on a snapshot taken before
-/// a claim or reopen could land (card bac19e3c). A held lock retains instead of waiting.
-/// This serializes lifecycle steps; whether the tree is quiescent is retire's own proof.
+/// a claim or reopen could land (card bac19e3c). `held` is the caller's own guard when it
+/// already holds the lock: taking it again would see itself as the holder and refuse every
+/// close (Codex b1fe8f13). Otherwise it is try-acquired, and a held lock retains rather than
+/// waits. This serializes lifecycle steps of the CLI entry points that take the lock; whether
+/// the tree is quiescent is retire's own proof.
 async fn retire_under_lifecycle(
     airc: &airc_lib::Airc,
     card_id: airc_lib::WorkCardId,
     path: &Path,
     root: &Path,
+    held: Option<&airc_lib::work_worktree::WorktreeLifecycleLock>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(_lifecycle) = airc_lib::work_worktree::try_lifecycle_lock(card_id)? else {
-        return Err(
-            format!("a claim or state change on {card_id} is in progress; retained").into(),
-        );
+    let _acquired = match held {
+        Some(_) => None,
+        None => match airc_lib::work_worktree::try_lifecycle_lock(card_id)? {
+            Some(lock) => Some(lock),
+            None => {
+                return Err(format!(
+                    "a claim or state change on {card_id} is in progress; retained"
+                )
+                .into())
+            }
+        },
     };
     let terminal = airc
         .work_boards_in_subscribed_rooms()
@@ -993,7 +1007,7 @@ pub async fn run_cleanup(
             eprintln!("✗ {} — no card id; retained", c.path.display());
             continue;
         };
-        match retire_under_lifecycle(&airc, card_id, &c.path, &lease_root).await {
+        match retire_under_lifecycle(&airc, card_id, &c.path, &lease_root, None).await {
             Ok(()) => {
                 println!("✓ removed {}", c.path.display());
                 removed += 1;
