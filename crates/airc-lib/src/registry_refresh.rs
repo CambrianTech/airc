@@ -191,6 +191,45 @@ impl RegistryRefreshGate {
     }
 }
 
+/// The governor's advised wait, when `error` is its refusal. A refusal is not a failure
+/// of the registry and is NOT reported by `run_tick`: its caller reports it once per
+/// condition ([`RefusalRun`]), where reporting each retry turned one spent budget into
+/// thousands of log lines (card e4e99c73).
+fn rate_limited(error: &crate::error::AircError) -> Option<u64> {
+    match error {
+        crate::AircError::AccountRegistry(
+            crate::account_registry::AccountRegistryError::RateLimited {
+                retry_after_secs, ..
+            },
+        ) => Some(*retry_after_secs),
+        _ => None,
+    }
+}
+
+/// One run of consecutive governor refusals, reported at its start, at doubling counts
+/// while it lasts (2, 4, 8, ...: log-many lines however long it runs, with no tuned
+/// interval), and once when it ends.
+#[derive(Debug, Default)]
+struct RefusalRun {
+    refusals: u64,
+    since: Option<std::time::Instant>,
+}
+
+impl RefusalRun {
+    /// Record a refusal; `Some(n)` when the n-th refusal of this run is due a report.
+    fn refused(&mut self) -> Option<u64> {
+        self.since.get_or_insert_with(std::time::Instant::now);
+        self.refusals += 1;
+        self.refusals.is_power_of_two().then_some(self.refusals)
+    }
+
+    /// Record an admitted call; `Some((refusals, lasted))` when it ended a run.
+    fn admitted(&mut self) -> Option<(u64, Duration)> {
+        let since = self.since.take()?;
+        Some((std::mem::take(&mut self.refusals), since.elapsed()))
+    }
+}
+
 /// Run ONE publish+refresh tick. Returns the count of peers enrolled
 /// from the refreshed document (0 if the store had no document yet).
 /// On any failure, emits a typed diagnostic and returns the error so
@@ -202,6 +241,7 @@ async fn run_tick(
 ) -> Result<TickReport, crate::error::AircError> {
     let published = match airc.publish_account_registry(store).await {
         Ok(doc) => doc,
+        Err(error) if rate_limited(&error).is_some() => return Err(error),
         Err(error) => {
             sink.emit(
                 DiagnosticEvent::error(
@@ -216,6 +256,7 @@ async fn run_tick(
     };
     let refreshed = match airc.refresh_account_registry(store).await {
         Ok(doc) => doc,
+        Err(error) if rate_limited(&error).is_some() => return Err(error),
         Err(error) => {
             sink.emit(
                 DiagnosticEvent::error(
@@ -266,7 +307,22 @@ pub async fn sync_once(
     if let Some(block) = gate.block().await {
         return Ok(SyncOutcome::Skipped(block));
     }
-    let report = run_tick(airc, store, &StderrJsonDiagnosticSink).await?;
+    let report = match run_tick(airc, store, &StderrJsonDiagnosticSink).await {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(retry_after_secs) = rate_limited(&error) {
+                StderrJsonDiagnosticSink.emit(
+                    DiagnosticEvent::warn(
+                        DiagnosticComponent::Daemon,
+                        DiagnosticCode::AccountRegistryRateLimited,
+                        "account registry refused by the gh governor",
+                    )
+                    .with_field("retry_after_secs", retry_after_secs),
+                );
+            }
+            return Err(error);
+        }
+    };
     Ok(SyncOutcome::Ran(report))
 }
 
@@ -307,6 +363,7 @@ pub async fn run_loop<S>(
     // "catch up" (which would risk back-to-back gist writes).
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    let mut refusals = RefusalRun::default();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -332,6 +389,7 @@ pub async fn run_loop<S>(
         // owns no write: waiting out a 60s denial during shutdown exceeds the
         // updater's process-exit deadline and leaves service stopped.
         let outcome = gated_tick(&gate, &airc, &store, &sink).await;
+        report_refusals(&mut refusals, outcome, &sink);
         tokio::select! {
             biased;
             _ = &mut shutdown => break,
@@ -344,6 +402,41 @@ pub async fn run_loop<S>(
         } else {
             ticker.reset();
         }
+    }
+}
+
+/// Report a governor refusal run through `run`: its start and doubling counts while it
+/// lasts, then its end once a call is admitted again (a gate-skip neither starts nor ends it).
+fn report_refusals(run: &mut RefusalRun, outcome: TickOutcome, sink: &dyn DiagnosticSink) {
+    match outcome {
+        TickOutcome::RateLimited { retry_after_secs } => {
+            if let Some(refusals) = run.refused() {
+                sink.emit(
+                    DiagnosticEvent::warn(
+                        DiagnosticComponent::Daemon,
+                        DiagnosticCode::AccountRegistryRateLimited,
+                        "account registry refused by the gh governor; retrying when it advises",
+                    )
+                    .with_field("refusals", refusals)
+                    .with_field("retry_after_secs", retry_after_secs),
+                );
+            }
+        }
+        TickOutcome::Imported => {
+            if let Some((refusals, lasted)) = run.admitted() {
+                sink.emit(
+                    DiagnosticEvent::new(
+                        airc_diagnostics::DiagnosticSeverity::Info,
+                        DiagnosticComponent::Daemon,
+                        DiagnosticCode::AccountRegistryRateLimitCleared,
+                        "account registry admitted again after a governor refusal run",
+                    )
+                    .with_field("refusals", refusals)
+                    .with_field("lasted_secs", lasted.as_secs()),
+                );
+            }
+        }
+        TickOutcome::NoChange => {}
     }
 }
 
@@ -426,6 +519,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (card e4e99c73): a spent gh budget made the governor refuse every
+    // registry retry for an hour, and each refusal was logged twice — ~6.5k lines from one
+    // condition on IntelMac (2026-10-15). A run of refusals is now reported at its start and
+    // at doubling counts (log-many lines), and once when a call is admitted again.
+    #[test]
+    fn a_refusal_run_is_reported_at_doubling_counts_and_once_when_it_ends() {
+        let sink = airc_diagnostics::MemoryDiagnosticSink::default();
+        let mut run = RefusalRun::default();
+        let refused = TickOutcome::RateLimited {
+            retry_after_secs: 3,
+        };
+        for _ in 0..100 {
+            report_refusals(&mut run, refused, &sink);
+        }
+        report_refusals(&mut run, TickOutcome::NoChange, &sink); // a gate-skip ends nothing
+        report_refusals(&mut run, TickOutcome::Imported, &sink);
+        report_refusals(&mut run, TickOutcome::Imported, &sink); // no run, nothing to clear
+        let events = sink.events();
+        let counts: Vec<String> = events
+            .iter()
+            .filter(|e| e.code == DiagnosticCode::AccountRegistryRateLimited)
+            .map(|e| e.fields["refusals"].clone())
+            .collect();
+        assert_eq!(
+            counts,
+            ["1", "2", "4", "8", "16", "32", "64"],
+            "100 refusals, 7 lines"
+        );
+        let cleared: Vec<_> = events
+            .iter()
+            .filter(|e| e.code == DiagnosticCode::AccountRegistryRateLimitCleared)
+            .collect();
+        assert_eq!(cleared.len(), 1, "one end for one run");
+        assert_eq!(cleared[0].fields["refusals"], "100");
+        // A new run starts its count afresh.
+        report_refusals(&mut run, refused, &sink);
+        assert_eq!(sink.events().last().unwrap().fields["refusals"], "1");
+    }
     use crate::account_registry::SqliteAccountRegistryStore;
     use crate::route::RouteEndpoint;
     use std::sync::Arc;
