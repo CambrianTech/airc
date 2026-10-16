@@ -96,6 +96,51 @@ fn work_create_claim_release_projects_on_board() {
     assert!(released_board.contains("claim=-"));
 }
 
+// what this catches: `release --room R` without a CLAIM_ID resolved the
+// holder's claim on the CURRENT room's board, so a card claimed in a room
+// the scope was not standing in was unreleasable ("not present in the board
+// projection") and therefore unclosable by its own claimant.
+#[test]
+fn work_release_defaults_to_my_claim_in_the_named_room_not_the_current_one() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(&home, &["room", "review"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "claimed in review",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+    run_ok(
+        &home,
+        &[
+            "work",
+            "claim",
+            card_id,
+            "--ttl-ms",
+            "60000",
+            "--no-lease-required",
+        ],
+    );
+    run_ok(&home, &["room", "general"]);
+
+    let released = run_ok(&home, &["work", "release", card_id, "--room", "review"]);
+    assert!(released.contains("released:"), "{released}");
+    let board = run_ok(&home, &["work", "board", "--room", "review"]);
+    assert!(
+        board.contains(card_id) && board.contains("claim=-"),
+        "{board}"
+    );
+}
+
 #[test]
 fn work_seed_is_idempotent_for_manager_candidates() {
     let workspace = common::daemon_tempdir();
