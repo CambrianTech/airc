@@ -266,6 +266,9 @@ pub async fn run_claim(
     let airc = crate::commands::attached_airc(home).await?;
     let room = room_or_current(&airc, room.as_deref(), "claim work in").await?;
     let card_uuid = card_in_room(&airc, &room, &card_id).await?;
+    // Held across publishing the claim AND creating/reusing its worktree, so a retirement
+    // never removes the tree between the two (card bac19e3c).
+    let _lifecycle = hold_lifecycle(card_uuid).await?;
     let claim_id = airc
         .claim_work_card_with_provenance_in(
             &room,
@@ -491,6 +494,9 @@ pub async fn run_state(
     // room — even if another client moves this scope's default mid-command.
     let room = room_or_current(&airc, room.as_deref(), "change work state in").await?;
     let card_uuid = card_in_room(&airc, &room, &card_id).await?;
+    // A state change (a reopen above all) publishes under the lifecycle lock, so a
+    // retirement's board re-read and its removal are never split by it (card bac19e3c).
+    let _lifecycle = hold_lifecycle(card_uuid).await?;
 
     // Card a1bc62b3 (substrate-target gate): refuse direct CLI writes
     // to states that should only come from substrate observers (e.g.
@@ -587,7 +593,7 @@ pub async fn run_state(
     // side-effectful path. The CLI is the right place because it's
     // already the orchestration layer that publishes the event.
     if card_state == CardState::Closed {
-        if let Err(error) = cleanup_card_worktree(card_uuid).await {
+        if let Err(error) = cleanup_card_worktree(&airc, card_uuid, Some(&_lifecycle)).await {
             eprintln!("airc: worktree cleanup skipped — {error}");
         }
     }
@@ -642,7 +648,7 @@ pub(crate) async fn mark_merged_and_reclaim(
         %card_id,
         "worktree reclaim attempted after MarkPullRequestMerged",
     );
-    if let Err(error) = cleanup_card_worktree(card_id).await {
+    if let Err(error) = cleanup_card_worktree(airc, card_id, None).await {
         eprintln!("airc: worktree cleanup skipped for {card_id} — {error}");
     }
     Ok(())
@@ -650,14 +656,71 @@ pub(crate) async fn mark_merged_and_reclaim(
 
 /// Retire a terminal card's managed checkout and branch through the same
 /// guarded path as manual cleanup. Missing checkouts are already retired.
+/// `held` is the card's lifecycle lock when the caller already holds it (a state change
+/// closing the card); `None` makes retirement try to take it itself.
 pub(crate) async fn cleanup_card_worktree(
+    airc: &airc_lib::Airc,
     card_id: airc_lib::WorkCardId,
+    held: Option<&airc_lib::work_worktree::WorktreeLifecycleLock>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = lease::lease_root().ok_or("cannot resolve managed worktree root")?;
     let parent = root.join(card_id.shown());
     if parent.exists() {
-        crate::worktree_retirement::retire(&resolve_worktree_path(&parent), &root)?;
+        retire_under_lifecycle(airc, card_id, &resolve_worktree_path(&parent), &root, held).await?;
     }
+    Ok(())
+}
+
+/// The card's worktree lifecycle lock (airc_lib::work_worktree), awaited on the blocking
+/// pool: a claim or state change in flight finishes first.
+async fn hold_lifecycle(
+    card_id: airc_lib::WorkCardId,
+) -> Result<airc_lib::work_worktree::WorktreeLifecycleLock, Box<dyn std::error::Error>> {
+    Ok(
+        tokio::task::spawn_blocking(move || airc_lib::work_worktree::lifecycle_lock(card_id))
+            .await??,
+    )
+}
+
+/// Retire `path` only while holding the card's lifecycle lock, and only if the board, re-read
+/// under that lock, still shows the card Merged or Closed — never on a snapshot taken before
+/// a claim or reopen could land (card bac19e3c). `held` is the caller's own guard when it
+/// already holds the lock: taking it again would see itself as the holder and refuse every
+/// close (Codex b1fe8f13). Otherwise it is try-acquired, and a held lock retains rather than
+/// waits. This serializes lifecycle steps of the CLI entry points that take the lock; whether
+/// the tree is quiescent is retire's own proof.
+async fn retire_under_lifecycle(
+    airc: &airc_lib::Airc,
+    card_id: airc_lib::WorkCardId,
+    path: &Path,
+    root: &Path,
+    held: Option<&airc_lib::work_worktree::WorktreeLifecycleLock>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _acquired = match held {
+        Some(_) => None,
+        None => match airc_lib::work_worktree::try_lifecycle_lock(card_id)? {
+            Some(lock) => Some(lock),
+            None => {
+                return Err(format!(
+                    "a claim or state change on {card_id} is in progress; retained"
+                )
+                .into())
+            }
+        },
+    };
+    let terminal = airc
+        .work_boards_in_subscribed_rooms()
+        .await?
+        .iter()
+        .flat_map(|board| board.snapshot().cards)
+        .find(|card| card.card_id == card_id)
+        .is_some_and(|card| matches!(card.state, CardState::Merged | CardState::Closed));
+    if !terminal {
+        return Err(
+            format!("{card_id} is no longer Merged or Closed on the board; retained").into(),
+        );
+    }
+    crate::worktree_retirement::retire(path, root)?;
     Ok(())
 }
 
@@ -865,6 +928,7 @@ pub async fn run_cleanup(
 
         classifications.push(WorktreeClassification {
             short,
+            card_id: card.as_ref().map(|c| c.card_id),
             path: effective,
             card_state,
             pr_number,
@@ -939,7 +1003,11 @@ pub async fn run_cleanup(
     // re-runs after fixing the specific issue.
     let mut removed = 0usize;
     for c in removable {
-        match crate::worktree_retirement::retire(&c.path, &lease_root) {
+        let Some(card_id) = c.card_id else {
+            eprintln!("✗ {} — no card id; retained", c.path.display());
+            continue;
+        };
+        match retire_under_lifecycle(&airc, card_id, &c.path, &lease_root, None).await {
             Ok(()) => {
                 println!("✓ removed {}", c.path.display());
                 removed += 1;
@@ -956,6 +1024,8 @@ pub async fn run_cleanup(
 /// One scan result for `run_cleanup`'s table + the force loop.
 struct WorktreeClassification {
     short: String,
+    /// The full id of the card it belongs to: the lifecycle lock's key (never the short id).
+    card_id: Option<airc_lib::WorkCardId>,
     path: std::path::PathBuf,
     card_state: Option<airc_work::CardState>,
     pr_number: Option<u64>,
