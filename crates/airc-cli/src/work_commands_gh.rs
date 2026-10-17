@@ -27,6 +27,7 @@ pub(crate) async fn open_pr_and_link(
     home: &std::path::Path,
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
+    workspace: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_work::model::{BranchName, PullRequestRef};
 
@@ -44,7 +45,25 @@ pub(crate) async fn open_pr_and_link(
     let short = card.card_id.shown();
     let lease_root = lease::lease_root()
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
-    let worktree_path = lease_root.join(&short);
+    let canonical = lease_root.join(&short);
+    // Card 52bf7370: the canonical `<lease_root>/<short>` path is the default, unchanged.
+    // An explicit --workspace replaces it only after it is proven to be THIS card's: the
+    // caller holds the card's claim, and the checkout is a governed worktree on the card's
+    // branch and repo. The PR metadata, the patch submission and the pushed-head gate below
+    // all read this one path; there is no cwd fallback.
+    let worktree_path = match workspace {
+        None => canonical,
+        Some(candidate) => {
+            crate::work_commands::resolve_my_active_claim(airc, room, card_id).await?;
+            crate::work_commands_git::validate_review_workspace(
+                candidate,
+                &lease_root,
+                &short,
+                card.repo.as_str(),
+                &canonical,
+            )?
+        }
+    };
     if !worktree_path.exists() {
         return Err(format!(
             "no worktree at {} — claim was made before card d1b2798d shipped, or with --no-lease-required (re-claim from a worktree to get auto-PR on review)",

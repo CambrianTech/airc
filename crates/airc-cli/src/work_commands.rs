@@ -364,7 +364,7 @@ pub async fn run_release(
 /// and so unclosable, from any other current room). Surfaces clear errors
 /// when there is no claim, or the claim is held by another peer — so the
 /// default never silently releases someone else's work.
-async fn resolve_my_active_claim(
+pub(crate) async fn resolve_my_active_claim(
     airc: &airc_lib::Airc,
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
@@ -485,9 +485,15 @@ pub async fn run_state(
     room: Option<String>,
     card_id: String,
     state: CliCardState,
+    workspace: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let airc = crate::commands::attached_airc(home).await?;
     let card_state = CardState::from(state);
+    // --workspace names the checkout a review publishes from; it means nothing for any
+    // other transition, so it is refused there rather than silently ignored (52bf7370).
+    if workspace.is_some() && card_state != CardState::Review {
+        return Err("--workspace applies only to `airc work state <card> review`".into());
+    }
+    let airc = crate::commands::attached_airc(home).await?;
 
     // Resolve ONCE, like `run_review` and `run_merge` (#1447): the close-gate board
     // read, the state change, the PR link and the review sibling all bind to THIS
@@ -567,7 +573,14 @@ pub async fn run_state(
     // Review must not be advertised before its PR prerequisites succeed. The
     // link event also projects Review, so errors must propagate, not be swallowed.
     if card_state == CardState::Review {
-        crate::work_commands_gh::open_pr_and_link(&airc, home, &room, card_uuid).await?;
+        crate::work_commands_gh::open_pr_and_link(
+            &airc,
+            home,
+            &room,
+            card_uuid,
+            workspace.as_deref(),
+        )
+        .await?;
     }
 
     airc.change_work_card_state_in(
@@ -857,7 +870,7 @@ pub async fn run_close(
     room: Option<String>,
     card_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_state(home, room, card_id, CliCardState::Closed).await
+    run_state(home, room, card_id, CliCardState::Closed, None).await
 }
 
 /// Card c9b28925: prune worktrees whose card has reached a terminal
