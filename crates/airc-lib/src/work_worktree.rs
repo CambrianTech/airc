@@ -1006,7 +1006,14 @@ mod tests {
     #[test]
     fn a_card_clone_owns_its_git_and_borrows_only_from_a_precious_mirror() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        // Canonical on unix (/var -> /private/var on macOS, so paths git reports match ours).
+        // NOT on Windows: canonicalize yields a \\?\ verbatim path that git cannot mkdir
+        // (CI job 117425627237: "cannot mkdir \\?\C:\...: Invalid argument").
+        let root = if cfg!(windows) {
+            tmp.path().to_path_buf()
+        } else {
+            tmp.path().canonicalize().unwrap()
+        };
         let git = |dir: &Path, args: &[&str]| git_in(dir, args).unwrap_or_else(|e| panic!("{e}"));
         let remote = root.join("remote.git");
         git(
