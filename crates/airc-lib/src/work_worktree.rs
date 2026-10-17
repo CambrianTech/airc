@@ -279,22 +279,80 @@ pub fn mirror_path_for(repo: &RepoId) -> Option<PathBuf> {
     })
 }
 
-/// Run `git` in `dir`, returning trimmed stdout or the failure with its stderr.
+/// The bound on one git call made while staging a card (card d166e4f2). Measured on
+/// IntelMac 2026-10-17T14:49:59Z: an incremental `fetch --prune origin` against GitHub took
+/// 1.26 s, and a full `clone --mirror --no-hardlinks` of the continuum repo (206 MB of
+/// objects) took 1.21 s. 120 s is ~95x the slowest of those, headroom for a cold DNS/TLS
+/// handshake on the slowest tier. A hang (an auth prompt, a stalled remote) is killed and
+/// reported, never waited out on a resident's claim path.
+const GIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run `git` in `dir`, bounded by [`GIT_BOUND`], never prompting (`GIT_TERMINAL_PROMPT=0`,
+/// stdin closed). Returns trimmed stdout, or the failure with its stderr or the timeout.
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = airc_core::process::background("git")
+    use std::io::Read;
+    let shown = || format!("git {} in {}", args.join(" "), dir.display());
+    let mut child = airc_core::process::background("git")
         .current_dir(dir)
         .args(args)
-        .output()
-        .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git {} failed in {}: {}",
-            args.join(" "),
-            dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", shown()))?;
+    // Drain both pipes while waiting, so a chatty git cannot block on a full pipe.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + GIT_BOUND;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{} did not finish within {} s and was killed",
+                    shown(),
+                    GIT_BOUND.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => return Err(format!("wait for {}: {e}", shown())),
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("{} failed: {}", shown(), stderr.trim()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    Ok(stdout.trim().to_owned())
+}
+
+/// Is `path` a LINKED worktree (its `.git` a file naming a gitdir elsewhere), as card
+/// checkouts were before card d166e4f2? A card clone's `.git` is a directory. Card staging
+/// asks this to decide whether a held card still needs migrating; nobody else re-derives it.
+pub fn is_linked_worktree(path: &Path) -> bool {
+    path.join(".git").is_file()
 }
 
 /// The node's bare mirror of `repo`: created once from `source` (a local clone of it), then
@@ -309,10 +367,14 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
 ///   object would corrupt those clones silently.
 /// - `origin` is `source`'s own origin URL, so fetches come from the real remote and never
 ///   from the deploy checkout's local branches.
+/// - It is first cloned FROM `source`, so it briefly holds `source`'s local branches (an
+///   operator's or agent's WIP). The prune-fetch drops every ref the real remote lacks, and
+///   a new mirror whose first fetch fails is removed, so no local branch can become a base.
 pub fn ensure_mirror(repo: &RepoId, source: &Path) -> Result<PathBuf, String> {
     let path = mirror_path_for(repo)
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/mirrors/".to_string())?;
-    if !path.exists() {
+    let created = !path.exists();
+    if created {
         let parent = path
             .parent()
             .ok_or_else(|| format!("mirror path {} has no parent", path.display()))?;
@@ -337,7 +399,17 @@ pub fn ensure_mirror(repo: &RepoId, source: &Path) -> Result<PathBuf, String> {
         git_in(&path, &["config", "gc.auto", "0"])?;
     }
     // Refs follow the real remote; objects are never pruned (preciousObjects).
-    git_in(&path, &["fetch", "--quiet", "--prune", "origin"])?;
+    if let Err(error) = git_in(&path, &["fetch", "--quiet", "--prune", "origin"]) {
+        if created {
+            // A new mirror still holds the SOURCE's local branches until this prune-fetch
+            // succeeds. Keep none of them as a possible card base: remove what was just made.
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(error);
+        }
+        // An existing mirror stages from the refs it already has; the base is still resolved
+        // against them, and the staleness is said, not hidden.
+        tracing::warn!(mirror = %path.display(), %error, "repo mirror refresh failed; staging from its existing refs");
+    }
     Ok(path)
 }
 
@@ -963,6 +1035,9 @@ mod tests {
         git(&source, &["add", "."]);
         git(&source, &["commit", "--quiet", "-m", "base"]);
         git(&source, &["push", "--quiet", "origin", "HEAD:canary"]);
+        // An agent's local WIP branch in the source, never pushed: it must not survive into
+        // the mirror, or it could become a card base.
+        git(&source, &["branch", "agent-wip"]);
         let source_refs = git(&source, &["for-each-ref"]);
         let home = root.join("home");
         std::fs::create_dir(&home).unwrap();
@@ -978,6 +1053,10 @@ mod tests {
             assert_eq!(
                 git(&mirror, &["config", "extensions.preciousObjects"]),
                 "true"
+            );
+            assert!(
+                git_in(&mirror, &["rev-parse", "--verify", "refs/heads/agent-wip"]).is_err(),
+                "the source's local-only branch is pruned from the mirror"
             );
             #[cfg(unix)]
             {
@@ -1013,11 +1092,15 @@ mod tests {
                 path.join(".git").is_dir(),
                 "the checkout owns its .git: a directory, never a gitdir file"
             );
+            assert!(
+                !is_linked_worktree(&path),
+                "a card clone is not a linked worktree"
+            );
             let alternates =
                 std::fs::read_to_string(path.join(".git/objects/info/alternates")).unwrap();
             assert_eq!(
-                alternates.trim(),
-                mirror.join("objects").to_str().unwrap(),
+                Path::new(alternates.trim()).canonicalize().unwrap(),
+                mirror.join("objects").canonicalize().unwrap(),
                 "it borrows from exactly the mirror's objects"
             );
             assert_eq!(
@@ -1055,6 +1138,23 @@ mod tests {
                 ensure_card_clone(&spec),
                 Ok(WorktreeOutcome::Reused(_))
             ));
+            // A legacy card checkout (a linked worktree, .git a FILE) is told apart, so card
+            // staging can migrate it instead of reusing a checkout git can't use confined.
+            let legacy = root.join("legacy");
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "legacy",
+                    legacy.to_str().unwrap(),
+                ],
+            );
+            assert!(is_linked_worktree(&legacy));
+            git(&source, &["worktree", "remove", legacy.to_str().unwrap()]);
+            git(&source, &["branch", "-D", "legacy"]);
 
             // The mirror loses the ref her base came from; prune and pack deletion are both refused,
             // so her clone still reads its history through the alternates.
@@ -1076,6 +1176,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
