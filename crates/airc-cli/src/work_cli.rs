@@ -151,6 +151,13 @@ pub enum WorkAction {
         /// New lifecycle state.
         #[arg(value_enum)]
         state: CliCardState,
+        /// Review only: publish from this worktree instead of the card's canonical
+        /// `~/.airc/worktrees/<short>`. It must be a governed worktree under
+        /// ~/.airc/worktrees/, on the card's branch and repo, and you must hold the
+        /// card's claim; its HEAD must still be pushed. For a canonical checkout that
+        /// is stale or lives in the wrong clone (card 52bf7370).
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
     },
     /// Mark a work card closed so it no longer appears as claimable.
     Close {

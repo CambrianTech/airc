@@ -924,7 +924,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 room,
                 card_id,
                 state,
-            } => work_commands::run_state(&home, room, card_id, state).await,
+                workspace,
+            } => work_commands::run_state(&home, room, card_id, state, workspace).await,
             WorkAction::Close { room, card_id } => {
                 work_commands::run_close(&home, room, card_id).await
             }

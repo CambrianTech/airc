@@ -116,6 +116,11 @@ pub(crate) async fn spawn_claim_worktree(
 /// degrade. Parses both `https://github.com/owner/repo[.git]` and
 /// `git@github.com:owner/repo[.git]` shapes.
 pub(crate) fn cwd_github_repo_id(repo_root: &str) -> Option<String> {
+    parse_github_repo_id(&origin_url(repo_root)?)
+}
+/// The `origin` remote URL of the checkout at `repo_root`, verbatim, or `None` when there
+/// is no origin. The one reader both repo-identity checks share.
+fn origin_url(repo_root: &str) -> Option<String> {
     let out = airc_core::process::background("git")
         .args(["-C", repo_root, "remote", "get-url", "origin"])
         .output()
@@ -123,8 +128,7 @@ pub(crate) fn cwd_github_repo_id(repo_root: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let url = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    parse_github_repo_id(&url)
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
 }
 /// Pure-function half of [`cwd_github_repo_id`] — accepts a remote
 /// URL and returns `Some("owner/repo")` for github URLs it
@@ -219,9 +223,87 @@ pub(crate) fn require_pushed_head(worktree: &str) -> Result<String, Box<dyn std:
             .is_some_and(|(sha, name)| sha == head.trim() && name == remote_ref)
     });
     if !matches {
-        return Err(format!("review refused: branch {branch} has not been pushed at HEAD; run `git push -u origin HEAD`, then retry `airc work state <card> review`").into());
+        return Err(format!("review refused: branch {branch} has not been pushed at HEAD of {worktree}; run `git push -u origin HEAD` there, then retry `airc work state <card> review` (or, if the card's work is pushed from another worktree you own under ~/.airc/worktrees/, pass it with --workspace)").into());
     }
     Ok(branch)
+}
+
+/// Card 52bf7370: validate an EXPLICIT review workspace that stands in for the card's
+/// canonical `<lease_root>/<short>` checkout. Returns the candidate's canonical path, or
+/// the reason it is refused. Ownership of the card is checked by the caller (it needs the
+/// board); everything checkable from the filesystem is checked here:
+///
+/// - the candidate is inside the lease zone (a governed workspace, never an arbitrary path)
+///   and is the top level of a git checkout;
+/// - its branch is the card's: equal to the canonical checkout's branch when that exists,
+///   else under the card's `<short>/` namespace;
+/// - its `origin` is the card's repo: the GitHub `owner/repo` must equal `card_repo`, and a
+///   non-GitHub origin must equal the canonical checkout's origin exactly.
+///
+/// The pushed-head check is NOT here and is not skipped: the caller runs
+/// [`require_pushed_head`] on the path this returns, exactly as on the canonical path.
+pub(crate) fn validate_review_workspace(
+    candidate: &std::path::Path,
+    lease_root: &std::path::Path,
+    short: &str,
+    card_repo: &str,
+    canonical: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let shown = candidate.display();
+    let lease = crate::lease::check_path_against(candidate, lease_root);
+    if !lease.under_lease {
+        return Err(format!(
+            "--workspace {shown} is outside the lease zone {}; only a governed worktree under it can stand in for the card's checkout",
+            lease.lease_root.display()
+        ));
+    }
+    let path = lease.path;
+    let path_str = path.to_string_lossy().to_string();
+    let toplevel = airc_core::process::background("git")
+        .args(["-C", &path_str, "rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| format!("--workspace {shown}: git rev-parse: {e}"))?;
+    let top = String::from_utf8_lossy(&toplevel.stdout).trim().to_string();
+    let top = std::path::Path::new(&top)
+        .canonicalize()
+        .unwrap_or_default();
+    if !toplevel.status.success() || top != path {
+        return Err(format!(
+            "--workspace {shown} is not the top level of a git checkout"
+        ));
+    }
+    let branch = git_rev_parse_branch(&path_str).map_err(|e| e.to_string())?;
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let canonical_branch = canonical
+        .exists()
+        .then(|| git_rev_parse_branch(&canonical_str).ok())
+        .flatten();
+    if let Some(expected) = &canonical_branch {
+        if &branch != expected {
+            return Err(format!(
+                "--workspace {shown} is on branch {branch}, but the card's checkout {} is on {expected}",
+                canonical.display()
+            ));
+        }
+    } else if !branch.starts_with(&format!("{short}/")) {
+        return Err(format!(
+            "--workspace {shown} is on branch {branch}, outside the card's {short}/ namespace"
+        ));
+    }
+    let origin =
+        origin_url(&path_str).ok_or_else(|| format!("--workspace {shown} has no origin remote"))?;
+    let same_repo = match parse_github_repo_id(&origin) {
+        Some(repo) => repo.eq_ignore_ascii_case(card_repo),
+        None => {
+            canonical.exists() && origin_url(&canonical_str).as_deref() == Some(origin.as_str())
+        }
+    };
+    if !same_repo {
+        return Err(format!(
+            "--workspace {shown} has origin {origin}, which is not the card's repo {card_repo}"
+        ));
+    }
+    Ok(path)
 }
 
 /// The patch a PR carries, as its reviewer reads it: `worktree`'s HEAD against its
@@ -537,6 +619,169 @@ mod tests {
         assert!(
             worktree_skip_reason(&card, None).is_none(),
             "unlinked card must NOT short-circuit worktree spawn",
+        );
+    }
+
+    // what this catches: a review that can only publish from the card's canonical
+    // checkout. Card 52bf7370 (continuum card 3026b83e, 2026-10-16): the claim put
+    // <lease>/<short> in the WRONG clone at a stale HEAD while the work was pushed from
+    // another governed worktree on the same branch name, so `state review` refused forever.
+    // The explicit workspace must be accepted only when it is the card's, and the
+    // pushed-head gate must still run on it.
+    #[test]
+    fn an_explicit_review_workspace_is_validated_and_still_pushed_head_gated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let out = airc_core::process::background("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let init_origin = |name: &str| {
+            let origin = dir.path().join(name);
+            std::fs::create_dir(&origin).expect("origin dir");
+            run(&origin, &["init", "--quiet", "--initial-branch=canary"]);
+            run(&origin, &["config", "user.email", "t@t"]);
+            run(&origin, &["config", "user.name", "t"]);
+            std::fs::write(origin.join("lib.rs"), "fn a() {}\n").expect("write");
+            run(&origin, &["add", "."]);
+            run(&origin, &["commit", "--quiet", "-m", "base"]);
+            run(&origin, &["config", "receive.denyCurrentBranch", "ignore"]);
+            origin
+        };
+        let clone = |origin: &std::path::Path, name: &str| {
+            let clone = dir.path().join(name);
+            run(
+                dir.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    origin.to_str().expect("utf8"),
+                    clone.to_str().expect("utf8"),
+                ],
+            );
+            run(&clone, &["config", "user.email", "t@t"]);
+            run(&clone, &["config", "user.name", "t"]);
+            clone
+        };
+        let origin = init_origin("origin");
+        let lease = dir.path().join("lease");
+        std::fs::create_dir(&lease).expect("lease dir");
+        let (short, branch) = ("52bf7370", "52bf7370/fix");
+        let at = |name: &str| lease.join(name).to_str().expect("utf8").to_string();
+
+        // The stale canonical checkout, in one clone; the real work, pushed, in another.
+        let deploy = clone(&origin, "deploy");
+        run(
+            &deploy,
+            &["worktree", "add", "--quiet", "-b", branch, &at(short)],
+        );
+        let consumer = clone(&origin, "consumer");
+        let owned = lease.join("52bf7370-obs");
+        run(
+            &consumer,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                &at("52bf7370-obs"),
+            ],
+        );
+        std::fs::write(owned.join("lib.rs"), "fn a() { fixed() }\n").expect("write");
+        run(&owned, &["commit", "--quiet", "-am", "the fix"]);
+        run(&owned, &["push", "--quiet", "-u", "origin", "HEAD"]);
+        let canonical = lease.join(short);
+        assert!(
+            require_pushed_head(canonical.to_str().expect("utf8")).is_err(),
+            "the stale canonical checkout is refused, as before"
+        );
+
+        let accepted = validate_review_workspace(&owned, &lease, short, "o/r", &canonical)
+            .expect("the owned, pushed worktree on the card's branch and repo is accepted");
+        assert_eq!(
+            require_pushed_head(accepted.to_str().expect("utf8")).expect("pushed"),
+            branch
+        );
+
+        // Outside the lease zone: an arbitrary checkout never stands in.
+        let outside = dir.path().join("outside");
+        run(
+            &consumer,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "52bf7370/elsewhere",
+                outside.to_str().expect("utf8"),
+            ],
+        );
+        assert!(
+            validate_review_workspace(&outside, &lease, short, "o/r", &canonical)
+                .unwrap_err()
+                .contains("outside the lease zone")
+        );
+        // Another card's branch.
+        run(
+            &consumer,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "9999aaaa/other",
+                &at("9999aaaa"),
+            ],
+        );
+        assert!(validate_review_workspace(
+            &lease.join("9999aaaa"),
+            &lease,
+            short,
+            "o/r",
+            &canonical
+        )
+        .unwrap_err()
+        .contains("is on branch 9999aaaa/other"));
+        // The card's branch name, in a different repository.
+        let foreign = clone(&init_origin("foreign"), "foreign-clone");
+        run(
+            &foreign,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                &at("52bf7370-foreign"),
+            ],
+        );
+        assert!(validate_review_workspace(
+            &lease.join("52bf7370-foreign"),
+            &lease,
+            short,
+            "o/r",
+            &canonical
+        )
+        .unwrap_err()
+        .contains("not the card's repo"));
+        // Valid workspace, unpushed revision: accepted as the card's, refused by the gate.
+        run(
+            &owned,
+            &["commit", "--quiet", "--allow-empty", "-m", "unpushed"],
+        );
+        let still = validate_review_workspace(&owned, &lease, short, "o/r", &canonical)
+            .expect("still the card's");
+        assert!(
+            require_pushed_head(still.to_str().expect("utf8")).is_err(),
+            "the pushed-head gate is never skipped"
         );
     }
 }
