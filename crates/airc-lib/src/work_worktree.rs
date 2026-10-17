@@ -174,22 +174,11 @@ pub struct WorktreeSpec<'a> {
     pub start_point: Option<&'a str>,
 }
 
-/// Create the card's worktree, or report that it already exists.
-///
-/// Best-effort by contract: every error is a reason the convenience was not
-/// provided, never a reason to undo a claim.
-pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, String> {
-    let path = worktree_path_for(spec.card_id)
-        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
-    if path.exists() {
-        return Ok(WorktreeOutcome::Reused(path));
-    }
-    let root = path
-        .parent()
-        .ok_or_else(|| format!("worktree path {} has no parent", path.display()))?;
-    std::fs::create_dir_all(root)
-        .map_err(|e| format!("create lease zone {}: {e}", root.display()))?;
-
+/// The commit a new card checkout starts from, resolved ONCE in the source clone: the
+/// integration base the evidence records, the ref it came from, and the immutable sha.
+/// Shared by [`ensure_worktree`] and [`ensure_card_clone`], so both allocate from the same
+/// base by the same rule.
+fn resolve_allocation(spec: &WorktreeSpec<'_>) -> Result<(Option<String>, String, String), String> {
     // Resolve once before creation and give Git the immutable object, so a branch
     // moving concurrently cannot make the recorded base differ from the new tree.
     let mut integration_base = crate::work_repository::configured_base_branch(spec.repo);
@@ -231,6 +220,26 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
             .map_err(|e| format!("refresh integration base before allocation: {e}"))?;
     }
     let base = resolve_commit(spec.clone_path, &start_ref)?;
+    Ok((integration_base, start_ref, base))
+}
+
+/// Create the card's worktree, or report that it already exists.
+///
+/// Best-effort by contract: every error is a reason the convenience was not
+/// provided, never a reason to undo a claim.
+pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, String> {
+    let path = worktree_path_for(spec.card_id)
+        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
+    if path.exists() {
+        return Ok(WorktreeOutcome::Reused(path));
+    }
+    let root = path
+        .parent()
+        .ok_or_else(|| format!("worktree path {} has no parent", path.display()))?;
+    std::fs::create_dir_all(root)
+        .map_err(|e| format!("create lease zone {}: {e}", root.display()))?;
+
+    let (integration_base, start_ref, base) = resolve_allocation(spec)?;
     let mut cmd = airc_core::process::background("git");
     cmd.current_dir(spec.clone_path)
         .args(["worktree", "add", "-b", spec.branch])
@@ -254,6 +263,129 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
         integration_base,
         start_ref,
         creation_sha: base.clone(),
+    };
+    allocation::record(&path, &evidence)?;
+    init_submodules(&path)?;
+    Ok(WorktreeOutcome::Created(path))
+}
+
+/// Where this node's mirror of `repo` lives: `~/.airc/mirrors/<owner>/<repo>.git`. A pure
+/// function of the repo, like [`worktree_path_for`] is of the card (card d166e4f2).
+pub fn mirror_path_for(repo: &RepoId) -> Option<PathBuf> {
+    home_dir().map(|home| {
+        home.join(".airc")
+            .join("mirrors")
+            .join(format!("{}.git", repo.as_str()))
+    })
+}
+
+/// Run `git` in `dir`, returning trimmed stdout or the failure with its stderr.
+fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = airc_core::process::background("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// The node's bare mirror of `repo`: created once from `source` (a local clone of it), then
+/// refreshed from the REAL remote on every call. Card clones borrow its objects read-only
+/// ([`ensure_card_clone`]), so a card checkout never shares a writable file with the deploy
+/// checkout or with another card.
+///
+/// - `--no-hardlinks`: the mirror shares no inode with `source`. A hard link would make a
+///   write in the mirror a write in the deploy repo's pack (Opus on d166e4f2).
+/// - `extensions.preciousObjects` + `gc.auto 0`: git refuses any prune or gc that could drop
+///   an object, because card clones still reference it through their alternates. A dropped
+///   object would corrupt those clones silently.
+/// - `origin` is `source`'s own origin URL, so fetches come from the real remote and never
+///   from the deploy checkout's local branches.
+pub fn ensure_mirror(repo: &RepoId, source: &Path) -> Result<PathBuf, String> {
+    let path = mirror_path_for(repo)
+        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/mirrors/".to_string())?;
+    if !path.exists() {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("mirror path {} has no parent", path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        let origin = git_in(source, &["remote", "get-url", "origin"])?;
+        let source_str = source.to_string_lossy().to_string();
+        let path_str = path.to_string_lossy().to_string();
+        git_in(
+            parent,
+            &[
+                "clone",
+                "--quiet",
+                "--mirror",
+                "--no-hardlinks",
+                &source_str,
+                &path_str,
+            ],
+        )?;
+        git_in(&path, &["remote", "set-url", "origin", &origin])?;
+        git_in(&path, &["config", "core.repositoryformatversion", "1"])?;
+        git_in(&path, &["config", "extensions.preciousObjects", "true"])?;
+        git_in(&path, &["config", "gc.auto", "0"])?;
+    }
+    // Refs follow the real remote; objects are never pruned (preciousObjects).
+    git_in(&path, &["fetch", "--quiet", "--prune", "origin"])?;
+    Ok(path)
+}
+
+/// Create the card's checkout as its OWN repository, or report that it already exists.
+///
+/// The checkout lives at the same [`worktree_path_for`] path a worktree would, with its
+/// `.git` a directory INSIDE it (card d166e4f2, Joel: "do it right" instead of #5116's grant
+/// of the deploy repo's .git). Objects are borrowed from `spec.clone_path`, which must be
+/// the node's [`ensure_mirror`] of the repo, through `--shared` alternates. A confined
+/// resident then needs exactly one READ-only root (`<mirror>/objects`); every write she
+/// makes, objects included, lands in her own `.git`.
+///
+/// `origin` is set to the mirror's origin, the real remote, so the act-end carry pushes
+/// (a local-path origin never carries).
+pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, String> {
+    let path = worktree_path_for(spec.card_id)
+        .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
+    if path.exists() {
+        return Ok(WorktreeOutcome::Reused(path));
+    }
+    let root = path
+        .parent()
+        .ok_or_else(|| format!("checkout path {} has no parent", path.display()))?;
+    std::fs::create_dir_all(root)
+        .map_err(|e| format!("create lease zone {}: {e}", root.display()))?;
+    let (integration_base, start_ref, base) = resolve_allocation(spec)?;
+    let origin = git_in(spec.clone_path, &["remote", "get-url", "origin"])?;
+    let mirror_str = spec.clone_path.to_string_lossy().to_string();
+    let path_str = path.to_string_lossy().to_string();
+    git_in(
+        root,
+        &[
+            "clone",
+            "--quiet",
+            "--shared",
+            "--no-checkout",
+            &mirror_str,
+            &path_str,
+        ],
+    )?;
+    git_in(&path, &["remote", "set-url", "origin", &origin])?;
+    git_in(&path, &["checkout", "--quiet", "-b", spec.branch, &base])?;
+    let evidence = AllocationEvidence {
+        repo: spec.repo.clone(),
+        requested_branch: spec.branch.to_owned(),
+        integration_base,
+        start_ref,
+        creation_sha: base,
     };
     allocation::record(&path, &evidence)?;
     init_submodules(&path)?;
@@ -792,5 +924,171 @@ mod tests {
                 );
             });
         });
+    }
+
+    // what this catches (card d166e4f2): a card checkout that writes into, or shares a
+    // writable file with, the repo it was cut from. #5116 had to grant the DEPLOY repo's .git
+    // because card worktrees were registered there. A card clone must own its .git, borrow
+    // objects only from a disposable mirror, push to the real remote, never touch the source,
+    // and survive the mirror losing refs.
+    #[test]
+    fn a_card_clone_owns_its_git_and_borrows_only_from_a_precious_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let git = |dir: &Path, args: &[&str]| git_in(dir, args).unwrap_or_else(|e| panic!("{e}"));
+        let remote = root.join("remote.git");
+        git(
+            &root,
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "--initial-branch=canary",
+                remote.to_str().unwrap(),
+            ],
+        );
+        let source = root.join("source");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ],
+        );
+        git(&source, &["config", "user.email", "t@t"]);
+        git(&source, &["config", "user.name", "t"]);
+        std::fs::write(source.join("lib.rs"), "fn a() {}\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "base"]);
+        git(&source, &["push", "--quiet", "origin", "HEAD:canary"]);
+        let source_refs = git(&source, &["for-each-ref"]);
+        let home = root.join("home");
+        std::fs::create_dir(&home).unwrap();
+        temp_env::with_var("HOME", Some(&home), || {
+            let repo = RepoId::new("o/r").unwrap();
+            let mirror = ensure_mirror(&repo, &source).expect("mirror is created");
+            assert_eq!(mirror, home.join(".airc/mirrors/o/r.git"));
+            assert_eq!(
+                git(&mirror, &["remote", "get-url", "origin"]),
+                remote.to_str().unwrap(),
+                "the mirror fetches from the real remote"
+            );
+            assert_eq!(
+                git(&mirror, &["config", "extensions.preciousObjects"]),
+                "true"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let inodes = |dir: &Path| -> std::collections::HashSet<u64> {
+                    walkdir_files(dir)
+                        .into_iter()
+                        .map(|f| std::fs::metadata(f).unwrap().ino())
+                        .collect()
+                };
+                assert!(
+                    inodes(&source.join(".git/objects"))
+                        .is_disjoint(&inodes(&mirror.join("objects"))),
+                    "--no-hardlinks: the mirror shares no inode with the source"
+                );
+            }
+
+            let card = WorkCardId::from_u128(0xd166_e4f2_0000_0000_0000_0000_0000_0001);
+            let branch = "d166e4f2/fix";
+            let spec = WorktreeSpec {
+                card_id: card,
+                repo: &repo,
+                clone_path: &mirror,
+                branch,
+                start_point: Some("refs/heads/canary"),
+            };
+            let path = ensure_card_clone(&spec)
+                .expect("card clone is created")
+                .path()
+                .to_path_buf();
+            assert_eq!(path, worktree_path_for(card).unwrap());
+            assert!(
+                path.join(".git").is_dir(),
+                "the checkout owns its .git: a directory, never a gitdir file"
+            );
+            let alternates =
+                std::fs::read_to_string(path.join(".git/objects/info/alternates")).unwrap();
+            assert_eq!(
+                alternates.trim(),
+                mirror.join("objects").to_str().unwrap(),
+                "it borrows from exactly the mirror's objects"
+            );
+            assert_eq!(
+                git(&path, &["remote", "get-url", "origin"]),
+                remote.to_str().unwrap(),
+                "origin is the real remote, so the carry pushes"
+            );
+            assert_eq!(git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]), branch);
+
+            git(&path, &["config", "user.email", "t@t"]);
+            git(&path, &["config", "user.name", "t"]);
+            std::fs::write(path.join("lib.rs"), "fn a() { fixed() }\n").unwrap();
+            git(&path, &["commit", "--quiet", "-am", "the fix"]);
+            let fix = git(&path, &["rev-parse", "HEAD"]);
+            git(&path, &["push", "--quiet", "-u", "origin", "HEAD"]);
+            assert_eq!(
+                git(&remote, &["rev-parse", branch]),
+                fix,
+                "the push lands on the real remote"
+            );
+            assert!(
+                git_in(&mirror, &["cat-file", "-e", &format!("{fix}^{{commit}}")]).is_err(),
+                "her new objects live in her own .git, not the mirror"
+            );
+            assert_eq!(
+                git(&source, &["for-each-ref"]),
+                source_refs,
+                "the source repo is never written"
+            );
+            assert!(
+                !source.join(".git/worktrees").exists(),
+                "no worktree is registered in the source"
+            );
+            assert!(matches!(
+                ensure_card_clone(&spec),
+                Ok(WorktreeOutcome::Reused(_))
+            ));
+
+            // The mirror loses the ref her base came from; prune and pack deletion are both refused,
+            // so her clone still reads its history through the alternates.
+            let base = git(&path, &["rev-parse", "HEAD~1"]);
+            git(&mirror, &["update-ref", "-d", "refs/heads/canary"]);
+            assert!(
+                git_in(&mirror, &["prune"]).is_err(),
+                "preciousObjects refuses a prune"
+            );
+            assert!(
+                git_in(&mirror, &["repack", "-a", "-d", "-k", "--quiet"]).is_err(),
+                "preciousObjects refuses deleting packs too, so no repack can drop her objects"
+            );
+            assert_eq!(
+                git(&path, &["log", "--format=%H", "-1", &base]),
+                base,
+                "her base is still readable"
+            );
+        });
+    }
+
+    fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p)
+                } else {
+                    out.push(p)
+                }
+            }
+        }
+        out
     }
 }
