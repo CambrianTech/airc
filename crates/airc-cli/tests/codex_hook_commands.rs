@@ -398,12 +398,7 @@ fn codex_hook_poll_waits_for_one_new_event() {
     run_ok(&home, &["send", "delayed poll event"]);
 
     let output = child.wait_with_output().expect("wait for poll");
-    assert!(
-        output.status.success(),
-        "poll failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, "poll");
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
     assert!(stdout.contains("delayed poll event"));
 }
@@ -693,13 +688,7 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .expect("airc-core command must spawn");
-    assert!(
-        output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, &format!("airc-core {:?}", args));
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 
@@ -711,13 +700,7 @@ fn run_ok_with_client(home: &Path, client_id: &str, args: &[&str]) -> String {
         .args(args)
         .output()
         .expect("airc-core command must spawn");
-    assert!(
-        output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, &format!("airc-core {:?}", args));
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 
@@ -738,13 +721,7 @@ fn run_hook(home: &Path, args: &[&str], stdin: &str) -> String {
         .write_all(stdin.as_bytes())
         .expect("write hook stdin");
     let output = child.wait_with_output().expect("wait for hook");
-    assert!(
-        output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, &format!("airc-core {:?}", args));
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 
@@ -766,13 +743,7 @@ fn run_hook_with_client(home: &Path, client_id: &str, args: &[&str], stdin: &str
         .write_all(stdin.as_bytes())
         .expect("write hook stdin");
     let output = child.wait_with_output().expect("wait for hook");
-    assert!(
-        output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, &format!("airc-core {:?}", args));
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 

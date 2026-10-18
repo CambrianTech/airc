@@ -279,3 +279,47 @@ pub fn wait_pid_gone(pid: u32, budget: Duration) -> bool {
     }
     !pid_alive(pid)
 }
+
+/// How a child process ended, in words a failed assert can carry: its exit code, the signal
+/// that killed it (unix), or on Windows the NTSTATUS a crash leaves, named when it is one of
+/// the crash codes. Card 81d11df6: a Windows CI tab's `airc send` failed with EMPTY stdout
+/// and stderr and the assert printed nothing else, so nobody could tell a crash (a stack
+/// overflow ends the process silently, 0xC00000FD) from an error path that forgot to speak.
+pub fn describe_exit(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("killed by signal {signal}");
+        }
+    }
+    match status.code() {
+        #[cfg(windows)]
+        Some(code) if (code as u32) >= 0xC000_0000 => {
+            let name = match code as u32 {
+                0xC000_00FD => " STATUS_STACK_OVERFLOW",
+                0xC000_0005 => " STATUS_ACCESS_VIOLATION",
+                0xC000_0409 => " STATUS_STACK_BUFFER_OVERRUN (abort/fail-fast)",
+                0xC000_013A => " STATUS_CONTROL_C_EXIT",
+                _ => "",
+            };
+            format!("crashed with NTSTATUS {:#010X}{name}", code as u32)
+        }
+        Some(code) => format!("exit code {code}"),
+        None => "no exit code".to_string(),
+    }
+}
+
+/// Assert a finished child succeeded; on failure the message carries HOW it ended
+/// ([`describe_exit`]) beside its stdout and stderr. The one success check the CLI tests
+/// share, so no assert can drop the exit status again.
+#[track_caller]
+pub fn assert_success(output: &std::process::Output, what: &str) {
+    assert!(
+        output.status.success(),
+        "{what} failed ({}): stdout={} stderr={}",
+        describe_exit(&output.status),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
