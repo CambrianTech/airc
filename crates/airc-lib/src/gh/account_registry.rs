@@ -413,7 +413,7 @@ struct PublishedState {
 
 impl GhAccountRegistryStore {
     /// Test seam: the unchanged-publish window has passed (it is wall-clock based).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn age_out_last_publish(&self) {
         if let Some(last) = self
             .last_published
@@ -1044,6 +1044,11 @@ impl AccountRegistryStore for GhAccountRegistryStore {
         // (e.g. a stale gist from a previous account) are skipped by
         // the merge, not surfaced as errors.
         let entries = self.list_registry_gists().await?;
+        // The list is the whole set: a gist no longer on it (deleted, gc'd) leaves the cache.
+        self.read_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|id, _| entries.iter().any(|e| &e.id == id));
         let mut documents = Vec::with_capacity(entries.len());
         for entry in &entries {
             if let Some(document) = self.fetch_gist_document(entry).await? {
