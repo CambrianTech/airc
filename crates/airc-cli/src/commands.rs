@@ -2573,18 +2573,27 @@ async fn refresh_routes_once(
                     // Re-binding the persisted port keeps every stale card
                     // valid; OS-assigned is only the first-election / port-
                     // stolen fallback, and whatever binds gets persisted.
+                    // Publish-on-bind only when the bind CHANGED what this node advertises.
+                    // Holding the relay role re-runs this election every tick; nudging the
+                    // registry on every run woke its loop the instant it finished sleeping
+                    // out a gh-governor denial, so the Registry budget never refilled, the
+                    // card never published and peers never found this node (the M5,
+                    // 2026-10-18: ~2 gh calls/s from the daemon, 15,423 Registry refusals,
+                    // 181,309 elections logged, 0 route candidates).
+                    let advertised_before = airc.route_endpoints().ok();
                     match become_relay_with_stable_port(airc, lan_ip, tailscale_ip).await {
                         Ok(addr) => {
-                            eprintln!(
-                                "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
-                                 self-elected as a relay (listening {addr}) and advertised it on \
-                                 this node's routable IP(s) (#1247)"
-                            );
-                            // Self-healing join — publish-on-bind: the relay
-                            // listener just bound; propagate the new relay
-                            // endpoint to the rendezvous now instead of
-                            // waiting up to a full registry cadence.
-                            endpoint_resync.notify_one();
+                            if airc.route_endpoints().ok() != advertised_before {
+                                eprintln!(
+                                    "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
+                                     self-elected as a relay (listening {addr}) and advertised it on \
+                                     this node's routable IP(s) (#1247)"
+                                );
+                                // Self-healing join — publish-on-bind: the relay listener
+                                // bound a NEW endpoint; propagate it to the rendezvous now
+                                // instead of waiting up to a full registry cadence.
+                                endpoint_resync.notify_one();
+                            }
                         }
                         Err(error) => eprintln!(
                             "airc daemon: relay self-election failed ({error}); \
