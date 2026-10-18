@@ -384,9 +384,47 @@ pub struct GhAccountRegistryStore {
     /// shared account budget (`~/.airc/gh/`) so it coordinates with the
     /// cli governor and every other scope; tests inject an isolated one.
     budget: crate::gh::governor::GhBudget,
+    /// Each peer gist's document as last read, keyed by gist id, with the `updated_at` it
+    /// was read at. One registry tick lists every gist (one call, which already carries
+    /// `updated_at`) and then fetched EVERY gist again (one call each) whether or not it
+    /// had changed. With four identities on one machine each ticking over eight gists, the
+    /// ticks alone filled the shared Registry budget, so every refresh and publish was
+    /// refused and the node never learned a peer (the M5, 2026-10-18: 15,423 refusals,
+    /// 0 route candidates). An unchanged gist is now read from here.
+    read_cache: Arc<std::sync::Mutex<ReadCache>>,
+    /// What this store last published that peers act on (channels, each peer's identity and
+    /// endpoints; never timestamps), when, and the gist id + filename it went to. A publish
+    /// that would change none of it is skipped until a third of the freshness TTL has passed
+    /// (three refresh chances per TTL), so the gist's `updated_at` stops moving every tick
+    /// and every peer's read cache hits. The proven id + filename also spare the probe.
+    last_published: Arc<std::sync::Mutex<Option<PublishedState>>>,
+}
+
+/// Peer gist documents as last read: gist id -> (`updated_at` read at, document).
+type ReadCache = std::collections::HashMap<String, (String, Option<AccountRegistryDocument>)>;
+
+#[derive(Debug, Clone)]
+struct PublishedState {
+    substance: String,
+    at_ms: u64,
+    gist_id: String,
+    filename: String,
 }
 
 impl GhAccountRegistryStore {
+    /// Test seam: the unchanged-publish window has passed (it is wall-clock based).
+    #[cfg(test)]
+    fn age_out_last_publish(&self) {
+        if let Some(last) = self
+            .last_published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            last.at_ms = 0;
+        }
+    }
+
     /// Construct a new store. The `store` handle is where this
     /// adapter persists the per-mesh-identity gist-id sentinel that
     /// lets subsequent publishes update the same gist rather than
@@ -402,6 +440,8 @@ impl GhAccountRegistryStore {
             scope_home: scope_home.into(),
             token_override: None,
             budget: crate::gh::governor::GhBudget::account_default(),
+            read_cache: Arc::default(),
+            last_published: Arc::default(),
         }
     }
 
@@ -583,7 +623,7 @@ impl GhAccountRegistryStore {
                     // Filter to gists whose description matches and which
                     // contain a registry file. Returns one line of JSON
                     // per match: {"id":"...","filename":"..."}.
-                    "[.[] | select(.description == \"airc-account-mesh-registry\") | {id, filename: (.files | keys | .[0])}] | .[]",
+                    "[.[] | select(.description == \"airc-account-mesh-registry\") | {id, filename: (.files | keys | .[0]), updated_at}] | .[]",
                 ],
                 None,
             )
@@ -604,6 +644,36 @@ impl GhAccountRegistryStore {
     /// failures return `None` (foreign or corrupt gists are skipped,
     /// not fatal — the reader merges what it can read).
     async fn fetch_gist_document(
+        &self,
+        entry: &GistListEntry,
+    ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
+        // Unchanged since the last read (the list call already told us): no gh call.
+        if !entry.updated_at.is_empty() {
+            if let Some((at, document)) = self
+                .read_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&entry.id)
+            {
+                if *at == entry.updated_at {
+                    return Ok(document.clone());
+                }
+            }
+        }
+        let document = self.fetch_gist_document_uncached(entry).await?;
+        if !entry.updated_at.is_empty() {
+            self.read_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    entry.id.clone(),
+                    (entry.updated_at.clone(), document.clone()),
+                );
+        }
+        Ok(document)
+    }
+
+    async fn fetch_gist_document_uncached(
         &self,
         entry: &GistListEntry,
     ) -> Result<Option<AccountRegistryDocument>, AccountRegistryError> {
@@ -866,9 +936,39 @@ impl AccountRegistryStore for GhAccountRegistryStore {
             ));
         }
         let document = &owned;
+        let substance = serde_json::json!({
+            "channels": document.channels,
+            "peers": document.peers.iter().map(|p| serde_json::json!({
+                "spec": p.peer_spec, "endpoints": p.endpoints,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let proven = self
+            .last_published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(last) = &proven {
+            if last.substance == substance
+                && now_ms.saturating_sub(last.at_ms) < DEFAULT_PEER_FRESHNESS_TTL_MS / 3
+            {
+                return Ok(());
+            }
+        }
         let body = serde_json::to_string_pretty(document).map_err(|error| {
             AccountRegistryError::Adapter(format!("serialize registry: {error}"))
         })?;
+        let remember = |gist_id: &str, filename: &str| {
+            *self
+                .last_published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PublishedState {
+                substance: substance.clone(),
+                at_ms: now_ms,
+                gist_id: gist_id.to_owned(),
+                filename: filename.to_owned(),
+            });
+        };
 
         // Find-or-update (card d793c242 item 2): same writer -> same
         // gist, update in place. Resolution order:
@@ -880,12 +980,21 @@ impl AccountRegistryStore for GhAccountRegistryStore {
         //   3. genuinely absent -> create ONE gist with the writer
         //      filename and persist the sentinel.
         if let Some(id) = self.load_gist_id(&document.mesh_identity).await? {
+            // This process already proved this gist and its filename: edit without a probe.
+            if let Some(last) = proven.as_ref().filter(|last| last.gist_id == id) {
+                if self.edit_gist(&id, &last.filename, &body).await.is_ok() {
+                    remember(&id, &last.filename);
+                    return Ok(());
+                }
+            }
             match self.probe_gist(&id).await? {
                 GistProbe::Found(filename) => {
                     // A transient edit failure does not invalidate a proven
                     // existing gist. Preserve both the sentinel and typed
                     // governor backoff; the next probe detects real deletion.
-                    return self.edit_gist(&id, &filename, &body).await;
+                    self.edit_gist(&id, &filename, &body).await?;
+                    remember(&id, &filename);
+                    return Ok(());
                 }
                 GistProbe::Gone => {
                     // Deleted out-of-band; fall through to find-or-create.
@@ -984,6 +1093,10 @@ impl AccountRegistryStore for GhAccountRegistryStore {
 struct GistListEntry {
     id: String,
     filename: String,
+    /// The gist's last write, from the same list call: a document whose `updated_at` has
+    /// not moved since the last read is not fetched again.
+    #[serde(default)]
+    updated_at: String,
 }
 
 /// Pull the gist id out of `gh gist create`'s stdout. The CLI
@@ -1621,6 +1734,16 @@ exit 0
             store.publish(&doc).await.unwrap();
             assert_eq!(stub.create_count(), 1);
             std::fs::remove_file(stub.state.join("stubgist1.filename")).unwrap();
+            // An unchanged document inside a third of the freshness TTL is not republished
+            // (what stopped the Registry budget starving, the M5 2026-10-18), so the deletion
+            // is not seen yet; once the window passes the next publish finds and recreates it.
+            store.publish(&doc).await.unwrap();
+            assert_eq!(
+                stub.create_count(),
+                1,
+                "unchanged inside the window: skipped"
+            );
+            store.age_out_last_publish();
             store.publish(&doc).await.unwrap();
             assert_eq!(stub.create_count(), 2);
             assert_eq!(
