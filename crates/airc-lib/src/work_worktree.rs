@@ -298,62 +298,22 @@ const GIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 /// Run `git` in `dir`, bounded by [`GIT_BOUND`], never prompting (`GIT_TERMINAL_PROMPT=0`,
 /// stdin closed). Returns trimmed stdout, or the failure with its stderr or the timeout.
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    use std::io::Read;
     let shown = || format!("git {} in {}", args.join(" "), dir.display());
-    let mut child = airc_core::process::background("git")
+    let mut command = airc_core::process::background("git");
+    command
         .current_dir(dir)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", shown()))?;
-    // Drain both pipes while waiting, so a chatty git cannot block on a full pipe.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_string(&mut text);
-            }
-            text
-        })
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let deadline = std::time::Instant::now() + GIT_BOUND;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{} did not finish within {} s and was killed",
-                    shown(),
-                    GIT_BOUND.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(e) => return Err(format!("wait for {}: {e}", shown())),
-        }
-    };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    if !status.success() {
-        return Err(format!("{} failed: {}", shown(), stderr.trim()));
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = airc_core::process::run_bounded(command, GIT_BOUND)
+        .map_err(|error| format!("{} {error}", shown()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed: {}",
+            shown(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    Ok(stdout.trim().to_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// Is `path` a LINKED worktree (its `.git` a file naming a gitdir elsewhere), as card
