@@ -1594,6 +1594,30 @@ pub async fn run_submit(
 /// attach to). Only the holder submits. The bytes are retained in the scope's blob store
 /// BEFORE their hash is published (BigMama on #1548): a reviewer, grader or lift reads a
 /// submission by hash, and the patch file can change after this call.
+/// The card on `board`, or a refusal that says WHERE it looked (card 8ffcf055). The bare
+/// "not visible in board projection" sent an agent through three retries on 2026-10-18:
+/// the scope's current room was #general and the card lived in #continuum-dev, under
+/// another `.airc` home. `searched` is the room the board came from, or `None` for every
+/// subscribed room. One lookup for every verb that needs a card from a board.
+pub(crate) fn board_card<'b>(
+    board: &'b airc_work::WorkBoardProjection,
+    card_id: airc_lib::WorkCardId,
+    searched: Option<&airc_lib::Room>,
+    scope_home: &Path,
+) -> Result<&'b airc_work::WorkCard, String> {
+    board.card(card_id).ok_or_else(|| {
+        let place = searched.map_or_else(
+            || "any subscribed room".to_string(),
+            |room| format!("room #{}", room.name),
+        );
+        format!(
+            "card {card_id} is not on the board of {place} (scope {}); if it lives \
+             elsewhere, pass --room <name> or --home <scope dir>",
+            scope_home.display()
+        )
+    })
+}
+
 pub(crate) async fn submit_patch(
     airc: &airc_lib::Airc,
     home: &Path,
@@ -2683,6 +2707,29 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
+    // what this catches (card 8ffcf055): a card missing from a board refused without saying
+    // WHERE it looked. An agent took three retries on 2026-10-18 to learn the scope's room
+    // was #general and the card lived in #continuum-dev under another `.airc` home.
+    #[test]
+    fn a_missing_card_names_the_room_and_scope_it_searched() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let room = airc_lib::Room::from_name(home.path(), "general").expect("room");
+        let board = airc_work::WorkBoardProjection::default();
+        let card = airc_lib::WorkCardId::from_u128(0x8ffc_f055);
+        let in_room = super::board_card(&board, card, Some(&room), home.path()).unwrap_err();
+        assert!(in_room.contains("room #general"), "{in_room}");
+        assert!(
+            in_room.contains(&home.path().display().to_string()),
+            "{in_room}"
+        );
+        assert!(
+            in_room.contains("--room") && in_room.contains("--home"),
+            "{in_room}"
+        );
+        let anywhere = super::board_card(&board, card, None, home.path()).unwrap_err();
+        assert!(anywhere.contains("any subscribed room"), "{anywhere}");
+    }
+
     // what this catches (card 9c3ab08d; BigMama on #1548): a submission naming a hash that
     // nothing holds, or an empty patch accepted as reviewable. The patch is retained first,
     // the published hash reads its exact bytes back, and empty is refused.
