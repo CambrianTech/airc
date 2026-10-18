@@ -1622,6 +1622,20 @@ pub(crate) async fn submit_patch(
         }
     };
     let artifact = retain_patch(&store, bytes)?;
+    // Submitting is proof the holder is alive: renew her own claim first, so a build that
+    // outlived the lease is not refused as expired (four times on IntelMac, 2026-10-18;
+    // card 41dc7705). The projection applies a heartbeat only while its claim is still the
+    // card's claim (projection/apply.rs `apply_claim_heartbeat`), so a card someone else
+    // has taken over is never renewed by this; its submission is refused as WrongClaim.
+    airc.heartbeat_work_claim_in(
+        room,
+        airc_lib::HeartbeatWorkClaim {
+            card_id,
+            claim_id,
+            ttl_ms: crate::work_cli::CLAIM_LEASE_MS,
+        },
+    )
+    .await?;
     let instance = instance.unwrap_or_else(|| card.repo.to_string());
     let submission = airc
         .submit_work_in(
