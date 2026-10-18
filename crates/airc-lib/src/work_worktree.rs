@@ -147,12 +147,20 @@ pub fn try_lifecycle_lock(card_id: WorkCardId) -> Result<Option<WorktreeLifecycl
 pub enum WorktreeOutcome {
     Created(PathBuf),
     Reused(PathBuf),
+    /// A held linked worktree (the pre-d166e4f2 shape) was replaced by a card clone on the
+    /// same branch and HEAD; the old tree was moved aside, whole, to `retired`.
+    Migrated {
+        path: PathBuf,
+        retired: PathBuf,
+    },
 }
 
 impl WorktreeOutcome {
     pub fn path(&self) -> &Path {
         match self {
-            WorktreeOutcome::Created(p) | WorktreeOutcome::Reused(p) => p,
+            WorktreeOutcome::Created(p)
+            | WorktreeOutcome::Reused(p)
+            | WorktreeOutcome::Migrated { path: p, .. } => p,
         }
     }
 }
@@ -349,8 +357,8 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Is `path` a LINKED worktree (its `.git` a file naming a gitdir elsewhere), as card
-/// checkouts were before card d166e4f2? A card clone's `.git` is a directory. Card staging
-/// asks this to decide whether a held card still needs migrating; nobody else re-derives it.
+/// checkouts were before card d166e4f2? A card clone's `.git` is a directory.
+/// [`ensure_card_clone`] asks this to decide whether a held card still needs migrating.
 pub fn is_linked_worktree(path: &Path) -> bool {
     path.join(".git").is_file()
 }
@@ -428,6 +436,18 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
     let path = worktree_path_for(spec.card_id)
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
     if path.exists() {
+        if is_linked_worktree(&path) {
+            match migrate_linked_checkout(spec.clone_path, &path) {
+                Ok(Some(retired)) => return Ok(WorktreeOutcome::Migrated { path, retired }),
+                Ok(None) => {}
+                // The old tree is untouched on every error path, and its file tools still work,
+                // so the resident keeps it; the reason is said, not hidden.
+                Err(error) => tracing::warn!(
+                    checkout = %path.display(), %error,
+                    "linked card checkout could not be migrated to a card clone; reusing it"
+                ),
+            }
+        }
         return Ok(WorktreeOutcome::Reused(path));
     }
     let root = path
@@ -462,6 +482,140 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
     allocation::record(&path, &evidence)?;
     init_submodules(&path)?;
     Ok(WorktreeOutcome::Created(path))
+}
+
+/// Replace a held linked worktree with a card clone, when nothing can be lost by doing so.
+///
+/// Opus measured on the M5, 2026-10-17: all 93 checkouts under `~/.airc/worktrees` were linked
+/// worktrees, including every card a resident held. Reusing them would keep their gitdir in the
+/// source repo's `.git`, which a confined resident cannot write, so her git would fail again.
+///
+/// It migrates only a tree that is clean, on a branch, and whose HEAD is on the real remote
+/// (reachable from an `origin/*` ref of the fresh clone). Then:
+/// 1. clone from `mirror` into `.migrating/<short>`, check out the same branch at the same HEAD,
+///    and carry the allocation evidence (creation base included) over;
+/// 2. move the old tree, whole, to `.retired/<short>-<unix secs>`, then the clone into place.
+///    If the second move fails, the old tree is moved back.
+///
+/// Nothing is deleted except our own half-made staging clone, and the source repo is never
+/// written: its `.git/worktrees/<id>` entry becomes prunable metadata. `Ok(None)` means kept,
+/// with the reason logged.
+fn migrate_linked_checkout(mirror: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
+    let keep = |reason: &str| {
+        tracing::warn!(
+            checkout = %path.display(), reason,
+            "linked card checkout kept: its git still needs the source repo's .git"
+        );
+        Ok(None)
+    };
+    if !git_in(path, &["status", "--porcelain"])?.is_empty() {
+        return keep("uncommitted changes");
+    }
+    let Ok(branch) = git_in(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
+        return keep("detached HEAD");
+    };
+    let head = git_in(path, &["rev-parse", "HEAD"])?;
+    let evidence = allocation_evidence(path)?;
+    let creation = resolve_commit(path, CREATION_BASE_REF).ok();
+    let (zone, name) = match (path.parent(), path.file_name()) {
+        (Some(zone), Some(name)) => (zone, name.to_string_lossy().into_owned()),
+        _ => return Err(format!("checkout path {} has no parent", path.display())),
+    };
+    let staged = zone.join(".migrating").join(&name);
+    let discard = |staged: &Path| {
+        if staged.exists() {
+            // Only ever our own staging clone, never a checkout anyone worked in.
+            let _ = std::fs::remove_dir_all(staged);
+        }
+    };
+    discard(&staged);
+    std::fs::create_dir_all(zone.join(".migrating"))
+        .map_err(|e| format!("create {}: {e}", zone.join(".migrating").display()))?;
+    let staged_str = staged.to_string_lossy().into_owned();
+    let mirror_str = mirror.to_string_lossy().into_owned();
+    let prepared = (|| -> Result<bool, String> {
+        git_in(
+            zone,
+            &[
+                "clone",
+                "--quiet",
+                "--shared",
+                "--no-checkout",
+                &mirror_str,
+                &staged_str,
+            ],
+        )?;
+        let pushed = git_in(
+            &staged,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                &head,
+                "refs/remotes/origin",
+            ],
+        )
+        .unwrap_or_default();
+        if pushed.is_empty() {
+            return Ok(false);
+        }
+        let origin = git_in(mirror, &["remote", "get-url", "origin"])?;
+        git_in(&staged, &["remote", "set-url", "origin", &origin])?;
+        git_in(&staged, &["checkout", "--quiet", "-b", &branch, &head])?;
+        let upstream = format!("origin/{branch}");
+        if git_in(&staged, &["rev-parse", "--verify", "--quiet", &upstream]).is_ok() {
+            git_in(
+                &staged,
+                &["branch", "--quiet", "--set-upstream-to", &upstream],
+            )?;
+        }
+        match (&evidence, &creation) {
+            (Some(evidence), _) => allocation::record(&staged, evidence)?,
+            (None, Some(base)) => {
+                git_in(&staged, &["update-ref", CREATION_BASE_REF, base, ""])?;
+            }
+            // A legacy tree with no anchor stays without one: never backfill from HEAD.
+            (None, None) => {}
+        }
+        init_submodules(&staged)?;
+        Ok(true)
+    })();
+    match prepared {
+        Ok(true) => {}
+        Ok(false) => {
+            discard(&staged);
+            return keep("HEAD is not on the remote");
+        }
+        Err(error) => {
+            discard(&staged);
+            return Err(error);
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let retired = zone.join(".retired").join(format!("{name}-{stamp}"));
+    std::fs::create_dir_all(zone.join(".retired"))
+        .map_err(|e| format!("create {}: {e}", zone.join(".retired").display()))?;
+    std::fs::rename(path, &retired).map_err(|e| {
+        discard(&staged);
+        format!(
+            "move {} aside to {}: {e}",
+            path.display(),
+            retired.display()
+        )
+    })?;
+    if let Err(e) = std::fs::rename(&staged, path) {
+        let restored = std::fs::rename(&retired, path);
+        discard(&staged);
+        return Err(format!(
+            "move card clone into {}: {e}; old tree restored: {}",
+            path.display(),
+            restored.is_ok()
+        ));
+    }
+    Ok(Some(retired))
 }
 
 /// Initialise submodules in a freshly created worktree.
@@ -1180,6 +1334,151 @@ mod tests {
                 base,
                 "her base is still readable"
             );
+        });
+    }
+
+    // what this catches (card 2209dee4, Opus on #5132): every checkout a resident held on the M5
+    // was a linked worktree, and reusing one keeps her gitdir in the source repo's .git. A clean
+    // tree whose HEAD is on the remote must become a card clone on the same branch and HEAD,
+    // keeping its allocation evidence; a dirty or unpushed tree must be kept, untouched.
+    #[test]
+    fn a_held_linked_worktree_migrates_only_when_nothing_can_be_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = if cfg!(windows) {
+            tmp.path().to_path_buf()
+        } else {
+            tmp.path().canonicalize().unwrap()
+        };
+        let git = |dir: &Path, args: &[&str]| git_in(dir, args).unwrap_or_else(|e| panic!("{e}"));
+        let remote = root.join("remote.git");
+        git(
+            &root,
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "--initial-branch=canary",
+                remote.to_str().unwrap(),
+            ],
+        );
+        let source = root.join("source");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ],
+        );
+        let who = |dir: &Path| {
+            git(dir, &["config", "user.email", "t@t"]);
+            git(dir, &["config", "user.name", "t"]);
+        };
+        who(&source);
+        std::fs::write(source.join("lib.rs"), "fn a() {}\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "base"]);
+        git(&source, &["push", "--quiet", "origin", "HEAD:canary"]);
+        let home = root.join("home");
+        std::fs::create_dir(&home).unwrap();
+        temp_env::with_var("HOME", Some(&home), || {
+            let repo = RepoId::new("o/r").unwrap();
+            let legacy = |n: u128, branch: &str| {
+                let card = WorkCardId::from_u128((0x2209_dee0 + n) << 96);
+                let spec = WorktreeSpec {
+                    card_id: card,
+                    repo: &repo,
+                    clone_path: &source,
+                    branch,
+                    start_point: Some("origin/canary"),
+                };
+                let path = ensure_worktree(&spec).unwrap().path().to_path_buf();
+                assert!(is_linked_worktree(&path));
+                who(&path);
+                std::fs::write(path.join("lib.rs"), format!("fn a() {{ {n} }}\n")).unwrap();
+                git(&path, &["commit", "--quiet", "-am", "work"]);
+                (card, path)
+            };
+            let (pushed_card, pushed) = legacy(1, "2209dee4/pushed");
+            git(&pushed, &["push", "--quiet", "origin", "HEAD"]);
+            let (unpushed_card, unpushed) = legacy(2, "2209dee4/unpushed");
+            let (dirty_card, dirty) = legacy(3, "2209dee4/dirty");
+            git(&dirty, &["push", "--quiet", "origin", "HEAD"]);
+            std::fs::write(dirty.join("wip.txt"), "uncommitted").unwrap();
+            let pushed_head = git(&pushed, &["rev-parse", "HEAD"]);
+            let pushed_evidence = allocation_evidence(&pushed).unwrap().expect("recorded");
+            // Staging refreshes the mirror before every checkout, so it has the pushes.
+            let mirror = ensure_mirror(&repo, &source).unwrap();
+            let stage = |card: WorkCardId, branch: &str| {
+                ensure_card_clone(&WorktreeSpec {
+                    card_id: card,
+                    repo: &repo,
+                    clone_path: &mirror,
+                    branch,
+                    start_point: None,
+                })
+                .unwrap()
+            };
+
+            let WorktreeOutcome::Migrated { path, retired } = stage(pushed_card, "2209dee4/pushed")
+            else {
+                panic!("a clean, pushed linked worktree migrates");
+            };
+            assert_eq!(path, pushed);
+            assert!(!is_linked_worktree(&path), "it is a card clone now");
+            assert_eq!(
+                git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+                "2209dee4/pushed"
+            );
+            assert_eq!(git(&path, &["rev-parse", "HEAD"]), pushed_head, "same HEAD");
+            assert_eq!(
+                git(&path, &["status", "--porcelain"]),
+                "",
+                "checked out clean"
+            );
+            assert_eq!(
+                git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+                "origin/2209dee4/pushed"
+            );
+            assert_eq!(
+                allocation_evidence(&path).unwrap(),
+                Some(pushed_evidence),
+                "the allocation evidence and creation base carry over"
+            );
+            assert_eq!(
+                git(&path, &["remote", "get-url", "origin"]),
+                remote.to_str().unwrap()
+            );
+            assert!(
+                retired.starts_with(home.join(".airc/worktrees/.retired"))
+                    && is_linked_worktree(&retired),
+                "the old tree is moved aside whole, never deleted"
+            );
+            let staging_is_empty = || {
+                std::fs::read_dir(home.join(".airc/worktrees/.migrating"))
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true)
+            };
+            assert!(staging_is_empty());
+            assert!(matches!(
+                stage(pushed_card, "2209dee4/pushed"),
+                WorktreeOutcome::Reused(_)
+            ));
+
+            for (card, path, why) in [
+                (unpushed_card, &unpushed, "a commit not on the remote"),
+                (dirty_card, &dirty, "uncommitted work"),
+            ] {
+                assert_eq!(
+                    stage(card, "x"),
+                    WorktreeOutcome::Reused(path.clone()),
+                    "kept: {why}"
+                );
+                assert!(is_linked_worktree(path), "untouched: {why}");
+            }
+            assert!(dirty.join("wip.txt").exists());
+            assert!(staging_is_empty(), "no staging clone is left behind");
         });
     }
 
