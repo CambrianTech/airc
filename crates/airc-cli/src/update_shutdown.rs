@@ -55,17 +55,8 @@ fn daemon_rpc<T: Send + 'static>(
         + Send
         + 'static,
 ) -> Result<T, airc_ipc::client::ClientError> {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(airc_ipc::client::ClientError::Io)?;
-        runtime.block_on(operation)
-    })
-    .join()
-    .map_err(|_| {
-        airc_ipc::client::ClientError::Io(std::io::Error::other("daemon IPC thread failed"))
-    })?
+    crate::runtime::block_on_fresh(operation)
+        .map_err(|error| airc_ipc::client::ClientError::Io(error.into_io("daemon IPC")))?
 }
 
 fn classify_daemon_status(
