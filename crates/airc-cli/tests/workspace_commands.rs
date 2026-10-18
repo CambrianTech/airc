@@ -105,13 +105,7 @@ fn run_ok(home: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .expect("airc-core command must spawn");
-    assert!(
-        output.status.success(),
-        "airc-core {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, &format!("airc-core {:?}", args));
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 

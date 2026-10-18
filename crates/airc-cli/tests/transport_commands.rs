@@ -80,13 +80,7 @@ fn transport_health_quiet_fail_exits_nonzero_on_no_routes() {
 
 fn run_ok(home: &std::path::Path, args: &[&str]) -> String {
     let output = run_raw(home, args);
-    assert!(
-        output.status.success(),
-        "airc {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, &format!("airc {:?}", args));
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 
