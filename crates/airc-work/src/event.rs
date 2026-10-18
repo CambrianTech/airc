@@ -967,6 +967,36 @@ mod tests {
             expired.validate_for_card(card),
             Err(SubmissionRejectionReason::ExpiredClaim)
         );
+        // Card 41dc7705: a holder's own submission heartbeats her claim first
+        // (`submit_patch`), so a lease that lapsed during a long build is renewed, not
+        // refused. A heartbeat naming a claim that is no longer the card's (a takeover)
+        // renews nothing, so the same late submission is still refused.
+        let lapsed_at = card.claim_expires_at_ms.unwrap() + 5_000;
+        let heartbeat = |claim_id| {
+            WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
+                card_id,
+                claim_id,
+                owner,
+                ttl_ms: 1000,
+                heartbeat_at_ms: lapsed_at,
+            })
+        };
+        let late = WorkSubmission {
+            submitted_at_ms: lapsed_at,
+            ..fresh.clone()
+        };
+        let mut renewed = board.clone();
+        renewed.apply(&heartbeat(claim_id)).unwrap();
+        assert_eq!(
+            late.validate_for_card(renewed.card(card_id).unwrap()),
+            Ok(())
+        );
+        let mut taken = board.clone();
+        taken.apply(&heartbeat(ClaimId::from_u128(9))).unwrap();
+        assert_eq!(
+            late.validate_for_card(taken.card(card_id).unwrap()),
+            Err(SubmissionRejectionReason::ExpiredClaim)
+        );
         let foreign = WorkSubmission {
             publisher: PeerId::from_u128(9),
             ..fresh.clone()
