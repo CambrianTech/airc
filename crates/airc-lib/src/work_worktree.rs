@@ -493,13 +493,28 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
     let creating = root.join(".creating");
     let staged = creating.join(&name);
     // Only ever our own staging clone (a crashed earlier attempt's included), never a
-    // checkout anyone worked in: nothing reaches the card's path until it is complete.
-    let discard = || {
-        if staged.exists() {
-            let _ = std::fs::remove_dir_all(&staged);
+    // checkout anyone worked in: nothing reaches the card's path until it is complete. A
+    // staging clone that cannot be removed (a locked file on Windows) is reported with the
+    // failure that left it, never dropped silently: it is disk nobody else will reclaim.
+    let discard = |failure: String| -> String {
+        match std::fs::remove_dir_all(&staged) {
+            Err(e) if staged.exists() => format!(
+                "{failure}; its staging clone could not be removed and is left at {}: {e}",
+                staged.display()
+            ),
+            _ => failure,
         }
     };
-    discard();
+    if staged.exists() {
+        // A leftover that will not go would make the clone below fail on a non-empty
+        // directory; say why instead.
+        std::fs::remove_dir_all(&staged).map_err(|e| {
+            format!(
+                "a previous staging clone at {} could not be removed: {e}",
+                staged.display()
+            )
+        })?;
+    }
     std::fs::create_dir_all(&creating)
         .map_err(|e| format!("create {}: {e}", creating.display()))?;
     let built = (|| -> Result<(), String> {
@@ -531,12 +546,13 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
         init_submodules(&staged)
     })();
     if let Err(error) = built {
-        discard();
-        return Err(error);
+        return Err(discard(error));
     }
     if let Err(e) = std::fs::rename(&staged, &path) {
-        discard();
-        return Err(format!("move card clone into {}: {e}", path.display()));
+        return Err(discard(format!(
+            "move card clone into {}: {e}",
+            path.display()
+        )));
     }
     Ok(WorktreeOutcome::Created(path))
 }
@@ -1373,11 +1389,30 @@ mod tests {
                 branch,
                 start_point: Some("refs/heads/canary"),
             };
+            // regression for card ca8a2293, on every OS (Windows included): a staging that
+            // fails after its clone exists (here, `checkout -b` refuses the branch name) leaves
+            // nothing at the card's path and no staging clone, so the staging below is clean.
+            let failed = ensure_card_clone(&WorktreeSpec {
+                branch: "d166e4f2/bad..name",
+                ..spec
+            });
+            let expected = worktree_path_for(card).unwrap();
+            assert!(failed.is_err(), "an invalid branch name fails the staging");
+            assert!(!expected.exists(), "no half-made clone at the card's path");
+            assert!(
+                !expected
+                    .parent()
+                    .unwrap()
+                    .join(".creating")
+                    .join(expected.file_name().unwrap())
+                    .exists(),
+                "the staging clone is discarded"
+            );
             let path = ensure_card_clone(&spec)
                 .expect("card clone is created")
                 .path()
                 .to_path_buf();
-            assert_eq!(path, worktree_path_for(card).unwrap());
+            assert_eq!(path, expected);
             assert!(
                 path.join(".git").is_dir(),
                 "the checkout owns its .git: a directory, never a gitdir file"
@@ -1730,6 +1765,18 @@ mod tests {
                 assert_eq!(
                     std::fs::read_to_string(path.join("vendor/dep/vendored.txt")).unwrap(),
                     "the submodule\n"
+                );
+                // Built in .creating and moved: the submodule's git (its gitdir under .git/modules
+                // and the alternates into its mirror) must still resolve from the final path.
+                assert_eq!(
+                    git(&path.join("vendor/dep"), &["rev-parse", "HEAD"]),
+                    git(&sub_work, &["rev-parse", "HEAD"]),
+                    "the submodule's git resolves at the moved path"
+                );
+                assert_eq!(
+                    git(&path, &["status", "--porcelain"]),
+                    "",
+                    "a clean checkout, submodule included, after the move"
                 );
                 let sub_mirror = home.join(".airc/mirrors/o/sub.git");
                 assert_eq!(
