@@ -273,7 +273,18 @@ pub fn ensure_worktree(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Strin
         creation_sha: base.clone(),
     };
     allocation::record(&path, &evidence)?;
-    init_submodules(&path)?;
+    // Loud, not silent: this worktree EXISTS (a linked worktree is the CLI agent's own tree,
+    // not discarded), so say so plainly and hand over the exact command. Swallowing this would
+    // hand back a lease that looks ready and fails at the first build, the shape
+    // init_submodules' doc describes.
+    init_submodules(&path).map_err(|error| {
+        format!(
+            "worktree {} was created but {error}\n  Builds in it will fail on the empty \
+             submodule paths (and can poison a shared CARGO_TARGET_DIR). Run `git submodule \
+             update --init --recursive` in the worktree before building.",
+            path.display()
+        )
+    })?;
     Ok(WorktreeOutcome::Created(path))
 }
 
@@ -449,9 +460,17 @@ fn ensure_mirror_from(
 ///
 /// `origin` is set to the mirror's origin, the real remote, so the act-end carry pushes
 /// (a local-path origin never carries).
+///
+/// A new clone is built whole in `.creating/<short>` and moved into place only once its
+/// submodules are initialised (card ca8a2293). Built in place, a clone whose submodule init
+/// failed stayed at the card's path, and the next staging found its `.git` and handed it out
+/// as ready with an empty `core/vendor/llama.cpp`, where a build dies in cmake. The card's
+/// lifecycle lock is held throughout, so two stagers of one card never share the staging dir,
+/// and cleanup never retires a checkout while it is being made or migrated.
 pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, String> {
     let path = worktree_path_for(spec.card_id)
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
+    let _lifecycle = lifecycle_lock(spec.card_id)?;
     if path.exists() {
         if is_linked_worktree(&path) {
             match migrate_linked_checkout(spec.clone_path, &path) {
@@ -467,37 +486,58 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
         }
         return Ok(WorktreeOutcome::Reused(path));
     }
-    let root = path
-        .parent()
-        .ok_or_else(|| format!("checkout path {} has no parent", path.display()))?;
-    std::fs::create_dir_all(root)
-        .map_err(|e| format!("create lease zone {}: {e}", root.display()))?;
-    let (integration_base, start_ref, base) = resolve_allocation(spec)?;
-    let origin = git_in(spec.clone_path, &["remote", "get-url", "origin"])?;
-    let mirror_str = spec.clone_path.to_string_lossy().to_string();
-    let path_str = path.to_string_lossy().to_string();
-    git_in(
-        root,
-        &[
-            "clone",
-            "--quiet",
-            "--shared",
-            "--no-checkout",
-            &mirror_str,
-            &path_str,
-        ],
-    )?;
-    git_in(&path, &["remote", "set-url", "origin", &origin])?;
-    git_in(&path, &["checkout", "--quiet", "-b", spec.branch, &base])?;
-    let evidence = AllocationEvidence {
-        repo: spec.repo.clone(),
-        requested_branch: spec.branch.to_owned(),
-        integration_base,
-        start_ref,
-        creation_sha: base,
+    let (root, name) = match (path.parent(), path.file_name()) {
+        (Some(root), Some(name)) => (root, name.to_string_lossy().into_owned()),
+        _ => return Err(format!("checkout path {} has no parent", path.display())),
     };
-    allocation::record(&path, &evidence)?;
-    init_submodules(&path)?;
+    let creating = root.join(".creating");
+    let staged = creating.join(&name);
+    // Only ever our own staging clone (a crashed earlier attempt's included), never a
+    // checkout anyone worked in: nothing reaches the card's path until it is complete.
+    let discard = || {
+        if staged.exists() {
+            let _ = std::fs::remove_dir_all(&staged);
+        }
+    };
+    discard();
+    std::fs::create_dir_all(&creating)
+        .map_err(|e| format!("create {}: {e}", creating.display()))?;
+    let built = (|| -> Result<(), String> {
+        let (integration_base, start_ref, base) = resolve_allocation(spec)?;
+        let origin = git_in(spec.clone_path, &["remote", "get-url", "origin"])?;
+        let mirror_str = spec.clone_path.to_string_lossy().to_string();
+        let staged_str = staged.to_string_lossy().to_string();
+        git_in(
+            root,
+            &[
+                "clone",
+                "--quiet",
+                "--shared",
+                "--no-checkout",
+                &mirror_str,
+                &staged_str,
+            ],
+        )?;
+        git_in(&staged, &["remote", "set-url", "origin", &origin])?;
+        git_in(&staged, &["checkout", "--quiet", "-b", spec.branch, &base])?;
+        let evidence = AllocationEvidence {
+            repo: spec.repo.clone(),
+            requested_branch: spec.branch.to_owned(),
+            integration_base,
+            start_ref,
+            creation_sha: base,
+        };
+        allocation::record(&staged, &evidence)?;
+        init_submodules(&staged)
+    })();
+    if let Err(error) = built {
+        discard();
+        return Err(error);
+    }
+    if let Err(e) = std::fs::rename(&staged, &path) {
+        discard();
+        return Err(format!("move card clone into {}: {e}", path.display()));
+    }
     Ok(WorktreeOutcome::Created(path))
 }
 
@@ -700,17 +740,9 @@ fn init_submodules(worktree: &std::path::Path) -> Result<(), String> {
         &["submodule", "update", "--init", "--recursive"],
         NETWORK_MIRROR_BOUND,
     ) {
-        // Loud, not silent: the worktree EXISTS at this point, so say so plainly and
-        // hand over the exact command. Swallowing this would hand back a lease that
-        // looks ready and fails at the first build — the shape the doc above
-        // describes, which is the thing being fixed.
         return Err(format!(
-            "worktree {} was created but `git submodule update --init --recursive` \
-             failed there: {}\n  Builds in it will fail on the empty submodule paths \
-             (and can poison a shared CARGO_TARGET_DIR). Run that command in the \
-             worktree before building.",
-            worktree.display(),
-            error
+            "`git submodule update --init --recursive` failed in {}: {error}",
+            worktree.display()
         ));
     }
     Ok(())
@@ -1661,16 +1693,40 @@ mod tests {
                 let repo = RepoId::new("o/r").unwrap();
                 let mirror = ensure_mirror(&repo, &source).expect("superproject mirror");
                 let card = WorkCardId::from_u128((0x327e_9b3e_u128) << 96);
-                let path = ensure_card_clone(&WorktreeSpec {
+                let spec = WorktreeSpec {
                     card_id: card,
                     repo: &repo,
                     clone_path: &mirror,
                     branch: "327e9b3e/sub",
                     start_point: Some("refs/heads/canary"),
-                })
-                .expect("card clone")
-                .path()
-                .to_path_buf();
+                };
+                // regression for card ca8a2293: a clone whose submodule init failed stayed at
+                // the card's path, and the next staging handed it out as ready with an empty
+                // vendor dir. With the submodule unreachable the staging fails, and nothing is
+                // left at the path or in the staging dir, so the retry below builds it whole.
+                let unreachable = format!("url.file://{}.insteadOf", root.join("gone").display());
+                let failed = temp_env::with_vars(
+                    [
+                        ("GIT_CONFIG_KEY_0", Some(unreachable.as_str())),
+                        ("GIT_TERMINAL_PROMPT", Some("0")),
+                    ],
+                    || ensure_card_clone(&spec),
+                );
+                let expected = worktree_path_for(card).unwrap();
+                assert!(
+                    failed.is_err(),
+                    "an unreachable submodule fails the staging"
+                );
+                assert!(!expected.exists(), "no half-made clone at the card's path");
+                let creating = expected.parent().unwrap().join(".creating");
+                assert!(
+                    !creating.join(expected.file_name().unwrap()).exists(),
+                    "the staging clone is discarded"
+                );
+                let path = ensure_card_clone(&spec)
+                    .expect("card clone")
+                    .path()
+                    .to_path_buf();
                 assert_eq!(
                     std::fs::read_to_string(path.join("vendor/dep/vendored.txt")).unwrap(),
                     "the submodule\n"
