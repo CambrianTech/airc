@@ -940,7 +940,14 @@ mod tests {
         let collector = std::thread::spawn(move || {
             output_tx.send(child.wait_with_output()).unwrap();
         });
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // A hang guard on the fixture's START, not part of the claim (the claim is the EOF-
+        // while-alive assertion below, which stays strict). The fixture re-executes this test
+        // binary twice, and macOS can stall a freshly linked binary's launch: measured on
+        // IntelMac 2026-10-19 under a full suite, the connect took 72,702 ms and 73,964 ms, with
+        // the child sampled at `_dyld_start` (card 30d53b1b). 10 s failed every first run after
+        // a rebuild. 180 s is ~2.4x the worst measured stall; a fixture that never starts still
+        // fails here.
+        let deadline = Instant::now() + Duration::from_secs(180);
         let mut control = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
