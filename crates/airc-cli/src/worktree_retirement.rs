@@ -60,11 +60,29 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
             "branch {branch} is shared or its worktree registration is ambiguous"
         ));
     }
+    let submodules = provable_submodules(&path, repo)?;
+    let modules = if submodules.is_empty() {
+        None
+    } else {
+        Some(proven_modules_dir(&path, repo, &submodules)?)
+    };
     let head = git(&path, &["rev-parse", "HEAD"])?;
     let recovery = format!("refs/airc/retired/{branch}/{head}");
     git(&path, &["update-ref", &recovery, &head])?;
-    // No --force, recursive deletion, or submodule fallback. Git protects locked
-    // checkouts, dirty races, and initialized submodules. Failure retains branch.
+    for sub in &submodules {
+        keep_submodule_pin(&path, repo, sub, &branch)?;
+    }
+    if let Some(modules) = modules {
+        // Without --force: git itself refuses a submodule with local changes
+        // that appeared after the proof above.
+        git(&path, &["submodule", "deinit", "--all"])?;
+        // Git refuses `worktree remove` while the checkout's `modules/` exists,
+        // and deinit keeps it. Every git directory in it was proven and its pin
+        // kept above, so it holds nothing that is not also elsewhere.
+        std::fs::remove_dir_all(modules).map_err(|e| e.to_string())?;
+    }
+    // No --force. Git protects locked checkouts and dirty races; the only
+    // recursive deletion is the proven `modules/` above. Failure retains branch.
     git(
         repo,
         &[
@@ -78,6 +96,161 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
     })?;
     println!("retired: {branch}; recovery: {recovery}");
     Ok(())
+}
+
+/// An initialized submodule of a card checkout, as `git submodule foreach` names it.
+struct Submodule {
+    name: String,
+    path: String,
+    pin: String,
+}
+
+/// Removing a worktree deletes its submodules' git directories, so a submodule
+/// is retired only when it can hold nothing but the commit the superproject
+/// records: checked out at that pin, no changes, no ignored files, and no local
+/// branch or stash beyond the pin and its remotes. The pin itself is then kept
+/// in the primary checkout's own store of that submodule (offline, like the
+/// branch's recovery ref); with no such store the checkout is retained.
+fn provable_submodules(path: &Path, repo: &Path) -> Result<Vec<Submodule>, String> {
+    let listed = git(
+        path,
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "echo \"$name|$sm_path|$sha1\"",
+        ],
+    )?;
+    let nested = git(
+        path,
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            "echo \"$displaypath\"",
+        ],
+    )?;
+    let submodules: Vec<Submodule> = listed
+        .lines()
+        .map(|line| {
+            let mut parts = line.splitn(3, '|');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(name), Some(path), Some(pin)) => Ok(Submodule {
+                    name: name.to_owned(),
+                    path: path.to_owned(),
+                    pin: pin.to_owned(),
+                }),
+                _ => Err(format!("unreadable submodule listing line: {line}")),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    if nested.lines().count() != submodules.len() {
+        return Err(
+            "a submodule has initialized submodules of its own; retain until reviewed".into(),
+        );
+    }
+    for sub in &submodules {
+        let at = path.join(&sub.path);
+        let unproven = |why: &str| format!("submodule {} {why}; retain until reviewed", sub.path);
+        if git(&at, &["rev-parse", "HEAD"])? != sub.pin {
+            return Err(unproven("is not at the commit the superproject records"));
+        }
+        if !git(&at, &["status", "--porcelain"])?.is_empty() {
+            return Err(unproven("has uncommitted work"));
+        }
+        if !git(
+            &at,
+            &["ls-files", "--others", "--ignored", "--exclude-standard"],
+        )?
+        .is_empty()
+        {
+            return Err(unproven("contains ignored files"));
+        }
+        if !git(
+            &at,
+            &["rev-list", "--branches", "--not", "--remotes", "HEAD"],
+        )?
+        .is_empty()
+        {
+            return Err(unproven("has a local branch beyond its pin and remotes"));
+        }
+        if git(&at, &["rev-parse", "-q", "--verify", "refs/stash"]).is_ok() {
+            return Err(unproven("has a stash"));
+        }
+        if !primary_store(repo, &sub.name).is_dir() {
+            return Err(unproven(
+                "has no store in the primary checkout to keep its pin",
+            ));
+        }
+    }
+    Ok(submodules)
+}
+
+/// The checkout's own `modules/` directory, only when every git directory in it
+/// belongs to a proven submodule (a deinitialized one left behind is not proven).
+fn proven_modules_dir(
+    path: &Path,
+    repo: &Path,
+    submodules: &[Submodule],
+) -> Result<std::path::PathBuf, String> {
+    let admin = std::path::PathBuf::from(git(path, &["rev-parse", "--absolute-git-dir"])?);
+    let worktrees = repo
+        .join("worktrees")
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let modules = admin.join("modules");
+    if !admin
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        .starts_with(&worktrees)
+    {
+        return Err("checkout's git directory is not a linked worktree's".into());
+    }
+    let mut pending = vec![modules.clone()];
+    while let Some(dir) = pending.pop() {
+        if dir.join("HEAD").is_file() && dir.join("objects").is_dir() {
+            let name = dir.strip_prefix(&modules).map_err(|e| e.to_string())?;
+            if !submodules.iter().any(|sub| Path::new(&sub.name) == name) {
+                return Err(format!(
+                    "submodule store {} is not initialized here, so it was not proven; retain until reviewed",
+                    name.display()
+                ));
+            }
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(modules)
+}
+
+fn primary_store(repo: &Path, name: &str) -> std::path::PathBuf {
+    repo.join("modules").join(name)
+}
+
+fn keep_submodule_pin(
+    path: &Path,
+    repo: &Path,
+    sub: &Submodule,
+    branch: &str,
+) -> Result<(), String> {
+    let store = primary_store(repo, &sub.name);
+    let kept = format!("refs/airc/retired/{branch}/{}/{}", sub.path, sub.pin);
+    git(
+        &path.join(&sub.path),
+        &[
+            "push",
+            "--quiet",
+            store.to_str().ok_or("non-UTF8 submodule store path")?,
+            &format!("{}:{kept}", sub.pin),
+        ],
+    )
+    .map(|_| ())
 }
 
 /// Use Git's branch operation, not raw ref deletion: a checkout can appear
@@ -211,9 +384,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preserves_initialized_submodule_checkout() {
-        let f = Fixture::new();
+    /// Commits a submodule `child` on the card branch and returns its pin. With
+    /// `primary_store`, the card is merged and the primary checkout initializes
+    /// the submodule, so `<common>/modules/child` exists to keep the pin.
+    fn with_submodule(f: &Fixture, primary_store: bool) -> String {
         let source = f.root.parent().unwrap().join("submodule-source");
         std::fs::create_dir_all(&source).unwrap();
         git(&source, &["init"]).unwrap();
@@ -249,13 +423,85 @@ mod tests {
             &["update-ref", "refs/remotes/origin/canary", "HEAD"],
         )
         .unwrap();
-        assert!(retire(&f.tree, &f.root).is_err());
-        assert!(f.tree.join("child/.git").exists());
-        assert!(git(
-            &f.repo,
-            &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
-        )
-        .is_ok());
+        if primary_store {
+            // The card merged, and the primary checkout initialized the merged
+            // submodule, as a real retirement finds it.
+            git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
+            git(
+                &f.repo,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                ],
+            )
+            .unwrap();
+        }
+        git(&f.tree.join("child"), &["rev-parse", "HEAD"]).unwrap()
+    }
+
+    // what this catches: card d853c9f9 — every continuum card initializes the
+    // llama.cpp submodule, so a plain `worktree remove` refused all of them and
+    // 186 merged checkouts (93G) accumulated on one machine.
+    #[test]
+    fn retires_a_clean_pinned_submodule_and_keeps_its_pin() {
+        let f = Fixture::new();
+        let pin = with_submodule(&f, true);
+        retire(&f.tree, &f.root).unwrap();
+        assert!(!f.tree.exists());
+        let store = f.repo.join(".git/modules/child");
+        assert_eq!(
+            git(
+                &store,
+                &[
+                    "rev-parse",
+                    &format!("refs/airc/retired/aabbccdd/fix/child/{pin}")
+                ]
+            )
+            .unwrap(),
+            pin
+        );
+    }
+
+    #[test]
+    fn preserves_a_submodule_that_could_hold_work() {
+        for case in ["no-primary-store", "untracked", "local-branch"] {
+            let f = Fixture::new();
+            let pin = with_submodule(&f, case != "no-primary-store");
+            let child = f.tree.join("child");
+            match case {
+                "no-primary-store" => {}
+                "untracked" => std::fs::write(child.join("work"), "valuable").unwrap(),
+                "local-branch" => {
+                    git(&child, &["checkout", "-q", "-b", "extra"]).unwrap();
+                    git(
+                        &child,
+                        &[
+                            "-c",
+                            "user.name=Fixture",
+                            "-c",
+                            "user.email=fixture@example.test",
+                            "commit",
+                            "--allow-empty",
+                            "-m",
+                            "local only",
+                        ],
+                    )
+                    .unwrap();
+                    git(&child, &["checkout", "-q", &pin]).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(retire(&f.tree, &f.root).is_err(), "{case}");
+            assert!(child.join(".git").exists(), "{case}");
+            assert!(git(
+                &f.repo,
+                &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
+            )
+            .is_ok());
+        }
     }
 
     #[test]
