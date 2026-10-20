@@ -933,6 +933,11 @@ pub async fn run_cleanup(
             .and_then(|c| c.pull_request.as_ref().map(|pr| pr.number));
         let repo = card.as_ref().map(|c| c.repo.to_string());
 
+        eprintln!(
+            "checking worktree {}: {}",
+            classifications.len() + 1,
+            path.display()
+        );
         let (effective, dirty_status, mut disposition) =
             classify_worktree_path(&path, card_state.as_ref());
         if matches!(matched, WorktreeCard::Ambiguous) {
@@ -1015,9 +1020,18 @@ pub async fn run_cleanup(
     // batch — surface the diagnostic, keep going. The operator
     // re-runs after fixing the specific issue.
     let mut removed = 0usize;
-    for c in removable {
+    let mut failed = 0usize;
+    let total = removable.len();
+    for (index, c) in removable.into_iter().enumerate() {
+        eprintln!(
+            "retiring worktree {}/{}: {}",
+            index + 1,
+            total,
+            c.path.display()
+        );
         let Some(card_id) = c.card_id else {
             eprintln!("✗ {} — no card id; retained", c.path.display());
+            failed += 1;
             continue;
         };
         match retire_under_lifecycle(&airc, card_id, &c.path, &lease_root, None).await {
@@ -1027,10 +1041,17 @@ pub async fn run_cleanup(
             }
             Err(error) => {
                 eprintln!("✗ {} — {error}", c.path.display());
+                failed += 1;
             }
         }
     }
-    println!("{removed} worktree(s) removed.");
+    println!("{removed} worktree retirement(s) completed; {failed} failed.");
+    if failed != 0 {
+        return Err(format!(
+            "{failed} worktree retirement(s) failed; inspect the per-path errors before retrying"
+        )
+        .into());
+    }
     Ok(())
 }
 
