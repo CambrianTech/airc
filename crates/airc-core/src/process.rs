@@ -156,7 +156,7 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.kill(); // already dead after the group kill; this covers any host where that did not reach it
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod bounded_tests {
     use super::*;
     use std::time::Duration;
@@ -164,7 +164,6 @@ mod bounded_tests {
     // what this catches: a timeout that kills only the direct child, leaving what it started
     // running (card c76d382a: git-remote-https outlived its git), or a success path that
     // loses output or blocks on a full pipe.
-    #[cfg(unix)]
     #[test]
     fn a_timeout_ends_the_whole_process_group_and_success_keeps_all_output() {
         let dir = std::env::temp_dir().join(format!("airc-bounded-{}", std::process::id()));
