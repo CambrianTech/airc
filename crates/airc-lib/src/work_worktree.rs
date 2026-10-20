@@ -295,65 +295,38 @@ pub fn mirror_path_for(repo: &RepoId) -> Option<PathBuf> {
 /// reported, never waited out on a resident's claim path.
 const GIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The bound on a mirror's FIRST clone over the network (a submodule's, card 327e9b3e). Measured
+/// IntelMac 2026-10-19T03:07Z: `clone --mirror` of CambrianTech/llama.cpp (453 MB) took 97.1 s,
+/// already 81% of [`GIT_BOUND`], so a slower link would be killed and re-downloaded on every
+/// staging. 600 s is ~6x that measurement: a bound kills a hang; it must not kill a slow link
+/// doing real work. A refresh of the same mirror took 0.9 s and stays under [`GIT_BOUND`].
+const NETWORK_MIRROR_BOUND: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Run `git` in `dir`, bounded by [`GIT_BOUND`], never prompting (`GIT_TERMINAL_PROMPT=0`,
 /// stdin closed). Returns trimmed stdout, or the failure with its stderr or the timeout.
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    use std::io::Read;
+    git_in_within(dir, args, GIT_BOUND)
+}
+
+/// [`git_in`] under an explicit bound, for the one operation measured to need longer
+/// ([`NETWORK_MIRROR_BOUND`]).
+fn git_in_within(dir: &Path, args: &[&str], bound: std::time::Duration) -> Result<String, String> {
     let shown = || format!("git {} in {}", args.join(" "), dir.display());
-    let mut child = airc_core::process::background("git")
+    let mut command = airc_core::process::background("git");
+    command
         .current_dir(dir)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", shown()))?;
-    // Drain both pipes while waiting, so a chatty git cannot block on a full pipe.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_string(&mut text);
-            }
-            text
-        })
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let deadline = std::time::Instant::now() + GIT_BOUND;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{} did not finish within {} s and was killed",
-                    shown(),
-                    GIT_BOUND.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(e) => return Err(format!("wait for {}: {e}", shown())),
-        }
-    };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    if !status.success() {
-        return Err(format!("{} failed: {}", shown(), stderr.trim()));
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = airc_core::process::run_bounded(command, bound)
+        .map_err(|error| format!("{} {error}", shown()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed: {}",
+            shown(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    Ok(stdout.trim().to_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// Is `path` a LINKED worktree (its `.git` a file naming a gitdir elsewhere), as card
@@ -379,41 +352,85 @@ pub fn is_linked_worktree(path: &Path) -> bool {
 ///   operator's or agent's WIP). The prune-fetch drops every ref the real remote lacks, and
 ///   a new mirror whose first fetch fails is removed, so no local branch can become a base.
 pub fn ensure_mirror(repo: &RepoId, source: &Path) -> Result<PathBuf, String> {
+    // Created from the local clone (fast, no network); origin is its real remote.
+    let origin = || git_in(source, &["remote", "get-url", "origin"]);
+    ensure_mirror_from(repo, &source.to_string_lossy(), origin)
+}
+
+/// [`ensure_mirror`]'s one implementation: a new mirror is cloned from `clone_from` (a local
+/// clone, or for a submodule its URL) and pointed at `origin()`; an existing one refreshes.
+fn ensure_mirror_from(
+    repo: &RepoId,
+    clone_from: &str,
+    origin: impl FnOnce() -> Result<String, String>,
+) -> Result<PathBuf, String> {
+    use fs2::FileExt;
     let path = mirror_path_for(repo)
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/mirrors/".to_string())?;
-    let created = !path.exists();
-    if created {
-        let parent = path
-            .parent()
-            .ok_or_else(|| format!("mirror path {} has no parent", path.display()))?;
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        let origin = git_in(source, &["remote", "get-url", "origin"])?;
-        let source_str = source.to_string_lossy().to_string();
-        let path_str = path.to_string_lossy().to_string();
-        git_in(
-            parent,
-            &[
-                "clone",
-                "--quiet",
-                "--mirror",
-                "--no-hardlinks",
-                &source_str,
-                &path_str,
-            ],
-        )?;
-        git_in(&path, &["remote", "set-url", "origin", &origin])?;
-        git_in(&path, &["config", "core.repositoryformatversion", "1"])?;
-        git_in(&path, &["config", "extensions.preciousObjects", "true"])?;
-        git_in(&path, &["config", "gc.auto", "0"])?;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("mirror path {} has no parent", path.display()));
+    };
+    let name = name.to_string_lossy().into_owned();
+    std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    // ONE creator or refresher per mirror at a time (Fable on #1591): residents staging at once
+    // after a deploy would otherwise create the same mirror together, so one could borrow a
+    // half-written mirror, or have its alternates removed by another's failed creation. The
+    // file lock is held until this returns (the guard is the open file).
+    let lock_path = parent.join(format!("{name}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    if !path.exists() {
+        // Built under a temporary name and published by rename only once complete, so no
+        // caller, and no crash midway, ever sees a half-made mirror at `path`. A failure
+        // removes only this temporary directory, never a mirror anyone borrows from.
+        let staging = parent.join(format!("{name}.creating"));
+        let _ = std::fs::remove_dir_all(&staging); // only ever our own leftover, under the lock
+        let made = (|| -> Result<(), String> {
+            let origin = origin()?;
+            let staging_str = staging.to_string_lossy().to_string();
+            // From a local clone this is a disk copy; from a URL it is the whole history over
+            // the network, measured to need far longer.
+            let over_network = clone_from.contains("://") || clone_from.starts_with("git@");
+            git_in_within(
+                parent,
+                &[
+                    "clone",
+                    "--quiet",
+                    "--mirror",
+                    "--no-hardlinks",
+                    clone_from,
+                    &staging_str,
+                ],
+                if over_network {
+                    NETWORK_MIRROR_BOUND
+                } else {
+                    GIT_BOUND
+                },
+            )?;
+            git_in(&staging, &["remote", "set-url", "origin", &origin])?;
+            git_in(&staging, &["config", "core.repositoryformatversion", "1"])?;
+            git_in(&staging, &["config", "extensions.preciousObjects", "true"])?;
+            git_in(&staging, &["config", "gc.auto", "0"])?;
+            // A new mirror still holds the SOURCE's local branches until this prune-fetch
+            // succeeds; none of them may become a card base, so it must succeed before publish.
+            git_in(&staging, &["fetch", "--quiet", "--prune", "origin"])?;
+            std::fs::rename(&staging, &path)
+                .map_err(|e| format!("publish mirror {}: {e}", path.display()))
+        })();
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        return made.map(|()| path);
     }
     // Refs follow the real remote; objects are never pruned (preciousObjects).
     if let Err(error) = git_in(&path, &["fetch", "--quiet", "--prune", "origin"]) {
-        if created {
-            // A new mirror still holds the SOURCE's local branches until this prune-fetch
-            // succeeds. Keep none of them as a possible card base: remove what was just made.
-            let _ = std::fs::remove_dir_all(&path);
-            return Err(error);
-        }
         // An existing mirror stages from the refs it already has; the base is still resolved
         // against them, and the staleness is said, not hidden.
         tracing::warn!(mirror = %path.display(), %error, "repo mirror refresh failed; staging from its existing refs");
@@ -644,12 +661,45 @@ fn migrate_linked_checkout(mirror: &Path, path: &Path) -> Result<Option<PathBuf>
 /// A repo with no submodules is unaffected — the command is a successful no-op — so
 /// this is safe for every scope, not only continuum.
 fn init_submodules(worktree: &std::path::Path) -> Result<(), String> {
-    let out = airc_core::process::background("git")
-        .current_dir(worktree)
-        .args(["submodule", "update", "--init", "--recursive"])
-        .output()
-        .map_err(|e| format!("spawn git submodule update in {}: {e}", worktree.display()))?;
-    if !out.status.success() {
+    // A card clone borrows each GitHub submodule's objects from the node's own mirror of it,
+    // exactly as it borrows the superproject's (card 327e9b3e): continuum's llama.cpp history
+    // is 510 MB, and without this every new or migrated card clone downloaded it from GitHub
+    // (measured IntelMac 2026-10-19). A submodule with no mirror (another host, a local
+    // path, a mirror that could not be made) is initialised by the plain update below.
+    for (sub_path, url) in declared_submodules(worktree) {
+        let Some(repo) = github_repo_of(&url) else {
+            continue;
+        };
+        let mirror = match ensure_mirror_from(&repo, &url, || Ok(url.clone())) {
+            Ok(mirror) => mirror,
+            Err(error) => {
+                tracing::warn!(submodule = %sub_path, %error, "submodule mirror unavailable; it initialises from its URL");
+                continue;
+            }
+        };
+        let mirror = mirror.to_string_lossy().into_owned();
+        if let Err(error) = git_in(
+            worktree,
+            &[
+                "submodule",
+                "update",
+                "--init",
+                "--reference",
+                &mirror,
+                "--",
+                &sub_path,
+            ],
+        ) {
+            tracing::warn!(submodule = %sub_path, %error, "submodule init from its mirror failed; it initialises from its URL");
+        }
+    }
+    // Bounded like every git here (Fable on #1591): anything not borrowed from a mirror comes
+    // over the network, so it takes the network bound, never an unbounded wait.
+    if let Err(error) = git_in_within(
+        worktree,
+        &["submodule", "update", "--init", "--recursive"],
+        NETWORK_MIRROR_BOUND,
+    ) {
         // Loud, not silent: the worktree EXISTS at this point, so say so plainly and
         // hand over the exact command. Swallowing this would hand back a lease that
         // looks ready and fails at the first build — the shape the doc above
@@ -660,10 +710,57 @@ fn init_submodules(worktree: &std::path::Path) -> Result<(), String> {
              (and can poison a shared CARGO_TARGET_DIR). Run that command in the \
              worktree before building.",
             worktree.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            error
         ));
     }
     Ok(())
+}
+
+/// Each submodule `checkout` declares in its `.gitmodules`, as (path, URL). None when it has
+/// no `.gitmodules` (git exits non-zero on a missing file, which here means "no submodules").
+fn declared_submodules(checkout: &Path) -> Vec<(String, String)> {
+    let Ok(listed) = git_in(
+        checkout,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.(path|url)$",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut by_name: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
+        std::collections::BTreeMap::new();
+    for line in listed.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix("submodule.") else {
+            continue;
+        };
+        if let Some(name) = rest.strip_suffix(".path") {
+            by_name.entry(name.to_owned()).or_default().0 = Some(value.to_owned());
+        } else if let Some(name) = rest.strip_suffix(".url") {
+            by_name.entry(name.to_owned()).or_default().1 = Some(value.to_owned());
+        }
+    }
+    by_name
+        .into_values()
+        .filter_map(|(path, url)| Some((path?, url?)))
+        .collect()
+}
+
+/// The GitHub `owner/name` a remote URL names, which keys its node mirror. `None` for any
+/// other remote: those initialise from their URL as before.
+fn github_repo_of(url: &str) -> Option<RepoId> {
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("git@github.com:"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+    let rest = rest.trim_end_matches('/');
+    RepoId::new(rest.strip_suffix(".git").unwrap_or(rest)).ok()
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1479,6 +1576,214 @@ mod tests {
             }
             assert!(dirty.join("wip.txt").exists());
             assert!(staging_is_empty(), "no staging clone is left behind");
+        });
+    }
+
+    // what this catches (card 327e9b3e): a card clone's submodule downloaded from its URL on
+    // every staging (continuum's llama.cpp history is 510 MB) instead of borrowing objects
+    // from the node's mirror of it, as the superproject does; or a non-GitHub submodule
+    // wrongly keyed to a mirror.
+    #[cfg(unix)]
+    #[test]
+    fn a_card_clone_borrows_its_submodule_objects_from_the_submodules_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let git = |dir: &Path, args: &[&str]| git_in(dir, args).unwrap_or_else(|e| panic!("{e}"));
+        let bare = |name: &str| {
+            let p = root.join(name);
+            git(
+                &root,
+                &[
+                    "init",
+                    "--quiet",
+                    "--bare",
+                    "--initial-branch=canary",
+                    p.to_str().unwrap(),
+                ],
+            );
+            p
+        };
+        let who = |dir: &Path| {
+            git(dir, &["config", "user.email", "t@t"]);
+            git(dir, &["config", "user.name", "t"]);
+        };
+        let sub_remote = bare("sub.git");
+        let sub_work = root.join("sub-work");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                sub_remote.to_str().unwrap(),
+                sub_work.to_str().unwrap(),
+            ],
+        );
+        who(&sub_work);
+        std::fs::write(sub_work.join("vendored.txt"), "the submodule\n").unwrap();
+        git(&sub_work, &["add", "."]);
+        git(&sub_work, &["commit", "--quiet", "-m", "sub"]);
+        git(&sub_work, &["push", "--quiet", "origin", "HEAD:canary"]);
+        let remote = bare("remote.git");
+        let source = root.join("source");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ],
+        );
+        who(&source);
+        let home = root.join("home");
+        std::fs::create_dir(&home).unwrap();
+        // The submodule is declared under its GitHub URL; git rewrites it to the local bare
+        // repo, so the mirror path is exercised with no network.
+        let url = "https://github.com/o/sub";
+        let rewrite = format!("url.file://{}.insteadOf", sub_remote.display());
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.to_str().unwrap())),
+                ("GIT_CONFIG_COUNT", Some("2")),
+                ("GIT_CONFIG_KEY_0", Some(rewrite.as_str())),
+                ("GIT_CONFIG_VALUE_0", Some(url)),
+                ("GIT_CONFIG_KEY_1", Some("protocol.file.allow")),
+                ("GIT_CONFIG_VALUE_1", Some("always")),
+            ],
+            || {
+                git(&source, &["submodule", "add", "--quiet", url, "vendor/dep"]);
+                git(&source, &["commit", "--quiet", "-m", "add submodule"]);
+                git(&source, &["push", "--quiet", "origin", "HEAD:canary"]);
+                assert_eq!(
+                    declared_submodules(&source),
+                    vec![("vendor/dep".to_string(), url.to_string())]
+                );
+                let repo = RepoId::new("o/r").unwrap();
+                let mirror = ensure_mirror(&repo, &source).expect("superproject mirror");
+                let card = WorkCardId::from_u128((0x327e_9b3e_u128) << 96);
+                let path = ensure_card_clone(&WorktreeSpec {
+                    card_id: card,
+                    repo: &repo,
+                    clone_path: &mirror,
+                    branch: "327e9b3e/sub",
+                    start_point: Some("refs/heads/canary"),
+                })
+                .expect("card clone")
+                .path()
+                .to_path_buf();
+                assert_eq!(
+                    std::fs::read_to_string(path.join("vendor/dep/vendored.txt")).unwrap(),
+                    "the submodule\n"
+                );
+                let sub_mirror = home.join(".airc/mirrors/o/sub.git");
+                assert_eq!(
+                    git(&sub_mirror, &["config", "extensions.preciousObjects"]),
+                    "true",
+                    "the submodule mirror is precious too"
+                );
+                let alternates = std::fs::read_to_string(
+                    path.join(".git/modules/vendor/dep/objects/info/alternates"),
+                )
+                .expect("the submodule borrows through alternates");
+                assert_eq!(
+                    Path::new(alternates.trim()).canonicalize().unwrap(),
+                    sub_mirror.join("objects").canonicalize().unwrap(),
+                    "its objects come from the node's mirror of it, not a fresh download"
+                );
+            },
+        );
+        assert_eq!(
+            github_repo_of("https://github.com/CambrianTech/llama.cpp"),
+            RepoId::new("CambrianTech/llama.cpp").ok()
+        );
+        assert_eq!(
+            github_repo_of("https://github.com/o/r.git"),
+            RepoId::new("o/r").ok()
+        );
+        assert_eq!(
+            github_repo_of("git@github.com:o/r.git"),
+            RepoId::new("o/r").ok()
+        );
+        assert_eq!(
+            github_repo_of("https://gitlab.com/o/r"),
+            None,
+            "another host keeps its URL"
+        );
+        assert_eq!(github_repo_of("/local/path"), None);
+    }
+
+    // what this catches (Fable on #1591): residents staging at once after a deploy all create
+    // the same mirror together, and one borrows a half-written mirror, or a failed creation
+    // deletes objects another clone already borrowed. One mirror must result, complete,
+    // with no temporary directory left behind.
+    #[test]
+    fn concurrent_first_stagings_publish_one_complete_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = if cfg!(windows) {
+            tmp.path().to_path_buf()
+        } else {
+            tmp.path().canonicalize().unwrap()
+        };
+        let git = |dir: &Path, args: &[&str]| git_in(dir, args).unwrap_or_else(|e| panic!("{e}"));
+        let remote = root.join("remote.git");
+        git(
+            &root,
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "--initial-branch=canary",
+                remote.to_str().unwrap(),
+            ],
+        );
+        let source = root.join("source");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ],
+        );
+        git(&source, &["config", "user.email", "t@t"]);
+        git(&source, &["config", "user.name", "t"]);
+        std::fs::write(source.join("lib.rs"), "fn a() {}\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "base"]);
+        git(&source, &["push", "--quiet", "origin", "HEAD:canary"]);
+        let home = root.join("home");
+        std::fs::create_dir(&home).unwrap();
+        temp_env::with_var("HOME", Some(&home), || {
+            let repo = RepoId::new("o/r").unwrap();
+            let made: Vec<Result<PathBuf, String>> = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..4)
+                    .map(|_| scope.spawn(|| ensure_mirror(&repo, &source)))
+                    .collect();
+                threads
+                    .into_iter()
+                    .map(|t| t.join().expect("no staging thread panics"))
+                    .collect()
+            });
+            let mirror = home.join(".airc/mirrors/o/r.git");
+            for result in &made {
+                assert_eq!(
+                    result
+                        .as_ref()
+                        .expect("every concurrent staging gets the mirror"),
+                    &mirror
+                );
+            }
+            assert_eq!(
+                git(&mirror, &["config", "extensions.preciousObjects"]),
+                "true",
+                "the published mirror is complete"
+            );
+            assert!(git_in(&mirror, &["rev-parse", "--verify", "refs/heads/canary"]).is_ok());
+            assert!(
+                !home.join(".airc/mirrors/o/r.git.creating").exists(),
+                "no temporary mirror left behind"
+            );
         });
     }
 
