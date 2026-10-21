@@ -18,6 +18,9 @@ async fn chunk(airc: &Airc, n: usize) {
 async fn exercise(airc: &Airc) {
     airc.join("a").await.unwrap();
     airc.join("b").await.unwrap();
+    // Joining need not append a durable event (daemon presence is ephemeral).
+    // Establish the checkpoint with a real settled message in both backends.
+    airc.say("before snapshot scan").await.unwrap();
     let start = airc.latest_subscribed_cursor().await.unwrap().unwrap();
     let mut expected: Vec<EventId> = vec![];
     for room in ["a", "b"] {
