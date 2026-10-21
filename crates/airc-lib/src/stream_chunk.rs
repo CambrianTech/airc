@@ -135,6 +135,13 @@ impl Airc {
         chunk: &StreamChunk,
     ) -> Result<airc_core::EventId, AircError> {
         let mut headers = Headers::new();
+        // FrameKind is not durability: an absent delivery header defaults to
+        // Durable in both embedded persistence and daemon dispatch.
+        headers.insert(
+            airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.into(),
+            crate::publish::delivery_class_header_value(airc_bus::DeliveryClass::StreamChunk)
+                .to_string(),
+        );
         headers.insert(HEADER_STREAM_ID.into(), chunk.stream_id.clone());
         headers.insert(HEADER_STREAM_SEQ.into(), chunk.seq.to_string());
         headers.insert(HEADER_STREAM_KIND.into(), chunk.kind.clone());
