@@ -18,6 +18,14 @@ use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
 /// did, so no historical board is rewritten.
 pub const TAKEOVER_ON_RECORD_SINCE_MS: u64 = 1_791_129_600_000; // 2026-10-04T16:00:00Z
 
+/// The card stops being held: the one place a claim ends, for a release and for a reopen.
+fn end_claim(card: &mut WorkCard) {
+    card.owner = None;
+    card.claim_id = None;
+    card.claim_provenance = None;
+    card.claim_expires_at_ms = None;
+}
+
 /// The owner acting on her own claimed card is presence: renew her lease by the
 /// ttl she claimed with. Kimi's lease lapsed while she was working the card, and
 /// the lapse is what made her card look abandoned.
@@ -372,10 +380,7 @@ impl WorkBoardProjection {
                 card.state
             }
         };
-        card.owner = None;
-        card.claim_id = None;
-        card.claim_provenance = None;
-        card.claim_expires_at_ms = None;
+        end_claim(card);
         card.updated_at_ms = e.released_at_ms;
         Ok(())
     }
@@ -433,6 +438,18 @@ impl WorkBoardProjection {
         let card = self.card_mut(e.card_id)?;
         card.state = e.state;
         card.updated_at_ms = e.changed_at_ms;
+        if e.state == CardState::Open {
+            // OPEN MEANS NOBODY HOLDS IT, whoever reopened it (card 12afbb2f). A release
+            // already lands here as Open with no claim; a reopen that kept the claim left
+            // an Open card the holder's own renewal kept alive forever: on the M5, Atlas
+            // renewed claims on SWE cards the board showed Open, so no reader agreed on
+            // whether they were held. Every other transition keeps the claim, so a
+            // send-back to InProgress or a move to Review never ends work that continues.
+            // A later release or heartbeat names a claim that is no longer active and is
+            // the no-op `apply_claim_released` and `apply_claim_heartbeat` already make it.
+            end_claim(card);
+            return Ok(());
+        }
         renew_owner_lease(card, e.changed_by, e.changed_at_ms);
         Ok(())
     }
