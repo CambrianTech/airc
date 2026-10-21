@@ -139,7 +139,10 @@ impl Airc {
             events.retain(|e| key(&e.cursor()) <= key(&safe));
             if events.len() > limit {
                 events.truncate(limit);
-                safe = events.last().expect("positive limit").cursor();
+                safe = events
+                    .last()
+                    .ok_or_else(|| AircError::Route("empty truncated agent page".into()))?
+                    .cursor();
             }
         }
         Ok(EventScan {
