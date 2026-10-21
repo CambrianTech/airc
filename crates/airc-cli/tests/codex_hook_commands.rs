@@ -1101,8 +1101,21 @@ fn hook_prioritizes_new_message_without_discarding_settled_backlog() {
     assert!(next.find("new-directed-request").unwrap() < next.find("Historical catch-up").unwrap());
     let mut remainder = String::new();
     for _ in 0..12 {
-        remainder.push_str(&additional_context(&run_hook(&home, args, "{}")));
+        let output = run_hook(&home, args, "{}");
+        // A drained hook succeeds silently; only emitted payloads are JSON.
+        if !output.trim().is_empty() {
+            remainder.push_str(&additional_context(&output));
+        }
     }
     assert!(remainder.contains("retained-old-11"));
     assert!(!remainder.contains("new-directed-request"));
+    let all = format!("{first}\n{next}\n{remainder}");
+    for n in 0..12 {
+        let message = format!("retained-old-{n}");
+        assert_eq!(
+            all.lines().filter(|line| line.ends_with(&message)).count(),
+            1,
+            "each retained message must be delivered exactly once: {message}"
+        );
+    }
 }
