@@ -30,7 +30,18 @@ struct State {
     rooms: Vec<RoomId>,
     source: String,
 }
-fn lock(home: &Path, consumer: &str) -> Result<File, AircError> {
+struct DeliveryLock(File);
+impl Drop for DeliveryLock {
+    fn drop(&mut self) {
+        // Closing one descriptor alone does not release a Unix flock while a
+        // duplicated descriptor (including one inherited across fork) survives.
+        // Release ownership explicitly when this delivery turn ends.
+        if let Err(error) = fs2::FileExt::unlock(&self.0) {
+            eprintln!("airc: delivery lock release failed: {error}");
+        }
+    }
+}
+fn lock(home: &Path, consumer: &str) -> Result<DeliveryLock, AircError> {
     // Resolve the actual database file, including directory/file symlinks and
     // relative aliases. A scope sharing this file therefore shares this lock.
     let db = home.join("events.sqlite").canonicalize().map_err(fail)?;
@@ -48,7 +59,7 @@ fn lock(home: &Path, consumer: &str) -> Result<File, AircError> {
         .map_err(fail)?;
     fs2::FileExt::try_lock_exclusive(&file)
         .map_err(|e| fail(format!("consumer busy or lock unavailable: {e}")))?;
-    Ok(file) // never unlink: process-held OS ownership, no TTL takeover
+    Ok(DeliveryLock(file)) // never unlink: process-held OS ownership, no TTL takeover
 }
 async fn rooms(airc: &Airc) -> Result<Vec<RoomId>, AircError> {
     let mut rooms: Vec<_> = airc
@@ -82,7 +93,7 @@ pub struct AgentDeliveryTurn {
     airc: Airc,
     consumer: String,
     state: State,
-    _guard: File,
+    _guard: DeliveryLock,
     live: EventScan,
     backlog: EventScan,
     through: TranscriptCursor,
@@ -453,6 +464,24 @@ mod tests {
             .await
             .unwrap();
         assert!(airc.prepare_agent_delivery("same", 8, 8).await.is_err());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_turn_releases_lock_even_with_a_duplicated_descriptor() {
+        let (dir, airc, _) = fixture().await;
+        let turn = airc
+            .prepare_agent_delivery("duplicated", 8, 8)
+            .await
+            .unwrap();
+        let duplicate = turn._guard.0.try_clone().unwrap();
+        assert!(lock(dir.path(), "duplicated").is_err());
+        drop(turn);
+        // The duplicate remains open: close-only ownership fails this assertion.
+        let next = lock(dir.path(), "duplicated").unwrap();
+        drop(duplicate);
+        assert!(lock(dir.path(), "duplicated").is_err());
+        drop(next);
+        assert!(lock(dir.path(), "duplicated").is_ok());
     }
     #[test]
     fn lock_child() {
