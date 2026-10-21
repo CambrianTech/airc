@@ -746,8 +746,8 @@ mod scan_tests {
         ));
     }
 
-    #[test]
-    fn byte_cut_acknowledges_only_the_delivered_prefix_and_empty_scan_reaches_bound() {
+    #[tokio::test]
+    async fn byte_cut_acknowledges_only_the_delivered_prefix_and_empty_scan_reaches_bound() {
         let room = RoomId::from_u128(1);
         let events: Vec<_> = (1..=3)
             .map(|n| {
@@ -792,14 +792,22 @@ mod scan_tests {
         assert_eq!(empty.scanned_through, request.through);
         assert!(!empty.has_more);
         // An ordinary Inbox reply cannot be mistaken for the positive ScanInbox contract.
-        let encoded = serde_json::to_value(Response::Inbox(InboxResponse {
-            envelopes: vec![],
-            newest: None,
-            has_more: false,
-        }))
+        let mut encoded = Vec::new();
+        airc_ipc::codec::write_frame(
+            &mut encoded,
+            &Response::Inbox(InboxResponse {
+                envelopes: vec![],
+                newest: None,
+                has_more: false,
+            }),
+        )
+        .await
         .unwrap();
         assert!(!matches!(
-            serde_json::from_value::<Response>(encoded).unwrap(),
+            airc_ipc::codec::read_frame::<_, Response>(&mut encoded.as_slice())
+                .await
+                .unwrap()
+                .unwrap(),
             Response::ScanInbox(_)
         ));
     }
