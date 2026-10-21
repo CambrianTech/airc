@@ -2412,6 +2412,21 @@ impl Airc {
         Ok(())
     }
 
+    /// Checkpoint a bounded transcript scan without publishing a lifecycle event.
+    /// The caller must stop before any visible event it has not delivered. Emitting
+    /// SubscriptionAdvanced for an excluded-only scan would create its own backlog.
+    pub async fn save_runtime_scan_cursor(
+        &self,
+        consumer_id: &str,
+        cursor: &airc_core::TranscriptCursor,
+    ) -> Result<(), AircError> {
+        self.inner
+            .store
+            .save_runtime_cursor(consumer_id, cursor, time::now_ms()?)
+            .await?;
+        Ok(())
+    }
+
     /// Persist a runtime consumer checkpoint for a concrete event.
     ///
     /// This is the preferred path for hooks and live feeds because it

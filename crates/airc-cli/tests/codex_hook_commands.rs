@@ -354,6 +354,51 @@ fn codex_hook_poll_prints_plain_digest_and_advances_cursor() {
     assert_eq!(second, "", "poll should share the hook cursor");
 }
 
+// Regression: the CLI checkpoints only the emitted prefix, shared by poll and hooks.
+#[test]
+fn digest_continuation_replays_remaining_messages_across_hook_surfaces() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    for text in [
+        "first instruction",
+        "second instruction",
+        "third instruction",
+    ] {
+        run_ok(&home, &["send", text]);
+    }
+    let first = run_ok_with_client(
+        &home,
+        "codex:bounded",
+        &["codex-hook", "poll", "--include-self", "--max-items", "1"],
+    );
+    assert!(first.contains("first instruction"));
+    assert!(!first.contains("second instruction"));
+    assert!(first.contains("More unread messages remain"));
+    let second = run_hook_with_client(
+        &home,
+        "codex:bounded",
+        &[
+            "codex-hook",
+            "user-prompt-submit",
+            "--include-self",
+            "--max-items",
+            "1",
+        ],
+        "{}",
+    );
+    let second = additional_context(&second);
+    assert!(second.contains("second instruction"));
+    assert!(!second.contains("third instruction"));
+    let third = run_ok_with_client(
+        &home,
+        "codex:bounded",
+        &["codex-hook", "poll", "--include-self", "--max-items", "1"],
+    );
+    assert!(third.contains("third instruction"));
+    assert!(!third.contains("first instruction"));
+}
+
 #[test]
 fn codex_hook_poll_filters_runtime_self_echoes() {
     let workspace = common::daemon_tempdir();
