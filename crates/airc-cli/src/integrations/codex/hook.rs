@@ -5,8 +5,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use airc_core::{Body, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, EventFilter, LiveLag};
+use airc_core::{Body, TranscriptCursor, TranscriptEvent, TranscriptKind};
+use airc_lib::{Airc, EventFilter, EventScan, LiveLag};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +66,12 @@ async fn run_hook(
         None => agent_process_client_id()?,
     };
     let consumer_id = consumer_id(runtime_client.as_deref());
-    let events = unread_events(&airc, &consumer_id, filter, count).await?;
+    let (batch, scanned_count) = unread_events(&airc, &consumer_id, filter, count).await?;
+    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
+    let end = delivery_end(&batch.events, max_items, raw, |event| {
+        include_self || !self_filter.is_self_event(event)
+    });
+    let events = &batch.events[..end];
 
     let resume = match crate::agent_resume::prepare(
         &airc,
@@ -83,14 +88,18 @@ async fn run_hook(
     };
     let work_context = match resume.as_ref() {
         Some(delivery) => Some(delivery.text.clone()),
-        None => work_context(&airc, &events).await?,
+        None => work_context(&airc, events).await?,
     };
-    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
     let visible: Vec<_> = events
         .iter()
         .filter(|event| include_self || !self_filter.is_self_event(event))
         .collect();
-    if let Some(context) = render_context(&visible, max_items, raw, work_context) {
+    if let Some(context) = continuation(
+        render_context(&visible, max_items, raw, work_context),
+        end < batch.events.len(),
+        scanned_count >= count.max(1),
+        runtime_client.as_deref(),
+    ) {
         print_hook_payload(&context, event_name)?;
         std::io::stdout().flush()?;
         if let Some(delivery) = resume {
@@ -99,9 +108,8 @@ async fn run_hook(
             }
         }
     }
-    if let Some(newest) = events.last() {
-        airc.save_runtime_cursor_for_event(&consumer_id, newest)
-            .await?;
+    if let Some(cursor) = delivered_cursor(&batch, end) {
+        airc.save_runtime_scan_cursor(&consumer_id, &cursor).await?;
     }
 
     Ok(())
@@ -120,28 +128,43 @@ pub async fn run_poll(
     let consumer_id = consumer_id(runtime_client.as_deref());
     let filter = hook_filter();
 
-    let mut events = unread_events(&airc, &consumer_id, filter.clone(), count).await?;
-    if events.is_empty() && wait_ms > 0 {
-        events = wait_for_one_event(&airc, filter.clone(), wait_ms).await?;
-        if events.is_empty() {
-            events = unread_events(&airc, &consumer_id, filter, count).await?;
+    let (mut batch, mut scanned_count) =
+        unread_events(&airc, &consumer_id, filter.clone(), count).await?;
+    if should_wait(scanned_count, wait_ms) {
+        // No raw records were read. Save the empty bootstrap origin before
+        // waiting; a live event wakes durable catchup rather than replacing it.
+        if let Some(cursor) = &batch.scanned_through {
+            airc.save_runtime_scan_cursor(&consumer_id, cursor).await?;
         }
+        (batch, scanned_count) =
+            catch_up_after_wake(wait_for_one_event(&airc, filter.clone(), wait_ms), || {
+                unread_events(&airc, &consumer_id, filter, count)
+            })
+            .await?;
     }
 
-    let work_context = work_context(&airc, &events).await?;
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
+    let end = delivery_end(&batch.events, max_items, raw, |event| {
+        include_self || !self_filter.is_self_event(event)
+    });
+    let events = &batch.events[..end];
+    let work_context = work_context(&airc, events).await?;
     let visible: Vec<_> = events
         .iter()
         .filter(|event| include_self || !self_filter.is_self_event(event))
         .collect();
-    if let Some(context) = render_context(&visible, max_items, raw, work_context) {
+    if let Some(context) = continuation(
+        render_context(&visible, max_items, raw, work_context),
+        end < batch.events.len(),
+        scanned_count >= count.max(1),
+        runtime_client.as_deref(),
+    ) {
         let mut output = std::io::stdout().lock();
         writeln!(output, "{context}")?;
         output.flush()?;
     }
-    if let Some(newest) = events.last() {
-        airc.save_runtime_cursor_for_event(&consumer_id, newest)
-            .await?;
+    if let Some(cursor) = delivered_cursor(&batch, end) {
+        airc.save_runtime_scan_cursor(&consumer_id, &cursor).await?;
     }
 
     Ok(())
@@ -181,6 +204,39 @@ fn render_context(
     (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
+fn should_wait(scanned_count: usize, wait_ms: u64) -> bool {
+    scanned_count == 0 && wait_ms > 0
+}
+
+fn continuation(
+    context: Option<String>,
+    pending: bool,
+    full_page: bool,
+    runtime_client: Option<&str>,
+) -> Option<String> {
+    if !pending && !full_page {
+        return context;
+    }
+    let status = if pending {
+        "More unread messages remain."
+    } else {
+        "The scan page was full; more unread records may remain."
+    };
+    // Stdin-only hook identity is not inherited by a later poll. State the
+    // supported explicit environment binding as data, never shell-interpolate it.
+    let next = match runtime_client {
+        Some(client) => format!(
+            "Continue in the same AIRC scope with airc codex-hook poll, setting AIRC_CLIENT_ID to the JSON string value {}.", serde_json::json!(client)
+        ),
+        None => "Continue by invoking the same hook with the same scope and identity context (consumer codex-hook:default).".to_string(),
+    };
+    let hint = format!("{status} {next}");
+    Some(match context {
+        Some(context) => format!("{context}\n{hint}"),
+        None => hint,
+    })
+}
+
 fn consumer_id(runtime_client: Option<&str>) -> String {
     match runtime_client {
         Some(client) => format!("{CONSUMER_PREFIX}:{client}"),
@@ -195,21 +251,86 @@ fn hook_filter() -> EventFilter {
     }
 }
 
+/// One bounded raw page per invocation. Even an entirely filtered page carries
+/// its scan cursor, so the next invocation progresses rather than rereading it.
 async fn unread_events(
     airc: &Airc,
     consumer_id: &str,
     filter: EventFilter,
     count: usize,
-) -> Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>> {
+) -> Result<(EventScan, usize), Box<dyn std::error::Error>> {
     let previous = airc.load_runtime_cursor(consumer_id).await?;
-    let events = match previous {
+    let batch = match previous {
         Some(cursor) => {
-            airc.resume_from_subscribed_filtered(&cursor, filter, count)
+            airc.scan_subscribed_events(&cursor, EventFilter::default(), count.max(1))
                 .await?
         }
-        None => airc.page_recent_subscribed_filtered(filter, count).await?,
+        None => {
+            let events = airc
+                .page_recent_subscribed_filtered(EventFilter::default(), count.max(1))
+                .await?;
+            let scanned_through = Some(events.last().map(TranscriptEvent::cursor).unwrap_or(
+                TranscriptCursor {
+                    lamport: 0,
+                    event_id: airc_core::EventId::from_u128(0),
+                },
+            ));
+            EventScan {
+                events,
+                scanned_through,
+            }
+        }
     };
-    Ok(events)
+    Ok(filter_page(batch, filter))
+}
+
+fn filter_page(mut batch: EventScan, filter: EventFilter) -> (EventScan, usize) {
+    // Count the bounded raw page before filtering: matching event count cannot
+    // tell whether an excluded or mixed page filled the scan budget.
+    let scanned_count = batch.events.len();
+    batch.events.retain(|event| filter.matches(event));
+    (batch, scanned_count)
+}
+
+/// Stop before the first visible message that cannot be emitted this turn.
+/// Deliberately suppressed lifecycle/self records do not spend the message budget.
+fn delivery_end(
+    events: &[TranscriptEvent],
+    max_items: usize,
+    raw: bool,
+    visible: impl Fn(&TranscriptEvent) -> bool,
+) -> usize {
+    let mut shown = 0;
+    for (index, event) in events.iter().enumerate() {
+        if visible(event)
+            && (raw || (!is_work_queue_event(event) && !is_runtime_alive_event(event)))
+        {
+            if !raw && shown == max_items.max(1) {
+                return index;
+            }
+            shown += 1;
+        }
+    }
+    events.len()
+}
+
+fn delivered_cursor(batch: &EventScan, end: usize) -> Option<TranscriptCursor> {
+    if end == batch.events.len() {
+        batch.scanned_through.clone()
+    } else {
+        end.checked_sub(1).map(|index| batch.events[index].cursor())
+    }
+}
+
+/// Subscription delivery only wakes the reader; the durable scan owns ordering.
+async fn catch_up_after_wake<W, F, R, T>(wake: W, read: F) -> Result<T, Box<dyn std::error::Error>>
+where
+    W: std::future::Future<Output = Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>>>,
+    F: FnOnce() -> R,
+    R: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    let _ = wake.await?;
+    read().await
 }
 
 async fn wait_for_one_event(
@@ -374,14 +495,14 @@ fn render_digest<'a>(
     events: impl IntoIterator<Item = &'a TranscriptEvent>,
     max_items: usize,
 ) -> String {
-    let messages = dedupe(events);
+    let messages = digest_messages(events);
     if messages.is_empty() {
         return String::new();
     }
 
     let max_items = max_items.max(1);
     let hidden = messages.len().saturating_sub(max_items);
-    let shown = &messages[messages.len().saturating_sub(max_items)..];
+    let shown = &messages[..messages.len().min(max_items)];
     let mut peers = Vec::new();
     for message in &messages {
         if !peers.contains(&message.peer) {
@@ -402,19 +523,15 @@ fn render_digest<'a>(
     lines.push(first);
     if hidden > 0 {
         lines.push(format!(
-            "latest {} shown; {hidden} older omitted",
+            "first {} shown; {hidden} remain pending",
             shown.len()
         ));
     }
     for message in shown {
-        lines.push(format!(
-            "- {}: {}",
-            message.peer,
-            summarize_text(&message.body, 120)
-        ));
+        lines.push(format!("- {}: {}", message.peer, message.body));
     }
     if hidden > 0 {
-        lines.push("more: airc codex-hook user-prompt-submit --raw".to_string());
+        lines.push("continue: airc codex-hook poll".to_string());
     }
     lines.join("\n")
 }
@@ -425,8 +542,9 @@ struct DigestMessage {
     body: String,
 }
 
-fn dedupe<'a>(events: impl IntoIterator<Item = &'a TranscriptEvent>) -> Vec<DigestMessage> {
-    let mut seen = BTreeSet::new();
+fn digest_messages<'a>(
+    events: impl IntoIterator<Item = &'a TranscriptEvent>,
+) -> Vec<DigestMessage> {
     let mut messages = Vec::new();
     for event in events {
         if is_work_queue_event(event) || is_runtime_alive_event(event) {
@@ -434,9 +552,7 @@ fn dedupe<'a>(events: impl IntoIterator<Item = &'a TranscriptEvent>) -> Vec<Dige
         }
         let peer = event.peer_id.to_string();
         let body = summarize_body(event);
-        if seen.insert((peer.clone(), body.clone())) {
-            messages.push(DigestMessage { peer, body });
-        }
+        messages.push(DigestMessage { peer, body });
     }
     messages
 }
@@ -478,14 +594,6 @@ fn format_body(body: &Body) -> String {
     }
 }
 
-fn summarize_text(value: &str, max_len: usize) -> String {
-    let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.len() <= max_len {
-        return one_line;
-    }
-    format!("{}...", one_line[..max_len.saturating_sub(3)].trim_end())
-}
-
 #[cfg(test)]
 mod tests {
     use airc_core::{
@@ -494,7 +602,10 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{consumer_id, render_digest, render_raw};
+    use super::{
+        catch_up_after_wake, consumer_id, delivered_cursor, delivery_end, render_digest, render_raw,
+    };
+    use airc_lib::EventScan;
 
     #[test]
     fn consumer_id_uses_runtime_client_when_present() {
@@ -538,6 +649,160 @@ mod tests {
         let digest = render_digest(&events, 8);
 
         assert!(digest.is_empty());
+    }
+
+    // Regression: 44 fetched messages with an eight-message budget must all be
+    // delivered in order, including identical bodies, without acknowledging the tail.
+    #[test]
+    fn digest_checkpoint_preserves_every_pending_message_and_unicode_body() {
+        let mut events: Vec<_> = (1..=44)
+            .map(|n| {
+                let mut event = event(Body::text(format!(
+                    "message-{n}: {} final instruction",
+                    "界".repeat(50)
+                )));
+                event.lamport = n;
+                event
+            })
+            .collect();
+        events[1].body = events[0].body.clone();
+        let mut delivered = Vec::new();
+        let mut offset = 0;
+        while offset < events.len() {
+            let batch = EventScan {
+                events: events[offset..].to_vec(),
+                scanned_through: events.last().map(TranscriptEvent::cursor),
+            };
+            let end = delivery_end(&batch.events, 8, false, |_| true);
+            assert_eq!(end, (44 - offset).min(8));
+            let output = render_digest(&batch.events[..end], 8);
+            for item in &batch.events[..end] {
+                assert!(
+                    output.contains(&super::summarize_body(item)),
+                    "full UTF-8 body retained"
+                );
+                delivered.push(item.event_id);
+            }
+            assert_eq!(
+                delivered_cursor(&batch, end),
+                Some(batch.events[end - 1].cursor())
+            );
+            offset += end;
+        }
+        assert_eq!(
+            delivered,
+            events.iter().map(|e| e.event_id).collect::<Vec<_>>()
+        );
+    }
+
+    // Regression: an excluded raw page has a checkpoint even with zero messages;
+    // a partial visible page must not advance to its raw high-water mark.
+    #[test]
+    fn excluded_pages_progress_but_unrendered_messages_do_not() {
+        let mut excluded = event(Body::text("excluded record"));
+        excluded.kind = TranscriptKind::Presence;
+        excluded.lamport = 50;
+        let batch = EventScan {
+            events: Vec::new(),
+            scanned_through: Some(excluded.cursor()),
+        };
+        assert_eq!(
+            delivered_cursor(&batch, delivery_end(&batch.events, 8, false, |_| true)),
+            Some(excluded.cursor())
+        );
+        let mut first = event(Body::text("first"));
+        first.lamport = 51;
+        let mut second = event(Body::text("second"));
+        second.lamport = 52;
+        let mut tail = excluded.clone();
+        tail.lamport = 53;
+        let batch = EventScan {
+            events: vec![first.clone(), second],
+            scanned_through: Some(tail.cursor()),
+        };
+        let end = delivery_end(&batch.events, 1, false, |_| true);
+        assert_eq!(delivered_cursor(&batch, end), Some(first.cursor()));
+        assert_eq!(delivered_cursor(&batch, 2), Some(tail.cursor()));
+    }
+
+    // Regression: a live notification after the subscribe gap cannot replace an
+    // earlier durable message; timeout/no-notification also performs durable catchup.
+    #[tokio::test]
+    async fn live_wake_always_reads_the_durable_gap() {
+        for notified in [false, true] {
+            let mut gap = event(Body::text("arrived before subscribe"));
+            gap.lamport = 10;
+            let mut live = event(Body::text("live notification"));
+            live.lamport = 11;
+            let wake = if notified {
+                vec![live.clone()]
+            } else {
+                Vec::new()
+            };
+            let expected = vec![gap.event_id, live.event_id];
+            let batch = catch_up_after_wake(async { Ok(wake) }, || async {
+                Ok(EventScan {
+                    scanned_through: Some(live.cursor()),
+                    events: vec![gap, live],
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                batch.events.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn full_raw_pages_continue_even_without_visible_context() {
+        for context in [None, Some("all matching messages delivered".to_string())] {
+            let output = super::continuation(context, false, true, Some("codex:stdin-only"))
+                .expect("full raw page needs a continuation");
+            assert!(output.contains("may remain"));
+            assert!(output.contains("AIRC_CLIENT_ID"));
+            assert!(output.contains("codex:stdin-only"));
+            assert!(!output.contains("More unread messages remain"));
+        }
+        for mixed in [false, true] {
+            let mut excluded = event(Body::text("excluded"));
+            excluded.kind = TranscriptKind::Presence;
+            let second = if mixed {
+                event(Body::text("visible"))
+            } else {
+                excluded.clone()
+            };
+            let raw = EventScan {
+                scanned_through: Some(second.cursor()),
+                events: vec![excluded, second],
+            };
+            let (filtered, scanned_count) = super::filter_page(raw, super::hook_filter());
+            assert_eq!(scanned_count, 2);
+            assert_eq!(filtered.events.len(), usize::from(mixed));
+            let end = delivery_end(&filtered.events, 8, false, |_| true);
+            assert!(super::continuation(
+                None,
+                end < filtered.events.len(),
+                scanned_count >= 2,
+                None
+            )
+            .is_some());
+        }
+        assert!(super::continuation(None, false, false, None).is_none());
+        assert!(super::continuation(None, true, false, None)
+            .unwrap()
+            .contains("same hook"));
+        assert!(
+            !super::should_wait(50, 30_000),
+            "excluded full page made progress"
+        );
+        assert!(
+            !super::should_wait(1, 30_000),
+            "partial raw page made progress"
+        );
+        assert!(super::should_wait(0, 30_000));
+        assert!(!super::should_wait(0, 0));
     }
 
     fn event(body: Body) -> TranscriptEvent {
