@@ -6,7 +6,7 @@
 //! `airc-store` so each attach starts at "new since last seen" instead
 //! of replaying the full transcript.
 
-use airc_core::{RoomId, TranscriptEvent, TranscriptKind};
+use airc_core::{MentionTarget, PeerId, RoomId, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, LiveLag};
 use futures::stream::StreamExt;
 use std::io::Write;
@@ -57,15 +57,9 @@ async fn print_delivery_turn(
     room: Option<RoomId>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let turn = match room {
-        Some(room) => {
-            airc.prepare_room_delivery(
-                consumer,
-                room,
-                announce_history,
-                CATCH_UP_LIMIT,
-                CATCH_UP_LIMIT,
-            )
-            .await?
+        Some(_) => {
+            airc.prepare_native_delivery(consumer, announce_history, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
+                .await?
         }
         None => {
             airc.prepare_agent_delivery(consumer, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
@@ -73,8 +67,18 @@ async fn print_delivery_turn(
         }
     };
     let live_end = turn.live_events().len().min(turn.live_budget);
+    let mut ambient = 0usize;
+    let mut ambient_rooms = std::collections::HashSet::new();
     for event in &turn.live_events()[..live_end] {
-        print_event(event, self_filter, output)?;
+        if room.is_none_or(|focus| foreground(event, focus, airc.peer_id())) {
+            print_event(event, self_filter, output)?;
+        } else {
+            ambient += 1;
+            ambient_rooms.insert(event.room_id);
+        }
+    }
+    if ambient > 0 {
+        writeln!(output, "Ambient activity: {ambient} events in {} other rooms; recover with `airc inbox --room <room>`. Bodies remain in history.", ambient_rooms.len())?;
     }
     // History remains durable and unacknowledged. Do not replay old requests
     // into a native live feed: announce the bounded page once per attachment,
@@ -83,7 +87,7 @@ async fn print_delivery_turn(
         if let Some(first) = turn.backlog_events().first() {
             writeln!(
                 output,
-                "Retained history (not live): at least {} unread events; first scanned timestamp {} ms since Unix epoch. Read deliberately in this same AIRC home with `airc inbox --all --json`; page a room with `airc inbox --room <room> --since-lamport <lamport> --since-event-id <event-id>`. History has not been acknowledged.",
+                "Retained history (not live): at least {} retained events; first scanned timestamp {} ms since Unix epoch. Read deliberately in this same AIRC home with `airc inbox --all --json`; page a room with `airc inbox --room <room> --since-lamport <lamport> --since-event-id <event-id>`. History has not been acknowledged.",
                 turn.backlog_events().len(),
                 first.occurred_at_ms,
             )?;
@@ -93,6 +97,10 @@ async fn print_delivery_turn(
     let pending = turn.has_pending(live_end, 0);
     turn.acknowledge(live_end, 0).await?;
     Ok(pending)
+}
+
+fn foreground(event: &TranscriptEvent, focus: RoomId, peer: PeerId) -> bool {
+    event.room_id == focus || matches!(event.target, MentionTarget::Peer(target) if target == peer)
 }
 
 fn consumer_id(runtime_client: Option<&str>) -> String {
@@ -128,6 +136,44 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn native_feed_keeps_cross_room_direct_messages_and_summarizes_ambient() {
+        let (_dir, airc, room) = fixture().await;
+        let mut set = airc.subscription_set().await.unwrap();
+        let other = set
+            .subscribe_with_wire_root(
+                airc.wire_root(),
+                &MeshIdentity::new("test"),
+                ChannelName::new("elsewhere").unwrap(),
+            )
+            .unwrap()
+            .room_id;
+        subscriptions::save(airc.coordinator_store_for_test(), &set)
+            .await
+            .unwrap();
+        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        print_delivery_turn(&airc, "focused", &filter, &mut Vec::new(), true, Some(room))
+            .await
+            .unwrap();
+        airc.append_event(event(&airc, other, 1, "claude:peer", "ambient-body"))
+            .await
+            .unwrap();
+        let mut directed = event(&airc, other, 2, "claude:peer", "direct-challenge");
+        directed.target = MentionTarget::Peer(airc.peer_id());
+        airc.append_event(directed).await.unwrap();
+        airc.append_event(event(&airc, room, 3, "claude:peer", "room-message"))
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        print_delivery_turn(&airc, "focused", &filter, &mut output, false, Some(room))
+            .await
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("direct-challenge"));
+        assert!(text.contains("room-message"));
+        assert!(!text.contains("ambient-body"));
+        assert!(text.contains("Ambient activity: 1 events in 1 other rooms"));
+    }
     #[tokio::test]
     async fn native_turn_announces_history_after_fresh_and_failed_output_does_not_ack() {
         let (_dir, airc, room) = fixture().await;
@@ -189,7 +235,7 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("at least 3 unread events"));
+        assert!(text.contains("at least 3 retained events"));
         assert!(!text.contains("old-2"));
         airc.append_event(event(&airc, room, 4, "claude:peer", "fresh-request"))
             .await

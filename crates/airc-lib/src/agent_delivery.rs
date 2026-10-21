@@ -72,16 +72,6 @@ async fn rooms(airc: &Airc) -> Result<Vec<RoomId>, AircError> {
     rooms.dedup();
     Ok(rooms)
 }
-// A named feed owns only that room; subscription changes elsewhere do not
-// invalidate its checkpoint or consume another room's delivery position.
-async fn delivery_rooms(airc: &Airc, room: Option<RoomId>) -> Result<Vec<RoomId>, AircError> {
-    let subscribed = rooms(airc).await?;
-    match room {
-        Some(room) if subscribed.contains(&room) => Ok(vec![room]),
-        Some(_) => Err(fail("delivery room is not subscribed; checkpoint retained")),
-        None => Ok(subscribed),
-    }
-}
 async fn persist(airc: &Airc, consumer: &str, state: &State) -> Result<(), AircError> {
     airc.inner
         .store
@@ -110,7 +100,6 @@ pub struct AgentDeliveryTurn {
     pub live_budget: usize,
     pub backlog_budget: usize,
     single: bool,
-    room: Option<RoomId>,
 }
 impl AgentDeliveryTurn {
     pub fn live_events(&self) -> &[TranscriptEvent] {
@@ -145,7 +134,7 @@ impl AgentDeliveryTurn {
     pub async fn acknowledge(self, live_end: usize, backlog_end: usize) -> Result<(), AircError> {
         tokio::spawn(async move {
             let mut turn = self;
-            if delivery_rooms(&turn.airc, turn.room).await? != turn.state.rooms {
+            if rooms(&turn.airc).await? != turn.state.rooms {
                 return Err(fail("subscription scope changed; checkpoint retained"));
             }
             let live = prefix(&turn.live, live_end, &turn.state.live)?;
@@ -199,19 +188,18 @@ impl Airc {
         let airc = self.clone();
         let consumer = consumer.to_owned();
         tokio::spawn(async move {
-            airc.prepare_delivery_owned(consumer, scan_limit, budget, None, false)
+            airc.prepare_delivery_owned(consumer, scan_limit, budget, false)
                 .await
         })
         .await
         .map_err(fail)?
     }
-    /// Prepare a named native feed. On attachment, reclassify all currently
+    /// Prepare an all-subscription native feed. On attachment, reclassify all currently
     /// unread events as retained history under the same exclusive delivery lock.
     /// This never acknowledges history or changes another consumer's checkpoint.
-    pub async fn prepare_room_delivery(
+    pub async fn prepare_native_delivery(
         &self,
         consumer: &str,
-        room: RoomId,
         attaching: bool,
         scan_limit: usize,
         budget: usize,
@@ -219,7 +207,7 @@ impl Airc {
         let airc = self.clone();
         let consumer = consumer.to_owned();
         tokio::spawn(async move {
-            airc.prepare_delivery_owned(consumer, scan_limit, budget, Some(room), attaching)
+            airc.prepare_delivery_owned(consumer, scan_limit, budget, attaching)
                 .await
         })
         .await
@@ -230,14 +218,13 @@ impl Airc {
         consumer: String,
         scan_limit: usize,
         budget: usize,
-        room: Option<RoomId>,
         attaching: bool,
     ) -> Result<AgentDeliveryTurn, AircError> {
         if !(1..=4096).contains(&scan_limit) || budget == 0 {
             return Err(fail("invalid scan/output budget"));
         }
         let guard = lock(self.home(), &consumer)?;
-        let channels = delivery_rooms(self, room).await?;
+        let channels = rooms(self).await?;
         let source = if let Some(client) = self.daemon_client() {
             // The owner's stable identity identifies the router sequence authority;
             // embedded local Lamport values are a different cursor domain.
@@ -328,7 +315,7 @@ impl Airc {
                 &channels,
             )
             .await?;
-        if delivery_rooms(self, room).await? != channels {
+        if rooms(self).await? != channels {
             return Err(fail(
                 "subscription scope changed during prepare; retry required",
             ));
@@ -359,7 +346,6 @@ impl Airc {
             live_budget,
             backlog_budget,
             single: budget == 1,
-            room,
         })
     }
 }
@@ -406,63 +392,41 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
-    async fn room_attach_retains_offline_live_and_failed_delivery_without_other_rooms() {
+    async fn native_attach_retains_offline_live_and_failed_delivery() {
         let (_dir, airc, room) = fixture().await;
         append(&airc, room, 1).await;
         drop(
-            airc.prepare_room_delivery("named", room, true, 64, 64)
+            airc.prepare_native_delivery("native", true, 64, 64)
                 .await
                 .unwrap(),
         );
-        append(&airc, room, 2).await; // arrived while detached
+        append(&airc, room, 2).await;
         let attached = airc
-            .prepare_room_delivery("named", room, true, 64, 64)
+            .prepare_native_delivery("native", true, 64, 64)
             .await
             .unwrap();
         assert!(attached.live_events().is_empty());
         assert_eq!(attached.backlog_events().len(), 2);
         drop(attached);
-        // Subscribe another room without invalidating this room's consumer.
-        let mut set = airc.subscription_set().await.unwrap();
-        let other = set
-            .subscribe_with_wire_root(
-                airc.wire_root(),
-                &MeshIdentity::new("test"),
-                ChannelName::new("other").unwrap(),
-            )
-            .unwrap()
-            .room_id;
-        subscriptions::save(airc.coordinator_store_for_test(), &set)
-            .await
-            .unwrap();
-        append(&airc, other, 3).await;
-        append(&airc, room, 4).await;
+        append(&airc, room, 3).await;
         let fresh = airc
-            .prepare_room_delivery("named", room, false, 64, 64)
+            .prepare_native_delivery("native", false, 64, 64)
             .await
             .unwrap();
-        assert_eq!(fresh.live_events().len(), 1);
-        assert_eq!(fresh.live_events()[0].lamport, 4);
-        drop(fresh); // failed output must replay on this attachment
+        assert_eq!(fresh.live_events()[0].lamport, 3);
+        drop(fresh);
         let retry = airc
-            .prepare_room_delivery("named", room, false, 64, 64)
+            .prepare_native_delivery("native", false, 64, 64)
             .await
             .unwrap();
-        assert_eq!(retry.live_events()[0].lamport, 4);
+        assert_eq!(retry.live_events()[0].lamport, 3);
         retry.acknowledge(1, 0).await.unwrap();
         let done = airc
-            .prepare_room_delivery("named", room, false, 64, 64)
+            .prepare_native_delivery("native", false, 64, 64)
             .await
             .unwrap();
         assert!(done.live_events().is_empty());
         assert_eq!(done.backlog_events().len(), 2);
-        drop(done);
-        let other_feed = airc
-            .prepare_room_delivery("other-consumer", other, true, 64, 64)
-            .await
-            .unwrap();
-        assert_eq!(other_feed.backlog_events().len(), 1);
-        assert_eq!(other_feed.backlog_events()[0].lamport, 3);
     }
     #[tokio::test]
     async fn fresh_delivery_precedes_large_backlog_and_restart_recovers_every_prefix() {
