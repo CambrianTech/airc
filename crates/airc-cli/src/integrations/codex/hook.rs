@@ -5,8 +5,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use airc_core::{Body, TranscriptCursor, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, EventFilter, EventScan, LiveLag};
+use airc_core::{Body, TranscriptEvent, TranscriptKind};
+use airc_lib::{Airc, EventFilter, LiveLag};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -66,12 +66,19 @@ async fn run_hook(
         None => agent_process_client_id()?,
     };
     let consumer_id = consumer_id(runtime_client.as_deref());
-    let (batch, scanned_count) = unread_events(&airc, &consumer_id, filter, count).await?;
+    let mut turn = airc
+        .prepare_agent_delivery(&consumer_id, count.max(1), max_items.max(1))
+        .await?;
+    turn.retain(&filter);
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
-    let end = delivery_end(&batch.events, max_items, raw, |event| {
-        include_self || !self_filter.is_self_event(event)
+    let (live_end, backlog_end) = delivery_ends(&turn, raw, |e| {
+        include_self || !self_filter.is_self_event(e)
     });
-    let events = &batch.events[..end];
+    let events = turn.live_events()[..live_end]
+        .iter()
+        .chain(&turn.backlog_events()[..backlog_end])
+        .cloned()
+        .collect::<Vec<_>>();
 
     let resume = match crate::agent_resume::prepare(
         &airc,
@@ -88,16 +95,15 @@ async fn run_hook(
     };
     let work_context = match resume.as_ref() {
         Some(delivery) => Some(delivery.text.clone()),
-        None => work_context(&airc, events).await?,
+        None => work_context(&airc, &events).await?,
     };
-    let visible: Vec<_> = events
-        .iter()
-        .filter(|event| include_self || !self_filter.is_self_event(event))
-        .collect();
+    let context = delivery_context(&turn, live_end, backlog_end, raw, work_context, |e| {
+        include_self || !self_filter.is_self_event(e)
+    });
     if let Some(context) = continuation(
-        render_context(&visible, max_items, raw, work_context),
-        end < batch.events.len(),
-        scanned_count >= count.max(1),
+        context,
+        live_end < turn.live_events().len() || backlog_end < turn.backlog_events().len(),
+        turn.has_pending(live_end, backlog_end),
         runtime_client.as_deref(),
     ) {
         print_hook_payload(&context, event_name)?;
@@ -108,9 +114,7 @@ async fn run_hook(
             }
         }
     }
-    if let Some(cursor) = delivered_cursor(&batch, end) {
-        airc.save_runtime_scan_cursor(&consumer_id, &cursor).await?;
-    }
+    turn.acknowledge(live_end, backlog_end).await?;
 
     Ok(())
 }
@@ -128,41 +132,102 @@ pub async fn run_poll(
     let consumer_id = consumer_id(runtime_client.as_deref());
     let filter = hook_filter();
 
-    let (batch, scanned_count) = poll_events_with_wake(
-        &airc,
-        &consumer_id,
-        filter.clone(),
-        count,
-        wait_ms,
-        wait_for_one_event(&airc, filter, wait_ms),
-    )
-    .await?;
-
+    let mut turn = airc
+        .prepare_agent_delivery(&consumer_id, count.max(1), max_items.max(1))
+        .await?;
+    turn.retain(&filter);
+    if turn.is_empty() && !turn.has_pending(0, 0) && wait_ms > 0 {
+        turn.acknowledge(0, 0).await?; // release ownership before an idle wait
+        let _ = wait_for_one_event(&airc, filter.clone(), wait_ms).await?;
+        turn = airc
+            .prepare_agent_delivery(&consumer_id, count.max(1), max_items.max(1))
+            .await?;
+        turn.retain(&filter);
+    }
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
-    let end = delivery_end(&batch.events, max_items, raw, |event| {
-        include_self || !self_filter.is_self_event(event)
+    let (live_end, backlog_end) = delivery_ends(&turn, raw, |e| {
+        include_self || !self_filter.is_self_event(e)
     });
-    let events = &batch.events[..end];
-    let work_context = work_context(&airc, events).await?;
-    let visible: Vec<_> = events
+    let events = turn.live_events()[..live_end]
         .iter()
-        .filter(|event| include_self || !self_filter.is_self_event(event))
-        .collect();
+        .chain(&turn.backlog_events()[..backlog_end])
+        .cloned()
+        .collect::<Vec<_>>();
+    let work = work_context(&airc, &events).await?;
+    let context = delivery_context(&turn, live_end, backlog_end, raw, work, |e| {
+        include_self || !self_filter.is_self_event(e)
+    });
     if let Some(context) = continuation(
-        render_context(&visible, max_items, raw, work_context),
-        end < batch.events.len(),
-        scanned_count >= count.max(1),
+        context,
+        live_end < turn.live_events().len() || backlog_end < turn.backlog_events().len(),
+        turn.has_pending(live_end, backlog_end),
         runtime_client.as_deref(),
     ) {
         let mut output = std::io::stdout().lock();
         writeln!(output, "{context}")?;
         output.flush()?;
     }
-    if let Some(cursor) = delivered_cursor(&batch, end) {
-        airc.save_runtime_scan_cursor(&consumer_id, &cursor).await?;
-    }
+    turn.acknowledge(live_end, backlog_end).await?;
 
     Ok(())
+}
+
+fn delivery_ends(
+    turn: &airc_lib::AgentDeliveryTurn,
+    raw: bool,
+    visible: impl Fn(&TranscriptEvent) -> bool,
+) -> (usize, usize) {
+    fn end(
+        events: &[TranscriptEvent],
+        budget: usize,
+        raw: bool,
+        visible: &impl Fn(&TranscriptEvent) -> bool,
+    ) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        let mut shown = 0;
+        for (i, e) in events.iter().enumerate() {
+            if visible(e) && (raw || (!is_work_queue_event(e) && !is_runtime_alive_event(e))) {
+                if shown == budget {
+                    return i;
+                }
+                shown += 1;
+            }
+        }
+        events.len()
+    }
+    (
+        end(turn.live_events(), turn.live_budget, raw, &visible),
+        end(turn.backlog_events(), turn.backlog_budget, raw, &visible),
+    )
+}
+fn delivery_context(
+    turn: &airc_lib::AgentDeliveryTurn,
+    live_end: usize,
+    backlog_end: usize,
+    raw: bool,
+    work: Option<String>,
+    visible: impl Fn(&TranscriptEvent) -> bool,
+) -> Option<String> {
+    let live: Vec<_> = turn.live_events()[..live_end]
+        .iter()
+        .filter(|e| visible(e))
+        .collect();
+    let backlog: Vec<_> = turn.backlog_events()[..backlog_end]
+        .iter()
+        .filter(|e| visible(e))
+        .collect();
+    let mut sections = Vec::new();
+    if let Some(text) = render_context(&live, turn.live_budget.max(1), raw, work) {
+        sections.push(text);
+    }
+    if let Some(text) = render_context(&backlog, turn.backlog_budget.max(1), raw, None) {
+        sections.push(format!(
+            "Historical catch-up (retained unread history):\n{text}"
+        ));
+    }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 async fn work_context(
@@ -197,10 +262,6 @@ fn render_context(
         sections.push(context);
     }
     (!sections.is_empty()).then(|| sections.join("\n\n"))
-}
-
-fn should_wait(scanned_count: usize, wait_ms: u64) -> bool {
-    scanned_count == 0 && wait_ms > 0
 }
 
 fn continuation(
@@ -244,118 +305,6 @@ fn hook_filter() -> EventFilter {
         kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
         ..EventFilter::default()
     }
-}
-
-/// Persist the empty origin before waiting, then read durable catch-up.
-async fn poll_events_with_wake<W>(
-    airc: &Airc,
-    consumer_id: &str,
-    filter: EventFilter,
-    count: usize,
-    wait_ms: u64,
-    wake: W,
-) -> Result<(EventScan, usize), Box<dyn std::error::Error>>
-where
-    W: std::future::Future<Output = Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>>>,
-{
-    let (batch, scanned_count) = unread_events(airc, consumer_id, filter.clone(), count).await?;
-    if should_wait(scanned_count, wait_ms) {
-        // Establish an empty consumer's origin before polling the wake future.
-        // A burst during the wait must be read forward, never bootstrapped as a tail.
-        if let Some(cursor) = &batch.scanned_through {
-            airc.save_runtime_scan_cursor(consumer_id, cursor).await?;
-        }
-        return catch_up_after_wake(wake, || unread_events(airc, consumer_id, filter, count)).await;
-    }
-    Ok((batch, scanned_count))
-}
-
-async fn unread_events(
-    airc: &Airc,
-    consumer_id: &str,
-    filter: EventFilter,
-    count: usize,
-) -> Result<(EventScan, usize), Box<dyn std::error::Error>> {
-    let previous = airc.load_runtime_cursor(consumer_id).await?;
-    let Some(through) = airc.latest_subscribed_cursor().await? else {
-        return Ok((
-            EventScan {
-                events: vec![],
-                scanned_through: Some(previous.unwrap_or(TranscriptCursor {
-                    lamport: 0,
-                    event_id: airc_core::EventId::from_u128(0),
-                })),
-            },
-            0,
-        ));
-    };
-    let batch = airc
-        .scan_agent_feed(previous.as_ref(), &through, count.max(1))
-        .await?;
-    let more = batch
-        .scanned_through
-        .as_ref()
-        .is_some_and(|c| (c.lamport, c.event_id.0) < (through.lamport, through.event_id.0));
-    let progressed = batch.scanned_through.as_ref() != previous.as_ref();
-    let (batch, matches) = filter_page(batch, filter);
-    // Preserve continuation on byte-short pages and avoid waiting before saving scan progress.
-    let scanned_count = if more {
-        count.max(1)
-    } else if progressed {
-        matches.max(1)
-    } else {
-        matches
-    };
-    Ok((batch, scanned_count))
-}
-
-fn filter_page(mut batch: EventScan, filter: EventFilter) -> (EventScan, usize) {
-    // Count the bounded raw page before filtering: matching event count cannot
-    // tell whether an excluded or mixed page filled the scan budget.
-    let scanned_count = batch.events.len();
-    batch.events.retain(|event| filter.matches(event));
-    (batch, scanned_count)
-}
-
-/// Stop before the first visible message that cannot be emitted this turn.
-/// Deliberately suppressed lifecycle/self records do not spend the message budget.
-fn delivery_end(
-    events: &[TranscriptEvent],
-    max_items: usize,
-    raw: bool,
-    visible: impl Fn(&TranscriptEvent) -> bool,
-) -> usize {
-    let mut shown = 0;
-    for (index, event) in events.iter().enumerate() {
-        if visible(event)
-            && (raw || (!is_work_queue_event(event) && !is_runtime_alive_event(event)))
-        {
-            if !raw && shown == max_items.max(1) {
-                return index;
-            }
-            shown += 1;
-        }
-    }
-    events.len()
-}
-
-fn delivered_cursor(batch: &EventScan, end: usize) -> Option<TranscriptCursor> {
-    if end == batch.events.len() {
-        batch.scanned_through.clone()
-    } else {
-        end.checked_sub(1).map(|index| batch.events[index].cursor())
-    }
-}
-
-/// Subscription delivery only wakes the reader; the durable scan owns ordering.
-async fn catch_up_after_wake<W, F, R, T>(wake: W, read: F) -> Result<T, Box<dyn std::error::Error>>
-where
-    W: std::future::Future<Output = Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>>>,
-    F: FnOnce() -> R,
-    R: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
-{
-    let _ = wake.await?;
-    read().await
 }
 
 async fn wait_for_one_event(
@@ -627,10 +576,8 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{
-        catch_up_after_wake, consumer_id, delivered_cursor, delivery_end, render_digest, render_raw,
-    };
-    use airc_lib::EventScan;
+    use super::{consumer_id, delivery_context, delivery_ends, render_digest, render_raw};
+    use airc_lib::Airc;
 
     #[test]
     fn consumer_id_uses_runtime_client_when_present() {
@@ -676,171 +623,14 @@ mod tests {
         assert!(digest.is_empty());
     }
 
-    // Regression: 44 fetched messages with an eight-message budget must all be
-    // delivered in order, including identical bodies, without acknowledging the tail.
-    #[test]
-    fn digest_checkpoint_preserves_every_pending_message_and_unicode_body() {
-        let mut events: Vec<_> = (1..=44)
-            .map(|n| {
-                let mut event = event(Body::text(format!(
-                    "message-{n}: {} final instruction",
-                    "界".repeat(50)
-                )));
-                event.lamport = n;
-                event
-            })
-            .collect();
-        events[1].body = events[0].body.clone();
-        let mut delivered = Vec::new();
-        let mut offset = 0;
-        while offset < events.len() {
-            let batch = EventScan {
-                events: events[offset..].to_vec(),
-                scanned_through: events.last().map(TranscriptEvent::cursor),
-            };
-            let end = delivery_end(&batch.events, 8, false, |_| true);
-            assert_eq!(end, (44 - offset).min(8));
-            let output = render_digest(&batch.events[..end], 8);
-            for item in &batch.events[..end] {
-                assert!(
-                    output.contains(&super::summarize_body(item)),
-                    "full UTF-8 body retained"
-                );
-                delivered.push(item.event_id);
-            }
-            assert_eq!(
-                delivered_cursor(&batch, end),
-                Some(batch.events[end - 1].cursor())
-            );
-            offset += end;
-        }
-        assert_eq!(
-            delivered,
-            events.iter().map(|e| e.event_id).collect::<Vec<_>>()
-        );
-    }
-
-    // Regression: an excluded raw page has a checkpoint even with zero messages;
-    // a partial visible page must not advance to its raw high-water mark.
-    #[test]
-    fn excluded_pages_progress_but_unrendered_messages_do_not() {
-        let mut excluded = event(Body::text("excluded record"));
-        excluded.kind = TranscriptKind::Presence;
-        excluded.lamport = 50;
-        let batch = EventScan {
-            events: Vec::new(),
-            scanned_through: Some(excluded.cursor()),
-        };
-        assert_eq!(
-            delivered_cursor(&batch, delivery_end(&batch.events, 8, false, |_| true)),
-            Some(excluded.cursor())
-        );
-        let mut first = event(Body::text("first"));
-        first.lamport = 51;
-        let mut second = event(Body::text("second"));
-        second.lamport = 52;
-        let mut tail = excluded.clone();
-        tail.lamport = 53;
-        let batch = EventScan {
-            events: vec![first.clone(), second],
-            scanned_through: Some(tail.cursor()),
-        };
-        let end = delivery_end(&batch.events, 1, false, |_| true);
-        assert_eq!(delivered_cursor(&batch, end), Some(first.cursor()));
-        assert_eq!(delivered_cursor(&batch, 2), Some(tail.cursor()));
-    }
-
-    // Regression: a live notification after the subscribe gap cannot replace an
-    // earlier durable message; timeout/no-notification also performs durable catchup.
-    #[tokio::test]
-    async fn live_wake_always_reads_the_durable_gap() {
-        for notified in [false, true] {
-            let mut gap = event(Body::text("arrived before subscribe"));
-            gap.lamport = 10;
-            let mut live = event(Body::text("live notification"));
-            live.lamport = 11;
-            let wake = if notified {
-                vec![live.clone()]
-            } else {
-                Vec::new()
-            };
-            let expected = vec![gap.event_id, live.event_id];
-            let batch = catch_up_after_wake(async { Ok(wake) }, || async {
-                Ok(EventScan {
-                    scanned_through: Some(live.cursor()),
-                    events: vec![gap, live],
-                })
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                batch.events.iter().map(|e| e.event_id).collect::<Vec<_>>(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn full_raw_pages_continue_even_without_visible_context() {
-        for context in [None, Some("all matching messages delivered".to_string())] {
-            let output = super::continuation(context, false, true, Some("codex:stdin-only"))
-                .expect("full raw page needs a continuation");
-            assert!(output.contains("may remain"));
-            assert!(output.contains("AIRC_CLIENT_ID"));
-            assert!(output.contains("codex:stdin-only"));
-            assert!(!output.contains("More unread messages remain"));
-        }
-        for mixed in [false, true] {
-            let mut excluded = event(Body::text("excluded"));
-            excluded.kind = TranscriptKind::Presence;
-            let second = if mixed {
-                event(Body::text("visible"))
-            } else {
-                excluded.clone()
-            };
-            let raw = EventScan {
-                scanned_through: Some(second.cursor()),
-                events: vec![excluded, second],
-            };
-            let (filtered, scanned_count) = super::filter_page(raw, super::hook_filter());
-            assert_eq!(scanned_count, 2);
-            assert_eq!(filtered.events.len(), usize::from(mixed));
-            let end = delivery_end(&filtered.events, 8, false, |_| true);
-            assert!(super::continuation(
-                None,
-                end < filtered.events.len(),
-                scanned_count >= 2,
-                None
-            )
-            .is_some());
-        }
-        assert!(super::continuation(None, false, false, None).is_none());
-        assert!(super::continuation(None, true, false, None)
-            .unwrap()
-            .contains("same hook"));
-        assert!(
-            !super::should_wait(50, 30_000),
-            "excluded full page made progress"
-        );
-        assert!(
-            !super::should_wait(1, 30_000),
-            "partial raw page made progress"
-        );
-        assert!(super::should_wait(0, 30_000));
-        assert!(!super::should_wait(0, 0));
-    }
-
-    #[tokio::test]
-    async fn empty_bootstrap_wait_preserves_the_entire_burst_larger_than_a_page() {
-        use airc_core::TranscriptCursor;
+    async fn fixture() -> (tempfile::TempDir, Airc, RoomId) {
         use airc_lib::subscriptions::{self, ChannelName, MeshIdentity, SubscriptionSet};
-        use airc_lib::Airc;
         let dir = tempfile::TempDir::new().unwrap();
         let airc = Airc::open_with_wire_root_for_test(dir.path(), dir.path())
             .await
             .unwrap();
         let mut set = SubscriptionSet::empty();
-        let channel = ChannelName::new("empty-bootstrap").unwrap();
+        let channel = ChannelName::new("hook-test").unwrap();
         let room = set
             .subscribe_with_wire_root(dir.path(), &MeshIdentity::new("test"), channel.clone())
             .unwrap()
@@ -849,45 +639,138 @@ mod tests {
         subscriptions::save(airc.coordinator_store_for_test(), &set)
             .await
             .unwrap();
-        assert!(airc.latest_subscribed_cursor().await.unwrap().is_none());
-        let origin = TranscriptCursor {
-            lamport: 0,
-            event_id: EventId::from_u128(0),
-        };
-        // The real poll path persists origin before it polls this deterministic
-        // wake future. Populate the real durable store while the consumer waits.
-        let wake = async {
-            assert_eq!(
-                airc.load_runtime_cursor("burst").await.unwrap(),
-                Some(origin)
-            );
-            for n in 1..=9 {
-                let mut e = event(Body::text(format!("burst-{n}")));
-                e.room_id = room;
-                e.lamport = n;
-                e.event_id = EventId::from_u128(n as u128);
-                airc.append_event(e).await.unwrap();
+        (dir, airc, room)
+    }
+    async fn append(
+        airc: &Airc,
+        room: RoomId,
+        n: u64,
+        body: Body,
+        self_event: bool,
+        excluded: bool,
+    ) {
+        let mut e = event(body);
+        e.room_id = room;
+        e.lamport = n;
+        e.event_id = EventId::from_u128(n as u128);
+        if self_event {
+            e.client_id = airc.client_id();
+        }
+        if excluded {
+            e.kind = TranscriptKind::Presence;
+        }
+        airc.append_event(e).await.unwrap();
+    }
+    #[tokio::test]
+    async fn production_dual_turn_preserves_prefixes_self_filter_and_output_failure() {
+        let (_dir, airc, room) = fixture().await;
+        for n in 1..=44 {
+            // Identical bodies remain independently acknowledged by ID; UTF-8 is intact.
+            append(
+                &airc,
+                room,
+                n,
+                Body::text(format!("{} final instruction", "界".repeat(50))),
+                false,
+                false,
+            )
+            .await;
+        }
+        drop(airc.prepare_agent_delivery("hook", 50, 3).await.unwrap());
+        append(&airc, room, 45, Body::text("hidden self"), true, false).await;
+        append(
+            &airc,
+            room,
+            46,
+            Body::text("excluded presence"),
+            false,
+            true,
+        )
+        .await;
+        append(
+            &airc,
+            room,
+            47,
+            Body::Json(json!({"kind":"alive"})),
+            false,
+            false,
+        )
+        .await;
+        append(&airc, room, 48, Body::text("fresh-first"), false, false).await;
+        append(&airc, room, 49, Body::text("fresh-second"), false, false).await;
+        append(&airc, room, 50, Body::text("fresh-pending"), false, false).await;
+        let visible = |e: &TranscriptEvent| e.client_id != airc.client_id();
+        let mut turn = airc.prepare_agent_delivery("hook", 50, 3).await.unwrap();
+        turn.retain(&super::hook_filter());
+        let ends = delivery_ends(&turn, false, visible);
+        assert_eq!((ends.0, ends.1), (4, 1)); // self/alive consume no budget; presence filtered
+        let context = delivery_context(&turn, ends.0, ends.1, false, None, visible).unwrap();
+        assert!(
+            context.find("fresh-first").unwrap() < context.find("Historical catch-up").unwrap()
+        );
+        assert!(!context.contains("fresh-pending"));
+        assert!(!context.contains("hidden self"));
+        assert!(!context.contains("excluded presence"));
+        drop(turn); // output failure: no acknowledgment
+        let mut retry = airc.prepare_agent_delivery("hook", 50, 3).await.unwrap();
+        retry.retain(&super::hook_filter());
+        assert_eq!(delivery_ends(&retry, false, visible), ends);
+        assert_eq!(
+            delivery_context(&retry, ends.0, ends.1, false, None, visible).unwrap(),
+            context
+        );
+        let mut seen = vec![retry.backlog_events()[0].event_id];
+        retry.acknowledge(ends.0, ends.1).await.unwrap();
+        for _ in 0..50 {
+            let mut page = airc.prepare_agent_delivery("hook", 50, 8).await.unwrap();
+            page.retain(&super::hook_filter());
+            let (l, b) = delivery_ends(&page, false, visible);
+            let output = delivery_context(&page, l, b, false, None, visible).unwrap_or_default();
+            assert!(!output.contains("fresh-first"));
+            for item in &page.backlog_events()[..b] {
+                assert!(output.contains(&super::summarize_body(item)));
+                seen.push(item.event_id);
             }
-            Ok(Vec::new()) // timeout also must catch up, not switch to tail
-        };
-        let (mut page, _) =
-            super::poll_events_with_wake(&airc, "burst", super::hook_filter(), 3, 1, wake)
-                .await
-                .unwrap();
+            let done = !page.has_pending(l, b);
+            page.acknowledge(l, b).await.unwrap();
+            if done {
+                break;
+            }
+        }
+        assert_eq!(seen, (1..=44).map(EventId::from_u128).collect::<Vec<_>>());
+    }
+    #[tokio::test]
+    async fn production_empty_bootstrap_preserves_burst_larger_than_page() {
+        let (_dir, airc, room) = fixture().await;
+        let empty = airc.prepare_agent_delivery("burst", 3, 3).await.unwrap();
+        assert!(empty.is_empty());
+        empty.acknowledge(0, 0).await.unwrap(); // actual pre-wait path
+        for n in 1..=9 {
+            append(
+                &airc,
+                room,
+                n,
+                Body::text(format!("burst-{n}")),
+                false,
+                false,
+            )
+            .await;
+        }
         let mut seen = Vec::new();
         for _ in 0..3 {
-            seen.extend(page.events.iter().map(|e| e.lamport));
-            let cursor = super::delivered_cursor(&page, page.events.len()).unwrap();
-            airc.save_runtime_scan_cursor("burst", &cursor)
-                .await
-                .unwrap();
-            page = super::unread_events(&airc, "burst", super::hook_filter(), 3)
-                .await
-                .unwrap()
-                .0;
+            let page = airc.prepare_agent_delivery("burst", 3, 3).await.unwrap();
+            let (l, b) = delivery_ends(&page, false, |_| true);
+            assert_eq!(b, 0);
+            seen.extend(page.live_events()[..l].iter().map(|e| e.lamport));
+            assert!(delivery_context(&page, l, b, false, None, |_| true).is_some());
+            page.acknowledge(l, b).await.unwrap();
         }
         assert_eq!(seen, (1..=9).collect::<Vec<_>>());
-        assert!(page.events.is_empty());
+        assert!(airc
+            .prepare_agent_delivery("burst", 3, 3)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     fn event(body: Body) -> TranscriptEvent {

@@ -62,6 +62,22 @@ impl Airc {
         through: &TranscriptCursor,
         limit: usize,
     ) -> Result<EventScan, AircError> {
+        let channels: Vec<_> = self
+            .subscription_set()
+            .await?
+            .all()
+            .map(|s| s.as_room().channel)
+            .collect();
+        self.scan_agent_feed_in_channels(after, through, limit, &channels)
+            .await
+    }
+    pub(crate) async fn scan_agent_feed_in_channels(
+        &self,
+        after: Option<&TranscriptCursor>,
+        through: &TranscriptCursor,
+        limit: usize,
+        channels: &[airc_core::RoomId],
+    ) -> Result<EventScan, AircError> {
         if limit == 0 || limit > 4096 {
             return Err(AircError::Route("agent scan limit must be 1..4096".into()));
         }
@@ -77,17 +93,11 @@ impl Airc {
                 scanned_through: Some(after.clone()),
             });
         }
-        let channels: Vec<_> = self
-            .subscription_set()
-            .await?
-            .all()
-            .map(|s| s.as_room().channel)
-            .collect();
         let predicate = headers();
         let mut events = Vec::new();
         let mut safe = through.clone();
         if let Some(client) = self.daemon_client() {
-            for channel in channels {
+            for channel in channels.iter().copied() {
                 let response = client
                     .scan_inbox(airc_ipc::request::ScanInboxRequest {
                         channel,
@@ -123,7 +133,7 @@ impl Airc {
             events = self
                 .inner
                 .store
-                .matching_history(after, through, &channels, &predicate, limit + 1, tail)
+                .matching_history(after, through, channels, &predicate, limit + 1, tail)
                 .await?;
         }
         events.sort_by_key(|e| key(&e.cursor()));
