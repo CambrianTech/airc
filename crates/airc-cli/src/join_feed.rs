@@ -75,8 +75,8 @@ async fn print_delivery_turn(
         }
     }
     output.flush()?;
-    let pending = turn.has_pending(live_end, false);
-    turn.acknowledge(live_end, false).await?;
+    let pending = turn.has_pending(live_end, 0);
+    turn.acknowledge(live_end, 0).await?;
     Ok(pending)
 }
 
