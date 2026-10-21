@@ -122,6 +122,7 @@ pub enum Request {
     /// tier (no gap at the ring/sink seam). Pass back the response's
     /// `newest` cursor for consume-once paging.
     Inbox(InboxRequest),
+    ScanInbox(ScanInboxRequest),
     /// **Card a1562dbc.** The O(1) tip probe: cursor of the newest
     /// durable event on a channel, answered from the router's hot ring
     /// / the sink's index — never by replaying the room. The cheap
@@ -991,4 +992,15 @@ mod tests {
             r#"{"op":"stop"}"#
         );
     }
+}
+
+/// Predicate-scoped forward scan (or initial tail), bounded by a fixed snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanInboxRequest {
+    pub channel: airc_core::RoomId,
+    pub after: IpcCursor,
+    pub through: IpcCursor,
+    pub headers: HeaderFilter,
+    pub limit: usize,
+    pub tail: bool,
 }

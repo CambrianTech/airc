@@ -42,6 +42,7 @@ pub mod bus_epoch_store;
 pub mod bus_sink;
 pub mod entities;
 pub mod error;
+mod header_query;
 pub mod local_identity;
 pub mod memory;
 pub mod mesh_identity;

@@ -258,6 +258,80 @@ impl DurableSink for SqliteDurableSink {
         }
     }
 
+    async fn page_matching(
+        &self,
+        channel: RoomId,
+        after: Cursor,
+        through: Cursor,
+        headers: &airc_core::HeaderFilter,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<Envelope>, BusError> {
+        // Bounded by `limit`. The trait caller (the router's deep-replay)
+        // may pass a very large limit to mean "the whole tail"; clamp to
+        // `i64::MAX` so the SQL bind never overflows and we never use
+        // `usize::MAX` as a sentinel. The query stays indexed: ORDER BY
+        // rides the composite index, LIMIT only caps the row count.
+        let bounded = u64::try_from(limit)
+            .unwrap_or(u64::MAX)
+            .min(i64::MAX as u64);
+
+        let mut query =
+            bus_event::Entity::find().filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
+
+        // Strictly after the cursor in generational order:
+        //   epoch > c.epoch
+        //   OR (epoch == c.epoch AND counter > c.counter)
+        //   OR (epoch == c.epoch AND counter == c.counter
+        //       AND event_id > c.event_id).
+        // event_id is the deterministic tiebreaker (§3.5); within one
+        // epoch the monotonic counter forbids a tie, but the tiebreak
+        // keeps the order total independent of how `seq` was produced.
+        {
+            let c = after;
+            let epoch = c.seq.epoch as i64;
+            let counter = c.seq.counter as i64;
+            let event_id = c.event_id.as_uuid();
+            let strictly_after = Expr::col(bus_event::Column::Epoch)
+                .gt(epoch)
+                .or(Expr::col(bus_event::Column::Epoch)
+                    .eq(epoch)
+                    .and(Expr::col(bus_event::Column::Counter).gt(counter)))
+                .or(Expr::col(bus_event::Column::Epoch)
+                    .eq(epoch)
+                    .and(Expr::col(bus_event::Column::Counter).eq(counter))
+                    .and(Expr::col(bus_event::Column::EventId).gt(event_id)));
+            query = query.filter(strictly_after);
+        }
+
+        query = query
+            .filter(
+                strictly_before(through)
+                    .or(Expr::col(bus_event::Column::EventId).eq(through.event_id.as_uuid())),
+            )
+            .filter(crate::header_query::predicate(headers))
+            .filter(bus_event::Column::Delivery.eq("durable"));
+        let order = if tail {
+            sea_orm::Order::Desc
+        } else {
+            sea_orm::Order::Asc
+        };
+        let rows = query
+            .order_by(bus_event::Column::Epoch, order.clone())
+            .order_by(bus_event::Column::Counter, order.clone())
+            .order_by(bus_event::Column::EventId, order)
+            .limit(bounded)
+            .all(&self.readers)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+
+        let mut rows = rows;
+        if tail {
+            rows.reverse();
+        }
+        rows.into_iter().map(from_model).collect()
+    }
+
     async fn page(
         &self,
         channel: RoomId,
@@ -1123,5 +1197,44 @@ mod tests {
 
         let page = sink.page(ch, None, 100).await.unwrap();
         assert_eq!(page.len(), 3, "all-new batch persists every event");
+    }
+    #[tokio::test]
+    async fn cold_header_filtered_page_keeps_system_events_and_cursor_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cold.sqlite");
+        let sink = SqliteDurableSink::open_path(&path).await.unwrap();
+        let ch = RoomId::from_u128(0x777);
+        let mut rows: Vec<_> = (1..=512)
+            .map(|n| {
+                let mut e = durable_kind_at(ch, Kind::Event, 1, n);
+                e.headers.insert("airc.stream.id".into(), "legacy".into());
+                e
+            })
+            .collect();
+        let first = durable_kind_at(ch, Kind::Event, 1, 513);
+        let mut second = first.clone();
+        second.event_id = EventId::from_u128(u128::MAX);
+        rows.push(first.clone());
+        rows.push(second.clone());
+        sink.append_batch(&rows.iter().collect::<Vec<_>>())
+            .await
+            .unwrap();
+        drop(sink);
+        let sink = SqliteDurableSink::open_path(&path).await.unwrap();
+        let filter = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
+            key: "airc.stream.id".into(),
+        }));
+        let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+        let page = sink
+            .page_matching(ch, origin, second.cursor(), &filter, 1, false)
+            .await
+            .unwrap();
+        assert_eq!(page[0].event_id, first.event_id);
+        let next = sink
+            .page_matching(ch, first.cursor(), second.cursor(), &filter, 1, false)
+            .await
+            .unwrap();
+        assert_eq!(next[0].event_id, second.event_id);
+        assert_eq!(sink.page(ch, None, 600).await.unwrap().len(), 514);
     }
 }

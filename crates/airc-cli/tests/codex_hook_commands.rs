@@ -1015,3 +1015,62 @@ fn post_tool_hook_session_input_isolates_shared_home_cursors() {
         ""
     );
 }
+
+#[test]
+fn hook_reads_current_message_after_typed_legacy_chunk_backlog() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    // Establish this consumer's checkpoint BEFORE the backlog.
+    run_hook_with_client(
+        &home,
+        "codex:backlog-reader",
+        &["codex-hook", "user-prompt-submit", "--raw"],
+        "{}",
+    );
+    for _ in 0..55 {
+        run_ok_with_client(
+            &home,
+            "claude:backlog-peer",
+            &[
+                "publish",
+                "--body-text",
+                "legacy-token-fragment",
+                "--header",
+                "airc.stream.id=legacy",
+                "--header",
+                "airc.client=claude:backlog-peer",
+                "--kind",
+                "event",
+            ],
+        );
+    }
+    run_ok_with_client(
+        &home,
+        "claude:backlog-peer",
+        &["send", "current-peer-request"],
+    );
+    run_ok_with_client(
+        &home,
+        "claude:backlog-peer",
+        &[
+            "publish",
+            "--body-text",
+            "ordinary-system-warning",
+            "--header",
+            "airc.client=claude:backlog-peer",
+            "--kind",
+            "event",
+        ],
+    );
+    let output = run_hook_with_client(
+        &home,
+        "codex:backlog-reader",
+        &["codex-hook", "user-prompt-submit", "--raw", "--count", "50"],
+        "{}",
+    );
+    let text = additional_context(&output);
+    assert!(text.contains("current-peer-request"));
+    assert!(text.contains("ordinary-system-warning"));
+    assert!(!text.contains("legacy-token-fragment"));
+}

@@ -57,6 +57,23 @@ pub trait DurableSink: Send + Sync {
     /// `from_cursor`, in total order. `from_cursor == None` means "from the
     /// beginning of the channel." This is the deep-replay leg of the cursor
     /// contract (§3.5).
+    /// Matching durable rows within a fixed inclusive snapshot, filtered before LIMIT.
+    /// A sink without this capability must refuse, never emulate with an unbounded scan.
+    async fn page_matching(
+        &self,
+        channel: RoomId,
+        after: Cursor,
+        through: Cursor,
+        headers: &airc_core::HeaderFilter,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<Envelope>> {
+        let _ = (channel, after, through, headers, limit, tail);
+        Err(crate::BusError::Sink(
+            "filtered history unsupported by sink".into(),
+        ))
+    }
+
     async fn page(
         &self,
         channel: RoomId,
@@ -232,6 +249,34 @@ impl DurableSink for InMemoryDurableSink {
             .get(&channel.0.as_u128())
             .and_then(|bucket| bucket.last())
             .map(|env| env.cursor()))
+    }
+
+    async fn page_matching(
+        &self,
+        channel: RoomId,
+        after: Cursor,
+        through: Cursor,
+        headers: &airc_core::HeaderFilter,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<Envelope>> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(airc_core::bounded_selection::select(
+            guard
+                .events
+                .get(&channel.0.as_u128())
+                .into_iter()
+                .flatten()
+                .filter(|e| {
+                    e.delivery.is_durable()
+                        && e.cursor().is_after(&after)
+                        && !e.cursor().is_after(&through)
+                        && headers.matches(&e.headers)
+                }),
+            |e| (e.seq, e.event_id.0),
+            limit,
+            tail,
+        ))
     }
 
     async fn page(

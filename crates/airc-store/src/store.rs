@@ -94,6 +94,22 @@ pub trait EventStore: Send + Sync {
     /// This is the "give me what I haven't seen yet" call subscribers
     /// use to resume from disk after a restart or after the in-memory
     /// fan-out path missed a frame.
+    /// Match headers before the page limit within a fixed snapshot.
+    async fn matching_history(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        headers: &airc_core::HeaderFilter,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<TranscriptEvent>, StoreError> {
+        let _ = (after, through, channels, headers, limit, tail);
+        Err(StoreError::Database(sea_orm::DbErr::Custom(
+            "filtered history unsupported".into(),
+        )))
+    }
+
     async fn resume_from(
         &self,
         cursor: &TranscriptCursor,

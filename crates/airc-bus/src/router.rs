@@ -1353,6 +1353,58 @@ impl EventRouter {
     /// transcript (academy 244k rows, cambriantech 472k), so a from-zero
     /// walk was O(n²/page) and never returned inside the callers' 30 s
     /// deadline, while the board — resuming from a saved cursor — was instant.
+    /// Snapshot-bounded, header-filtered durable page. Hot pending writes remain visible.
+    pub async fn matching_history(
+        &self,
+        channel: RoomId,
+        after: Cursor,
+        through: Cursor,
+        headers: &airc_core::HeaderFilter,
+        limit: usize,
+        tail: bool,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows = {
+            let shard = self.shard_for(channel);
+            let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            map.get(&channel.0.as_u128())
+                .map(|state| {
+                    state
+                        .ring
+                        .replay_after(None)
+                        .into_iter()
+                        .filter(|e| {
+                            e.delivery.is_durable()
+                                && e.cursor().is_after(&after)
+                                && !e.cursor().is_after(&through)
+                                && headers.matches(&e.headers)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        rows.extend(
+            self.inner
+                .sink
+                .page_matching(channel, after, through, headers, limit, tail)
+                .await?
+                .into_iter()
+                .map(Arc::new),
+        );
+        rows.sort_by_key(|e| (e.seq, e.event_id.0));
+        rows.dedup_by_key(|e| e.event_id);
+        if tail {
+            rows.reverse();
+        }
+        rows.truncate(limit);
+        if tail {
+            rows.reverse();
+        }
+        Ok(rows)
+    }
+
     pub async fn resume_from_cursor(
         &self,
         channel: RoomId,
