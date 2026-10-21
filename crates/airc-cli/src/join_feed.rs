@@ -93,7 +93,7 @@ fn print_event(
 
 #[cfg(test)]
 mod tests {
-    use airc_core::{Body, ClientId, EventId, Headers, MentionTarget, RoomId, TranscriptKind};
+    use airc_core::{Body, EventId, Headers, MentionTarget, RoomId, TranscriptKind};
     use airc_lib::subscriptions::{self, ChannelName, MeshIdentity, SubscriptionSet};
     use airc_protocol::HEADER_AIRC_CLIENT;
     use tempfile::TempDir;
