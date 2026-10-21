@@ -20,14 +20,14 @@ pub fn select<'a, T: Clone + 'a, K: Ord>(
                 selected.first_key_value()
             } else {
                 selected.last_key_value()
-            }
-            .unwrap()
-            .0;
-            if if tail {
-                &key <= boundary
-            } else {
-                &key >= boundary
-            } {
+            };
+            if boundary.is_some_and(|(boundary, _)| {
+                if tail {
+                    &key <= boundary
+                } else {
+                    &key >= boundary
+                }
+            }) {
                 continue;
             }
             if tail {
