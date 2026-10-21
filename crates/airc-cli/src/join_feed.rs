@@ -6,7 +6,7 @@
 //! `airc-store` so each attach starts at "new since last seen" instead
 //! of replaying the full transcript.
 
-use airc_core::{TranscriptEvent, TranscriptKind};
+use airc_core::{RoomId, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, LiveLag};
 use futures::stream::StreamExt;
 use std::io::Write;
@@ -16,9 +16,9 @@ use crate::client_id::{current_client_id, RuntimeSelfFilter};
 const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
 
-pub async fn run(airc: &Airc) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_client = current_client_id()?;
-    let consumer_id = consumer_id(runtime_client.as_deref());
+    let consumer_id = format!("{}:room:{room}", consumer_id(runtime_client.as_deref()));
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
     let mut output = std::io::stdout();
     // Native Monitor keeps its supported subscription; notifications wake bounded
@@ -33,6 +33,7 @@ pub async fn run(airc: &Airc) -> Result<(), Box<dyn std::error::Error>> {
             &self_filter,
             &mut output,
             announce_history,
+            Some(room),
         )
         .await?;
         announce_history = false;
@@ -53,10 +54,24 @@ async fn print_delivery_turn(
     self_filter: &RuntimeSelfFilter<'_>,
     output: &mut impl Write,
     announce_history: bool,
+    room: Option<RoomId>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let turn = airc
-        .prepare_agent_delivery(consumer, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
-        .await?;
+    let turn = match room {
+        Some(room) => {
+            airc.prepare_room_delivery(
+                consumer,
+                room,
+                announce_history,
+                CATCH_UP_LIMIT,
+                CATCH_UP_LIMIT,
+            )
+            .await?
+        }
+        None => {
+            airc.prepare_agent_delivery(consumer, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
+                .await?
+        }
+    };
     let live_end = turn.live_events().len().min(turn.live_budget);
     for event in &turn.live_events()[..live_end] {
         print_event(event, self_filter, output)?;
@@ -140,13 +155,13 @@ mod tests {
             }
         }
         assert!(
-            print_delivery_turn(&airc, "native-new", &self_filter, &mut Broken, true)
+            print_delivery_turn(&airc, "native-new", &self_filter, &mut Broken, true, None)
                 .await
                 .is_err()
         );
         let mut output = Vec::new();
         assert!(
-            print_delivery_turn(&airc, "native-new", &self_filter, &mut output, true)
+            print_delivery_turn(&airc, "native-new", &self_filter, &mut output, true, None)
                 .await
                 .unwrap()
         );
@@ -154,7 +169,7 @@ mod tests {
         assert!(text.find("fresh-request").unwrap() < text.find("Retained history").unwrap());
         assert!(!text.contains("old-200"));
         let mut next = Vec::new();
-        print_delivery_turn(&airc, "native-new", &self_filter, &mut next, true)
+        print_delivery_turn(&airc, "native-new", &self_filter, &mut next, true, None)
             .await
             .unwrap();
         assert!(!String::from_utf8(next).unwrap().contains("fresh-request"));
@@ -170,7 +185,7 @@ mod tests {
         }
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut output, true)
+        print_delivery_turn(&airc, "paced", &filter, &mut output, true, None)
             .await
             .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -180,14 +195,14 @@ mod tests {
             .await
             .unwrap();
         let mut fresh = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut fresh, false)
+        print_delivery_turn(&airc, "paced", &filter, &mut fresh, false, None)
             .await
             .unwrap();
         let text = String::from_utf8(fresh).unwrap();
         assert!(text.contains("fresh-request"));
         assert!(!text.contains("old-"));
         let mut resumed = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut resumed, false)
+        print_delivery_turn(&airc, "paced", &filter, &mut resumed, false, None)
             .await
             .unwrap();
         let text = String::from_utf8(resumed).unwrap();
@@ -232,7 +247,7 @@ mod tests {
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
         assert!(
-            print_delivery_turn(&airc, "filtered", &filter, &mut output, true)
+            print_delivery_turn(&airc, "filtered", &filter, &mut output, true, None)
                 .await
                 .unwrap()
         );
@@ -242,7 +257,7 @@ mod tests {
         assert!(!text.contains("own hidden"));
         let mut retry = Vec::new();
         assert!(
-            print_delivery_turn(&airc, "filtered", &filter, &mut retry, false)
+            print_delivery_turn(&airc, "filtered", &filter, &mut retry, false, None)
                 .await
                 .unwrap()
         );
