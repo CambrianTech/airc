@@ -188,7 +188,26 @@ impl Airc {
         let airc = self.clone();
         let consumer = consumer.to_owned();
         tokio::spawn(async move {
-            airc.prepare_delivery_owned(consumer, scan_limit, budget)
+            airc.prepare_delivery_owned(consumer, scan_limit, budget, false)
+                .await
+        })
+        .await
+        .map_err(fail)?
+    }
+    /// Prepare an all-subscription native feed. On attachment, reclassify all currently
+    /// unread events as retained history under the same exclusive delivery lock.
+    /// This never acknowledges history or changes another consumer's checkpoint.
+    pub async fn prepare_native_delivery(
+        &self,
+        consumer: &str,
+        attaching: bool,
+        scan_limit: usize,
+        budget: usize,
+    ) -> Result<AgentDeliveryTurn, AircError> {
+        let airc = self.clone();
+        let consumer = consumer.to_owned();
+        tokio::spawn(async move {
+            airc.prepare_delivery_owned(consumer, scan_limit, budget, attaching)
                 .await
         })
         .await
@@ -199,6 +218,7 @@ impl Airc {
         consumer: String,
         scan_limit: usize,
         budget: usize,
+        attaching: bool,
     ) -> Result<AgentDeliveryTurn, AircError> {
         if !(1..=4096).contains(&scan_limit) || budget == 0 {
             return Err(fail("invalid scan/output budget"));
@@ -232,42 +252,53 @@ impl Airc {
                 }
             }
         }
-        let state = if let Some(row) = self.inner.store.get_scoped_state(SCOPE, &consumer).await? {
-            let state: State = serde_json::from_str(&row.value_json).map_err(fail)?;
-            if row.version != 1
-                || state.version != 1
-                || state.rooms != channels
-                || state.source != source
-                || key(&state.backlog) > key(&state.boundary)
-                || key(&state.boundary) > key(&state.live)
-            {
-                return Err(fail(
-                    "unsupported or changed delivery scope/state; history retained",
-                ));
-            }
-            state
-        } else {
-            let backlog = self
-                .load_runtime_cursor(&consumer)
-                .await?
-                .unwrap_or_else(zero);
-            let boundary = if key(&backlog) > key(&tip) {
-                backlog.clone()
+        let mut state =
+            if let Some(row) = self.inner.store.get_scoped_state(SCOPE, &consumer).await? {
+                let state: State = serde_json::from_str(&row.value_json).map_err(fail)?;
+                if row.version != 1
+                    || state.version != 1
+                    || state.rooms != channels
+                    || state.source != source
+                    || key(&state.backlog) > key(&state.boundary)
+                    || key(&state.boundary) > key(&state.live)
+                {
+                    return Err(fail(
+                        "unsupported or changed delivery scope/state; history retained",
+                    ));
+                }
+                state
             } else {
-                tip.clone()
+                let backlog = self
+                    .load_runtime_cursor(&consumer)
+                    .await?
+                    .unwrap_or_else(zero);
+                let boundary = if key(&backlog) > key(&tip) {
+                    backlog.clone()
+                } else {
+                    tip.clone()
+                };
+                let state = State {
+                    version: 1,
+                    live: boundary.clone(),
+                    boundary,
+                    backlog,
+                    next_live: true,
+                    rooms: channels.clone(),
+                    source,
+                };
+                persist(self, &consumer, &state).await?;
+                state
             };
-            let state = State {
-                version: 1,
-                live: boundary.clone(),
-                boundary,
-                backlog,
-                next_live: true,
-                rooms: channels.clone(),
-                source,
-            };
+        if attaching {
+            // Keep the oldest unread history position. Previously delivered live
+            // events may be within this retained range, but are never replayed as
+            // live output. Deliberate inbox recovery remains the history reader.
+            if key(&tip) > key(&state.live) {
+                state.live = tip.clone();
+            }
+            state.boundary = state.live.clone();
             persist(self, &consumer, &state).await?;
-            state
-        };
+        }
         let through = if key(&state.live) > key(&tip) {
             state.live.clone()
         } else {
@@ -359,6 +390,43 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+    #[tokio::test]
+    async fn native_attach_retains_offline_live_and_failed_delivery() {
+        let (_dir, airc, room) = fixture().await;
+        append(&airc, room, 1).await;
+        drop(
+            airc.prepare_native_delivery("native", true, 64, 64)
+                .await
+                .unwrap(),
+        );
+        append(&airc, room, 2).await;
+        let attached = airc
+            .prepare_native_delivery("native", true, 64, 64)
+            .await
+            .unwrap();
+        assert!(attached.live_events().is_empty());
+        assert_eq!(attached.backlog_events().len(), 2);
+        drop(attached);
+        append(&airc, room, 3).await;
+        let fresh = airc
+            .prepare_native_delivery("native", false, 64, 64)
+            .await
+            .unwrap();
+        assert_eq!(fresh.live_events()[0].lamport, 3);
+        drop(fresh);
+        let retry = airc
+            .prepare_native_delivery("native", false, 64, 64)
+            .await
+            .unwrap();
+        assert_eq!(retry.live_events()[0].lamport, 3);
+        retry.acknowledge(1, 0).await.unwrap();
+        let done = airc
+            .prepare_native_delivery("native", false, 64, 64)
+            .await
+            .unwrap();
+        assert!(done.live_events().is_empty());
+        assert_eq!(done.backlog_events().len(), 2);
     }
     #[tokio::test]
     async fn fresh_delivery_precedes_large_backlog_and_restart_recovers_every_prefix() {

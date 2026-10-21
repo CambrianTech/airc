@@ -329,8 +329,10 @@ Required corrections:
    clean-install tests.
 3. Keep `Airc::join_channel(name)` / `airc join --room X` additive: add/promote
    a channel without removing the rest.
-4. Keep monitor and hooks defaulted to all subscribed channels, not current
-   room.
+4. Keep monitor and hooks subscribed to all channels. Native join prints its
+   attached room and direct peer-addressed events from any subscribed room;
+   ambient events elsewhere are counted, with bodies retained for inbox recovery.
+   Hooks retain their existing all-channel rendering.
 5. Keep machine-global coordinator/cache under `~/.airc/accounts/<identity>/`
    as the local source of truth for joined scopes and live channels.
 6. Keep account-mesh registry abstraction for `git user identity + channel ->
