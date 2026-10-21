@@ -123,6 +123,29 @@ impl EventStore for InMemoryEventStore {
         Ok(filtered)
     }
 
+    async fn matching_history(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        headers: &airc_core::HeaderFilter,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<TranscriptEvent>, StoreError> {
+        let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(airc_core::bounded_selection::select(
+            events.iter().filter(|e| {
+                channels.contains(&e.room_id)
+                    && strictly_after(e, after)
+                    && !strictly_after(e, through)
+                    && headers.matches(&e.headers)
+            }),
+            |e| (e.lamport, e.event_id.0),
+            limit,
+            tail,
+        ))
+    }
+
     async fn resume_from(
         &self,
         cursor: &TranscriptCursor,

@@ -213,6 +213,16 @@ impl DaemonClient {
         }
     }
 
+    pub async fn scan_inbox(
+        &self,
+        request: crate::request::ScanInboxRequest,
+    ) -> Result<crate::response::ScanInboxResponse, ClientError> {
+        match self.call(Request::ScanInbox(request)).await? {
+            Response::ScanInbox(response) => Ok(response),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
+        }
+    }
+
     pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
         match self.call(Request::Inbox(request)).await? {
             Response::Inbox(response) => Ok(response),

@@ -128,20 +128,15 @@ pub async fn run_poll(
     let consumer_id = consumer_id(runtime_client.as_deref());
     let filter = hook_filter();
 
-    let (mut batch, mut scanned_count) =
-        unread_events(&airc, &consumer_id, filter.clone(), count).await?;
-    if should_wait(scanned_count, wait_ms) {
-        // No raw records were read. Save the empty bootstrap origin before
-        // waiting; a live event wakes durable catchup rather than replacing it.
-        if let Some(cursor) = &batch.scanned_through {
-            airc.save_runtime_scan_cursor(&consumer_id, cursor).await?;
-        }
-        (batch, scanned_count) =
-            catch_up_after_wake(wait_for_one_event(&airc, filter.clone(), wait_ms), || {
-                unread_events(&airc, &consumer_id, filter, count)
-            })
-            .await?;
-    }
+    let (batch, scanned_count) = poll_events_with_wake(
+        &airc,
+        &consumer_id,
+        filter.clone(),
+        count,
+        wait_ms,
+        wait_for_one_event(&airc, filter, wait_ms),
+    )
+    .await?;
 
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
     let end = delivery_end(&batch.events, max_items, raw, |event| {
@@ -251,8 +246,30 @@ fn hook_filter() -> EventFilter {
     }
 }
 
-/// One bounded raw page per invocation. Even an entirely filtered page carries
-/// its scan cursor, so the next invocation progresses rather than rereading it.
+/// Persist the empty origin before waiting, then read durable catch-up.
+async fn poll_events_with_wake<W>(
+    airc: &Airc,
+    consumer_id: &str,
+    filter: EventFilter,
+    count: usize,
+    wait_ms: u64,
+    wake: W,
+) -> Result<(EventScan, usize), Box<dyn std::error::Error>>
+where
+    W: std::future::Future<Output = Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>>>,
+{
+    let (batch, scanned_count) = unread_events(airc, consumer_id, filter.clone(), count).await?;
+    if should_wait(scanned_count, wait_ms) {
+        // Establish an empty consumer's origin before polling the wake future.
+        // A burst during the wait must be read forward, never bootstrapped as a tail.
+        if let Some(cursor) = &batch.scanned_through {
+            airc.save_runtime_scan_cursor(consumer_id, cursor).await?;
+        }
+        return catch_up_after_wake(wake, || unread_events(airc, consumer_id, filter, count)).await;
+    }
+    Ok((batch, scanned_count))
+}
+
 async fn unread_events(
     airc: &Airc,
     consumer_id: &str,
@@ -260,28 +277,36 @@ async fn unread_events(
     count: usize,
 ) -> Result<(EventScan, usize), Box<dyn std::error::Error>> {
     let previous = airc.load_runtime_cursor(consumer_id).await?;
-    let batch = match previous {
-        Some(cursor) => {
-            airc.scan_subscribed_events(&cursor, EventFilter::default(), count.max(1))
-                .await?
-        }
-        None => {
-            let events = airc
-                .page_recent_subscribed_filtered(EventFilter::default(), count.max(1))
-                .await?;
-            let scanned_through = Some(events.last().map(TranscriptEvent::cursor).unwrap_or(
-                TranscriptCursor {
+    let Some(through) = airc.latest_subscribed_cursor().await? else {
+        return Ok((
+            EventScan {
+                events: vec![],
+                scanned_through: Some(previous.unwrap_or(TranscriptCursor {
                     lamport: 0,
                     event_id: airc_core::EventId::from_u128(0),
-                },
-            ));
-            EventScan {
-                events,
-                scanned_through,
-            }
-        }
+                })),
+            },
+            0,
+        ));
     };
-    Ok(filter_page(batch, filter))
+    let batch = airc
+        .scan_agent_feed(previous.as_ref(), &through, count.max(1))
+        .await?;
+    let more = batch
+        .scanned_through
+        .as_ref()
+        .is_some_and(|c| (c.lamport, c.event_id.0) < (through.lamport, through.event_id.0));
+    let progressed = batch.scanned_through.as_ref() != previous.as_ref();
+    let (batch, matches) = filter_page(batch, filter);
+    // Preserve continuation on byte-short pages and avoid waiting before saving scan progress.
+    let scanned_count = if more {
+        count.max(1)
+    } else if progressed {
+        matches.max(1)
+    } else {
+        matches
+    };
+    Ok((batch, scanned_count))
 }
 
 fn filter_page(mut batch: EventScan, filter: EventFilter) -> (EventScan, usize) {
@@ -335,10 +360,10 @@ where
 
 async fn wait_for_one_event(
     airc: &Airc,
-    filter: EventFilter,
+    _filter: EventFilter,
     wait_ms: u64,
 ) -> Result<Vec<TranscriptEvent>, Box<dyn std::error::Error>> {
-    let mut stream = airc.subscribe_subscribed_filtered(filter).await?;
+    let mut stream = airc.subscribe_agent_feed().await?;
     match tokio::time::timeout(Duration::from_millis(wait_ms), stream.next()).await {
         Ok(Some(Ok(event))) => Ok(vec![event.as_ref().clone()]),
         Ok(Some(Err(LiveLag { .. }))) | Ok(None) | Err(_) => Ok(Vec::new()),
@@ -803,6 +828,66 @@ mod tests {
         );
         assert!(super::should_wait(0, 30_000));
         assert!(!super::should_wait(0, 0));
+    }
+
+    #[tokio::test]
+    async fn empty_bootstrap_wait_preserves_the_entire_burst_larger_than_a_page() {
+        use airc_core::TranscriptCursor;
+        use airc_lib::subscriptions::{self, ChannelName, MeshIdentity, SubscriptionSet};
+        use airc_lib::Airc;
+        let dir = tempfile::TempDir::new().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(dir.path(), dir.path())
+            .await
+            .unwrap();
+        let mut set = SubscriptionSet::empty();
+        let channel = ChannelName::new("empty-bootstrap").unwrap();
+        let room = set
+            .subscribe_with_wire_root(dir.path(), &MeshIdentity::new("test"), channel.clone())
+            .unwrap()
+            .room_id;
+        set.set_default(channel).unwrap();
+        subscriptions::save(airc.coordinator_store_for_test(), &set)
+            .await
+            .unwrap();
+        assert!(airc.latest_subscribed_cursor().await.unwrap().is_none());
+        let origin = TranscriptCursor {
+            lamport: 0,
+            event_id: EventId::from_u128(0),
+        };
+        // The real poll path persists origin before it polls this deterministic
+        // wake future. Populate the real durable store while the consumer waits.
+        let wake = async {
+            assert_eq!(
+                airc.load_runtime_cursor("burst").await.unwrap(),
+                Some(origin)
+            );
+            for n in 1..=9 {
+                let mut e = event(Body::text(format!("burst-{n}")));
+                e.room_id = room;
+                e.lamport = n;
+                e.event_id = EventId::from_u128(n as u128);
+                airc.append_event(e).await.unwrap();
+            }
+            Ok(Vec::new()) // timeout also must catch up, not switch to tail
+        };
+        let (mut page, _) =
+            super::poll_events_with_wake(&airc, "burst", super::hook_filter(), 3, 1, wake)
+                .await
+                .unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.extend(page.events.iter().map(|e| e.lamport));
+            let cursor = super::delivered_cursor(&page, page.events.len()).unwrap();
+            airc.save_runtime_scan_cursor("burst", &cursor)
+                .await
+                .unwrap();
+            page = super::unread_events(&airc, "burst", super::hook_filter(), 3)
+                .await
+                .unwrap()
+                .0;
+        }
+        assert_eq!(seen, (1..=9).collect::<Vec<_>>());
+        assert!(page.events.is_empty());
     }
 
     fn event(body: Body) -> TranscriptEvent {

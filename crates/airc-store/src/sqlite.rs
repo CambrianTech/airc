@@ -1089,6 +1089,54 @@ impl EventStore for SqliteEventStore {
         rows.into_iter().map(from_model).collect()
     }
 
+    async fn matching_history(
+        &self,
+        cursor: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        headers: &airc_core::HeaderFilter,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<TranscriptEvent>, StoreError> {
+        // Strictly after the cursor: lamport > c.lamport
+        //   OR (lamport == c.lamport AND event_id > c.event_id).
+        // Two-key tiebreak so events with identical lamports remain
+        // ordered deterministically.
+        let cursor_lamport = cursor.lamport as i64;
+        let cursor_event_id = cursor.event_id.as_uuid();
+        let strictly_after = Expr::col(event::Column::Lamport)
+            .gt(cursor_lamport)
+            .or(Expr::col(event::Column::Lamport)
+                .eq(cursor_lamport)
+                .and(Expr::col(event::Column::EventId).gt(cursor_event_id)));
+        let order = if tail {
+            sea_orm::Order::Desc
+        } else {
+            sea_orm::Order::Asc
+        };
+        let query = event::Entity::find()
+            .filter(strictly_after)
+            .order_by(event::Column::Lamport, order.clone())
+            .order_by(event::Column::EventId, order)
+            .limit(limit as u64);
+        let query = query
+            .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
+            .filter(crate::header_query::predicate(headers))
+            .filter(
+                Expr::col(event::Column::Lamport)
+                    .lt(through.lamport as i64)
+                    .or(Expr::col(event::Column::Lamport)
+                        .eq(through.lamport as i64)
+                        .and(Expr::col(event::Column::EventId).lte(through.event_id.as_uuid()))),
+            );
+        let rows = query.all(&self.db).await?;
+        let mut rows = rows;
+        if tail {
+            rows.reverse();
+        }
+        rows.into_iter().map(from_model).collect()
+    }
+
     async fn resume_from(
         &self,
         cursor: &TranscriptCursor,

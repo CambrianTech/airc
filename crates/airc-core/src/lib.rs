@@ -65,3 +65,5 @@ pub use receipt::{Receipt, ReceiptKind};
 pub use scoped_state::{ScopeRef, ScopedStateEntry, PEER_IDENTITY_STATE_KEY};
 pub use temp_home::scope_home_is_temp_rooted;
 pub use transcript::{MentionTarget, TranscriptEvent, TranscriptKind};
+
+pub mod bounded_selection;

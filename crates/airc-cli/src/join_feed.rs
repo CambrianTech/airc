@@ -7,7 +7,9 @@
 //! of replaying the full transcript.
 
 use airc_core::{TranscriptCursor, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, EventFilter, FilteredEventStream, LiveLag};
+#[cfg(test)]
+use airc_lib::EventFilter;
+use airc_lib::{Airc, FilteredEventStream, LiveLag};
 use futures::stream::StreamExt;
 use std::io::Write;
 use std::sync::Arc;
@@ -50,9 +52,7 @@ async fn attach_feed(
     // Subscribe/ack BEFORE taking the replay snapshot. Arrivals during replay
     // are buffered; the fixed snapshot separates replay from overlapping live
     // delivery. A live checkpoint cannot overtake unread historical pages.
-    let stream = airc
-        .subscribe_subscribed_filtered(EventFilter::default())
-        .await?;
+    let stream = airc.subscribe_agent_feed().await?;
     let replayed_through = print_catch_up(airc, consumer_id, self_filter, output).await?;
     Ok(AttachedFeed {
         stream,
@@ -80,7 +80,7 @@ async fn print_catch_up(
     };
     while cursor_before(&cursor, &target) {
         let page = airc
-            .scan_subscribed_events(&cursor, EventFilter::default(), CATCH_UP_LIMIT)
+            .scan_agent_feed(Some(&cursor), &target, CATCH_UP_LIMIT)
             .await?;
         let Some(scanned_through) = page.scanned_through else {
             return Err(
@@ -501,6 +501,55 @@ mod tests {
             assert!(visible.contains("fresh message"));
             assert!(!visible.contains("older overlap"));
         }
+    }
+
+    #[tokio::test]
+    async fn typed_chunks_do_not_block_frozen_tail_completion() {
+        let (_dir, airc, room) = fixture().await;
+        let origin = event(&airc, room, 0, "codex:thread-1", "origin").cursor();
+        airc.coordinator_store_for_test()
+            .save_runtime_cursor("typed-tail", &origin, 0)
+            .await
+            .unwrap();
+        for n in 1..=CATCH_UP_LIMIT as u64 + 5 {
+            let mut chunk = event(&airc, room, n, "claude:peer", "legacy fragment");
+            chunk.kind = TranscriptKind::System;
+            chunk
+                .headers
+                .insert(airc_lib::HEADER_STREAM_ID.into(), "typed-stream".into());
+            airc.append_event(chunk).await.unwrap();
+        }
+        let warning = event(
+            &airc,
+            room,
+            CATCH_UP_LIMIT as u64 + 6,
+            "claude:peer",
+            "ordinary warning",
+        );
+        airc.append_event(warning).await.unwrap();
+        let mut suffix = event(
+            &airc,
+            room,
+            CATCH_UP_LIMIT as u64 + 7,
+            "claude:peer",
+            "last fragment",
+        );
+        suffix
+            .headers
+            .insert(airc_lib::HEADER_STREAM_ID.into(), "typed-stream".into());
+        let through = suffix.cursor();
+        airc.append_event(suffix).await.unwrap();
+        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:thread-1"));
+        let mut output = Vec::new();
+        assert_eq!(
+            print_catch_up(&airc, "typed-tail", &filter, &mut output)
+                .await
+                .unwrap(),
+            Some(through)
+        );
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("ordinary warning"));
+        assert!(!text.contains("fragment"));
     }
 
     async fn fixture() -> (TempDir, Airc, RoomId) {

@@ -666,3 +666,82 @@ mod tests {
         );
     }
 }
+
+/// Exact CBOR size of a Vec<u8>: serde encodes an integer array, not bytes.
+/// Kept beside the actual codec; parity tests protect its encoding assumptions.
+pub fn byte_array_payload_len(bytes: &[u8]) -> usize {
+    cbor_array_header_len(bytes.len()) + bytes.len() + bytes.iter().filter(|&&b| b >= 24).count()
+}
+fn cbor_array_header_len(count: usize) -> usize {
+    match count {
+        0..=23 => 1,
+        24..=255 => 2,
+        256..=65535 => 3,
+        _ if u32::try_from(count).is_ok() => 5,
+        _ => 9,
+    }
+}
+/// Exact ScanInbox metadata and outer array cost, excluding envelope arrays.
+/// Serialize the real response skeleton so tags/cursor schema stay authoritative.
+pub fn scan_inbox_payload_overhead(
+    cursor: crate::request::IpcCursor,
+    has_more: bool,
+    count: usize,
+) -> std::io::Result<usize> {
+    let skeleton = crate::Response::ScanInbox(crate::response::ScanInboxResponse {
+        envelopes: vec![],
+        scanned_through: cursor,
+        has_more,
+    });
+    Ok(
+        encode_frame_payload(&skeleton)?.len() - cbor_array_header_len(0)
+            + cbor_array_header_len(count),
+    )
+}
+#[cfg(test)]
+mod scan_size_tests {
+    use super::*;
+    #[test]
+    fn scan_size_matches_real_outer_codec_at_array_and_frame_boundaries() {
+        let cursor = crate::request::IpcCursor {
+            epoch: u64::MAX,
+            counter: u64::MAX,
+            event_id: airc_core::EventId::from_u128(u128::MAX),
+        };
+        for count in [0, 1, 23, 24, 255, 256] {
+            let page = crate::response::ScanInboxResponse {
+                envelopes: vec![vec![255; 29]; count],
+                scanned_through: cursor,
+                has_more: true,
+            };
+            let expected = scan_inbox_payload_overhead(cursor, true, count).unwrap()
+                + page
+                    .envelopes
+                    .iter()
+                    .map(|v| byte_array_payload_len(v))
+                    .sum::<usize>();
+            assert_eq!(
+                encode_frame_payload(&crate::Response::ScanInbox(page))
+                    .unwrap()
+                    .len(),
+                expected
+            );
+        }
+        let overhead = scan_inbox_payload_overhead(cursor, true, 1).unwrap();
+        // Near the real 16 MiB bound, all payload bytes need two CBOR bytes.
+        let n = (MAX_FRAME_BYTES as usize - overhead - 5) / 2;
+        for size in [n, n + 1] {
+            let page = crate::response::ScanInboxResponse {
+                envelopes: vec![vec![255; size]],
+                scanned_through: cursor,
+                has_more: true,
+            };
+            let expected = overhead + byte_array_payload_len(&page.envelopes[0]);
+            let encoded = encode_frame_payload(&crate::Response::ScanInbox(page));
+            assert_eq!(encoded.is_ok(), expected <= MAX_FRAME_BYTES as usize);
+            if let Ok(encoded) = encoded {
+                assert_eq!(encoded.len(), expected);
+            }
+        }
+    }
+}
