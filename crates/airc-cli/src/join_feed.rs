@@ -15,10 +15,6 @@ use crate::client_id::{current_client_id, RuntimeSelfFilter};
 
 const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
-// Retained history must not exhaust a native Monitor's event allowance before
-// a fresh request arrives. Keep its durable cursor, but admit only one old
-// event per interval; subscription notifications still wake fresh delivery.
-const HISTORY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub async fn run(airc: &Airc) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_client = current_client_id()?;
@@ -29,20 +25,17 @@ pub async fn run(airc: &Airc) -> Result<(), Box<dyn std::error::Error>> {
     // durable scans rather than directly advancing over unseen live predecessors.
     let mut stream = airc.subscribe_agent_feed().await?;
     println!("attached — Ctrl-C to detach.");
-    let mut next_history = tokio::time::Instant::now();
+    let mut announce_history = true;
     loop {
-        let history_due = tokio::time::Instant::now() >= next_history;
         print_delivery_turn(
             airc,
             &consumer_id,
             &self_filter,
             &mut output,
-            usize::from(history_due),
+            announce_history,
         )
         .await?;
-        if history_due {
-            next_history = tokio::time::Instant::now() + HISTORY_INTERVAL;
-        }
+        announce_history = false;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
@@ -59,29 +52,31 @@ async fn print_delivery_turn(
     consumer: &str,
     self_filter: &RuntimeSelfFilter<'_>,
     output: &mut impl Write,
-    history_budget: usize,
+    announce_history: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let turn = airc
         .prepare_agent_delivery(consumer, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
         .await?;
     let live_end = turn.live_events().len().min(turn.live_budget);
-    let backlog_end = turn
-        .backlog_events()
-        .len()
-        .min(turn.backlog_budget)
-        .min(history_budget);
     for event in &turn.live_events()[..live_end] {
         print_event(event, self_filter, output)?;
     }
-    if backlog_end > 0 {
-        writeln!(output, "historical catch-up:")?;
-    }
-    for event in &turn.backlog_events()[..backlog_end] {
-        print_event(event, self_filter, output)?;
+    // History remains durable and unacknowledged. Do not replay old requests
+    // into a native live feed: announce the bounded page once per attachment,
+    // and let the agent deliberately recover history with the supported reader.
+    if announce_history {
+        if let Some(first) = turn.backlog_events().first() {
+            writeln!(
+                output,
+                "Retained history (not live): at least {} unread events; first scanned timestamp {} ms since Unix epoch. Read deliberately in this same AIRC home with `airc inbox --all --json`; page a room with `airc inbox --room <room> --since-lamport <lamport> --since-event-id <event-id>`. History has not been acknowledged.",
+                turn.backlog_events().len(),
+                first.occurred_at_ms,
+            )?;
+        }
     }
     output.flush()?;
-    let pending = turn.has_pending(live_end, backlog_end);
-    turn.acknowledge(live_end, backlog_end).await?;
+    let pending = turn.has_pending(live_end, false);
+    turn.acknowledge(live_end, false).await?;
     Ok(pending)
 }
 
@@ -119,7 +114,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn native_turn_delivers_fresh_before_backlog_and_failed_output_does_not_ack() {
+    async fn native_turn_announces_history_after_fresh_and_failed_output_does_not_ack() {
         let (_dir, airc, room) = fixture().await;
         for n in 1..=200 {
             airc.append_event(event(&airc, room, n, "claude:peer", &format!("old-{n}")))
@@ -145,28 +140,28 @@ mod tests {
             }
         }
         assert!(
-            print_delivery_turn(&airc, "native-new", &self_filter, &mut Broken, 64)
+            print_delivery_turn(&airc, "native-new", &self_filter, &mut Broken, true)
                 .await
                 .is_err()
         );
         let mut output = Vec::new();
         assert!(
-            print_delivery_turn(&airc, "native-new", &self_filter, &mut output, 64)
+            print_delivery_turn(&airc, "native-new", &self_filter, &mut output, true)
                 .await
                 .unwrap()
         );
         let text = String::from_utf8(output).unwrap();
-        assert!(text.find("fresh-request").unwrap() < text.find("old-1").unwrap());
+        assert!(text.find("fresh-request").unwrap() < text.find("Retained history").unwrap());
         assert!(!text.contains("old-200"));
         let mut next = Vec::new();
-        print_delivery_turn(&airc, "native-new", &self_filter, &mut next, 64)
+        print_delivery_turn(&airc, "native-new", &self_filter, &mut next, true)
             .await
             .unwrap();
         assert!(!String::from_utf8(next).unwrap().contains("fresh-request"));
     }
 
     #[tokio::test]
-    async fn withheld_history_survives_fresh_delivery_and_resumes_in_order() {
+    async fn history_is_announced_once_and_retained_while_fresh_delivery_continues() {
         let (_dir, airc, room) = fixture().await;
         for n in 1..=3 {
             airc.append_event(event(&airc, room, n, "claude:peer", &format!("old-{n}")))
@@ -175,28 +170,30 @@ mod tests {
         }
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut output, 1)
+        print_delivery_turn(&airc, "paced", &filter, &mut output, true)
             .await
             .unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("old-1"));
+        assert!(text.contains("at least 3 unread events"));
         assert!(!text.contains("old-2"));
         airc.append_event(event(&airc, room, 4, "claude:peer", "fresh-request"))
             .await
             .unwrap();
         let mut fresh = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut fresh, 0)
+        print_delivery_turn(&airc, "paced", &filter, &mut fresh, false)
             .await
             .unwrap();
         let text = String::from_utf8(fresh).unwrap();
         assert!(text.contains("fresh-request"));
         assert!(!text.contains("old-"));
         let mut resumed = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut resumed, 1)
+        print_delivery_turn(&airc, "paced", &filter, &mut resumed, false)
             .await
             .unwrap();
         let text = String::from_utf8(resumed).unwrap();
-        assert!(text.contains("old-2"));
+        assert!(text.is_empty());
+        let retained = airc.prepare_agent_delivery("paced", 64, 64).await.unwrap();
+        assert_eq!(retained.backlog_events().len(), 3);
         assert!(!text.contains("old-1"));
         assert!(!text.contains("old-3"));
     }
@@ -224,13 +221,18 @@ mod tests {
         airc.append_event(event(&airc, room, 131, "codex:local", "own hidden"))
             .await
             .unwrap();
+        drop(
+            airc.prepare_agent_delivery("filtered", 64, 64)
+                .await
+                .unwrap(),
+        );
         let mut warning = event(&airc, room, 132, "claude:peer", "ordinary warning");
         warning.kind = TranscriptKind::System;
         airc.append_event(warning).await.unwrap();
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
         assert!(
-            !print_delivery_turn(&airc, "filtered", &filter, &mut output, 64)
+            print_delivery_turn(&airc, "filtered", &filter, &mut output, true)
                 .await
                 .unwrap()
         );
@@ -240,7 +242,7 @@ mod tests {
         assert!(!text.contains("own hidden"));
         let mut retry = Vec::new();
         assert!(
-            !print_delivery_turn(&airc, "filtered", &filter, &mut retry, 64)
+            print_delivery_turn(&airc, "filtered", &filter, &mut retry, false)
                 .await
                 .unwrap()
         );
