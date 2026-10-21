@@ -4,18 +4,7 @@ use std::path::{Path, PathBuf};
 
 type Error = Box<dyn std::error::Error>;
 
-/// Explicitly enabled, fixed-count transaction evidence; never changes recovery policy.
-pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
-    if std::env::var_os("AIRC_UPDATE_DIAGNOSTICS").is_some_and(|v| v == "1") {
-        let owner = std::env::var("AIRC_UPDATE_SESSION_OWNER")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok());
-        eprintln!(
-            "update-diagnostic worker_pid={} setup_owner_pid={owner:?} {message}",
-            std::process::id()
-        );
-    }
-}
+use crate::update_artifact::diagnostic;
 
 fn transaction_move(stage: &str, from: &Path, to: &Path) -> std::io::Result<()> {
     let started = std::time::Instant::now();
