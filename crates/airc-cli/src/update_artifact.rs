@@ -102,7 +102,7 @@ impl PreparedInstall {
                 .arg(&self.expected);
             command
         };
-        let status = command
+        command
             .env("AIRC_DIR", &self.source)
             .env("AIRC_INSTALL_NO_PULL", "1")
             // The transaction displaces this executing installation. Never
@@ -110,8 +110,20 @@ impl PreparedInstall {
             .env("BIN_DIR", &self.bin_directory)
             .env("BIN_TARGET", &self.bin_directory)
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()?;
+            .stderr(Stdio::inherit());
+        let started = std::time::Instant::now();
+        let mut child = command.spawn()?;
+        crate::update_rollback::diagnostic(format_args!(
+            "stage=installer-start mode={mode} child_pid={}",
+            child.id()
+        ));
+        let status = child.wait();
+        crate::update_rollback::diagnostic(format_args!(
+            "stage=installer-exit mode={mode} child_pid={} elapsed_ms={} result={status:?}",
+            child.id(),
+            started.elapsed().as_millis()
+        ));
+        let status = status?;
         if !status.success() {
             let entry = if cfg!(windows) {
                 "install.ps1"

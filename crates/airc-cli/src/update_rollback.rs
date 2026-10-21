@@ -4,6 +4,29 @@ use std::path::{Path, PathBuf};
 
 type Error = Box<dyn std::error::Error>;
 
+/// Explicitly enabled, fixed-count transaction evidence; never changes recovery policy.
+pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("AIRC_UPDATE_DIAGNOSTICS").is_some_and(|v| v == "1") {
+        let owner = std::env::var("AIRC_UPDATE_SESSION_OWNER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        eprintln!(
+            "update-diagnostic worker_pid={} setup_owner_pid={owner:?} {message}",
+            std::process::id()
+        );
+    }
+}
+
+fn transaction_move(stage: &str, from: &Path, to: &Path) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
+    let result = move_without_replace(from, to);
+    diagnostic(format_args!(
+        "stage={stage} from={from:?} to={to:?} elapsed_ms={} result={result:?}",
+        started.elapsed().as_millis()
+    ));
+    result
+}
+
 pub(crate) struct BinarySwap {
     current: PathBuf,
     previous: PathBuf,
@@ -29,7 +52,7 @@ impl BinarySwap {
                 .ok_or("installed binary has no filename")?,
         );
         let failed = directory.join("failed-candidate");
-        if let Err(error) = move_without_replace(current, &previous) {
+        if let Err(error) = transaction_move("displace", current, &previous) {
             let _ = std::fs::remove_dir(&directory); // Only our still-empty directory.
             return Err(format!(
                 "could not displace installed binary {} to {}: {error}; installation was not started and retained paths were not deleted",
@@ -69,12 +92,26 @@ impl BinarySwap {
                 )
                 .into());
             }
-            move_without_replace(&self.current, &self.failed)?;
+            transaction_move("retain-candidate", &self.current, &self.failed)?;
         }
         // Renaming restores the original file object, even while the updater
         // still executes from it. Copying over it after this succeeds is invalid
         // on Windows: it attempts to overwrite the updater's own mapped image.
-        move_without_replace(&self.previous, &self.current).map_err(|error| {
+        transaction_move("restore-previous", &self.previous, &self.current).map_err(|error| {
+            // Inspect only our three paths, never host process/account state.
+            if std::env::var_os("AIRC_UPDATE_DIAGNOSTICS").is_some_and(|v| v == "1") {
+                for (name, path) in [
+                    ("current", &self.current),
+                    ("previous", &self.previous),
+                    ("failed", &self.failed),
+                ] {
+                    let state =
+                        std::fs::symlink_metadata(path).map(|m| (m.file_type().is_file(), m.len()));
+                    diagnostic(format_args!(
+                        "stage=restore-failed path_role={name} path={path:?} metadata={state:?}"
+                    ));
+                }
+            }
             format!(
                 "could not restore {} to {}: {error}; retained rollback files were not deleted",
                 self.previous.display(),
