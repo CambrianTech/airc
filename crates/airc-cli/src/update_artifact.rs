@@ -113,12 +113,12 @@ impl PreparedInstall {
             .stderr(Stdio::inherit());
         let started = std::time::Instant::now();
         let mut child = command.spawn()?;
-        crate::update_rollback::diagnostic(format_args!(
+        diagnostic(format_args!(
             "stage=installer-start mode={mode} child_pid={}",
             child.id()
         ));
         let status = child.wait();
-        crate::update_rollback::diagnostic(format_args!(
+        diagnostic(format_args!(
             "stage=installer-exit mode={mode} child_pid={} elapsed_ms={} result={status:?}",
             child.id(),
             started.elapsed().as_millis()
@@ -141,5 +141,18 @@ impl Drop for PreparedInstall {
         // Only this freshly-created temporary directory is owned here. The
         // source checkout, installed binary and Cargo outputs are never removed.
         let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Explicitly enabled, fixed-count transaction evidence; never changes recovery policy.
+pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("AIRC_UPDATE_DIAGNOSTICS").is_some_and(|v| v == "1") {
+        let owner = std::env::var("AIRC_UPDATE_SESSION_OWNER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        eprintln!(
+            "update-diagnostic worker_pid={} setup_owner_pid={owner:?} {message}",
+            std::process::id()
+        );
     }
 }
