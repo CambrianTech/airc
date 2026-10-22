@@ -82,17 +82,34 @@ async fn reattach(
     home: &std::path::Path,
 ) -> Result<airc_lib::FilteredEventStream, Box<dyn std::error::Error>> {
     eprintln!("airc join: the daemon went away; waiting for it to return (an update hands it over in seconds)");
+    let started = std::time::Instant::now();
     let mut wait = std::time::Duration::from_millis(250);
+    // What the wait is waiting on, said once each time it changes (card e496eda4): a live
+    // handoff took 46-110 s to reattach to a daemon that already answered `airc status`, and
+    // only the failing call's own error can say why.
+    let mut last_reason = String::new();
     loop {
         if airc_lib::daemon_lifecycle::operator_stop_recorded(home)? {
             return Err("the daemon was stopped by the operator; run `airc join` to resume".into());
         }
         match airc.subscribe_agent_feed().await {
             Ok(stream) => {
-                eprintln!("airc join: reattached; delivery resumes from this feed's checkpoint");
+                eprintln!(
+                    "airc join: reattached after {} ms; delivery resumes from this feed's checkpoint",
+                    started.elapsed().as_millis()
+                );
                 return Ok(stream);
             }
-            Err(error) if error.is_daemon_absent() => {}
+            Err(error) if error.is_daemon_absent() => {
+                let reason = error.to_string();
+                if reason != last_reason {
+                    eprintln!(
+                        "airc join: still waiting at {} ms: {reason}",
+                        started.elapsed().as_millis()
+                    );
+                    last_reason = reason;
+                }
+            }
             Err(error) => return Err(error.into()),
         }
         tokio::select! {
