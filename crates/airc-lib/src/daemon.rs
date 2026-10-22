@@ -694,20 +694,8 @@ async fn spawn_channel_reader(
     // `from` is the resume point a caller hands over (the set reader
     // falling back after a daemon rollback); `None` is the live edge.
     let request = channel_request(channel, from, delivery.clone(), headers.clone());
-    let mut stream = client
-        .attach(request)
-        .await
-        .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
-    match read_response_frame(&mut stream).await {
-        Ok(Some(Response::Ok)) => {}
-        Ok(Some(Response::Error { message })) => {
-            return Err(AircError::Route(format!("daemon attach: {message}")))
-        }
-        Ok(Some(_)) | Ok(None) => {
-            return Err(AircError::Route("daemon attach: no ack".to_string()))
-        }
-        Err(e) => return Err(AircError::Route(format!("daemon attach ack: {e}"))),
-    }
+    let mut stream = client.attach(request).await?; // typed: see `attach_ack`
+    attach_ack(read_response_frame(&mut stream).await, "daemon attach")?;
     Ok(tokio::spawn(async move {
         // Drain the live stream; when it drops (daemon restart /
         // transient loss) re-attach and RESUME strictly after the
@@ -873,16 +861,10 @@ impl Airc {
         };
         let mut cursors: std::collections::HashMap<RoomId, IpcCursor> = Default::default();
         let mut stream = client.attach(request_for(&cursors)).await?; // typed, as above
-        match read_response_frame(&mut stream).await {
-            Ok(Some(Response::Ok)) => {}
-            Ok(Some(Response::Error { message })) => {
-                return Err(AircError::Route(format!("daemon attach (set): {message}")))
-            }
-            Ok(Some(_)) | Ok(None) => {
-                return Err(AircError::Route("daemon attach (set): no ack".to_string()))
-            }
-            Err(e) => return Err(AircError::Route(format!("daemon attach (set) ack: {e}"))),
-        }
+        attach_ack(
+            read_response_frame(&mut stream).await,
+            "daemon attach (set)",
+        )?;
         let rooms = channels.len();
         Ok(tokio::spawn(async move {
             let mut backoff_ms = RECONNECT_BACKOFF_START_MS;
@@ -1051,9 +1033,59 @@ fn ipc_delivery(delivery: airc_bus::DeliveryClass) -> IpcDelivery {
     }
 }
 
+/// An attach's acknowledgment, typed by cause (Codex on #1603). A daemon that refuses the
+/// attach, or answers with a frame that is not an acknowledgment or not a frame at all, is a
+/// real error (`Route`). A connection that closes or fails before the acknowledgment is the
+/// daemon going away, which happens in an update's handoff: it is `DaemonClient(Io)`, which
+/// `AircError::is_daemon_absent` reads, so a waiting reader attaches again instead of ending.
+fn attach_ack(ack: std::io::Result<Option<Response>>, what: &str) -> Result<(), AircError> {
+    match ack {
+        Ok(Some(Response::Ok)) => Ok(()),
+        Ok(Some(Response::Error { message })) => {
+            Err(AircError::Route(format!("{what}: {message}")))
+        }
+        Ok(Some(other)) => Err(AircError::Route(format!(
+            "{what}: not an acknowledgment: {other:?}"
+        ))),
+        Ok(None) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{what}: closed before acknowledging"),
+            ),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(AircError::Route(
+            format!("{what}: malformed acknowledgment: {error}"),
+        )),
+        Err(error) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(error))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (Codex on #1603): a replacement daemon that closes the attach before
+    // acknowledging it, read as a refusal, which ends a reattaching feed for good. Through
+    // the real frame reader: a close (before or inside the frame) is the daemon gone; a
+    // refusal or a frame that does not decode is a real error.
+    #[tokio::test]
+    async fn an_attach_closed_before_its_ack_is_the_daemon_gone_and_a_refusal_is_not() {
+        let closed = attach_ack(read_response_frame(&mut tokio::io::empty()).await, "attach");
+        assert!(closed.unwrap_err().is_daemon_absent());
+        let mut cut: &[u8] = &[0, 0, 0, 9, 1];
+        let cut = attach_ack(read_response_frame(&mut cut).await, "attach");
+        assert!(cut.unwrap_err().is_daemon_absent());
+        let refused = attach_ack(
+            Ok(Some(Response::Error {
+                message: "no such room".into(),
+            })),
+            "attach",
+        );
+        assert!(!refused.unwrap_err().is_daemon_absent());
+        let mut garbage: &[u8] = &[0, 0, 0, 1, 0xff];
+        let garbage = attach_ack(read_response_frame(&mut garbage).await, "attach");
+        assert!(!garbage.unwrap_err().is_daemon_absent());
+    }
 
     // what this catches (Astra's re-review of airc #1523): a daemon rolled back
     // under a live set subscription stops serving channel sets, and the set
