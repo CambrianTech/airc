@@ -440,7 +440,10 @@ mod tests {
         assert!(dm.contains(&format!(" → @{}/{r} e=", short(&kimi))), "{dm}");
         let other = RoomId::new();
         let cross = render_feed_line(&event(MentionTarget::Room(other))).expect("renders");
-        assert!(cross.contains(&format!(" → {r}→{} e=", short(&other))), "{cross}");
+        assert!(
+            cross.contains(&format!(" → {r}→{} e=", short(&other))),
+            "{cross}"
+        );
     }
 
     #[test]
