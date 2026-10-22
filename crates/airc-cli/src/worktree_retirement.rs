@@ -197,7 +197,8 @@ fn release_submodules(path: &Path) -> Result<(), String> {
 fn unverified_tags(checkout: &Path, recorded: &str) -> Result<Vec<String>, String> {
     let elsewhere = [
         "--not",
-        "--branches",
+        "--exclude=refs/tags/*",
+        "--all",
         "--reflog",
         "HEAD",
         "--remotes",
@@ -578,6 +579,38 @@ mod tests {
         git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
         retire(&f.tree, &f.root).unwrap();
         assert!(!f.tree.exists());
+    }
+
+    // what this catches (Codex on #1606): narrowing `--all` to `--branches` to leave tags
+    // out also left out custom refs (refs/keep/*, notes) that `--all` protected. A commit
+    // only such a ref reaches, with its reflogs expired, keeps the worktree.
+    #[test]
+    fn preserves_a_submodule_commit_only_a_custom_ref_reaches() {
+        let f = Fixture::new();
+        let child = with_submodule(&f);
+        let recorded = git(&f.tree, &["rev-parse", "HEAD:child"]).unwrap();
+        git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+        git(
+            &child,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "kept by a custom ref",
+            ],
+        )
+        .unwrap();
+        git(&child, &["update-ref", "refs/keep/work", "HEAD"]).unwrap();
+        git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+        git(&child, &["reflog", "expire", "--expire=now", "--all"]).unwrap();
+        git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
+        let error = retire(&f.tree, &f.root).unwrap_err();
+        assert!(error.contains("found nowhere else"), "{error}");
+        assert!(child.join(".git").exists());
     }
 
     // what this catches (Codex on #1606): ignoring every tag would delete history a tag
