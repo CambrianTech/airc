@@ -16,7 +16,12 @@ use crate::client_id::{current_client_id, RuntimeSelfFilter};
 const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
 
-pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    airc: &Airc,
+    room: RoomId,
+    home: &std::path::Path,
+    socket: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_client = current_client_id()?;
     let consumer_id = format!("{}:room:{room}", consumer_id(runtime_client.as_deref()));
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
@@ -27,7 +32,7 @@ pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Er
     println!("attached — Ctrl-C to detach.");
     let mut announce_history = true;
     loop {
-        print_delivery_turn(
+        let turn = print_delivery_turn(
             airc,
             &consumer_id,
             &self_filter,
@@ -35,7 +40,16 @@ pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Er
             announce_history,
             Some(room),
         )
-        .await?;
+        .await;
+        if let Err(error) = turn {
+            // An error while the daemon answers is a real one; while it does not, the
+            // daemon is between processes (an update's handoff, or a restart).
+            if daemon_answers(socket).await {
+                return Err(error);
+            }
+            stream = reattach(airc, home, socket).await?;
+            continue;
+        }
         announce_history = false;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -43,9 +57,48 @@ pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Er
             next = stream.next() => match next {
                 Some(Ok(_)) => {},
                 Some(Err(lag @ LiveLag { .. })) => eprintln!("airc: {lag}; recovering from durable delivery state"),
-                None => return Err("agent live subscription closed; checkpoints retained".into()),
+                None => stream = reattach(airc, home, socket).await?,
             },
         }
+    }
+}
+
+/// The daemon answers a ping now.
+async fn daemon_answers(socket: &std::path::Path) -> bool {
+    airc_ipc::DaemonClient::new(socket.to_path_buf())
+        .ping_with_timeout(std::time::Duration::from_secs(2))
+        .await
+        .is_ok()
+}
+
+/// Wait out the daemon's absence and subscribe again (card 201417d4). A supported update
+/// hands the daemon over in seconds, and that used to end every attached feed (Claude
+/// Monitor, a Codex join session) until someone re-ran `airc join`. Delivery resumes from
+/// this consumer's durable checkpoint, so nothing published in the gap is lost and nothing
+/// already printed is printed again. Only an operator stop ends the feed here: it is the
+/// one absence that is meant to last.
+async fn reattach(
+    airc: &Airc,
+    home: &std::path::Path,
+    socket: &std::path::Path,
+) -> Result<airc_lib::FilteredEventStream, Box<dyn std::error::Error>> {
+    eprintln!("airc join: the daemon went away; waiting for it to return (an update hands it over in seconds)");
+    let mut wait = std::time::Duration::from_millis(250);
+    loop {
+        if airc_lib::daemon_lifecycle::operator_stop_recorded(home)? {
+            return Err("the daemon was stopped by the operator; run `airc join` to resume".into());
+        }
+        if daemon_answers(socket).await {
+            if let Ok(stream) = airc.subscribe_agent_feed().await {
+                eprintln!("airc join: reattached; delivery resumes from this feed's checkpoint");
+                return Ok(stream);
+            }
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Err("detached while waiting for the daemon".into()),
+            _ = tokio::time::sleep(wait) => {},
+        }
+        wait = (wait * 2).min(std::time::Duration::from_secs(5));
     }
 }
 async fn print_delivery_turn(
@@ -315,6 +368,25 @@ mod tests {
                 .unwrap()
         );
         assert!(retry.is_empty());
+    }
+
+    // what this catches (card 201417d4): the wait that keeps a feed alive across a daemon
+    // handoff swallowing the one absence meant to last. With an operator stop recorded and no
+    // daemon answering, the feed ends with the resume instruction instead of waiting forever.
+    #[tokio::test]
+    async fn an_operator_stop_ends_the_wait_for_the_daemon() {
+        let (dir, airc, _room) = fixture().await;
+        let stop =
+            airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
+        stop.record_operator_stop().unwrap();
+        drop(stop);
+        let absent = dir.path().join("no-daemon.sock");
+        let ended = reattach(&airc, dir.path(), &absent)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(ended.contains("stopped by the operator"), "{ended}");
     }
 
     async fn fixture() -> (TempDir, Airc, RoomId) {

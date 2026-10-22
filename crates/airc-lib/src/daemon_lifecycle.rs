@@ -173,6 +173,14 @@ impl DaemonLifecycleGuard {
     }
 }
 
+/// Whether an operator stop is recorded for `home`'s machine account. Unserialized: for a
+/// reader deciding whether to keep waiting for the daemon (a live feed across an update), where
+/// a stop recorded a moment later is seen on its next look. Admission still reads it under
+/// the lifecycle gate.
+pub fn operator_stop_recorded(home: &Path) -> io::Result<bool> {
+    operator_stopped(&crate::machine_account_home(home))
+}
+
 fn operator_stopped(owner: &crate::MachineAccountHome) -> io::Result<bool> {
     match std::fs::symlink_metadata(owner.join("daemon-operator-stop")) {
         Ok(_) => Ok(true),
