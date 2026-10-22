@@ -81,33 +81,71 @@ async fn reattach(
     airc: &Airc,
     home: &std::path::Path,
 ) -> Result<airc_lib::FilteredEventStream, Box<dyn std::error::Error>> {
-    eprintln!("airc join: the daemon went away; waiting for it to return (an update hands it over in seconds)");
+    let wall_started = std::time::SystemTime::now();
+    eprintln!(
+        "airc join [{}]: the daemon went away; waiting for it to return (an update hands it over in seconds)",
+        utc_now()
+    );
     let started = std::time::Instant::now();
     let mut wait = std::time::Duration::from_millis(250);
     // What the wait is waiting on, said once each time it changes (card e496eda4): a live
     // handoff took 46-110 s to reattach to a daemon that already answered `airc status`, and
     // only the failing call's own error can say why.
     let mut last_reason = String::new();
+    // And said again at least every 30 s even when it hasn't changed, with the attempt count
+    // and both clocks (card 5a74fe71): on 2026-10-22 a stall with one unchanged reason was
+    // silent for four minutes and its Instant reported 4.1 s, so neither showed whether the
+    // loop was iterating (attempts climbing) or blocked inside one await (attempts frozen;
+    // the 'still inside subscribe' line below).
+    let mut attempts: u64 = 0;
+    let mut last_said = std::time::Instant::now();
     loop {
+        attempts += 1;
         if airc_lib::daemon_lifecycle::operator_stop_recorded(home)? {
             return Err("the daemon was stopped by the operator; run `airc join` to resume".into());
         }
-        match airc.subscribe_agent_feed().await {
+        // The attempt itself is raced against a 30 s tick, so a hang INSIDE the subscribe call
+        // (the 10-22 shape: two live connections to the successor, no answer) says so, and
+        // Ctrl-C still detaches (Fable on #1611).
+        let attempt = airc.subscribe_agent_feed();
+        tokio::pin!(attempt);
+        let mut inside = tokio::time::interval(std::time::Duration::from_secs(30));
+        inside.tick().await; // the first tick is immediate; the next is 30 s into the attempt
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut attempt => break outcome,
+                _ = inside.tick() => eprintln!(
+                    "airc join [{}]: still inside subscribe at {} ms (wall {} ms, attempt {attempts})",
+                    utc_now(),
+                    started.elapsed().as_millis(),
+                    wall_elapsed_ms(wall_started)
+                ),
+                _ = tokio::signal::ctrl_c() => return Err("detached while waiting for the daemon".into()),
+            }
+        };
+        match outcome {
             Ok(stream) => {
                 eprintln!(
-                    "airc join: reattached after {} ms; delivery resumes from this feed's checkpoint",
-                    started.elapsed().as_millis()
+                    "airc join [{}]: reattached after {} ms (wall {} ms, attempt {attempts}); delivery resumes from this feed's checkpoint",
+                    utc_now(),
+                    started.elapsed().as_millis(),
+                    wall_elapsed_ms(wall_started)
                 );
                 return Ok(stream);
             }
             Err(error) if error.is_daemon_absent() => {
                 let reason = error.to_string();
-                if reason != last_reason {
+                if reason != last_reason
+                    || last_said.elapsed() >= std::time::Duration::from_secs(30)
+                {
                     eprintln!(
-                        "airc join: still waiting at {} ms: {reason}",
-                        started.elapsed().as_millis()
+                        "airc join [{}]: still waiting at {} ms (wall {} ms, attempt {attempts}): {reason}",
+                        utc_now(),
+                        started.elapsed().as_millis(),
+                        wall_elapsed_ms(wall_started)
                     );
                     last_reason = reason;
+                    last_said = std::time::Instant::now();
                 }
             }
             Err(error) => return Err(error.into()),
@@ -119,6 +157,18 @@ async fn reattach(
         wait = (wait * 2).min(std::time::Duration::from_secs(5));
     }
 }
+/// The wall-clock time for a diagnostic line, so a reader can line the feed up with the
+/// daemon's own log and a peer's (card 5a74fe71).
+fn utc_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Wall-clock milliseconds since `since`, beside the monotonic count: when the two disagree
+/// the process was not running its timer the way the monotonic clock says (card 5a74fe71).
+fn wall_elapsed_ms(since: std::time::SystemTime) -> u128 {
+    since.elapsed().map_or(0, |elapsed| elapsed.as_millis()) // map_or: a clock stepped backwards reads 0, never a panic
+}
+
 async fn print_delivery_turn(
     airc: &Airc,
     consumer: &str,
