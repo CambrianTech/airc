@@ -679,7 +679,12 @@ pub(crate) async fn cleanup_card_worktree(
     let root = lease::lease_root().ok_or("cannot resolve managed worktree root")?;
     let parent = root.join(card_id.shown());
     if parent.exists() {
-        retire_under_lifecycle(airc, card_id, &resolve_worktree_path(&parent), &root, held).await?;
+        let outcome =
+            retire_under_lifecycle(airc, card_id, &resolve_worktree_path(&parent), &root, held)
+                .await?;
+        if let Some(retained) = outcome.retained_branch {
+            return Err(retained.into());
+        }
     }
     Ok(())
 }
@@ -708,7 +713,7 @@ async fn retire_under_lifecycle(
     path: &Path,
     root: &Path,
     held: Option<&airc_lib::work_worktree::WorktreeLifecycleLock>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<crate::worktree_retirement::Retirement, Box<dyn std::error::Error>> {
     let _acquired = match held {
         Some(_) => None,
         None => match airc_lib::work_worktree::try_lifecycle_lock(card_id)? {
@@ -733,8 +738,7 @@ async fn retire_under_lifecycle(
             format!("{card_id} is no longer Merged or Closed on the board; retained").into(),
         );
     }
-    crate::worktree_retirement::retire(path, root)?;
-    Ok(())
+    Ok(crate::worktree_retirement::retire(path, root)?)
 }
 
 /// Spawn a sibling review card for `parent_id` if one doesn't already
@@ -1020,6 +1024,7 @@ pub async fn run_cleanup(
     // batch — surface the diagnostic, keep going. The operator
     // re-runs after fixing the specific issue.
     let mut removed = 0usize;
+    let mut retained_branches = 0usize;
     let mut failed = 0usize;
     let total = removable.len();
     for (index, c) in removable.into_iter().enumerate() {
@@ -1035,9 +1040,14 @@ pub async fn run_cleanup(
             continue;
         };
         match retire_under_lifecycle(&airc, card_id, &c.path, &lease_root, None).await {
-            Ok(()) => {
-                println!("✓ removed {}", c.path.display());
+            Ok(outcome) => {
                 removed += 1;
+                if let Some(retained) = outcome.retained_branch {
+                    eprintln!("checkout removed {}: {retained}", c.path.display());
+                    retained_branches += 1;
+                } else {
+                    println!("removed {}", c.path.display());
+                }
             }
             Err(error) => {
                 eprintln!("✗ {} — {error}", c.path.display());
@@ -1045,10 +1055,10 @@ pub async fn run_cleanup(
             }
         }
     }
-    println!("{removed} worktree retirement(s) completed; {failed} failed.");
-    if failed != 0 {
+    println!("{removed} checkout(s) removed; {retained_branches} branch(es) retained; {failed} checkout retirement(s) failed.");
+    if failed != 0 || retained_branches != 0 {
         return Err(format!(
-            "{failed} worktree retirement(s) failed; inspect the per-path errors before retrying"
+            "{failed} checkout retirement(s) failed; {retained_branches} branch(es) retained after checkout removal; inspect diagnostics, do not retry removed checkouts"
         )
         .into());
     }
@@ -1084,6 +1094,8 @@ pub(crate) enum Disposition {
     SkipDirty,
     /// Couldn't run `git status` (not a git dir, permissions, etc).
     SkipNotGit,
+    /// Clean detached checkout: retain until an explicit branch owner is established.
+    SkipDetached,
     /// No card matches the worktree's short id. Orphan — surface but
     /// don't touch; could be from a deleted card or a different scope.
     SkipUnknownCard,
@@ -1123,6 +1135,7 @@ impl Disposition {
             Disposition::KeepActive => 1,
             Disposition::SkipDirty => 2,
             Disposition::SkipNotGit => 3,
+            Disposition::SkipDetached => 6,
             Disposition::SkipUnknownCard => 4,
             Disposition::SkipAmbiguousCard => 5,
         }
@@ -1134,6 +1147,7 @@ impl Disposition {
             Disposition::KeepActive => "KeepActive",
             Disposition::SkipDirty => "SkipDirty",
             Disposition::SkipNotGit => "SkipNotGit",
+            Disposition::SkipDetached => "SkipDetached",
             Disposition::SkipUnknownCard => "SkipUnknownCard",
             Disposition::SkipAmbiguousCard => "SkipAmbiguousCard",
         }
@@ -1145,6 +1159,7 @@ impl Disposition {
             Disposition::KeepActive => "",
             Disposition::SkipDirty => "  uncommitted or unpushed work",
             Disposition::SkipNotGit => "  not a git worktree",
+            Disposition::SkipDetached => "  detached HEAD; checkout retained",
             Disposition::SkipUnknownCard => "  no matching card on board",
             Disposition::SkipAmbiguousCard => "  short id matches more than one card",
         }
@@ -1180,7 +1195,14 @@ pub(crate) fn classify_worktree_path(
 ) -> (std::path::PathBuf, DirtyStatus, Disposition) {
     let effective = resolve_worktree_path(path);
     let dirty_status = probe_dirty_status_at(&effective);
-    let disposition = classify_worktree(card_state, &dirty_status);
+    let mut disposition = classify_worktree(card_state, &dirty_status);
+    if disposition == Disposition::Removable {
+        disposition = match crate::worktree_retirement::attached_branch(&effective) {
+            Ok(Some(_)) => disposition,
+            Ok(None) => Disposition::SkipDetached,
+            Err(_) => Disposition::SkipNotGit,
+        };
+    }
     (effective, dirty_status, disposition)
 }
 

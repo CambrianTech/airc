@@ -16,16 +16,44 @@ fn git(path: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug)]
+pub(crate) struct Retirement {
+    /// The checkout was removed, but Git refused branch deletion. Preserve the
+    /// diagnostic and recovery ref; this is partial completion, not a retryable checkout.
+    pub(crate) retained_branch: Option<String>,
+}
+
+pub(crate) fn attached_branch(path: &Path) -> Result<Option<String>, String> {
+    let out = airc_core::process::background("git")
+        .arg("-C")
+        .arg(path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    }
+    let branch = String::from_utf8(out.stdout).map_err(|e| e.to_string())?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("empty branch identity; retained".into());
+    }
+    Ok(Some(branch.to_owned()))
+}
+
 /// Caller must establish terminal card ownership. This function checks the
 /// filesystem again immediately before removing anything. A recovery ref keeps
 /// the exact history available even after a squash merge removes the remote ref.
-pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
+pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<Retirement, String> {
     let root = managed_root.canonicalize().map_err(|e| e.to_string())?;
     let path = path.canonicalize().map_err(|e| e.to_string())?;
     if path == root || !path.starts_with(&root) || !path.join(".git").is_file() {
         return Err("refusing non-managed or primary checkout".into());
     }
-    let branch = git(&path, &["symbolic-ref", "--short", "HEAD"])?;
+    let branch = attached_branch(&path)?.ok_or("detached HEAD; checkout retained")?;
     if matches!(branch.as_str(), "main" | "master" | "canary") {
         return Err(format!("refusing integration branch {branch}"));
     }
@@ -63,6 +91,11 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
     let head = git(&path, &["rev-parse", "HEAD"])?;
     let recovery = format!("refs/airc/retired/{branch}/{head}");
     git(&path, &["update-ref", &recovery, &head])?;
+    if attached_branch(&path)?.as_deref() != Some(branch.as_str())
+        || git(&path, &["rev-parse", "HEAD"])? != head
+    {
+        return Err("branch or HEAD changed during retirement; checkout retained".into());
+    }
     release_submodules(&path)?;
     // No --force or recursive deletion. Git protects locked checkouts and dirty
     // races; submodules were released above only if they held nothing unique.
@@ -75,11 +108,13 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
             path.to_str().ok_or("non-UTF8 worktree path")?,
         ],
     )?;
-    retire_branch(repo, &branch, &head).map_err(|error| {
+    let retained_branch = retire_branch(repo, &branch, &head).err().map(|error| {
         format!("checkout removed; branch {branch} retained: {error}; recovery: {recovery}")
-    })?;
-    println!("retired: {branch}; recovery: {recovery}");
-    Ok(())
+    });
+    if retained_branch.is_none() {
+        println!("retired: {branch}; recovery: {recovery}");
+    }
+    Ok(Retirement { retained_branch })
 }
 
 /// Let `worktree remove` retire a worktree that initialized submodules. Git keeps
@@ -430,8 +465,12 @@ mod tests {
         )
         .unwrap();
         assert_ne!(original, git(&f.repo, &["rev-parse", "HEAD"]).unwrap());
-        let error = retire(&f.tree, &f.root).unwrap_err();
-        assert!(error.contains("branch aabbccdd/fix retained"), "{error}");
+        let outcome = retire(&f.tree, &f.root).unwrap();
+        let retained = outcome.retained_branch.unwrap();
+        assert!(
+            retained.contains("branch aabbccdd/fix retained"),
+            "{retained}"
+        );
         assert!(!f.tree.exists());
         assert_eq!(
             git(&f.repo, &["rev-parse", "refs/heads/aabbccdd/fix"]).unwrap(),
@@ -448,6 +487,25 @@ mod tests {
             .unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn detached_checkout_is_classified_and_retained_before_mutation() {
+        let f = Fixture::new();
+        git(&f.tree, &["checkout", "--detach"]).unwrap();
+        let head = git(&f.tree, &["rev-parse", "HEAD"]).unwrap();
+        let (_, _, disposition) = crate::work_commands::classify_worktree_path(
+            &f.tree,
+            Some(&airc_work::CardState::Closed),
+        );
+        assert_eq!(disposition, crate::work_commands::Disposition::SkipDetached);
+        assert!(retire(&f.tree, &f.root)
+            .unwrap_err()
+            .contains("detached HEAD"));
+        assert_eq!(git(&f.tree, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(git(&f.repo, &["for-each-ref", "refs/airc/retired"])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
