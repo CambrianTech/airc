@@ -18,6 +18,7 @@ use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 const CONSUMER_PREFIX: &str = "codex-hook";
 // Automatic context is a notification, not an export of nested transcripts. Keep
 // large bodies in durable history; explicit --raw reads retain the full payload.
+// 4 KiB is a chosen per-message notification budget, not a transport limit.
 const DIGEST_BODY_BYTES: usize = 4096;
 
 pub async fn run_user_prompt_submit(

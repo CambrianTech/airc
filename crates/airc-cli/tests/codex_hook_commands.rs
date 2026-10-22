@@ -211,6 +211,35 @@ fn codex_hook_excludes_self_echoes_but_still_advances_cursor() {
 }
 
 #[test]
+fn oversized_hook_reference_recovers_whole_body_after_acknowledgement() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    let body = "recovery-界".repeat(700);
+    run_ok(&home, &["send", &body]);
+    run_ok(&home, &["send", "fresh-review-request"]);
+    let args = &["codex-hook", "user-prompt-submit", "--include-self"];
+    let context = additional_context(&run_hook(&home, args, "{}"));
+    assert!(context.contains("body retained:"));
+    assert!(context.contains("fresh-review-request"));
+    assert!(!context.contains(&body));
+    // Execute the exact public recovery command emitted by the daemon-backed
+    // hook, rather than assuming embedded event lamports share its cursor domain.
+    let recovery = context
+        .split('`')
+        .find(|part| part.starts_with("airc inbox "))
+        .expect("recoverable reference");
+    let recovery_args: Vec<_> = recovery.split_whitespace().skip(1).collect();
+    assert!(run_hook(&home, args, "{}").trim().is_empty());
+    let recovered = run_ok(&home, &recovery_args);
+    let json: Value = serde_json::from_str(&recovered).unwrap();
+    assert!(
+        json.to_string().contains(&body),
+        "full body remains in inbox"
+    );
+}
+
+#[test]
 fn codex_hook_filters_by_runtime_client_header_not_persisted_identity() {
     let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
