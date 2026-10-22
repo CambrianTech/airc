@@ -16,7 +16,11 @@ use crate::client_id::{current_client_id, RuntimeSelfFilter};
 const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
 
-pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    airc: &Airc,
+    room: RoomId,
+    home: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_client = current_client_id()?;
     let consumer_id = format!("{}:room:{room}", consumer_id(runtime_client.as_deref()));
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
@@ -27,7 +31,7 @@ pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Er
     println!("attached — Ctrl-C to detach.");
     let mut announce_history = true;
     loop {
-        print_delivery_turn(
+        let turn = print_delivery_turn(
             airc,
             &consumer_id,
             &self_filter,
@@ -35,7 +39,16 @@ pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Er
             announce_history,
             Some(room),
         )
-        .await?;
+        .await;
+        if let Err(error) = turn {
+            // Decided by the error's type, never by probing afterwards: a replacement daemon
+            // can answer a probe before the old one's failure is handled (Codex on #1603).
+            if !daemon_absent(error.as_ref()) {
+                return Err(error);
+            }
+            stream = reattach(airc, home).await?;
+            continue;
+        }
         announce_history = false;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -43,9 +56,50 @@ pub async fn run(airc: &Airc, room: RoomId) -> Result<(), Box<dyn std::error::Er
             next = stream.next() => match next {
                 Some(Ok(_)) => {},
                 Some(Err(lag @ LiveLag { .. })) => eprintln!("airc: {lag}; recovering from durable delivery state"),
-                None => return Err("agent live subscription closed; checkpoints retained".into()),
+                None => stream = reattach(airc, home).await?,
             },
         }
+    }
+}
+
+/// The daemon was not there to answer (`AircError::is_daemon_absent`): a daemon between
+/// processes. Output, store and protocol errors are not this, and end the feed.
+fn daemon_absent(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<airc_lib::AircError>()
+        .is_some_and(airc_lib::AircError::is_daemon_absent)
+}
+
+/// Wait out the daemon's absence and subscribe again (card 201417d4). A supported update
+/// hands the daemon over in seconds, and that used to end every attached feed (Claude
+/// Monitor, a Codex join session) until someone re-ran `airc join`. Delivery resumes from
+/// this consumer's durable checkpoint, so nothing published in the gap is lost. Delivery is
+/// at-least-once across the gap: a turn flushes its output before it acknowledges, so an
+/// event printed just before the daemon went away can print again. Only an operator stop
+/// ends the feed here: it is the one absence meant to last.
+async fn reattach(
+    airc: &Airc,
+    home: &std::path::Path,
+) -> Result<airc_lib::FilteredEventStream, Box<dyn std::error::Error>> {
+    eprintln!("airc join: the daemon went away; waiting for it to return (an update hands it over in seconds)");
+    let mut wait = std::time::Duration::from_millis(250);
+    loop {
+        if airc_lib::daemon_lifecycle::operator_stop_recorded(home)? {
+            return Err("the daemon was stopped by the operator; run `airc join` to resume".into());
+        }
+        match airc.subscribe_agent_feed().await {
+            Ok(stream) => {
+                eprintln!("airc join: reattached; delivery resumes from this feed's checkpoint");
+                return Ok(stream);
+            }
+            Err(error) if error.is_daemon_absent() => {}
+            Err(error) => return Err(error.into()),
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Err("detached while waiting for the daemon".into()),
+            _ = tokio::time::sleep(wait) => {},
+        }
+        wait = (wait * 2).min(std::time::Duration::from_secs(5));
     }
 }
 async fn print_delivery_turn(
@@ -315,6 +369,85 @@ mod tests {
                 .unwrap()
         );
         assert!(retry.is_empty());
+    }
+
+    // what this catches (card 201417d4): the wait that keeps a feed alive across a daemon
+    // handoff swallowing the one absence meant to last. With an operator stop recorded and no
+    // daemon answering, the feed ends with the resume instruction instead of waiting forever.
+    #[tokio::test]
+    async fn an_operator_stop_ends_the_wait_for_the_daemon() {
+        let (dir, airc, _room) = fixture().await;
+        let stop =
+            airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
+        stop.record_operator_stop().unwrap();
+        drop(stop);
+        let ended = reattach(&airc, dir.path()).await.err().unwrap().to_string();
+        assert!(ended.contains("stopped by the operator"), "{ended}");
+    }
+
+    // what this catches (Codex on #1603): ending the feed on a daemon handoff because a fast
+    // replacement answered a probe taken after the failure. The decision is the error's own
+    // type: a daemon that was not there (not connected, dropped mid-call, timed out) reattaches
+    // whatever answers later; a refused request, an output error or a store error ends the feed.
+    #[test]
+    fn a_daemon_absence_reattaches_and_every_other_error_ends_the_feed() {
+        use airc_lib::AircError;
+        let boxed = |error: AircError| -> Box<dyn std::error::Error> { error.into() };
+        let gone = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        for absent in [
+            AircError::DaemonClient(airc_ipc::ClientError::NotConnected(gone())),
+            AircError::DaemonClient(airc_ipc::ClientError::Io(gone())),
+            AircError::DaemonClient(airc_ipc::ClientError::Timeout),
+        ] {
+            assert!(daemon_absent(boxed(absent).as_ref()));
+        }
+        for real in [
+            boxed(AircError::DaemonClient(airc_ipc::ClientError::Daemon(
+                "refused".into(),
+            ))),
+            boxed(AircError::Route(
+                "agent delivery: invalid delivered prefix".into(),
+            )),
+            Box::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                as Box<dyn std::error::Error>,
+        ] {
+            assert!(!daemon_absent(real.as_ref()), "{real}");
+        }
+    }
+
+    // what this catches (Codex on #1603): a reattach that loses what was published while the
+    // daemon was away, or prints again what was already delivered and acknowledged. Delivery
+    // resumes from this consumer's durable checkpoint: the turn after a reattach prints the
+    // event from the gap, and not the one acknowledged before it.
+    #[tokio::test]
+    async fn a_reattach_resumes_at_the_checkpoint() {
+        let (_dir, airc, room) = fixture().await;
+        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        print_delivery_turn(&airc, "resume", &filter, &mut Vec::new(), true, Some(room))
+            .await
+            .unwrap();
+        airc.append_event(event(&airc, room, 1, "claude:peer", "before-the-gap"))
+            .await
+            .unwrap();
+        let mut first = Vec::new();
+        print_delivery_turn(&airc, "resume", &filter, &mut first, false, Some(room))
+            .await
+            .unwrap();
+        assert!(String::from_utf8(first).unwrap().contains("before-the-gap"));
+        airc.append_event(event(&airc, room, 2, "claude:peer", "during-the-gap"))
+            .await
+            .unwrap();
+        let _stream = reattach(&airc, _dir.path()).await.unwrap();
+        let mut after = Vec::new();
+        print_delivery_turn(&airc, "resume", &filter, &mut after, false, Some(room))
+            .await
+            .unwrap();
+        let after = String::from_utf8(after).unwrap();
+        assert!(after.contains("during-the-gap"), "{after}");
+        assert!(
+            !after.contains("before-the-gap"),
+            "acknowledged before the gap: {after}"
+        );
     }
 
     async fn fixture() -> (TempDir, Airc, RoomId) {

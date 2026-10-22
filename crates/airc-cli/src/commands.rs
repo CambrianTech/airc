@@ -346,7 +346,7 @@ pub async fn run_join(
         // feed, never spawned: the feed ends the join, and the keeper ends with it.
         let watched = airc.current_room().await?.channel;
         tokio::select! {
-            fed = crate::join_feed::run(&airc, watched) => fed?,
+            fed = crate::join_feed::run(&airc, watched, home) => fed?,
             () = keep_daemon(home, socket, watched) => {}
         }
     }
