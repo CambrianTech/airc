@@ -93,7 +93,7 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
 /// what a scan skipped). Every repository on disk must belong to an initialized
 /// submodule at its recorded commit; one that does not (a deinitialized
 /// submodule's repository) is unexamined, so the worktree is kept. Each examined
-/// repository must have no stash, no commit reachable from neither its remotes
+/// repository must have no stash, no commit (refs or reflog) reachable from neither its remotes
 /// nor the recorded commit, and no ignored files in its checkout. Every git call
 /// is checked; a failure keeps the worktree. `deinit` runs WITHOUT --force, so
 /// git itself refuses a checkout that changed since.
@@ -131,7 +131,14 @@ fn release_submodules(path: &Path) -> Result<(), String> {
         let repo = git(&checkout, &["rev-parse", "--absolute-git-dir"])?;
         let unique = git(
             &checkout,
-            &["rev-list", "--all", "--not", "--remotes", recorded],
+            &[
+                "rev-list",
+                "--all",
+                "--reflog",
+                "--not",
+                "--remotes",
+                recorded,
+            ],
         )?;
         if !unique.is_empty() {
             return Err(format!("submodule {sub} holds commits found nowhere else"));
@@ -455,6 +462,36 @@ mod tests {
             &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
         )
         .is_ok());
+    }
+
+    // what this catches (Codex on #1602): a commit made on a detached HEAD and left behind
+    // when the checkout returned to the recorded commit. No ref names it, so `--all` alone
+    // misses it; only the reflog still reaches it, and that keeps the repository.
+    #[test]
+    fn preserves_a_submodule_commit_only_its_reflog_reaches() {
+        let f = Fixture::new();
+        let child = with_submodule(&f);
+        let recorded = git(&f.tree, &["rev-parse", "HEAD:child"]).unwrap();
+        git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+        git(
+            &child,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "detached only",
+            ],
+        )
+        .unwrap();
+        git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+        assert!(git(&f.tree, &["status", "--porcelain"]).unwrap().is_empty());
+        let error = retire(&f.tree, &f.root).unwrap_err();
+        assert!(error.contains("found nowhere else"), "{error}");
+        assert!(child.join(".git").exists());
     }
 
     // what this catches (Codex on #1602): the superproject's ignored-files check
