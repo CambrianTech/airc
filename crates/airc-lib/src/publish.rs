@@ -24,7 +24,7 @@
 //! daemon-attached [`Airc::attach`] handles.
 
 use airc_bus::DeliveryClass;
-use airc_core::{Body, EventId, Headers, MentionTarget, RoomId};
+use airc_core::{Body, EventId, Headers, MentionTarget, PeerId, RoomId};
 use airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS;
 use airc_protocol::FrameKind;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,28 @@ pub enum PublishTarget {
     /// auto-join is intentional — publishing should not change
     /// what rooms this scope is part of.
     RoomByName(String),
+    /// Address a peer in an already subscribed room (None uses the current room).
+    /// This is typed addressing, not a privacy or encryption guarantee.
+    PeerInRoom { room: Option<String>, peer: PeerId },
+}
+
+impl PublishTarget {
+    /// Keep the selected room while directing the frame to one peer.
+    pub fn to_peer(self, peer: PeerId) -> Self {
+        let room = match self {
+            Self::CurrentRoom => None,
+            Self::RoomByName(room) => Some(room),
+            Self::PeerInRoom { room, .. } => room,
+        };
+        Self::PeerInRoom { room, peer }
+    }
+
+    fn recipient(&self) -> MentionTarget {
+        match self {
+            Self::PeerInRoom { peer, .. } => MentionTarget::Peer(*peer),
+            _ => MentionTarget::All,
+        }
+    }
 }
 
 /// Typed receipt returned by [`Airc::publish`]. JSON-serialisable
@@ -127,14 +149,15 @@ impl Airc {
             HEADER_AIRC_DELIVERY_CLASS.to_string(),
             delivery_class_header_value(delivery).to_string(),
         );
+        let recipient = target.recipient();
         let room = self.resolve_publish_target(&target).await?;
         if self.is_daemon_attached() {
             return self
-                .daemon_publish(&room, kind, body, headers, delivery)
+                .daemon_publish(&room, kind, body, headers, delivery, recipient)
                 .await;
         }
         let result = self
-            .send_frame_to_room(kind, MentionTarget::All, body, headers, &room)
+            .send_frame_to_room(kind, recipient, body, headers, &room)
             .await?;
         Ok(PublishReceipt {
             event_id: result.event_id,
@@ -150,10 +173,13 @@ impl Airc {
         target: &PublishTarget,
     ) -> Result<crate::Room, AircError> {
         match target {
-            PublishTarget::CurrentRoom => self.current_room().await,
-            PublishTarget::RoomByName(name) => {
-                self.room_by_name_or_channel(name, "publish to").await
+            PublishTarget::CurrentRoom | PublishTarget::PeerInRoom { room: None, .. } => {
+                self.current_room().await
             }
+            PublishTarget::RoomByName(name)
+            | PublishTarget::PeerInRoom {
+                room: Some(name), ..
+            } => self.room_by_name_or_channel(name, "publish to").await,
         }
     }
 

@@ -407,6 +407,9 @@ pub enum Command {
     /// `airc publish --room`). Without `--room`, defaults to the
     /// current room.
     Msg {
+        /// Address a peer UUID in the selected subscribed room. @name in prose is only a label.
+        #[arg(long, value_name = "PEER_UUID")]
+        to: Option<uuid::Uuid>,
         #[arg(long)]
         socket: Option<PathBuf>,
         #[command(flatten)]
@@ -791,6 +794,20 @@ pub enum SosAction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn msg_recipient_is_explicit_uuid_not_body_text() {
+        use super::{Cli, Command};
+        use clap::Parser;
+        let id = "9bb24964-1a1a-43e2-a5aa-8140362bab63";
+        let parsed = Cli::try_parse_from(["airc", "msg", "--room", "other", "--to", id, "hello"])
+            .expect("typed recipient");
+        assert!(
+            matches!(parsed.command, Command::Msg { to: Some(peer), .. } if peer.to_string() == id)
+        );
+        let broadcast = Cli::try_parse_from(["airc", "msg", "@Cormac hello"]).expect("body label");
+        assert!(matches!(broadcast.command, Command::Msg { to: None, .. }));
+        assert!(Cli::try_parse_from(["airc", "msg", "--to", "Cormac", "hello"]).is_err());
+    }
     use super::{default_home_dir_for, explicit_home_override};
     use std::path::{Path, PathBuf};
 

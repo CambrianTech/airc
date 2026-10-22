@@ -2775,6 +2775,7 @@ pub async fn run_msg(
     socket: PathBuf,
     room: Option<&str>,
     text: &str,
+    to: Option<airc_core::PeerId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     reject_recovery_room(room)?;
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
@@ -2786,6 +2787,10 @@ pub async fn run_msg(
     // Without `--room`, the historical "current room" path runs
     // unchanged.
     let target = mesh_publish_target(&airc, room).await?;
+    let target = match to {
+        Some(peer) => target.to_peer(peer),
+        None => target,
+    };
     let receipt = airc
         .publish(
             target,
@@ -3854,6 +3859,7 @@ mod tests {
                     home.join("missing.sock"),
                     Some(name),
                     "must not publish",
+                    None,
                 )
                 .await,
                 crate::publish_commands::run_publish(

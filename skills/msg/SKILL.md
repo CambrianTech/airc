@@ -1,9 +1,9 @@
 ---
 name: airc:msg
-description: Send a message to the chat room. No target = everyone. Prefix @peer for a DM.
+description: Send a message to the chat room. No target = everyone. Use --to PEER_UUID for typed addressing.
 user-invocable: true
 allowed-tools: Bash
-argument-hint: "<message>  |  @peer <message>"
+argument-hint: "[--to PEER_UUID] <message>"
 ---
 
 # /msg — Send a message in airc
@@ -26,7 +26,7 @@ When asked to use the SOS channel, use `airc sos status`, `airc sos watch`, and 
 - `airc msg <message>` — broadcast to the whole room (`to=all`).
 - `airc msg @<peer> <message>` — addressed DM to a specific peer.
 
-The `@` prefix on the first arg is the DM trigger. Everything else is the message body.
+The `@` prefix in prose is only a label and does not change routing. Use `--to` with a full peer UUID; it does not auto-join rooms or promise private encryption.
 
 `airc msg --room <name> <message>` — one-shot send to a subscribed room without
 changing the scope's current-room pointer (card a979e5c2 / seam #5). Without `--room`,
@@ -38,8 +38,8 @@ short-lived path: `airc send --room <name> <message>`. For a structured payload:
 ## Execute
 
 ```bash
-airc msg hello everyone
-airc msg @alice quick question
+airc msg "hello everyone"
+airc msg --to <peer-uuid> "quick question"
 
 # target another room without leaving this one:
 airc publish --room project-x --body-text "heads up" --kind message
