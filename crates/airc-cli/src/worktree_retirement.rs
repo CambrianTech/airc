@@ -86,36 +86,102 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
 /// each submodule's repository in the worktree's own gitdir (`modules/`) and
 /// refuses to remove the worktree while that directory exists, even after a
 /// clean `deinit`, so every repo with a submodule (continuum's vendored engine)
-/// left each merged card's checkout behind for a human. The directory is
-/// removed only when it holds nothing that exists nowhere else: every
-/// submodule, recursively, has no stash and no commit reachable from neither
-/// its remotes nor the commit the superproject records. Its checkout has
-/// already passed the superproject's dirty probe (local changes or new commits
-/// show as a modified submodule), and `deinit` runs WITHOUT --force, so git
-/// itself refuses a checkout that changed since.
+/// left each merged card's checkout behind for a human.
+///
+/// `modules/` is deleted only when every repository in it was examined and holds
+/// nothing that exists nowhere else (Codex on #1602: never infer safety from
+/// what a scan skipped). Every repository on disk must belong to an initialized
+/// submodule at its recorded commit; one that does not (a deinitialized
+/// submodule's repository) is unexamined, so the worktree is kept. Each examined
+/// repository must have no stash, no commit reachable from neither its remotes
+/// nor the recorded commit, and no ignored files in its checkout. Every git call
+/// is checked; a failure keeps the worktree. `deinit` runs WITHOUT --force, so
+/// git itself refuses a checkout that changed since.
 fn release_submodules(path: &Path) -> Result<(), String> {
     let git_dir = git(path, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
     let modules = Path::new(&git_dir).join("modules");
     if !modules.is_dir() {
         return Ok(());
     }
-    let unique = git(
-        path,
-        &[
-            "submodule",
-            "foreach",
-            "--quiet",
-            "--recursive",
-            "git rev-list --all --not --remotes $sha1 | head -n 1; git stash list | head -n 1",
-        ],
-    )?;
-    if !unique.is_empty() {
-        return Err(format!(
-            "a submodule holds commits or a stash found nowhere else: {unique}"
-        ));
+    let mut examined = Vec::new();
+    for line in git(path, &["submodule", "status", "--recursive"])?.lines() {
+        let (state, rest) = line.split_at(line.len().min(1));
+        let mut fields = rest.split_whitespace();
+        let (Some(recorded), Some(sub)) = (fields.next(), fields.next()) else {
+            return Err(format!("unreadable submodule status line: {line}"));
+        };
+        match state {
+            " " => {}
+            "-" => continue, // not initialized here: its repository, if any, stays unexamined
+            _ => {
+                return Err(format!(
+                    "submodule {sub} is not at its recorded commit ({state})"
+                ))
+            }
+        }
+        let checkout = path.join(sub);
+        let repo = git(&checkout, &["rev-parse", "--absolute-git-dir"])?;
+        let unique = git(
+            &checkout,
+            &["rev-list", "--all", "--not", "--remotes", recorded],
+        )?;
+        if !unique.is_empty() {
+            return Err(format!("submodule {sub} holds commits found nowhere else"));
+        }
+        if !git(&checkout, &["stash", "list"])?.is_empty() {
+            return Err(format!("submodule {sub} holds a stash"));
+        }
+        if !git(
+            &checkout,
+            &["ls-files", "--others", "--ignored", "--exclude-standard"],
+        )?
+        .is_empty()
+        {
+            return Err(format!(
+                "submodule {sub} contains ignored files; retain until reviewed"
+            ));
+        }
+        examined.push(
+            Path::new(&repo)
+                .canonicalize()
+                .map_err(|e| format!("submodule {sub} repository: {e}"))?,
+        );
+    }
+    for repo in repositories_under(&modules)? {
+        if !examined.contains(&repo) {
+            return Err(format!(
+                "unexamined submodule repository retained: {}",
+                repo.display()
+            ));
+        }
     }
     git(path, &["submodule", "deinit", "--all"])?;
     std::fs::remove_dir_all(&modules).map_err(|e| format!("submodule repositories retained: {e}"))
+}
+
+/// Every git repository under `dir`: a directory holding `HEAD` and `objects/`,
+/// and the nested submodules in its own `modules/`. Canonical paths, so they
+/// compare with what `rev-parse --absolute-git-dir` reports.
+fn repositories_under(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        if next.join("HEAD").is_file() && next.join("objects").is_dir() {
+            found.push(next.canonicalize().map_err(|e| e.to_string())?);
+            let nested = next.join("modules");
+            if nested.is_dir() {
+                pending.push(nested);
+            }
+            continue;
+        }
+        for entry in std::fs::read_dir(&next).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Use Git's branch operation, not raw ref deletion: a checkout can appear
@@ -297,6 +363,8 @@ mod tests {
     fn retires_a_clean_worktree_with_an_initialized_submodule() {
         let f = Fixture::new();
         with_submodule(&f);
+        // merged, as a retired card's branch is, so the branch itself retires too
+        git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
         retire(&f.tree, &f.root).unwrap();
         assert!(!f.tree.exists());
         assert!(git(
@@ -340,6 +408,62 @@ mod tests {
             &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
         )
         .is_ok());
+    }
+
+    // what this catches (Codex on #1602): a scan of initialized submodules only,
+    // then deleting every repository under modules/. A submodule deinitialized
+    // after a commit landed only on its branch keeps its repository on disk but
+    // is skipped by any initialized-only scan; it must keep the worktree.
+    #[test]
+    fn preserves_a_deinitialized_submodule_repository_it_could_not_examine() {
+        let f = Fixture::new();
+        let child = with_submodule(&f);
+        let recorded = git(&f.tree, &["rev-parse", "HEAD:child"]).unwrap();
+        git(
+            &child,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "only here",
+            ],
+        )
+        .unwrap();
+        git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+        let repo = git(&child, &["rev-parse", "--absolute-git-dir"]).unwrap();
+        git(&f.tree, &["submodule", "deinit", "child"]).unwrap();
+        let error = retire(&f.tree, &f.root).unwrap_err();
+        assert!(error.contains("unexamined"), "{error}");
+        assert!(
+            Path::new(&repo).join("HEAD").is_file(),
+            "the repository is kept"
+        );
+        assert!(git(
+            &f.repo,
+            &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
+        )
+        .is_ok());
+    }
+
+    // what this catches (Codex on #1602): the superproject's ignored-files check
+    // does not recurse, so an ignored artifact inside a submodule checkout would
+    // be deleted with the worktree.
+    #[test]
+    fn preserves_an_ignored_artifact_inside_a_submodule() {
+        let f = Fixture::new();
+        let child = with_submodule(&f);
+        let exclude = git(&child, &["rev-parse", "--git-path", "info/exclude"]).unwrap();
+        let exclude = child.join(exclude);
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "artifact\n").unwrap();
+        std::fs::write(child.join("artifact"), "valuable").unwrap();
+        let error = retire(&f.tree, &f.root).unwrap_err();
+        assert!(error.contains("ignored files"), "{error}");
+        assert!(child.join("artifact").is_file());
     }
 
     #[test]
