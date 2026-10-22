@@ -93,7 +93,7 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
 /// what a scan skipped). Every repository on disk must belong to an initialized
 /// submodule at its recorded commit; one that does not (a deinitialized
 /// submodule's repository) is unexamined, so the worktree is kept. Each examined
-/// repository must have no stash, no commit (refs or reflog) reachable from neither its remotes
+/// repository must have no stash, no commit (local branches, HEAD or reflog) reachable from neither its remotes
 /// nor the recorded commit, and no ignored files in its checkout. Every git call
 /// is checked; a failure keeps the worktree. `deinit` runs WITHOUT --force, so
 /// git itself refuses a checkout that changed since.
@@ -131,10 +131,16 @@ fn release_submodules(path: &Path) -> Result<(), String> {
         let repo = git(&checkout, &["rev-parse", "--absolute-git-dir"])?;
         let unique = git(
             &checkout,
+            // Local branches, HEAD and every reflog (the stash's included): where work
+            // that exists only here lives. Not `--all`: that takes in refs/tags, and a
+            // submodule fetches its upstream's tags (llama.cpp: 6,282), whose commits no
+            // remote branch reaches, so every continuum worktree read as holding unique
+            // work (card fb048121). A tag made here and never pushed is not counted.
             &[
                 "rev-list",
-                "--all",
+                "--branches",
                 "--reflog",
+                "HEAD",
                 "--not",
                 "--remotes",
                 recorded,
@@ -462,6 +468,44 @@ mod tests {
             &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
         )
         .is_ok());
+    }
+
+    // what this catches (card fb048121): a submodule's fetched upstream tags read as work
+    // found nowhere else. llama.cpp's 6,282 tags reach commits no remote branch does, so
+    // every continuum worktree was refused. A tag fetched from the submodule's origin is the
+    // origin's, not this checkout's: a clean worktree holding one retires.
+    #[test]
+    fn retires_a_submodule_holding_only_a_fetched_upstream_tag() {
+        let f = Fixture::new();
+        let child = with_submodule(&f);
+        let source = f.root.parent().unwrap().join("submodule-source");
+        let head = git(&source, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        git(&source, &["checkout", "--quiet", "-b", "side"]).unwrap();
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "tagged only",
+            ],
+        )
+        .unwrap();
+        git(&source, &["tag", "upstream-tag"]).unwrap();
+        git(&source, &["checkout", "--quiet", &head]).unwrap();
+        git(&source, &["branch", "--quiet", "-D", "side"]).unwrap();
+        git(
+            &child,
+            &["fetch", "--quiet", "origin", "tag", "upstream-tag"],
+        )
+        .unwrap();
+        git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
+        retire(&f.tree, &f.root).unwrap();
+        assert!(!f.tree.exists());
     }
 
     // what this catches (Codex on #1602): a commit made on a detached HEAD and left behind
