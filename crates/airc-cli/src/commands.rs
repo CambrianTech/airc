@@ -2815,6 +2815,9 @@ pub async fn run_msg(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
+    if let Some(peer) = to {
+        println!("addressed to peer {peer}; recipient presence and agent-visible delivery are unconfirmed until the peer replies");
+    }
     if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
         println!("{warning}");
     }

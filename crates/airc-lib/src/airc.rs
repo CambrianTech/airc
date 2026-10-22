@@ -1291,6 +1291,7 @@ impl Airc {
                 // A wall post is history: durable, unchanged by the
                 // presence-plane work.
                 airc_bus::DeliveryClass::Durable,
+                airc_core::MentionTarget::All,
             )
             .await?;
         } else {
