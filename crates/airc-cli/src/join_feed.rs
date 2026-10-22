@@ -95,7 +95,8 @@ async fn reattach(
     // And said again at least every 30 s even when it hasn't changed, with the attempt count
     // and both clocks (card 5a74fe71): on 2026-10-22 a stall with one unchanged reason was
     // silent for four minutes and its Instant reported 4.1 s, so neither showed whether the
-    // loop was iterating (attempts climbing) or blocked inside one await (attempts frozen).
+    // loop was iterating (attempts climbing) or blocked inside one await (attempts frozen;
+    // the 'still inside subscribe' line below).
     let mut attempts: u64 = 0;
     let mut last_said = std::time::Instant::now();
     loop {
@@ -103,7 +104,26 @@ async fn reattach(
         if airc_lib::daemon_lifecycle::operator_stop_recorded(home)? {
             return Err("the daemon was stopped by the operator; run `airc join` to resume".into());
         }
-        match airc.subscribe_agent_feed().await {
+        // The attempt itself is raced against a 30 s tick, so a hang INSIDE the subscribe call
+        // (the 10-22 shape: two live connections to the successor, no answer) says so, and
+        // Ctrl-C still detaches (Fable on #1611).
+        let attempt = airc.subscribe_agent_feed();
+        tokio::pin!(attempt);
+        let mut inside = tokio::time::interval(std::time::Duration::from_secs(30));
+        inside.tick().await; // the first tick is immediate; the next is 30 s into the attempt
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut attempt => break outcome,
+                _ = inside.tick() => eprintln!(
+                    "airc join [{}]: still inside subscribe at {} ms (wall {} ms, attempt {attempts})",
+                    utc_now(),
+                    started.elapsed().as_millis(),
+                    wall_elapsed_ms(wall_started)
+                ),
+                _ = tokio::signal::ctrl_c() => return Err("detached while waiting for the daemon".into()),
+            }
+        };
+        match outcome {
             Ok(stream) => {
                 eprintln!(
                     "airc join [{}]: reattached after {} ms (wall {} ms, attempt {attempts}); delivery resumes from this feed's checkpoint",
