@@ -131,13 +131,14 @@ fn release_submodules(path: &Path) -> Result<(), String> {
         let repo = git(&checkout, &["rev-parse", "--absolute-git-dir"])?;
         let unique = git(
             &checkout,
-            // Local branches, HEAD and every reflog (the stash's included). Tags are
-            // judged separately (`unverified_tags`): a submodule fetches its upstream's
-            // tags (llama.cpp: 6,282) whose commits no remote branch reaches, and those
-            // are the origin's, not this checkout's (card fb048121).
+            // Every ref but tags (branches, the stash, custom refs such as refs/keep/*),
+            // HEAD and every reflog. Tags are judged against the origin instead
+            // (`unverified_tags`): a submodule fetches its upstream's tags (llama.cpp:
+            // 6,282) whose commits no remote branch reaches (card fb048121).
             &[
                 "rev-list",
-                "--branches",
+                "--exclude=refs/tags/*",
+                "--all",
                 "--reflog",
                 "HEAD",
                 "--not",
