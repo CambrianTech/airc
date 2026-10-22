@@ -67,7 +67,7 @@ impl PublishTarget {
     fn recipient(&self) -> MentionTarget {
         match self {
             Self::PeerInRoom { peer, .. } => MentionTarget::Peer(*peer),
-            _ => MentionTarget::All,
+            Self::CurrentRoom | Self::RoomByName(_) => MentionTarget::All,
         }
     }
 }
