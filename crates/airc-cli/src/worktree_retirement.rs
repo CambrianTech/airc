@@ -91,8 +91,9 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
 /// `modules/` is deleted only when every repository in it was examined and holds
 /// nothing that exists nowhere else (Codex on #1602: never infer safety from
 /// what a scan skipped). Every repository on disk must belong to an initialized
-/// submodule at its recorded commit; one that does not (a deinitialized
-/// submodule's repository) is unexamined, so the worktree is kept. Each examined
+/// submodule at its recorded commit, including present checkouts whose shared
+/// registration was cleared by a sibling. A genuinely deinitialized or unmapped
+/// repository remains unexamined, so the worktree is kept. Each examined
 /// repository must have no stash, no commit (local branches, HEAD or reflog) reachable from neither its remotes
 /// nor the recorded commit, and no ignored files in its checkout. Every git call
 /// is checked; a failure keeps the worktree. `deinit` runs WITHOUT --force, so
@@ -104,7 +105,21 @@ fn release_submodules(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     let mut examined = Vec::new();
-    for line in git(path, &["submodule", "status", "--recursive"])?.lines() {
+    // Registration lives in shared superproject config: deinit in one worktree
+    // clears it for siblings too. Command-local activity discovers their actual
+    // checkouts without initializing anything or rewriting that shared config.
+    for line in git(
+        path,
+        &[
+            "-c",
+            "submodule.active=.",
+            "submodule",
+            "status",
+            "--recursive",
+        ],
+    )?
+    .lines()
+    {
         // `submodule status` leads each line with its state (' ' at the recorded
         // commit, '-' not initialized, '+' elsewhere, 'U' conflicted). `git()` trims
         // the output, which strips the first line's leading ' ', so a line that
@@ -129,46 +144,7 @@ fn release_submodules(path: &Path) -> Result<(), String> {
         }
         let checkout = path.join(sub);
         let repo = git(&checkout, &["rev-parse", "--absolute-git-dir"])?;
-        let unique = git(
-            &checkout,
-            // Every ref but tags (branches, the stash, custom refs such as refs/keep/*),
-            // HEAD and every reflog. Tags are judged against the origin instead
-            // (`unverified_tags`): a submodule fetches its upstream's tags (llama.cpp:
-            // 6,282) whose commits no remote branch reaches (card fb048121).
-            &[
-                "rev-list",
-                "--exclude=refs/tags/*",
-                "--all",
-                "--reflog",
-                "HEAD",
-                "--not",
-                "--remotes",
-                recorded,
-            ],
-        )?;
-        if !unique.is_empty() {
-            return Err(format!("submodule {sub} holds commits found nowhere else"));
-        }
-        let unverified = unverified_tags(&checkout, recorded)?;
-        if !unverified.is_empty() {
-            return Err(format!(
-                "submodule {sub} has tags its origin does not hold, reaching commits found nowhere else: {}",
-                unverified.join(", ")
-            ));
-        }
-        if !git(&checkout, &["stash", "list"])?.is_empty() {
-            return Err(format!("submodule {sub} holds a stash"));
-        }
-        if !git(
-            &checkout,
-            &["ls-files", "--others", "--ignored", "--exclude-standard"],
-        )?
-        .is_empty()
-        {
-            return Err(format!(
-                "submodule {sub} contains ignored files; retain until reviewed"
-            ));
-        }
+        verify_submodule_contents(&checkout, recorded, &checkout)?;
         examined.push(
             Path::new(&repo)
                 .canonicalize()
@@ -183,8 +159,94 @@ fn release_submodules(path: &Path) -> Result<(), String> {
             ));
         }
     }
-    git(path, &["submodule", "deinit", "--all"])?;
+    git(
+        path,
+        &["-c", "submodule.active=.", "submodule", "deinit", "--all"],
+    )?;
     std::fs::remove_dir_all(&modules).map_err(|e| format!("submodule repositories retained: {e}"))
+}
+
+/// Validate submodule content and prevent retiring storage used by another checkout.
+fn verify_submodule_contents(
+    checkout: &Path,
+    recorded: &str,
+    expected_checkout: &Path,
+) -> Result<(), String> {
+    let sub = checkout.display();
+    let registrations = git(checkout, &["worktree", "list", "--porcelain", "-z"])?;
+    let paths: Vec<_> = registrations
+        .split('\0')
+        .filter_map(|field| field.strip_prefix("worktree "))
+        .collect();
+    let repository = git(checkout, &["rev-parse", "--absolute-git-dir"])?;
+    if paths.len() != 1 {
+        return Err(format!("submodule {sub} has other worktree registrations"));
+    }
+    // Submodules report their gitdir as the main registration on some Git
+    // versions; neither spelling permits additional linked worktrees.
+    let registered = Path::new(paths[0])
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if registered
+        != expected_checkout
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+        && registered
+            != Path::new(&repository)
+                .canonicalize()
+                .map_err(|e| e.to_string())?
+    {
+        return Err(format!("submodule {sub} has other worktree registrations"));
+    }
+    if !git(
+        checkout,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )?
+    .is_empty()
+    {
+        return Err(format!("submodule {sub} has uncommitted work"));
+    }
+    let unique = git(
+        checkout,
+        // Every ref but tags (branches, the stash, custom refs such as refs/keep/*),
+        // HEAD and every reflog. Tags are judged against the origin instead
+        // (`unverified_tags`): a submodule fetches its upstream's tags (llama.cpp:
+        // 6,282) whose commits no remote branch reaches (card fb048121).
+        &[
+            "rev-list",
+            "--exclude=refs/tags/*",
+            "--all",
+            "--reflog",
+            "HEAD",
+            "--not",
+            "--remotes",
+            recorded,
+        ],
+    )?;
+    if !unique.is_empty() {
+        return Err(format!("submodule {sub} holds commits found nowhere else"));
+    }
+    let unverified = unverified_tags(checkout, recorded)?;
+    if !unverified.is_empty() {
+        return Err(format!(
+            "submodule {sub} has tags its origin does not hold, reaching commits found nowhere else: {}",
+            unverified.join(", ")
+        ));
+    }
+    if !git(checkout, &["stash", "list"])?.is_empty() {
+        return Err(format!("submodule {sub} holds a stash"));
+    }
+    if !git(
+        checkout,
+        &["ls-files", "--others", "--ignored", "--exclude-standard"],
+    )?
+    .is_empty()
+    {
+        return Err(format!(
+            "submodule {sub} contains ignored files; retain until reviewed"
+        ));
+    }
+    Ok(())
 }
 
 /// The tags in `checkout` that reach commits nothing else here reaches (no local branch,
@@ -468,6 +530,79 @@ mod tests {
         .is_err());
     }
 
+    // Deinitializing one sibling clears shared submodule registration, while
+    // other worktrees still contain initialized checkouts and their repositories.
+    #[test]
+    fn examines_present_submodules_after_shared_registration_is_cleared() {
+        for case in ["clean", "linked", "index"] {
+            let f = Fixture::new();
+            let child = with_submodule(&f);
+            let repo = git(&child, &["rev-parse", "--absolute-git-dir"]).unwrap();
+            let recorded = git(&child, &["rev-parse", "HEAD"]).unwrap();
+            git(&f.tree, &["config", "--remove-section", "submodule.child"]).unwrap();
+            assert!(git(&f.tree, &["submodule", "status"])
+                .unwrap()
+                .starts_with('-'));
+            match case {
+                "linked" => {
+                    let other = f.root.parent().unwrap().join("external-child");
+                    git(
+                        &child,
+                        &[
+                            "worktree",
+                            "add",
+                            "--detach",
+                            other.to_str().unwrap(),
+                            &recorded,
+                        ],
+                    )
+                    .unwrap();
+                }
+                "index" => {
+                    let blob = git(
+                        &child,
+                        &[
+                            "hash-object",
+                            "-w",
+                            f.repo.join(".git/config").to_str().unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                    git(
+                        &child,
+                        &[
+                            "update-index",
+                            "--add",
+                            "--cacheinfo",
+                            "100644",
+                            &blob,
+                            "staged-only",
+                        ],
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
+            let result = retire(&f.tree, &f.root);
+            if case == "clean" {
+                result.unwrap();
+                assert!(!f.tree.exists());
+            } else {
+                assert!(result.is_err(), "{case}");
+                assert!(Path::new(&repo).join("HEAD").exists());
+                assert!(child.join(".git").exists());
+                if case == "linked" {
+                    assert!(f
+                        .root
+                        .parent()
+                        .unwrap()
+                        .join("external-child/.git")
+                        .exists());
+                }
+            }
+        }
+    }
     // what this catches: releasing a submodule repository that holds the only
     // copy of a commit. The commit sits on the submodule's branch while its
     // checkout is back at the recorded commit, so the superproject reads clean
