@@ -779,6 +779,8 @@ async fn wait_for_daemon_exit(client: &DaemonClient, max_wait: Duration) {
 /// Callers own scope, lifecycle guards and log streams; this boundary owns the
 /// credential handoff and platform detachment before creating the process.
 pub(crate) fn spawn_daemon(mut command: Command) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    crate::update_session::detach_runtime(&mut command);
     inject_gh_token(&mut command);
     detach_daemon(&mut command);
     command.spawn()

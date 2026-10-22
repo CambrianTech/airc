@@ -4,6 +4,15 @@ use std::path::Path;
 type Error = Box<dyn std::error::Error>;
 const RESTORED: u8 = 200;
 
+/// Installer authority belongs to the temporary update process tree. A daemon
+/// survives that owner and must establish a fresh session for its next update;
+/// inheriting these markers would instead borrow an already-exited owner.
+pub(crate) fn detach_runtime(command: &mut std::process::Command) {
+    command
+        .env_remove("CAMBRIAN_INSTALL_ELEVATION")
+        .env_remove("AIRC_UPDATE_SESSION_OWNER");
+}
+
 #[derive(Debug)]
 struct SessionExit(u8);
 impl std::fmt::Display for SessionExit {

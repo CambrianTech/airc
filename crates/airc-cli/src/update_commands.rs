@@ -880,6 +880,11 @@ mod tests {
             "update_commands::tests::restarted_daemon_does_not_hold_updater_output_open";
 
         if env::var(MODE).as_deref() == Ok("daemon") {
+            #[cfg(windows)]
+            {
+                assert!(env::var_os("CAMBRIAN_INSTALL_ELEVATION").is_none());
+                assert!(env::var_os("AIRC_UPDATE_SESSION_OWNER").is_none());
+            }
             assert_eq!(env::var("GH_TOKEN").as_deref(), Ok("fixture-daemon-token"));
             println!("fixture daemon stdout");
             eprintln!("fixture daemon stderr");
@@ -911,6 +916,16 @@ mod tests {
                 .args(["--exact", TEST, "--nocapture"])
                 .env(MODE, "daemon");
             spawn_restarted_daemon(command, Path::new(&env::var(FIXTURE_HOME).unwrap())).unwrap();
+            // Detachment changes only the runtime child's environment. The
+            // installer retains its authority through publication/recovery.
+            assert_eq!(
+                env::var("CAMBRIAN_INSTALL_ELEVATION").as_deref(),
+                Ok("fixture-session")
+            );
+            assert_eq!(
+                env::var("AIRC_UPDATE_SESSION_OWNER").as_deref(),
+                Ok("fixture-owner")
+            );
             println!("fixture updater stdout");
             eprintln!("fixture updater stderr");
             return;
@@ -923,6 +938,8 @@ mod tests {
         launcher
             .args(["--exact", TEST, "--nocapture"])
             .env(MODE, "launcher")
+            .env("CAMBRIAN_INSTALL_ELEVATION", "fixture-session")
+            .env("AIRC_UPDATE_SESSION_OWNER", "fixture-owner")
             .env(FIXTURE_HOME, home.path())
             .env(ADDRESS, listener.local_addr().unwrap().to_string())
             .stdin(Stdio::null())
