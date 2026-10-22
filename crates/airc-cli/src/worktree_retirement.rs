@@ -105,14 +105,22 @@ fn release_submodules(path: &Path) -> Result<(), String> {
     }
     let mut examined = Vec::new();
     for line in git(path, &["submodule", "status", "--recursive"])?.lines() {
-        let (state, rest) = line.split_at(line.len().min(1));
+        // `submodule status` leads each line with its state (' ' at the recorded
+        // commit, '-' not initialized, '+' elsewhere, 'U' conflicted). `git()` trims
+        // the output, which strips the first line's leading ' ', so a line that
+        // starts with the commit itself is a ' ' line.
+        let (state, rest) = match line.chars().next() {
+            Some(mark @ (' ' | '-' | '+' | 'U')) => (mark, &line[1..]),
+            Some(c) if c.is_ascii_hexdigit() => (' ', line),
+            _ => return Err(format!("unreadable submodule status line: {line}")),
+        };
         let mut fields = rest.split_whitespace();
         let (Some(recorded), Some(sub)) = (fields.next(), fields.next()) else {
             return Err(format!("unreadable submodule status line: {line}"));
         };
         match state {
-            " " => {}
-            "-" => continue, // not initialized here: its repository, if any, stays unexamined
+            ' ' => {}
+            '-' => continue, // not initialized here: its repository, if any, stays unexamined
             _ => {
                 return Err(format!(
                     "submodule {sub} is not at its recorded commit ({state})"
