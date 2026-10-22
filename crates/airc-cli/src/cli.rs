@@ -664,16 +664,20 @@ pub enum Command {
         native: bool,
     },
 
-    /// Fast-forward the installed source checkout and refresh the
-    /// installed `airc` binary + skills from that source.
+    /// Install a verified published build from the configured release channel
+    /// and reconcile the daemon through its guarded maintenance handoff.
     #[command(visible_aliases = ["upgrade", "pull"])]
     Update {
         /// Self-update with a smoke-test and rollback: back up the live
-        /// binary, rebuild, verify the new binary runs + reports the
-        /// pulled SHA, and roll back to the backup if it doesn't. Safe to
+        /// binary, verify the published binary runs + reports the
+        /// selected SHA, and roll back to the backup if it doesn't. Safe to
         /// run unattended (e.g. when a peer detects it's stale).
         #[arg(long)]
         auto: bool,
+        /// Install this exact full commit SHA from the configured channel.
+        /// Its published platform artifact must pass the normal verification.
+        #[arg(long, conflicts_with = "adopt_installed")]
+        revision: Option<String>,
         /// Start and verify an already-installed binary, or replace a stale
         /// daemon through the maintenance handoff, without rebuilding.
         #[arg(long, conflicts_with = "auto")]
