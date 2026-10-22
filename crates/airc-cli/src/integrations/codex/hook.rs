@@ -192,7 +192,7 @@ fn delivery_ends(
         }
         let mut shown = 0;
         for (i, e) in events.iter().enumerate() {
-            if visible(e) && (raw || (!is_work_queue_event(e) && !is_runtime_alive_event(e))) {
+            if visible(e) && (raw || (!is_work_queue_event(e) && !is_routine_liveness_event(e))) {
                 if shown == budget {
                     return i;
                 }
@@ -525,7 +525,7 @@ fn digest_messages<'a>(
 ) -> Vec<DigestMessage> {
     let mut messages = Vec::new();
     for event in events {
-        if is_work_queue_event(event) || is_runtime_alive_event(event) {
+        if is_work_queue_event(event) || is_routine_liveness_event(event) {
             continue;
         }
         let peer = event.peer_id.to_string();
@@ -544,7 +544,17 @@ fn digest_messages<'a>(
     messages
 }
 
-fn is_runtime_alive_event(event: &TranscriptEvent) -> bool {
+fn is_routine_liveness_event(event: &TranscriptEvent) -> bool {
+    // Lease renewals are liveness, not agent correspondence. Keep the event in
+    // the durable transcript/raw output, but do not spend the digest budget on it.
+    if event
+        .headers
+        .get(airc_lib::HEADER_FORGE_WORK_EVENT_KIND)
+        .map(String::as_str)
+        == Some("claim_heartbeat")
+    {
+        return true;
+    }
     let Some(body) = &event.body else {
         return false;
     };
@@ -592,6 +602,24 @@ mod tests {
     use super::{consumer_id, delivery_context, delivery_ends, render_digest, render_raw};
     use airc_lib::Airc;
 
+    #[test]
+    fn lease_renewals_do_not_bury_peer_messages_and_remain_in_raw_output() {
+        let mut renewal = event(Body::Json(json!({"kind":"claim_heartbeat"})));
+        renewal.headers.insert(
+            airc_lib::HEADER_FORGE_WORK_EVENT_KIND.into(),
+            "claim_heartbeat".into(),
+        );
+        let events = vec![renewal, event(Body::text("review the current head"))];
+        let digest = render_digest(&events, 1);
+        assert!(digest.contains("review the current head"));
+        assert!(!digest.contains("claim_heartbeat"));
+        assert!(render_raw(&events).contains("claim_heartbeat"));
+        // Ordinary messages discussing a renewal are still correspondence.
+        assert!(
+            render_digest(&[event(Body::text("claim_heartbeat failed"))], 1)
+                .contains("claim_heartbeat failed")
+        );
+    }
     #[test]
     fn consumer_id_uses_runtime_client_when_present() {
         assert_eq!(
@@ -691,6 +719,40 @@ mod tests {
             e.kind = TranscriptKind::Presence;
         }
         airc.append_event(e).await.unwrap();
+    }
+    #[tokio::test]
+    async fn lease_renewal_does_not_spend_delivery_budget_or_reset_the_cursor() {
+        let (_dir, airc, room) = fixture().await;
+        drop(
+            airc.prepare_agent_delivery("lease-test", 50, 1)
+                .await
+                .unwrap(),
+        );
+        let mut renewal = event(Body::Json(json!({"kind":"claim_heartbeat"})));
+        renewal.room_id = room;
+        renewal.lamport = 1;
+        renewal.headers.insert(
+            airc_lib::HEADER_FORGE_WORK_EVENT_KIND.into(),
+            "claim_heartbeat".into(),
+        );
+        airc.append_event(renewal).await.unwrap();
+        append(&airc, room, 2, Body::text("urgent review"), false, false).await;
+        let turn = airc
+            .prepare_agent_delivery("lease-test", 50, 1)
+            .await
+            .unwrap();
+        let ends = delivery_ends(&turn, false, |_| true);
+        assert_eq!(ends.0, 2);
+        assert_eq!(delivery_ends(&turn, true, |_| true).0, 1);
+        let context = delivery_context(&turn, ends.0, ends.1, false, None, |_| true).unwrap();
+        assert!(context.contains("urgent review"));
+        assert!(!context.contains("claim_heartbeat"));
+        turn.acknowledge(ends.0, ends.1).await.unwrap();
+        let next = airc
+            .prepare_agent_delivery("lease-test", 50, 1)
+            .await
+            .unwrap();
+        assert!(next.is_empty());
     }
     #[tokio::test]
     async fn production_dual_turn_preserves_prefixes_self_filter_and_output_failure() {
