@@ -436,6 +436,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Stop { socket } => commands::run_stop(&home, default_or(socket, &home)).await,
 
         Command::Msg {
+            to,
             socket,
             room,
             text,
@@ -493,7 +494,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .into())
                 }
             };
-            commands::run_msg(&home, default_or(socket, &home), room.named(), &body).await
+            commands::run_msg(
+                &home,
+                default_or(socket, &home),
+                room.named(),
+                &body,
+                to.map(airc_core::PeerId::from_uuid),
+            )
+            .await
         }
         Command::Publish {
             room,

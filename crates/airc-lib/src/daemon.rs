@@ -22,7 +22,7 @@ use airc_core::{
 use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
     AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind,
-    IpcTarget, PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
+    PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -239,6 +239,7 @@ impl Airc {
         body: Body,
         mut headers: airc_core::Headers,
         delivery: airc_bus::DeliveryClass,
+        target: MentionTarget,
     ) -> Result<PublishReceipt, AircError> {
         room.stamp_name_header(&mut headers);
         let response = self
@@ -255,7 +256,7 @@ impl Airc {
                 // digest forever. Presence is state, not an event (#1341).
                 // `publish` still passes Durable, so chat is unchanged.
                 delivery: ipc_delivery(delivery),
-                target: IpcTarget::All,
+                target: target.into(),
                 correlation_id: None,
                 coalesce_key: coalesce_key_of(&headers),
                 // The consumer's `Body` is encoded to opaque payload

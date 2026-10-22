@@ -158,9 +158,16 @@ mod tests {
         airc.append_event(event(&airc, other, 1, "claude:peer", "ambient-body"))
             .await
             .unwrap();
-        let mut directed = event(&airc, other, 2, "claude:peer", "direct-challenge");
-        directed.target = MentionTarget::Peer(airc.peer_id());
-        airc.append_event(directed).await.unwrap();
+        // Exercise the public publish path, not a hand-crafted transcript target.
+        // A different runtime represents a peer session on this shared account.
+        airc.publish(
+            airc_lib::PublishTarget::RoomByName(other.to_string()).to_peer(airc.peer_id()),
+            airc_protocol::FrameKind::Message,
+            Body::text("direct-challenge"),
+            Headers::from([(HEADER_AIRC_CLIENT.to_string(), "claude:peer".to_string())]),
+        )
+        .await
+        .unwrap();
         airc.append_event(event(&airc, room, 3, "claude:peer", "room-message"))
             .await
             .unwrap();
