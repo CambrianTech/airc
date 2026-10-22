@@ -63,8 +63,10 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
     let head = git(&path, &["rev-parse", "HEAD"])?;
     let recovery = format!("refs/airc/retired/{branch}/{head}");
     git(&path, &["update-ref", &recovery, &head])?;
-    // No --force, recursive deletion, or submodule fallback. Git protects locked
-    // checkouts, dirty races, and initialized submodules. Failure retains branch.
+    release_submodules(&path)?;
+    // No --force or recursive deletion. Git protects locked checkouts and dirty
+    // races; submodules were released above only if they held nothing unique.
+    // Failure retains branch.
     git(
         repo,
         &[
@@ -78,6 +80,42 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<(), String> {
     })?;
     println!("retired: {branch}; recovery: {recovery}");
     Ok(())
+}
+
+/// Let `worktree remove` retire a worktree that initialized submodules. Git keeps
+/// each submodule's repository in the worktree's own gitdir (`modules/`) and
+/// refuses to remove the worktree while that directory exists, even after a
+/// clean `deinit`, so every repo with a submodule (continuum's vendored engine)
+/// left each merged card's checkout behind for a human. The directory is
+/// removed only when it holds nothing that exists nowhere else: every
+/// submodule, recursively, has no stash and no commit reachable from neither
+/// its remotes nor the commit the superproject records. Its checkout has
+/// already passed the superproject's dirty probe (local changes or new commits
+/// show as a modified submodule), and `deinit` runs WITHOUT --force, so git
+/// itself refuses a checkout that changed since.
+fn release_submodules(path: &Path) -> Result<(), String> {
+    let git_dir = git(path, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+    let modules = Path::new(&git_dir).join("modules");
+    if !modules.is_dir() {
+        return Ok(());
+    }
+    let unique = git(
+        path,
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            "git rev-list --all --not --remotes $sha1 | head -n 1; git stash list | head -n 1",
+        ],
+    )?;
+    if !unique.is_empty() {
+        return Err(format!(
+            "a submodule holds commits or a stash found nowhere else: {unique}"
+        ));
+    }
+    git(path, &["submodule", "deinit", "--all"])?;
+    std::fs::remove_dir_all(&modules).map_err(|e| format!("submodule repositories retained: {e}"))
 }
 
 /// Use Git's branch operation, not raw ref deletion: a checkout can appear
@@ -211,9 +249,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preserves_initialized_submodule_checkout() {
-        let f = Fixture::new();
+    /// A worktree with an initialized submodule pinned at the recorded commit, the
+    /// shape of every continuum card checkout (core/vendor/llama.cpp).
+    fn with_submodule(f: &Fixture) -> std::path::PathBuf {
         let source = f.root.parent().unwrap().join("submodule-source");
         std::fs::create_dir_all(&source).unwrap();
         git(&source, &["init"]).unwrap();
@@ -249,8 +287,54 @@ mod tests {
             &["update-ref", "refs/remotes/origin/canary", "HEAD"],
         )
         .unwrap();
-        assert!(retire(&f.tree, &f.root).is_err());
-        assert!(f.tree.join("child/.git").exists());
+        f.tree.join("child")
+    }
+
+    // what this catches: `git worktree remove` refusing every worktree that
+    // initialized a submodule, which left each merged card's checkout behind
+    // (continuum, 2026-10-22: 20b4f33b and c180de5d removed by hand).
+    #[test]
+    fn retires_a_clean_worktree_with_an_initialized_submodule() {
+        let f = Fixture::new();
+        with_submodule(&f);
+        retire(&f.tree, &f.root).unwrap();
+        assert!(!f.tree.exists());
+        assert!(git(
+            &f.repo,
+            &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
+        )
+        .is_err());
+    }
+
+    // what this catches: releasing a submodule repository that holds the only
+    // copy of a commit. The commit sits on the submodule's branch while its
+    // checkout is back at the recorded commit, so the superproject reads clean
+    // and only the release check can see it; the worktree, its submodule and
+    // the branch are all kept.
+    #[test]
+    fn preserves_a_submodule_holding_a_commit_found_nowhere_else() {
+        let f = Fixture::new();
+        let child = with_submodule(&f);
+        let recorded = git(&f.tree, &["rev-parse", "HEAD:child"]).unwrap();
+        git(
+            &child,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "only here",
+            ],
+        )
+        .unwrap();
+        git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+        assert!(git(&f.tree, &["status", "--porcelain"]).unwrap().is_empty());
+        let error = retire(&f.tree, &f.root).unwrap_err();
+        assert!(error.contains("found nowhere else"), "{error}");
+        assert!(child.join(".git").exists());
         assert!(git(
             &f.repo,
             &["rev-parse", "--verify", "refs/heads/aabbccdd/fix"]
