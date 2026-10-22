@@ -131,11 +131,10 @@ fn release_submodules(path: &Path) -> Result<(), String> {
         let repo = git(&checkout, &["rev-parse", "--absolute-git-dir"])?;
         let unique = git(
             &checkout,
-            // Local branches, HEAD and every reflog (the stash's included): where work
-            // that exists only here lives. Not `--all`: that takes in refs/tags, and a
-            // submodule fetches its upstream's tags (llama.cpp: 6,282), whose commits no
-            // remote branch reaches, so every continuum worktree read as holding unique
-            // work (card fb048121). A tag made here and never pushed is not counted.
+            // Local branches, HEAD and every reflog (the stash's included). Tags are
+            // judged separately (`unverified_tags`): a submodule fetches its upstream's
+            // tags (llama.cpp: 6,282) whose commits no remote branch reaches, and those
+            // are the origin's, not this checkout's (card fb048121).
             &[
                 "rev-list",
                 "--branches",
@@ -148,6 +147,13 @@ fn release_submodules(path: &Path) -> Result<(), String> {
         )?;
         if !unique.is_empty() {
             return Err(format!("submodule {sub} holds commits found nowhere else"));
+        }
+        let unverified = unverified_tags(&checkout, recorded)?;
+        if !unverified.is_empty() {
+            return Err(format!(
+                "submodule {sub} has tags its origin does not hold, reaching commits found nowhere else: {}",
+                unverified.join(", ")
+            ));
         }
         if !git(&checkout, &["stash", "list"])?.is_empty() {
             return Err(format!("submodule {sub} holds a stash"));
@@ -178,6 +184,71 @@ fn release_submodules(path: &Path) -> Result<(), String> {
     }
     git(path, &["submodule", "deinit", "--all"])?;
     std::fs::remove_dir_all(&modules).map_err(|e| format!("submodule repositories retained: {e}"))
+}
+
+/// The tags in `checkout` that reach commits nothing else here reaches (no local branch,
+/// HEAD, reflog, remote branch or the recorded commit) and that are not the origin's own:
+/// the origin has no tag of that name, or it names another object. Empty when no commit is
+/// reachable only through tags, the common case, which asks the origin nothing. Otherwise
+/// the origin's tags are read (`ls-remote`), and failing to read them is an error, so the
+/// worktree is kept (Codex on #1606: a fetched upstream tag is the origin's; a tag made here,
+/// or one that diverged, is work).
+fn unverified_tags(checkout: &Path, recorded: &str) -> Result<Vec<String>, String> {
+    let elsewhere = [
+        "--not",
+        "--branches",
+        "--reflog",
+        "HEAD",
+        "--remotes",
+        recorded,
+    ];
+    let only_tagged = git(
+        checkout,
+        &[&["rev-list", "--tags"][..], &elsewhere[..]].concat(),
+    )?;
+    if only_tagged.is_empty() {
+        return Ok(Vec::new());
+    }
+    let origin = git(checkout, &["ls-remote", "--tags", "origin"])?;
+    let origin: std::collections::HashMap<&str, &str> = origin
+        .lines()
+        .filter_map(|line| {
+            let (object, name) = line.split_once('\t')?;
+            let name = name.strip_prefix("refs/tags/")?;
+            (!name.ends_with("^{}")).then_some((name, object))
+        })
+        .collect();
+    let local = git(
+        checkout,
+        &[
+            "for-each-ref",
+            "refs/tags",
+            "--format=%(refname:strip=2) %(objectname)",
+        ],
+    )?;
+    let mut unverified = Vec::new();
+    for line in local.lines() {
+        let (name, object) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("unreadable tag line: {line}"))?;
+        if origin.get(name) != Some(&object) {
+            unverified.push(name.to_owned());
+        }
+    }
+    if unverified.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refs: Vec<String> = unverified
+        .iter()
+        .map(|name| format!("refs/tags/{name}"))
+        .collect();
+    let mut args: Vec<&str> = vec!["rev-list"];
+    args.extend(refs.iter().map(String::as_str));
+    args.extend(elsewhere);
+    if git(checkout, &args)?.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(unverified)
 }
 
 /// Every git repository under `dir`: a directory holding `HEAD` and `objects/`,
@@ -506,6 +577,55 @@ mod tests {
         git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
         retire(&f.tree, &f.root).unwrap();
         assert!(!f.tree.exists());
+    }
+
+    // what this catches (Codex on #1606): ignoring every tag would delete history a tag
+    // alone keeps. A tag made in the submodule on a commit made there, once its reflog has
+    // expired, and a tag that took the upstream's name but points elsewhere, are both work:
+    // the origin does not hold that tag at that object, so the worktree is kept.
+    #[test]
+    fn preserves_a_submodule_tag_its_origin_does_not_hold() {
+        for case in ["local-only", "divergent"] {
+            let f = Fixture::new();
+            let child = with_submodule(&f);
+            let recorded = git(&f.tree, &["rev-parse", "HEAD:child"]).unwrap();
+            let source = f.root.parent().unwrap().join("submodule-source");
+            git(&source, &["tag", "upstream-tag"]).unwrap();
+            git(
+                &child,
+                &["fetch", "--quiet", "origin", "tag", "upstream-tag"],
+            )
+            .unwrap();
+            git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+            git(
+                &child,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.test",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "only here",
+                ],
+            )
+            .unwrap();
+            match case {
+                "local-only" => git(&child, &["tag", "mine"]).unwrap(),
+                "divergent" => git(&child, &["tag", "-f", "upstream-tag"]).unwrap(),
+                _ => unreachable!(),
+            };
+            git(&child, &["checkout", "--quiet", "--detach", &recorded]).unwrap();
+            git(&child, &["reflog", "expire", "--expire=now", "--all"]).unwrap();
+            git(&f.repo, &["merge", "--ff-only", "aabbccdd/fix"]).unwrap();
+            let error = retire(&f.tree, &f.root).unwrap_err();
+            assert!(
+                error.contains("tags its origin does not hold"),
+                "{case}: {error}"
+            );
+            assert!(child.join(".git").exists(), "{case}");
+        }
     }
 
     // what this catches (Codex on #1602): a commit made on a detached HEAD and left behind
