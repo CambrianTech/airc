@@ -7,7 +7,7 @@
 //! are suppressed so they don't drown real signal. Shared by both feed
 //! call sites (`join_feed` and `commands`) so the two can't drift.
 
-use airc_core::{Body, TranscriptEvent};
+use airc_core::{Body, MentionTarget, TranscriptEvent};
 use airc_work::WorkEvent;
 use serde_json::Value;
 
@@ -60,13 +60,28 @@ pub(crate) fn render_feed_line(event: &TranscriptEvent) -> Option<String> {
     // unrecoverable truncation is not - so the one thing a cut must never remove is the
     // pointer back to what was said. It costs 11 chars of budget against a measured
     // cut of 500, and the bound below is pinned at 48 for it.
+    //
+    // The address is part of who a line is FOR (card 17db7a1a): a message to one peer printed
+    // as `sender → room` read as room traffic, so an instruction addressed to Kimi reached
+    // another agent's feed looking like his. A broadcast keeps `sender → room`; a peer
+    // address reads `sender → @peer/room`, a sibling-room reference `sender → room→other`.
     Some(format!(
-        "[{kind:?}] {sender} → {channel} e={handle}: {detail}",
+        "[{kind:?}] {sender} → {address} e={handle}: {detail}",
         kind = event.kind,
         sender = short(&event.peer_id),
-        channel = short(&event.room_id),
+        address = address(event),
         handle = short(&event.event_id),
     ))
+}
+
+/// Where the event was addressed, in the feed's short-id form.
+fn address(event: &TranscriptEvent) -> String {
+    let room = short(&event.room_id);
+    match &event.target {
+        MentionTarget::All => room,
+        MentionTarget::Peer(peer) => format!("@{}/{room}", short(peer)),
+        MentionTarget::Room(other) => format!("{room}→{}", short(other)),
+    }
 }
 
 fn body_detail(body: Option<&Body>) -> Option<String> {
@@ -395,6 +410,39 @@ mod tests {
     // this pins that the handle sits INSIDE that prefix - before the first character of what
     // was said - so a notification truncated to 300 or 400 chars still names how to fetch
     // the rest.
+    // what this catches (card 17db7a1a): a message addressed to one peer rendered as room
+    // traffic, so its reader could not tell "to me", "to someone else" and "to everyone"
+    // apart. Each address renders as itself; a broadcast is unchanged.
+    #[test]
+    fn a_feed_line_shows_who_the_event_was_addressed_to() {
+        use airc_core::{ClientId, EventId, Headers, PeerId, RoomId, TranscriptKind};
+        let room = RoomId::new();
+        let event = |target: MentionTarget| TranscriptEvent {
+            event_id: EventId::new(),
+            room_id: room,
+            peer_id: PeerId::new(),
+            client_id: ClientId::new(),
+            kind: TranscriptKind::Message,
+            occurred_at_ms: 0,
+            lamport: 0,
+            target,
+            headers: Headers::new(),
+            body: Some(Body::text("hi")),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+        let r = short(&room);
+        let all = render_feed_line(&event(MentionTarget::All)).expect("renders");
+        assert!(all.contains(&format!(" → {r} e=")), "{all}");
+        let kimi = PeerId::new();
+        let dm = render_feed_line(&event(MentionTarget::Peer(kimi))).expect("renders");
+        assert!(dm.contains(&format!(" → @{}/{r} e=", short(&kimi))), "{dm}");
+        let other = RoomId::new();
+        let cross = render_feed_line(&event(MentionTarget::Room(other))).expect("renders");
+        assert!(cross.contains(&format!(" → {r}→{} e=", short(&other))), "{cross}");
+    }
+
     #[test]
     fn truncated_line_keeps_its_event_handle() {
         use airc_core::{
