@@ -54,7 +54,11 @@ fn retire_legacy_endpoints(
     verify_daemon_build(airc_exe, home, canonical, expected)
 }
 
-pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_update(
+    home: &Path,
+    socket: PathBuf,
+    revision: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
     let airc_exe = env::current_exe()?;
@@ -86,7 +90,7 @@ pub fn run_update(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error
     //   2. nothing-to-do  — return WITHOUT ever stopping the daemon
     //   3. prepare artifact — compile and verify while the node is still on the air
     //   4. stop → install → restart — the genuinely exclusive part
-    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
+    let (build_dir, before, after) = prepare_build_source(&source, &channel, revision)?;
 
     // NOTHING TO DO → NO BLACKOUT.
     //
@@ -188,7 +192,11 @@ fn machine_airc_home() -> Option<PathBuf> {
 fn prepare_build_source(
     source: &Path,
     channel: &str,
+    revision: Option<&str>,
 ) -> Result<(PathBuf, String, String), Box<dyn std::error::Error>> {
+    if let Some(revision) = revision {
+        validate_revision(revision)?;
+    }
     run_checked(
         airc_core::process::background("git")
             .arg("-C")
@@ -196,8 +204,10 @@ fn prepare_build_source(
             .args(["fetch", "--quiet", "origin", channel]),
         "git fetch (channel)",
     )?;
+    let origin_ref = format!("origin/{channel}");
+    let target = resolve_update_target(source, &origin_ref, revision)?;
     let branch = git_text(source, ["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if branch == channel {
+    if branch == channel && revision.is_none() {
         let before = git_text(source, ["rev-parse", "--short", "HEAD"])?;
         // Advance to the ref the fetch above ALREADY resolved, rather than
         // letting a bare `git pull` re-fetch and re-derive what to merge.
@@ -219,12 +229,11 @@ fn prepare_build_source(
         // no branch to be ambiguous about. It is also strictly less work: the
         // fetch two statements up already did the network round trip, and the
         // bare pull was repeating it.
-        let origin_ref = format!("origin/{channel}");
         run_checked(
             airc_core::process::background("git")
                 .arg("-C")
                 .arg(source)
-                .args(["merge", "--ff-only", "--quiet", &origin_ref]),
+                .args(["merge", "--ff-only", "--quiet", &target]),
             "git merge --ff-only (channel)",
         )?;
         let after = git_text(source, ["rev-parse", "--short", "HEAD"])?;
@@ -234,25 +243,65 @@ fn prepare_build_source(
     let wt = machine_airc_home()
         .ok_or("HOME is not set; cannot place the update worktree")?
         .join("update-worktree");
-    let origin_ref = format!("origin/{channel}");
+    prepare_owned_worktree(source, &wt, &target)
+}
+
+fn validate_revision(revision: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("--revision requires an exact 40-character commit SHA".into());
+    }
+    Ok(())
+}
+
+/// A pin selects a channel commit, never an arbitrary ref, tag or Git option.
+/// Resolve before touching the owned checkout or entering daemon maintenance.
+fn resolve_update_target(
+    source: &Path,
+    channel_ref: &str,
+    revision: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let target = match revision {
+        Some(revision) => {
+            validate_revision(revision)?;
+            let commit = format!("{revision}^{{commit}}");
+            let target = git_text(source, ["rev-parse", "--verify", &commit])?;
+            run_checked(
+                airc_core::process::background("git")
+                    .arg("-C")
+                    .arg(source)
+                    .args(["merge-base", "--is-ancestor", &target, channel_ref]),
+                "requested revision is not a proven ancestor of the configured channel",
+            )?;
+            target
+        }
+        None => git_text(source, ["rev-parse", "--verify", channel_ref])?,
+    };
+    Ok(target)
+}
+
+fn prepare_owned_worktree(
+    source: &Path,
+    wt: &Path,
+    target: &str,
+) -> Result<(PathBuf, String, String), Box<dyn std::error::Error>> {
     if wt.join(".git").exists() {
         // Reuse: `before` is what this node last built from the channel, so the
         // auto path's no-op compare stays meaningful across runs.
-        let before = git_text(&wt, ["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+        let before = git_text(wt, ["rev-parse", "HEAD"]).unwrap_or_default();
         run_checked(
             airc_core::process::background("git")
                 .arg("-C")
-                .arg(&wt)
-                .args(["reset", "--hard", &origin_ref]),
+                .arg(wt)
+                .args(["reset", "--hard", target]),
             "git reset --hard (update worktree)",
         )?;
-        let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
-        Ok((wt, before, after))
+        let after = git_text(wt, ["rev-parse", "HEAD"])?;
+        Ok((wt.to_path_buf(), before, after))
     } else {
         if wt.exists() {
             // Half-created leftover (no .git link) — clear it and drop any stale
             // registration so `worktree add` can't refuse.
-            std::fs::remove_dir_all(&wt)?;
+            std::fs::remove_dir_all(wt)?;
         }
         let _ = airc_core::process::background("git")
             .arg("-C")
@@ -267,12 +316,12 @@ fn prepare_build_source(
             airc_core::process::background("git")
                 .arg("-C")
                 .arg(source)
-                .args(["worktree", "add", "--detach", &wt_str, &origin_ref]),
+                .args(["worktree", "add", "--detach", &wt_str, target]),
             "git worktree add (update worktree)",
         )?;
-        let after = git_text(&wt, ["rev-parse", "--short", "HEAD"])?;
+        let after = git_text(wt, ["rev-parse", "HEAD"])?;
         // Empty `before` ≠ `after` → first channel build always proceeds.
-        Ok((wt, String::new(), after))
+        Ok((wt.to_path_buf(), String::new(), after))
     }
 }
 
@@ -297,7 +346,11 @@ fn prepare_build_source(
 ///
 /// Windows rollback restores the original file object by rename. It must not
 /// overwrite the executable from which this updater is still running.
-pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_update_auto(
+    home: &Path,
+    socket: PathBuf,
+    revision: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let source = install_source_dir()?;
     validate_source_checkout(&source)?;
     let airc_exe = env::current_exe()?;
@@ -307,7 +360,7 @@ pub fn run_update_auto(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::
     // Channel-pinned build source: fetch/reset only ever touch the channel
     // worktree (or ff-pull a checkout that IS the channel) — never the running
     // binary and never a dev checkout's working tree.
-    let (build_dir, before, after) = prepare_build_source(&source, &channel)?;
+    let (build_dir, before, after) = prepare_build_source(&source, &channel, revision)?;
 
     // BOTH halves, same as `airc update` (#354): unchanged SOURCE alone does not
     // mean the INSTALLED binary is current — a prior install can have failed or
@@ -852,6 +905,102 @@ fn command_error(label: &str, output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn published_revision_pin_survives_a_newer_channel_tip_without_mutating_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let worktree = temp.path().join("update-worktree");
+        std::fs::create_dir(&source).unwrap();
+        let git = |args: &[&str]| {
+            let output = airc_core::process::background("git")
+                .arg("-C")
+                .arg(&source)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-b", "canary"]);
+        git(&["commit", "--allow-empty", "-m", "published"]);
+        let published = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "--allow-empty", "-m", "publication pending"]);
+        let tip = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/canary", &tip]);
+        std::fs::write(source.join("owner-work"), "preserve").unwrap();
+
+        let target =
+            super::resolve_update_target(&source, "origin/canary", Some(&published)).unwrap();
+        let (_, _, after) = super::prepare_owned_worktree(&source, &worktree, &target).unwrap();
+        assert!(published.starts_with(&after));
+        assert_eq!(git(&["rev-parse", "HEAD"]), tip);
+        assert_eq!(
+            std::fs::read_to_string(source.join("owner-work")).unwrap(),
+            "preserve"
+        );
+        let (_, before, again) =
+            super::prepare_owned_worktree(&source, &worktree, &target).unwrap();
+        assert_eq!(before, again);
+        assert_eq!(
+            super::resolve_update_target(&source, "origin/canary", None).unwrap(),
+            tip
+        );
+
+        git(&["checkout", "--orphan", "unrelated"]);
+        git(&["commit", "--allow-empty", "-m", "not channel history"]);
+        let unrelated = git(&["rev-parse", "HEAD"]);
+        assert!(super::resolve_update_target(&source, "origin/canary", Some(&unrelated)).is_err());
+        for invalid in [
+            "HEAD",
+            "--help",
+            "abc1234",
+            "0000000000000000000000000000000000000000",
+        ] {
+            assert!(super::resolve_update_target(&source, "origin/canary", Some(invalid)).is_err());
+        }
+        assert_eq!(
+            super::git_text(&worktree, ["rev-parse", "HEAD"]).unwrap(),
+            published
+        );
+    }
+
+    #[test]
+    fn update_revision_is_explicit_and_cannot_mix_with_adopt_installed() {
+        use clap::Parser;
+        let sha = "1234567890123456789012345678901234567890";
+        for args in [
+            vec!["airc", "update", "--revision", sha],
+            vec!["airc", "update", "--auto", "--revision", sha],
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(cli.command, crate::cli::Command::Update { revision: Some(value), .. } if value == sha)
+            );
+        }
+        assert!(crate::cli::Cli::try_parse_from([
+            "airc",
+            "update",
+            "--adopt-installed",
+            "--revision",
+            sha
+        ])
+        .is_err());
+    }
+
     #[test]
     fn restored_owner_handoff_requires_typed_verified_failure() {
         let error =

@@ -691,6 +691,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Update {
             auto,
+            revision,
             adopt_installed,
         } => {
             let socket = cli::default_socket_path_in(&home);
@@ -699,14 +700,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 #[cfg(windows)]
                 {
-                    update_session::run(&home, auto)
+                    update_session::run(&home, auto, revision.as_deref())
                 }
                 #[cfg(not(windows))]
                 {
                     if auto {
-                        update_commands::run_update_auto(&home, socket)
+                        update_commands::run_update_auto(&home, socket, revision.as_deref())
                     } else {
-                        update_commands::run_update(&home, socket)
+                        update_commands::run_update(&home, socket, revision.as_deref())
                     }
                 }
             }
