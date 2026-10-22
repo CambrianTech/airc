@@ -19,10 +19,20 @@
 # Runs in git-bash on Windows and any POSIX sh with bash. Pure bash + cargo;
 # no airc binary dependency, so it works on a half-installed tree.
 #
-# Env knobs (all optional):
+# A machine that must not compile (a node serving inference, where a build competes
+# with the live models for CPU and memory) records that ONCE, durably:
+#   git config --global airc.cargoGate fmt-only
+# The gate then runs only `cargo fmt --check` (a formatter, no compile) and says that
+# clippy and the compile are left to CI. Whatever installs or operates the machine sets it;
+# the hook never guesses whether a machine serves.
+#
+# Env knobs (all optional, per push):
 #   AIRC_HOOK_SKIP=1           disable ALL airc hooks (shared escape hatch)
 #   AIRC_CARGO_GATE_SKIP=1     disable just this gate (emergency push)
-#   AIRC_CARGO_GATE_CLIPPY=0   fmt-check only; skip the slower clippy pass
+#   AIRC_CARGO_GATE_CLIPPY=0   fmt-check only, for this push
+#
+# Every outcome line names exactly the checks that ran. A line saying clippy passed when
+# clippy did not run is a false receipt (card 32338302).
 
 set -u
 
@@ -51,12 +61,23 @@ if ! cargo fmt --check; then
   exit 1
 fi
 
-if [ "${AIRC_CARGO_GATE_CLIPPY:-1}" = "1" ]; then
-  if ! cargo clippy --all-targets -- -D warnings; then
-    echo "airc pre-push: BLOCKED — cargo clippy found warnings/errors (deny-warnings)." >&2
-    echo "  Fix the lints above, or skip clippy only: AIRC_CARGO_GATE_CLIPPY=0 git push …" >&2
-    exit 1
-  fi
+# Why clippy (the compile) would not run here, if it would not; empty means it runs.
+DEFERRED_BY=""
+if [ "$(git config --get airc.cargoGate 2>/dev/null || true)" = "fmt-only" ]; then
+  DEFERRED_BY="airc.cargoGate=fmt-only (this machine does not compile)"
+elif [ "${AIRC_CARGO_GATE_CLIPPY:-1}" != "1" ]; then
+  DEFERRED_BY="AIRC_CARGO_GATE_CLIPPY=0"
+fi
+
+if [ -n "$DEFERRED_BY" ]; then
+  echo "airc pre-push: fmt clean; clippy and the compile are left to CI ($DEFERRED_BY)."
+  exit 0
+fi
+
+if ! cargo clippy --all-targets -- -D warnings; then
+  echo "airc pre-push: BLOCKED — cargo clippy found warnings/errors (deny-warnings)." >&2
+  echo "  Fix the lints above, or skip clippy only: AIRC_CARGO_GATE_CLIPPY=0 git push …" >&2
+  exit 1
 fi
 
 echo "airc pre-push: cargo gate clean (fmt + clippy)."
