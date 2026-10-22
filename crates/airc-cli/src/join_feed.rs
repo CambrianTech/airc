@@ -20,7 +20,6 @@ pub async fn run(
     airc: &Airc,
     room: RoomId,
     home: &std::path::Path,
-    socket: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_client = current_client_id()?;
     let consumer_id = format!("{}:room:{room}", consumer_id(runtime_client.as_deref()));
@@ -42,12 +41,12 @@ pub async fn run(
         )
         .await;
         if let Err(error) = turn {
-            // An error while the daemon answers is a real one; while it does not, the
-            // daemon is between processes (an update's handoff, or a restart).
-            if daemon_answers(socket).await {
+            // Decided by the error's type, never by probing afterwards: a replacement daemon
+            // can answer a probe before the old one's failure is handled (Codex on #1603).
+            if !daemon_absent(error.as_ref()) {
                 return Err(error);
             }
-            stream = reattach(airc, home, socket).await?;
+            stream = reattach(airc, home).await?;
             continue;
         }
         announce_history = false;
@@ -57,30 +56,30 @@ pub async fn run(
             next = stream.next() => match next {
                 Some(Ok(_)) => {},
                 Some(Err(lag @ LiveLag { .. })) => eprintln!("airc: {lag}; recovering from durable delivery state"),
-                None => stream = reattach(airc, home, socket).await?,
+                None => stream = reattach(airc, home).await?,
             },
         }
     }
 }
 
-/// The daemon answers a ping now.
-async fn daemon_answers(socket: &std::path::Path) -> bool {
-    airc_ipc::DaemonClient::new(socket.to_path_buf())
-        .ping_with_timeout(std::time::Duration::from_secs(2))
-        .await
-        .is_ok()
+/// The daemon was not there to answer (`AircError::is_daemon_absent`): a daemon between
+/// processes. Output, store and protocol errors are not this, and end the feed.
+fn daemon_absent(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<airc_lib::AircError>()
+        .is_some_and(airc_lib::AircError::is_daemon_absent)
 }
 
 /// Wait out the daemon's absence and subscribe again (card 201417d4). A supported update
 /// hands the daemon over in seconds, and that used to end every attached feed (Claude
 /// Monitor, a Codex join session) until someone re-ran `airc join`. Delivery resumes from
-/// this consumer's durable checkpoint, so nothing published in the gap is lost and nothing
-/// already printed is printed again. Only an operator stop ends the feed here: it is the
-/// one absence that is meant to last.
+/// this consumer's durable checkpoint, so nothing published in the gap is lost. Delivery is
+/// at-least-once across the gap: a turn flushes its output before it acknowledges, so an
+/// event printed just before the daemon went away can print again. Only an operator stop
+/// ends the feed here: it is the one absence meant to last.
 async fn reattach(
     airc: &Airc,
     home: &std::path::Path,
-    socket: &std::path::Path,
 ) -> Result<airc_lib::FilteredEventStream, Box<dyn std::error::Error>> {
     eprintln!("airc join: the daemon went away; waiting for it to return (an update hands it over in seconds)");
     let mut wait = std::time::Duration::from_millis(250);
@@ -88,11 +87,13 @@ async fn reattach(
         if airc_lib::daemon_lifecycle::operator_stop_recorded(home)? {
             return Err("the daemon was stopped by the operator; run `airc join` to resume".into());
         }
-        if daemon_answers(socket).await {
-            if let Ok(stream) = airc.subscribe_agent_feed().await {
+        match airc.subscribe_agent_feed().await {
+            Ok(stream) => {
                 eprintln!("airc join: reattached; delivery resumes from this feed's checkpoint");
                 return Ok(stream);
             }
+            Err(error) if error.is_daemon_absent() => {}
+            Err(error) => return Err(error.into()),
         }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Err("detached while waiting for the daemon".into()),
@@ -380,13 +381,73 @@ mod tests {
             airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
         stop.record_operator_stop().unwrap();
         drop(stop);
-        let absent = dir.path().join("no-daemon.sock");
-        let ended = reattach(&airc, dir.path(), &absent)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
+        let ended = reattach(&airc, dir.path()).await.err().unwrap().to_string();
         assert!(ended.contains("stopped by the operator"), "{ended}");
+    }
+
+    // what this catches (Codex on #1603): ending the feed on a daemon handoff because a fast
+    // replacement answered a probe taken after the failure. The decision is the error's own
+    // type: a daemon that was not there (not connected, dropped mid-call, timed out) reattaches
+    // whatever answers later; a refused request, an output error or a store error ends the feed.
+    #[test]
+    fn a_daemon_absence_reattaches_and_every_other_error_ends_the_feed() {
+        use airc_lib::AircError;
+        let boxed = |error: AircError| -> Box<dyn std::error::Error> { error.into() };
+        let gone = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        for absent in [
+            AircError::DaemonClient(airc_ipc::ClientError::NotConnected(gone())),
+            AircError::DaemonClient(airc_ipc::ClientError::Io(gone())),
+            AircError::DaemonClient(airc_ipc::ClientError::Timeout),
+        ] {
+            assert!(daemon_absent(boxed(absent).as_ref()));
+        }
+        for real in [
+            boxed(AircError::DaemonClient(airc_ipc::ClientError::Daemon(
+                "refused".into(),
+            ))),
+            boxed(AircError::Route(
+                "agent delivery: invalid delivered prefix".into(),
+            )),
+            Box::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                as Box<dyn std::error::Error>,
+        ] {
+            assert!(!daemon_absent(real.as_ref()), "{real}");
+        }
+    }
+
+    // what this catches (Codex on #1603): a reattach that loses what was published while the
+    // daemon was away, or prints again what was already delivered and acknowledged. Delivery
+    // resumes from this consumer's durable checkpoint: the turn after a reattach prints the
+    // event from the gap, and not the one acknowledged before it.
+    #[tokio::test]
+    async fn a_reattach_resumes_at_the_checkpoint() {
+        let (_dir, airc, room) = fixture().await;
+        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        print_delivery_turn(&airc, "resume", &filter, &mut Vec::new(), true, Some(room))
+            .await
+            .unwrap();
+        airc.append_event(event(&airc, room, 1, "claude:peer", "before-the-gap"))
+            .await
+            .unwrap();
+        let mut first = Vec::new();
+        print_delivery_turn(&airc, "resume", &filter, &mut first, false, Some(room))
+            .await
+            .unwrap();
+        assert!(String::from_utf8(first).unwrap().contains("before-the-gap"));
+        airc.append_event(event(&airc, room, 2, "claude:peer", "during-the-gap"))
+            .await
+            .unwrap();
+        let _stream = reattach(&airc, _dir.path()).await.unwrap();
+        let mut after = Vec::new();
+        print_delivery_turn(&airc, "resume", &filter, &mut after, false, Some(room))
+            .await
+            .unwrap();
+        let after = String::from_utf8(after).unwrap();
+        assert!(after.contains("during-the-gap"), "{after}");
+        assert!(
+            !after.contains("before-the-gap"),
+            "acknowledged before the gap: {after}"
+        );
     }
 
     async fn fixture() -> (TempDir, Airc, RoomId) {

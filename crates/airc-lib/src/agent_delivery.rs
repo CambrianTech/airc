@@ -228,7 +228,8 @@ impl Airc {
         let source = if let Some(client) = self.daemon_client() {
             // The owner's stable identity identifies the router sequence authority;
             // embedded local Lamport values are a different cursor domain.
-            let owner = client.status().await.map_err(fail)?.peer_id;
+            // Typed, not flattened: a reader decides from it whether the daemon is gone.
+            let owner = client.status().await?.peer_id;
             format!(
                 "daemon-router:{}:{}",
                 owner,

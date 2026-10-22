@@ -594,8 +594,7 @@ impl Airc {
         // unchanged — no error text is ever interpreted to decide this.
         let daemon_serves_sets = client
             .status()
-            .await
-            .map_err(|e| AircError::Route(format!("daemon status: {e}")))?
+            .await? // typed: a reader tells a daemon between processes from a refused request
             .attach_channel_sets;
         if daemon_serves_sets && channels.len() > 1 {
             let handle =
@@ -873,10 +872,7 @@ impl Airc {
             }
         };
         let mut cursors: std::collections::HashMap<RoomId, IpcCursor> = Default::default();
-        let mut stream = client
-            .attach(request_for(&cursors))
-            .await
-            .map_err(|e| AircError::Route(format!("daemon attach (set): {e}")))?;
+        let mut stream = client.attach(request_for(&cursors)).await?; // typed, as above
         match read_response_frame(&mut stream).await {
             Ok(Some(Response::Ok)) => {}
             Ok(Some(Response::Error { message })) => {
