@@ -22,7 +22,7 @@ use airc_core::{
 use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
     AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind,
-    IpcTarget, PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
+    PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
