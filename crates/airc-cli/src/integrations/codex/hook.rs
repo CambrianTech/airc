@@ -16,6 +16,10 @@ use crate::client_id::{
 use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 const CONSUMER_PREFIX: &str = "codex-hook";
+// Automatic context is a notification, not an export of nested transcripts. Keep
+// large bodies in durable history; explicit --raw reads retain the full payload.
+// 4 KiB is a chosen per-message notification budget, not a transport limit.
+const DIGEST_BODY_BYTES: usize = 4096;
 
 pub async fn run_user_prompt_submit(
     home: &Path,
@@ -525,7 +529,16 @@ fn digest_messages<'a>(
             continue;
         }
         let peer = event.peer_id.to_string();
-        let body = summarize_body(event);
+        let full = summarize_body(event);
+        let body = if full.len() <= DIGEST_BODY_BYTES {
+            full
+        } else {
+            format!(
+                "[body retained: {} bytes; event {}; room {}; cursor {} / {}] Read in this same AIRC home with `airc inbox --room {} --since-lamport {} --since-event-id 00000000-0000-0000-0000-000000000000 --json`; page forward to this event ID if needed. This is a reference, not the message body.",
+                full.len(), event.event_id, event.room_id, event.lamport, event.event_id,
+                event.room_id, event.lamport.saturating_sub(1),
+            )
+        };
         messages.push(DigestMessage { peer, body });
     }
     messages
@@ -621,6 +634,24 @@ mod tests {
         let digest = render_digest(&events, 8);
 
         assert!(digest.is_empty());
+    }
+
+    #[test]
+    fn oversized_transcript_is_recoverable_without_burying_the_next_request() {
+        let huge = "界".repeat(30_000);
+        let retained = event(Body::text(&huge));
+        let id = retained.event_id.to_string();
+        let events = vec![retained, event(Body::text("review the new head"))];
+        let digest = render_digest(&events, 8);
+        assert!(digest.len() < super::DIGEST_BODY_BYTES);
+        assert!(digest.contains(&id));
+        assert!(digest.contains("airc inbox --room"));
+        assert!(digest.contains("review the new head"));
+        assert!(!digest.contains(&huge));
+        assert!(
+            render_raw(&events).contains(&huge),
+            "explicit recovery remains whole"
+        );
     }
 
     async fn fixture() -> (tempfile::TempDir, Airc, RoomId) {
