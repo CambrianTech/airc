@@ -52,9 +52,11 @@ fn mirror_allocation_uses_origins_default_not_the_source_checkout_head() {
         || {
             let repo = RepoId::new("Example/mirror-default").unwrap();
             let mirror = ensure_mirror(&repo, &source).unwrap();
-            // Actual mirror refresh prunes origin/HEAD inherited from the local
-            // clone. Its own HEAD can still point at the now-pruned agent branch.
+            // Mirror refresh prunes origin/HEAD inherited from the local clone.
+            // Git versions differ on whether refresh also repairs mirror HEAD;
+            // explicitly retain the stale source-agent HEAD for this regression.
             assert!(git_in(&mirror, &["symbolic-ref", "refs/remotes/origin/HEAD"]).is_err());
+            git(&mirror, &["symbolic-ref", "HEAD", "refs/heads/agent-work"]);
             assert_eq!(
                 git(&mirror, &["symbolic-ref", "HEAD"]),
                 "refs/heads/agent-work"
