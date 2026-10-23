@@ -1126,7 +1126,13 @@ mod tests {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "fixture daemon did not connect");
+                    if Instant::now() >= deadline {
+                        // The fixture daemon's own output is the evidence: on IntelMac under
+                        // full-suite load it sat at _dyld_start past this deadline (card f4703abe).
+                        let log = std::fs::read_to_string(home.path().join("airc-daemon.log"))
+                            .unwrap_or_else(|error| format!("<no daemon log: {error}>"));
+                        panic!("fixture daemon did not connect; its log:\n{log}");
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => panic!("fixture listener failed: {error}"),
