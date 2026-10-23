@@ -22,9 +22,7 @@ pub(crate) async fn spawn_claim_worktree(
     // Need the card's title for the branch slug — the board of the room the card
     // was claimed in is the source of truth.
     let board = airc.work_board_in(room).await?;
-    let card = board
-        .card(card_id)
-        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+    let card = crate::work_commands::board_card(&board, card_id, Some(room), airc.home())?;
     let short = card.card_id.shown();
 
     // Card 8a3082c4 + BIGMAMA review fix: skip worktree spawn when
