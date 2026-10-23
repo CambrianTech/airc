@@ -2,6 +2,11 @@
 
 use clap::{Args, Subcommand, ValueEnum};
 
+/// A work-card claim's lease: how long a claim (or its last heartbeat) holds before the
+/// board shows it stale. One number for `claim`, `heartbeat` and the renewal a holder's
+/// own submission makes (`work_commands::submit_patch`).
+pub(crate) const CLAIM_LEASE_MS: u64 = 600_000;
+
 #[derive(Debug, Args)]
 pub struct WorkArgs {
     #[command(subcommand)]
@@ -66,7 +71,7 @@ pub enum WorkAction {
         /// Work card id: the full UUID, or the short form the board shows.
         card_id: String,
         /// Claim lease duration.
-        #[arg(long, default_value_t = 600_000)]
+        #[arg(long, default_value_t = CLAIM_LEASE_MS)]
         ttl_ms: u64,
         /// Allow claim from outside `~/.airc/worktrees/`. Default
         /// behaviour refuses, to keep lane work inside leases.
@@ -83,7 +88,7 @@ pub enum WorkAction {
         /// Claim id returned by `work claim`: full, or the short form the board shows.
         claim_id: String,
         /// New lease duration from this heartbeat.
-        #[arg(long, default_value_t = 600_000)]
+        #[arg(long, default_value_t = CLAIM_LEASE_MS)]
         ttl_ms: u64,
     },
     /// Release this peer's claim on a work card.
