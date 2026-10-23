@@ -2,16 +2,19 @@
 
 use std::path::Path;
 
-use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
+use super::git_in;
 
 pub(super) fn origin_default(source: &Path) -> Result<String, String> {
-    let git = CommandGitRunner;
-    if git.run_git(source, &["rev-parse", "--is-bare-repository"])? != "true" {
-        return git
-            .run_git(source, &["symbolic-ref", "refs/remotes/origin/HEAD"])
-            .map_err(|e| {
-                format!("remote default unavailable; supply start_point explicitly: {e}")
-            });
+    let bare = git_in(source, &["rev-parse", "--is-bare-repository"]).map_err(|e| {
+        format!(
+            "cannot classify {} as bare or working clone: {e}",
+            source.display()
+        )
+    })?;
+    if bare != "true" {
+        return git_in(source, &["symbolic-ref", "refs/remotes/origin/HEAD"]).map_err(|e| {
+            format!("remote default unavailable; supply start_point explicitly: {e}")
+        });
     }
 
     // A mirror stores the remote's branches under refs/heads, not refs/remotes.
@@ -19,8 +22,7 @@ pub(super) fn origin_default(source: &Path) -> Result<String, String> {
     // branch or an old default. Ask the actual origin instead of guessing from
     // those local refs. Allocation still fetches and resolves the selected branch
     // once, recording that immutable commit before creating the card checkout.
-    let advertised = git
-        .run_git(source, &["ls-remote", "--symref", "origin", "HEAD"])
+    let advertised = git_in(source, &["ls-remote", "--symref", "origin", "HEAD"])
         .map_err(|e| format!("remote default unavailable; supply start_point explicitly: {e}"))?;
     advertised_default(&advertised)
 }
