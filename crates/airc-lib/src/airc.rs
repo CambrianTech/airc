@@ -164,6 +164,17 @@ pub fn daemon_command(
     command
 }
 
+/// The daemon's log file — in the home [`daemon_command`] gives the daemon,
+/// never the spawning scope's. Spawn sites opened `<caller scope>/airc-daemon.log`
+/// while the daemon itself ran as the machine account, so the machine daemon's
+/// whole output landed in whichever project scope happened to start it
+/// (IntelMac 2026-10-15: 548 MB in a project `.airc`, the account log untouched).
+pub fn daemon_log_path(scope_home: &Path) -> PathBuf {
+    machine_account_home(scope_home)
+        .as_path()
+        .join("airc-daemon.log")
+}
+
 fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
