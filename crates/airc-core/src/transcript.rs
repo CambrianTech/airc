@@ -135,6 +135,68 @@ impl TranscriptKind {
         )
     }
 
+    /// True for the lifecycle kinds a REMOTE peer must receive — the announcements one
+    /// citizen publishes *for the room*, as opposed to the observations a scope makes
+    /// *about itself*.
+    ///
+    /// ## Why this is not `is_lifecycle`
+    ///
+    /// `is_lifecycle` answers "did the substrate author this, rather than a human typing",
+    /// and it deliberately includes kinds that must NEVER leave the box: `WireEstablished`
+    /// / `WireLost` are this scope's transport observations, `PeerArrived` / `PeerDeparted`
+    /// are mutations of the LOCAL trust registry, `RoomJoined` / `RoomParted` are what THIS
+    /// scope did, and `SubscriptionAdvanced` is a local consumer's cursor. "My wire came up"
+    /// is nobody else's event. Using `is_lifecycle` as the routing predicate would broadcast
+    /// every one of those.
+    ///
+    /// The four below are the opposite: each one's own doc says another peer consumes it —
+    /// the identity card is emitted on join *"so other peers populate their roster on
+    /// attach"*, the doctrine is *"the 'how we work here' markdown every attaching agent
+    /// loads on join"*, the wall post is the room's living document, and the channel
+    /// purpose is what *"a citizen calibrates participation to"*. A published announcement
+    /// that reaches no peer has not been published.
+    ///
+    /// ## Why the decision lives on the KIND
+    ///
+    /// So it is made once. Measured on IntelMac 2026-09-05: every one of these four is
+    /// emitted through `airc-lib`'s `emit_lifecycle`, which persists locally and sends to an
+    /// in-process broadcast channel and never calls `router.publish` — so identity cards are
+    /// structurally process-local. Three nodes each held a full LOCAL identity and rendered
+    /// every peer as `peer-<hex>`, permanently and symmetrically, which is the signature of
+    /// a reader looking at a store the writer never reaches rather than of propagation lag.
+    /// Bolting a publish onto one call site would fix identity and leave the other three,
+    /// which is how there came to be four of them.
+    ///
+    /// Adding a variant: answer this question at the definition site. The exhaustive match
+    /// below makes the compiler ask.
+    pub fn crosses_to_peers(self) -> bool {
+        match self {
+            // Announcements: published BY a citizen FOR the room.
+            TranscriptKind::IdentityPublished
+            | TranscriptKind::DoctrinePublished
+            | TranscriptKind::WallPostPublished
+            | TranscriptKind::ChannelPurposePublished => true,
+
+            // This scope's own observations — local by nature.
+            TranscriptKind::PeerArrived
+            | TranscriptKind::PeerDeparted
+            | TranscriptKind::WireEstablished
+            | TranscriptKind::WireLost
+            | TranscriptKind::RoomJoined
+            | TranscriptKind::RoomParted
+            | TranscriptKind::SubscriptionAdvanced => false,
+
+            // Not lifecycle at all: these already ride their own send paths
+            // (`say` / attachments / receipts), so routing them here would double-send.
+            TranscriptKind::Message
+            | TranscriptKind::Attachment
+            | TranscriptKind::Receipt
+            | TranscriptKind::Presence
+            | TranscriptKind::SessionControl
+            | TranscriptKind::System => false,
+        }
+    }
+
     /// Stable wire / storage discriminator string. This is the single
     /// source of truth for the `TranscriptKind ↔ &str` mapping that
     /// downstream codecs (airc-store SQLite, future JSON envelopes,
@@ -338,5 +400,54 @@ mod tests {
             None,
             "unknown discriminators must return None (so callers can wrap as an error)"
         );
+    }
+
+    // what this catches: an announcement kind that silently stops crossing the wire, and a
+    // local observation that starts crossing. Measured 2026-09-05: all four announcements
+    // were emitted through a path that never reached the bus, so three nodes each rendered
+    // every peer as `peer-<hex>` forever while holding a full local identity. The bug was
+    // invisible because each half worked — the card was written, and the reader read; they
+    // just used different stores. Pinning the SET here means the next kind added has to
+    // answer the question at its definition site instead of inheriting silence.
+    #[test]
+    fn only_the_room_announcements_cross_to_peers() {
+        let crossing: Vec<&str> = TranscriptKind::ALL_VARIANTS
+            .iter()
+            .filter(|k| k.crosses_to_peers())
+            .map(|k| k.as_wire_str())
+            .collect();
+        assert_eq!(
+            crossing,
+            vec![
+                "identity_published",
+                "doctrine_published",
+                "wall_post_published",
+                "channel_purpose_published",
+            ],
+            "the set of kinds a remote peer receives changed — if that is deliberate, say \
+             why here; `is_lifecycle` is NOT this set and must not be substituted for it"
+        );
+    }
+
+    // what this catches: substituting `is_lifecycle` for the routing predicate. It is the
+    // tempting one-liner and it would broadcast this scope's own transport and registry
+    // observations to every peer in the room — "my wire came up" is nobody else's event.
+    #[test]
+    fn a_scopes_own_observations_never_cross() {
+        for local in [
+            TranscriptKind::PeerArrived,
+            TranscriptKind::PeerDeparted,
+            TranscriptKind::WireEstablished,
+            TranscriptKind::WireLost,
+            TranscriptKind::RoomJoined,
+            TranscriptKind::RoomParted,
+            TranscriptKind::SubscriptionAdvanced,
+        ] {
+            assert!(local.is_lifecycle(), "{local:?} should still be lifecycle");
+            assert!(
+                !local.crosses_to_peers(),
+                "{local:?} is this scope's own observation and must not be broadcast"
+            );
+        }
     }
 }
