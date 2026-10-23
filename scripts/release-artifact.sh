@@ -19,7 +19,10 @@ airc_release_artifact() (
   local temporary; temporary="$(mktemp -d)"
   trap 'rm -rf "$temporary"' EXIT
   curl --fail --location --silent --show-error --max-time 60 --max-filesize 4096 "$base/$asset.sha256" -o "$temporary/sum" || {
-    echo "AIRC artifact $tag is not available; no source build will be attempted. Contributors may select --developer-build." >&2; exit 1;
+    # Usually CI has not published it YET: merge to release took 9.3, 10.2 and 14.5 min on
+    # 2026-10-18 (#1582, #1583, #1584). Say so, and name the command that actually takes the
+    # build flag: `airc update` does not, install.sh does (card d0b4e684).
+    echo "AIRC artifact $tag is not available; no source build will be attempted. If canary just moved, CI publishes it 9-15 min after the merge (measured 2026-10-18): rerun \`airc update\` then. Contributors can compile instead with \`./install.sh --developer-build\` from the airc checkout." >&2; exit 1;
   }
   read -r digest listed < "$temporary/sum"
   listed="${listed#\*}"
