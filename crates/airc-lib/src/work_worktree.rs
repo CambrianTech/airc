@@ -44,6 +44,7 @@ pub use airc_core::shown_id::SHORT_ID_LEN;
 pub const CREATION_BASE_REF: &str = "refs/worktree/airc-creation-base";
 
 mod allocation;
+mod default_ref;
 
 pub use allocation::{
     allocation_evidence, decode_allocation_evidence, AllocationEvidence, ALLOCATION_REF,
@@ -195,15 +196,7 @@ fn resolve_allocation(spec: &WorktreeSpec<'_>) -> Result<(Option<String>, String
         None => match integration_base.as_deref() {
             Some(base) => format!("refs/remotes/origin/{base}"),
             None => {
-                use airc_work::local_git::{CommandGitRunner, GitCommandRunner};
-                let remote_default = CommandGitRunner
-                    .run_git(
-                        spec.clone_path,
-                        &["symbolic-ref", "refs/remotes/origin/HEAD"],
-                    )
-                    .map_err(|e| {
-                        format!("remote default unavailable; supply start_point explicitly: {e}")
-                    })?;
+                let remote_default = default_ref::origin_default(spec.clone_path)?;
                 let branch = remote_default
                     .strip_prefix("refs/remotes/origin/")
                     .filter(|branch| !branch.is_empty() && *branch != "HEAD")
