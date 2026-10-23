@@ -159,6 +159,15 @@ pub enum WorkAction {
         #[arg(long)]
         workspace: Option<std::path::PathBuf>,
     },
+    /// Print one work card in full: its board row, room, pull request, review link and body
+    /// (the repro, measurements and acceptance the board does not show).
+    Show {
+        /// Subscribed room containing the card; does not change the current room.
+        #[arg(long)]
+        room: Option<String>,
+        /// Work card id: the full UUID, or the short form the board shows.
+        card_id: String,
+    },
     /// Mark a work card closed so it no longer appears as claimable.
     Close {
         /// Subscribed room containing the card; does not change the current room.
