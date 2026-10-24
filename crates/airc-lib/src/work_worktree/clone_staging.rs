@@ -196,6 +196,23 @@ mod tests {
     }
 
     #[test]
+    fn recovery_publication_failure_restores_original_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("card");
+        std::fs::create_dir_all(destination.join(".git")).unwrap();
+        std::fs::write(destination.join(".git/HEAD"), "ref: refs/heads/.invalid\n").unwrap();
+        std::fs::write(destination.join(".git/objects-to-preserve"), "original").unwrap();
+        let staged = Staging::new(root.path(), airc_work::WorkCardId::from_u128(1)).unwrap();
+        // No staging tree: force rename failure after preserving the predecessor.
+        assert!(staged.recover(&destination).is_err());
+        assert_eq!(
+            std::fs::read_to_string(destination.join(".git/objects-to-preserve")).unwrap(),
+            "original"
+        );
+        assert!(interrupted_clone(&destination));
+    }
+
+    #[test]
     fn successful_allocation_publishes_complete_tree() {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("card");

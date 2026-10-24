@@ -1704,6 +1704,11 @@ mod tests {
                 );
                 let sub_mirror = home.join(".airc/mirrors/o/sub.git");
                 assert_eq!(
+                    git(&path.join("vendor/dep"), &["status", "--porcelain"]),
+                    "",
+                    "submodule gitdir and worktree paths still resolve after publication"
+                );
+                assert_eq!(
                     git(&sub_mirror, &["config", "extensions.preciousObjects"]),
                     "true",
                     "the submodule mirror is precious too"
