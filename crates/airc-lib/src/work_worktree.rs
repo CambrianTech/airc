@@ -44,6 +44,7 @@ pub use airc_core::shown_id::SHORT_ID_LEN;
 pub const CREATION_BASE_REF: &str = "refs/worktree/airc-creation-base";
 
 mod allocation;
+mod clone_staging;
 mod default_ref;
 
 pub use allocation::{
@@ -443,9 +444,21 @@ fn ensure_mirror_from(
 /// `origin` is set to the mirror's origin, the real remote, so the act-end carry pushes
 /// (a local-path origin never carries).
 pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, String> {
+    // Resident callers do not already hold the CLI's lifecycle lock. Own it
+    // here so staging/recovery and retirement cannot race.
+    let _lifecycle = lifecycle_lock(spec.card_id)?;
     let path = worktree_path_for(spec.card_id)
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
-    if path.exists() {
+    let interrupted = clone_staging::interrupted_clone(&path);
+    if path.exists() && !interrupted {
+        // A killed clone can leave .git/HEAD -> .invalid. Preserve it, but
+        // never report that partial allocation as a usable workspace.
+        resolve_commit(&path, "HEAD").map_err(|error| {
+            format!(
+                "card checkout {} is incomplete; preserved for recovery: {error}",
+                path.display()
+            )
+        })?;
         if is_linked_worktree(&path) {
             match migrate_linked_checkout(spec.clone_path, &path) {
                 Ok(Some(retired)) => return Ok(WorktreeOutcome::Migrated { path, retired }),
@@ -457,6 +470,11 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
                     "linked card checkout could not be migrated to a card clone; reusing it"
                 ),
             }
+        } else if allocation_evidence(&path)?.is_none() {
+            return Err(format!(
+                "card checkout {} has no completed allocation evidence; preserved for recovery",
+                path.display()
+            ));
         }
         return Ok(WorktreeOutcome::Reused(path));
     }
@@ -468,8 +486,18 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
     let (integration_base, start_ref, base) = resolve_allocation(spec)?;
     let origin = git_in(spec.clone_path, &["remote", "get-url", "origin"])?;
     let mirror_str = spec.clone_path.to_string_lossy().to_string();
-    let path_str = path.to_string_lossy().to_string();
-    git_in(
+    let staging = clone_staging::Staging::new(root, spec.card_id)?;
+    let staged = staging.path();
+    let path_str = staged.to_string_lossy().to_string();
+    // Git ignores --shared/--local for shallow sources and transfers a pack.
+    // The observed Continuum mirror transferred 1.58 GB, exceeding 120s.
+    let clone_bound =
+        if git_in(spec.clone_path, &["rev-parse", "--is-shallow-repository"])? == "true" {
+            NETWORK_MIRROR_BOUND
+        } else {
+            GIT_BOUND
+        };
+    git_in_within(
         root,
         &[
             "clone",
@@ -479,9 +507,10 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
             &mirror_str,
             &path_str,
         ],
+        clone_bound,
     )?;
-    git_in(&path, &["remote", "set-url", "origin", &origin])?;
-    git_in(&path, &["checkout", "--quiet", "-b", spec.branch, &base])?;
+    git_in(staged, &["remote", "set-url", "origin", &origin])?;
+    git_in(staged, &["checkout", "--quiet", "-b", spec.branch, &base])?;
     let evidence = AllocationEvidence {
         repo: spec.repo.clone(),
         requested_branch: spec.branch.to_owned(),
@@ -489,8 +518,13 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
         start_ref,
         creation_sha: base,
     };
-    allocation::record(&path, &evidence)?;
-    init_submodules(&path)?;
+    init_submodules(staged)?;
+    allocation::record(staged, &evidence)?;
+    if interrupted {
+        let retired = staging.recover(&path)?;
+        return Ok(WorktreeOutcome::Migrated { path, retired });
+    }
+    staging.publish(&path)?;
     Ok(WorktreeOutcome::Created(path))
 }
 
