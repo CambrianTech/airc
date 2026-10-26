@@ -388,11 +388,11 @@ async fn the_addressed_checkpoint_moves_only_through_scanned_ranges() {
         next.state.summarized, start,
         "nothing below the scan is settled"
     );
-    assert_eq!(
-        next.state.addressed_below.as_ref().map(|c| c.lamport),
-        Some(21),
-        "only 21..=30 were scanned"
-    );
+    let rest = &next.state.unsearched;
+    assert_eq!(rest.len(), 1, "one range left");
+    assert_eq!(rest[0].after, start, "nothing below the scan is settled");
+    assert_eq!(rest[0].top.lamport, 21, "only 21..=30 were scanned");
+    assert!(rest[0].top_exclusive);
     assert!(next.has_history());
 }
 // what this catches (Codex (c) on #1617): showing the ambient count once does
@@ -445,6 +445,44 @@ async fn a_crash_after_output_replays_the_page_and_never_skips() {
     assert_eq!(page(summary(&mut next, &airc).await), vec![4, 3, 2, 1]);
     assert_eq!(first, (5..=12).rev().collect::<Vec<_>>());
 }
+// what this catches (Cormac on #1617): a request that arrives during a SECOND
+// outage, while older addressed pages are still owed, is searched too and
+// emitted exactly once; no shown request is emitted again.
+#[tokio::test]
+async fn a_request_from_a_second_outage_is_emitted_exactly_once() {
+    let (_dir, airc, room) = fixture().await;
+    for n in 1..=20 {
+        airc.append_event(request(&airc, room, n)).await.unwrap();
+    }
+    let me = airc.addressee().await.unwrap();
+    let mut shown = Vec::new();
+    let mut first = airc
+        .prepare_native_delivery("outages", true, 64, 64)
+        .await
+        .unwrap();
+    let page = first
+        .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, WINDOW)
+        .await
+        .unwrap()
+        .unwrap();
+    shown.extend(page.addressed.iter().map(|e| e.lamport));
+    first.acknowledge(0, true).await.unwrap(); // one page shown, then detach
+    airc.append_event(request(&airc, room, 21)).await.unwrap(); // second outage
+    shown.extend(walk(&airc, "outages", WINDOW, true).await);
+    let mut sorted = shown.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        (1..=21).collect::<Vec<_>>(),
+        "every request once: {shown:?}"
+    );
+    assert_eq!(&shown[..8], (13..=20).rev().collect::<Vec<_>>().as_slice());
+    assert_eq!(
+        shown[8], 21,
+        "the late request is searched first, newest range first"
+    );
+}
+
 // what this catches (Codex on #1617): `live` is the delivery proof. A reattach
 // after an outage that is dropped before any output leaves it where it was; the
 // outage events are history, never marked delivered by the attach.

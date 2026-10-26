@@ -24,7 +24,6 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use addressed::AddressedProgress;
 pub use addressed::AddressedWindow;
 use history::HistoryProgress;
 pub use history::HistorySummary;
@@ -157,16 +156,11 @@ impl AgentDeliveryTurn {
             turn.state.live = delivered;
             if let (true, Some(progress)) = (settle_history, turn.progress.take()) {
                 turn.state.history_counted |= progress.counted_shown;
-                match progress.addressed {
-                    AddressedProgress::Finished => {
-                        turn.state.summarized = turn.state.boundary.clone();
-                        turn.state.history_counted = false;
-                        turn.state.addressed_below = None;
-                    }
-                    AddressedProgress::Below(cursor) => {
-                        turn.state.addressed_below = Some(cursor);
-                    }
+                if progress.unsearched.is_empty() {
+                    turn.state.summarized = turn.state.boundary.clone();
+                    turn.state.history_counted = false;
                 }
+                turn.state.unsearched = progress.unsearched;
             }
             persist(&turn.airc, &turn.consumer, &turn.state).await
         })
@@ -284,6 +278,8 @@ impl Airc {
                         "unsupported or changed delivery scope/state; history retained",
                     ));
                 }
+                let mut state = state;
+                state.ensure_unsearched();
                 state
             } else {
                 // A legacy checkpoint seeds the summary watermark: what it already
@@ -297,7 +293,7 @@ impl Airc {
                 } else {
                     tip.clone()
                 };
-                let state = State {
+                let mut state = State {
                     version: 1,
                     live: boundary.clone(),
                     boundary,
@@ -305,8 +301,9 @@ impl Airc {
                     rooms: channels.clone(),
                     source,
                     history_counted: false,
-                    addressed_below: None,
+                    unsearched: Vec::new(),
                 };
+                state.ensure_unsearched();
                 persist(self, &consumer, &state).await?;
                 state
             };
@@ -317,20 +314,27 @@ impl Airc {
             // acknowledged. A settled consumer's next history starts where its
             // previous reading stopped (`scan_from`: what was delivered or already
             // history), so nothing is counted twice; an unsettled one keeps its
-            // oldest position and its addressed checkpoint until it finishes.
+            // oldest position and every unsearched range it still owes. Either way
+            // the new segment `(read_through, tip]` is appended as unsearched, so a
+            // request that arrived during this outage is searched too.
             // History is never replayed as live output; `airc inbox` reads it.
             let settled = key(&state.summarized) >= key(&state.boundary);
             let read_through = state.scan_from().clone();
             if settled {
                 state.summarized = read_through.clone();
                 state.history_counted = false;
-                state.addressed_below = None;
+                state.unsearched.clear();
             }
             if key(&tip) > key(&read_through) {
                 if !settled {
                     // The range grew: its count must be shown again.
                     state.history_counted = false;
                 }
+                state.unsearched.push(state::Unsearched {
+                    after: read_through,
+                    top: tip.clone(),
+                    top_exclusive: false,
+                });
                 state.boundary = tip.clone();
             } else {
                 state.boundary = read_through;

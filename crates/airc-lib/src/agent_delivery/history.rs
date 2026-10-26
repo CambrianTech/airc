@@ -3,7 +3,8 @@
 
 use airc_core::TranscriptEvent;
 
-use super::addressed::{AddressedProgress, AddressedWindow};
+use super::addressed::AddressedWindow;
+use super::state::Unsearched;
 use super::{key, AgentDeliveryTurn};
 use crate::AircError;
 
@@ -30,12 +31,13 @@ pub struct HistorySummary {
     pub addressed_complete: bool,
 }
 
-/// How far one summary turn got: whether it showed the count, and how far down
-/// the addressed requests are emitted (or that the range is finished).
+/// How far one summary turn got: whether it showed the count, and the
+/// unsearched ranges left once its addressed page is emitted.
 #[derive(Clone)]
 pub(super) struct HistoryProgress {
     pub(super) counted_shown: bool,
-    pub(super) addressed: AddressedProgress,
+    /// The unsearched ranges once this turn's page is emitted; empty: settle.
+    pub(super) unsearched: Vec<Unsearched>,
 }
 impl AgentDeliveryTurn {
     /// One turn of the unsettled pre-attachment history. The ambient count is
@@ -81,10 +83,10 @@ impl AgentDeliveryTurn {
             Vec::new()
         };
         let page = self.addressed_history(shown, me, window).await?;
-        let addressed_complete = matches!(page.progress, AddressedProgress::Finished);
+        let addressed_complete = page.unsearched.is_empty();
         self.progress = Some(HistoryProgress {
             counted_shown: !self.state.history_counted,
-            addressed: page.progress,
+            unsearched: page.unsearched,
         });
         if counted.is_none() && page.shown.is_empty() {
             return Ok(None);

@@ -14,9 +14,11 @@ use super::key;
 /// - `summarized`: history settled through here (counted, and every addressed
 ///   request in it emitted). Moves only when a summary turn finishes the range.
 /// - `history_counted`: the ambient count of `(summarized, boundary]` was shown.
-/// - `addressed_below`: addressed requests at or after this position (and up to
-///   `boundary`) have been emitted; the next page reads strictly below it.
-///   `None`: none emitted yet in this range.
+/// - `unsearched`: the stretches of `(summarized, boundary]` whose addressed
+///   requests are not yet all emitted, oldest first. A turn pages the newest one
+///   down; an unsettled reattach appends the new top segment rather than losing
+///   it. Nothing is ever reset, so no shown request is emitted twice, and the
+///   range settles only when this list is empty.
 ///
 /// Settling a summary marks nothing delivered, delivering marks no history
 /// summarized, and no settlement buries an addressed request not yet emitted.
@@ -33,9 +35,31 @@ pub(super) struct State {
     #[serde(default)]
     pub(super) history_counted: bool,
     #[serde(default)]
-    pub(super) addressed_below: Option<TranscriptCursor>,
+    pub(super) unsearched: Vec<Unsearched>,
+}
+
+/// Pre-attachment history whose addressed requests are not all emitted yet:
+/// events after `after`, up to `top` (inclusive unless `top_exclusive`, which a
+/// page sets so the next one reads strictly below what it already showed).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct Unsearched {
+    pub(super) after: TranscriptCursor,
+    pub(super) top: TranscriptCursor,
+    pub(super) top_exclusive: bool,
 }
 impl State {
+    /// The whole unsettled history as one unsearched range, for a state that has
+    /// none recorded (a new consumer, or a row written before ranges existed).
+    pub(super) fn ensure_unsearched(&mut self) {
+        if key(&self.summarized) < key(&self.boundary) && self.unsearched.is_empty() {
+            self.unsearched.push(Unsearched {
+                after: self.summarized.clone(),
+                top: self.boundary.clone(),
+                top_exclusive: false,
+            });
+        }
+    }
+
     /// Where live delivery reads from: after both what was delivered and where
     /// this attachment began.
     pub(super) fn scan_from(&self) -> &TranscriptCursor {
