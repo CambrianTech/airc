@@ -41,9 +41,13 @@ pub(crate) fn history_line(summary: &HistorySummary) -> Option<String> {
     let (Some(oldest), Some(newest)) = (counted.oldest_ms, counted.newest_ms) else {
         return None;
     };
+    let shown = match summary.recent.len() {
+        0 => String::new(),
+        n => format!("; the newest {n} follow, the rest are"),
+    };
     (counted.count > 0).then(|| {
         format!(
-            "AIRC: {} earlier events from before this session attached ({} to {}), not replayed; read them with `airc inbox --all --json`.",
+            "AIRC: {} earlier events from before this session attached ({} to {}){shown} not replayed; read them with `airc inbox --all --json`.",
             counted.count,
             original_time(oldest),
             original_time(newest),
@@ -66,11 +70,17 @@ pub(crate) fn more_addressed_line(summary: &HistorySummary) -> Option<String> {
     })
 }
 
-/// History in a hook: the count, then one page of the requests addressed to
-/// this identity, newest first, each whole with its original time, then what
-/// the page left out. A direct request is never folded into the count.
+/// History in a hook: the count, the newest page of room events whole (oldest
+/// first, as a channel opens), then one page of the requests addressed to this
+/// identity, newest first, then what the page left out. Every shown event
+/// carries its original time; a direct request is never folded into the count.
 pub(super) fn history_section(summary: &HistorySummary) -> Option<String> {
     let mut lines: Vec<String> = history_line(summary).into_iter().collect();
+    lines.extend(
+        digest_messages(&summary.recent)
+            .iter()
+            .map(|m| format!("- {} [{}]: {}", m.peer, m.at, m.body)),
+    );
     let addressed = digest_messages(&summary.addressed);
     if !addressed.is_empty() {
         lines

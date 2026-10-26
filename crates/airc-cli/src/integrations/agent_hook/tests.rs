@@ -238,9 +238,12 @@ async fn backlog_is_one_summary_then_only_new_events() {
         visible,
     )
     .unwrap();
-    assert!(context.starts_with("AIRC: 44 earlier events from before this session attached"));
+    assert!(context.starts_with(
+        "AIRC: 44 earlier events from before this session attached (1970-01-01T00:00Z to 1970-01-01T00:00Z); the newest 8 follow"
+    ), "{context}");
     assert!(context.contains("fresh-first") && context.contains("fresh-second"));
-    assert!(!context.contains("old instruction"));
+    // The newest page of the room (as a channel opens), never the older 36.
+    assert_eq!(context.matches("old instruction").count(), 8, "{context}");
     assert!(!context.contains("hidden self"));
     assert!(!context.contains("excluded presence"));
     drop(turn); // output failure: no acknowledgment, the same context is due again
@@ -312,7 +315,19 @@ async fn a_direct_request_before_attach_is_shown_while_room_history_is_one_line(
         "{context}"
     );
     assert!(context.contains("AIRC: 501 earlier events"), "{context}");
-    assert!(!context.contains("old-room-"), "{context}");
+    // One bounded read of the newest page (8 events): the direct request is one of
+    // them and shows in its own section, so 7 room events follow the count.
+    assert!(context.contains("the newest 7 follow"), "{context}");
+    let shows = |body: &str| {
+        context
+            .lines()
+            .any(|line| line.ends_with(&format!(": {body}")))
+    };
+    assert!(shows("old-room-500") && shows("old-room-494"), "{context}");
+    assert!(
+        !shows("old-room-493"),
+        "the older 493 are counted, not shown: {context}"
+    );
     let shown = format!(
         "[{}]: please review #1617",
         super::render::original_time(two_minutes_ago)
@@ -358,24 +373,35 @@ async fn leading_at_names_address_pre_attach_history_and_mid_sentence_names_do_n
     append_text(&airc, room, 3, "I told Fable already", MentionTarget::All).await;
     let mut turn = airc.prepare_agent_delivery("names", 50, 8).await.unwrap();
     let me = airc.addressee().await.unwrap();
+    let lamports =
+        |events: &[TranscriptEvent]| events.iter().map(|e| e.lamport).collect::<Vec<_>>();
     let summary = summarize(&mut turn, &me, |_| true).await.unwrap();
+    assert_eq!(
+        lamports(&summary.addressed),
+        [1],
+        "only my leading name addresses me"
+    );
+    assert_eq!(
+        lamports(&summary.recent),
+        [2, 3],
+        "the rest is room history, shown whole"
+    );
     let text = super::render::history_section(&summary).unwrap();
     assert!(text.contains("please rebase"), "{text}");
     assert!(text.contains("AIRC: 3 earlier events"), "{text}");
-    assert!(
-        !text.contains("review #1617") && !text.contains("I told Fable"),
-        "{text}"
-    );
     for name in ["Fable", "codex"] {
         let other = airc_lib::Addressee::new(PeerId::new(), [name.to_string()]);
         let summary = summarize(&mut turn, &other, |_| true).await.unwrap();
-        let text = super::render::history_section(&summary).unwrap();
-        assert!(
-            text.contains("@Fable @Codex review #1617"),
-            "{name}: {text}"
+        assert_eq!(
+            lamports(&summary.addressed),
+            [2],
+            "{name}: both leading names address"
         );
-        assert!(!text.contains("I told Fable"), "{name}: {text}");
-        assert!(text.contains("AIRC: 3 earlier events"), "{name}: {text}");
+        assert_eq!(
+            lamports(&summary.recent),
+            [1, 3],
+            "{name}: mid-sentence is not addressed"
+        );
     }
 }
 

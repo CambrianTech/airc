@@ -259,7 +259,18 @@ fn backlog_is_summarized_once_then_only_new_messages_deliver() {
         first.contains("earlier events from before this session attached"),
         "{first}"
     );
-    assert!(!first.contains("retained-old-"), "{first}");
+    // The newest page (--max-items 2) opens the session whole; the older ten are
+    // counted, never replayed.
+    let shows = |body: &str| {
+        first
+            .lines()
+            .any(|line| line.ends_with(&format!(": {body}")))
+    };
+    assert!(
+        shows("retained-old-11") && shows("retained-old-10"),
+        "{first}"
+    );
+    assert!(!shows("retained-old-9"), "{first}");
     assert!(
         run_hook(&home, args, "{}").trim().is_empty(),
         "the summary is shown once"

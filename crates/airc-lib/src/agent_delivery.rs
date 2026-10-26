@@ -1,14 +1,16 @@
 //! Live delivery with output-owned acknowledgment, and pre-attachment history
-//! summarized once instead of replayed.
+//! summarized instead of replayed.
 //!
 //! A consumer's first turn (and a native feed's every attachment) finds history it
 //! was never attached for: everything between its last settled position and the
 //! present. That history used to be paged out as "retained catch-up" a few items per
 //! turn, oldest first, so a scope with months of backlog emitted months-old chat on
-//! every hook call and never drained (card ba22c72c, the M5 on 2026-10-26). It is now
-//! counted once ([`AgentDeliveryTurn::history_summary`]); the caller shows that one
-//! line, settles it on acknowledgment, and from then on carries only events that
-//! arrived after attachment. The history itself stays durable for `airc inbox`.
+//! every hook call and never drained (card ba22c72c, the M5 on 2026-10-26). Now a
+//! turn opens it the way a chat client opens a channel: the store's count of the
+//! range with its original times, and the newest page of room events whole, once
+//! ([`AgentDeliveryTurn::history_summary`]). Requests addressed to this identity
+//! page on later turns until every one is shown, and only then does the range
+//! settle. The history itself stays durable for `airc inbox`.
 use crate::{Airc, AircError, EventFilter, EventScan};
 use airc_core::{EventId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_store::StoredScopedState;
@@ -137,6 +139,10 @@ pub struct HistorySummary {
     /// Matching events in the range, with their oldest and newest times; shown
     /// once per range (`None` on later turns that only page addressed requests).
     pub counted: Option<airc_core::HistoryCount>,
+    /// The newest page of the range's room events, shown whole, oldest first,
+    /// with the count (the way a chat client opens a channel on its newest
+    /// page). Addressed requests are not repeated here; they page below.
+    pub recent: Vec<TranscriptEvent>,
     /// One reader page of the events addressed to this identity, newest first.
     pub addressed: Vec<TranscriptEvent>,
     /// Addressed events already found beyond that page; later turns emit them.
@@ -212,7 +218,9 @@ impl AgentDeliveryTurn {
         key(&self.state.summarized) < key(&self.state.boundary)
     }
     /// One turn of the unsettled pre-attachment history. The ambient count is
-    /// the store's (headers only, no event read) and is shown once per range;
+    /// the store's (headers only, no event read) and is shown once per range,
+    /// with the newest page of room events shown whole (one bounded newest-first
+    /// store read of `window.page` events, never a walk);
     /// addressed requests are paged newest first by [`Self::addressed_history`]
     /// until every one is emitted, and only then does the range settle.
     /// `own_sends` is the ONE self-echo rule, applied to the count (translated by
@@ -246,6 +254,11 @@ impl AgentDeliveryTurn {
             (count.count > 0).then_some(count)
         };
         let shown = |e: &TranscriptEvent| keep(e) && !own_sends.is_some_and(|r| r.is_self_event(e));
+        let recent = if counted.is_some() {
+            self.recent_history(&shown, me, window.page).await?
+        } else {
+            Vec::new()
+        };
         let page = self.addressed_history(shown, me, window).await?;
         let addressed_complete = matches!(page.progress, AddressedProgress::Finished);
         self.progress = Some(HistoryProgress {
@@ -257,10 +270,36 @@ impl AgentDeliveryTurn {
         }
         Ok(Some(HistorySummary {
             counted,
+            recent,
             addressed: page.shown,
             more_addressed: page.more,
             addressed_complete,
         }))
+    }
+    /// The newest `page` room events of the unsettled history that `shown` keeps,
+    /// oldest first, leaving out requests addressed to `me` (those page on their
+    /// own). One newest-first store read bounded by `page`; never a walk.
+    async fn recent_history(
+        &self,
+        shown: &impl Fn(&TranscriptEvent) -> bool,
+        me: &crate::Addressee,
+        page: usize,
+    ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let tail = self
+            .airc
+            .scan_agent_feed_in_channels(
+                None,
+                &self.state.boundary,
+                page.clamp(1, 4096),
+                &self.channels,
+            )
+            .await?;
+        Ok(tail
+            .events
+            .into_iter()
+            .filter(|e| key(&e.cursor()) > key(&self.state.summarized))
+            .filter(|e| shown(e) && !me.is_addressed(e))
+            .collect())
     }
     /// The next page of requests addressed to `me` in the unsettled history,
     /// newest first, strictly below what earlier turns emitted.

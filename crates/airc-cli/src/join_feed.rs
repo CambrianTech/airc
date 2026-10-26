@@ -243,6 +243,10 @@ async fn print_delivery_turn(
         if let Some(line) = crate::integrations::agent_hook::history_line(&summary) {
             writeln!(output, "{line}")?;
         }
+        // The newest page of the room, whole, as the channel opens.
+        for event in &summary.recent {
+            print_event(event, self_filter, output, attached_at_ms)?;
+        }
         // A request addressed to this identity is never reduced to the count:
         // one page of them, newest first, then what the page left out.
         for event in &summary.addressed {
@@ -407,7 +411,10 @@ mod tests {
         assert!(
             text.find("fresh-request").unwrap() < text.find("AIRC: 200 earlier events").unwrap()
         );
-        assert!(!text.contains("old-200"));
+        // The newest page (64) of the 200 opens the feed, the rest is counted.
+        assert!(text.lines().any(|l| l.ends_with(": old-200")), "{text}");
+        assert!(text.lines().any(|l| l.ends_with(": old-137")), "{text}");
+        assert!(!text.lines().any(|l| l.ends_with(": old-136")), "{text}");
         let mut next = Vec::new();
         print_delivery_turn(&airc, "native-new", &self_filter, &mut next, true, None, 0)
             .await
@@ -430,7 +437,8 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("AIRC: 3 earlier events from before this session attached"));
-        assert!(!text.contains("old-2"));
+        assert!(text.contains("the newest 3 follow"), "{text}");
+        assert!(text.lines().any(|l| l.ends_with(": old-2")), "{text}");
         airc.append_event(event(&airc, room, 4, "claude:peer", "fresh-request"))
             .await
             .unwrap();
