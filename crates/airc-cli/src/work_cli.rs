@@ -502,3 +502,186 @@ pub enum CliCardState {
     Merged,
     Closed,
 }
+
+impl WorkArgs {
+    /// Dispatch `airc work ...` (moved from `main.rs`, unchanged).
+    pub async fn run(self, home: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{merger, work_commands};
+        let home = home.to_path_buf();
+        match self.action {
+            WorkAction::Create {
+                room,
+                repo,
+                title,
+                body,
+                lane_id,
+                priority,
+            } => work_commands::run_create(&home, room, repo, title, body, lane_id, priority).await,
+            WorkAction::Seed {
+                repo,
+                title,
+                body,
+                lane_id,
+                priority,
+                evidence_key,
+            } => {
+                work_commands::run_seed(&home, repo, title, body, lane_id, priority, evidence_key)
+                    .await
+            }
+            WorkAction::Claim {
+                room,
+                card_id,
+                ttl_ms,
+                no_lease_required,
+            } => work_commands::run_claim(&home, room, card_id, ttl_ms, no_lease_required).await,
+            WorkAction::Heartbeat {
+                room,
+                card_id,
+                claim_id,
+                ttl_ms,
+            } => work_commands::run_heartbeat(&home, room, card_id, claim_id, ttl_ms).await,
+            WorkAction::Release {
+                room,
+                card_id,
+                claim_id,
+                reason,
+            } => work_commands::run_release(&home, room, card_id, claim_id, reason).await,
+            WorkAction::Update {
+                room,
+                card_id,
+                title,
+                body,
+                priority,
+            } => work_commands::run_update(&home, room, card_id, title, body, priority).await,
+            WorkAction::State {
+                room,
+                card_id,
+                state,
+                workspace,
+            } => work_commands::run_state(&home, room, card_id, state, workspace).await,
+            WorkAction::Close { room, card_id } => {
+                work_commands::run_close(&home, room, card_id).await
+            }
+            WorkAction::Cleanup { dry_run, force } => {
+                work_commands::run_cleanup(&home, dry_run, force).await
+            }
+            WorkAction::Board {
+                room,
+                limit,
+                available,
+                mine,
+                others,
+            } => {
+                let filter = work_commands::BoardFilter::from_flags(available, mine, others);
+                work_commands::run_board(&home, room, limit, filter).await
+            }
+            WorkAction::Next {
+                repo,
+                max_priority,
+                exclude_stale,
+                limit,
+                event_limit,
+                check_idle,
+            } => {
+                work_commands::run_next(
+                    &home,
+                    repo,
+                    max_priority,
+                    !exclude_stale,
+                    limit,
+                    event_limit,
+                    check_idle,
+                )
+                .await
+            }
+            WorkAction::Roster {
+                repo,
+                event_limit,
+                active_within_ms,
+            } => work_commands::run_roster(&home, repo, event_limit, active_within_ms).await,
+            WorkAction::Manage {
+                repo,
+                max_priority,
+                exclude_stale,
+                limit,
+                event_limit,
+                active_within_ms,
+            } => {
+                work_commands::run_manage(
+                    &home,
+                    repo,
+                    max_priority,
+                    !exclude_stale,
+                    limit,
+                    event_limit,
+                    active_within_ms,
+                )
+                .await
+            }
+            WorkAction::Review {
+                room,
+                parent_id,
+                pr,
+                priority,
+                body,
+            } => work_commands::run_review(&home, room, parent_id, pr, priority, body).await,
+            WorkAction::Availability {
+                repo,
+                state,
+                note,
+                ttl_ms,
+            } => work_commands::run_availability(&home, repo, state, note, ttl_ms).await,
+            WorkAction::Merger { action } => match action {
+                MergerAction::Run {
+                    interval_secs,
+                    dry_run,
+                } => {
+                    merger::run(
+                        &home,
+                        std::time::Duration::from_secs(interval_secs),
+                        dry_run,
+                    )
+                    .await
+                }
+            },
+            WorkAction::Merge {
+                room,
+                card_id,
+                dry_run,
+                pending_timeout_secs,
+            } => {
+                work_commands::run_merge(&home, room, card_id, dry_run, pending_timeout_secs).await
+            }
+            WorkAction::Link { room, card_id, pr } => {
+                work_commands::run_link(&home, room, card_id, pr).await
+            }
+            WorkAction::Relink { card_id, pr } => {
+                work_commands::run_relink(&home, card_id, pr).await
+            }
+            WorkAction::Submit {
+                card_id,
+                patch,
+                base,
+                instance,
+                room,
+            } => work_commands::run_submit(&home, room, card_id, patch, base, instance).await,
+            WorkAction::SubmissionReview {
+                review_card_id,
+                outcome,
+                evidence_file,
+                submission,
+                room,
+            } => {
+                work_commands::run_submission_review(
+                    &home,
+                    room,
+                    review_card_id,
+                    outcome,
+                    evidence_file,
+                    submission,
+                )
+                .await
+            }
+        }
+    }
+}

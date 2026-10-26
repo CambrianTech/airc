@@ -17,13 +17,13 @@ async fn daemon_history_is_summarized_once_and_live_is_never_behind_it() {
             .unwrap(),
     );
     let fresh = airc.say("fresh-request").await.unwrap();
-    let page = airc
+    let mut page = airc
         .prepare_agent_delivery("consumer", 32, 8)
         .await
         .unwrap();
     assert!(page.live_events().iter().any(|e| e.event_id == fresh));
     let summary = page.history_summary(|_| true).await.unwrap().unwrap();
-    assert!(summary.at_least && (1..=32).contains(&summary.count));
+    assert!(!summary.more && summary.count >= 96, "{summary:?}");
     assert!(summary.oldest_ms <= summary.newest_ms);
     let live = page.live_events().len();
     page.acknowledge(live, true).await.unwrap();

@@ -192,7 +192,7 @@ async fn print_delivery_turn(
     room: Option<RoomId>,
     attached_at_ms: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let turn = match room {
+    let mut turn = match room {
         Some(_) => {
             airc.prepare_native_delivery(consumer, announce_history, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
                 .await?
@@ -230,11 +230,13 @@ async fn print_delivery_turn(
         None
     };
     if let Some(summary) = history {
-        writeln!(
-            output,
-            "{}",
-            crate::integrations::agent_hook::history_line(&summary)
-        )?;
+        if let Some(line) = crate::integrations::agent_hook::history_line(&summary) {
+            writeln!(output, "{line}")?;
+        }
+        // A request addressed to this identity is never reduced to the count.
+        for event in &summary.addressed {
+            print_event(event, self_filter, output, attached_at_ms)?;
+        }
     }
     output.flush()?;
     let pending = turn.has_pending(live_end);
@@ -389,8 +391,7 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(
-            text.find("fresh-request").unwrap()
-                < text.find("at least 64 earlier messages").unwrap()
+            text.find("fresh-request").unwrap() < text.find("AIRC: 200 earlier messages").unwrap()
         );
         assert!(!text.contains("old-200"));
         let mut next = Vec::new();

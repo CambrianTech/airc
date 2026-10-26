@@ -95,23 +95,26 @@ async fn persist(airc: &Airc, consumer: &str, state: &State) -> Result<(), AircE
         .await?;
     Ok(())
 }
-/// What a turn found between a consumer's settled position and its attachment:
-/// counted, not replayed (card ba22c72c).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What a turn found between a consumer's settled position and its attachment.
+/// Ambient room history is counted, never replayed; a request addressed to this
+/// identity is never reduced to a count (card ba22c72c, and the DeliverySelection
+/// contract that an authorized direct request is never filtered out).
+#[derive(Clone, Debug, PartialEq)]
 pub struct HistorySummary {
-    /// Kept events counted in the range.
+    /// Kept ambient events counted in the walked part of the range.
     pub count: usize,
-    /// The count stopped at one scan page; the range holds more than `count`.
-    pub at_least: bool,
-    /// Original timestamps of the oldest and newest kept events.
+    /// Original timestamps of the oldest and newest counted ambient events.
     pub oldest_ms: u64,
     pub newest_ms: u64,
+    /// Kept events addressed to this identity, oldest first, shown whole.
+    pub addressed: Vec<TranscriptEvent>,
+    /// The walk stopped at one scan page; newer history is counted next turn.
+    pub more: bool,
 }
-/// Events read from the newest end of a history range when the counting page
-/// stopped short, to find the newest kept event. A bound on work, not a tuning
-/// value: a range whose newest 64 events are all hidden reports the counted
-/// page's newest instead, which is still an original timestamp from the range.
-const HISTORY_TAIL: usize = 64;
+/// Events one turn walks through pre-attachment history: the scan contract's
+/// maximum page. A backlog larger than this drains one page per turn instead of
+/// one unbounded walk that could outlast a runtime's hook deadline.
+const HISTORY_PAGE: usize = 4096;
 /// Owns exclusive delivery rights until acknowledged or dropped. Output must be
 /// flushed before `acknowledge`. Dropping without ack retains the live range and
 /// the unsettled history. Crash after output but before ack may replay; stdout has
@@ -125,7 +128,8 @@ pub struct AgentDeliveryTurn {
     live: EventScan,
     through: TranscriptCursor,
     channels: Vec<RoomId>,
-    scan_limit: usize,
+    /// How far `history_summary` walked; what acknowledgment may settle.
+    walked: Option<TranscriptCursor>,
     pub budget: usize,
 }
 impl AgentDeliveryTurn {
@@ -150,55 +154,54 @@ impl AgentDeliveryTurn {
     pub fn has_history(&self) -> bool {
         key(&self.state.backlog) < key(&self.state.boundary)
     }
-    /// Count the unsettled pre-attachment history that `keep` would show, with the
-    /// original timestamps of its oldest and newest kept events. One forward page
-    /// counts (exact up to the scan limit, `at_least` beyond it); `None` when there
-    /// is no history or none of it is kept.
+    /// Walk up to one page of the unsettled pre-attachment history that `keep`
+    /// would show: ambient events are counted with their original times, events
+    /// addressed to this identity are returned whole. `None` when the walked page
+    /// holds nothing kept. Acknowledging with `settle_history` settles exactly
+    /// the walked part; a larger backlog continues on the next turn.
     pub async fn history_summary(
-        &self,
+        &mut self,
         keep: impl Fn(&TranscriptEvent) -> bool,
     ) -> Result<Option<HistorySummary>, AircError> {
         if !self.has_history() {
             return Ok(None);
         }
-        let (after, boundary) = (&self.state.backlog, &self.state.boundary);
+        let boundary = self.state.boundary.clone();
         let page = self
             .airc
-            .scan_agent_feed_in_channels(Some(after), boundary, self.scan_limit, &self.channels)
+            .scan_agent_feed_in_channels(
+                Some(&self.state.backlog),
+                &boundary,
+                HISTORY_PAGE,
+                &self.channels,
+            )
             .await?;
-        let kept: Vec<_> = page.events.iter().filter(|e| keep(e)).collect();
-        let at_least = page
+        let walked = page
             .scanned_through
-            .as_ref()
-            .is_some_and(|c| key(c) < key(boundary));
-        let (Some(oldest), Some(last)) = (kept.first(), kept.last()) else {
+            .clone()
+            .ok_or_else(|| fail("history scan certified no position; nothing settled"))?;
+        let more = key(&walked) < key(&boundary);
+        self.walked = Some(walked);
+        let me = self.airc.peer_id();
+        let (addressed, ambient): (Vec<_>, Vec<_>) = page
+            .events
+            .into_iter()
+            .filter(|e| keep(e))
+            .partition(|e| e.target == airc_core::MentionTarget::Peer(me));
+        if ambient.is_empty() && addressed.is_empty() {
             return Ok(None);
-        };
-        let mut newest_ms = last.occurred_at_ms;
-        if at_least {
-            let tail = self
-                .airc
-                .scan_agent_feed_in_channels(None, boundary, HISTORY_TAIL, &self.channels)
-                .await?;
-            if let Some(newest) = tail
-                .events
-                .iter()
-                .rev()
-                .find(|e| key(&e.cursor()) > key(after) && keep(e))
-            {
-                newest_ms = newest.occurred_at_ms;
-            }
         }
         Ok(Some(HistorySummary {
-            count: kept.len(),
-            at_least,
-            oldest_ms: oldest.occurred_at_ms,
-            newest_ms,
+            count: ambient.len(),
+            oldest_ms: ambient.first().map_or(0, |e| e.occurred_at_ms),
+            newest_ms: ambient.last().map_or(0, |e| e.occurred_at_ms),
+            addressed,
+            more,
         }))
     }
-    /// Consumes the guard. `settle_history` records that the caller has shown the
-    /// history summary (or that there was nothing in it worth showing), so the
-    /// next turn starts at the present. The finite commit task retains OS
+    /// Consumes the guard. `settle_history` records that the caller has shown what
+    /// `history_summary` returned (or that it returned nothing), settling the
+    /// walked part of the history; without a walk nothing is settled. The finite commit task retains OS
     /// ownership even if its caller is cancelled while the database driver still
     /// executes the write.
     pub async fn acknowledge(self, live_end: usize, settle_history: bool) -> Result<(), AircError> {
@@ -212,8 +215,12 @@ impl AgentDeliveryTurn {
                 return Err(fail("acknowledgment outside prepared range"));
             }
             turn.state.live = live;
-            if settle_history {
-                turn.state.backlog = turn.state.boundary.clone();
+            if let (true, Some(walked)) = (settle_history, turn.walked.take()) {
+                if key(&walked) > key(&turn.state.backlog)
+                    && key(&walked) <= key(&turn.state.boundary)
+                {
+                    turn.state.backlog = walked;
+                }
             }
             persist(&turn.airc, &turn.consumer, &turn.state).await
         })
@@ -390,7 +397,7 @@ impl Airc {
             live,
             through,
             channels,
-            scan_limit,
+            walked: None,
             budget,
         })
     }
@@ -457,7 +464,7 @@ mod tests {
         live.acknowledge(1, true).await.unwrap();
         append(&airc, room, 2).await;
         append(&airc, room, 3).await;
-        let attached = airc
+        let mut attached = airc
             .prepare_native_delivery("native", true, 64, 64)
             .await
             .unwrap();
@@ -469,7 +476,7 @@ mod tests {
         );
         drop(attached); // summary not shown: it stays unsettled across reattach
         append(&airc, room, 4).await;
-        let again = airc
+        let mut again = airc
             .prepare_native_delivery("native", true, 64, 64)
             .await
             .unwrap();
@@ -499,7 +506,7 @@ mod tests {
         for n in 1..=1000 {
             append(&airc, room, n).await;
         }
-        let initial = airc
+        let mut initial = airc
             .prepare_agent_delivery("consumer", 64, 8)
             .await
             .unwrap();
@@ -508,10 +515,11 @@ mod tests {
         assert_eq!(
             summary,
             HistorySummary {
-                count: 64,
-                at_least: true,
+                count: 1000,
                 oldest_ms: 1,
-                newest_ms: 1000
+                newest_ms: 1000,
+                addressed: Vec::new(),
+                more: false,
             }
         );
         let hidden_newest = initial
@@ -522,12 +530,13 @@ mod tests {
         assert_eq!(hidden_newest.newest_ms, 999);
         drop(initial); // output failed: the summary stays due
         append(&airc, room, 1001).await;
-        let first = airc
+        let mut first = airc
             .prepare_agent_delivery("consumer", 64, 8)
             .await
             .unwrap();
         assert!(first.has_history());
         assert_eq!(first.live_events()[0].lamport, 1001);
+        assert!(first.history_summary(|_| true).await.unwrap().is_some());
         first.acknowledge(1, true).await.unwrap();
         assert!(airc
             .load_runtime_cursor("consumer")
@@ -537,7 +546,7 @@ mod tests {
         let reopened = Airc::open_with_wire_root_for_test(dir.path(), dir.path())
             .await
             .unwrap();
-        let settled = reopened
+        let mut settled = reopened
             .prepare_agent_delivery("consumer", 64, 8)
             .await
             .unwrap();
@@ -552,6 +561,47 @@ mod tests {
             .unwrap();
         assert_eq!(next.live_events().len(), 1);
         assert_eq!(next.live_events()[0].lamport, 1002);
+    }
+    // what this catches: a direct request in pre-attachment history is never reduced
+    // to a count, even past the first page; a backlog larger than one page drains a
+    // page per turn, and a turn that never walked settles nothing.
+    #[tokio::test]
+    async fn addressed_history_is_returned_whole_and_large_backlogs_drain_by_page() {
+        let (_dir, airc, room) = fixture().await;
+        for n in 1..=5000 {
+            append(&airc, room, n).await;
+        }
+        let direct = TranscriptEvent {
+            event_id: EventId::from_u128(5001),
+            room_id: room,
+            peer_id: airc.peer_id(),
+            client_id: airc.client_id(),
+            kind: TranscriptKind::Message,
+            occurred_at_ms: 5001,
+            lamport: 5001,
+            target: MentionTarget::Peer(airc.peer_id()),
+            headers: Headers::new(),
+            body: Some(Body::text("review my PR")),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+        airc.append_event(direct.clone()).await.unwrap();
+        let unwalked = airc.prepare_agent_delivery("paged", 64, 8).await.unwrap();
+        unwalked.acknowledge(0, true).await.unwrap();
+        let mut first = airc.prepare_agent_delivery("paged", 64, 8).await.unwrap();
+        let page = first.history_summary(|_| true).await.unwrap().unwrap();
+        assert_eq!((page.count, page.more), (HISTORY_PAGE, true));
+        assert!(page.addressed.is_empty());
+        first.acknowledge(0, true).await.unwrap();
+        let mut second = airc.prepare_agent_delivery("paged", 64, 8).await.unwrap();
+        let rest = second.history_summary(|_| true).await.unwrap().unwrap();
+        assert_eq!((rest.count, rest.more), (5000 - HISTORY_PAGE, false));
+        let ids: Vec<_> = rest.addressed.iter().map(|e| e.event_id).collect();
+        assert_eq!(ids, vec![direct.event_id]);
+        second.acknowledge(0, true).await.unwrap();
+        let done = airc.prepare_agent_delivery("paged", 64, 8).await.unwrap();
+        assert!(!done.has_history());
     }
     // what this catches: output that failed before acknowledgment replays (at least once).
     #[tokio::test]

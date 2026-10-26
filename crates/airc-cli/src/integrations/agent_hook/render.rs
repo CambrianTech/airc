@@ -27,19 +27,43 @@ pub(crate) fn original_time(occurred_at_ms: u64) -> String {
         .unwrap_or_else(|| format!("{occurred_at_ms} ms since the Unix epoch"))
 }
 
-/// One line for history this consumer was never attached for: counted, not
-/// replayed, with the original times of its oldest and newest messages.
-pub(crate) fn history_line(summary: &HistorySummary) -> String {
-    let count = if summary.at_least {
-        format!("at least {}", summary.count)
+/// One line for ambient history this consumer was never attached for: counted,
+/// not replayed, with the original times of its oldest and newest messages.
+/// `None` when the walk counted no ambient message.
+pub(crate) fn history_line(summary: &HistorySummary) -> Option<String> {
+    if summary.count == 0 {
+        return None;
+    }
+    let more = if summary.more {
+        "; newer history is counted on the next call"
     } else {
-        summary.count.to_string()
+        ""
     };
-    format!(
-        "AIRC: {count} earlier messages from before this session attached ({} to {}), not replayed; read them with `airc inbox --all --json`.",
+    Some(format!(
+        "AIRC: {} earlier messages from before this session attached ({} to {}), not replayed{more}; read them with `airc inbox --all --json`.",
+        summary.count,
         original_time(summary.oldest_ms),
         original_time(summary.newest_ms),
-    )
+    ))
+}
+
+/// History in a hook: the ambient count, then every request addressed to this
+/// identity shown whole with its original time; a direct request is never a count.
+pub(super) fn history_section(summary: &HistorySummary) -> Option<String> {
+    let mut lines: Vec<String> = history_line(summary).into_iter().collect();
+    let addressed = digest_messages(&summary.addressed);
+    if !addressed.is_empty() {
+        lines.push(format!(
+            "AIRC: {} addressed to you before this session attached:",
+            addressed.len()
+        ));
+        lines.extend(
+            addressed
+                .iter()
+                .map(|m| format!("- {} [{}]: {}", m.peer, m.at, m.body)),
+        );
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 pub(super) fn render_raw<'a>(events: impl IntoIterator<Item = &'a TranscriptEvent>) -> String {

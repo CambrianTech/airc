@@ -272,8 +272,8 @@ fn delivery_context(
         .filter(|e| visible(e))
         .collect();
     let mut sections = Vec::new();
-    if let Some(summary) = history {
-        sections.push(render::history_line(summary));
+    if let Some(text) = history.and_then(render::history_section) {
+        sections.push(text);
     }
     let chat = if raw {
         render::render_raw(live.iter().copied())

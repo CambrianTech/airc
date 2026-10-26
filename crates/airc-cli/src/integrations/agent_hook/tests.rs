@@ -227,6 +227,7 @@ async fn backlog_is_one_summary_then_only_new_events() {
     retry.retain(&selection.filter);
     assert_eq!(delivery_end(&retry, false, visible), end);
     assert!(retry.has_history());
+    assert!(retry.history_summary(visible).await.unwrap().is_some());
     retry.acknowledge(end, true).await.unwrap();
     append(&airc, room, 50, Body::text("after-attach"), false, false).await;
     let mut next = airc.prepare_agent_delivery("hook", 50, 3).await.unwrap();
@@ -237,6 +238,73 @@ async fn backlog_is_one_summary_then_only_new_events() {
     assert!(context.contains("after-attach"));
     assert!(!context.contains("fresh-first") && !context.contains("old instruction"));
     assert_eq!(summarize_body(&next.live_events()[0]), "after-attach");
+}
+
+// what this catches: a request addressed to this reader two minutes before its first
+// hook call is shown whole with its original time, while 500 old room messages stay
+// one summary line (the DeliverySelection contract: a direct request is never a count).
+#[tokio::test]
+async fn a_direct_request_before_attach_is_shown_while_room_history_is_one_line() {
+    let (_dir, airc, room) = fixture().await;
+    for n in 1..=500 {
+        append(
+            &airc,
+            room,
+            n,
+            Body::text(format!("old-room-{n}")),
+            false,
+            false,
+        )
+        .await;
+    }
+    let two_minutes_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 120_000;
+    let mut direct = event(Body::text("please review #1617"));
+    direct.room_id = room;
+    direct.lamport = 501;
+    direct.event_id = EventId::from_u128(501);
+    direct.kind = TranscriptKind::Message;
+    direct.occurred_at_ms = two_minutes_ago;
+    direct.target = MentionTarget::Peer(airc.peer_id());
+    airc.append_event(direct).await.unwrap();
+    let options = super::HookOptions {
+        count: 50,
+        max_items: 8,
+        raw: false,
+        selection: DeliverySelection::default(),
+    };
+    let mut turn = super::prepare(&airc, "claude-hook:direct", &options)
+        .await
+        .unwrap();
+    let (context, end) = super::compose(&CLAUDE, &airc, &mut turn, None, &options, None)
+        .await
+        .unwrap();
+    let context = context.unwrap();
+    assert_eq!(
+        context
+            .matches("earlier messages from before this session attached")
+            .count(),
+        1,
+        "{context}"
+    );
+    assert!(context.contains("AIRC: 500 earlier messages"), "{context}");
+    assert!(!context.contains("old-room-"), "{context}");
+    let shown = format!(
+        "[{}]: please review #1617",
+        super::render::original_time(two_minutes_ago)
+    );
+    assert!(context.contains(&shown), "{context}");
+    turn.acknowledge(end, true).await.unwrap();
+    let mut next = super::prepare(&airc, "claude-hook:direct", &options)
+        .await
+        .unwrap();
+    let (again, _) = super::compose(&CLAUDE, &airc, &mut next, None, &options, None)
+        .await
+        .unwrap();
+    assert!(again.is_none(), "shown once: {again:?}");
 }
 
 #[tokio::test]
