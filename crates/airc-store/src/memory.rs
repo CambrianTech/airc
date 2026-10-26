@@ -27,6 +27,7 @@ impl CountHistory for InMemoryEventStore {
         through: &TranscriptCursor,
         channels: &[RoomId],
         headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, StoreError> {
         let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
         Ok(events
@@ -36,6 +37,7 @@ impl CountHistory for InMemoryEventStore {
                     && strictly_after(e, after)
                     && !strictly_after(e, through)
                     && headers.matches(&e.headers)
+                    && !exclude.is_some_and(|rule| rule.is_self_event(e))
             })
             .fold(airc_core::HistoryCount::default(), |count, e| {
                 count.with_event(e.occurred_at_ms)

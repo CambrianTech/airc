@@ -304,18 +304,25 @@ impl DurableSink for SqliteDurableSink {
         after: Cursor,
         through: Cursor,
         headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, BusError> {
+        let mut rows = matching_rows(channel, after, through, headers);
+        if let Some(rule) = exclude {
+            rows = rows.filter(crate::header_query::not_runtime_self(
+                rule,
+                bus_event::Column::ClientId,
+            ));
+        }
         // COUNT/MIN/MAX in the store: no row, header JSON or payload leaves SQLite.
-        let row: Option<(i64, Option<i64>, Option<i64>)> =
-            matching_rows(channel, after, through, headers)
-                .select_only()
-                .column_as(Expr::col(bus_event::Column::EventId).count(), "count")
-                .column_as(Expr::col(bus_event::Column::OccurredAtMs).min(), "oldest")
-                .column_as(Expr::col(bus_event::Column::OccurredAtMs).max(), "newest")
-                .into_tuple()
-                .one(&self.readers)
-                .await
-                .map_err(|e| BusError::Sink(e.to_string()))?;
+        let row: Option<(i64, Option<i64>, Option<i64>)> = rows
+            .select_only()
+            .column_as(Expr::col(bus_event::Column::EventId).count(), "count")
+            .column_as(Expr::col(bus_event::Column::OccurredAtMs).min(), "oldest")
+            .column_as(Expr::col(bus_event::Column::OccurredAtMs).max(), "newest")
+            .into_tuple()
+            .one(&self.readers)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
         let Some((count, oldest, newest)) = row else {
             return Ok(airc_core::HistoryCount::default());
         };

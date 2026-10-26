@@ -11,7 +11,7 @@ use airc_lib::{Airc, LiveLag};
 use futures::stream::StreamExt;
 use std::io::Write;
 
-use crate::client_id::{current_client_id, RuntimeSelfFilter};
+use crate::client_id::current_client_id;
 
 const CONSUMER_PREFIX: &str = "join-feed";
 const CATCH_UP_LIMIT: usize = 64;
@@ -23,7 +23,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_client = current_client_id()?;
     let consumer_id = format!("{}:room:{room}", consumer_id(runtime_client.as_deref()));
-    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client.as_deref());
+    let self_filter = airc_core::RuntimeSelf::new(airc.client_id(), runtime_client.as_deref());
     let mut output = std::io::stdout();
     // Native Monitor keeps its supported subscription; notifications wake bounded
     // durable scans rather than directly advancing over unseen live predecessors.
@@ -186,7 +186,7 @@ fn wall_elapsed_ms(since: std::time::SystemTime) -> u128 {
 async fn print_delivery_turn(
     airc: &Airc,
     consumer: &str,
-    self_filter: &RuntimeSelfFilter<'_>,
+    self_filter: &airc_core::RuntimeSelf,
     output: &mut impl Write,
     announce_history: bool,
     room: Option<RoomId>,
@@ -227,14 +227,14 @@ async fn print_delivery_turn(
         };
         let keep = |e: &TranscriptEvent| {
             e.kind != TranscriptKind::SubscriptionAdvanced
-                && !self_filter.is_self_event(e)
                 && crate::event_render::render_feed_line(e).is_some()
         };
         // The feed renders no liveness beat, so the count routes them out by header.
         let count_filter = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
             key: airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND.to_string(),
         }));
-        turn.history_summary(count_filter, keep, &me, window)
+        // The feed's own self rule, the one print_event applies to live lines.
+        turn.history_summary(count_filter, Some(self_filter), keep, &me, window)
             .await?
     } else {
         None
@@ -269,7 +269,7 @@ fn consumer_id(runtime_client: Option<&str>) -> String {
 
 fn print_event(
     event: &TranscriptEvent,
-    self_filter: &RuntimeSelfFilter<'_>,
+    self_filter: &airc_core::RuntimeSelf,
     output: &mut impl Write,
     attached_at_ms: u64,
 ) -> std::io::Result<()> {
@@ -316,7 +316,7 @@ mod tests {
         subscriptions::save(airc.coordinator_store_for_test(), &set)
             .await
             .unwrap();
-        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        let filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         print_delivery_turn(
             &airc,
             "focused",
@@ -370,7 +370,7 @@ mod tests {
         airc.append_event(event(&airc, room, 201, "claude:peer", "fresh-request"))
             .await
             .unwrap();
-        let self_filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        let self_filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         struct Broken;
         impl Write for Broken {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -423,7 +423,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        let filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
         print_delivery_turn(&airc, "paced", &filter, &mut output, true, None, 0)
             .await
@@ -457,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn late_arrival_carries_its_original_time() {
         let (_dir, airc, room) = fixture().await;
-        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        let filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         print_delivery_turn(&airc, "late", &filter, &mut Vec::new(), true, Some(room), 0)
             .await
             .unwrap();
@@ -513,7 +513,7 @@ mod tests {
         let mut warning = event(&airc, room, 132, "claude:peer", "ordinary warning");
         warning.kind = TranscriptKind::System;
         airc.append_event(warning).await.unwrap();
-        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        let filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
         print_delivery_turn(&airc, "filtered", &filter, &mut output, true, None, 0)
             .await
@@ -582,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn a_reattach_resumes_at_the_checkpoint() {
         let (_dir, airc, room) = fixture().await;
-        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        let filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         print_delivery_turn(
             &airc,
             "resume",

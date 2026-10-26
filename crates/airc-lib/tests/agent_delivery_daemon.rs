@@ -28,7 +28,7 @@ async fn daemon_history_is_summarized_once_and_live_is_never_behind_it() {
         page: 8,
     };
     let summary = page
-        .history_summary(airc_core::HeaderFilter::Any, |_| true, &me, window)
+        .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
         .await
         .unwrap()
         .unwrap();
@@ -105,7 +105,7 @@ async fn measure_history_turn_on_a_50k_backlog() {
         let started = std::time::Instant::now();
         let turn = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
         let summary = turn
-            .history_summary(airc_core::HeaderFilter::Any, |_| true, &me, window)
+            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
             .await
             .unwrap();
         turn.acknowledge(0, true).await.unwrap();

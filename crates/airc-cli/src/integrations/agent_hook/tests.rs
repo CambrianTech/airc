@@ -19,7 +19,7 @@ async fn summarize(
     me: &airc_lib::Addressee,
     keep: impl Fn(&TranscriptEvent) -> bool,
 ) -> Option<airc_lib::HistorySummary> {
-    turn.history_summary(airc_core::HeaderFilter::Any, keep, me, WINDOW)
+    turn.history_summary(airc_core::HeaderFilter::Any, None, keep, me, WINDOW)
         .await
         .unwrap()
 }

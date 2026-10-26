@@ -638,7 +638,13 @@ async fn handle_count_inbox(
     }
     match state
         .router
-        .count_matching(request.channel, after, through, &request.headers)
+        .count_matching(
+            request.channel,
+            after,
+            through,
+            &request.headers,
+            request.exclude_self.as_ref(),
+        )
         .await
     {
         Ok(count) => Response::CountInbox(count),

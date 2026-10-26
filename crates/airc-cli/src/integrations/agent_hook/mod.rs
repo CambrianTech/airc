@@ -23,9 +23,7 @@ use airc_core::{TranscriptEvent, TranscriptKind};
 use airc_lib::{AgentDeliveryTurn, Airc, EventFilter, LiveLag};
 use futures::StreamExt;
 
-use crate::client_id::{
-    agent_process_client_id, current_client_id, explicit_client_id, RuntimeSelfFilter,
-};
+use crate::client_id::{agent_process_client_id, current_client_id, explicit_client_id};
 use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 pub use args::HookReadArgs;
@@ -90,31 +88,36 @@ impl Default for DeliverySelection {
 }
 
 impl DeliverySelection {
-    fn shows(&self, event: &TranscriptEvent, self_filter: &RuntimeSelfFilter<'_>) -> bool {
-        self.include_self || !self_filter.is_self_event(event)
+    /// The self-echo rule this selection applies: the runtime's own sends are
+    /// hidden (and still advance the cursor) unless it asked to include them.
+    /// ONE rule for live delivery, the addressed history page and the store count.
+    fn own_sends<'a>(
+        &self,
+        rule: &'a airc_core::RuntimeSelf,
+    ) -> Option<&'a airc_core::RuntimeSelf> {
+        (!self.include_self).then_some(rule)
     }
 
-    /// The same selection as a header predicate, for the store to count history
-    /// without reading events: liveness beats and work-queue churn are routed out
-    /// by their headers, and so are this runtime's own stamped sends.
-    fn count_filter(&self, runtime_client: Option<&str>) -> airc_core::HeaderFilter {
+    fn shows(&self, event: &TranscriptEvent, rule: &airc_core::RuntimeSelf) -> bool {
+        !self
+            .own_sends(rule)
+            .is_some_and(|own| own.is_self_event(event))
+    }
+
+    /// The rest of the selection as a header predicate, for the store to count
+    /// history without reading events: liveness beats and work-queue churn are
+    /// routed out by their headers. (Own sends go through [`Self::own_sends`].)
+    fn count_filter(&self) -> airc_core::HeaderFilter {
         use airc_core::HeaderFilter;
         let absent = |key: &str| {
             HeaderFilter::Not(Box::new(HeaderFilter::Has {
                 key: key.to_string(),
             }))
         };
-        let mut all = vec![
+        HeaderFilter::All(vec![
             absent(airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND),
             absent(airc_lib::HEADER_FORGE_WORK_EVENT_KIND),
-        ];
-        if let (false, Some(client)) = (self.include_self, runtime_client) {
-            all.push(HeaderFilter::Not(Box::new(HeaderFilter::Exact {
-                key: airc_protocol::HEADER_AIRC_CLIENT.to_string(),
-                value: client.to_string(),
-            })));
-        }
-        HeaderFilter::All(all)
+        ])
     }
 }
 
@@ -234,7 +237,7 @@ async fn compose(
     options: &HookOptions,
     resume: Option<String>,
 ) -> Result<(Option<String>, usize), Box<dyn std::error::Error>> {
-    let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client);
+    let self_filter = airc_core::RuntimeSelf::new(airc.client_id(), runtime_client);
     let shows = |e: &TranscriptEvent| options.selection.shows(e, &self_filter);
     let live_end = delivery_end(turn, options.raw, shows);
     let me = airc.addressee().await?;
@@ -245,11 +248,10 @@ async fn compose(
     };
     let history = turn
         .history_summary(
-            options.selection.count_filter(runtime_client),
+            options.selection.count_filter(),
+            options.selection.own_sends(&self_filter),
             |e| {
-                options.selection.filter.matches(e)
-                    && shows(e)
-                    && (options.raw || render::is_correspondence(e))
+                options.selection.filter.matches(e) && (options.raw || render::is_correspondence(e))
             },
             &me,
             window,

@@ -352,6 +352,7 @@ impl EventRouter {
         after: Cursor,
         through: Cursor,
         headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
     ) -> crate::Result<airc_core::HistoryCount> {
         let sink_head = self.inner.sink.head_cursor(channel).await?;
         let durable_through = match sink_head {
@@ -362,7 +363,7 @@ impl EventRouter {
         let durable = if durable_through.is_after(&after) {
             self.inner
                 .sink
-                .count_matching(channel, after, durable_through, headers)
+                .count_matching(channel, after, durable_through, headers, exclude)
                 .await?
         } else {
             airc_core::HistoryCount::default()
@@ -386,6 +387,7 @@ impl EventRouter {
                                 && e.cursor().is_after(&pending_after)
                                 && !e.cursor().is_after(&through)
                                 && headers.matches(&e.headers)
+                                && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
                         })
                         .fold(airc_core::HistoryCount::default(), |count, e| {
                             count.with_event(e.occurred_at_ms)
@@ -448,14 +450,14 @@ mod tests {
         let any = airc_core::HeaderFilter::Any;
         assert_eq!(
             router
-                .count_matching(room, after, through, &any)
+                .count_matching(room, after, through, &any, None)
                 .await
                 .unwrap(),
             expect(6)
         );
         assert_eq!(
             router
-                .count_matching(room, after, through, &routed)
+                .count_matching(room, after, through, &routed, None)
                 .await
                 .unwrap(),
             expect(5)
@@ -471,16 +473,24 @@ mod tests {
             Some(through),
             "persisted"
         );
+        // The runtime-self rule applies on both legs: every event here is this
+        // client's own unstamped send, so excluding self leaves nothing.
+        let me = airc_core::RuntimeSelf::new(from.1, None);
+        let own = router
+            .count_matching(room, after, through, &any, Some(&me))
+            .await
+            .unwrap();
+        assert_eq!(own.count, 0);
         assert_eq!(
             router
-                .count_matching(room, after, through, &any)
+                .count_matching(room, after, through, &any, None)
                 .await
                 .unwrap(),
             expect(6)
         );
         assert_eq!(
             router
-                .count_matching(room, after, through, &routed)
+                .count_matching(room, after, through, &routed, None)
                 .await
                 .unwrap(),
             expect(5)

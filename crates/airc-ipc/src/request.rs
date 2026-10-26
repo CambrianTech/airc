@@ -634,4 +634,7 @@ pub struct CountInboxRequest {
     pub after: IpcCursor,
     pub through: IpcCursor,
     pub headers: HeaderFilter,
+    /// The asking runtime's own sends, left out of the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_self: Option<airc_core::RuntimeSelf>,
 }

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 
-use airc_core::{HeaderFilter, HistoryCount, RoomId, TranscriptCursor};
+use airc_core::{HeaderFilter, HistoryCount, RoomId, RuntimeSelf, TranscriptCursor};
 
 use crate::entities::event;
 use crate::error::StoreError;
@@ -18,13 +18,15 @@ use crate::sqlite::SqliteEventStore;
 
 #[async_trait]
 pub trait CountHistory: Send + Sync {
-    /// Matching events strictly after `after` and at or before `through`.
+    /// Matching events strictly after `after` and at or before `through`,
+    /// without `exclude`'s own sends.
     async fn count_history(
         &self,
         after: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[RoomId],
         headers: &HeaderFilter,
+        exclude: Option<&RuntimeSelf>,
     ) -> Result<HistoryCount, StoreError>;
 }
 
@@ -59,15 +61,23 @@ impl CountHistory for SqliteEventStore {
         through: &TranscriptCursor,
         channels: &[RoomId],
         headers: &HeaderFilter,
+        exclude: Option<&RuntimeSelf>,
     ) -> Result<HistoryCount, StoreError> {
-        let row: Option<(i64, Option<i64>, Option<i64>)> = event::Entity::find()
+        let mut query = event::Entity::find()
+            .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
+            .filter(transcript_range(after, through))
+            .filter(crate::header_query::predicate(headers));
+        if let Some(rule) = exclude {
+            query = query.filter(crate::header_query::not_runtime_self(
+                rule,
+                event::Column::ClientId,
+            ));
+        }
+        let row: Option<(i64, Option<i64>, Option<i64>)> = query
             .select_only()
             .column_as(Expr::col(event::Column::EventId).count(), "count")
             .column_as(Expr::col(event::Column::OccurredAtMs).min(), "oldest")
             .column_as(Expr::col(event::Column::OccurredAtMs).max(), "newest")
-            .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
-            .filter(transcript_range(after, through))
-            .filter(crate::header_query::predicate(headers))
             .into_tuple()
             .one(self.connection())
             .await?;

@@ -570,18 +570,24 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
     assert_eq!(sink.page(ch, None, 600).await.unwrap().len(), 514);
     // The count is the same range, counted in the store: it agrees with the page.
     let routed = sink
-        .count_matching(ch, origin, second.cursor(), &filter)
+        .count_matching(ch, origin, second.cursor(), &filter, None)
         .await
         .unwrap();
     assert_eq!(routed.count, 2);
     let all = sink
-        .count_matching(ch, origin, second.cursor(), &airc_core::HeaderFilter::Any)
+        .count_matching(
+            ch,
+            origin,
+            second.cursor(),
+            &airc_core::HeaderFilter::Any,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(all.count, 514);
     assert!(all.oldest_ms <= all.newest_ms);
     let empty = sink
-        .count_matching(ch, second.cursor(), second.cursor(), &filter)
+        .count_matching(ch, second.cursor(), second.cursor(), &filter, None)
         .await
         .unwrap();
     assert_eq!(empty, airc_core::HistoryCount::default());

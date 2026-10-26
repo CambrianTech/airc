@@ -56,7 +56,7 @@ pub use attachment::AttachmentManifest;
 pub use body::Body;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use datetime::{iso_to_epoch, DateTimeError};
-pub use filter::{filter_self_echoes, SelfFilter};
+pub use filter::{filter_self_echoes, RuntimeSelf, SelfFilter};
 pub use headers::{HeaderFilter, Headers};
 pub use history_count::HistoryCount;
 pub use humanhash::{humanhash, HumanhashError};

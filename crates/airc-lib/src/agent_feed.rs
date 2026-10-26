@@ -171,6 +171,7 @@ impl Airc {
         through: &TranscriptCursor,
         channels: &[airc_core::RoomId],
         extra: HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, AircError> {
         let predicate = HeaderFilter::All(vec![headers(), extra]);
         let mut total = airc_core::HistoryCount::default();
@@ -185,6 +186,7 @@ impl Airc {
                         after: ipc(after),
                         through: ipc(through),
                         headers: predicate.clone(),
+                        exclude_self: exclude.cloned(),
                     })
                     .await?;
                 total = total.merge(count);
@@ -194,7 +196,7 @@ impl Airc {
         Ok(self
             .inner
             .store
-            .count_history(after, through, channels, &predicate)
+            .count_history(after, through, channels, &predicate, exclude)
             .await?)
     }
 }

@@ -8,7 +8,7 @@ use airc_lib::{decode_wire_event, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
-use crate::client_id::{current_client_id, RuntimeSelfFilter};
+use crate::client_id::current_client_id;
 use crate::work_suggestions::render_claimable_work_for_event;
 
 /// One frame to surface on stdout — either a decoded transcript event
@@ -55,7 +55,7 @@ pub(crate) async fn run(
 ) -> Result<(), Box<dyn Error>> {
     let airc = Airc::open(home).await?;
     let client_id = current_client_id().ok().flatten();
-    let self_filter = RuntimeSelfFilter::new(airc.client_id(), client_id.as_deref());
+    let self_filter = airc_core::RuntimeSelf::new(airc.client_id(), client_id.as_deref());
     let socket = crate::cli::default_socket_path_in(home);
     let set = airc.subscription_set().await?;
     let channels: Vec<RoomId> = set.all().map(|sub| sub.as_room().channel).collect();
@@ -237,7 +237,7 @@ fn resume_frame(text: &str, sandbox: &Sandbox) -> String {
 
 fn render_event(
     event: &TranscriptEvent,
-    self_filter: &RuntimeSelfFilter<'_>,
+    self_filter: &airc_core::RuntimeSelf,
     sandbox: &mut Sandbox,
 ) {
     if self_filter.is_self_event(event) {
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn render_event_filters_same_client() {
         let event = event("hello");
-        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);
@@ -351,7 +351,7 @@ mod tests {
         event
             .headers
             .insert(HEADER_AIRC_CLIENT.to_string(), "codex:thread-1".to_string());
-        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);
@@ -367,7 +367,7 @@ mod tests {
             "claude:session-1".to_string(),
         );
         // Shared HOME: both durable IDs may match, but the runtime differs.
-        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn render_event_keeps_unstamped_different_client() {
         let event = event("another client on this peer");
-        let self_filter = RuntimeSelfFilter::new(ClientId::new(), Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(ClientId::new(), Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);

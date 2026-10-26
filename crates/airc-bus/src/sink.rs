@@ -75,8 +75,8 @@ pub trait DurableSink: Send + Sync {
     }
 
     /// Count the durable rows `page_matching` would select over the same
-    /// range, with the oldest and newest `occurred_at_ms`, without reading
-    /// them out. A sink without this capability must refuse, never emulate
+    /// range, minus `exclude`'s own sends, with the oldest and newest
+    /// `occurred_at_ms`, without reading them out. A sink without this capability must refuse, never emulate
     /// with a scan.
     async fn count_matching(
         &self,
@@ -84,8 +84,9 @@ pub trait DurableSink: Send + Sync {
         after: Cursor,
         through: Cursor,
         headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount> {
-        let _ = (channel, after, through, headers);
+        let _ = (channel, after, through, headers, exclude);
         Err(crate::BusError::Sink(
             "history count unsupported by sink".into(),
         ))
@@ -274,6 +275,7 @@ impl DurableSink for InMemoryDurableSink {
         after: Cursor,
         through: Cursor,
         headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Ok(guard
@@ -286,6 +288,7 @@ impl DurableSink for InMemoryDurableSink {
                     && e.cursor().is_after(&after)
                     && !e.cursor().is_after(&through)
                     && headers.matches(&e.headers)
+                    && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
             })
             .fold(airc_core::HistoryCount::default(), |count, e| {
                 count.with_event(e.occurred_at_ms)

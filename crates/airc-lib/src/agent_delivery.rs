@@ -172,11 +172,14 @@ impl AgentDeliveryTurn {
     /// Summarize the unsettled pre-attachment history in one turn: the store
     /// counts the events matching `count_filter` (headers only, no event read),
     /// and [`Self::addressed_history`] finds one page of the requests addressed
-    /// to `me` that `keep` shows. `None` when there is neither. Acknowledging
-    /// with `settle_history` then settles the whole range.
+    /// to `me` that `keep` shows. `own_sends` is the ONE self-echo rule, applied
+    /// to both: the store translates it for the count, the page applies it as is.
+    /// `None` when there is neither. Acknowledging with `settle_history` then
+    /// settles the whole range.
     pub async fn history_summary(
         &self,
         count_filter: airc_core::HeaderFilter,
+        own_sends: Option<&airc_core::RuntimeSelf>,
         keep: impl Fn(&TranscriptEvent) -> bool,
         me: &crate::Addressee,
         window: AddressedWindow,
@@ -191,10 +194,12 @@ impl AgentDeliveryTurn {
                 &self.state.boundary,
                 &self.channels,
                 count_filter,
+                own_sends,
             )
             .await?;
+        let shown = |e: &TranscriptEvent| keep(e) && !own_sends.is_some_and(|r| r.is_self_event(e));
         let (addressed, more_addressed, addressed_complete) =
-            self.addressed_history(keep, me, window).await?;
+            self.addressed_history(shown, me, window).await?;
         if counted.count == 0 && addressed.is_empty() {
             return Ok(None);
         }
@@ -490,7 +495,7 @@ mod tests {
     };
     async fn summary(turn: &AgentDeliveryTurn, airc: &Airc) -> Option<HistorySummary> {
         let me = airc.addressee().await.unwrap();
-        turn.history_summary(airc_core::HeaderFilter::Any, |_| true, &me, WINDOW)
+        turn.history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, WINDOW)
             .await
             .unwrap()
     }
@@ -585,6 +590,7 @@ mod tests {
                 airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
                     key: "airc.test.hidden".into(),
                 })),
+                None,
                 |_| true,
                 &airc.addressee().await.unwrap(),
                 WINDOW,
@@ -669,6 +675,75 @@ mod tests {
         turn.acknowledge(0, true).await.unwrap();
         let done = airc.prepare_agent_delivery("paged", 64, 8).await.unwrap();
         assert!(!done.has_history());
+    }
+    // what this catches (#1617 CI, red on 3 OSes): the history count and the
+    // addressed page apply the SAME self-echo rule as live delivery, translated by
+    // the store: an unstamped own send is left out, and a send stamped by another
+    // runtime on this shared client still counts.
+    #[tokio::test]
+    async fn history_applies_the_one_self_echo_rule_in_the_store() {
+        let (_dir, airc, room) = fixture().await;
+        let send = |n: u64, stamp: Option<&str>, target: MentionTarget| TranscriptEvent {
+            event_id: EventId::from_u128(n as u128),
+            room_id: room,
+            peer_id: airc.peer_id(),
+            client_id: airc.client_id(),
+            kind: TranscriptKind::Message,
+            occurred_at_ms: n,
+            lamport: n,
+            target,
+            headers: stamp
+                .map(|tag| {
+                    Headers::from([(
+                        airc_core::headers::HEADER_AIRC_CLIENT.to_string(),
+                        tag.to_string(),
+                    )])
+                })
+                .unwrap_or_default(),
+            body: Some(Body::text(format!("send-{n}"))),
+            attachment: None,
+            receipt: None,
+            metadata: serde_json::Value::Null,
+        };
+        let me_peer = MentionTarget::Peer(airc.peer_id());
+        airc.append_event(send(1, None, MentionTarget::All))
+            .await
+            .unwrap();
+        airc.append_event(send(2, Some("codex:other"), MentionTarget::All))
+            .await
+            .unwrap();
+        airc.append_event(send(3, None, me_peer.clone()))
+            .await
+            .unwrap();
+        airc.append_event(send(4, Some("codex:other"), me_peer))
+            .await
+            .unwrap();
+        let turn = airc
+            .prepare_agent_delivery("self-rule", 64, 8)
+            .await
+            .unwrap();
+        let me = airc.addressee().await.unwrap();
+        let own = airc_core::RuntimeSelf::new(airc.client_id(), None);
+        let found = turn
+            .history_summary(
+                airc_core::HeaderFilter::Any,
+                Some(&own),
+                |_| true,
+                &me,
+                WINDOW,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.counted.count, 2, "the two other-runtime sends");
+        let lamports: Vec<_> = found.addressed.iter().map(|e| e.lamport).collect();
+        assert_eq!(
+            lamports,
+            [4],
+            "the own request is hidden, the other runtime's shown"
+        );
+        let everything = summary(&turn, &airc).await.unwrap();
+        assert_eq!(everything.counted.count, 4);
     }
     // what this catches (Codex on #1617): the summary watermark and the delivery
     // proof are separate persisted fields. Settling a summary marks no live event

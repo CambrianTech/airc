@@ -90,6 +90,9 @@ pub fn command_for_home(home: &Path) -> Command {
     // throwaway home are mismatched, the rendezvous fails, and the
     // command exits non-zero. See `inject_gh_token` in commands.rs.
     command.env("AIRC_NO_GH_TOKEN_INJECT", "1");
+    // Hermetic identity: a test run from inside an agent session must resolve the
+    // runtime client exactly as CI does, not through the agent it was launched by.
+    command.env("AIRC_NO_AGENT_ANCESTRY", "1");
     for name in [
         "AIRC_CLIENT_ID",
         "CODEX_THREAD_ID",
