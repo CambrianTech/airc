@@ -7,6 +7,12 @@ use airc_lib::HistorySummary;
 
 use crate::work_suggestions::is_work_queue_event;
 
+/// How many items one hook notification shows: the digest's page, and the
+/// default of `--max-items`. A notification is read between steps, not browsed,
+/// so it carries a screenful and names how to read the rest. Unchanged from the
+/// digest's long-standing default.
+pub(crate) const DIGEST_PAGE: usize = 8;
+
 // Automatic context is a notification, not an export of nested transcripts. Keep
 // large bodies in durable history; explicit --raw reads retain the full payload.
 // 4 KiB is a chosen per-message notification budget, not a transport limit.
@@ -27,42 +33,56 @@ pub(crate) fn original_time(occurred_at_ms: u64) -> String {
         .unwrap_or_else(|| format!("{occurred_at_ms} ms since the Unix epoch"))
 }
 
-/// One line for ambient history this consumer was never attached for: counted,
-/// not replayed, with the original times of its oldest and newest messages.
-/// `None` when the walk counted no ambient message.
+/// One line for history this consumer was never attached for: counted by the
+/// store, not replayed, with the original times of its oldest and newest events.
+/// `None` when nothing was counted.
 pub(crate) fn history_line(summary: &HistorySummary) -> Option<String> {
-    if summary.count == 0 {
+    let counted = summary.counted;
+    let (Some(oldest), Some(newest)) = (counted.oldest_ms, counted.newest_ms) else {
         return None;
-    }
-    let more = if summary.more {
-        "; newer history is counted on the next call"
-    } else {
-        ""
     };
-    Some(format!(
-        "AIRC: {} earlier messages from before this session attached ({} to {}), not replayed{more}; read them with `airc inbox --all --json`.",
-        summary.count,
-        original_time(summary.oldest_ms),
-        original_time(summary.newest_ms),
-    ))
+    (counted.count > 0).then(|| {
+        format!(
+            "AIRC: {} earlier events from before this session attached ({} to {}), not replayed; read them with `airc inbox --all --json`.",
+            counted.count,
+            original_time(oldest),
+            original_time(newest),
+        )
+    })
 }
 
-/// History in a hook: the ambient count, then every request addressed to this
-/// identity shown whole with its original time; a direct request is never a count.
+/// The line after the addressed page: how many more requests were found, and,
+/// while the addressed search reads only the newest events (card 6fb2ea16), that
+/// older ones may be among the counted events. `None` when nothing is left out.
+pub(crate) fn more_addressed_line(summary: &HistorySummary) -> Option<String> {
+    let more = summary.more_addressed;
+    match (more, summary.addressed_complete) {
+        (0, true) => None,
+        (_, true) => Some(format!(
+            "AIRC: {more} more addressed to you; read them with `airc inbox --all --json`."
+        )),
+        (_, false) => Some(format!(
+            "AIRC: {more} more addressed to you among the newest events, and older requests may be among the counted ones; read them with `airc inbox --all --json`."
+        )),
+    }
+}
+
+/// History in a hook: the count, then one page of the requests addressed to
+/// this identity, newest first, each whole with its original time, then what
+/// the page left out. A direct request is never folded into the count.
 pub(super) fn history_section(summary: &HistorySummary) -> Option<String> {
     let mut lines: Vec<String> = history_line(summary).into_iter().collect();
     let addressed = digest_messages(&summary.addressed);
     if !addressed.is_empty() {
-        lines.push(format!(
-            "AIRC: {} addressed to you before this session attached:",
-            addressed.len()
-        ));
+        lines
+            .push("AIRC: addressed to you before this session attached, newest first:".to_string());
         lines.extend(
             addressed
                 .iter()
                 .map(|m| format!("- {} [{}]: {}", m.peer, m.at, m.body)),
         );
     }
+    lines.extend(more_addressed_line(summary));
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 

@@ -256,7 +256,7 @@ fn backlog_is_summarized_once_then_only_new_messages_deliver() {
     ];
     let first = additional_context(&run_hook(&home, args, "{}"));
     assert!(
-        first.contains("earlier messages from before this session attached"),
+        first.contains("earlier events from before this session attached"),
         "{first}"
     );
     assert!(!first.contains("retained-old-"), "{first}");
@@ -267,7 +267,7 @@ fn backlog_is_summarized_once_then_only_new_messages_deliver() {
     run_ok(&home, &["send", "new-directed-request"]);
     let next = additional_context(&run_hook(&home, args, "{}"));
     assert!(next.contains("new-directed-request"));
-    assert!(!next.contains("earlier messages") && !next.contains("retained-old-"));
+    assert!(!next.contains("earlier events") && !next.contains("retained-old-"));
     for _ in 0..3 {
         assert!(run_hook(&home, args, "{}").trim().is_empty());
     }

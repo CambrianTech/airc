@@ -10,7 +10,7 @@ pub struct HookReadArgs {
     #[arg(long, default_value_t = 50)]
     pub count: usize,
     /// Maximum events to show in digest mode.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = super::render::DIGEST_PAGE)]
     pub max_items: usize,
     /// Emit raw unread lines instead of a compact digest.
     #[arg(long)]

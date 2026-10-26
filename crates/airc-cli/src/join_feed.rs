@@ -192,7 +192,7 @@ async fn print_delivery_turn(
     room: Option<RoomId>,
     attached_at_ms: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut turn = match room {
+    let turn = match room {
         Some(_) => {
             airc.prepare_native_delivery(consumer, announce_history, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
                 .await?
@@ -220,12 +220,22 @@ async fn print_delivery_turn(
     // it is counted once per attachment, with its original times, and settled
     // (card ba22c72c). It stays durable for `airc inbox`.
     let history = if announce_history {
-        turn.history_summary(|e| {
+        let me = airc.addressee().await?;
+        let window = airc_lib::AddressedWindow {
+            candidates: CATCH_UP_LIMIT,
+            page: turn.budget,
+        };
+        let keep = |e: &TranscriptEvent| {
             e.kind != TranscriptKind::SubscriptionAdvanced
                 && !self_filter.is_self_event(e)
                 && crate::event_render::render_feed_line(e).is_some()
-        })
-        .await?
+        };
+        // The feed renders no liveness beat, so the count routes them out by header.
+        let count_filter = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
+            key: airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND.to_string(),
+        }));
+        turn.history_summary(count_filter, keep, &me, window)
+            .await?
     } else {
         None
     };
@@ -233,9 +243,13 @@ async fn print_delivery_turn(
         if let Some(line) = crate::integrations::agent_hook::history_line(&summary) {
             writeln!(output, "{line}")?;
         }
-        // A request addressed to this identity is never reduced to the count.
+        // A request addressed to this identity is never reduced to the count:
+        // one page of them, newest first, then what the page left out.
         for event in &summary.addressed {
             print_event(event, self_filter, output, attached_at_ms)?;
+        }
+        if let Some(line) = crate::integrations::agent_hook::more_addressed_line(&summary) {
+            writeln!(output, "{line}")?;
         }
     }
     output.flush()?;
@@ -391,7 +405,7 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(
-            text.find("fresh-request").unwrap() < text.find("AIRC: 200 earlier messages").unwrap()
+            text.find("fresh-request").unwrap() < text.find("AIRC: 200 earlier events").unwrap()
         );
         assert!(!text.contains("old-200"));
         let mut next = Vec::new();
@@ -415,7 +429,7 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("AIRC: 3 earlier messages from before this session attached"));
+        assert!(text.contains("AIRC: 3 earlier events from before this session attached"));
         assert!(!text.contains("old-2"));
         airc.append_event(event(&airc, room, 4, "claude:peer", "fresh-request"))
             .await

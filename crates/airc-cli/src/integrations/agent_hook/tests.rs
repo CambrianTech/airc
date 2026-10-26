@@ -7,6 +7,22 @@ use serde_json::json;
 
 use super::render::{render_digest, render_raw, summarize_body, DIGEST_BODY_BYTES};
 use super::{consumer_id, delivery_context, delivery_end, DeliverySelection};
+
+const WINDOW: airc_lib::AddressedWindow = airc_lib::AddressedWindow {
+    candidates: 50,
+    page: 8,
+};
+
+/// The store-counted summary every event in the range contributes to.
+async fn summarize(
+    turn: &airc_lib::AgentDeliveryTurn,
+    me: &airc_lib::Addressee,
+    keep: impl Fn(&TranscriptEvent) -> bool,
+) -> Option<airc_lib::HistorySummary> {
+    turn.history_summary(airc_core::HeaderFilter::Any, keep, me, WINDOW)
+        .await
+        .unwrap()
+}
 use crate::integrations::claude::CLAUDE;
 use crate::integrations::codex::hook::CODEX;
 
@@ -198,14 +214,17 @@ async fn backlog_is_one_summary_then_only_new_events() {
     let mut turn = airc.prepare_agent_delivery("hook", 50, 3).await.unwrap();
     turn.retain(&selection.filter);
     let end = delivery_end(&turn, false, visible);
-    let summary = turn
-        .history_summary(|e| selection.filter.matches(e) && visible(e))
+    let me = airc.addressee().await.unwrap();
+    let summary = summarize(&turn, &me, |e| selection.filter.matches(e) && visible(e))
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(
-        (summary.count, summary.oldest_ms, summary.newest_ms),
-        (44, 1, 44)
+        summary.counted,
+        airc_core::HistoryCount {
+            count: 44,
+            oldest_ms: Some(1),
+            newest_ms: Some(44)
+        }
     );
     let context = delivery_context(
         &turn,
@@ -217,7 +236,7 @@ async fn backlog_is_one_summary_then_only_new_events() {
         visible,
     )
     .unwrap();
-    assert!(context.starts_with("AIRC: 44 earlier messages from before this session attached"));
+    assert!(context.starts_with("AIRC: 44 earlier events from before this session attached"));
     assert!(context.contains("fresh-first") && context.contains("fresh-second"));
     assert!(!context.contains("old instruction"));
     assert!(!context.contains("hidden self"));
@@ -227,7 +246,7 @@ async fn backlog_is_one_summary_then_only_new_events() {
     retry.retain(&selection.filter);
     assert_eq!(delivery_end(&retry, false, visible), end);
     assert!(retry.has_history());
-    assert!(retry.history_summary(visible).await.unwrap().is_some());
+    assert!(summarize(&retry, &me, visible).await.is_some());
     retry.acknowledge(end, true).await.unwrap();
     append(&airc, room, 50, Body::text("after-attach"), false, false).await;
     let mut next = airc.prepare_agent_delivery("hook", 50, 3).await.unwrap();
@@ -285,12 +304,12 @@ async fn a_direct_request_before_attach_is_shown_while_room_history_is_one_line(
     let context = context.unwrap();
     assert_eq!(
         context
-            .matches("earlier messages from before this session attached")
+            .matches("earlier events from before this session attached")
             .count(),
         1,
         "{context}"
     );
-    assert!(context.contains("AIRC: 500 earlier messages"), "{context}");
+    assert!(context.contains("AIRC: 501 earlier events"), "{context}");
     assert!(!context.contains("old-room-"), "{context}");
     let shown = format!(
         "[{}]: please review #1617",
@@ -305,6 +324,93 @@ async fn a_direct_request_before_attach_is_shown_while_room_history_is_one_line(
         .await
         .unwrap();
     assert!(again.is_none(), "shown once: {again:?}");
+}
+
+async fn append_text(airc: &Airc, room: RoomId, n: u64, text: &str, target: MentionTarget) {
+    let mut e = event(Body::text(text));
+    e.room_id = room;
+    e.lamport = n;
+    e.occurred_at_ms = n;
+    e.event_id = EventId::from_u128(n as u128);
+    e.kind = TranscriptKind::Message;
+    e.target = target;
+    airc.append_event(e).await.unwrap();
+}
+
+// what this catches (Cormac on #1617): today's requests are `@name` text broadcast to
+// the room. A pre-attach "@<my name> ..." with target All is shown whole; "@Fable
+// @Codex" is shown to each; a name mid-sentence is ambient and only counted.
+#[tokio::test]
+async fn leading_at_names_address_pre_attach_history_and_mid_sentence_names_do_not() {
+    let (_dir, airc, room) = fixture().await;
+    let mine = format!("@{} please rebase", airc.agent_name().to_uppercase());
+    append_text(&airc, room, 1, &mine, MentionTarget::All).await;
+    append_text(
+        &airc,
+        room,
+        2,
+        "@Fable @Codex review #1617",
+        MentionTarget::All,
+    )
+    .await;
+    append_text(&airc, room, 3, "I told Fable already", MentionTarget::All).await;
+    let turn = airc.prepare_agent_delivery("names", 50, 8).await.unwrap();
+    let me = airc.addressee().await.unwrap();
+    let summary = summarize(&turn, &me, |_| true).await.unwrap();
+    let text = super::render::history_section(&summary).unwrap();
+    assert!(text.contains("please rebase"), "{text}");
+    assert!(text.contains("AIRC: 3 earlier events"), "{text}");
+    assert!(
+        !text.contains("review #1617") && !text.contains("I told Fable"),
+        "{text}"
+    );
+    for name in ["Fable", "codex"] {
+        let other = airc_lib::Addressee::new(PeerId::new(), [name.to_string()]);
+        let summary = summarize(&turn, &other, |_| true).await.unwrap();
+        let text = super::render::history_section(&summary).unwrap();
+        assert!(
+            text.contains("@Fable @Codex review #1617"),
+            "{name}: {text}"
+        );
+        assert!(!text.contains("I told Fable"), "{name}: {text}");
+        assert!(text.contains("AIRC: 3 earlier events"), "{name}: {text}");
+    }
+}
+
+// what this catches: 120 requests addressed to me before attach show one reader
+// page (the digest page), newest first, and one line counting the rest; never a dump.
+// (The interim search reading only the newest candidates is pinned in airc-lib.)
+#[tokio::test]
+async fn many_addressed_requests_show_one_page_and_a_count() {
+    let (_dir, airc, room) = fixture().await;
+    for n in 1..=120 {
+        let body = format!("request-{n:03}");
+        append_text(&airc, room, n, &body, MentionTarget::Peer(airc.peer_id())).await;
+    }
+    // `--count` above the backlog: the interim addressed search covers it all.
+    let options = super::HookOptions {
+        count: 200,
+        max_items: super::render::DIGEST_PAGE,
+        raw: false,
+        selection: DeliverySelection::default(),
+    };
+    let mut turn = super::prepare(&airc, "claude-hook:many", &options)
+        .await
+        .unwrap();
+    let (context, _) = super::compose(&CLAUDE, &airc, &mut turn, None, &options, None)
+        .await
+        .unwrap();
+    let context = context.unwrap();
+    let shown = context.matches("request-").count();
+    assert_eq!(shown, super::render::DIGEST_PAGE, "{context}");
+    assert!(context.find("request-120").unwrap() < context.find("request-113").unwrap());
+    assert!(!context.contains("request-112"), "{context}");
+    assert!(context.contains("AIRC: 120 earlier events"), "{context}");
+    let more = 120 - super::render::DIGEST_PAGE;
+    assert!(
+        context.contains(&format!("AIRC: {more} more addressed to you")),
+        "{context}"
+    );
 }
 
 #[tokio::test]

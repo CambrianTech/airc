@@ -160,4 +160,41 @@ impl Airc {
             scanned_through: Some(safe),
         })
     }
+
+    /// Count the agent-feed events in `(after, through]` of `channels` that also
+    /// match `extra`, with their oldest and newest times. The store answers
+    /// (one `CountInbox` per channel over the daemon, one query embedded); no
+    /// event crosses the socket or is decoded.
+    pub(crate) async fn count_agent_feed_in_channels(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[airc_core::RoomId],
+        extra: HeaderFilter,
+    ) -> Result<airc_core::HistoryCount, AircError> {
+        let predicate = HeaderFilter::All(vec![headers(), extra]);
+        let mut total = airc_core::HistoryCount::default();
+        if key(after) >= key(through) {
+            return Ok(total);
+        }
+        if let Some(client) = self.daemon_client() {
+            for channel in channels.iter().copied() {
+                let count = client
+                    .count_inbox(airc_ipc::request::CountInboxRequest {
+                        channel,
+                        after: ipc(after),
+                        through: ipc(through),
+                        headers: predicate.clone(),
+                    })
+                    .await?;
+                total = total.merge(count);
+            }
+            return Ok(total);
+        }
+        Ok(self
+            .inner
+            .store
+            .count_history(after, through, channels, &predicate)
+            .await?)
+    }
 }

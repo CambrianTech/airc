@@ -30,6 +30,8 @@ pub enum Response {
     /// the stream consume-once.
     Inbox(InboxResponse),
     ScanInbox(ScanInboxResponse),
+    /// Response to `CountInbox`: three numbers, never an event.
+    CountInbox(airc_core::HistoryCount),
     /// **Card a1562dbc.** Response to `RoomTip` — the cursor of the
     /// newest durable event on the requested channel, straight from the
     /// store's index. No envelope bytes ride along: the probe returns

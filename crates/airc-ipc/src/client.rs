@@ -223,6 +223,16 @@ impl DaemonClient {
         }
     }
 
+    pub async fn count_inbox(
+        &self,
+        request: crate::request::CountInboxRequest,
+    ) -> Result<airc_core::HistoryCount, ClientError> {
+        match self.call(Request::CountInbox(request)).await? {
+            Response::CountInbox(count) => Ok(count),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
+        }
+    }
+
     pub async fn inbox(&self, request: InboxRequest) -> Result<InboxResponse, ClientError> {
         match self.call(Request::Inbox(request)).await? {
             Response::Inbox(response) => Ok(response),

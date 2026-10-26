@@ -17,14 +17,24 @@ async fn daemon_history_is_summarized_once_and_live_is_never_behind_it() {
             .unwrap(),
     );
     let fresh = airc.say("fresh-request").await.unwrap();
-    let mut page = airc
+    let page = airc
         .prepare_agent_delivery("consumer", 32, 8)
         .await
         .unwrap();
     assert!(page.live_events().iter().any(|e| e.event_id == fresh));
-    let summary = page.history_summary(|_| true).await.unwrap().unwrap();
-    assert!(!summary.more && summary.count >= 96, "{summary:?}");
-    assert!(summary.oldest_ms <= summary.newest_ms);
+    let me = airc.addressee().await.unwrap();
+    let window = airc_lib::AddressedWindow {
+        candidates: 32,
+        page: 8,
+    };
+    let summary = page
+        .history_summary(airc_core::HeaderFilter::Any, |_| true, &me, window)
+        .await
+        .unwrap()
+        .unwrap();
+    // Counted by the daemon's store over CountInbox: every historical send, once.
+    assert!(summary.counted.count >= 96, "{summary:?}");
+    assert!(summary.counted.oldest_ms <= summary.counted.newest_ms);
     let live = page.live_events().len();
     page.acknowledge(live, true).await.unwrap();
     let next = airc
@@ -63,4 +73,52 @@ async fn switching_cursor_authority_refuses_existing_delivery_state() {
             .await
             .unwrap(),
     );
+}
+
+// Measurement, not a gate: one hook-shaped turn (prepare, history summary,
+// acknowledge) for a fresh consumer over a 50k-event pre-attach backlog, on the
+// real daemon transport. Run: cargo test -p airc-lib --test agent_delivery_daemon
+// measure_ -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "manual measurement: one history turn over a 50k-event backlog; --ignored --nocapture"]
+async fn measure_history_turn_on_a_50k_backlog() {
+    let machine = common::Machine::boot().await;
+    machine.pin_identity("delivery-measure").await;
+    let airc = machine.attach("delivery-measure-runtime").await;
+    airc.join("delivery-measure-room").await.unwrap();
+    let started = std::time::Instant::now();
+    for n in 0..50_000 {
+        airc.say(&format!(
+            "backlog message {n} with an ordinary sentence of chat"
+        ))
+        .await
+        .unwrap();
+    }
+    eprintln!("seeded 50000 events in {:?}", started.elapsed());
+    let me = airc.addressee().await.unwrap();
+    let window = airc_lib::AddressedWindow {
+        candidates: 50,
+        page: 8,
+    };
+    for run in 0..3 {
+        let consumer = format!("measure-{run}");
+        let started = std::time::Instant::now();
+        let turn = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
+        let summary = turn
+            .history_summary(airc_core::HeaderFilter::Any, |_| true, &me, window)
+            .await
+            .unwrap();
+        turn.acknowledge(0, true).await.unwrap();
+        let first = started.elapsed();
+        // The hot path after attach: every later hook call on the same consumer.
+        let started = std::time::Instant::now();
+        let next = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
+        assert!(!next.has_history());
+        next.acknowledge(0, true).await.unwrap();
+        eprintln!(
+            "run {run}: first turn {first:?} (summary {:?}); next turn {:?}",
+            summary.map(|s| (s.counted.count, s.addressed.len())),
+            started.elapsed()
+        );
+    }
 }

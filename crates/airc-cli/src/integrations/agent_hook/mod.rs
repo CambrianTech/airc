@@ -29,7 +29,7 @@ use crate::client_id::{
 use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 pub use args::HookReadArgs;
-pub(crate) use render::{history_line, original_time};
+pub(crate) use render::{history_line, more_addressed_line, original_time};
 
 /// What differs between runtimes. Everything else is this module's.
 pub struct HookRuntime {
@@ -66,6 +66,9 @@ impl HookEvent {
 /// `Default` remaining today's behaviour, and no adapter changes. Its contract:
 /// an authorized direct request is never filtered out, and acknowledging a turn
 /// marks events DELIVERED to this consumer, never that a reader consumed them.
+/// "Addressed to me" has one predicate, [`airc_lib::Addressee::is_addressed`]
+/// (typed target, or a leading `@name` that is mine); the pre-attachment
+/// summary already uses it, and a selection field must use it too.
 #[derive(Clone, Debug)]
 pub struct DeliverySelection {
     /// Transcript filter applied before budgeting; filtered events still advance.
@@ -89,6 +92,29 @@ impl Default for DeliverySelection {
 impl DeliverySelection {
     fn shows(&self, event: &TranscriptEvent, self_filter: &RuntimeSelfFilter<'_>) -> bool {
         self.include_self || !self_filter.is_self_event(event)
+    }
+
+    /// The same selection as a header predicate, for the store to count history
+    /// without reading events: liveness beats and work-queue churn are routed out
+    /// by their headers, and so are this runtime's own stamped sends.
+    fn count_filter(&self, runtime_client: Option<&str>) -> airc_core::HeaderFilter {
+        use airc_core::HeaderFilter;
+        let absent = |key: &str| {
+            HeaderFilter::Not(Box::new(HeaderFilter::Has {
+                key: key.to_string(),
+            }))
+        };
+        let mut all = vec![
+            absent(airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND),
+            absent(airc_lib::HEADER_FORGE_WORK_EVENT_KIND),
+        ];
+        if let (false, Some(client)) = (self.include_self, runtime_client) {
+            all.push(HeaderFilter::Not(Box::new(HeaderFilter::Exact {
+                key: airc_protocol::HEADER_AIRC_CLIENT.to_string(),
+                value: client.to_string(),
+            })));
+        }
+        HeaderFilter::All(all)
     }
 }
 
@@ -211,12 +237,23 @@ async fn compose(
     let self_filter = RuntimeSelfFilter::new(airc.client_id(), runtime_client);
     let shows = |e: &TranscriptEvent| options.selection.shows(e, &self_filter);
     let live_end = delivery_end(turn, options.raw, shows);
+    let me = airc.addressee().await?;
+    let window = airc_lib::AddressedWindow {
+        // The interim addressed search reads the hook's own scan size (`--count`).
+        candidates: options.count.max(1),
+        page: turn.budget,
+    };
     let history = turn
-        .history_summary(|e| {
-            options.selection.filter.matches(e)
-                && shows(e)
-                && (options.raw || render::is_correspondence(e))
-        })
+        .history_summary(
+            options.selection.count_filter(runtime_client),
+            |e| {
+                options.selection.filter.matches(e)
+                    && shows(e)
+                    && (options.raw || render::is_correspondence(e))
+            },
+            &me,
+            window,
+        )
         .await?;
     let work = match resume {
         Some(text) => Some(text),
