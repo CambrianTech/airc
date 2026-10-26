@@ -2,6 +2,28 @@
 use airc_core::HeaderFilter;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 
+/// Rows that are NOT this runtime's own sends: [`airc_core::RuntimeSelf`]
+/// translated to the stores' header predicate and their `client_id` column.
+pub(crate) fn not_runtime_self(
+    rule: &airc_core::RuntimeSelf,
+    client_id: impl sea_orm::sea_query::IntoColumnRef,
+) -> SimpleExpr {
+    let stamped = HeaderFilter::Has {
+        key: airc_core::headers::HEADER_AIRC_CLIENT.to_string(),
+    };
+    let unstamped_self = predicate(&HeaderFilter::Not(Box::new(stamped)))
+        .and(Expr::col(client_id).eq(rule.client_id.as_uuid()));
+    let is_self = match &rule.runtime_client {
+        Some(tag) => predicate(&HeaderFilter::Exact {
+            key: airc_core::headers::HEADER_AIRC_CLIENT.to_string(),
+            value: tag.clone(),
+        })
+        .or(unstamped_self),
+        None => unstamped_self,
+    };
+    is_self.not()
+}
+
 pub(crate) fn predicate(filter: &HeaderFilter) -> SimpleExpr {
     match filter {
         HeaderFilter::Any => Expr::cust("1 = 1"),

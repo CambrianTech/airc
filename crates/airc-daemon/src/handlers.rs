@@ -72,6 +72,7 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
         Request::ScanInbox(scan) => handle_scan_inbox(state, scan).await,
+        Request::CountInbox(count) => handle_count_inbox(state, count).await,
         Request::RoomTip(tip) => handle_room_tip(state, tip).await,
         Request::Presence(request) => handle_presence(&state, request),
         Request::PeerIdentityCard(req) => handle_peer_identity_card(state, req).await,
@@ -621,6 +622,36 @@ async fn handle_scan_inbox(
         }
     };
     scan_page_response(events, request, airc_ipc::codec::MAX_FRAME_BYTES as usize)
+}
+
+async fn handle_count_inbox(
+    state: Arc<DaemonState>,
+    request: airc_ipc::request::CountInboxRequest,
+) -> Response {
+    let cursor = |c: IpcCursor| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id);
+    let after = cursor(request.after);
+    let through = cursor(request.through);
+    if after.is_after(&through) {
+        return Response::Error {
+            message: "count inbox: `after` is past `through`".into(),
+        };
+    }
+    match state
+        .router
+        .count_matching(
+            request.channel,
+            after,
+            through,
+            &request.headers,
+            request.exclude_self.as_ref(),
+        )
+        .await
+    {
+        Ok(count) => Response::CountInbox(count),
+        Err(error) => Response::Error {
+            message: format!("count inbox: {error}"),
+        },
+    }
 }
 
 fn scan_page_response(

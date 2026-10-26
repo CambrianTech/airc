@@ -11,12 +11,39 @@ use uuid::Uuid;
 
 use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
+use crate::history_count::CountHistory;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::refresh_lock::{StoredRefreshLock, StoredRefreshLockOutcome};
 use crate::scoped_state::StoredScopedState;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
+
+#[async_trait]
+impl CountHistory for InMemoryEventStore {
+    async fn count_history(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
+    ) -> Result<airc_core::HistoryCount, StoreError> {
+        let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(events
+            .iter()
+            .filter(|e| {
+                channels.contains(&e.room_id)
+                    && strictly_after(e, after)
+                    && !strictly_after(e, through)
+                    && headers.matches(&e.headers)
+                    && !exclude.is_some_and(|rule| rule.is_self_event(e))
+            })
+            .fold(airc_core::HistoryCount::default(), |count, e| {
+                count.with_event(e.occurred_at_ms)
+            }))
+    }
+}
 
 pub struct InMemoryEventStore {
     local_identities: Mutex<BTreeMap<String, StoredLocalIdentity>>,

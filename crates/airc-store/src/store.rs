@@ -23,7 +23,7 @@ use crate::subscriptions::StoredSubscription;
 /// is the canonical position; lamport is the primary order, event_id
 /// is the deterministic tiebreaker.
 #[async_trait]
-pub trait EventStore: Send + Sync {
+pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// Load the default-agent local identity row, if present.
     ///
     /// Equivalent to [`Self::load_local_identity_by_agent_name`] with

@@ -248,5 +248,7 @@ pub use airc_work::{
     HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_REPO,
 };
 
+mod addressing;
 mod agent_delivery;
-pub use agent_delivery::AgentDeliveryTurn;
+pub use addressing::{leading_mentions, Addressee};
+pub use agent_delivery::{AddressedWindow, AgentDeliveryTurn, HistorySummary};
