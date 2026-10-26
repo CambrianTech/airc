@@ -192,7 +192,7 @@ async fn print_delivery_turn(
     room: Option<RoomId>,
     attached_at_ms: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let turn = match room {
+    let mut turn = match room {
         Some(_) => {
             airc.prepare_native_delivery(consumer, announce_history, CATCH_UP_LIMIT, CATCH_UP_LIMIT)
                 .await?

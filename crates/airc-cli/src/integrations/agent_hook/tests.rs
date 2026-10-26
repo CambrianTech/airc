@@ -15,7 +15,7 @@ const WINDOW: airc_lib::AddressedWindow = airc_lib::AddressedWindow {
 
 /// The store-counted summary every event in the range contributes to.
 async fn summarize(
-    turn: &airc_lib::AgentDeliveryTurn,
+    turn: &mut airc_lib::AgentDeliveryTurn,
     me: &airc_lib::Addressee,
     keep: impl Fn(&TranscriptEvent) -> bool,
 ) -> Option<airc_lib::HistorySummary> {
@@ -215,16 +215,18 @@ async fn backlog_is_one_summary_then_only_new_events() {
     turn.retain(&selection.filter);
     let end = delivery_end(&turn, false, visible);
     let me = airc.addressee().await.unwrap();
-    let summary = summarize(&turn, &me, |e| selection.filter.matches(e) && visible(e))
-        .await
-        .unwrap();
+    let summary = summarize(&mut turn, &me, |e| {
+        selection.filter.matches(e) && visible(e)
+    })
+    .await
+    .unwrap();
     assert_eq!(
         summary.counted,
-        airc_core::HistoryCount {
+        Some(airc_core::HistoryCount {
             count: 44,
             oldest_ms: Some(1),
             newest_ms: Some(44)
-        }
+        })
     );
     let context = delivery_context(
         &turn,
@@ -246,7 +248,7 @@ async fn backlog_is_one_summary_then_only_new_events() {
     retry.retain(&selection.filter);
     assert_eq!(delivery_end(&retry, false, visible), end);
     assert!(retry.has_history());
-    assert!(summarize(&retry, &me, visible).await.is_some());
+    assert!(summarize(&mut retry, &me, visible).await.is_some());
     retry.acknowledge(end, true).await.unwrap();
     append(&airc, room, 50, Body::text("after-attach"), false, false).await;
     let mut next = airc.prepare_agent_delivery("hook", 50, 3).await.unwrap();
@@ -354,9 +356,9 @@ async fn leading_at_names_address_pre_attach_history_and_mid_sentence_names_do_n
     )
     .await;
     append_text(&airc, room, 3, "I told Fable already", MentionTarget::All).await;
-    let turn = airc.prepare_agent_delivery("names", 50, 8).await.unwrap();
+    let mut turn = airc.prepare_agent_delivery("names", 50, 8).await.unwrap();
     let me = airc.addressee().await.unwrap();
-    let summary = summarize(&turn, &me, |_| true).await.unwrap();
+    let summary = summarize(&mut turn, &me, |_| true).await.unwrap();
     let text = super::render::history_section(&summary).unwrap();
     assert!(text.contains("please rebase"), "{text}");
     assert!(text.contains("AIRC: 3 earlier events"), "{text}");
@@ -366,7 +368,7 @@ async fn leading_at_names_address_pre_attach_history_and_mid_sentence_names_do_n
     );
     for name in ["Fable", "codex"] {
         let other = airc_lib::Addressee::new(PeerId::new(), [name.to_string()]);
-        let summary = summarize(&turn, &other, |_| true).await.unwrap();
+        let summary = summarize(&mut turn, &other, |_| true).await.unwrap();
         let text = super::render::history_section(&summary).unwrap();
         assert!(
             text.contains("@Fable @Codex review #1617"),

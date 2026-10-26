@@ -3,7 +3,7 @@ mod common;
 // what this catches: over the daemon transport, history before attachment is one
 // summary and the fresh request is live; once settled, neither returns (card ba22c72c).
 #[tokio::test]
-async fn daemon_history_is_summarized_once_and_live_is_never_behind_it() {
+async fn daemon_history_is_counted_once_and_settles_when_searched() {
     let machine = common::Machine::boot().await;
     machine.pin_identity("delivery-daemon").await;
     let airc = machine.attach("delivery-runtime").await;
@@ -17,7 +17,7 @@ async fn daemon_history_is_summarized_once_and_live_is_never_behind_it() {
             .unwrap(),
     );
     let fresh = airc.say("fresh-request").await.unwrap();
-    let page = airc
+    let mut page = airc
         .prepare_agent_delivery("consumer", 32, 8)
         .await
         .unwrap();
@@ -33,16 +33,30 @@ async fn daemon_history_is_summarized_once_and_live_is_never_behind_it() {
         .unwrap()
         .unwrap();
     // Counted by the daemon's store over CountInbox: every historical send, once.
-    assert!(summary.counted.count >= 96, "{summary:?}");
-    assert!(summary.counted.oldest_ms <= summary.counted.newest_ms);
+    assert!(summary.counted.unwrap().count >= 96, "{summary:?}");
+    assert!(summary.counted.unwrap().oldest_ms <= summary.counted.unwrap().newest_ms);
     let live = page.live_events().len();
     page.acknowledge(live, true).await.unwrap();
-    let next = airc
-        .prepare_agent_delivery("consumer", 32, 8)
-        .await
-        .unwrap();
-    assert!(!next.live_events().iter().any(|e| e.event_id == fresh));
-    assert!(!next.has_history());
+    // The bounded addressed search walks the rest one window per turn, silently,
+    // and the history settles once it reaches the start; the fresh request is
+    // never delivered again.
+    for _ in 0..8 {
+        let mut next = airc
+            .prepare_agent_delivery("consumer", 32, 8)
+            .await
+            .unwrap();
+        assert!(!next.live_events().iter().any(|e| e.event_id == fresh));
+        if !next.has_history() {
+            return;
+        }
+        let quiet = next
+            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+            .await
+            .unwrap();
+        assert!(quiet.is_none(), "count shown once, nothing addressed");
+        next.acknowledge(0, true).await.unwrap();
+    }
+    panic!("history never settled");
 }
 
 #[tokio::test]
@@ -103,21 +117,38 @@ async fn measure_history_turn_on_a_50k_backlog() {
     for run in 0..3 {
         let consumer = format!("measure-{run}");
         let started = std::time::Instant::now();
-        let turn = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
+        let mut turn = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
         let summary = turn
             .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
             .await
             .unwrap();
         turn.acknowledge(0, true).await.unwrap();
         let first = started.elapsed();
-        // The hot path after attach: every later hook call on the same consumer.
+        // Until card 6fb2ea16, the addressed search walks one window per call.
+        let (mut walk_turns, mut slowest) = (0, std::time::Duration::ZERO);
+        let walk_started = std::time::Instant::now();
+        loop {
+            let started = std::time::Instant::now();
+            let mut turn = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
+            if !turn.has_history() {
+                break;
+            }
+            turn.history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+                .await
+                .unwrap();
+            turn.acknowledge(0, true).await.unwrap();
+            walk_turns += 1;
+            slowest = slowest.max(started.elapsed());
+        }
+        let walk = walk_started.elapsed();
+        // The hot path once settled: every later hook call on the same consumer.
         let started = std::time::Instant::now();
         let next = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
         assert!(!next.has_history());
         next.acknowledge(0, true).await.unwrap();
         eprintln!(
-            "run {run}: first turn {first:?} (summary {:?}); next turn {:?}",
-            summary.map(|s| (s.counted.count, s.addressed.len())),
+            "run {run}: first turn {first:?} (count {:?}); walk {walk_turns} turns in {walk:?} (slowest {slowest:?}); settled turn {:?}",
+            summary.and_then(|s| s.counted).map(|c| c.count),
             started.elapsed()
         );
     }

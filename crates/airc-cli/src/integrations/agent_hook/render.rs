@@ -37,7 +37,7 @@ pub(crate) fn original_time(occurred_at_ms: u64) -> String {
 /// store, not replayed, with the original times of its oldest and newest events.
 /// `None` when nothing was counted.
 pub(crate) fn history_line(summary: &HistorySummary) -> Option<String> {
-    let counted = summary.counted;
+    let counted = summary.counted?;
     let (Some(oldest), Some(newest)) = (counted.oldest_ms, counted.newest_ms) else {
         return None;
     };
@@ -51,20 +51,19 @@ pub(crate) fn history_line(summary: &HistorySummary) -> Option<String> {
     })
 }
 
-/// The line after the addressed page: how many more requests were found, and,
-/// while the addressed search reads only the newest events (card 6fb2ea16), that
-/// older ones may be among the counted events. `None` when nothing is left out.
+/// The line after the addressed page: requests still to come. They are never
+/// settled unseen; later calls page them until every one is shown. `None` when
+/// this page finished the range.
 pub(crate) fn more_addressed_line(summary: &HistorySummary) -> Option<String> {
     let more = summary.more_addressed;
-    match (more, summary.addressed_complete) {
-        (0, true) => None,
-        (_, true) => Some(format!(
-            "AIRC: {more} more addressed to you; read them with `airc inbox --all --json`."
-        )),
-        (_, false) => Some(format!(
-            "AIRC: {more} more addressed to you among the newest events, and older requests may be among the counted ones; read them with `airc inbox --all --json`."
-        )),
+    if summary.addressed_complete {
+        return None;
     }
+    Some(if more > 0 {
+        format!("AIRC: {more} more addressed to you; they follow on the next calls.")
+    } else {
+        "AIRC: older requests addressed to you, if any, follow on the next calls.".to_string()
+    })
 }
 
 /// History in a hook: the count, then one page of the requests addressed to
