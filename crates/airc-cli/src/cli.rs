@@ -723,6 +723,9 @@ pub enum Command {
     /// Codex lifecycle hook adapters backed by Rust AIRC events.
     CodexHook(CodexHookArgs),
 
+    /// Claude Code lifecycle hook adapters backed by Rust AIRC events.
+    ClaudeHook(crate::integrations::claude::ClaudeHookArgs),
+
     /// Launch the runtime feed owner for Codex integration.
     CodexStart(CodexStartArgs),
 

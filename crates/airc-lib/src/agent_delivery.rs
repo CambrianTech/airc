@@ -1,4 +1,14 @@
-//! Independent live delivery and retained catch-up, with output-owned acknowledgment.
+//! Live delivery with output-owned acknowledgment, and pre-attachment history
+//! summarized once instead of replayed.
+//!
+//! A consumer's first turn (and a native feed's every attachment) finds history it
+//! was never attached for: everything between its last settled position and the
+//! present. That history used to be paged out as "retained catch-up" a few items per
+//! turn, oldest first, so a scope with months of backlog emitted months-old chat on
+//! every hook call and never drained (card ba22c72c, the M5 on 2026-10-26). It is now
+//! counted once ([`AgentDeliveryTurn::history_summary`]); the caller shows that one
+//! line, settles it on acknowledgment, and from then on carries only events that
+//! arrived after attachment. The history itself stays durable for `airc inbox`.
 use crate::{Airc, AircError, EventFilter, EventScan};
 use airc_core::{EventId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_store::StoredScopedState;
@@ -26,7 +36,6 @@ struct State {
     boundary: TranscriptCursor,
     backlog: TranscriptCursor,
     live: TranscriptCursor,
-    next_live: bool,
     rooms: Vec<RoomId>,
     source: String,
 }
@@ -86,70 +95,125 @@ async fn persist(airc: &Airc, consumer: &str, state: &State) -> Result<(), AircE
         .await?;
     Ok(())
 }
+/// What a turn found between a consumer's settled position and its attachment:
+/// counted, not replayed (card ba22c72c).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistorySummary {
+    /// Kept events counted in the range.
+    pub count: usize,
+    /// The count stopped at one scan page; the range holds more than `count`.
+    pub at_least: bool,
+    /// Original timestamps of the oldest and newest kept events.
+    pub oldest_ms: u64,
+    pub newest_ms: u64,
+}
+/// Events read from the newest end of a history range when the counting page
+/// stopped short, to find the newest kept event. A bound on work, not a tuning
+/// value: a range whose newest 64 events are all hidden reports the counted
+/// page's newest instead, which is still an original timestamp from the range.
+const HISTORY_TAIL: usize = 64;
 /// Owns exclusive delivery rights until acknowledged or dropped. Output must be
-/// flushed before `acknowledge`. Dropping without ack retains both unread ranges.
-/// Crash after output but before ack may replay; stdout has no transactional ack.
+/// flushed before `acknowledge`. Dropping without ack retains the live range and
+/// the unsettled history. Crash after output but before ack may replay; stdout has
+/// no transactional ack. Acknowledging marks positions DELIVERED to this consumer;
+/// whether a reader consumed what it was shown is the reader's own fact.
 pub struct AgentDeliveryTurn {
     airc: Airc,
     consumer: String,
     state: State,
     _guard: DeliveryLock,
     live: EventScan,
-    backlog: EventScan,
     through: TranscriptCursor,
-    pub live_budget: usize,
-    pub backlog_budget: usize,
-    single: bool,
+    channels: Vec<RoomId>,
+    scan_limit: usize,
+    pub budget: usize,
 }
 impl AgentDeliveryTurn {
     pub fn live_events(&self) -> &[TranscriptEvent] {
         &self.live.events
     }
-    pub fn backlog_events(&self) -> &[TranscriptEvent] {
-        &self.backlog.events
-    }
     pub fn retain(&mut self, filter: &EventFilter) {
         self.live.events.retain(|e| filter.matches(e));
-        self.backlog.events.retain(|e| filter.matches(e));
     }
     pub fn is_empty(&self) -> bool {
-        self.live.events.is_empty() && self.backlog.events.is_empty()
+        self.live.events.is_empty()
     }
-    pub fn has_pending(&self, live_end: usize, backlog_end: usize) -> bool {
+    pub fn has_pending(&self, live_end: usize) -> bool {
         live_end < self.live.events.len()
-            || backlog_end < self.backlog.events.len()
             || self
                 .live
                 .scanned_through
                 .as_ref()
                 .is_some_and(|c| key(c) < key(&self.through))
-            || self
-                .backlog
-                .scanned_through
-                .as_ref()
-                .is_some_and(|c| key(c) < key(&self.state.boundary))
     }
-    /// Consumes the guard. The finite commit task retains OS ownership even if
-    /// its caller is cancelled while the database driver still executes the write.
-    pub async fn acknowledge(self, live_end: usize, backlog_end: usize) -> Result<(), AircError> {
+    /// True when history before attachment is still unsettled.
+    pub fn has_history(&self) -> bool {
+        key(&self.state.backlog) < key(&self.state.boundary)
+    }
+    /// Count the unsettled pre-attachment history that `keep` would show, with the
+    /// original timestamps of its oldest and newest kept events. One forward page
+    /// counts (exact up to the scan limit, `at_least` beyond it); `None` when there
+    /// is no history or none of it is kept.
+    pub async fn history_summary(
+        &self,
+        keep: impl Fn(&TranscriptEvent) -> bool,
+    ) -> Result<Option<HistorySummary>, AircError> {
+        if !self.has_history() {
+            return Ok(None);
+        }
+        let (after, boundary) = (&self.state.backlog, &self.state.boundary);
+        let page = self
+            .airc
+            .scan_agent_feed_in_channels(Some(after), boundary, self.scan_limit, &self.channels)
+            .await?;
+        let kept: Vec<_> = page.events.iter().filter(|e| keep(e)).collect();
+        let at_least = page
+            .scanned_through
+            .as_ref()
+            .is_some_and(|c| key(c) < key(boundary));
+        let (Some(oldest), Some(last)) = (kept.first(), kept.last()) else {
+            return Ok(None);
+        };
+        let mut newest_ms = last.occurred_at_ms;
+        if at_least {
+            let tail = self
+                .airc
+                .scan_agent_feed_in_channels(None, boundary, HISTORY_TAIL, &self.channels)
+                .await?;
+            if let Some(newest) = tail
+                .events
+                .iter()
+                .rev()
+                .find(|e| key(&e.cursor()) > key(after) && keep(e))
+            {
+                newest_ms = newest.occurred_at_ms;
+            }
+        }
+        Ok(Some(HistorySummary {
+            count: kept.len(),
+            at_least,
+            oldest_ms: oldest.occurred_at_ms,
+            newest_ms,
+        }))
+    }
+    /// Consumes the guard. `settle_history` records that the caller has shown the
+    /// history summary (or that there was nothing in it worth showing), so the
+    /// next turn starts at the present. The finite commit task retains OS
+    /// ownership even if its caller is cancelled while the database driver still
+    /// executes the write.
+    pub async fn acknowledge(self, live_end: usize, settle_history: bool) -> Result<(), AircError> {
         tokio::spawn(async move {
             let mut turn = self;
             if rooms(&turn.airc).await? != turn.state.rooms {
                 return Err(fail("subscription scope changed; checkpoint retained"));
             }
             let live = prefix(&turn.live, live_end, &turn.state.live)?;
-            let backlog = prefix(&turn.backlog, backlog_end, &turn.state.backlog)?;
-            if key(&live) < key(&turn.state.live)
-                || key(&live) > key(&turn.through)
-                || key(&backlog) < key(&turn.state.backlog)
-                || key(&backlog) > key(&turn.state.boundary)
-            {
+            if key(&live) < key(&turn.state.live) || key(&live) > key(&turn.through) {
                 return Err(fail("acknowledgment outside prepared range"));
             }
             turn.state.live = live;
-            turn.state.backlog = backlog;
-            if turn.single {
-                turn.state.next_live = !turn.state.next_live;
+            if settle_history {
+                turn.state.backlog = turn.state.boundary.clone();
             }
             persist(&turn.airc, &turn.consumer, &turn.state).await
         })
@@ -176,7 +240,8 @@ fn prefix(
     })
 }
 impl Airc {
-    /// Initialize the partition once, then prepare bounded live and backlog pages.
+    /// Initialize the partition once, then prepare a bounded live page. History
+    /// before the first attachment is left for [`AgentDeliveryTurn::history_summary`].
     /// Scope changes fail explicitly: a global cursor cannot safely cover newly
     /// joined rooms' older events. Legacy checkpoints and general history are untouched.
     pub async fn prepare_agent_delivery(
@@ -195,7 +260,7 @@ impl Airc {
         .map_err(fail)?
     }
     /// Prepare an all-subscription native feed. On attachment, reclassify all currently
-    /// unread events as retained history under the same exclusive delivery lock.
+    /// unread events as pre-attachment history under the same exclusive delivery lock.
     /// This never acknowledges history or changes another consumer's checkpoint.
     pub async fn prepare_native_delivery(
         &self,
@@ -283,7 +348,6 @@ impl Airc {
                     live: boundary.clone(),
                     boundary,
                     backlog,
-                    next_live: true,
                     rooms: channels.clone(),
                     source,
                 };
@@ -291,9 +355,14 @@ impl Airc {
                 state
             };
         if attaching {
-            // Keep the oldest unread history position. Previously delivered live
-            // events may be within this retained range, but are never replayed as
-            // live output. Deliberate inbox recovery remains the history reader.
+            // What arrived while detached becomes this attachment's history. A
+            // settled consumer's history starts where its live delivery stopped,
+            // so nothing already delivered is counted again; an unsettled one keeps
+            // its oldest position until a summary of it is shown. History is never
+            // replayed as live output; `airc inbox` remains the history reader.
+            if key(&state.backlog) >= key(&state.boundary) {
+                state.backlog = state.live.clone();
+            }
             if key(&tip) > key(&state.live) {
                 state.live = tip.clone();
             }
@@ -308,33 +377,10 @@ impl Airc {
         let live = self
             .scan_agent_feed_in_channels(Some(&state.live), &through, scan_limit, &channels)
             .await?;
-        let backlog = self
-            .scan_agent_feed_in_channels(
-                Some(&state.backlog),
-                &state.boundary,
-                scan_limit,
-                &channels,
-            )
-            .await?;
         if rooms(self).await? != channels {
             return Err(fail(
                 "subscription scope changed during prepare; retry required",
             ));
-        }
-        let (mut live_budget, mut backlog_budget) = if budget == 1 {
-            if state.next_live {
-                (1, 0)
-            } else {
-                (0, 1)
-            }
-        } else {
-            (budget - 1, 1)
-        };
-        if live.events.is_empty() {
-            backlog_budget = budget;
-        }
-        if backlog.events.is_empty() {
-            live_budget = budget;
         }
         Ok(AgentDeliveryTurn {
             airc: self.clone(),
@@ -342,11 +388,10 @@ impl Airc {
             state,
             _guard: guard,
             live,
-            backlog,
             through,
-            live_budget,
-            backlog_budget,
-            single: budget == 1,
+            channels,
+            scan_limit,
+            budget,
         })
     }
 }
@@ -392,45 +437,64 @@ mod tests {
         .await
         .unwrap();
     }
+    // what this catches: a native reattach counts only what arrived while detached,
+    // never re-counting what live delivery already showed, and keeps unsettled history.
     #[tokio::test]
-    async fn native_attach_retains_offline_live_and_failed_delivery() {
+    async fn native_attach_summarizes_only_the_detached_gap() {
         let (_dir, airc, room) = fixture().await;
+        let first = airc
+            .prepare_native_delivery("native", true, 64, 64)
+            .await
+            .unwrap();
+        assert!(!first.has_history());
+        first.acknowledge(0, true).await.unwrap();
         append(&airc, room, 1).await;
-        drop(
-            airc.prepare_native_delivery("native", true, 64, 64)
-                .await
-                .unwrap(),
-        );
+        let live = airc
+            .prepare_native_delivery("native", false, 64, 64)
+            .await
+            .unwrap();
+        assert_eq!(live.live_events()[0].lamport, 1);
+        live.acknowledge(1, true).await.unwrap();
         append(&airc, room, 2).await;
+        append(&airc, room, 3).await;
         let attached = airc
             .prepare_native_delivery("native", true, 64, 64)
             .await
             .unwrap();
         assert!(attached.live_events().is_empty());
-        assert_eq!(attached.backlog_events().len(), 2);
-        drop(attached);
-        append(&airc, room, 3).await;
+        let summary = attached.history_summary(|_| true).await.unwrap().unwrap();
+        assert_eq!(
+            (summary.count, summary.oldest_ms, summary.newest_ms),
+            (2, 2, 3)
+        );
+        drop(attached); // summary not shown: it stays unsettled across reattach
+        append(&airc, room, 4).await;
+        let again = airc
+            .prepare_native_delivery("native", true, 64, 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            again
+                .history_summary(|_| true)
+                .await
+                .unwrap()
+                .unwrap()
+                .count,
+            3
+        );
+        again.acknowledge(0, true).await.unwrap();
+        append(&airc, room, 5).await;
         let fresh = airc
             .prepare_native_delivery("native", false, 64, 64)
             .await
             .unwrap();
-        assert_eq!(fresh.live_events()[0].lamport, 3);
-        drop(fresh);
-        let retry = airc
-            .prepare_native_delivery("native", false, 64, 64)
-            .await
-            .unwrap();
-        assert_eq!(retry.live_events()[0].lamport, 3);
-        retry.acknowledge(1, 0).await.unwrap();
-        let done = airc
-            .prepare_native_delivery("native", false, 64, 64)
-            .await
-            .unwrap();
-        assert!(done.live_events().is_empty());
-        assert_eq!(done.backlog_events().len(), 2);
+        assert!(!fresh.has_history());
+        assert_eq!(fresh.live_events()[0].lamport, 5);
     }
+    // what this catches: card ba22c72c. A long backlog is one summary with its
+    // original times, then only events newer than attachment; it never re-pages.
     #[tokio::test]
-    async fn fresh_delivery_precedes_large_backlog_and_restart_recovers_every_prefix() {
+    async fn backlog_is_summarized_once_then_only_new_events_deliver() {
         let (dir, airc, room) = fixture().await;
         for n in 1..=1000 {
             append(&airc, room, n).await;
@@ -439,17 +503,32 @@ mod tests {
             .prepare_agent_delivery("consumer", 64, 8)
             .await
             .unwrap();
-        assert_eq!(initial.state.boundary.lamport, 1000);
-        drop(initial); // output failed/cancelled: no prefix acknowledged
+        assert!(initial.live_events().is_empty());
+        let summary = initial.history_summary(|_| true).await.unwrap().unwrap();
+        assert_eq!(
+            summary,
+            HistorySummary {
+                count: 64,
+                at_least: true,
+                oldest_ms: 1,
+                newest_ms: 1000
+            }
+        );
+        let hidden_newest = initial
+            .history_summary(|e| e.lamport != 1000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hidden_newest.newest_ms, 999);
+        drop(initial); // output failed: the summary stays due
         append(&airc, room, 1001).await;
         let first = airc
             .prepare_agent_delivery("consumer", 64, 8)
             .await
             .unwrap();
+        assert!(first.has_history());
         assert_eq!(first.live_events()[0].lamport, 1001);
-        assert_eq!(first.backlog_events()[0].lamport, 1);
-        assert_eq!(first.backlog_budget, 1);
-        first.acknowledge(1, 1).await.unwrap();
+        first.acknowledge(1, true).await.unwrap();
         assert!(airc
             .load_runtime_cursor("consumer")
             .await
@@ -458,43 +537,42 @@ mod tests {
         let reopened = Airc::open_with_wire_root_for_test(dir.path(), dir.path())
             .await
             .unwrap();
-        let mut seen = vec![1];
-        loop {
-            let turn = reopened
-                .prepare_agent_delivery("consumer", 64, 64)
-                .await
-                .unwrap();
-            assert!(turn.live_events().is_empty());
-            assert_eq!(turn.state.boundary.lamport, 1000);
-            let end = turn.backlog_events().len().min(turn.backlog_budget);
-            seen.extend(turn.backlog_events()[..end].iter().map(|e| e.lamport));
-            let pending = turn.has_pending(0, end);
-            turn.acknowledge(0, end).await.unwrap();
-            if !pending {
-                break;
-            }
-        }
-        assert_eq!(seen, (1..=1000).collect::<Vec<_>>());
+        let settled = reopened
+            .prepare_agent_delivery("consumer", 64, 8)
+            .await
+            .unwrap();
+        assert!(!settled.has_history());
+        assert!(settled.history_summary(|_| true).await.unwrap().is_none());
+        assert!(settled.is_empty());
+        drop(settled);
+        append(&reopened, room, 1002).await;
+        let next = reopened
+            .prepare_agent_delivery("consumer", 64, 8)
+            .await
+            .unwrap();
+        assert_eq!(next.live_events().len(), 1);
+        assert_eq!(next.live_events()[0].lamport, 1002);
     }
+    // what this catches: output that failed before acknowledgment replays (at least once).
     #[tokio::test]
-    async fn one_item_budget_alternates_and_unacknowledged_output_replays() {
+    async fn unacknowledged_output_replays() {
         let (_dir, airc, room) = fixture().await;
+        airc.prepare_agent_delivery("one", 8, 1)
+            .await
+            .unwrap()
+            .acknowledge(0, true)
+            .await
+            .unwrap();
         append(&airc, room, 1).await;
-        drop(airc.prepare_agent_delivery("one", 8, 1).await.unwrap());
         append(&airc, room, 2).await;
         let first = airc.prepare_agent_delivery("one", 8, 1).await.unwrap();
-        assert_eq!((first.live_budget, first.backlog_budget), (1, 0));
+        assert!(first.has_pending(1));
         drop(first); // includes crash-after-output: at-least-once, not silent loss
         let replay = airc.prepare_agent_delivery("one", 8, 1).await.unwrap();
-        assert_eq!(replay.live_events()[0].lamport, 2);
-        replay.acknowledge(1, 0).await.unwrap();
-        append(&airc, room, 3).await;
+        assert_eq!(replay.live_events()[0].lamport, 1);
+        replay.acknowledge(1, false).await.unwrap();
         let second = airc.prepare_agent_delivery("one", 8, 1).await.unwrap();
-        assert_eq!((second.live_budget, second.backlog_budget), (0, 1));
-        assert_eq!(second.backlog_events()[0].lamport, 1);
-        second.acknowledge(0, 1).await.unwrap();
-        let third = airc.prepare_agent_delivery("one", 8, 1).await.unwrap();
-        assert_eq!(third.live_events()[0].lamport, 3);
+        assert_eq!(second.live_events()[0].lamport, 2);
     }
     #[tokio::test]
     async fn aliases_and_concurrent_prepares_share_ownership_and_new_scope_refuses() {

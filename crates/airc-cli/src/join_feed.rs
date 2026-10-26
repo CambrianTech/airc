@@ -28,6 +28,10 @@ pub async fn run(
     // Native Monitor keeps its supported subscription; notifications wake bounded
     // durable scans rather than directly advancing over unseen live predecessors.
     let mut stream = airc.subscribe_agent_feed().await?;
+    // An event that says it was sent before this moment arrived late (a peer's
+    // backlog reaching this node now): it prints with its original time, so old
+    // chat never reads as new (card ba22c72c, 10-day-old messages on 2026-10-26).
+    let attached_at_ms = attached_now_ms();
     println!("attached — Ctrl-C to detach.");
     let mut announce_history = true;
     loop {
@@ -38,6 +42,7 @@ pub async fn run(
             &mut output,
             announce_history,
             Some(room),
+            attached_at_ms,
         )
         .await;
         if let Err(error) = turn {
@@ -165,6 +170,15 @@ fn utc_now() -> String {
 
 /// Wall-clock milliseconds since `since`, beside the monotonic count: when the two disagree
 /// the process was not running its timer the way the monotonic clock says (card 5a74fe71).
+fn attached_now_ms() -> u64 {
+    // A clock before the epoch reads 0: no event is then marked late, never a panic.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 fn wall_elapsed_ms(since: std::time::SystemTime) -> u128 {
     since.elapsed().map_or(0, |elapsed| elapsed.as_millis()) // map_or: a clock stepped backwards reads 0, never a panic
 }
@@ -176,6 +190,7 @@ async fn print_delivery_turn(
     output: &mut impl Write,
     announce_history: bool,
     room: Option<RoomId>,
+    attached_at_ms: u64,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let turn = match room {
         Some(_) => {
@@ -187,12 +202,12 @@ async fn print_delivery_turn(
                 .await?
         }
     };
-    let live_end = turn.live_events().len().min(turn.live_budget);
+    let live_end = turn.live_events().len().min(turn.budget);
     let mut ambient = 0usize;
     let mut ambient_rooms = std::collections::HashSet::new();
     for event in &turn.live_events()[..live_end] {
         if room.is_none_or(|focus| foreground(event, focus, airc.peer_id())) {
-            print_event(event, self_filter, output)?;
+            print_event(event, self_filter, output, attached_at_ms)?;
         } else {
             ambient += 1;
             ambient_rooms.insert(event.room_id);
@@ -201,22 +216,29 @@ async fn print_delivery_turn(
     if ambient > 0 {
         writeln!(output, "Ambient activity: {ambient} events in {} other rooms; recover with `airc inbox --room <room>`. Bodies remain in history.", ambient_rooms.len())?;
     }
-    // History remains durable and unacknowledged. Do not replay old requests
-    // into a native live feed: announce the bounded page once per attachment,
-    // and let the agent deliberately recover history with the supported reader.
-    if announce_history {
-        if let Some(first) = turn.backlog_events().first() {
-            writeln!(
-                output,
-                "Retained history (not live): at least {} retained events; first scanned timestamp {} ms since Unix epoch. Read deliberately in this same AIRC home with `airc inbox --all --json`; page a room with `airc inbox --room <room> --since-lamport <lamport> --since-event-id <event-id>`. History has not been acknowledged.",
-                turn.backlog_events().len(),
-                first.occurred_at_ms,
-            )?;
-        }
+    // History from before this attachment is never replayed into a live feed:
+    // it is counted once per attachment, with its original times, and settled
+    // (card ba22c72c). It stays durable for `airc inbox`.
+    let history = if announce_history {
+        turn.history_summary(|e| {
+            e.kind != TranscriptKind::SubscriptionAdvanced
+                && !self_filter.is_self_event(e)
+                && crate::event_render::render_feed_line(e).is_some()
+        })
+        .await?
+    } else {
+        None
+    };
+    if let Some(summary) = history {
+        writeln!(
+            output,
+            "{}",
+            crate::integrations::agent_hook::history_line(&summary)
+        )?;
     }
     output.flush()?;
-    let pending = turn.has_pending(live_end, 0);
-    turn.acknowledge(live_end, 0).await?;
+    let pending = turn.has_pending(live_end);
+    turn.acknowledge(live_end, announce_history).await?;
     Ok(pending)
 }
 
@@ -233,6 +255,7 @@ fn print_event(
     event: &TranscriptEvent,
     self_filter: &RuntimeSelfFilter<'_>,
     output: &mut impl Write,
+    attached_at_ms: u64,
 ) -> std::io::Result<()> {
     // Cursor lifecycle events are local delivery bookkeeping, not a message.
     // Suppress by the typed kind before inspecting/rendering any body; their
@@ -243,7 +266,12 @@ fn print_event(
     // Structured events render by kind; `alive` heartbeats are suppressed
     // (None) so they don't drown the feed. See `event_render`.
     if let Some(line) = crate::event_render::render_feed_line(event) {
-        writeln!(output, "{line}")?;
+        if event.occurred_at_ms < attached_at_ms {
+            let sent = crate::integrations::agent_hook::original_time(event.occurred_at_ms);
+            writeln!(output, "[sent {sent}] {line}")?;
+        } else {
+            writeln!(output, "{line}")?;
+        }
     }
     Ok(())
 }
@@ -273,9 +301,17 @@ mod tests {
             .await
             .unwrap();
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
-        print_delivery_turn(&airc, "focused", &filter, &mut Vec::new(), true, Some(room))
-            .await
-            .unwrap();
+        print_delivery_turn(
+            &airc,
+            "focused",
+            &filter,
+            &mut Vec::new(),
+            true,
+            Some(room),
+            0,
+        )
+        .await
+        .unwrap();
         airc.append_event(event(&airc, other, 1, "claude:peer", "ambient-body"))
             .await
             .unwrap();
@@ -293,7 +329,7 @@ mod tests {
             .await
             .unwrap();
         let mut output = Vec::new();
-        print_delivery_turn(&airc, "focused", &filter, &mut output, false, Some(room))
+        print_delivery_turn(&airc, "focused", &filter, &mut output, false, Some(room), 0)
             .await
             .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -328,29 +364,44 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(
-            print_delivery_turn(&airc, "native-new", &self_filter, &mut Broken, true, None)
-                .await
-                .is_err()
-        );
+        assert!(print_delivery_turn(
+            &airc,
+            "native-new",
+            &self_filter,
+            &mut Broken,
+            true,
+            None,
+            0
+        )
+        .await
+        .is_err());
         let mut output = Vec::new();
-        assert!(
-            print_delivery_turn(&airc, "native-new", &self_filter, &mut output, true, None)
-                .await
-                .unwrap()
-        );
+        print_delivery_turn(
+            &airc,
+            "native-new",
+            &self_filter,
+            &mut output,
+            true,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.find("fresh-request").unwrap() < text.find("Retained history").unwrap());
+        assert!(
+            text.find("fresh-request").unwrap()
+                < text.find("at least 64 earlier messages").unwrap()
+        );
         assert!(!text.contains("old-200"));
         let mut next = Vec::new();
-        print_delivery_turn(&airc, "native-new", &self_filter, &mut next, true, None)
+        print_delivery_turn(&airc, "native-new", &self_filter, &mut next, true, None, 0)
             .await
             .unwrap();
         assert!(!String::from_utf8(next).unwrap().contains("fresh-request"));
     }
 
     #[tokio::test]
-    async fn history_is_announced_once_and_retained_while_fresh_delivery_continues() {
+    async fn history_is_announced_once_and_settled_while_fresh_delivery_continues() {
         let (_dir, airc, room) = fixture().await;
         for n in 1..=3 {
             airc.append_event(event(&airc, room, n, "claude:peer", &format!("old-{n}")))
@@ -359,32 +410,61 @@ mod tests {
         }
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut output, true, None)
+        print_delivery_turn(&airc, "paced", &filter, &mut output, true, None, 0)
             .await
             .unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("at least 3 retained events"));
+        assert!(text.contains("AIRC: 3 earlier messages from before this session attached"));
         assert!(!text.contains("old-2"));
         airc.append_event(event(&airc, room, 4, "claude:peer", "fresh-request"))
             .await
             .unwrap();
         let mut fresh = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut fresh, false, None)
+        print_delivery_turn(&airc, "paced", &filter, &mut fresh, false, None, 0)
             .await
             .unwrap();
         let text = String::from_utf8(fresh).unwrap();
         assert!(text.contains("fresh-request"));
         assert!(!text.contains("old-"));
         let mut resumed = Vec::new();
-        print_delivery_turn(&airc, "paced", &filter, &mut resumed, false, None)
+        print_delivery_turn(&airc, "paced", &filter, &mut resumed, false, None, 0)
             .await
             .unwrap();
         let text = String::from_utf8(resumed).unwrap();
         assert!(text.is_empty());
-        let retained = airc.prepare_agent_delivery("paced", 64, 64).await.unwrap();
-        assert_eq!(retained.backlog_events().len(), 3);
-        assert!(!text.contains("old-1"));
-        assert!(!text.contains("old-3"));
+        // Announced once, then settled: the summary never repeats.
+        let settled = airc.prepare_agent_delivery("paced", 64, 64).await.unwrap();
+        assert!(!settled.has_history());
+    }
+
+    // what this catches: card ba22c72c on the live stream. An event that arrives after
+    // attachment but was sent before it prints with its original time, never as new.
+    #[tokio::test]
+    async fn late_arrival_carries_its_original_time() {
+        let (_dir, airc, room) = fixture().await;
+        let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
+        print_delivery_turn(&airc, "late", &filter, &mut Vec::new(), true, Some(room), 0)
+            .await
+            .unwrap();
+        let ten_days_old = 1_760_000_000_000; // 2025-10-09T08:53Z
+        let mut late = event(&airc, room, 1, "claude:peer", "old-sos");
+        late.occurred_at_ms = ten_days_old;
+        airc.append_event(late).await.unwrap();
+        let mut output = Vec::new();
+        print_delivery_turn(
+            &airc,
+            "late",
+            &filter,
+            &mut output,
+            false,
+            Some(room),
+            ten_days_old + 1,
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("[sent 2025-10-09T08:53Z] "), "{text}");
+        assert!(text.contains("old-sos"));
     }
 
     #[test]
@@ -420,18 +500,16 @@ mod tests {
         airc.append_event(warning).await.unwrap();
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
-        assert!(
-            print_delivery_turn(&airc, "filtered", &filter, &mut output, true, None)
-                .await
-                .unwrap()
-        );
+        print_delivery_turn(&airc, "filtered", &filter, &mut output, true, None, 0)
+            .await
+            .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("ordinary warning"));
         assert!(!text.contains("fragment"));
         assert!(!text.contains("own hidden"));
         let mut retry = Vec::new();
         assert!(
-            print_delivery_turn(&airc, "filtered", &filter, &mut retry, false, None)
+            !print_delivery_turn(&airc, "filtered", &filter, &mut retry, false, None, 0)
                 .await
                 .unwrap()
         );
@@ -490,14 +568,22 @@ mod tests {
     async fn a_reattach_resumes_at_the_checkpoint() {
         let (_dir, airc, room) = fixture().await;
         let filter = RuntimeSelfFilter::new(airc.client_id(), Some("codex:local"));
-        print_delivery_turn(&airc, "resume", &filter, &mut Vec::new(), true, Some(room))
-            .await
-            .unwrap();
+        print_delivery_turn(
+            &airc,
+            "resume",
+            &filter,
+            &mut Vec::new(),
+            true,
+            Some(room),
+            0,
+        )
+        .await
+        .unwrap();
         airc.append_event(event(&airc, room, 1, "claude:peer", "before-the-gap"))
             .await
             .unwrap();
         let mut first = Vec::new();
-        print_delivery_turn(&airc, "resume", &filter, &mut first, false, Some(room))
+        print_delivery_turn(&airc, "resume", &filter, &mut first, false, Some(room), 0)
             .await
             .unwrap();
         assert!(String::from_utf8(first).unwrap().contains("before-the-gap"));
@@ -506,7 +592,7 @@ mod tests {
             .unwrap();
         let _stream = reattach(&airc, _dir.path()).await.unwrap();
         let mut after = Vec::new();
-        print_delivery_turn(&airc, "resume", &filter, &mut after, false, Some(room))
+        print_delivery_turn(&airc, "resume", &filter, &mut after, false, Some(room), 0)
             .await
             .unwrap();
         let after = String::from_utf8(after).unwrap();

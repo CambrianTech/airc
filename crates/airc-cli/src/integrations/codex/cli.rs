@@ -1,8 +1,10 @@
 //! Codex integration CLI definitions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
+
+use crate::integrations::agent_hook::{self, HookEvent, HookReadArgs};
 
 #[derive(Debug, Args)]
 pub struct CodexHookArgs {
@@ -36,61 +38,51 @@ pub enum CodexHookAction {
         codex_home: Option<PathBuf>,
     },
     /// Emit Codex UserPromptSubmit JSON with unread AIRC context.
-    UserPromptSubmit {
-        /// Maximum unread events to fetch from the transcript store.
-        #[arg(long, default_value_t = 50)]
-        count: usize,
-        /// Maximum events to show in digest mode.
-        #[arg(long, default_value_t = 8)]
-        max_items: usize,
-        /// Emit raw unread lines instead of a compact digest.
-        #[arg(long)]
-        raw: bool,
-        /// Include events from this peer. Default excludes same-peer
-        /// self echoes so Codex does not re-inject its own sends.
-        #[arg(long)]
-        include_self: bool,
-    },
+    UserPromptSubmit(#[command(flatten)] HookReadArgs),
     /// Emit Codex PostToolUse JSON with unread AIRC context.
-    PostToolUse {
-        /// Maximum unread events to fetch from the transcript store.
-        #[arg(long, default_value_t = 50)]
-        count: usize,
-        /// Maximum events to show in digest mode.
-        #[arg(long, default_value_t = 8)]
-        max_items: usize,
-        /// Emit raw unread lines instead of a compact digest.
-        #[arg(long)]
-        raw: bool,
-        /// Include events from this peer. Default excludes same-peer
-        /// self echoes so Codex does not re-inject its own sends.
-        #[arg(long)]
-        include_self: bool,
-    },
+    PostToolUse(#[command(flatten)] HookReadArgs),
     /// Print unread AIRC context for an active Codex turn.
     ///
     /// Unlike the UserPromptSubmit hook, this is a normal CLI surface
     /// Codex can call between tool steps. With `--wait-ms`, it briefly
     /// waits for a new subscribed event before returning.
     Poll {
-        /// Maximum unread events to fetch from the transcript store.
-        #[arg(long, default_value_t = 50)]
-        count: usize,
-        /// Maximum events to show in digest mode.
-        #[arg(long, default_value_t = 8)]
-        max_items: usize,
-        /// Emit raw unread lines instead of a compact digest.
-        #[arg(long)]
-        raw: bool,
-        /// Include events from this runtime client. Default excludes
-        /// self echoes while still advancing the cursor.
-        #[arg(long)]
-        include_self: bool,
+        #[command(flatten)]
+        read: HookReadArgs,
         /// Wait this many milliseconds for one new event if no unread
         /// events are immediately available.
         #[arg(long, default_value_t = 0)]
         wait_ms: u64,
     },
+}
+
+impl CodexHookArgs {
+    pub async fn run(self, home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        use super::{hook::CODEX, install};
+        match self.action {
+            CodexHookAction::ConfigureInstaller {
+                codex_home,
+                token_stdin,
+                command_rules,
+            } => install::configure_installer(codex_home, token_stdin, command_rules),
+            CodexHookAction::InstallHooks { codex_home } => {
+                install::run_install_hooks(codex_home).await
+            }
+            CodexHookAction::UninstallHooks { codex_home } => {
+                install::run_uninstall_hooks(codex_home).await
+            }
+            CodexHookAction::UserPromptSubmit(read) => {
+                agent_hook::run_hook(&CODEX, home, &read.options(), HookEvent::UserPromptSubmit)
+                    .await
+            }
+            CodexHookAction::PostToolUse(read) => {
+                agent_hook::run_hook(&CODEX, home, &read.options(), HookEvent::PostToolUse).await
+            }
+            CodexHookAction::Poll { read, wait_ms } => {
+                agent_hook::run_poll(&CODEX, home, &read.options(), wait_ms).await
+            }
+        }
+    }
 }
 
 #[derive(Debug, Args)]

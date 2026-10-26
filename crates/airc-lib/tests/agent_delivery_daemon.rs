@@ -1,7 +1,9 @@
 //! Same partition contract over the deployed daemon ScanInbox transport.
 mod common;
+// what this catches: over the daemon transport, history before attachment is one
+// summary and the fresh request is live; once settled, neither returns (card ba22c72c).
 #[tokio::test]
-async fn daemon_live_lane_does_not_wait_for_retained_catchup() {
+async fn daemon_history_is_summarized_once_and_live_is_never_behind_it() {
     let machine = common::Machine::boot().await;
     machine.pin_identity("delivery-daemon").await;
     let airc = machine.attach("delivery-runtime").await;
@@ -20,17 +22,17 @@ async fn daemon_live_lane_does_not_wait_for_retained_catchup() {
         .await
         .unwrap();
     assert!(page.live_events().iter().any(|e| e.event_id == fresh));
-    assert!(!page.backlog_events().is_empty());
-    assert!(page.has_pending(page.live_events().len(), 1));
+    let summary = page.history_summary(|_| true).await.unwrap().unwrap();
+    assert!(summary.at_least && (1..=32).contains(&summary.count));
+    assert!(summary.oldest_ms <= summary.newest_ms);
     let live = page.live_events().len();
-    page.acknowledge(live, 1).await.unwrap();
+    page.acknowledge(live, true).await.unwrap();
     let next = airc
         .prepare_agent_delivery("consumer", 32, 8)
         .await
         .unwrap();
     assert!(!next.live_events().iter().any(|e| e.event_id == fresh));
-    assert!(!next.backlog_events().iter().any(|e| e.event_id == fresh));
-    assert!(!next.backlog_events().is_empty());
+    assert!(!next.has_history());
 }
 
 #[tokio::test]

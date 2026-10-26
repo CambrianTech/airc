@@ -125,7 +125,6 @@ use gh_cli::GhAction;
 use gist_cli::GistAction;
 use handshake_cli::HandshakeAction;
 use identity_cli::IdentityAction;
-use integrations::codex::CodexHookAction;
 use knock_cli::KnockAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use monitor::MonitorAction;
@@ -815,70 +814,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => pending_commands::run_host_broadcast_route(&snapshot, &config, &fallback_gist),
         },
 
-        Command::CodexHook(args) => match args.action {
-            CodexHookAction::ConfigureInstaller {
-                codex_home,
-                token_stdin,
-                command_rules,
-            } => integrations::codex::install::configure_installer(
-                codex_home,
-                token_stdin,
-                command_rules,
-            ),
-            CodexHookAction::InstallHooks { codex_home } => {
-                integrations::codex::install::run_install_hooks(codex_home).await
-            }
-            CodexHookAction::UninstallHooks { codex_home } => {
-                integrations::codex::install::run_uninstall_hooks(codex_home).await
-            }
-            CodexHookAction::UserPromptSubmit {
-                count,
-                max_items,
-                raw,
-                include_self,
-            } => {
-                integrations::codex::hook::run_user_prompt_submit(
-                    &home,
-                    count,
-                    max_items,
-                    raw,
-                    include_self,
-                )
-                .await
-            }
-            CodexHookAction::PostToolUse {
-                count,
-                max_items,
-                raw,
-                include_self,
-            } => {
-                integrations::codex::hook::run_post_tool_use(
-                    &home,
-                    count,
-                    max_items,
-                    raw,
-                    include_self,
-                )
-                .await
-            }
-            CodexHookAction::Poll {
-                count,
-                max_items,
-                raw,
-                include_self,
-                wait_ms,
-            } => {
-                integrations::codex::hook::run_poll(
-                    &home,
-                    count,
-                    max_items,
-                    raw,
-                    include_self,
-                    wait_ms,
-                )
-                .await
-            }
-        },
+        Command::CodexHook(args) => args.run(&home).await,
+        Command::ClaudeHook(args) => args.run(&home).await,
 
         Command::CodexStart(args) => {
             integrations::codex::start::run(&args.airc, &args.home, &args.log, args.join_args).await

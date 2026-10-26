@@ -249,4 +249,4 @@ pub use airc_work::{
 };
 
 mod agent_delivery;
-pub use agent_delivery::AgentDeliveryTurn;
+pub use agent_delivery::{AgentDeliveryTurn, HistorySummary};
