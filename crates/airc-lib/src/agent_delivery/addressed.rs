@@ -7,6 +7,9 @@ use super::state::Unsearched;
 use super::{key, AgentDeliveryTurn};
 use crate::AircError;
 
+/// The most events one agent-feed scan returns (its contract: 1..=4096).
+const SCAN_CAP: usize = 4096;
+
 pub(super) struct AddressedPage {
     pub(super) shown: Vec<TranscriptEvent>,
     pub(super) more: usize,
@@ -46,7 +49,8 @@ impl AgentDeliveryTurn {
         // One turn's work is bounded by `candidates` events in total; it moves on
         // to the next (older) range only while budget and page room remain, so
         // a reattach's small new segment costs no extra turn.
-        let mut budget = window.candidates.max(1);
+        // The budget is clamped to what one scan can return, SCAN_CAP.
+        let mut budget = window.candidates.clamp(1, SCAN_CAP);
         let mut shown: Vec<TranscriptEvent> = Vec::new();
         let mut more = 0;
         while let Some(range) = unsearched.pop() {
@@ -56,18 +60,32 @@ impl AgentDeliveryTurn {
                 break;
             }
             // An exclusive top reads one more and drops the top event itself.
-            let limit = (budget + usize::from(range.top_exclusive)).min(4096);
+            // `budget` is already within SCAN_CAP; the sentinel is added saturating,
+            // so no accepted --count can wrap, then capped again.
+            let limit = budget
+                .saturating_add(usize::from(range.top_exclusive))
+                .min(SCAN_CAP);
             let tail = self
                 .airc
                 .scan_agent_feed_in_channels(None, &range.top, limit, &self.channels)
                 .await?;
+            // Whether the range's start was reached is a fact about the RAW scan:
+            // it returned fewer events than asked, or reached back to the range's
+            // own start. Never inferred from the filtered count, which falls short
+            // of the limit whenever the exclusive top is dropped or the scan cap
+            // trims the request (Cormac on #1617: --count 4096 on an exclusive
+            // range read 4095 < 4096 as "reached" and settled the rest unseen).
+            let reached_start = tail.events.len() < limit
+                || tail
+                    .events
+                    .first()
+                    .is_some_and(|oldest| key(&oldest.cursor()) <= key(&range.after));
             let scanned: Vec<_> = tail
                 .events
                 .into_iter()
                 .filter(|e| key(&e.cursor()) > key(&range.after))
                 .filter(|e| !range.top_exclusive || key(&e.cursor()) < key(&range.top))
                 .collect();
-            let reached_start = scanned.len() < budget;
             budget -= scanned.len().min(budget);
             let oldest_scanned = scanned.first().map(|e| e.cursor());
             let mut found: Vec<_> = scanned

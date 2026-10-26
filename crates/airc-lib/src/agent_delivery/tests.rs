@@ -483,6 +483,55 @@ async fn a_request_from_a_second_outage_is_emitted_exactly_once() {
     );
 }
 
+// what this catches (Cormac on #1617): at the scan cap, "reached the start" is
+// read from the raw scan. With --count 4096 and more than 4096 events below an
+// exclusive top, the oldest event (a request to me) is still emitted, not settled
+// unseen.
+#[tokio::test]
+async fn at_the_scan_cap_the_oldest_request_is_still_emitted() {
+    let (_dir, airc, room) = fixture().await;
+    airc.append_event(request(&airc, room, 1)).await.unwrap();
+    for n in 2..=8300 {
+        append(&airc, room, n).await;
+    }
+    let me = airc.addressee().await.unwrap();
+    // At the cap, and (Codex) far above it: both clamp to one 4096-event scan.
+    for (consumer, candidates) in [("capped", 4096), ("over-cap", 10_000)] {
+        let window = AddressedWindow {
+            candidates,
+            page: 8,
+        };
+        // Turn 1 reads the newest 4096 (inclusive top); the rest of the range is
+        // preserved as an exclusive unsearched range, never settled.
+        let mut first = airc
+            .prepare_native_delivery(consumer, false, 64, 64)
+            .await
+            .unwrap();
+        first
+            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+            .await
+            .unwrap();
+        first.acknowledge(0, true).await.unwrap();
+        let after_first = airc
+            .prepare_native_delivery(consumer, false, 64, 64)
+            .await
+            .unwrap();
+        assert!(after_first.has_history(), "{consumer}: capped, not settled");
+        let rest = &after_first.state.unsearched;
+        assert_eq!(rest.len(), 1, "{consumer}");
+        assert!(rest[0].top_exclusive, "{consumer}");
+        assert_eq!(rest[0].top.lamport, 8300 - 4096 + 1, "{consumer}");
+        drop(after_first);
+        // Turn 2 hits the cap on that exclusive range; the request is still
+        // emitted on a later turn, never settled unseen.
+        assert_eq!(
+            walk(&airc, consumer, window, false).await,
+            vec![1],
+            "{consumer}"
+        );
+    }
+}
+
 // what this catches (Codex on #1617): `live` is the delivery proof. A reattach
 // after an outage that is dropped before any output leaves it where it was; the
 // outage events are history, never marked delivered by the attach.
