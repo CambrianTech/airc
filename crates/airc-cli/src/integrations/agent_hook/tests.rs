@@ -441,37 +441,95 @@ async fn many_addressed_requests_show_one_page_and_a_count() {
     );
 }
 
+// what this catches (Codex on #1618): a burst larger than one turn can read is presented as
+// bounded history through the one re-attach owner, never replayed live oldest first and never
+// lost. A 9-event burst at a scan of 3 stays durable in the store; the summary counts exactly
+// the 9 with their original times and shows the newest ambient event; both requests in it are
+// emitted before the history settles, again after a turn that showed them was dropped without
+// acknowledgment and the process restarted; and the next arrival is delivered live.
 #[tokio::test]
-async fn production_empty_bootstrap_preserves_burst_larger_than_page() {
-    let (_dir, airc, room) = fixture().await;
+async fn burst_larger_than_a_turn_becomes_bounded_history_and_keeps_its_requests() {
+    let (dir, airc, room) = fixture().await;
     let empty = airc.prepare_agent_delivery("burst", 3, 3).await.unwrap();
     assert!(empty.is_empty());
     empty.acknowledge(0, false).await.unwrap(); // actual pre-wait path
+    let me_target = MentionTarget::Peer(airc.peer_id());
     for n in 1..=9 {
-        append(
-            &airc,
-            room,
-            n,
-            Body::text(format!("burst-{n}")),
-            false,
-            false,
-        )
-        .await;
+        if n == 3 || n == 6 {
+            append_text(&airc, room, n, &format!("request-{n}"), me_target.clone()).await;
+        } else {
+            append(
+                &airc,
+                room,
+                n,
+                Body::text(format!("burst-{n}")),
+                false,
+                false,
+            )
+            .await;
+        }
     }
-    let mut seen = Vec::new();
-    for _ in 0..3 {
-        let page = airc.prepare_agent_delivery("burst", 3, 3).await.unwrap();
-        let l = delivery_end(&page, false, |_| true);
-        seen.extend(page.live_events()[..l].iter().map(|e| e.lamport));
-        assert!(delivery_context(&page, l, false, None, None, "codex-hook", |_| true).is_some());
-        page.acknowledge(l, true).await.unwrap();
-    }
-    assert_eq!(seen, (1..=9).collect::<Vec<_>>());
-    assert!(airc
-        .prepare_agent_delivery("burst", 3, 3)
+    let durable: Vec<u64> = airc
+        .page_recent(50)
         .await
         .unwrap()
-        .is_empty());
+        .iter()
+        .map(|e| e.lamport)
+        .collect();
+    assert!(
+        (1..=9).all(|n| durable.contains(&n)),
+        "all 9 stay durable: {durable:?}"
+    );
+    let lamports =
+        |events: &[TranscriptEvent]| events.iter().map(|e| e.lamport).collect::<Vec<_>>();
+    let me = airc.addressee().await.unwrap();
+    // Shown, then dropped without acknowledgment.
+    let mut dropped = airc.prepare_agent_delivery("burst", 3, 3).await.unwrap();
+    assert!(
+        dropped.live_events().is_empty(),
+        "the burst never replays live"
+    );
+    let summary = summarize(&mut dropped, &me, |_| true).await.unwrap();
+    assert_eq!(
+        summary.counted.unwrap(),
+        airc_core::HistoryCount {
+            count: 9,
+            oldest_ms: Some(1),
+            newest_ms: Some(9),
+        },
+        "the represented range, exactly"
+    );
+    assert_eq!(
+        summary.recent.last().map(|e| e.lamport),
+        Some(9),
+        "newest ambient shown"
+    );
+    assert_eq!(lamports(&summary.addressed), [6, 3]);
+    assert!(summary.addressed_complete);
+    drop(dropped);
+    drop(airc);
+    // After a restart every unshown obligation is still owed.
+    let airc = Airc::open_with_wire_root_for_test(dir.path(), dir.path())
+        .await
+        .unwrap();
+    let mut turn = airc.prepare_agent_delivery("burst", 3, 3).await.unwrap();
+    assert!(turn.has_history(), "not settled by a dropped turn");
+    let summary = summarize(&mut turn, &me, |_| true).await.unwrap();
+    assert_eq!(summary.counted.unwrap().count, 9);
+    assert_eq!(
+        lamports(&summary.addressed),
+        [6, 3],
+        "emitted before settling"
+    );
+    turn.acknowledge(0, true).await.unwrap();
+    append(&airc, room, 10, Body::text("after"), false, false).await;
+    let next = airc.prepare_agent_delivery("burst", 3, 3).await.unwrap();
+    assert!(!next.has_history(), "settled once both were emitted");
+    assert_eq!(
+        lamports(next.live_events()),
+        [10],
+        "delivered live, promptly"
+    );
 }
 
 fn event(body: Body) -> TranscriptEvent {

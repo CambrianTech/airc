@@ -11,6 +11,14 @@
 //! ([`AgentDeliveryTurn::history_summary`]). Requests addressed to this identity
 //! page on later turns until every one is shown, and only then does the range
 //! settle. The history itself stays durable for `airc inbox`.
+//!
+//! Live delivery is oldest first, but only within what one turn can read. A
+//! consumer further behind than one turn re-attaches at the present
+//! (`prepare_delivery_owned`, the one owner of that decision): what it missed is
+//! deliberately presented as bounded history (the count with its times, the
+//! newest page whole, and every addressed request until emitted) instead of
+//! being replayed in ambient live order. The re-attach never moves `live`, the
+//! delivery proof: nothing it reclassified was shown.
 use crate::{Airc, AircError, EventFilter, EventScan};
 use airc_core::{EventId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_store::StoredScopedState;
@@ -308,8 +316,9 @@ impl Airc {
                 state
             };
         // A consumer further behind than one turn can read re-attaches: what it missed becomes
-        // history (counted, with what was addressed to it searched newest first), and live
-        // delivery restarts at the present. Paged oldest first, a hook whose peers post faster
+        // history (counted, with what was addressed to it emitted oldest range first), and live
+        // delivery restarts at the present; ambient live order is deliberately given up for a
+        // bounded history presentation, and `live` (the delivery proof) does not move. Paged oldest first, a hook whose peers post faster
         // than its page never caught up: a Claude Code session read its 10-26 backlog on 10-29,
         // nine events a call, and every message addressed to it that day stayed out of reach.
         let attaching = attaching || {
