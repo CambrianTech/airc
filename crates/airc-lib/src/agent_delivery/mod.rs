@@ -184,7 +184,12 @@ fn prefix(
     if end > page.events.len() {
         return Err(fail("invalid delivered prefix"));
     }
-    Ok(if end == page.events.len() {
+    // Nothing shown is nothing delivered: an empty acknowledgment never moves the live proof,
+    // even when the scan ran past events (a re-attach scans from its boundary; the backlog below
+    // it is history, accounted by the summary, never delivery). Codex on airc#1618.
+    Ok(if end == 0 {
+        previous.clone()
+    } else if end == page.events.len() {
         page.scanned_through
             .clone()
             .unwrap_or_else(|| previous.clone())
