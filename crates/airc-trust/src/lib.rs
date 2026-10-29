@@ -166,6 +166,7 @@ impl From<StoreError> for PeersStoreError {
             | StoreError::Database(_)
             | StoreError::LockPoisoned
             | StoreError::Migration(_)
+            | StoreError::AheadOfBinary { .. }
             | StoreError::DuplicateEventId(_)
             | StoreError::UnknownTranscriptKind(_)
             | StoreError::InvalidStoredValue { .. }

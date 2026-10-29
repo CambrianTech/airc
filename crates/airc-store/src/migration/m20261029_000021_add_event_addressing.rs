@@ -8,21 +8,16 @@
 //! `@name`). The store writes them at append; the stored event and the signed
 //! envelope bytes are untouched.
 //!
-//! Existing rows are backfilled through the entities, a keyset page at a time:
-//! read `(event_id, target, body|payload)`, derive the addressing in Rust with
-//! the same function append uses, and update only the rows whose values differ
-//! from the column defaults, one `UPDATE .. WHERE event_id IN (..)` per value.
+//! A third column, `derived_version`, marks rows whose derived data
+//! (addressing, and the header rows of migration 000022) is current. This
+//! migration is DDL only and runs, with its version row, inside the one
+//! transaction `apply_migrations` wraps around `Migrator::up`; the derivation
+//! itself is `crate::derive`, resumable and run after every open, so rows an
+//! interrupted backfill or an older writer left at version 0 are healed.
 
-use std::collections::BTreeMap;
-
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use sea_orm_migration::prelude::*;
-use uuid::Uuid;
 
-use crate::entities::{bus_event, event};
-
-/// Rows read per backfill page.
-const PAGE: u64 = 1000;
+use super::fault::{self, Fault};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -42,12 +37,27 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(table)
+                        .table(table.clone())
                         .add_column(
                             ColumnDef::new(Addressing::LeadingMention)
                                 .boolean()
                                 .not_null()
                                 .default(false),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+            // 0 = not derived: every existing row, and any row an older writer
+            // inserts without the column.
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(table)
+                        .add_column(
+                            ColumnDef::new(Addressing::DerivedVersion)
+                                .integer()
+                                .not_null()
+                                .default(0),
                         )
                         .to_owned(),
                 )
@@ -99,9 +109,25 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
         }
-        let db = manager.get_connection();
-        backfill_events(db).await?;
-        backfill_bus_events(db).await
+        // The derivation finds the rows it still owes by this column.
+        for (name, table) in [
+            ("idx_events_derived_version", Events::Table.into_iden()),
+            (
+                "idx_bus_events_derived_version",
+                BusEvents::Table.into_iden(),
+            ),
+        ] {
+            manager
+                .create_index(
+                    Index::create()
+                        .name(name)
+                        .table(table)
+                        .col(Addressing::DerivedVersion)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        fault::hit(Fault::AfterAddressingDdl)
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -110,6 +136,8 @@ impl MigrationTrait for Migration {
             "idx_events_room_leading_mention",
             "idx_bus_events_room_addressed_peer",
             "idx_bus_events_room_leading_mention",
+            "idx_events_derived_version",
+            "idx_bus_events_derived_version",
         ] {
             manager
                 .drop_index(Index::drop().name(name).to_owned())
@@ -117,7 +145,11 @@ impl MigrationTrait for Migration {
         }
         // SQLite takes one alter option per statement.
         for table in [Events::Table.into_iden(), BusEvents::Table.into_iden()] {
-            for column in [Addressing::AddressedPeer, Addressing::LeadingMention] {
+            for column in [
+                Addressing::AddressedPeer,
+                Addressing::LeadingMention,
+                Addressing::DerivedVersion,
+            ] {
                 manager
                     .alter_table(
                         Table::alter()
@@ -129,116 +161,6 @@ impl MigrationTrait for Migration {
             }
         }
         Ok(())
-    }
-}
-
-fn decode(what: &str, error: impl std::fmt::Display) -> DbErr {
-    DbErr::Custom(format!("addressing backfill: {what}: {error}"))
-}
-
-/// The non-default addressing of one page, grouped by value: the rows whose
-/// typed target names each peer, and the rows that open with an `@name`.
-#[derive(Default)]
-struct Derived {
-    peers: BTreeMap<Uuid, Vec<Uuid>>,
-    leading: Vec<Uuid>,
-}
-
-impl Derived {
-    fn add(&mut self, id: Uuid, addressing: airc_core::Addressing) {
-        if let Some(peer) = addressing.peer {
-            self.peers.entry(peer.as_uuid()).or_default().push(id);
-        }
-        if addressing.leading_mention {
-            self.leading.push(id);
-        }
-    }
-}
-
-async fn backfill_events(db: &SchemaManagerConnection<'_>) -> Result<(), DbErr> {
-    let mut last: Option<Uuid> = None;
-    loop {
-        let mut page = event::Entity::find()
-            .select_only()
-            .column(event::Column::EventId)
-            .column(event::Column::Target)
-            .column(event::Column::Body)
-            .order_by_asc(event::Column::EventId)
-            .limit(PAGE);
-        if let Some(after) = last {
-            page = page.filter(event::Column::EventId.gt(after));
-        }
-        let rows: Vec<(Uuid, serde_json::Value, Option<serde_json::Value>)> =
-            page.into_tuple().all(db).await?;
-        let Some((tail, _, _)) = rows.last() else {
-            return Ok(());
-        };
-        last = Some(*tail);
-        let mut derived = Derived::default();
-        for (id, target, body) in rows {
-            let target: airc_core::MentionTarget =
-                serde_json::from_value(target).map_err(|e| decode("events.target", e))?;
-            let body: Option<airc_core::Body> = body
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|e| decode("events.body", e))?;
-            derived.add(id, airc_core::Addressing::of_target(&target, body.as_ref()));
-        }
-        for (peer, ids) in derived.peers {
-            event::Entity::update_many()
-                .col_expr(event::Column::AddressedPeer, Expr::value(peer))
-                .filter(event::Column::EventId.is_in(ids))
-                .exec(db)
-                .await?;
-        }
-        if !derived.leading.is_empty() {
-            event::Entity::update_many()
-                .col_expr(event::Column::LeadingMention, Expr::value(true))
-                .filter(event::Column::EventId.is_in(derived.leading))
-                .exec(db)
-                .await?;
-        }
-    }
-}
-
-async fn backfill_bus_events(db: &SchemaManagerConnection<'_>) -> Result<(), DbErr> {
-    let mut last: Option<Uuid> = None;
-    loop {
-        let mut page = bus_event::Entity::find()
-            .select_only()
-            .column(bus_event::Column::EventId)
-            .column(bus_event::Column::Target)
-            .column(bus_event::Column::Payload)
-            .order_by_asc(bus_event::Column::EventId)
-            .limit(PAGE);
-        if let Some(after) = last {
-            page = page.filter(bus_event::Column::EventId.gt(after));
-        }
-        let rows: Vec<(Uuid, serde_json::Value, Vec<u8>)> = page.into_tuple().all(db).await?;
-        let Some((tail, _, _)) = rows.last() else {
-            return Ok(());
-        };
-        last = Some(*tail);
-        let mut derived = Derived::default();
-        for (id, target, payload) in rows {
-            let target: airc_bus::Target =
-                serde_json::from_value(target).map_err(|e| decode("bus_events.target", e))?;
-            derived.add(id, airc_bus::addressing_of(&target, &payload));
-        }
-        for (peer, ids) in derived.peers {
-            bus_event::Entity::update_many()
-                .col_expr(bus_event::Column::AddressedPeer, Expr::value(peer))
-                .filter(bus_event::Column::EventId.is_in(ids))
-                .exec(db)
-                .await?;
-        }
-        if !derived.leading.is_empty() {
-            bus_event::Entity::update_many()
-                .col_expr(bus_event::Column::LeadingMention, Expr::value(true))
-                .filter(bus_event::Column::EventId.is_in(derived.leading))
-                .exec(db)
-                .await?;
-        }
     }
 }
 
@@ -263,4 +185,5 @@ enum BusEvents {
 enum Addressing {
     AddressedPeer,
     LeadingMention,
+    DerivedVersion,
 }

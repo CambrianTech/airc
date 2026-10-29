@@ -111,12 +111,9 @@ impl SqliteEventStore {
                 .busy_timeout(POOL_ACQUIRE_TIMEOUT)
         });
         let db = Database::connect(opts).await?;
-        // Forward-compatible BOTH directions: apply our pending
-        // migrations, but tolerate a DB already migrated AHEAD of this
-        // binary (version skew must not brick the store).
-        crate::migration::apply_migrations(&db)
-            .await
-            .map_err(|err| StoreError::Migration(err.to_string()))?;
+        // Migrate forward atomically, derive what rows owe, and refuse a DB
+        // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
+        crate::migration::apply_migrations(&db).await?;
         Ok(Self { db })
     }
 
@@ -995,7 +992,7 @@ fn stored_endpoints_stamp_ms(column: Option<i64>) -> Result<u64, StoreError> {
     }
 }
 
-fn sqlite_file_url(path: &Path) -> String {
+pub(crate) fn sqlite_file_url(path: &Path) -> String {
     let raw = normalise_sqlite_path(path);
     if has_windows_drive_prefix(&raw) {
         format!("sqlite:{raw}?mode=rwc")
@@ -1560,6 +1557,7 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
         metadata: ActiveValue::Set(ev.metadata.clone()),
         addressed_peer: ActiveValue::Set(addressing.peer.map(|peer| peer.as_uuid())),
         leading_mention: ActiveValue::Set(addressing.leading_mention),
+        derived_version: ActiveValue::Set(crate::derive::DERIVED_VERSION),
     })
 }
 
@@ -1648,6 +1646,7 @@ mod tests {
             metadata: serde_json::Value::Null,
             addressed_peer: None,
             leading_mention: false,
+            derived_version: crate::derive::DERIVED_VERSION,
         }
     }
 

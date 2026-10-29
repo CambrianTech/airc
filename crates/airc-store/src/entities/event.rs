@@ -48,6 +48,9 @@ pub struct Model {
     pub addressed_peer: Option<Uuid>,
     /// The body text opens with an `@name` ([`airc_core::leading_mentions`]).
     pub leading_mention: bool,
+    /// The version of this row's derived data (addressing, header rows);
+    /// below `crate::derive::DERIVED_VERSION` it is derived on the next open.
+    pub derived_version: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -97,8 +97,8 @@ impl SqliteDurableSink {
         let db = Database::connect(opts)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
-        // Forward-compatible both directions: tolerate a DB migrated
-        // ahead of this binary (version skew must not brick the sink).
+        // Migrate forward atomically, derive what rows owe, and refuse a DB
+        // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
@@ -524,6 +524,7 @@ fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
         occurred_at_ms: Set(u64_to_i64("bus_events.occurred_at_ms", e.occurred_at_ms)?),
         addressed_peer: Set(addressing.peer.map(|peer| peer.as_uuid())),
         leading_mention: Set(addressing.leading_mention),
+        derived_version: Set(crate::derive::DERIVED_VERSION),
     })
 }
 

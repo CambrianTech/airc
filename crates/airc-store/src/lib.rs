@@ -40,6 +40,7 @@ pub mod account_registry;
 pub mod beacon;
 pub mod bus_epoch_store;
 pub mod bus_sink;
+mod derive;
 pub mod entities;
 pub mod error;
 mod event_query;
