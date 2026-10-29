@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use airc_core::identity::Identity;
 use airc_identity::LocalIdentity;
 use airc_lib::MachineAccountHome;
-use airc_store::{EventStore, SqliteEventStore};
+use airc_store::EventStore;
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
@@ -319,7 +319,7 @@ async fn save_identity_card(home: &Path, identity: Identity) -> Result<(), Box<d
 
 async fn identity_store(home: &Path) -> Result<Box<dyn EventStore>, Box<dyn Error>> {
     Ok(Box::new(
-        SqliteEventStore::open_path(&home.join("events.sqlite")).await?,
+        airc_lib::store_admission::open_writer_store(home, &home.join("events.sqlite")).await?,
     ))
 }
 

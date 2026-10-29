@@ -38,7 +38,12 @@ async fn check_identity(home: &Path) -> Vec<Finding> {
     // Open the store to ask about the singleton row. If the store
     // itself can't open, surface that instead — that's a different
     // class of breakage (disk full, permissions, db corruption).
-    let store = match airc_store::SqliteEventStore::open_path(&home.join("events.sqlite")).await {
+    let store = match airc_lib::store_admission::open_writer_store(
+        home,
+        &home.join("events.sqlite"),
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => {
             return vec![Finding::blocked(

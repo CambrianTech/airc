@@ -60,6 +60,11 @@ const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 pub struct SqliteEventStore {
     db: DatabaseConnection,
+    /// The write custody this handle was admitted under (a lifecycle lock
+    /// guard, or the daemon's proof of its own); held for the handle's whole
+    /// lifetime and released when it drops. `None` for stores opened outside
+    /// the machine-account lifecycle (in-memory, tests).
+    _custody: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl SqliteEventStore {
@@ -114,7 +119,7 @@ impl SqliteEventStore {
         // Migrate forward atomically, derive what rows owe, and refuse a DB
         // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db).await?;
-        Ok(Self { db })
+        Ok(Self { db, _custody: None })
     }
 
     /// Open a file-backed SQLite store from a filesystem path.
@@ -130,6 +135,19 @@ impl SqliteEventStore {
             }
         }
         Self::open(&sqlite_file_url(path)).await
+    }
+
+    /// Open `path` for writing under `custody`, which the store holds until it
+    /// drops. The one entry for the machine store's writers is
+    /// `airc_lib::store_admission`, which acquires the custody first, so an
+    /// update cannot begin between this open and the last write.
+    pub async fn open_path_in_custody(
+        path: &Path,
+        custody: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, StoreError> {
+        let mut store = Self::open_path(path).await?;
+        store._custody = Some(custody);
+        Ok(store)
     }
 
     /// Open an ephemeral in-memory store. Convenience for tests.

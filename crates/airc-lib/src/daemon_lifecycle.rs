@@ -66,7 +66,23 @@ pub struct DaemonStartupGuard {
     owner: crate::MachineAccountHome,
 }
 
+/// Proof that this process is the daemon admitted through
+/// [`DaemonStartupGuard::acquire`]: the daemon's own store opens present it
+/// instead of re-acquiring lifecycle custody (an `airc update` excludes the
+/// daemon by stopping it, after which no proof outlives the process).
+/// Constructed only by [`DaemonStartupGuard::custody`].
+#[derive(Clone, Debug)]
+pub struct DaemonCustody {
+    _admitted: (),
+}
+
 impl DaemonStartupGuard {
+    /// This daemon's custody proof, minted while startup is held; it stays
+    /// valid after [`Self::bound`] for the process's lifetime.
+    pub fn custody(&self) -> DaemonCustody {
+        DaemonCustody { _admitted: () }
+    }
+
     pub fn acquire(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
         let active = DaemonLifecycleGuard::open(&owner, "daemon-startup.lock")?;
@@ -110,6 +126,25 @@ impl DaemonLifecycleGuard {
         };
         require_running(&guard.owner)?;
         Ok(guard)
+    }
+
+    /// Write custody for a process that writes the machine store directly
+    /// (not the daemon): the same shared admission as [`Self::autostart`],
+    /// refused with [`MaintenanceInProgress`] while maintenance is held, but
+    /// not refused by an operator stop (stopping the daemon does not forbid a
+    /// CLI from editing the store). Held for the writer's lifetime, it makes a
+    /// later [`Self::maintenance`] wait until the writer is done.
+    pub fn writer(home: &Path) -> io::Result<Self> {
+        let owner = crate::machine_account_home(home);
+        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
+        FileExt::try_lock_shared(&intent).map_err(MaintenanceInProgress::refusal)?;
+        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
+        FileExt::try_lock_shared(&file).map_err(MaintenanceInProgress::refusal)?;
+        Ok(Self {
+            active: file,
+            _maintenance_intent: None,
+            owner,
+        })
     }
 
     /// Serialize operator intent or maintenance; updaters acquire after building

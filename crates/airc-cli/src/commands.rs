@@ -28,7 +28,7 @@ use airc_diagnostics::{
 use airc_identity::LocalIdentity;
 use airc_ipc::{AddPeerRequest, DaemonClient, RemovePeerRequest, Request, Response};
 use airc_lib::{Airc, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVAL};
-use airc_store::{EventStore, SqliteEventStore};
+use airc_store::EventStore;
 use airc_trust as peers_store;
 
 /// `init` — open the substrate at `<home>`. `Airc::open` loads or
@@ -1856,6 +1856,8 @@ pub async fn run_daemon(
     // A parent may time out or die before this child binds. Keep startup
     // observable to stop even after that parent's admission lock is gone.
     let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home)?;
+    // The daemon's own store opens present this proof (store_admission).
+    let custody = startup.custody();
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call
@@ -1892,7 +1894,8 @@ pub async fn run_daemon(
     // Concrete handle kept alongside the trait object: the inbound
     // bridge's unknown-channel heal reads the account-registry CACHE
     // (a concrete SqliteAccountRegistryStore over this same file).
-    let machine_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let machine_store =
+        Arc::new(airc_lib::store_admission::open_daemon_store(&db_path, &custody).await?);
     let coordinator_store: Arc<dyn EventStore> = machine_store.clone();
     let state = Arc::new(
         DaemonState::build(
@@ -2063,6 +2066,7 @@ pub async fn run_daemon(
     // initialization awaits LAN/store setup. notify_waiters does not retain a
     // permit for a future created after that Stop.
     let registry_shutdown = state.shutdown.clone().notified_owned();
+    let registry_custody = custody.clone();
     let registry_handle = tokio::spawn(async move {
         // HERMETIC GATE (card d793c242): test/temp daemons inherit the
         // operator's working gh auth, so without this gate they publish
@@ -2213,15 +2217,16 @@ pub async fn run_daemon(
             }
         }
         let db_path = airc_lib::machine_account_home(&registry_home).join("events.sqlite");
-        let event_store = match SqliteEventStore::open_path(&db_path).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                eprintln!(
+        let event_store =
+            match airc_lib::store_admission::open_daemon_store(&db_path, &registry_custody).await {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    eprintln!(
                     "airc daemon: account-registry loop disabled — could not open store: {error}"
                 );
-                return;
-            }
-        };
+                    return;
+                }
+            };
         // Resolve gh's full path for the daemon's own use. The gate +
         // store default to bare `gh`, but a DETACHED daemon descended
         // from a bash launcher has a PATH `Command::new("gh")` can't
@@ -3273,7 +3278,7 @@ pub async fn run_peer_prune(
     // Authoritative live set: the fresh, stale-pruned account-registry
     // document (READ-ONLY — `live_registry_peer_ids` does not enrol).
     let db_path = airc_lib::machine_account_home(home).join("events.sqlite");
-    let event_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let event_store = Arc::new(airc_lib::store_admission::open_writer_store(home, &db_path).await?);
     let store = match resolve_gh_bin() {
         Some(bin) => airc_lib::GhAccountRegistryStore::new(event_store, home).with_bin(bin),
         None => airc_lib::GhAccountRegistryStore::new(event_store, home),

@@ -27,7 +27,7 @@ use airc_lib::{
     machine_account_home, Airc, GateBlock, GcAction, GhAccountRegistryStore, RegistryRefreshGate,
     RouteEndpoint, SyncOutcome,
 };
-use airc_store::SqliteEventStore;
+
 use std::sync::Arc;
 
 /// Convert the daemon's IPC endpoint mirror back to the lib type.
@@ -146,7 +146,7 @@ pub async fn run_sync(
     // The gh sentinel + registry rows live in the machine-account
     // home's events.sqlite — the same DB the daemon's store uses.
     let db_path = machine_account_home(home).join("events.sqlite");
-    let event_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let event_store = Arc::new(airc_lib::store_admission::open_writer_store(home, &db_path).await?);
     let store = GhAccountRegistryStore::new(event_store, home);
     let gate = RegistryRefreshGate::GhAuth {
         // Honor the operator's AIRC_GH_BIN here too (card 1f2cbffa):
@@ -252,7 +252,7 @@ fn print_gate_skip(verb: &str, block: &GateBlock) {
 /// fetch cost back down to one gist per real machine.
 pub async fn run_gc(home: &Path, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = machine_account_home(home).join("events.sqlite");
-    let event_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let event_store = Arc::new(airc_lib::store_admission::open_writer_store(home, &db_path).await?);
     let store = GhAccountRegistryStore::new(event_store, home);
     let gate = RegistryRefreshGate::GhAuth {
         gh_bin: crate::commands::gh_bin_override(),
