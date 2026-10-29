@@ -166,14 +166,19 @@ impl WriteGate {
             return Ok(WriteTicket { locks: None });
         };
         let mut in_flight = locks.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        if *in_flight == 0 {
-            // The gate only while taking the lifecycle, as autostart does: a
-            // requested maintenance closes it before draining in-flight writes.
-            try_shared(&locks.gate)?;
-            let taken = try_shared(&locks.lifecycle);
-            FileExt::unlock(&locks.gate)?;
-            taken?;
-        }
+        // Every write passes the gate, serialized by `in_flight`'s mutex: a requested
+        // maintenance closes it before draining, so a write attempted while it drains is
+        // refused even when others of this store are still in flight; checked only on the
+        // 0 -> 1 edge, a steady stream of writes kept maintenance from draining (Codex on
+        // airc#1618). The lifecycle share is taken on 0 -> 1 and released on 1 -> 0 only.
+        try_shared(&locks.gate)?;
+        let taken = if *in_flight == 0 {
+            try_shared(&locks.lifecycle)
+        } else {
+            Ok(())
+        };
+        FileExt::unlock(&locks.gate)?;
+        taken?;
         *in_flight += 1;
         Ok(WriteTicket { locks: Some(locks) })
     }

@@ -112,6 +112,16 @@ mod tests {
             matches!(started.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "maintenance waits for the write in flight"
         );
+        // A NEW write on the same store while maintenance drains is refused, typed, even
+        // though another write of this store is still in flight (Codex on airc#1618).
+        let refused = match custody.admit() {
+            Err(error) => error,
+            Ok(_) => panic!("a write attempted while maintenance drains was admitted"),
+        };
+        assert!(
+            airc_store::custody::is_maintenance_in_progress(&refused),
+            "{refused}"
+        );
         drop(in_flight);
         started
             .recv_timeout(Duration::from_secs(5))
