@@ -23,22 +23,39 @@
 //! that peer how long it may be away. That is a policy decision with an owner,
 //! not a drain.
 
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use airc_core::HeaderFilter;
+use sea_orm::sea_query::{Alias, Expr, SimpleExpr};
+use sea_orm::{EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
 
+use crate::entities::{bus_event_header, event_header};
 use crate::error::StoreError;
+use crate::header_query::{predicate, HeaderRows};
 use crate::sqlite::SqliteEventStore;
+use crate::sqlite_only::{pragma_u64, sqlite_only, Pragma, SqliteOnly};
 
 /// `bus_events` rows that were heartbeats: the header every heartbeat carries.
-/// Quoted because the key has dots in it.
-const HEARTBEAT_ROW: &str = r#"json_type(headers, '$."airc.heartbeat.kind"') IS NOT NULL"#;
+fn heartbeat_row() -> HeaderFilter {
+    HeaderFilter::Has {
+        key: "airc.heartbeat.kind".into(),
+    }
+}
+
 /// `events` rows of any NON-DURABLE class — decided by the header, never the body
 /// (the header rule: classify at ingress from headers, never decode payloads). After
 /// #1457 no non-durable frame is transcript history, so every such row is dead:
 /// cursor-paging requests and replies (stamped `request_response` by the backfill
 /// exchange, up to 8 MB each) and any other class that predates the gate. A missing
 /// header means durable, exactly as `delivery_class_from_header` reads it.
-const NON_DURABLE_ROW: &str =
-    r#"coalesce(json_extract(headers, '$."airc.delivery_class"'), 'durable') <> 'durable'"#;
+fn non_durable_row() -> HeaderFilter {
+    let key = "airc.delivery_class".to_string();
+    HeaderFilter::All(vec![
+        HeaderFilter::Has { key: key.clone() },
+        HeaderFilter::Not(Box::new(HeaderFilter::Exact {
+            key,
+            value: "durable".into(),
+        })),
+    ])
+}
 
 /// Rows of rowid space one DELETE statement covers. The pools are
 /// `max_connections(1)` and SQLite has one writer: a single statement over a
@@ -105,10 +122,10 @@ impl SqliteEventStore {
         window: i64,
     ) -> Result<DrainReport, StoreError> {
         let heartbeat_rows = self
-            .delete_in_windows("bus_events", HEARTBEAT_ROW, window)
+            .delete_in_windows::<bus_event_header::Entity>(&heartbeat_row(), window)
             .await?;
         let non_durable_rows = self
-            .delete_in_windows("events", NON_DURABLE_ROW, window)
+            .delete_in_windows::<event_header::Entity>(&non_durable_row(), window)
             .await?;
         Ok(DrainReport {
             heartbeat_rows,
@@ -117,33 +134,57 @@ impl SqliteEventStore {
         })
     }
 
-    /// `DELETE … WHERE <predicate>` one rowid window at a time, yielding between
-    /// windows so queued appends and reads take the connection and the write lock
-    /// ([`DRAIN_WINDOW_ROWS`]). Bounded by the table's max rowid at the start: rows
-    /// written during the pass are the next pass's.
-    async fn delete_in_windows(
+    /// Delete the owner rows of `H` whose headers match `dead`, with their
+    /// header rows, one rowid window at a time, yielding between windows so
+    /// queued appends and reads take the connection and the write lock
+    /// ([`DRAIN_WINDOW_ROWS`]). Bounded by the table's max rowid at the start:
+    /// rows written during the pass are the next pass's.
+    async fn delete_in_windows<H: HeaderRows>(
         &self,
-        table: &str,
-        predicate: &str,
+        dead: &HeaderFilter,
         window: i64,
     ) -> Result<u64, StoreError> {
         let db = self.connection();
-        let max_rowid = self
-            .scalar_i64(&format!("SELECT coalesce(max(rowid), 0) FROM {table}"))
+        let rowid = || Expr::col((H::Owner::default(), Alias::new("rowid")));
+        let max_rowid: Option<Option<i64>> = H::Owner::find()
+            .select_only()
+            .column_as(rowid().max(), "max_rowid")
+            .into_tuple()
+            .one(db)
             .await?;
-        let sql = format!("DELETE FROM {table} WHERE rowid > ? AND rowid <= ? AND {predicate}");
+        let Some(max_rowid) = max_rowid.flatten() else {
+            return Ok(0);
+        };
+        let owner_id = || Expr::col((H::Owner::default(), H::OWNER_EVENT_ID));
         let mut low = 0i64;
         let mut removed = 0u64;
         while low < max_rowid {
             let high = low.saturating_add(window.max(1));
-            removed += db
-                .execute(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    &sql,
-                    [low.into(), high.into()],
-                ))
-                .await?
-                .rows_affected();
+            let in_window: SimpleExpr = rowid()
+                .gt(low)
+                .and(rowid().lte(high))
+                .and(predicate::<H>(dead));
+            // The ids first: the header rows the predicate reads go with them.
+            let ids: Vec<uuid::Uuid> = H::Owner::find()
+                .select_only()
+                .column_as(owner_id(), "event_id")
+                .filter(in_window)
+                .into_tuple()
+                .all(db)
+                .await?;
+            if !ids.is_empty() {
+                let txn = db.begin().await?;
+                H::delete_many()
+                    .filter(Expr::col((H::default(), H::EVENT_ID)).is_in(ids.clone()))
+                    .exec(&txn)
+                    .await?;
+                removed += H::Owner::delete_many()
+                    .filter(owner_id().is_in(ids))
+                    .exec(&txn)
+                    .await?
+                    .rows_affected;
+                txn.commit().await?;
+            }
             low = high;
             tokio::task::yield_now().await;
         }
@@ -153,10 +194,12 @@ impl SqliteEventStore {
     /// `page_size × page_count` and `page_size × freelist_count`, from SQLite
     /// itself — not the file's length, which the WAL and the OS decide.
     pub async fn footprint(&self) -> Result<StoreFootprint, StoreError> {
-        let page_size = self.pragma_u64("page_size").await?;
+        let page_size = pragma_u64(self.connection(), Pragma::PageSize).await?;
         Ok(StoreFootprint {
-            file_bytes: page_size.saturating_mul(self.pragma_u64("page_count").await?),
-            free_bytes: page_size.saturating_mul(self.pragma_u64("freelist_count").await?),
+            file_bytes: page_size
+                .saturating_mul(pragma_u64(self.connection(), Pragma::PageCount).await?),
+            free_bytes: page_size
+                .saturating_mul(pragma_u64(self.connection(), Pragma::FreelistCount).await?),
         })
     }
 
@@ -168,27 +211,22 @@ impl SqliteEventStore {
             Reclaim::Full => {
                 // Set the mode first: VACUUM is what makes an auto_vacuum change
                 // take effect, so one full pass buys every later incremental one.
-                db.execute_unprepared("PRAGMA auto_vacuum = INCREMENTAL")
-                    .await?;
-                db.execute_unprepared("VACUUM").await?;
+                sqlite_only(db, SqliteOnly::AutoVacuumIncremental).await?;
+                sqlite_only(db, SqliteOnly::Vacuum).await?;
                 // In WAL mode the vacuumed image lands in the log, and the OS file keeps
                 // its old length until a checkpoint truncates it (BigMama, 2026-09-26:
                 // page accounting said 789 MB while the file was 2.92 GB plus a 1.6 GB
                 // WAL). The doctor line reads the file, so the reclaim finishes the job.
-                db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
-                    .await?;
+                sqlite_only(db, SqliteOnly::WalCheckpointTruncate).await?;
             }
             Reclaim::Incremental => {
                 // Bounded steps, yielding between them. A step that frees nothing
                 // ends the loop: an `auto_vacuum=0` file ignores the pragma, and
                 // waiting on its freelist to shrink would never end.
-                let mut free = self.pragma_u64("freelist_count").await?;
+                let mut free = pragma_u64(self.connection(), Pragma::FreelistCount).await?;
                 while free > 0 {
-                    db.execute_unprepared(&format!(
-                        "PRAGMA incremental_vacuum({RECLAIM_STEP_PAGES})"
-                    ))
-                    .await?;
-                    let now = self.pragma_u64("freelist_count").await?;
+                    sqlite_only(db, SqliteOnly::IncrementalVacuum(RECLAIM_STEP_PAGES)).await?;
+                    let now = pragma_u64(self.connection(), Pragma::FreelistCount).await?;
                     if now >= free {
                         break;
                     }
@@ -200,34 +238,11 @@ impl SqliteEventStore {
         self.footprint().await
     }
 
-    async fn scalar_i64(&self, sql: &str) -> Result<i64, StoreError> {
-        let row = self
-            .connection()
-            .query_one(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
-            .await?
-            .ok_or_else(|| StoreError::Migration(format!("`{sql}` returned no row")))?;
-        Ok(row.try_get_by_index(0)?)
-    }
-
     /// Whether the file has LEFT `auto_vacuum = NONE` (0): `INCREMENTAL` (2) returns any
     /// freelist through the bounded steps, and `FULL` (1) shrinks itself on every commit
     /// (Fable on #1462). Either way a full VACUUM is never needed again.
     pub async fn is_incremental(&self) -> Result<bool, StoreError> {
-        Ok(self.pragma_u64("auto_vacuum").await? != 0)
-    }
-
-    async fn pragma_u64(&self, name: &str) -> Result<u64, StoreError> {
-        let row = self
-            .connection()
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                format!("PRAGMA {name}"),
-            ))
-            .await?
-            .ok_or_else(|| StoreError::Migration(format!("PRAGMA {name} returned no row")))?;
-        let value: i64 = row.try_get_by_index(0)?;
-        u64::try_from(value)
-            .map_err(|_| StoreError::Migration(format!("PRAGMA {name} was negative: {value}")))
+        Ok(pragma_u64(self.connection(), Pragma::AutoVacuum).await? != 0)
     }
 }
 

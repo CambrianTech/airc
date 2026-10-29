@@ -54,8 +54,6 @@ pub mod refresh_lock;
 pub mod retention;
 pub mod scoped_state;
 pub mod sqlite;
-// The SQLite-only adapter; its non-test callers arrive with the raw-SQL sweep.
-#[cfg(test)]
 mod sqlite_only;
 pub mod store;
 pub mod subscriptions;
