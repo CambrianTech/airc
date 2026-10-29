@@ -23,5 +23,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+# Test binaries may open stores without installing a write admission.
+airc-store = { path = "../airc-store", features = ["test-fixtures"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }

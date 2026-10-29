@@ -7,7 +7,7 @@
 //! forward; a NEWER one (migrations this binary does not know) is refused for
 //! writing ([`crate::StoreError::AheadOfBinary`]).
 
-use sea_orm::{DatabaseConnection, EntityTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, TransactionTrait};
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::seaql_migrations;
 
@@ -99,8 +99,23 @@ pub async fn apply_migrations(db: &DatabaseConnection) -> Result<(), StoreError>
     crate::derive::derive_pending(db).await
 }
 
+/// Refuse a write when the database was migrated past this binary after it was
+/// opened (an `airc update` ran while this process held the store open): the
+/// write would store rows without what the newer binary derives. Cheap: one
+/// COUNT of the version table, which at open held exactly this binary's
+/// migrations; only a mismatch reads the versions to name them.
+pub(crate) async fn refuse_if_ahead(db: &impl ConnectionTrait) -> Result<(), StoreError> {
+    let applied = seaql_migrations::Entity::find().count(db).await?;
+    if applied <= Migrator::migrations().len() as u64 {
+        return Ok(());
+    }
+    Err(StoreError::AheadOfBinary {
+        versions: unknown_applied(db).await?,
+    })
+}
+
 /// Versions recorded as applied that this binary has no migration for.
-async fn unknown_applied(db: &DatabaseConnection) -> Result<Vec<String>, StoreError> {
+async fn unknown_applied(db: &impl ConnectionTrait) -> Result<Vec<String>, StoreError> {
     Migrator::install(db).await?;
     let known: std::collections::HashSet<String> = Migrator::migrations()
         .iter()
@@ -135,6 +150,27 @@ mod tests {
         Database::connect("sqlite::memory:")
             .await
             .expect("connect in-memory")
+    }
+
+    // what this catches (Codex on #1618): a store this binary opened stays open
+    // across an `airc update` that migrates the database forward; its next write
+    // is refused AheadOfBinary, never a row without the newer derived data.
+    #[tokio::test]
+    async fn a_stale_writer_is_refused_after_the_database_moves_ahead() {
+        use crate::store::EventStore;
+        let store = crate::SqliteEventStore::in_memory().await.unwrap();
+        let cursor = |n: u128| airc_core::TranscriptCursor {
+            lamport: n as u64,
+            event_id: airc_core::EventId::from_u128(n),
+        };
+        store.save_runtime_cursor("c", &cursor(1), 1).await.unwrap();
+        record(store.connection(), "m99999999_999999_newer_binary").await;
+        match store.save_runtime_cursor("c", &cursor(2), 2).await {
+            Err(StoreError::AheadOfBinary { versions }) => {
+                assert_eq!(versions, ["m99999999_999999_newer_binary"]);
+            }
+            other => panic!("expected AheadOfBinary, got {other:?}"),
+        }
     }
 
     // what this catches (Codex on #1618): a database a NEWER binary migrated is refused

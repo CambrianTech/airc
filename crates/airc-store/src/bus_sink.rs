@@ -64,6 +64,8 @@ const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 pub struct SqliteDurableSink {
     db: DatabaseConnection,
     readers: DatabaseConnection,
+    /// How this sink's writes are admitted ([`crate::custody`]).
+    custody: crate::custody::WriteGate,
 }
 
 impl SqliteDurableSink {
@@ -80,7 +82,12 @@ impl SqliteDurableSink {
     ///
     /// For an in-memory store use `"sqlite::memory:"`; for a file store
     /// use `"sqlite://<path>?mode=rwc"`.
-    pub async fn open(db_url: &str) -> Result<Self, BusError> {
+    pub(crate) async fn open(
+        db_url: &str,
+        admission: crate::custody::Admission,
+    ) -> Result<Self, BusError> {
+        let custody =
+            crate::custody::WriteGate::new(admission).map_err(|e| BusError::Sink(e.to_string()))?;
         let mut opts = Self::pool_options(db_url);
         // WAL + the busy timeout ride the connection options so the journal switch
         // never needs a separate exclusive statement racing another opener — see
@@ -99,9 +106,12 @@ impl SqliteDurableSink {
             .map_err(|e| BusError::Sink(e.to_string()))?;
         // Migrate forward atomically, derive what rows owe, and refuse a DB
         // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
-        crate::migration::apply_migrations(&db)
-            .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+        {
+            let _write = custody.admit().map_err(|e| BusError::Sink(e.to_string()))?;
+            crate::migration::apply_migrations(&db)
+                .await
+                .map_err(|e| BusError::Sink(e.to_string()))?;
+        }
         // Inspect the driver's resolved mode rather than guessing from the
         // input URL. Reopening a memory URL can create a different database;
         // shared-cache memory also lacks file-WAL reader/writer isolation.
@@ -148,7 +158,24 @@ impl SqliteDurableSink {
                 .await
                 .map_err(|e| BusError::Sink(e.to_string()))?
         };
-        Ok(Self { db, readers })
+        Ok(Self {
+            db,
+            readers,
+            custody,
+        })
+    }
+
+    /// Admit one write: custody, then no migration past this binary since
+    /// open ([`crate::SqliteEventStore::admit_write`] is the same rule).
+    async fn admit_write(&self) -> Result<crate::custody::WriteTicket<'_>, BusError> {
+        let ticket = self
+            .custody
+            .admit()
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+        crate::migration::refuse_if_ahead(&self.db)
+            .await
+            .map_err(|e| BusError::Sink(e.to_string()))?;
+        Ok(ticket)
     }
 
     /// Open a file-backed durable tier from a filesystem path. Keeps
@@ -159,7 +186,8 @@ impl SqliteDurableSink {
                 std::fs::create_dir_all(parent).map_err(|e| BusError::Sink(e.to_string()))?;
             }
         }
-        Self::open(&sqlite_file_url(path)).await
+        let admission = crate::custody::resolve(path).map_err(|e| BusError::Sink(e.to_string()))?;
+        Self::open(&sqlite_file_url(path), admission).await
     }
 
     /// Inspect an existing owner store without creating it, migrating it, or
@@ -181,15 +209,18 @@ impl SqliteDurableSink {
         let db = Database::connect(opts)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
+        // Read-only: SQLite refuses its writes, so they need no admission.
         Ok(Self {
             readers: db.clone(),
             db,
+            custody: crate::custody::WriteGate::new(crate::custody::Admission::Unmanaged)
+                .map_err(|e| BusError::Sink(e.to_string()))?,
         })
     }
 
     /// Open an ephemeral in-memory durable tier. Convenience for tests.
     pub async fn in_memory() -> Result<Self, BusError> {
-        Self::open("sqlite::memory:").await
+        Self::open("sqlite::memory:", crate::custody::Admission::Unmanaged).await
     }
 
     /// Bump the persisted generational epoch on **this** ORM and return
@@ -198,6 +229,7 @@ impl SqliteDurableSink {
     /// transcript (`bus_event`) and the epoch cell (`bus_epoch`) in one
     /// ORM — the single-writer machine store (§3.3 / §3.8).
     pub async fn bump_epoch(&self) -> Result<crate::SqliteEpochStore, BusError> {
+        let _write = self.admit_write().await?;
         crate::SqliteEpochStore::bump(&self.db).await
     }
 }
@@ -224,6 +256,7 @@ impl DurableSink for SqliteDurableSink {
             return Ok(());
         }
         let sink = |err: sea_orm::DbErr| BusError::Sink(err.to_string());
+        let _write = self.admit_write().await?;
         let actives = events
             .iter()
             .map(|e| to_active_model(e))

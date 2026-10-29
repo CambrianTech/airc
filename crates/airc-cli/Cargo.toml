@@ -60,6 +60,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 libc = "0.2"
 
 [dev-dependencies]
+# Test binaries may open stores without installing a write admission.
+airc-store = { path = "../airc-store", features = ["test-fixtures"] }
 airc-lib = { path = "../airc-lib", features = ["mock"] }
 tempfile = "3"
 temp-env = "0.3"

@@ -38,6 +38,8 @@ uuid = { version = "1", features = ["v4", "v5"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync", "time"] }
 
 [dev-dependencies]
+# Test binaries may open stores without installing a write admission.
+airc-store = { path = "../airc-store", features = ["test-fixtures"] }
 # airc-work supplies the WorkEvent codec for the daemon's
 # cross-IPC propagation proof (`work_event_propagation_proof.rs`,
 # card 28c89065 invariant (c)). Dev-only: the daemon itself stays

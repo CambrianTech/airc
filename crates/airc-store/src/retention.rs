@@ -174,6 +174,7 @@ impl SqliteEventStore {
                 .all(db)
                 .await?;
             if !ids.is_empty() {
+                let _write = self.admit_write().await?;
                 let txn = db.begin().await?;
                 T::Headers::delete_many()
                     .filter(T::HEADER_EVENT_ID.is_in(ids.clone()))
@@ -207,6 +208,7 @@ impl SqliteEventStore {
     /// Give freelist pages back to the filesystem. See [`Reclaim`] for the cost of
     /// each mode; the caller decides when the daemon can afford which.
     pub async fn reclaim(&self, mode: Reclaim) -> Result<StoreFootprint, StoreError> {
+        let _write = self.admit_write().await?;
         let db = self.connection();
         match mode {
             Reclaim::Full => {

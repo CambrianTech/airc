@@ -50,7 +50,9 @@ async fn append_then_page_round_trips_full_envelope() {
         "sqlite:",
         "sqlite:file::memory:",
     ] {
-        let sink = SqliteDurableSink::open(url).await.unwrap();
+        let sink = SqliteDurableSink::open(url, crate::custody::Admission::Unmanaged)
+            .await
+            .unwrap();
         sink.append(&e).await.unwrap();
         let page = sink.page(ch, None, 100).await.unwrap();
         assert_eq!(page.len(), 1, "single database for {url}");
@@ -58,7 +60,11 @@ async fn append_then_page_round_trips_full_envelope() {
     }
     // SeaORM rejects this URL before SQLx sees it; do not manufacture
     // support for an alias that the existing constructor never accepted.
-    assert!(SqliteDurableSink::open("sqlite://:memory:").await.is_err());
+    assert!(
+        SqliteDurableSink::open("sqlite://:memory:", crate::custody::Admission::Unmanaged)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -425,9 +431,12 @@ async fn persists_across_handles_on_disk() {
 
     // An explicitly shared SQLite cache keeps the old serialized pool;
     // adding a second connection would introduce table-lock contention.
-    let shared = SqliteDurableSink::open(&format!("{}&cache=shared", sqlite_file_url(&path)))
-        .await
-        .unwrap();
+    let shared = SqliteDurableSink::open(
+        &format!("{}&cache=shared", sqlite_file_url(&path)),
+        crate::custody::Admission::Unmanaged,
+    )
+    .await
+    .unwrap();
     let read_lease = shared.readers.begin().await.unwrap();
     assert!(shared
         .db

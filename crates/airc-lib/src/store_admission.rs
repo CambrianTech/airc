@@ -1,77 +1,102 @@
-//! The one admission for opening the machine store (`events.sqlite`) for
-//! writing. A writer opens it here and nowhere else:
+//! How this process's store writes are admitted ([`airc_store::custody`]),
+//! decided once: every store open in the process (`SqliteEventStore::open_path`,
+//! `SqliteDurableSink::open_path`, and so every crate that opens one: trust,
+//! identity, `Airc::open`, the CLI commands, the daemon) resolves through the
+//! resolver installed here.
 //!
-//! - a CLI command holds [`DaemonLifecycleGuard::writer`] custody inside the
-//!   returned store for as long as the store lives, so an `airc update` cannot
-//!   start between the open and the last write (maintenance waits for it), and
-//!   while maintenance is held the open is refused with
-//!   [`crate::daemon_lifecycle::MaintenanceInProgress`];
-//! - the daemon presents its [`DaemonCustody`] proof instead, never
-//!   re-acquiring the lifecycle locks it was admitted under.
+//! - A CLI process: each write takes its machine account's lifecycle lock
+//!   shared for that one write ([`airc_store::custody::Admission::Writer`]),
+//!   refused typed while an update or stop holds maintenance, which in turn
+//!   waits only for writes in flight.
+//! - The daemon, once it presents its [`DaemonCustody`] proof
+//!   ([`declare_daemon`]): its writes take no lifecycle lock, so they never
+//!   contend with the startup guard it holds; maintenance stops it instead.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
-use airc_store::{SqliteEventStore, StoreError};
+use airc_store::custody::Admission;
 
-use crate::daemon_lifecycle::{DaemonCustody, DaemonLifecycleGuard};
+use crate::daemon_lifecycle::DaemonCustody;
 
-/// Why a writable open was not made.
-#[derive(Debug, thiserror::Error)]
-pub enum StoreAdmissionError {
-    /// Maintenance holds the lifecycle (typed inside), or its lock files failed.
-    #[error("{0}")]
-    Custody(#[from] std::io::Error),
-    #[error("{0}")]
-    Store(#[from] StoreError),
+static DAEMON: OnceLock<DaemonCustody> = OnceLock::new();
+
+/// Install this process's admission resolver (idempotent). Called by the CLI
+/// at startup and by every airc-lib entry that opens a store.
+pub fn install() {
+    airc_store::custody::install_resolver(resolve);
 }
 
-/// Open `db_path` for writing from a process that is not the daemon, under
-/// `home`'s machine-account lifecycle custody, held by the returned store.
-pub async fn open_writer_store(
-    home: &Path,
-    db_path: &Path,
-) -> Result<SqliteEventStore, StoreAdmissionError> {
-    let custody = DaemonLifecycleGuard::writer(home)?;
-    Ok(SqliteEventStore::open_path_in_custody(db_path, Box::new(custody)).await?)
+/// Declare this process the daemon, proven by its startup guard: from here on
+/// its store writes take no lifecycle lock.
+pub fn declare_daemon(proof: &DaemonCustody) {
+    let _ = DAEMON.set(proof.clone());
+    install();
 }
 
-/// Open `db_path` for writing from the daemon itself, under its admission proof.
-pub async fn open_daemon_store(
-    db_path: &Path,
-    custody: &DaemonCustody,
-) -> Result<SqliteEventStore, StoreError> {
-    SqliteEventStore::open_path_in_custody(db_path, Box::new(custody.clone())).await
+fn resolve(db_path: &Path) -> Admission {
+    if DAEMON.get().is_some() {
+        return Admission::Daemon;
+    }
+    // A store file always has a parent directory; only `/` has none, and it
+    // is not a store.
+    let home = db_path.parent().unwrap_or(db_path);
+    Admission::Writer {
+        owner: crate::machine_account_home(home).into_path_buf(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon_lifecycle::{is_maintenance_in_progress, DaemonStartupGuard};
+    use crate::daemon_lifecycle::{DaemonLifecycleGuard, DaemonStartupGuard};
+    use airc_store::custody::is_maintenance_in_progress;
+    use airc_store::{EventStore, SqliteEventStore};
 
-    // what this catches (Codex on #1618): a CLI writer cannot open the machine
-    // store while an update holds maintenance; the refusal is the typed one.
-    #[tokio::test]
-    async fn a_writer_open_during_maintenance_is_refused_typed() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("events.sqlite");
-        let update = DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
-        let refused = open_writer_store(dir.path(), &db).await.err().unwrap();
-        assert!(is_maintenance_in_progress(&refused), "{refused}");
-        drop(update);
-        assert!(open_writer_store(dir.path(), &db).await.is_ok());
+    async fn write(store: &SqliteEventStore, key: &str) -> Result<(), airc_store::StoreError> {
+        store
+            .set_scoped_state(airc_store::StoredScopedState {
+                scope_key: "test".into(),
+                key: key.into(),
+                value_json: "1".into(),
+                version: 1,
+                updated_at_ms: 0,
+                updated_by: None,
+            })
+            .await
     }
 
-    // what this catches (Codex on #1618): custody lives as long as the store,
-    // not just the open. While a writer holds the store, maintenance closes
-    // admission but cannot start; when the store drops, it starts.
+    // what this catches (Codex on #1618): a long-lived process that merely holds
+    // a store open (an `airc join` feed) never blocks an update: maintenance
+    // starts while the store stays open, a write during maintenance is refused
+    // with the typed error, and writes resume when maintenance ends.
     #[tokio::test]
-    async fn a_writer_holding_the_store_holds_maintenance_off_until_it_drops() {
+    async fn an_open_store_does_not_block_maintenance_and_writes_are_refused_during_it() {
+        install();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open_path(&dir.path().join("events.sqlite"))
+            .await
+            .unwrap();
+        write(&store, "before").await.unwrap();
+        let update = DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
+        let refused = write(&store, "during").await.err().unwrap();
+        assert!(is_maintenance_in_progress(&refused), "{refused}");
+        drop(update);
+        write(&store, "after").await.unwrap();
+    }
+
+    // what this catches (Codex on #1618): a write in flight delays maintenance
+    // until it ends; maintenance closes admission meanwhile.
+    #[test]
+    fn a_write_in_flight_delays_maintenance_until_it_ends() {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
-        let store = open_writer_store(dir.path(), &dir.path().join("events.sqlite"))
-            .await
-            .unwrap();
+        let custody = airc_store::custody::Admission::Writer {
+            owner: crate::machine_account_home(dir.path()).into_path_buf(),
+        };
+        let custody = airc_store::custody::WriteGate::new(custody).unwrap();
+        let in_flight = custody.admit().unwrap();
         let home = dir.path().to_owned();
         let (send, started) = mpsc::channel();
         let updater = std::thread::spawn(move || {
@@ -85,9 +110,9 @@ mod tests {
         }
         assert!(
             matches!(started.try_recv(), Err(mpsc::TryRecvError::Empty)),
-            "maintenance must wait for the open store"
+            "maintenance waits for the write in flight"
         );
-        drop(store);
+        drop(in_flight);
         started
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
@@ -95,20 +120,17 @@ mod tests {
         updater.join().unwrap();
     }
 
-    // what this catches (Codex on #1618): the daemon's own opens take no
-    // lifecycle lock, so they cannot deadlock against the startup guard it
-    // holds, and an update's maintenance (taken before it stops the daemon)
-    // is not blocked by the daemon's open store.
-    #[tokio::test]
-    async fn the_daemon_store_opens_under_its_proof_without_lifecycle_locks() {
+    // what this catches (Codex on #1618): the daemon's writes take no lifecycle
+    // lock, so they cannot deadlock against its startup guard, and an update's
+    // maintenance (taken before it stops the daemon) is not blocked by them.
+    #[test]
+    fn the_daemon_writes_without_lifecycle_locks() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("events.sqlite");
         let startup = DaemonStartupGuard::acquire(dir.path()).unwrap();
-        let custody = startup.custody();
-        let first = open_daemon_store(&db, &custody).await.unwrap();
-        let second = open_daemon_store(&db, &custody).await.unwrap();
+        let gate = airc_store::custody::WriteGate::new(Admission::Daemon).unwrap();
+        let in_flight = gate.admit().unwrap();
         startup.bound().unwrap();
         let update = DaemonLifecycleGuard::maintenance(dir.path()).unwrap();
-        drop((first, second, update));
+        drop((in_flight, update));
     }
 }

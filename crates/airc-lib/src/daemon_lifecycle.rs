@@ -6,52 +6,7 @@ use std::path::Path;
 
 use fs2::FileExt;
 
-/// Automatic daemon start refused: an `airc update` (or an operator stop or
-/// resume) holds daemon maintenance. The updater holds it from before it stops
-/// the daemon until its replacement has opened the store and bound its
-/// endpoint, and the OS releases it on every exit, failure or crash included.
-/// Carried inside the `io::Error` [`DaemonLifecycleGuard::autostart`] returns;
-/// [`is_maintenance_in_progress`] recognizes it.
-#[derive(Debug)]
-pub struct MaintenanceInProgress {
-    lock: io::Error,
-}
-
-impl MaintenanceInProgress {
-    fn refusal(lock: io::Error) -> io::Error {
-        io::Error::new(lock.kind(), Self { lock })
-    }
-}
-
-impl std::fmt::Display for MaintenanceInProgress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "an airc update (or operator stop/resume) is in progress; automatic daemon \
-             start refused until it finishes, then retry ({})",
-            self.lock
-        )
-    }
-}
-
-impl std::error::Error for MaintenanceInProgress {}
-
-/// Whether `error` (anywhere in its source chain) is a [`MaintenanceInProgress`] refusal.
-pub fn is_maintenance_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut next = Some(error);
-    while let Some(error) = next {
-        if error.is::<MaintenanceInProgress>()
-            || error
-                .downcast_ref::<io::Error>()
-                .and_then(|io| io.get_ref())
-                .is_some_and(|inner| inner.is::<MaintenanceInProgress>())
-        {
-            return true;
-        }
-        next = error.source();
-    }
-    false
-}
+use airc_store::custody::{try_shared, LIFECYCLE_LOCK, MAINTENANCE_LOCK};
 
 pub struct DaemonLifecycleGuard {
     active: File,
@@ -67,9 +22,10 @@ pub struct DaemonStartupGuard {
 }
 
 /// Proof that this process is the daemon admitted through
-/// [`DaemonStartupGuard::acquire`]: the daemon's own store opens present it
-/// instead of re-acquiring lifecycle custody (an `airc update` excludes the
-/// daemon by stopping it, after which no proof outlives the process).
+/// [`DaemonStartupGuard::acquire`]. Presented once to
+/// [`crate::store_admission::declare_daemon`], it makes this process's store
+/// writes take no lifecycle lock (an `airc update` excludes the daemon by
+/// stopping it), so they never contend with the startup guard.
 /// Constructed only by [`DaemonStartupGuard::custody`].
 #[derive(Clone, Debug)]
 pub struct DaemonCustody {
@@ -115,10 +71,10 @@ impl DaemonLifecycleGuard {
         // Hold the admission gate only while acquiring the active read lock.
         // A waiting updater closes this gate before draining existing readers,
         // so continuous new CLI calls cannot starve installation.
-        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
-        FileExt::try_lock_shared(&intent).map_err(MaintenanceInProgress::refusal)?;
-        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
-        FileExt::try_lock_shared(&file).map_err(MaintenanceInProgress::refusal)?;
+        let intent = Self::open(&owner, MAINTENANCE_LOCK)?;
+        try_shared(&intent)?;
+        let file = Self::open(&owner, LIFECYCLE_LOCK)?;
+        try_shared(&file)?;
         let guard = Self {
             active: file,
             _maintenance_intent: None,
@@ -128,25 +84,6 @@ impl DaemonLifecycleGuard {
         Ok(guard)
     }
 
-    /// Write custody for a process that writes the machine store directly
-    /// (not the daemon): the same shared admission as [`Self::autostart`],
-    /// refused with [`MaintenanceInProgress`] while maintenance is held, but
-    /// not refused by an operator stop (stopping the daemon does not forbid a
-    /// CLI from editing the store). Held for the writer's lifetime, it makes a
-    /// later [`Self::maintenance`] wait until the writer is done.
-    pub fn writer(home: &Path) -> io::Result<Self> {
-        let owner = crate::machine_account_home(home);
-        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
-        FileExt::try_lock_shared(&intent).map_err(MaintenanceInProgress::refusal)?;
-        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
-        FileExt::try_lock_shared(&file).map_err(MaintenanceInProgress::refusal)?;
-        Ok(Self {
-            active: file,
-            _maintenance_intent: None,
-            owner,
-        })
-    }
-
     /// Serialize operator intent or maintenance; updaters acquire after building
     /// and hold through installation and verified restart.
     /// This synchronous updater boundary waits in the OS, without polling. It
@@ -154,9 +91,9 @@ impl DaemonLifecycleGuard {
     /// Process cancellation releases both locks, including a pending acquisition.
     pub fn maintenance(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
-        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
+        let intent = Self::open(&owner, MAINTENANCE_LOCK)?;
         FileExt::lock_exclusive(&intent)?;
-        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
+        let file = Self::open(&owner, LIFECYCLE_LOCK)?;
         FileExt::lock_exclusive(&file).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -235,13 +172,7 @@ impl DaemonLifecycleGuard {
     }
 
     fn open(owner: &crate::MachineAccountHome, name: &str) -> io::Result<File> {
-        std::fs::create_dir_all(owner)?;
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(owner.join(name))
+        airc_store::custody::lock_file(owner.as_path(), name)
     }
 }
 
@@ -280,6 +211,8 @@ impl Drop for DaemonLifecycleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use airc_store::custody::is_maintenance_in_progress;
 
     // what this catches (Codex on #1618): a CLI auto-start attempted in the update's
     // stop/swap window, from another thread as a hook would from another process, is

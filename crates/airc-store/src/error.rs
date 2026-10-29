@@ -18,6 +18,10 @@ pub enum StoreError {
     #[error("store lock poisoned")]
     LockPoisoned,
 
+    /// A file store opened in a process that installed no write admission.
+    #[error(transparent)]
+    NotAdmitted(#[from] crate::custody::NotAdmitted),
+
     /// Migration error during `open`.
     #[error("store migration error: {0}")]
     Migration(String),

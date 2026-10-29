@@ -60,21 +60,20 @@ const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 pub struct SqliteEventStore {
     db: DatabaseConnection,
-    /// The write custody this handle was admitted under (a lifecycle lock
-    /// guard, or the daemon's proof of its own); held for the handle's whole
-    /// lifetime and released when it drops. `None` for stores opened outside
-    /// the machine-account lifecycle (in-memory, tests).
-    _custody: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// How this store's writes are admitted ([`crate::custody`]): every write
+    /// method takes a ticket for its own length.
+    custody: crate::custody::WriteGate,
 }
 
 impl SqliteEventStore {
     /// Open an existing SQLite database (or create one) at `db_url`
-    /// and run any pending migrations.
+    /// under `admission`, and run any pending migrations (one admitted write).
     ///
     /// For an in-memory store use `"sqlite::memory:"`; for a file
     /// store use `"sqlite://<path>?mode=rwc"` so SQLite creates the
     /// file if missing.
-    pub async fn open(db_url: &str) -> Result<Self, StoreError> {
+    async fn open(db_url: &str, admission: crate::custody::Admission) -> Result<Self, StoreError> {
+        let custody = crate::custody::WriteGate::new(admission)?;
         let mut opts = ConnectOptions::new(db_url.to_owned());
         // Keep timeouts predictable for tests — long enough to absorb
         // a slow CI box, short enough to fail fast on a bad URL.
@@ -118,8 +117,11 @@ impl SqliteEventStore {
         let db = Database::connect(opts).await?;
         // Migrate forward atomically, derive what rows owe, and refuse a DB
         // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
-        crate::migration::apply_migrations(&db).await?;
-        Ok(Self { db, _custody: None })
+        {
+            let _write = custody.admit()?;
+            crate::migration::apply_migrations(&db).await?;
+        }
+        Ok(Self { db, custody })
     }
 
     /// Open a file-backed SQLite store from a filesystem path.
@@ -134,28 +136,26 @@ impl SqliteEventStore {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        Self::open(&sqlite_file_url(path)).await
-    }
-
-    /// Open `path` for writing under `custody`, which the store holds until it
-    /// drops. The one entry for the machine store's writers is
-    /// `airc_lib::store_admission`, which acquires the custody first, so an
-    /// update cannot begin between this open and the last write.
-    pub async fn open_path_in_custody(
-        path: &Path,
-        custody: Box<dyn std::any::Any + Send + Sync>,
-    ) -> Result<Self, StoreError> {
-        let mut store = Self::open_path(path).await?;
-        store._custody = Some(custody);
-        Ok(store)
+        let admission = crate::custody::resolve(path)?;
+        Self::open(&sqlite_file_url(path), admission).await
     }
 
     /// Open an ephemeral in-memory store. Convenience for tests.
     pub async fn in_memory() -> Result<Self, StoreError> {
-        Self::open("sqlite::memory:").await
+        Self::open("sqlite::memory:", crate::custody::Admission::Unmanaged).await
     }
+
+    /// Admit one write: this process's custody for it ([`crate::custody`]),
+    /// then the database must not have been migrated past this binary since it
+    /// was opened ([`StoreError::AheadOfBinary`]). Held until the write ends.
+    pub(crate) async fn admit_write(&self) -> Result<crate::custody::WriteTicket<'_>, StoreError> {
+        let ticket = self.custody.admit()?;
+        crate::migration::refuse_if_ahead(&self.db).await?;
+        Ok(ticket)
+    }
+
     /// The one ORM, for the sibling modules of this crate that run statements the
-    /// entity API does not express (`retention`: JSON-predicate deletes, pragmas).
+    /// entity API does not express (`retention`: windowed deletes, pragmas).
     pub(crate) fn connection(&self) -> &DatabaseConnection {
         &self.db
     }
@@ -167,6 +167,7 @@ impl SqliteEventStore {
         refresh_interval_ms: u64,
         holder_pid: u32,
     ) -> Result<StoredRefreshLockOutcome, StoreError> {
+        let _write = self.admit_write().await?;
         const MAX_ATTEMPTS: usize = 8;
         let held_at_ms = u64_to_i64("refresh_locks.held_at_ms", now_ms)?;
         let holder_pid = u64_to_i64("refresh_locks.holder_pid", holder_pid as u64)?;
@@ -219,6 +220,7 @@ impl SqliteEventStore {
     }
 
     pub async fn release_refresh_lock(&self, mesh_identity: &str) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         refresh_lock::Entity::delete_by_id(mesh_identity.to_string())
             .exec(&self.db)
             .await?;
@@ -269,6 +271,7 @@ impl SqliteEventStore {
         pubkey_b64: String,
         added_at_ms: u64,
     ) -> Result<StoredPeer, StoreError> {
+        let _write = self.admit_write().await?;
         // Card 34942ec1 Sub-A: defaults to the safe-conservative
         // tier (Untrusted). Sub-B detection and explicit-enrolment
         // CLI paths land via [`set_peer_trust_tier`] in a follow-up
@@ -296,6 +299,7 @@ impl SqliteEventStore {
         added_at_ms: u64,
         tier: TrustTier,
     ) -> Result<StoredPeer, StoreError> {
+        let _write = self.admit_write().await?;
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
@@ -367,6 +371,7 @@ impl SqliteEventStore {
         pubkey_b64: String,
         added_at_ms: u64,
     ) -> Result<StoredPeer, StoreError> {
+        let _write = self.admit_write().await?;
         // Card 34942ec1 Sub-A: replace preserves the existing tier
         // (a rotation is a key-material event; trust gradient is
         // orthogonal — losing it on rotate would silently demote a
@@ -433,6 +438,7 @@ impl SqliteEventStore {
         &self,
         peer_id: PeerId,
     ) -> Result<Option<StoredPeer>, StoreError> {
+        let _write = self.admit_write().await?;
         let txn = self.db.begin().await?;
         let stored = peer_trust::Entity::find_by_id(peer_id.as_uuid())
             .one(&txn)
@@ -484,6 +490,7 @@ impl SqliteEventStore {
         peer_id: PeerId,
         tier: TrustTier,
     ) -> Result<Option<StoredPeer>, StoreError> {
+        let _write = self.admit_write().await?;
         let txn = self.db.begin().await?;
         let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
             .one(&txn)
@@ -539,6 +546,7 @@ impl SqliteEventStore {
         advertised_at_ms: u64,
         endpoints_peer_id: Option<PeerId>,
     ) -> Result<Option<StoredPeer>, StoreError> {
+        let _write = self.admit_write().await?;
         let txn = self.db.begin().await?;
         let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
             .one(&txn)
@@ -617,6 +625,7 @@ impl SqliteEventStore {
         peer_id: PeerId,
         seen_at_ms: u64,
     ) -> Result<Option<StoredPeer>, StoreError> {
+        let _write = self.admit_write().await?;
         let txn = self.db.begin().await?;
         let Some(existing) = peer_trust::Entity::find_by_id(peer_id.as_uuid())
             .one(&txn)
@@ -658,6 +667,7 @@ impl SqliteEventStore {
         &self,
         entry: RotationAuditEntry,
     ) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let active = peer_rotation_audit::ActiveModel {
             peer_id: Set(entry.peer_id.as_uuid()),
             sequence: Set(u64_to_i64("peer_rotation_audit.sequence", entry.sequence)?),
@@ -770,6 +780,7 @@ impl SqliteEventStore {
         &self,
         identity: StoredLocalIdentity,
     ) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let active = local_identity::ActiveModel {
             id: ActiveValue::NotSet,
             peer_id: Set(identity.peer_id.as_uuid()),
@@ -802,6 +813,7 @@ impl SqliteEventStore {
     /// Replace the user-facing identity card on the singleton row.
     /// Peer/client ids are not touched.
     pub async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let row = local_identity::Entity::find_by_id(local_identity::SINGLETON_ID)
             .one(&self.db)
             .await?
@@ -854,6 +866,7 @@ impl SqliteEventStore {
         &self,
         document: StoredAccountRegistry,
     ) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let active = account_registry::document::ActiveModel {
             mesh_identity: Set(document.mesh_identity.clone()),
             schema_version: Set(i32::from(document.schema_version)),
@@ -911,6 +924,7 @@ impl SqliteEventStore {
         &self,
         mesh_identity: &str,
     ) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         account_registry::gist_sentinel::Entity::delete_by_id(mesh_identity.to_string())
             .exec(&self.db)
             .await?;
@@ -922,6 +936,7 @@ impl SqliteEventStore {
         &self,
         sentinel: StoredAccountRegistryGistSentinel,
     ) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let active = account_registry::gist_sentinel::ActiveModel {
             mesh_identity: Set(sentinel.mesh_identity.clone()),
             gist_id: Set(sentinel.gist_id),
@@ -1051,6 +1066,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn append(&self, ev: TranscriptEvent) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let active = to_active_model(&ev)?;
         // Card 127816bd Phase 1.C — eliminate the post-insert SELECT.
         //
@@ -1200,6 +1216,7 @@ impl EventStore for SqliteEventStore {
         cursor: &TranscriptCursor,
         updated_at_ms: u64,
     ) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let lamport = cursor.lamport as i64;
         // The existing signed column round-trips all u64 lamports by cast.
         // Negative stored values are the UPPER unsigned half, not older than
@@ -1267,6 +1284,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn replace_subscriptions(&self, rows: Vec<StoredSubscription>) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let txn = self.db.begin().await?;
         subscription::Entity::delete_many().exec(&txn).await?;
         for row in rows {
@@ -1307,6 +1325,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn save_mesh_identity(&self, entry: StoredMeshIdentity) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let active = mesh_identity::ActiveModel {
             scope: ActiveValue::Set(entry.scope),
             identity: ActiveValue::Set(entry.identity),
@@ -1345,6 +1364,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn set_scoped_state(&self, entry: StoredScopedState) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let active = scoped_state::ActiveModel {
             scope_key: ActiveValue::Set(entry.scope_key),
             key: ActiveValue::Set(entry.key),
@@ -1382,6 +1402,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn delete_scoped_state(&self, scope_key: &str, key: &str) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         scoped_state::Entity::delete_by_id((scope_key.to_string(), key.to_string()))
             .exec(&self.db)
             .await?;
@@ -1418,6 +1439,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn save_beacon(&self, entry: StoredBeacon) -> Result<(), StoreError> {
+        let _write = self.admit_write().await?;
         let txn = self.db.begin().await?;
         let peer_uuid = entry.peer_id.as_uuid();
         let active = beacon::ActiveModel {
@@ -1472,6 +1494,7 @@ impl EventStore for SqliteEventStore {
         mesh_identity: &str,
         peer_ids: &[PeerId],
     ) -> Result<usize, StoreError> {
+        let _write = self.admit_write().await?;
         let txn = self.db.begin().await?;
         let mut removed = 0;
         for peer_id in peer_ids {
