@@ -114,7 +114,18 @@ async fn all_defined_migrations_applied(db: &DatabaseConnection) -> Result<bool,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use sea_orm::{ActiveModelTrait, Database, Set};
+
+    /// Record `version` as applied, through SeaORM's own migrations entity.
+    async fn record(db: &DatabaseConnection, version: &str) {
+        seaql_migrations::ActiveModel {
+            version: Set(version.to_owned()),
+            applied_at: Set(0),
+        }
+        .insert(db)
+        .await
+        .expect("record migration");
+    }
 
     async fn memory_db() -> DatabaseConnection {
         Database::connect("sqlite::memory:")
@@ -127,14 +138,7 @@ mod tests {
         let db = memory_db().await;
         apply_migrations(&db).await.expect("initial migrate");
         // Simulate a newer build recording a migration we have no file for.
-        db.execute(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "INSERT INTO seaql_migrations (version, applied_at) \
-             VALUES ('m99999999_999999_future', 0)"
-                .to_owned(),
-        ))
-        .await
-        .expect("insert future migration");
+        record(&db, "m99999999_999999_future").await;
         // Re-opening must NOT hard-fail on the unknown-applied migration —
         // the DB is merely ahead of us, and our schema is all present.
         apply_migrations(&db)
@@ -148,22 +152,26 @@ mod tests {
         // we genuinely have pending schema, so we must NOT silently skip
         // it; the error surfaces instead.
         let db = memory_db().await;
-        db.execute(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "CREATE TABLE seaql_migrations \
-             (version varchar PRIMARY KEY, applied_at bigint NOT NULL)"
-                .to_owned(),
-        ))
-        .await
-        .expect("create migrations table");
-        db.execute(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "INSERT INTO seaql_migrations (version, applied_at) \
-             VALUES ('m99999999_999999_foreign', 0)"
-                .to_owned(),
-        ))
-        .await
-        .expect("insert foreign migration");
+        SchemaManager::new(&db)
+            .create_table(
+                Table::create()
+                    .table(Alias::new("seaql_migrations"))
+                    .col(
+                        ColumnDef::new(Alias::new("version"))
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("applied_at"))
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+            .expect("create migrations table");
+        record(&db, "m99999999_999999_foreign").await;
         assert!(
             apply_migrations(&db).await.is_err(),
             "divergence (our migrations unapplied) must surface, not silently skip"
