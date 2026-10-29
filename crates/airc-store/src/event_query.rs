@@ -40,7 +40,9 @@ pub(crate) fn matching(
         .order_by(event::Column::EventId, order)
         .limit(limit as u64)
         .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
-        .filter(crate::header_query::predicate(rule.headers))
+        .filter(crate::header_query::predicate::<
+            crate::entities::event_header::Entity,
+        >(rule.headers))
         .filter(
             Expr::col(event::Column::Lamport)
                 .lt(through.lamport as i64)

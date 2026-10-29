@@ -33,14 +33,14 @@ use bytes::Bytes;
 use sea_orm::{
     sea_query::{Expr, OnConflict},
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
 use airc_bus::{BusError, DurableSink, Seq};
 use airc_core::{ClientId, EventId, Headers, PeerId, RoomId};
 
-use crate::entities::bus_event;
+use crate::entities::{bus_event, bus_event_header};
 
 /// Deadlock backstop for the single-connection pool — NOT a load limit.
 ///
@@ -85,7 +85,9 @@ impl SqliteDurableSink {
         // WAL + the busy timeout ride the connection options so the journal switch
         // never needs a separate exclusive statement racing another opener — see
         // `SqliteEventStore::open` (2026-09-14: "database is locked" at attach on
-        // Windows CI). `set_wal` stays as the idempotent belt for an old DB.
+        // Windows CI). The driver applies them to every connection it opens, an
+        // old DB's included (§3.3: WAL lets deep-replay reads run beside the one
+        // writer; `synchronous=NORMAL` fsyncs per checkpoint, not per commit).
         opts.map_sqlx_sqlite_opts(|so| {
             use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
             so.journal_mode(SqliteJournalMode::Wal)
@@ -95,7 +97,6 @@ impl SqliteDurableSink {
         let db = Database::connect(opts)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
-        set_wal(&db).await?;
         // Forward-compatible both directions: tolerate a DB migrated
         // ahead of this binary (version skew must not brick the sink).
         crate::migration::apply_migrations(&db)
@@ -208,54 +209,64 @@ impl DurableSink for SqliteDurableSink {
         // must not double-store. ON CONFLICT DO NOTHING — a duplicate is
         // a silent no-op, never an error (the router treats append as
         // at-least-once).
-        let active = to_active_model(e)?;
-        let res = bus_event::Entity::insert(active)
-            .on_conflict(
-                OnConflict::column(bus_event::Column::EventId)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(&self.db)
-            .await;
-        match res {
-            Ok(_) => Ok(()),
-            // `RecordNotInserted` is the DO-NOTHING path: the event_id
-            // already exists. Idempotent success, not an error.
-            Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
-            Err(err) => Err(BusError::Sink(err.to_string())),
-        }
+        self.append_batch(&[e]).await
     }
 
-    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the whole
-    /// batch = ONE transaction commit (vs one per event in `append`); fsync work
-    /// is amortized at WAL checkpoint under synchronous=NORMAL. Same
-    /// idempotent-on-`event_id` contract. SQLite executes a multi-VALUES insert
-    /// as one atomic statement, so on error nothing is committed and the caller
-    /// re-pins the whole batch (no partial-persist ambiguity — verified by
-    /// `append_batch_mixed_persists_every_new_event`).
+    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the
+    /// events and their header rows, in ONE transaction (one commit per batch,
+    /// not per event); fsync work is amortized at WAL checkpoint under
+    /// synchronous=NORMAL. Same idempotent-on-`event_id` contract: a replayed
+    /// event and its headers conflict and are skipped. On error nothing is
+    /// committed and the caller re-pins the whole batch (no partial-persist
+    /// ambiguity — verified by `append_batch_mixed_persists_every_new_event`).
     async fn append_batch(&self, events: &[&Envelope]) -> Result<(), BusError> {
         if events.is_empty() {
             return Ok(());
         }
+        let sink = |err: sea_orm::DbErr| BusError::Sink(err.to_string());
         let actives = events
             .iter()
             .map(|e| to_active_model(e))
             .collect::<Result<Vec<_>, _>>()?;
-        let res = bus_event::Entity::insert_many(actives)
+        let headers: Vec<_> = events
+            .iter()
+            .flat_map(|e| {
+                crate::header_query::bus_event_header_rows(e.event_id.as_uuid(), &e.headers)
+            })
+            .collect();
+        let txn = self.db.begin().await.map_err(sink)?;
+        match bus_event::Entity::insert_many(actives)
             .on_conflict(
                 OnConflict::column(bus_event::Column::EventId)
                     .do_nothing()
                     .to_owned(),
             )
-            .exec(&self.db)
-            .await;
-        match res {
-            Ok(_) => Ok(()),
+            .exec(&txn)
+            .await
+        {
             // Every row in the batch already existed (all conflicted) — the
             // DO-NOTHING all-dupes path. Idempotent success, not an error.
-            Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
-            Err(err) => Err(BusError::Sink(err.to_string())),
+            Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
+            Err(err) => return Err(sink(err)),
         }
+        for chunk in headers.chunks(crate::header_query::HEADER_ROWS_PER_INSERT) {
+            match bus_event_header::Entity::insert_many(chunk.to_vec())
+                .on_conflict(
+                    OnConflict::columns([
+                        bus_event_header::Column::EventId,
+                        bus_event_header::Column::Key,
+                    ])
+                    .do_nothing()
+                    .to_owned(),
+                )
+                .exec(&txn)
+                .await
+            {
+                Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
+                Err(err) => return Err(sink(err)),
+            }
+        }
+        txn.commit().await.map_err(sink)
     }
 
     async fn page_matching(
@@ -298,10 +309,9 @@ impl DurableSink for SqliteDurableSink {
     ) -> Result<airc_core::HistoryCount, BusError> {
         let mut rows = matching_rows(channel, after, through, headers);
         if let Some(rule) = exclude {
-            rows = rows.filter(crate::header_query::not_runtime_self(
-                rule,
-                bus_event::Column::ClientId,
-            ));
+            rows = rows.filter(crate::header_query::not_runtime_self::<
+                bus_event_header::Entity,
+            >(rule));
         }
         // COUNT/MIN/MAX in the store: no row, header JSON or payload leaves SQLite.
         let row: Option<(i64, Option<i64>, Option<i64>)> = rows
@@ -490,24 +500,6 @@ impl DurableSink for SqliteDurableSink {
     }
 }
 
-/// Put the connection in WAL journal mode (§3.3). WAL lets the
-/// deep-replay reads run concurrently with the single writer without
-/// blocking it; `synchronous=NORMAL` is the standard WAL durability
-/// trade (an fsync per checkpoint, not per commit) and is safe for the
-/// deliver-first / persist-async contract (§3.3 — the ORM is the source
-/// of truth; a crash loses only the un-flushed tail, replayable from
-/// peers). In-memory databases ignore the pragma.
-async fn set_wal(db: &DatabaseConnection) -> Result<(), BusError> {
-    use sea_orm::{ConnectionTrait, Statement};
-    let backend = db.get_database_backend();
-    for pragma in ["PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;"] {
-        db.execute(Statement::from_string(backend, pragma.to_owned()))
-            .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
-    }
-    Ok(())
-}
-
 /// The ONE sanctioned `Envelope -> row` serialize (§3.3). Lives only
 /// here; no other copy of this mapping exists.
 fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
@@ -606,7 +598,9 @@ fn matching_rows(
             strictly_before(through)
                 .or(Expr::col(bus_event::Column::EventId).eq(through.event_id.as_uuid())),
         )
-        .filter(crate::header_query::predicate(headers))
+        .filter(crate::header_query::predicate::<bus_event_header::Entity>(
+            headers,
+        ))
         .filter(bus_event::Column::Delivery.eq("durable"))
 }
 

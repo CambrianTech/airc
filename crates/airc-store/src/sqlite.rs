@@ -32,7 +32,7 @@ use airc_core::{
 use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 use crate::beacon::StoredBeacon;
 use crate::entities::{
-    account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
+    account_registry, beacon, beacon_channel, event, event_header, local_identity, mesh_identity,
     peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, scoped_state, subscription,
 };
 use crate::error::StoreError;
@@ -1053,21 +1053,33 @@ impl EventStore for SqliteEventStore {
         // Removes one full SELECT (planner + index hit) per `.say()`
         // — a measurable share of the 3.5ms/op baseline measured
         // in `airc-lib/tests/chat_throughput.rs`.
+        //
+        // The header rows (`crate::header_query`) commit with the event in one
+        // transaction; a duplicate rolls both back.
+        let txn = self.db.begin().await?;
         match event::Entity::insert(active)
             .on_conflict(
                 OnConflict::column(event::Column::EventId)
                     .do_nothing()
                     .to_owned(),
             )
-            .exec(&self.db)
+            .exec(&txn)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             Err(sea_orm::DbErr::RecordNotInserted) => {
-                Err(StoreError::DuplicateEventId(ev.event_id.as_uuid()))
+                return Err(StoreError::DuplicateEventId(ev.event_id.as_uuid()));
             }
-            Err(err) => Err(StoreError::Database(err)),
+            Err(err) => return Err(StoreError::Database(err)),
         }
+        let headers = crate::header_query::event_header_rows(ev.event_id.as_uuid(), &ev.headers);
+        for chunk in headers.chunks(crate::header_query::HEADER_ROWS_PER_INSERT) {
+            event_header::Entity::insert_many(chunk.to_vec())
+                .exec(&txn)
+                .await?;
+        }
+        txn.commit().await?;
+        Ok(())
     }
 
     async fn page_recent(
