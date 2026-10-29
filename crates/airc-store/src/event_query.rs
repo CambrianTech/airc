@@ -1,5 +1,13 @@
-//! The `events` select a bounded history scan runs: one builder, so the store
-//! and the index-evidence tests read the same statement.
+//! The `events` selects a bounded history scan runs: one builder, so the store
+//! and the index-evidence tests read the same statements.
+//!
+//! An addressee scan is two selects, one per branch (`addressed_peer = me`,
+//! `leading_mention = true`), each served whole by its own composite index
+//! `(room_id, <branch column>, lamport, event_id)`: SQLite cannot serve an OR
+//! across two columns from one index and walks the room's order index instead
+//! (measured on the M5: `SEARCH events USING INDEX
+//! idx_events_room_lamport_event_id (room_id=?)`). The caller merges the
+//! branches ([`merge`]).
 
 use airc_core::{HistoryMatch, RoomId, TranscriptCursor};
 use sea_orm::{
@@ -9,7 +17,8 @@ use sea_orm::{
 use crate::entities::event;
 
 /// Events of `channels` in `(cursor, through]` matching `rule`, the first
-/// `limit` in transcript order (the last `limit`, newest first, for `tail`).
+/// `limit` in transcript order (the last `limit`, newest first, for `tail`):
+/// one select, or one per addressee branch.
 pub(crate) fn matching(
     cursor: &TranscriptCursor,
     through: &TranscriptCursor,
@@ -17,7 +26,7 @@ pub(crate) fn matching(
     rule: HistoryMatch<'_>,
     limit: usize,
     tail: bool,
-) -> Select<event::Entity> {
+) -> Vec<Select<event::Entity>> {
     // Strictly after the cursor: lamport > c.lamport
     //   OR (lamport == c.lamport AND event_id > c.event_id).
     // Two-key tiebreak so events with identical lamports remain
@@ -34,7 +43,7 @@ pub(crate) fn matching(
     } else {
         sea_orm::Order::Asc
     };
-    let mut query = event::Entity::find()
+    let query = event::Entity::find()
         .filter(strictly_after)
         .order_by(event::Column::Lamport, order.clone())
         .order_by(event::Column::EventId, order)
@@ -50,13 +59,32 @@ pub(crate) fn matching(
                     .eq(through.lamport as i64)
                     .and(Expr::col(event::Column::EventId).lte(through.event_id.as_uuid()))),
         );
-    if let Some(addressee) = rule.addressed_to {
-        // The indexed columns `to_active_model` derived at append.
-        query = query.filter(
-            event::Column::AddressedPeer
-                .eq(addressee.peer.as_uuid())
-                .or(event::Column::LeadingMention.eq(true)),
-        );
+    let Some(addressee) = rule.addressed_to else {
+        return vec![query];
+    };
+    // The indexed columns `to_active_model` derived at append, one per branch.
+    vec![
+        query
+            .clone()
+            .filter(event::Column::AddressedPeer.eq(addressee.peer.as_uuid())),
+        query.filter(event::Column::LeadingMention.eq(true)),
+    ]
+}
+
+/// The branches' rows as one page: deduplicated by event id, in transcript
+/// order, the first `limit` (the last `limit` for `tail`).
+pub(crate) fn merge(
+    branches: Vec<Vec<event::Model>>,
+    limit: usize,
+    tail: bool,
+) -> Vec<event::Model> {
+    let mut rows: Vec<_> = branches.into_iter().flatten().collect();
+    rows.sort_by_key(|row| (row.lamport, row.event_id));
+    rows.dedup_by_key(|row| row.event_id);
+    if tail {
+        rows.drain(..rows.len().saturating_sub(limit));
+    } else {
+        rows.truncate(limit);
     }
-    query
+    rows
 }

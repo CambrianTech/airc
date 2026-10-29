@@ -646,26 +646,27 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         .unwrap();
     let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
     assert_eq!(ids, [typed.event_id, led.event_id]);
-    // Index evidence: the scan SEARCHes the addressing indexes (rows touched
-    // are candidates), never walks the room in cursor order.
-    let built = sea_orm::QueryTrait::build(
-        &page_rows(ch, origin, through, rule, 10, true),
-        sea_orm::DbBackend::Sqlite,
-    );
-    let plan = crate::sqlite_only::query_plan(&sink.readers, built)
-        .await
-        .unwrap();
-    for index in [
+    // Index evidence: each branch SEARCHes its own addressing index (rows
+    // touched are candidates), never walks the room in cursor order.
+    let branches = page_rows(ch, origin, through, rule, 10, true);
+    let indexes = [
         "idx_bus_events_room_addressed_peer",
         "idx_bus_events_room_leading_mention",
-    ] {
+    ];
+    assert_eq!(branches.len(), indexes.len(), "one select per branch");
+    for (query, index) in branches.iter().zip(indexes) {
+        let built = sea_orm::QueryTrait::build(query, sea_orm::DbBackend::Sqlite);
+        let plan = crate::sqlite_only::query_plan(&sink.readers, built)
+            .await
+            .unwrap();
         assert!(
-            plan.iter().any(|step| step.contains(index)),
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH") && step.contains(index)),
             "{index} searched: {plan:?}"
         );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN")),
+            "no table walk: {plan:?}"
+        );
     }
-    assert!(
-        !plan.iter().any(|step| step.starts_with("SCAN")),
-        "no table walk: {plan:?}"
-    );
 }

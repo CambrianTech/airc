@@ -287,16 +287,19 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
-        let rows = page_rows(channel, after, through, rule, bounded, tail)
-            .all(&self.readers)
-            .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
-
-        let mut rows = rows;
-        if tail {
-            rows.reverse();
+        let mut branches = Vec::new();
+        for query in page_rows(channel, after, through, rule, bounded, tail) {
+            branches.push(
+                query
+                    .all(&self.readers)
+                    .await
+                    .map_err(|e| BusError::Sink(e.to_string()))?,
+            );
         }
-        rows.into_iter().map(from_model).collect()
+        merge_pages(branches, limit, tail)
+            .into_iter()
+            .map(from_model)
+            .collect()
     }
 
     async fn count_matching(
@@ -604,8 +607,14 @@ fn matching_rows(
         .filter(bus_event::Column::Delivery.eq("durable"))
 }
 
-/// The page `page_matching` reads: [`matching_rows`] narrowed by the addressee
-/// pre-filter when set, the first `limit` in cursor order (the last, for `tail`).
+/// The selects `page_matching` reads: [`matching_rows`], the first `limit` in
+/// cursor order (the last, for `tail`); with an addressee filter, one select
+/// per branch (`addressed_peer = me`, `leading_mention = true`), each served
+/// whole by its composite index `(room_id, <branch column>, epoch, counter,
+/// event_id)`. SQLite cannot serve an OR across two columns from one index and
+/// walks the room's order index instead (measured on the M5: `SEARCH
+/// bus_events USING INDEX idx_bus_events_room_epoch_counter_event_id
+/// (room_id=?)`); [`merge_pages`] joins the branches.
 fn page_rows(
     channel: RoomId,
     after: Cursor,
@@ -613,26 +622,45 @@ fn page_rows(
     rule: airc_core::HistoryMatch<'_>,
     limit: u64,
     tail: bool,
-) -> sea_orm::Select<bus_event::Entity> {
-    let mut query = matching_rows(channel, after, through, rule.headers);
-    if let Some(addressee) = rule.addressed_to {
-        // The indexed columns `to_active_model` derived at append.
-        query = query.filter(
-            bus_event::Column::AddressedPeer
-                .eq(addressee.peer.as_uuid())
-                .or(bus_event::Column::LeadingMention.eq(true)),
-        );
-    }
+) -> Vec<sea_orm::Select<bus_event::Entity>> {
     let order = if tail {
         sea_orm::Order::Desc
     } else {
         sea_orm::Order::Asc
     };
-    query
+    let query = matching_rows(channel, after, through, rule.headers)
         .order_by(bus_event::Column::Epoch, order.clone())
         .order_by(bus_event::Column::Counter, order.clone())
         .order_by(bus_event::Column::EventId, order)
-        .limit(limit)
+        .limit(limit);
+    let Some(addressee) = rule.addressed_to else {
+        return vec![query];
+    };
+    // The indexed columns `to_active_model` derived at append, one per branch.
+    vec![
+        query
+            .clone()
+            .filter(bus_event::Column::AddressedPeer.eq(addressee.peer.as_uuid())),
+        query.filter(bus_event::Column::LeadingMention.eq(true)),
+    ]
+}
+
+/// The branches' rows as one page: deduplicated by event id, in cursor order,
+/// the first `limit` (the last `limit` for `tail`).
+fn merge_pages(
+    branches: Vec<Vec<bus_event::Model>>,
+    limit: usize,
+    tail: bool,
+) -> Vec<bus_event::Model> {
+    let mut rows: Vec<_> = branches.into_iter().flatten().collect();
+    rows.sort_by_key(|row| (row.epoch, row.counter, row.event_id));
+    rows.dedup_by_key(|row| row.event_id);
+    if tail {
+        rows.drain(..rows.len().saturating_sub(limit));
+    } else {
+        rows.truncate(limit);
+    }
+    rows
 }
 
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],

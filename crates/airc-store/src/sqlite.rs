@@ -1110,13 +1110,14 @@ impl EventStore for SqliteEventStore {
         limit: usize,
         tail: bool,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        let query = crate::event_query::matching(cursor, through, channels, rule, limit, tail);
-        let rows = query.all(&self.db).await?;
-        let mut rows = rows;
-        if tail {
-            rows.reverse();
+        let mut branches = Vec::new();
+        for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail) {
+            branches.push(query.all(&self.db).await?);
         }
-        rows.into_iter().map(from_model).collect()
+        crate::event_query::merge(branches, limit, tail)
+            .into_iter()
+            .map(from_model)
+            .collect()
     }
 
     async fn resume_from(
@@ -1732,24 +1733,27 @@ mod tests {
             headers: &airc_core::HeaderFilter::Any,
             addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
         };
-        let built = crate::event_query::matching(&origin, &through, &[room], rule, 10, true)
-            .build(sea_orm::DbBackend::Sqlite);
-        let plan = crate::sqlite_only::query_plan(&store.db, built)
-            .await
-            .unwrap();
-        for index in [
+        let branches = crate::event_query::matching(&origin, &through, &[room], rule, 10, true);
+        let indexes = [
             "idx_events_room_addressed_peer",
             "idx_events_room_leading_mention",
-        ] {
+        ];
+        assert_eq!(branches.len(), indexes.len(), "one select per branch");
+        for (query, index) in branches.into_iter().zip(indexes) {
+            let built = query.build(sea_orm::DbBackend::Sqlite);
+            let plan = crate::sqlite_only::query_plan(&store.db, built)
+                .await
+                .unwrap();
             assert!(
-                plan.iter().any(|step| step.contains(index)),
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH") && step.contains(index)),
                 "{index} searched: {plan:?}"
             );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN")),
+                "no table walk: {plan:?}"
+            );
         }
-        assert!(
-            !plan.iter().any(|step| step.starts_with("SCAN")),
-            "no table walk: {plan:?}"
-        );
         let started = std::time::Instant::now();
         let page = store
             .matching_history(&origin, &through, &[room], rule, 10, true)
@@ -1757,8 +1761,8 @@ mod tests {
             .unwrap();
         let elapsed = started.elapsed();
         assert_eq!(page, requests);
-        // Three index probes and a sort of three rows; a walk of 20k rows
-        // decoding JSON is the regression this bound would catch.
+        // Two index searches and a merge of three rows; a walk of 20k rows
+        // is the regression this bound would catch.
         assert!(
             elapsed < std::time::Duration::from_millis(250),
             "{elapsed:?}"
