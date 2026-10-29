@@ -417,7 +417,7 @@ async fn persists_across_handles_on_disk() {
             .is_err(),
         "the replay pool is read-only"
     );
-    let SqliteDurableSink { db, readers } = sink;
+    let SqliteDurableSink { db, readers, custody: _ } = sink;
     readers.close().await.unwrap();
     db.close().await.unwrap();
     let reopened = SqliteDurableSink::open_path(&path).await.unwrap();
