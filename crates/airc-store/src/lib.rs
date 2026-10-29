@@ -42,6 +42,7 @@ pub mod bus_epoch_store;
 pub mod bus_sink;
 pub mod entities;
 pub mod error;
+mod event_query;
 mod header_query;
 pub mod history_count;
 pub mod local_identity;
@@ -53,6 +54,9 @@ pub mod refresh_lock;
 pub mod retention;
 pub mod scoped_state;
 pub mod sqlite;
+// The SQLite-only adapter; its non-test callers arrive with the raw-SQL sweep.
+#[cfg(test)]
+mod sqlite_only;
 pub mod store;
 pub mod subscriptions;
 

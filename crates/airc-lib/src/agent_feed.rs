@@ -68,15 +68,19 @@ impl Airc {
             .all()
             .map(|s| s.as_room().channel)
             .collect();
-        self.scan_agent_feed_in_channels(after, through, limit, &channels)
+        self.scan_agent_feed_in_channels(after, through, limit, &channels, None)
             .await
     }
+    /// [`Self::scan_agent_feed`] over `channels`; with `addressed_to`, only the
+    /// events that could be addressed to that peer, selected by the store before
+    /// `limit` (so ambient traffic in the range costs nothing).
     pub(crate) async fn scan_agent_feed_in_channels(
         &self,
         after: Option<&TranscriptCursor>,
         through: &TranscriptCursor,
         limit: usize,
         channels: &[airc_core::RoomId],
+        addressed_to: Option<airc_core::AddresseeFilter>,
     ) -> Result<EventScan, AircError> {
         if limit == 0 || limit > 4096 {
             return Err(AircError::Route("agent scan limit must be 1..4096".into()));
@@ -94,6 +98,10 @@ impl Airc {
             });
         }
         let predicate = headers();
+        let rule = airc_core::HistoryMatch {
+            headers: &predicate,
+            addressed_to,
+        };
         let mut events = Vec::new();
         let mut safe = through.clone();
         if let Some(client) = self.daemon_client() {
@@ -104,6 +112,7 @@ impl Airc {
                         after: ipc(after),
                         through: ipc(through),
                         headers: predicate.clone(),
+                        addressed_to,
                         limit,
                         tail,
                     })
@@ -118,7 +127,7 @@ impl Airc {
                 for encoded in response.envelopes {
                     let event = crate::daemon::decode_wire_event(encoded)?;
                     if event.room_id != channel
-                        || !predicate.matches(&event.headers)
+                        || !rule.matches_event(&event)
                         || key(&event.cursor()) <= key(after)
                         || key(&event.cursor()) > key(through)
                     {
@@ -133,7 +142,7 @@ impl Airc {
             events = self
                 .inner
                 .store
-                .matching_history(after, through, channels, &predicate, limit + 1, tail)
+                .matching_history(after, through, channels, rule, limit + 1, tail)
                 .await?;
         }
         events.sort_by_key(|e| key(&e.cursor()));

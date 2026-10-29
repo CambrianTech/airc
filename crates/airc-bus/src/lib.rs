@@ -27,6 +27,7 @@
 //!
 //! - [`envelope`] — the generic [`Envelope`] (§2), [`Seq`], [`Cursor`],
 //!   [`Target`], [`Kind`], [`DeliveryClass`].
+//! - [`addressing`] — who an envelope could be addressed to, as indexed.
 //! - [`clock`] — injectable [`Clock`] (+ [`ManualClock`] for tests).
 //! - [`seq`] — generational [`SeqSource`] + persisted [`EpochStore`].
 //! - [`sink`] — the [`DurableSink`] trait + [`InMemoryDurableSink`].
@@ -35,6 +36,7 @@
 //! - [`filter`] — the subscription [`Filter`] predicate.
 //! - [`router`] — the [`EventRouter`] (publish + subscribe + write-behind).
 
+pub mod addressing;
 pub mod clock;
 pub mod envelope;
 pub mod ephemeral;
@@ -46,6 +48,7 @@ pub mod seq;
 pub mod sink;
 mod subscriber_index;
 
+pub use addressing::addressing_of;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use envelope::{Cursor, DeliveryClass, Envelope, Kind, Seq, Target};
 pub use ephemeral::{EphemeralCache, HEADER_EPHEMERAL_TTL_MS};

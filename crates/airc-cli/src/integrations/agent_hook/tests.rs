@@ -407,7 +407,7 @@ async fn leading_at_names_address_pre_attach_history_and_mid_sentence_names_do_n
 
 // what this catches: 120 requests addressed to me before attach show one reader
 // page (the digest page), newest first, and one line counting the rest; never a dump.
-// (The interim search reading only the newest candidates is pinned in airc-lib.)
+// (How the store's addressee candidates are paged is pinned in airc-lib.)
 #[tokio::test]
 async fn many_addressed_requests_show_one_page_and_a_count() {
     let (_dir, airc, room) = fixture().await;
@@ -415,7 +415,7 @@ async fn many_addressed_requests_show_one_page_and_a_count() {
         let body = format!("request-{n:03}");
         append_text(&airc, room, n, &body, MentionTarget::Peer(airc.peer_id())).await;
     }
-    // `--count` above the backlog: the interim addressed search covers it all.
+    // `--count` above the backlog: one turn's candidate budget covers it all.
     let options = super::HookOptions {
         count: 200,
         max_items: super::render::DIGEST_PAGE,

@@ -623,6 +623,10 @@ pub struct ScanInboxRequest {
     pub after: IpcCursor,
     pub through: IpcCursor,
     pub headers: HeaderFilter,
+    /// Only events that could be addressed to this peer (its typed target, or
+    /// a body opening with an `@name`), selected by the store before `limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addressed_to: Option<airc_core::AddresseeFilter>,
     pub limit: usize,
     pub tail: bool,
 }

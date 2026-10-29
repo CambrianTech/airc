@@ -250,5 +250,5 @@ pub use airc_work::{
 
 mod addressing;
 mod agent_delivery;
-pub use addressing::{leading_mentions, Addressee};
+pub use addressing::Addressee;
 pub use agent_delivery::{AddressedWindow, AgentDeliveryTurn, HistorySummary};

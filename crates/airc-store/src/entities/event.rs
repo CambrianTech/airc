@@ -43,6 +43,11 @@ pub struct Model {
     pub receipt: Option<Json>,
     /// Free-form consumer metadata.
     pub metadata: Json,
+    /// The peer a `MentionTarget::Peer` target names, else NULL: derived at
+    /// append ([`airc_core::Addressing`]) so an addressee scan is indexed.
+    pub addressed_peer: Option<Uuid>,
+    /// The body text opens with an `@name` ([`airc_core::leading_mentions`]).
+    pub leading_mention: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -608,7 +608,10 @@ async fn handle_scan_inbox(
             request.channel,
             after,
             through,
-            &request.headers,
+            airc_core::HistoryMatch {
+                headers: &request.headers,
+                addressed_to: request.addressed_to,
+            },
             request.limit + 1,
             request.tail,
         )
@@ -752,6 +755,7 @@ mod scan_tests {
                 event_id: airc_core::EventId::from_u128(u128::MAX),
             },
             headers: airc_core::HeaderFilter::Any,
+            addressed_to: None,
             limit: 2,
             tail: false,
         };
@@ -806,6 +810,7 @@ mod scan_tests {
                 event_id: airc_core::EventId::from_u128(9),
             },
             headers: airc_core::HeaderFilter::Any,
+            addressed_to: None,
             limit: 3,
             tail: false,
         };

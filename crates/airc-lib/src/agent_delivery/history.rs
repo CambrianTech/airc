@@ -116,6 +116,7 @@ impl AgentDeliveryTurn {
                 &self.state.boundary,
                 page.clamp(1, 4096),
                 &self.channels,
+                None,
             )
             .await?;
         Ok(tail

@@ -558,12 +558,26 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
     }));
     let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
     let page = sink
-        .page_matching(ch, origin, second.cursor(), &filter, 1, false)
+        .page_matching(
+            ch,
+            origin,
+            second.cursor(),
+            airc_core::HistoryMatch::headers(&filter),
+            1,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(page[0].event_id, first.event_id);
     let next = sink
-        .page_matching(ch, first.cursor(), second.cursor(), &filter, 1, false)
+        .page_matching(
+            ch,
+            first.cursor(),
+            second.cursor(),
+            airc_core::HistoryMatch::headers(&filter),
+            1,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(next[0].event_id, second.event_id);
@@ -591,4 +605,67 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         .await
         .unwrap();
     assert_eq!(empty, airc_core::HistoryCount::default());
+}
+
+// what this catches: an addressee scan is answered by the indexed addressing
+// columns, so the newest page holds the typed-target and `@`-led requests even
+// when a thousand unaddressed events are newer than them, by searching the
+// addressing indexes; a mid-sentence `@` and another peer's typed target stay out.
+#[tokio::test]
+async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
+    let sink = SqliteDurableSink::in_memory().await.unwrap();
+    let ch = RoomId::from_u128(0xadd);
+    let me = PeerId::from_u128(0x3e);
+    let body = |text: &str| Bytes::from(airc_core::Body::text(text).to_payload());
+    let mut typed = durable_at(ch, 1, 0).with_target(Target::Peer(me));
+    typed.payload = body("no names");
+    let mut led = durable_at(ch, 1, 1);
+    led.payload = body(" ,@Fable please review");
+    let mut other = durable_at(ch, 1, 2).with_target(Target::Peer(PeerId::from_u128(0x4f)));
+    other.payload = body("for someone else");
+    let mut mid = durable_at(ch, 1, 3);
+    mid.payload = body("ask @Fable later");
+    let mut rows = vec![typed.clone(), led.clone(), other, mid];
+    rows.extend((4..1000).map(|n| {
+        let mut e = durable_at(ch, 1, n);
+        e.payload = body("ambient chatter");
+        e
+    }));
+    sink.append_batch(&rows.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+    let through = rows[rows.len() - 1].cursor();
+    let rule = airc_core::HistoryMatch {
+        headers: &airc_core::HeaderFilter::Any,
+        addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
+    };
+    let page = sink
+        .page_matching(ch, origin, through, rule, 10, true)
+        .await
+        .unwrap();
+    let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
+    assert_eq!(ids, [typed.event_id, led.event_id]);
+    // Index evidence: the scan SEARCHes the addressing indexes (rows touched
+    // are candidates), never walks the room in cursor order.
+    let built = sea_orm::QueryTrait::build(
+        &page_rows(ch, origin, through, rule, 10, true),
+        sea_orm::DbBackend::Sqlite,
+    );
+    let plan = crate::sqlite_only::query_plan(&sink.readers, built)
+        .await
+        .unwrap();
+    for index in [
+        "idx_bus_events_room_addressed_peer",
+        "idx_bus_events_room_leading_mention",
+    ] {
+        assert!(
+            plan.iter().any(|step| step.contains(index)),
+            "{index} searched: {plan:?}"
+        );
+    }
+    assert!(
+        !plan.iter().any(|step| step.starts_with("SCAN")),
+        "no table walk: {plan:?}"
+    );
 }

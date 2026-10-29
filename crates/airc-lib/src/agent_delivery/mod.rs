@@ -314,7 +314,13 @@ impl Airc {
         // nine events a call, and every message addressed to it that day stayed out of reach.
         let attaching = attaching || {
             let probe = self
-                .scan_agent_feed_in_channels(Some(state.scan_from()), &tip, scan_limit, &channels)
+                .scan_agent_feed_in_channels(
+                    Some(state.scan_from()),
+                    &tip,
+                    scan_limit,
+                    &channels,
+                    None,
+                )
                 .await?;
             probe
                 .scanned_through
@@ -362,7 +368,7 @@ impl Airc {
             tip
         };
         let live = self
-            .scan_agent_feed_in_channels(Some(&scan_from), &through, scan_limit, &channels)
+            .scan_agent_feed_in_channels(Some(&scan_from), &through, scan_limit, &channels, None)
             .await?;
         if rooms(self).await? != channels {
             return Err(fail(

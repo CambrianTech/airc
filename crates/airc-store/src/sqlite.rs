@@ -1094,41 +1094,11 @@ impl EventStore for SqliteEventStore {
         cursor: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[RoomId],
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        // Strictly after the cursor: lamport > c.lamport
-        //   OR (lamport == c.lamport AND event_id > c.event_id).
-        // Two-key tiebreak so events with identical lamports remain
-        // ordered deterministically.
-        let cursor_lamport = cursor.lamport as i64;
-        let cursor_event_id = cursor.event_id.as_uuid();
-        let strictly_after = Expr::col(event::Column::Lamport)
-            .gt(cursor_lamport)
-            .or(Expr::col(event::Column::Lamport)
-                .eq(cursor_lamport)
-                .and(Expr::col(event::Column::EventId).gt(cursor_event_id)));
-        let order = if tail {
-            sea_orm::Order::Desc
-        } else {
-            sea_orm::Order::Asc
-        };
-        let query = event::Entity::find()
-            .filter(strictly_after)
-            .order_by(event::Column::Lamport, order.clone())
-            .order_by(event::Column::EventId, order)
-            .limit(limit as u64);
-        let query = query
-            .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
-            .filter(crate::header_query::predicate(headers))
-            .filter(
-                Expr::col(event::Column::Lamport)
-                    .lt(through.lamport as i64)
-                    .or(Expr::col(event::Column::Lamport)
-                        .eq(through.lamport as i64)
-                        .and(Expr::col(event::Column::EventId).lte(through.event_id.as_uuid()))),
-            );
+        let query = crate::event_query::matching(cursor, through, channels, rule, limit, tail);
         let rows = query.all(&self.db).await?;
         let mut rows = rows;
         if tail {
@@ -1551,6 +1521,7 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
     // airc-core's `wire_str_round_trip_covers_every_variant` test
     // catches any drift before this codec is even invoked.
     let kind = ev.kind.as_wire_str();
+    let addressing = airc_core::Addressing::of_event(ev);
     Ok(event::ActiveModel {
         event_id: ActiveValue::Set(ev.event_id.as_uuid()),
         room_id: ActiveValue::Set(ev.room_id.as_uuid()),
@@ -1574,6 +1545,8 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
             None => None,
         }),
         metadata: ActiveValue::Set(ev.metadata.clone()),
+        addressed_peer: ActiveValue::Set(addressing.peer.map(|peer| peer.as_uuid())),
+        leading_mention: ActiveValue::Set(addressing.leading_mention),
     })
 }
 
@@ -1623,6 +1596,7 @@ fn _json_value_keepalive(_: JsonValue) {}
 mod tests {
     use super::*;
     use airc_core::transcript::MentionTarget;
+    use sea_orm::QueryTrait;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -1659,6 +1633,8 @@ mod tests {
             attachment: None,
             receipt: None,
             metadata: serde_json::Value::Null,
+            addressed_peer: None,
+            leading_mention: false,
         }
     }
 
@@ -1669,6 +1645,111 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::UnknownTranscriptKind(ref kind)) if kind == "future_kind"),
             "expected UnknownTranscriptKind, got {result:?}"
+        );
+    }
+
+    // what this catches: the embedded addressee scan reads the addressing
+    // columns derived at append, so a typed-target and an `@`-led request come
+    // back as the newest candidates under many newer unaddressed events, and a
+    // mid-sentence `@` stays out.
+    #[tokio::test]
+    async fn addressee_scan_selects_candidates_by_indexed_columns() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let room = RoomId::from_u128(0xadd);
+        let me = PeerId::from_u128(0x3e);
+        let mut typed = make_event(1, room, "no names");
+        typed.target = MentionTarget::Peer(me);
+        let led = make_event(2, room, "\t@Fable review");
+        store.append(typed.clone()).await.unwrap();
+        store.append(led.clone()).await.unwrap();
+        store
+            .append(make_event(3, room, "ask @Fable later"))
+            .await
+            .unwrap();
+        for lamport in 4..600 {
+            store
+                .append(make_event(lamport, room, "ambient"))
+                .await
+                .unwrap();
+        }
+        let origin = TranscriptCursor {
+            lamport: 0,
+            event_id: EventId::from_u128(0),
+        };
+        let through = TranscriptCursor {
+            lamport: u64::MAX >> 1,
+            event_id: EventId::from_u128(u128::MAX),
+        };
+        let rule = airc_core::HistoryMatch {
+            headers: &airc_core::HeaderFilter::Any,
+            addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
+        };
+        let page = store
+            .matching_history(&origin, &through, &[room], rule, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(page, [typed, led]);
+    }
+
+    // what this catches: the addressee scan must SEARCH the addressing indexes
+    // (rows touched = candidates), never walk the room in cursor order; over
+    // 20k unaddressed events it returns the three requests, in bounded time.
+    #[tokio::test]
+    async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
+        let store = SqliteEventStore::in_memory().await.unwrap();
+        let room = RoomId::from_u128(0xadd2);
+        let me = PeerId::from_u128(0x3e);
+        let mut requests = Vec::new();
+        for lamport in 1..=20_003u64 {
+            let mut ev = make_event(lamport, room, "ambient");
+            if lamport % 6_000 == 0 {
+                ev.target = MentionTarget::Peer(me);
+                requests.push(ev.clone());
+            }
+            store.append(ev).await.unwrap();
+        }
+        let origin = TranscriptCursor {
+            lamport: 0,
+            event_id: EventId::from_u128(0),
+        };
+        let through = TranscriptCursor {
+            lamport: u64::MAX >> 1,
+            event_id: EventId::from_u128(u128::MAX),
+        };
+        let rule = airc_core::HistoryMatch {
+            headers: &airc_core::HeaderFilter::Any,
+            addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
+        };
+        let built = crate::event_query::matching(&origin, &through, &[room], rule, 10, true)
+            .build(sea_orm::DbBackend::Sqlite);
+        let plan = crate::sqlite_only::query_plan(&store.db, built)
+            .await
+            .unwrap();
+        for index in [
+            "idx_events_room_addressed_peer",
+            "idx_events_room_leading_mention",
+        ] {
+            assert!(
+                plan.iter().any(|step| step.contains(index)),
+                "{index} searched: {plan:?}"
+            );
+        }
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN")),
+            "no table walk: {plan:?}"
+        );
+        let started = std::time::Instant::now();
+        let page = store
+            .matching_history(&origin, &through, &[room], rule, 10, true)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(page, requests);
+        // Three index probes and a sort of three rows; a walk of 20k rows
+        // decoding JSON is the regression this bound would catch.
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "{elapsed:?}"
         );
     }
 

@@ -17,9 +17,9 @@ pub(super) struct AddressedPage {
     pub(super) unsearched: Vec<Unsearched>,
 }
 
-/// How a turn looks for addressed history: how many of the newest events it may
-/// read (the interim, see [`AgentDeliveryTurn::addressed_history`]) and how many
-/// it shows.
+/// How a turn looks for addressed history: how many addressee CANDIDATES it
+/// may read (events the store selected as possibly addressed to this identity,
+/// never ambient traffic) and how many requests it shows.
 #[derive(Clone, Copy, Debug)]
 pub struct AddressedWindow {
     pub candidates: usize,
@@ -30,14 +30,17 @@ impl AgentDeliveryTurn {
     /// The next page of requests addressed to `me` in the unsettled history,
     /// newest first, from the newest unsearched range on down.
     ///
-    /// INTERIM until card 6fb2ea16 (Cormac): the store cannot yet select by
-    /// addressee (the typed target is a JSON column and a leading `@name` lives
-    /// in the body), so one turn reads at most `window.candidates` events in
-    /// bounded tail scans, newest range first, and applies
-    /// [`crate::Addressee`] to them. The range then shrinks only through what was
-    /// actually emitted or scanned, so a request the bounded search has not
-    /// reached is never settled past. When 6fb2ea16's indexed addressee query
-    /// lands, this body becomes that query and callers do not change.
+    /// Each range is read with the store's addressee pre-filter
+    /// ([`crate::Addressee::filter`]): the store selects, from indexed columns,
+    /// only the events whose typed target is `me` or whose body opens with an
+    /// `@name`, newest first, before any limit. Ambient traffic in a range costs
+    /// nothing, so a reattach's new top range settles in one read and the rest
+    /// of the turn's `window.candidates` reaches the older ranges below it; an
+    /// older request is no longer starved by whatever arrived since (Codex on
+    /// #1617). [`crate::Addressee::is_addressed`] then applies the exact
+    /// predicate (which of the `@names` are mine). A range shrinks only through
+    /// what was actually emitted or read, so a request not yet reached is never
+    /// settled past.
     pub(super) async fn addressed_history(
         &self,
         keep: impl Fn(&TranscriptEvent) -> bool,
@@ -46,9 +49,9 @@ impl AgentDeliveryTurn {
     ) -> Result<AddressedPage, AircError> {
         let mut unsearched = self.state.unsearched.clone();
         let page = window.page.max(1);
-        // One turn's work is bounded by `candidates` events in total; it moves on
-        // to the next (older) range only while budget and page room remain, so
-        // a reattach's small new segment costs no extra turn.
+        // One turn reads at most `candidates` store-selected candidates in
+        // total; it moves on to the next (older) range while budget and page
+        // room remain, so a reattach's new segment costs no extra turn.
         // The budget is clamped to what one scan can return, SCAN_CAP.
         let mut budget = window.candidates.clamp(1, SCAN_CAP);
         let mut shown: Vec<TranscriptEvent> = Vec::new();
@@ -67,9 +70,16 @@ impl AgentDeliveryTurn {
                 .min(SCAN_CAP);
             let tail = self
                 .airc
-                .scan_agent_feed_in_channels(None, &range.top, limit, &self.channels)
+                .scan_agent_feed_in_channels(
+                    None,
+                    &range.top,
+                    limit,
+                    &self.channels,
+                    Some(me.filter()),
+                )
                 .await?;
-            // Whether the range's start was reached is a fact about the RAW scan:
+            // Whether the range's start was reached is a fact about the candidate
+            // scan (every candidate in the range is in hand):
             // it returned fewer events than asked, or reached back to the range's
             // own start. Never inferred from the filtered count, which falls short
             // of the limit whenever the exclusive top is dropped or the scan cap
@@ -97,8 +107,8 @@ impl AgentDeliveryTurn {
             let left_in_window = found.len() - take;
             found.truncate(take);
             // What of this range is left: below the oldest request shown when
-            // more remain in the window; below the oldest event scanned when the
-            // window held no more; nothing once the scan reached its start.
+            // more remain in the scan; below the oldest candidate scanned when
+            // the scan held no more; nothing once the scan reached its start.
             let below = if left_in_window > 0 {
                 found.last().map(|e| e.cursor())
             } else if reached_start {

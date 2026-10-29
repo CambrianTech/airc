@@ -263,7 +263,7 @@ impl DurableSink for SqliteDurableSink {
         channel: RoomId,
         after: Cursor,
         through: Cursor,
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
     ) -> Result<Vec<Envelope>, BusError> {
@@ -276,17 +276,7 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
-        let query = matching_rows(channel, after, through, headers);
-        let order = if tail {
-            sea_orm::Order::Desc
-        } else {
-            sea_orm::Order::Asc
-        };
-        let rows = query
-            .order_by(bus_event::Column::Epoch, order.clone())
-            .order_by(bus_event::Column::Counter, order.clone())
-            .order_by(bus_event::Column::EventId, order)
-            .limit(bounded)
+        let rows = page_rows(channel, after, through, rule, bounded, tail)
             .all(&self.readers)
             .await
             .map_err(|e| BusError::Sink(e.to_string()))?;
@@ -521,6 +511,7 @@ async fn set_wal(db: &DatabaseConnection) -> Result<(), BusError> {
 /// The ONE sanctioned `Envelope -> row` serialize (§3.3). Lives only
 /// here; no other copy of this mapping exists.
 fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
+    let addressing = e.addressing();
     Ok(bus_event::ActiveModel {
         event_id: Set(e.event_id.as_uuid()),
         room_id: Set(e.channel.as_uuid()),
@@ -536,6 +527,8 @@ fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
         peer_id: Set(e.from.0.as_uuid()),
         client_id: Set(e.from.1.as_uuid()),
         occurred_at_ms: Set(u64_to_i64("bus_events.occurred_at_ms", e.occurred_at_ms)?),
+        addressed_peer: Set(addressing.peer.map(|peer| peer.as_uuid())),
+        leading_mention: Set(addressing.leading_mention),
     })
 }
 
@@ -615,6 +608,37 @@ fn matching_rows(
         )
         .filter(crate::header_query::predicate(headers))
         .filter(bus_event::Column::Delivery.eq("durable"))
+}
+
+/// The page `page_matching` reads: [`matching_rows`] narrowed by the addressee
+/// pre-filter when set, the first `limit` in cursor order (the last, for `tail`).
+fn page_rows(
+    channel: RoomId,
+    after: Cursor,
+    through: Cursor,
+    rule: airc_core::HistoryMatch<'_>,
+    limit: u64,
+    tail: bool,
+) -> sea_orm::Select<bus_event::Entity> {
+    let mut query = matching_rows(channel, after, through, rule.headers);
+    if let Some(addressee) = rule.addressed_to {
+        // The indexed columns `to_active_model` derived at append.
+        query = query.filter(
+            bus_event::Column::AddressedPeer
+                .eq(addressee.peer.as_uuid())
+                .or(bus_event::Column::LeadingMention.eq(true)),
+        );
+    }
+    let order = if tail {
+        sea_orm::Order::Desc
+    } else {
+        sea_orm::Order::Asc
+    };
+    query
+        .order_by(bus_event::Column::Epoch, order.clone())
+        .order_by(bus_event::Column::Counter, order.clone())
+        .order_by(bus_event::Column::EventId, order)
+        .limit(limit)
 }
 
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],

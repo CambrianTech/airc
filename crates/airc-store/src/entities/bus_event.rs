@@ -65,6 +65,12 @@ pub struct Model {
     pub client_id: Uuid,
     /// Owner-stamped wall clock (ms).
     pub occurred_at_ms: i64,
+    /// The peer a `Target::Peer` target names, else NULL: derived at append
+    /// ([`airc_bus::Envelope::addressing`]) so an addressee scan is indexed.
+    /// The stored envelope itself is untouched.
+    pub addressed_peer: Option<Uuid>,
+    /// The payload is a `Body` whose text opens with an `@name`.
+    pub leading_mention: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

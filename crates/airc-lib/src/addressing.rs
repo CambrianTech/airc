@@ -6,10 +6,11 @@
 //! (case-insensitive), or a shown-id prefix of my peer id. Today's requests are
 //! mostly `@name` text broadcast to the room, so the typed target alone missed
 //! them. Only LEADING names address; a name mid-sentence is a mention, not a
-//! request. Receiver-side: every fact is local, no roster is read.
+//! request ([`airc_core::leading_mentions`]). Receiver-side: every fact is
+//! local, no roster is read.
 
 use airc_core::shown_id::Shown;
-use airc_core::{MentionTarget, PeerId, TranscriptEvent};
+use airc_core::{leading_mentions, AddresseeFilter, MentionTarget, PeerId, TranscriptEvent};
 
 use crate::{Airc, AircError};
 
@@ -32,6 +33,12 @@ impl Addressee {
         Self { peer, names }
     }
 
+    /// The store-side candidate pre-filter for this addressee: a superset of
+    /// what [`Self::is_addressed`] keeps, answered from indexed columns.
+    pub fn filter(&self) -> AddresseeFilter {
+        AddresseeFilter { peer: self.peer }
+    }
+
     pub fn is_addressed(&self, event: &TranscriptEvent) -> bool {
         event.target == MentionTarget::Peer(self.peer)
             || event
@@ -48,32 +55,6 @@ impl Addressee {
             || Shown::<PeerId>::try_from(mention)
                 .is_ok_and(|shown| shown.resolve([self.peer]).is_ok())
     }
-}
-
-/// The `@names` a body opens with, without the `@`: `"@Fable @Codex, review"`
-/// yields `Fable`, `Codex`. Names are separated by whitespace or commas; the
-/// first word that is not an `@name` ends the list. A name is alphanumerics,
-/// `-` and `_`.
-pub fn leading_mentions(text: &str) -> impl Iterator<Item = &str> {
-    let mut rest = text;
-    std::iter::from_fn(move || {
-        let tail = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
-        let after = tail.strip_prefix('@')?;
-        let end = after
-            .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(after.len());
-        if end == 0 {
-            return None;
-        }
-        let (name, remainder) = after.split_at(end);
-        // A name followed by anything but a separator closes the list after it.
-        rest = if remainder.starts_with(|c: char| c.is_whitespace() || c == ',') {
-            remainder
-        } else {
-            ""
-        };
-        Some(name)
-    })
 }
 
 impl Airc {
@@ -132,10 +113,5 @@ mod tests {
             MentionTarget::Peer(PeerId::from_u128(0x7711fe60 << 96)),
         );
         assert!(fable.is_addressed(&typed));
-        let names: Vec<_> = leading_mentions("@M5,ack").collect();
-        assert_eq!(names, ["M5"]);
-        let names: Vec<_> = leading_mentions("@a @b: @c").collect();
-        assert_eq!(names, ["a", "b"]);
-        assert_eq!(leading_mentions("@ stray").count(), 0);
     }
 }
