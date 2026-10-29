@@ -797,3 +797,24 @@ async fn unknown_state_version_refuses_without_overwriting() {
         99
     );
 }
+// what this catches: a hook that never catches up. Paged oldest first, a consumer whose peers
+// posted faster than its page read a three-day-old backlog nine events a call, and everything
+// addressed to it that day stayed out of reach (a Claude Code session, 2026-10-29). Further
+// behind than one turn can read, it re-attaches: the backlog is counted as history, nothing of
+// it replays as live, and the next message is delivered live.
+#[tokio::test]
+async fn a_consumer_further_behind_than_a_turn_reattaches_at_the_present() {
+    let (_dir, airc, room) = fixture().await;
+    let first = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
+    first.acknowledge(0, true).await.unwrap();
+    for n in 1..=10 {
+        append(&airc, room, n).await;
+    }
+    let mut behind = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
+    assert!(behind.live_events().is_empty(), "the backlog never replays as live");
+    assert_eq!(summary(&mut behind, &airc).await.unwrap().counted.unwrap(), counted(10, 1, 10));
+    behind.acknowledge(0, true).await.unwrap();
+    append(&airc, room, 11).await;
+    let present = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
+    assert_eq!(present.live_events().iter().map(|e| e.lamport).collect::<Vec<_>>(), vec![11]);
+}

@@ -307,6 +307,17 @@ impl Airc {
                 persist(self, &consumer, &state).await?;
                 state
             };
+        // A consumer further behind than one turn can read re-attaches: what it missed becomes
+        // history (counted, with what was addressed to it searched newest first), and live
+        // delivery restarts at the present. Paged oldest first, a hook whose peers post faster
+        // than its page never caught up: a Claude Code session read its 10-26 backlog on 10-29,
+        // nine events a call, and every message addressed to it that day stayed out of reach.
+        let attaching = attaching || {
+            let probe = self
+                .scan_agent_feed_in_channels(Some(state.scan_from()), &tip, scan_limit, &channels)
+                .await?;
+            probe.scanned_through.as_ref().is_some_and(|through| key(through) < key(&tip))
+        };
         if attaching {
             // What arrived while detached becomes this attachment's history: the
             // new boundary is the present. `live`, the delivery proof, does not
