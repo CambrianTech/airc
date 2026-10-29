@@ -316,7 +316,10 @@ impl Airc {
             let probe = self
                 .scan_agent_feed_in_channels(Some(state.scan_from()), &tip, scan_limit, &channels)
                 .await?;
-            probe.scanned_through.as_ref().is_some_and(|through| key(through) < key(&tip))
+            probe
+                .scanned_through
+                .as_ref()
+                .is_some_and(|through| key(through) < key(&tip))
         };
         if attaching {
             // What arrived while detached becomes this attachment's history: the

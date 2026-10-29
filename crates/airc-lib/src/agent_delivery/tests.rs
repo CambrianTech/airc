@@ -811,10 +811,23 @@ async fn a_consumer_further_behind_than_a_turn_reattaches_at_the_present() {
         append(&airc, room, n).await;
     }
     let mut behind = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
-    assert!(behind.live_events().is_empty(), "the backlog never replays as live");
-    assert_eq!(summary(&mut behind, &airc).await.unwrap().counted.unwrap(), counted(10, 1, 10));
+    assert!(
+        behind.live_events().is_empty(),
+        "the backlog never replays as live"
+    );
+    assert_eq!(
+        summary(&mut behind, &airc).await.unwrap().counted.unwrap(),
+        counted(10, 1, 10)
+    );
     behind.acknowledge(0, true).await.unwrap();
     append(&airc, room, 11).await;
     let present = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
-    assert_eq!(present.live_events().iter().map(|e| e.lamport).collect::<Vec<_>>(), vec![11]);
+    assert_eq!(
+        present
+            .live_events()
+            .iter()
+            .map(|e| e.lamport)
+            .collect::<Vec<_>>(),
+        vec![11]
+    );
 }
