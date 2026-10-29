@@ -40,7 +40,7 @@ use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
 use airc_bus::{BusError, DurableSink, Seq};
 use airc_core::{ClientId, EventId, Headers, PeerId, RoomId};
 
-use crate::entities::{bus_event, bus_event_header};
+use crate::entities::bus_event;
 
 /// Deadlock backstop for the single-connection pool — NOT a load limit.
 ///
@@ -228,12 +228,6 @@ impl DurableSink for SqliteDurableSink {
             .iter()
             .map(|e| to_active_model(e))
             .collect::<Result<Vec<_>, _>>()?;
-        let headers: Vec<_> = events
-            .iter()
-            .flat_map(|e| {
-                crate::header_query::bus_event_header_rows(e.event_id.as_uuid(), &e.headers)
-            })
-            .collect();
         let txn = self.db.begin().await.map_err(sink)?;
         match bus_event::Entity::insert_many(actives)
             .on_conflict(
@@ -249,23 +243,12 @@ impl DurableSink for SqliteDurableSink {
             Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
             Err(err) => return Err(sink(err)),
         }
-        for chunk in headers.chunks(crate::header_query::HEADER_ROWS_PER_INSERT) {
-            match bus_event_header::Entity::insert_many(chunk.to_vec())
-                .on_conflict(
-                    OnConflict::columns([
-                        bus_event_header::Column::EventId,
-                        bus_event_header::Column::Key,
-                    ])
-                    .do_nothing()
-                    .to_owned(),
-                )
-                .exec(&txn)
-                .await
-            {
-                Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
-                Err(err) => return Err(sink(err)),
-            }
-        }
+        crate::header_query::write_header_rows::<bus_event::Entity>(
+            &txn,
+            events.iter().map(|e| (e.event_id.as_uuid(), &e.headers)),
+        )
+        .await
+        .map_err(sink)?;
         txn.commit().await.map_err(sink)
     }
 
@@ -296,10 +279,15 @@ impl DurableSink for SqliteDurableSink {
                     .map_err(|e| BusError::Sink(e.to_string()))?,
             );
         }
-        merge_pages(branches, limit, tail)
-            .into_iter()
-            .map(from_model)
-            .collect()
+        crate::event_table::merge_branches(
+            branches,
+            |row| (row.epoch, row.counter, row.event_id),
+            limit,
+            tail,
+        )
+        .into_iter()
+        .map(from_model)
+        .collect()
     }
 
     async fn count_matching(
@@ -312,9 +300,9 @@ impl DurableSink for SqliteDurableSink {
     ) -> Result<airc_core::HistoryCount, BusError> {
         let mut rows = matching_rows(channel, after, through, headers);
         if let Some(rule) = exclude {
-            rows = rows.filter(crate::header_query::not_runtime_self::<
-                bus_event_header::Entity,
-            >(rule));
+            rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
+                rule,
+            ));
         }
         // COUNT/MIN/MAX in the store: no row, header JSON or payload leaves SQLite.
         let row: Option<(i64, Option<i64>, Option<i64>)> = rows
@@ -602,20 +590,13 @@ fn matching_rows(
             strictly_before(through)
                 .or(Expr::col(bus_event::Column::EventId).eq(through.event_id.as_uuid())),
         )
-        .filter(crate::header_query::predicate::<bus_event_header::Entity>(
-            headers,
-        ))
+        .filter(crate::header_query::predicate::<bus_event::Entity>(headers))
         .filter(bus_event::Column::Delivery.eq("durable"))
 }
 
 /// The selects `page_matching` reads: [`matching_rows`], the first `limit` in
-/// cursor order (the last, for `tail`); with an addressee filter, one select
-/// per branch (`addressed_peer = me`, `leading_mention = true`), each served
-/// whole by its composite index `(room_id, <branch column>, epoch, counter,
-/// event_id)`. SQLite cannot serve an OR across two columns from one index and
-/// walks the room's order index instead (measured on the M5: `SEARCH
-/// bus_events USING INDEX idx_bus_events_room_epoch_counter_event_id
-/// (room_id=?)`); [`merge_pages`] joins the branches.
+/// cursor order (the last, for `tail`); with an addressee filter, one per
+/// branch ([`crate::event_table::addressee_branches`]).
 fn page_rows(
     channel: RoomId,
     after: Cursor,
@@ -634,34 +615,7 @@ fn page_rows(
         .order_by(bus_event::Column::Counter, order.clone())
         .order_by(bus_event::Column::EventId, order)
         .limit(limit);
-    let Some(addressee) = rule.addressed_to else {
-        return vec![query];
-    };
-    // The indexed columns `to_active_model` derived at append, one per branch.
-    vec![
-        query
-            .clone()
-            .filter(bus_event::Column::AddressedPeer.eq(addressee.peer.as_uuid())),
-        query.filter(bus_event::Column::LeadingMention.eq(true)),
-    ]
-}
-
-/// The branches' rows as one page: deduplicated by event id, in cursor order,
-/// the first `limit` (the last `limit` for `tail`).
-fn merge_pages(
-    branches: Vec<Vec<bus_event::Model>>,
-    limit: usize,
-    tail: bool,
-) -> Vec<bus_event::Model> {
-    let mut rows: Vec<_> = branches.into_iter().flatten().collect();
-    rows.sort_by_key(|row| (row.epoch, row.counter, row.event_id));
-    rows.dedup_by_key(|row| row.event_id);
-    if tail {
-        rows.drain(..rows.len().saturating_sub(limit));
-    } else {
-        rows.truncate(limit);
-    }
-    rows
+    crate::event_table::addressee_branches(query, rule.addressed_to)
 }
 
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],

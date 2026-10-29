@@ -32,7 +32,7 @@ use airc_core::{
 use crate::account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 use crate::beacon::StoredBeacon;
 use crate::entities::{
-    account_registry, beacon, beacon_channel, event, event_header, local_identity, mesh_identity,
+    account_registry, beacon, beacon_channel, event, local_identity, mesh_identity,
     peer_rotation_audit, peer_trust, refresh_lock, runtime_cursor, scoped_state, subscription,
 };
 use crate::error::StoreError;
@@ -1069,12 +1069,11 @@ impl EventStore for SqliteEventStore {
             }
             Err(err) => return Err(StoreError::Database(err)),
         }
-        let headers = crate::header_query::event_header_rows(ev.event_id.as_uuid(), &ev.headers);
-        for chunk in headers.chunks(crate::header_query::HEADER_ROWS_PER_INSERT) {
-            event_header::Entity::insert_many(chunk.to_vec())
-                .exec(&txn)
-                .await?;
-        }
+        crate::header_query::write_header_rows::<event::Entity>(
+            &txn,
+            [(ev.event_id.as_uuid(), &ev.headers)],
+        )
+        .await?;
         txn.commit().await?;
         Ok(())
     }
@@ -1111,7 +1110,7 @@ impl EventStore for SqliteEventStore {
         for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail) {
             branches.push(query.all(&self.db).await?);
         }
-        crate::event_query::merge(branches, limit, tail)
+        crate::event_table::merge_branches(branches, |row| (row.lamport, row.event_id), limit, tail)
             .into_iter()
             .map(from_model)
             .collect()

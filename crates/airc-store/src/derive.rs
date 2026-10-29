@@ -19,9 +19,10 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use crate::entities::{bus_event, bus_event_header, event, event_header};
+use crate::entities::{bus_event, event};
 use crate::error::StoreError;
-use crate::header_query::{bus_event_header_rows, event_header_rows, HEADER_ROWS_PER_INSERT};
+use crate::event_table::EventTable;
+use crate::header_query::write_header_rows;
 use crate::migration::fault::{self, Fault};
 
 /// The version of the derived data this binary writes.
@@ -33,17 +34,13 @@ const BATCH: u64 = 1000;
 /// Derive every row of both event tables that is not current.
 pub(crate) async fn derive_pending(db: &DatabaseConnection) -> Result<(), StoreError> {
     loop {
-        let events = derive_events(db).await?;
-        let bus_events = derive_bus_events(db).await?;
+        let events = derive_batch::<event::Entity>(db).await?;
+        let bus_events = derive_batch::<bus_event::Entity>(db).await?;
         if events == 0 && bus_events == 0 {
             return Ok(());
         }
         fault::hit(Fault::AfterDerivedBatch)?;
     }
-}
-
-fn decode(what: &str, error: impl std::fmt::Display) -> StoreError {
-    StoreError::Migration(format!("deriving {what}: {error}"))
 }
 
 /// A batch's non-default addressing, grouped by value: the rows whose typed
@@ -65,19 +62,19 @@ impl Grouped {
     }
 }
 
-async fn derive_events(db: &DatabaseConnection) -> Result<usize, StoreError> {
-    let rows: Vec<(
-        Uuid,
-        serde_json::Value,
-        Option<serde_json::Value>,
-        serde_json::Value,
-    )> = event::Entity::find()
+/// Derive up to [`BATCH`] rows of `T` that are not current, in one
+/// transaction; how many there were.
+async fn derive_batch<T: EventTable>(db: &DatabaseConnection) -> Result<usize, StoreError>
+where
+    <T::Headers as EntityTrait>::ActiveModel: Send,
+{
+    let rows: Vec<(Uuid, serde_json::Value, T::Content, serde_json::Value)> = T::find()
         .select_only()
-        .column(event::Column::EventId)
-        .column(event::Column::Target)
-        .column(event::Column::Body)
-        .column(event::Column::Headers)
-        .filter(event::Column::DerivedVersion.lt(DERIVED_VERSION))
+        .column(T::EVENT_ID)
+        .column(T::TARGET)
+        .column(T::CONTENT)
+        .column(T::HEADERS)
+        .filter(T::DERIVED_VERSION.lt(DERIVED_VERSION))
         .limit(BATCH)
         .into_tuple()
         .all(db)
@@ -88,121 +85,38 @@ async fn derive_events(db: &DatabaseConnection) -> Result<usize, StoreError> {
     }
     let mut ids = Vec::with_capacity(count);
     let mut grouped = Grouped::default();
-    let mut headers = Vec::new();
-    for (id, target, body, held) in rows {
-        let target: airc_core::MentionTarget =
-            serde_json::from_value(target).map_err(|e| decode("events.target", e))?;
-        let body: Option<airc_core::Body> = body
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| decode("events.body", e))?;
-        let held: airc_core::Headers =
-            serde_json::from_value(held).map_err(|e| decode("events.headers", e))?;
-        grouped.add(id, airc_core::Addressing::of_target(&target, body.as_ref()));
-        headers.extend(event_header_rows(id, &held));
+    let mut headers = Vec::with_capacity(count);
+    for (id, target, content, held) in rows {
+        let held: airc_core::Headers = serde_json::from_value(held)
+            .map_err(|e| StoreError::Migration(format!("decoding headers: {e}")))?;
+        grouped.add(id, T::addressing(target, content)?);
+        headers.push((id, held));
         ids.push(id);
     }
     let txn = db.begin().await?;
-    event_header::Entity::delete_many()
-        .filter(event_header::Column::EventId.is_in(ids.clone()))
+    T::Headers::delete_many()
+        .filter(T::HEADER_EVENT_ID.is_in(ids.clone()))
         .exec(&txn)
         .await?;
-    for chunk in headers.chunks(HEADER_ROWS_PER_INSERT) {
-        event_header::Entity::insert_many(chunk.to_vec())
-            .exec(&txn)
-            .await?;
-    }
-    event::Entity::update_many()
-        .col_expr(
-            event::Column::AddressedPeer,
-            Expr::value(Option::<Uuid>::None),
-        )
-        .col_expr(event::Column::LeadingMention, Expr::value(false))
-        .col_expr(event::Column::DerivedVersion, Expr::value(DERIVED_VERSION))
-        .filter(event::Column::EventId.is_in(ids))
+    write_header_rows::<T>(&txn, headers.iter().map(|(id, held)| (*id, held))).await?;
+    T::update_many()
+        .col_expr(T::ADDRESSED_PEER, Expr::value(Option::<Uuid>::None))
+        .col_expr(T::LEADING_MENTION, Expr::value(false))
+        .col_expr(T::DERIVED_VERSION, Expr::value(DERIVED_VERSION))
+        .filter(T::EVENT_ID.is_in(ids))
         .exec(&txn)
         .await?;
     for (peer, ids) in grouped.peers {
-        event::Entity::update_many()
-            .col_expr(event::Column::AddressedPeer, Expr::value(peer))
-            .filter(event::Column::EventId.is_in(ids))
+        T::update_many()
+            .col_expr(T::ADDRESSED_PEER, Expr::value(peer))
+            .filter(T::EVENT_ID.is_in(ids))
             .exec(&txn)
             .await?;
     }
     if !grouped.leading.is_empty() {
-        event::Entity::update_many()
-            .col_expr(event::Column::LeadingMention, Expr::value(true))
-            .filter(event::Column::EventId.is_in(grouped.leading))
-            .exec(&txn)
-            .await?;
-    }
-    txn.commit().await?;
-    Ok(count)
-}
-
-async fn derive_bus_events(db: &DatabaseConnection) -> Result<usize, StoreError> {
-    let rows: Vec<(Uuid, serde_json::Value, Vec<u8>, serde_json::Value)> =
-        bus_event::Entity::find()
-            .select_only()
-            .column(bus_event::Column::EventId)
-            .column(bus_event::Column::Target)
-            .column(bus_event::Column::Payload)
-            .column(bus_event::Column::Headers)
-            .filter(bus_event::Column::DerivedVersion.lt(DERIVED_VERSION))
-            .limit(BATCH)
-            .into_tuple()
-            .all(db)
-            .await?;
-    let count = rows.len();
-    if count == 0 {
-        return Ok(0);
-    }
-    let mut ids = Vec::with_capacity(count);
-    let mut grouped = Grouped::default();
-    let mut headers = Vec::new();
-    for (id, target, payload, held) in rows {
-        let target: airc_bus::Target =
-            serde_json::from_value(target).map_err(|e| decode("bus_events.target", e))?;
-        let held: airc_core::Headers =
-            serde_json::from_value(held).map_err(|e| decode("bus_events.headers", e))?;
-        grouped.add(id, airc_bus::addressing_of(&target, &payload));
-        headers.extend(bus_event_header_rows(id, &held));
-        ids.push(id);
-    }
-    let txn = db.begin().await?;
-    bus_event_header::Entity::delete_many()
-        .filter(bus_event_header::Column::EventId.is_in(ids.clone()))
-        .exec(&txn)
-        .await?;
-    for chunk in headers.chunks(HEADER_ROWS_PER_INSERT) {
-        bus_event_header::Entity::insert_many(chunk.to_vec())
-            .exec(&txn)
-            .await?;
-    }
-    bus_event::Entity::update_many()
-        .col_expr(
-            bus_event::Column::AddressedPeer,
-            Expr::value(Option::<Uuid>::None),
-        )
-        .col_expr(bus_event::Column::LeadingMention, Expr::value(false))
-        .col_expr(
-            bus_event::Column::DerivedVersion,
-            Expr::value(DERIVED_VERSION),
-        )
-        .filter(bus_event::Column::EventId.is_in(ids))
-        .exec(&txn)
-        .await?;
-    for (peer, ids) in grouped.peers {
-        bus_event::Entity::update_many()
-            .col_expr(bus_event::Column::AddressedPeer, Expr::value(peer))
-            .filter(bus_event::Column::EventId.is_in(ids))
-            .exec(&txn)
-            .await?;
-    }
-    if !grouped.leading.is_empty() {
-        bus_event::Entity::update_many()
-            .col_expr(bus_event::Column::LeadingMention, Expr::value(true))
-            .filter(bus_event::Column::EventId.is_in(grouped.leading))
+        T::update_many()
+            .col_expr(T::LEADING_MENTION, Expr::value(true))
+            .filter(T::EVENT_ID.is_in(grouped.leading))
             .exec(&txn)
             .await?;
     }
@@ -213,6 +127,7 @@ async fn derive_bus_events(db: &DatabaseConnection) -> Result<usize, StoreError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::{bus_event_header, event_header};
     use crate::migration::{apply_migrations, Migrator};
     use crate::SqliteEventStore;
     use airc_core::{Body, MentionTarget, PeerId};

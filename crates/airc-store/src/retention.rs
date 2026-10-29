@@ -25,11 +25,12 @@
 
 use airc_core::HeaderFilter;
 use sea_orm::sea_query::{Alias, Expr, SimpleExpr};
-use sea_orm::{EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
 
-use crate::entities::{bus_event_header, event_header};
+use crate::entities::{bus_event, event};
 use crate::error::StoreError;
-use crate::header_query::{predicate, HeaderRows};
+use crate::event_table::EventTable;
+use crate::header_query::predicate;
 use crate::sqlite::SqliteEventStore;
 use crate::sqlite_only::{pragma_u64, sqlite_only, Pragma, SqliteOnly};
 
@@ -122,10 +123,10 @@ impl SqliteEventStore {
         window: i64,
     ) -> Result<DrainReport, StoreError> {
         let heartbeat_rows = self
-            .delete_in_windows::<bus_event_header::Entity>(&heartbeat_row(), window)
+            .delete_in_windows::<bus_event::Entity>(&heartbeat_row(), window)
             .await?;
         let non_durable_rows = self
-            .delete_in_windows::<event_header::Entity>(&non_durable_row(), window)
+            .delete_in_windows::<event::Entity>(&non_durable_row(), window)
             .await?;
         Ok(DrainReport {
             heartbeat_rows,
@@ -134,19 +135,19 @@ impl SqliteEventStore {
         })
     }
 
-    /// Delete the owner rows of `H` whose headers match `dead`, with their
+    /// Delete the rows of `T` whose headers match `dead`, with their
     /// header rows, one rowid window at a time, yielding between windows so
     /// queued appends and reads take the connection and the write lock
     /// ([`DRAIN_WINDOW_ROWS`]). Bounded by the table's max rowid at the start:
     /// rows written during the pass are the next pass's.
-    async fn delete_in_windows<H: HeaderRows>(
+    async fn delete_in_windows<T: EventTable>(
         &self,
         dead: &HeaderFilter,
         window: i64,
     ) -> Result<u64, StoreError> {
         let db = self.connection();
-        let rowid = || Expr::col((H::Owner::default(), Alias::new("rowid")));
-        let max_rowid: Option<Option<i64>> = H::Owner::find()
+        let rowid = || Expr::col((T::default(), Alias::new("rowid")));
+        let max_rowid: Option<Option<i64>> = T::find()
             .select_only()
             .column_as(rowid().max(), "max_rowid")
             .into_tuple()
@@ -155,7 +156,7 @@ impl SqliteEventStore {
         let Some(max_rowid) = max_rowid.flatten() else {
             return Ok(0);
         };
-        let owner_id = || Expr::col((H::Owner::default(), H::OWNER_EVENT_ID));
+        let owner_id = || Expr::col((T::default(), T::EVENT_ID));
         let mut low = 0i64;
         let mut removed = 0u64;
         while low < max_rowid {
@@ -163,9 +164,9 @@ impl SqliteEventStore {
             let in_window: SimpleExpr = rowid()
                 .gt(low)
                 .and(rowid().lte(high))
-                .and(predicate::<H>(dead));
+                .and(predicate::<T>(dead));
             // The ids first: the header rows the predicate reads go with them.
-            let ids: Vec<uuid::Uuid> = H::Owner::find()
+            let ids: Vec<uuid::Uuid> = T::find()
                 .select_only()
                 .column_as(owner_id(), "event_id")
                 .filter(in_window)
@@ -174,11 +175,11 @@ impl SqliteEventStore {
                 .await?;
             if !ids.is_empty() {
                 let txn = db.begin().await?;
-                H::delete_many()
-                    .filter(Expr::col((H::default(), H::EVENT_ID)).is_in(ids.clone()))
+                T::Headers::delete_many()
+                    .filter(T::HEADER_EVENT_ID.is_in(ids.clone()))
                     .exec(&txn)
                     .await?;
-                removed += H::Owner::delete_many()
+                removed += T::delete_many()
                     .filter(owner_id().is_in(ids))
                     .exec(&txn)
                     .await?

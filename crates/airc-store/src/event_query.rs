@@ -1,13 +1,8 @@
 //! The `events` selects a bounded history scan runs: one builder, so the store
 //! and the index-evidence tests read the same statements.
-//!
-//! An addressee scan is two selects, one per branch (`addressed_peer = me`,
-//! `leading_mention = true`), each served whole by its own composite index
-//! `(room_id, <branch column>, lamport, event_id)`: SQLite cannot serve an OR
-//! across two columns from one index and walks the room's order index instead
-//! (measured on the M5: `SEARCH events USING INDEX
-//! idx_events_room_lamport_event_id (room_id=?)`). The caller merges the
-//! branches ([`merge`]).
+//! An addressee scan is one select per branch
+//! ([`crate::event_table::addressee_branches`]); the caller merges them
+//! ([`crate::event_table::merge_branches`]).
 
 use airc_core::{HistoryMatch, RoomId, TranscriptCursor};
 use sea_orm::{
@@ -49,9 +44,9 @@ pub(crate) fn matching(
         .order_by(event::Column::EventId, order)
         .limit(limit as u64)
         .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
-        .filter(crate::header_query::predicate::<
-            crate::entities::event_header::Entity,
-        >(rule.headers))
+        .filter(crate::header_query::predicate::<event::Entity>(
+            rule.headers,
+        ))
         .filter(
             Expr::col(event::Column::Lamport)
                 .lt(through.lamport as i64)
@@ -59,32 +54,5 @@ pub(crate) fn matching(
                     .eq(through.lamport as i64)
                     .and(Expr::col(event::Column::EventId).lte(through.event_id.as_uuid()))),
         );
-    let Some(addressee) = rule.addressed_to else {
-        return vec![query];
-    };
-    // The indexed columns `to_active_model` derived at append, one per branch.
-    vec![
-        query
-            .clone()
-            .filter(event::Column::AddressedPeer.eq(addressee.peer.as_uuid())),
-        query.filter(event::Column::LeadingMention.eq(true)),
-    ]
-}
-
-/// The branches' rows as one page: deduplicated by event id, in transcript
-/// order, the first `limit` (the last `limit` for `tail`).
-pub(crate) fn merge(
-    branches: Vec<Vec<event::Model>>,
-    limit: usize,
-    tail: bool,
-) -> Vec<event::Model> {
-    let mut rows: Vec<_> = branches.into_iter().flatten().collect();
-    rows.sort_by_key(|row| (row.lamport, row.event_id));
-    rows.dedup_by_key(|row| row.event_id);
-    if tail {
-        rows.drain(..rows.len().saturating_sub(limit));
-    } else {
-        rows.truncate(limit);
-    }
-    rows
+    crate::event_table::addressee_branches(query, rule.addressed_to)
 }

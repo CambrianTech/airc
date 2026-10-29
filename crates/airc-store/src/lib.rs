@@ -44,6 +44,7 @@ mod derive;
 pub mod entities;
 pub mod error;
 mod event_query;
+mod event_table;
 mod header_query;
 pub mod history_count;
 pub mod local_identity;

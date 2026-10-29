@@ -1,86 +1,69 @@
 //! The shared header predicate algebra ([`HeaderFilter`]) evaluated by the
-//! store as typed subqueries on the derived header entities
-//! ([`crate::entities::event_header`], [`crate::entities::bus_event_header`]):
+//! store as typed subqueries on an [`EventTable`]'s derived header entity
+//! ([`crate::entities::event_header`], [`crate::entities::bus_event_header`]),
+//! and the one writer of those header rows:
 //! `Has` is a header row with the key, `Exact` one with the key and the value
 //! (binary comparison), `Prefix` one with the key and a value in the code-point
 //! range the prefix opens; `Not`/`All`/`AnyOf` compose. No JSON is parsed in SQL.
 
 use airc_core::{HeaderFilter, Headers};
-use sea_orm::sea_query::{Expr, Query, SelectStatement, SimpleExpr};
-use sea_orm::{ActiveValue::Set, EntityTrait};
+use sea_orm::sea_query::{Expr, OnConflict, Query, SelectStatement, SimpleExpr};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, DbErr, EntityTrait};
 use uuid::Uuid;
 
-use crate::entities::{bus_event, bus_event_header, event, event_header};
-
-/// A header entity and the event table it indexes.
-pub(crate) trait HeaderRows: EntityTrait {
-    type Owner: EntityTrait;
-    const EVENT_ID: Self::Column;
-    const KEY: Self::Column;
-    const VALUE: Self::Column;
-    const OWNER_EVENT_ID: <Self::Owner as EntityTrait>::Column;
-    const OWNER_CLIENT_ID: <Self::Owner as EntityTrait>::Column;
-}
-
-impl HeaderRows for event_header::Entity {
-    type Owner = event::Entity;
-    const EVENT_ID: Self::Column = event_header::Column::EventId;
-    const KEY: Self::Column = event_header::Column::Key;
-    const VALUE: Self::Column = event_header::Column::Value;
-    const OWNER_EVENT_ID: event::Column = event::Column::EventId;
-    const OWNER_CLIENT_ID: event::Column = event::Column::ClientId;
-}
-
-impl HeaderRows for bus_event_header::Entity {
-    type Owner = bus_event::Entity;
-    const EVENT_ID: Self::Column = bus_event_header::Column::EventId;
-    const KEY: Self::Column = bus_event_header::Column::Key;
-    const VALUE: Self::Column = bus_event_header::Column::Value;
-    const OWNER_EVENT_ID: bus_event::Column = bus_event::Column::EventId;
-    const OWNER_CLIENT_ID: bus_event::Column = bus_event::Column::ClientId;
-}
-
-/// The header rows of one `events` row, written beside it at append.
-pub(crate) fn event_header_rows(id: Uuid, headers: &Headers) -> Vec<event_header::ActiveModel> {
-    headers
-        .iter()
-        .map(|(key, value)| event_header::ActiveModel {
-            event_id: Set(id),
-            key: Set(key.clone()),
-            value: Set(value.clone()),
-        })
-        .collect()
-}
-
-/// The header rows of one `bus_events` row, written beside it at append.
-pub(crate) fn bus_event_header_rows(
-    id: Uuid,
-    headers: &Headers,
-) -> Vec<bus_event_header::ActiveModel> {
-    headers
-        .iter()
-        .map(|(key, value)| bus_event_header::ActiveModel {
-            event_id: Set(id),
-            key: Set(key.clone()),
-            value: Set(value.clone()),
-        })
-        .collect()
-}
+use crate::event_table::EventTable;
 
 /// Header rows written per INSERT: three bound values each, well under
 /// SQLite's 32,766 host parameters per statement.
-pub(crate) const HEADER_ROWS_PER_INSERT: usize = 5_000;
+const HEADER_ROWS_PER_INSERT: usize = 5_000;
 
-/// Owner rows that are NOT this runtime's own sends: [`airc_core::RuntimeSelf`]
-/// translated to the header predicate and the owner's `client_id` column.
-pub(crate) fn not_runtime_self<H: HeaderRows>(rule: &airc_core::RuntimeSelf) -> SimpleExpr {
+/// Write the header rows of `events` (id and headers) into `T`'s header
+/// entity, in INSERTs of at most [`HEADER_ROWS_PER_INSERT`] rows; a row that is
+/// already there (a replayed event) is skipped.
+pub(crate) async fn write_header_rows<'a, T: EventTable>(
+    db: &impl ConnectionTrait,
+    events: impl IntoIterator<Item = (Uuid, &'a Headers)>,
+) -> Result<(), DbErr>
+where
+    <T::Headers as EntityTrait>::ActiveModel: Send,
+{
+    let mut rows = Vec::new();
+    for (id, headers) in events {
+        for (key, value) in headers {
+            let mut row = <<T::Headers as EntityTrait>::ActiveModel as ActiveModelTrait>::default();
+            row.try_set(T::HEADER_EVENT_ID, id.into())?;
+            row.try_set(T::HEADER_KEY, key.clone().into())?;
+            row.try_set(T::HEADER_VALUE, value.clone().into())?;
+            rows.push(row);
+        }
+    }
+    for chunk in rows.chunks(HEADER_ROWS_PER_INSERT) {
+        match T::Headers::insert_many(chunk.to_vec())
+            .on_conflict(
+                OnConflict::columns([T::HEADER_EVENT_ID, T::HEADER_KEY])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+        {
+            Ok(_) | Err(DbErr::RecordNotInserted) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Rows of `T` that are NOT this runtime's own sends: [`airc_core::RuntimeSelf`]
+/// translated to the header predicate and the table's `client_id` column.
+pub(crate) fn not_runtime_self<T: EventTable>(rule: &airc_core::RuntimeSelf) -> SimpleExpr {
     let stamped = HeaderFilter::Has {
         key: airc_core::headers::HEADER_AIRC_CLIENT.to_string(),
     };
-    let unstamped_self = predicate::<H>(&HeaderFilter::Not(Box::new(stamped)))
-        .and(Expr::col((H::Owner::default(), H::OWNER_CLIENT_ID)).eq(rule.client_id.as_uuid()));
+    let unstamped_self = predicate::<T>(&HeaderFilter::Not(Box::new(stamped)))
+        .and(Expr::col((T::default(), T::CLIENT_ID)).eq(rule.client_id.as_uuid()));
     let is_self = match &rule.runtime_client {
-        Some(tag) => predicate::<H>(&HeaderFilter::Exact {
+        Some(tag) => predicate::<T>(&HeaderFilter::Exact {
             key: airc_core::headers::HEADER_AIRC_CLIENT.to_string(),
             value: tag.clone(),
         })
@@ -90,51 +73,51 @@ pub(crate) fn not_runtime_self<H: HeaderRows>(rule: &airc_core::RuntimeSelf) -> 
     is_self.not()
 }
 
-/// Owner rows whose headers match `filter`.
-pub(crate) fn predicate<H: HeaderRows>(filter: &HeaderFilter) -> SimpleExpr {
+/// Rows of `T` whose headers match `filter`.
+pub(crate) fn predicate<T: EventTable>(filter: &HeaderFilter) -> SimpleExpr {
+    let value = || Expr::col((T::Headers::default(), T::HEADER_VALUE));
     match filter {
         HeaderFilter::Any => Expr::value(true),
-        HeaderFilter::Has { key } => holding::<H>(rows::<H>(key, None)),
-        HeaderFilter::Exact { key, value } => holding::<H>(rows::<H>(
-            key,
-            Some(Expr::col((H::default(), H::VALUE)).eq(value.as_str())),
-        )),
+        HeaderFilter::Has { key } => holding::<T>(rows::<T>(key, None)),
+        HeaderFilter::Exact { key, value: wanted } => {
+            holding::<T>(rows::<T>(key, Some(value().eq(wanted.as_str()))))
+        }
         HeaderFilter::Prefix { key, value_prefix } => {
             // Every value that starts with the prefix, and only those, lies in
             // [prefix, successor(prefix)) in code-point (UTF-8 byte) order.
-            let from = Expr::col((H::default(), H::VALUE)).gte(value_prefix.as_str());
+            let from = value().gte(value_prefix.as_str());
             let range = match successor(value_prefix) {
-                Some(upper) => from.and(Expr::col((H::default(), H::VALUE)).lt(upper)),
+                Some(upper) => from.and(value().lt(upper)),
                 None if value_prefix.is_empty() => Expr::value(true),
                 None => from,
             };
-            holding::<H>(rows::<H>(key, Some(range)))
+            holding::<T>(rows::<T>(key, Some(range)))
         }
-        HeaderFilter::Not(inner) => predicate::<H>(inner).not(),
+        HeaderFilter::Not(inner) => predicate::<T>(inner).not(),
         HeaderFilter::All(items) => items
             .iter()
-            .fold(Expr::value(true), |acc, f| acc.and(predicate::<H>(f))),
+            .fold(Expr::value(true), |acc, f| acc.and(predicate::<T>(f))),
         HeaderFilter::AnyOf(items) => items
             .iter()
-            .fold(Expr::value(false), |acc, f| acc.or(predicate::<H>(f))),
+            .fold(Expr::value(false), |acc, f| acc.or(predicate::<T>(f))),
     }
 }
 
 /// The ids of events holding header `key` (and matching `value`, if given).
-fn rows<H: HeaderRows>(key: &str, value: Option<SimpleExpr>) -> SelectStatement {
+fn rows<T: EventTable>(key: &str, value: Option<SimpleExpr>) -> SelectStatement {
     let mut select = Query::select();
     select
-        .column((H::default(), H::EVENT_ID))
-        .from(H::default())
-        .and_where(Expr::col((H::default(), H::KEY)).eq(key));
+        .column((T::Headers::default(), T::HEADER_EVENT_ID))
+        .from(T::Headers::default())
+        .and_where(Expr::col((T::Headers::default(), T::HEADER_KEY)).eq(key));
     if let Some(value) = value {
         select.and_where(value);
     }
     select.to_owned()
 }
 
-fn holding<H: HeaderRows>(ids: SelectStatement) -> SimpleExpr {
-    Expr::col((H::Owner::default(), H::OWNER_EVENT_ID)).in_subquery(ids)
+fn holding<T: EventTable>(ids: SelectStatement) -> SimpleExpr {
+    Expr::col((T::default(), T::EVENT_ID)).in_subquery(ids)
 }
 
 /// The least string greater than every string that starts with `prefix`:
@@ -158,6 +141,7 @@ fn successor(prefix: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::event;
     use crate::store::EventStore;
     use crate::SqliteEventStore;
     use airc_core::{Body, ClientId, EventId, MentionTarget, PeerId, RoomId, TranscriptEvent};
@@ -231,7 +215,7 @@ mod tests {
             let ids: Vec<uuid::Uuid> = event::Entity::find()
                 .select_only()
                 .column(event::Column::EventId)
-                .filter(predicate::<event_header::Entity>(&filter))
+                .filter(predicate::<event::Entity>(&filter))
                 .into_tuple()
                 .all(store.connection())
                 .await

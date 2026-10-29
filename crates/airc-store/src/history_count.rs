@@ -13,7 +13,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 
 use airc_core::{HeaderFilter, HistoryCount, RoomId, RuntimeSelf, TranscriptCursor};
 
-use crate::entities::{event, event_header};
+use crate::entities::event;
 use crate::error::StoreError;
 use crate::sqlite::SqliteEventStore;
 
@@ -67,12 +67,9 @@ impl CountHistory for SqliteEventStore {
         let mut query = event::Entity::find()
             .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
             .filter(transcript_range(after, through))
-            .filter(crate::header_query::predicate::<event_header::Entity>(
-                headers,
-            ));
+            .filter(crate::header_query::predicate::<event::Entity>(headers));
         if let Some(rule) = exclude {
-            query =
-                query.filter(crate::header_query::not_runtime_self::<event_header::Entity>(rule));
+            query = query.filter(crate::header_query::not_runtime_self::<event::Entity>(rule));
         }
         let row: Option<(i64, Option<i64>, Option<i64>)> = query
             .select_only()
