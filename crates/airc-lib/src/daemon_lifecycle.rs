@@ -6,6 +6,53 @@ use std::path::Path;
 
 use fs2::FileExt;
 
+/// Automatic daemon start refused: an `airc update` (or an operator stop or
+/// resume) holds daemon maintenance. The updater holds it from before it stops
+/// the daemon until its replacement has opened the store and bound its
+/// endpoint, and the OS releases it on every exit, failure or crash included.
+/// Carried inside the `io::Error` [`DaemonLifecycleGuard::autostart`] returns;
+/// [`is_maintenance_in_progress`] recognizes it.
+#[derive(Debug)]
+pub struct MaintenanceInProgress {
+    lock: io::Error,
+}
+
+impl MaintenanceInProgress {
+    fn refusal(lock: io::Error) -> io::Error {
+        io::Error::new(lock.kind(), Self { lock })
+    }
+}
+
+impl std::fmt::Display for MaintenanceInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "an airc update (or operator stop/resume) is in progress; automatic daemon \
+             start refused until it finishes, then retry ({})",
+            self.lock
+        )
+    }
+}
+
+impl std::error::Error for MaintenanceInProgress {}
+
+/// Whether `error` (anywhere in its source chain) is a [`MaintenanceInProgress`] refusal.
+pub fn is_maintenance_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(error);
+    while let Some(error) = next {
+        if error.is::<MaintenanceInProgress>()
+            || error
+                .downcast_ref::<io::Error>()
+                .and_then(|io| io.get_ref())
+                .is_some_and(|inner| inner.is::<MaintenanceInProgress>())
+        {
+            return true;
+        }
+        next = error.source();
+    }
+    false
+}
+
 pub struct DaemonLifecycleGuard {
     active: File,
     _maintenance_intent: Option<File>,
@@ -53,19 +100,9 @@ impl DaemonLifecycleGuard {
         // A waiting updater closes this gate before draining existing readers,
         // so continuous new CLI calls cannot starve installation.
         let intent = Self::open(&owner, "daemon-maintenance.lock")?;
-        FileExt::try_lock_shared(&intent).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("daemon maintenance requested; autostart refused: {error}"),
-            )
-        })?;
+        FileExt::try_lock_shared(&intent).map_err(MaintenanceInProgress::refusal)?;
         let file = Self::open(&owner, "daemon-lifecycle.lock")?;
-        FileExt::try_lock_shared(&file).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("daemon maintenance in progress; autostart refused: {error}"),
-            )
-        })?;
+        FileExt::try_lock_shared(&file).map_err(MaintenanceInProgress::refusal)?;
         let guard = Self {
             active: file,
             _maintenance_intent: None,
@@ -208,6 +245,35 @@ impl Drop for DaemonLifecycleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches (Codex on #1618): a CLI auto-start attempted in the update's
+    // stop/swap window, from another thread as a hook would from another process, is
+    // refused with the typed maintenance error (never a spawn); and an update that FAILS
+    // while holding maintenance releases it, so the next auto-start is admitted.
+    #[test]
+    fn an_update_window_refuses_autostart_typed_and_a_failed_update_releases_it() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_owned();
+        let (held, window) = mpsc::channel();
+        let (finish, finished) = mpsc::channel::<()>();
+        let updater = std::thread::spawn(move || -> Result<(), io::Error> {
+            let _custody = DaemonLifecycleGuard::maintenance(&home)?;
+            held.send(()).map_err(io::Error::other)?;
+            finished.recv().map_err(io::Error::other)?;
+            Err(io::Error::other("injected update failure after the stop"))
+        });
+        window.recv().unwrap();
+        let refused = DaemonLifecycleGuard::autostart(dir.path()).err().unwrap();
+        assert!(is_maintenance_in_progress(&refused), "{refused}");
+        assert!(refused.to_string().contains("update"), "{refused}");
+        finish.send(()).unwrap();
+        assert!(updater.join().unwrap().is_err(), "the update failed");
+        assert!(
+            DaemonLifecycleGuard::autostart(dir.path()).is_ok(),
+            "custody released on the failure path"
+        );
+    }
 
     // A reconnect must not respawn the old executable inside stop/install;
     // releasing the updater's OS lock must immediately restore autostart.
