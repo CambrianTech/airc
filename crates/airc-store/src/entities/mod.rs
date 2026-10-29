@@ -37,6 +37,7 @@
 pub mod account_registry;
 pub mod beacon;
 pub mod beacon_channel;
+pub mod bus_epoch;
 pub mod bus_event;
 pub mod bus_event_header;
 pub mod event;
