@@ -565,6 +565,16 @@ fn ensure_runtime_integrations() {
             eprintln!("airc: Codex hook setup skipped: {error}");
         }
     }
+    match crate::integrations::claude::install_hooks_for_default_config_if_present() {
+        Ok(None) => {}
+        Ok(Some(path)) => println!(
+            "runtime: installed AIRC UserPromptSubmit and PostToolUse hooks in {}",
+            path.display()
+        ),
+        Err(error) => {
+            eprintln!("airc: Claude Code hook setup skipped: {error}");
+        }
+    }
 }
 
 /// `version` — print package version + install dir. Distinct from
