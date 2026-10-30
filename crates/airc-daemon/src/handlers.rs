@@ -43,7 +43,7 @@ const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as 
 pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
     match request {
         Request::Addressed(request) => {
-            crate::addressed_connection::route_local(&state, request.frame)
+            crate::addressed_connection::route_local(&state, request.frame).await
         }
         Request::AttachAddressed(_) | Request::ProveAddressed(_) => Response::Error {
             message: "addressed proof requires its original challenged connection".into(),

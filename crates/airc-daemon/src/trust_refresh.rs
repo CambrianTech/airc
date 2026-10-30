@@ -64,6 +64,19 @@ pub async fn refresh_peer(
     peer_id: airc_core::PeerId,
     expected: Option<[u8; 32]>,
 ) -> Result<(), TrustRefreshError> {
+    let key = durable_peer_key(root, peer_id).await?;
+    if expected.is_some_and(|expected| expected != key) {
+        return Err(TrustRefreshError::KeyMismatch(peer_id));
+    }
+    registry
+        .enrol(peer_id, 0, key)
+        .map_err(TrustRefreshError::InvalidPubkey)
+}
+
+async fn durable_peer_key(
+    root: &Path,
+    peer_id: airc_core::PeerId,
+) -> Result<[u8; 32], TrustRefreshError> {
     let peer = airc_trust::load(root)
         .await?
         .into_iter()
@@ -75,12 +88,20 @@ pub async fn refresh_peer(
     let key: [u8; 32] = bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| TrustRefreshError::WrongPubkeyLength(bytes.len()))?;
-    if expected.is_some_and(|expected| expected != key) {
-        return Err(TrustRefreshError::KeyMismatch(peer_id));
-    }
+    Ok(key)
+}
+
+/// Admission uses its own durable snapshot, never the shared transport cache.
+/// Durable trust currently represents only key generation zero.
+pub async fn admission_registry(
+    root: &Path,
+    peer_id: airc_core::PeerId,
+) -> Result<PeerKeyRegistry, TrustRefreshError> {
+    let registry = PeerKeyRegistry::new();
     registry
-        .enrol(peer_id, 0, key)
-        .map_err(TrustRefreshError::InvalidPubkey)
+        .enrol(peer_id, 0, durable_peer_key(root, peer_id).await?)
+        .map_err(TrustRefreshError::InvalidPubkey)?;
+    Ok(registry)
 }
 
 impl From<airc_trust::PeersStoreError> for TrustRefreshError {

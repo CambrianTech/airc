@@ -17,7 +17,7 @@ fn refusal(message: impl Into<String>) -> Response {
     }
 }
 
-pub(crate) fn route_local(state: &DaemonState, frame: Frame) -> Response {
+pub(crate) async fn route_local(state: &DaemonState, frame: Frame) -> Response {
     if frame.kind != FrameKind::Addressed || frame.envelope.channel != addressed_channel() {
         return refusal("addressed route refuses room or plaintext frames");
     }
@@ -28,7 +28,12 @@ pub(crate) fn route_local(state: &DaemonState, frame: Frame) -> Response {
     {
         return refusal("local addressed sender must sign its own envelope");
     }
-    if let Err(error) = airc_protocol::verify(&frame, VerificationPolicy::Strict, &state.registry) {
+    let registry =
+        match crate::trust_refresh::admission_registry(&state.home, frame.envelope.sender).await {
+            Ok(registry) => registry,
+            Err(error) => return refusal(format!("addressed trust refused: {error}")),
+        };
+    if let Err(error) = airc_protocol::verify(&frame, VerificationPolicy::Strict, &registry) {
         return refusal(format!("addressed signature refused: {error}"));
     }
     match state.addressed.route(*peer, frame) {
@@ -82,10 +87,10 @@ where
         let request = read_frame::<_, Request>(&mut reader).await?;
         Ok::<_, std::io::Error>(match request {
             Some(Request::ProveAddressed(proof)) => {
-                crate::trust_refresh::refresh_peer(&state.registry, &state.home, peer, None)
+                let registry = crate::trust_refresh::admission_registry(&state.home, peer)
                     .await
                     .map_err(std::io::Error::other)?;
-                challenge.verify(&proof, &state.registry).is_ok()
+                challenge.verify(&proof, &registry).is_ok()
             }
             _ => false,
         })
@@ -170,6 +175,43 @@ mod tests {
         .await
         .unwrap();
         (home, Arc::new(state), peer, key)
+    }
+
+    #[tokio::test]
+    async fn stale_shared_cache_cannot_authenticate_after_durable_rotation() {
+        let (_home, state, peer, old) = fixture().await;
+        let next = PeerKeypair::generate();
+        let rotation =
+            airc_protocol::trust_rotation::sign_rotation(&old, peer, next.public_bytes(), 1, 1)
+                .unwrap();
+        airc_trust::rotate(&state.home, &rotation).await.unwrap();
+        crate::trust_refresh::refresh_peer(&state.registry, &state.home, peer, None)
+            .await
+            .unwrap();
+        // Deterministically finish a delayed old cache write after the new one.
+        state.registry.enrol(peer, 0, old.public_bytes()).unwrap();
+        state.registry.enrol(peer, 7, old.public_bytes()).unwrap();
+        let registry = crate::trust_refresh::admission_registry(&state.home, peer)
+            .await
+            .unwrap();
+        let challenge = AttachChallenge {
+            daemon: state.peer_id,
+            peer,
+            nonce: uuid::Uuid::new_v4(),
+        };
+        assert!(challenge
+            .verify(&challenge.sign(&old, 0), &registry)
+            .is_err());
+        assert!(challenge
+            .verify(&challenge.sign(&old, 7), &registry)
+            .is_err());
+        assert!(challenge
+            .verify(&challenge.sign(&next, 0), &registry)
+            .is_ok());
+        airc_trust::remove(&state.home, peer).await.unwrap();
+        assert!(crate::trust_refresh::admission_registry(&state.home, peer)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
