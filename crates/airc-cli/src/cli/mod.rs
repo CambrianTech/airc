@@ -29,6 +29,7 @@ use crate::knock_cli::KnockArgs;
 use crate::pending_cli::PendingArgs;
 use crate::route_cli::RouteArgs;
 use crate::state_cli::StateArgs;
+use crate::store_cli::StoreArgs;
 use crate::transport_cli::TransportArgs;
 use crate::work_cli::WorkArgs;
 
@@ -557,6 +558,9 @@ pub enum Command {
         #[arg(long)]
         health: bool,
     },
+
+    /// The machine store's own maintenance (migration recovery).
+    Store(StoreArgs),
 
     /// Shared GitHub request governor.
     Gh(GhArgs),
