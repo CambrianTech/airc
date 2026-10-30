@@ -49,7 +49,7 @@ impl Airc {
             .sessions
             .seal_for(msg.to, &aad(me, msg.to), &plaintext)
             .map_err(AddressedError::Handshake)?;
-        self.send_addressed_wire(msg.to, &AddressedWire::Sealed(sealed))
+        self.send_addressed_wire(msg.to, &AddressedWire::Sealed(sealed), deadline)
             .await
     }
 
@@ -63,7 +63,7 @@ impl Airc {
     ) -> Result<(), AddressedError> {
         let state = &self.inner.addressed;
         let mut established = state.established.subscribe();
-        self.rekey(peer).await?;
+        self.rekey(peer, deadline).await?;
         let waited = tokio::time::timeout_at(deadline, async {
             while !state.sessions.has_session(peer) {
                 if established.changed().await.is_err() {
@@ -83,6 +83,7 @@ impl Airc {
         &self,
         to: airc_core::PeerId,
         wire: &AddressedWire,
+        deadline: Instant,
     ) -> Result<(), AddressedError> {
         let body = wire
             .to_body()
@@ -115,7 +116,7 @@ impl Airc {
             .map_err(|error| AddressedError::Codec(error.to_string()))?;
         if let Some(client) = &self.inner.daemon_client {
             return client
-                .send_addressed(frame)
+                .send_addressed(frame, deadline)
                 .await
                 .map_err(|error| AddressedError::Transport(error.to_string()));
         }

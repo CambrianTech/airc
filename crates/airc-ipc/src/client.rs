@@ -358,10 +358,28 @@ impl DaemonClient {
     }
 
     /// Hand the daemon one addressed frame this scope sealed and signed.
-    pub async fn send_addressed(&self, frame: airc_protocol::Frame) -> Result<(), ClientError> {
+    pub async fn send_addressed(
+        &self,
+        frame: airc_protocol::Frame,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ClientError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(ClientError::Timeout)?;
+        let expires = std::time::SystemTime::now()
+            .checked_add(remaining)
+            .ok_or(ClientError::Timeout)?;
+        let deadline_unix_ms = u64::try_from(
+            expires
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| ClientError::Io(std::io::Error::other(error)))?
+                .as_millis(),
+        )
+        .map_err(|_| ClientError::Timeout)?;
         match self
             .call(Request::Addressed(crate::request::AddressedRequest {
                 frame,
+                deadline_unix_ms,
             }))
             .await?
         {

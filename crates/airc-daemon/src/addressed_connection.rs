@@ -45,10 +45,33 @@ impl std::fmt::Display for AddressedAdmissionError {
 }
 impl std::error::Error for AddressedAdmissionError {}
 
-pub(crate) async fn route_local(state: &DaemonState, frame: Frame) -> Response {
-    match admit_local(state, frame).await {
-        Ok(()) => Response::Ok,
-        Err(error) => refusal(error.to_string()),
+pub(crate) async fn route_request(
+    state: &DaemonState,
+    request: airc_ipc::AddressedRequest,
+) -> Response {
+    let Some(expires) = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_millis(request.deadline_unix_ms))
+    else {
+        return refusal("addressed deadline is out of range");
+    };
+    let Ok(remaining) = expires.duration_since(std::time::SystemTime::now()) else {
+        return refusal("addressed deadline elapsed");
+    };
+    if remaining.is_zero() {
+        return refusal("addressed deadline elapsed");
+    }
+    let remaining = remaining.min(airc_ipc::client::DEFAULT_RPC_TIMEOUT);
+    let shutdown = state.shutdown.notified();
+    tokio::pin!(shutdown);
+    shutdown.as_mut().enable();
+    tokio::select! {
+        biased;
+        _ = &mut shutdown => refusal("addressed daemon shutting down"),
+        result = tokio::time::timeout(remaining, admit_local(state, request.frame)) => match result {
+            Ok(Ok(())) => Response::Ok,
+            Ok(Err(error)) => refusal(error.to_string()),
+            Err(_) => refusal("addressed deadline elapsed"),
+        },
     }
 }
 
@@ -210,6 +233,42 @@ mod tests {
         .await
         .unwrap();
         (home, Arc::new(state), peer, key)
+    }
+
+    #[tokio::test]
+    async fn expired_ipc_frame_is_refused_before_admission() {
+        let (_home, state, peer, _key) = fixture().await;
+        let mut receiver = state.addressed.register(peer).unwrap();
+        let frame = Frame {
+            kind: FrameKind::Addressed,
+            envelope: airc_protocol::Envelope {
+                event_id: airc_core::EventId::new(),
+                sender: peer,
+                sender_client: airc_core::ClientId::new(),
+                channel: addressed_channel(),
+                target: MentionTarget::Peer(peer),
+                lamport: 1,
+                occurred_at_ms: 1,
+                reply_to: None,
+                headers: Default::default(),
+                body: None,
+                media: Vec::new(),
+                signature: Signature::Unsigned,
+            },
+        };
+        let response = route_request(
+            &state,
+            airc_ipc::AddressedRequest {
+                frame,
+                deadline_unix_ms: 1,
+            },
+        )
+        .await;
+        assert_eq!(response, refusal("addressed deadline elapsed"));
+        assert!(matches!(
+            receiver.rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

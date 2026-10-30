@@ -193,6 +193,8 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AddressedRequest {
     pub frame: airc_protocol::Frame,
+    /// Absolute expiry on this machine; elapsed socket time never renews it.
+    pub deadline_unix_ms: u64,
 }
 
 /// Parameters for `AttachAddressed`.

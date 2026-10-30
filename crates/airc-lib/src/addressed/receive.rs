@@ -42,7 +42,11 @@ impl Airc {
                     Ok(resp) => {
                         state.session_installed();
                         if let Err(error) = self
-                            .send_addressed_wire(from, &AddressedWire::Resp(resp))
+                            .send_addressed_wire(
+                                from,
+                                &AddressedWire::Resp(resp),
+                                tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT,
+                            )
                             .await
                         {
                             refuse(from, &format!("handshake response not sent: {error}"));
@@ -133,16 +137,26 @@ impl Airc {
     /// gave), or start one. Called once per frame that could not be opened
     /// and once per send attempt, so it heals a lost init or reply without a
     /// timer and never storms.
-    pub(super) async fn rekey(&self, peer: airc_core::PeerId) -> Result<(), super::AddressedError> {
+    pub(super) async fn rekey(
+        &self,
+        peer: airc_core::PeerId,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), super::AddressedError> {
         let sessions = &self.inner.addressed.sessions;
         let now = now_ms().map_err(|error| super::AddressedError::Transport(error.to_string()))?;
         let init = sessions.ensure_handshake(peer, now);
-        self.send_addressed_wire(peer, &AddressedWire::Init(init))
+        self.send_addressed_wire(peer, &AddressedWire::Init(init), deadline)
             .await
     }
 
     async fn rekey_logged(&self, peer: airc_core::PeerId) {
-        if let Err(error) = self.rekey(peer).await {
+        if let Err(error) = self
+            .rekey(
+                peer,
+                tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT,
+            )
+            .await
+        {
             refuse(peer, &format!("re-key init not sent: {error}"));
         }
     }
