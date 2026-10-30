@@ -82,7 +82,7 @@ pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
         room_id: env.channel,
         peer_id: env.from.0,
         client_id: env.from.1,
-        kind: env.kind.transcript_kind(),
+        kind: env.class.transcript_kind(),
         occurred_at_ms: env.occurred_at_ms,
         lamport: pack_seq(env.seq.epoch, env.seq.counter),
         target: target_to_mention(&env.target),

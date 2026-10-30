@@ -78,6 +78,7 @@ impl AgentDeliveryTurn {
                 .min(SCAN_CAP);
             let kinds = std::collections::BTreeSet::new();
             let rule = airc_core::HistoryMatch {
+                sender: None,
                 selection: airc_core::EventSelection::Correspondence,
                 headers: &airc_core::HeaderFilter::Any,
                 kinds: &kinds,

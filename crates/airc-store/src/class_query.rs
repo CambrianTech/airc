@@ -29,8 +29,16 @@ pub(crate) fn selection<T: EventTable>(
 
 pub(crate) fn matching<T: EventTable>(rule: HistoryMatch<'_>) -> Result<SimpleExpr, StoreError> {
     let mut selected = selection::<T>(&rule.selection, rule.headers)?;
+    if let Some(sender) = rule.sender {
+        selected = selected.and(T::PEER_ID.eq(sender.as_uuid()));
+    }
     if !rule.kinds.is_empty() {
-        selected = selected.and(T::KIND.is_in(T::kinds(rule.kinds)));
+        let classes = EventClass::ALL
+            .iter()
+            .filter(|class| rule.kinds.contains(&class.transcript_kind()))
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        selected = selected.and(T::CLASS.is_in(classes));
     }
     if let Some((peer, client, filter)) = rule.self_echo {
         selected = match filter {

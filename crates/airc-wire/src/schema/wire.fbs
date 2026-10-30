@@ -46,6 +46,8 @@ enum EventClass : ubyte {
   ActivityWorkReceipt,
   ActivityWorkState,
   ActivityPresence,
+  ActivityWorkPresence,
+  ActivityCoordination,
   ControlCommand,
   ControlCommandResult,
   ControlSession,
@@ -53,7 +55,17 @@ enum EventClass : ubyte {
   ControlAddressed,
   ControlSignal,
   ControlStream,
-  ControlLifecycle,
+  LifecyclePeerArrived,
+  LifecyclePeerDeparted,
+  LifecycleWireEstablished,
+  LifecycleWireLost,
+  LifecycleRoomJoined,
+  LifecycleRoomParted,
+  LifecycleSubscriptionAdvanced,
+  LifecycleIdentityPublished,
+  LifecycleDoctrinePublished,
+  LifecycleWallPostPublished,
+  LifecycleChannelPurposePublished,
 }
 
 // Delivery + retention class (§2, §3.3, §3.4). Mirrors

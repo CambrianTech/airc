@@ -9,6 +9,7 @@ static EMPTY_KINDS: std::collections::BTreeSet<crate::TranscriptKind> =
 
 #[derive(Debug, Clone)]
 pub struct HistoryMatch<'a> {
+    pub sender: Option<crate::PeerId>,
     pub kinds: &'a std::collections::BTreeSet<crate::TranscriptKind>,
     pub self_echo: Option<(crate::PeerId, crate::ClientId, crate::SelfFilter)>,
     pub selection: crate::EventSelection,
@@ -20,6 +21,7 @@ pub struct HistoryMatch<'a> {
 impl<'a> HistoryMatch<'a> {
     pub fn headers(headers: &'a HeaderFilter) -> Self {
         Self {
+            sender: None,
             kinds: &EMPTY_KINDS,
             self_echo: None,
             selection: crate::EventSelection::All,
@@ -39,6 +41,7 @@ impl<'a> HistoryMatch<'a> {
         addressing: impl FnOnce() -> Addressing,
     ) -> bool {
         self.selection.matches(class)
+            && self.sender.is_none_or(|sender| sender == from.0)
             && (self.kinds.is_empty() || self.kinds.contains(&kind))
             && self
                 .self_echo
@@ -56,7 +59,7 @@ impl<'a> HistoryMatch<'a> {
     pub fn matches_event(&self, event: &TranscriptEvent) -> bool {
         self.matches_with(
             event.class,
-            event.kind,
+            event.class.transcript_kind(),
             (event.peer_id, event.client_id),
             &event.headers,
             || Addressing::of_event(event),

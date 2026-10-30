@@ -451,6 +451,7 @@ mod tests {
         let all_headers = airc_core::HeaderFilter::Any;
         let kinds = std::collections::BTreeSet::new();
         let routed = airc_core::HistoryMatch {
+            sender: None,
             kinds: &kinds,
             self_echo: None,
             selection: airc_core::EventSelection::Correspondence,

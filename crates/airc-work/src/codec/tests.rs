@@ -1,5 +1,5 @@
 use airc_core::{Body, PeerId};
-use airc_protocol::{FrameKind, HEADER_FORGE_BODY_HINT};
+use airc_protocol::HEADER_FORGE_BODY_HINT;
 
 use super::*;
 use crate::goal::{ExitCondition, GoalId};
@@ -65,11 +65,11 @@ fn subscription_matches_work_events_without_parsing_body() {
     let sub = work_event_subscription();
 
     assert!(sub.headers_filter.matches(&headers));
-    assert!(sub.kinds.contains(&FrameKind::Event));
+    assert!(sub.selection.matches(work_event_class(&event)));
 }
 
 #[test]
-fn decode_rejects_wrong_hint_and_non_json_body() {
+fn decode_uses_payload_schema_not_hint_and_rejects_non_json_body() {
     let event = card_created();
     let (mut headers, _) = encode_work_event(&event).unwrap();
     headers.insert(
@@ -79,7 +79,7 @@ fn decode_rejects_wrong_hint_and_non_json_body() {
 
     assert!(matches!(
         decode_work_event(&headers, Some(&Body::text("not work"))),
-        Err(WorkEventCodecError::BodyHintMismatch { .. })
+        Err(WorkEventCodecError::Json(_))
     ));
 
     headers.insert(

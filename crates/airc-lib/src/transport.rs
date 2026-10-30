@@ -273,7 +273,7 @@ impl Airc {
             })
             .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
         );
-        self.emit_lifecycle(airc_core::TranscriptKind::WireLost, room_id, body)
+        self.emit_lifecycle(airc_core::LifecycleKind::WireLost, room_id, body)
             .await
     }
 

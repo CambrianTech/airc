@@ -22,7 +22,7 @@ impl Envelope {
     pub fn matches_history(&self, rule: &airc_core::HistoryMatch<'_>) -> bool {
         rule.matches_with(
             self.class,
-            self.kind.transcript_kind(),
+            self.class.transcript_kind(),
             self.from,
             &self.headers,
             || self.addressing(),

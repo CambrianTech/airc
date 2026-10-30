@@ -781,9 +781,21 @@ pub enum PublishClass {
     Intent,
     WorkReceipt,
     WorkState,
+    WorkPresence,
+    Coordination,
     Presence,
     Session,
-    Lifecycle,
+    PeerArrived,
+    PeerDeparted,
+    WireEstablished,
+    WireLost,
+    RoomJoined,
+    RoomParted,
+    SubscriptionAdvanced,
+    IdentityPublished,
+    DoctrinePublished,
+    WallPostPublished,
+    ChannelPurposePublished,
 }
 
 impl From<PublishClass> for airc_core::EventClass {
@@ -797,9 +809,43 @@ impl From<PublishClass> for airc_core::EventClass {
             PublishClass::Intent => EventClass::Activity(ActivityKind::Intent),
             PublishClass::WorkReceipt => EventClass::Activity(ActivityKind::WorkReceipt),
             PublishClass::WorkState => EventClass::Activity(ActivityKind::WorkState),
+            PublishClass::WorkPresence => EventClass::Activity(ActivityKind::WorkPresence),
+            PublishClass::Coordination => EventClass::Activity(ActivityKind::Coordination),
             PublishClass::Presence => EventClass::Activity(ActivityKind::Presence),
             PublishClass::Session => EventClass::Control(ControlKind::Session),
-            PublishClass::Lifecycle => EventClass::Control(ControlKind::Lifecycle),
+            PublishClass::PeerArrived => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::PeerArrived,
+            )),
+            PublishClass::PeerDeparted => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::PeerDeparted,
+            )),
+            PublishClass::WireEstablished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::WireEstablished,
+            )),
+            PublishClass::WireLost => {
+                EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::WireLost))
+            }
+            PublishClass::RoomJoined => {
+                EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomJoined))
+            }
+            PublishClass::RoomParted => {
+                EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomParted))
+            }
+            PublishClass::SubscriptionAdvanced => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::SubscriptionAdvanced,
+            )),
+            PublishClass::IdentityPublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::IdentityPublished,
+            )),
+            PublishClass::DoctrinePublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::DoctrinePublished,
+            )),
+            PublishClass::WallPostPublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::WallPostPublished,
+            )),
+            PublishClass::ChannelPurposePublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::ChannelPurposePublished,
+            )),
         }
     }
 }

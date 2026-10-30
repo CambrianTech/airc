@@ -50,7 +50,7 @@ async fn subscribe_work_events_yields_typed_card_created_event() {
     let mut got = None;
     while std::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
-            Ok(Some((_transcript_event, work_event))) => {
+            Ok(Some(Ok((_transcript_event, work_event)))) => {
                 if let WorkEvent::CardCreated(payload) = &work_event {
                     if payload.card_id == card_id {
                         got = Some(work_event);
@@ -58,6 +58,7 @@ async fn subscribe_work_events_yields_typed_card_created_event() {
                     }
                 }
             }
+            Ok(Some(Err(error))) => panic!("subscription failed: {error}"),
             Ok(None) => panic!("subscription closed before our event"),
             Err(_) => continue,
         }
@@ -90,11 +91,18 @@ async fn recent_work_events_reads_back_from_transcript() {
         .await
         .expect("create card");
 
+    for _ in 0..64 {
+        alice
+            .say("unrelated newer correspondence")
+            .await
+            .expect("chat flood");
+    }
+
     // Give the daemon a moment to durably record the card event.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let events = alice
-        .recent_work_events(WorkEventFilter::default(), 64)
+        .recent_work_events(WorkEventFilter::default(), 1)
         .await
         .expect("recent query");
 

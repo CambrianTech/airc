@@ -173,6 +173,8 @@ pub fn any_openclaw_event_filter() -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -188,6 +190,8 @@ pub fn workspace_event_filter(workspace_id: &str) -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),

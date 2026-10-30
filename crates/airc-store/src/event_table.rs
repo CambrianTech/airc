@@ -19,8 +19,6 @@ pub(crate) trait EventTable: EntityTrait {
     const CLASS_FAMILY: Self::Column;
     const CLIENT_ID: Self::Column;
     const PEER_ID: Self::Column;
-    const KIND: Self::Column;
-    fn kinds(kinds: &std::collections::BTreeSet<airc_core::TranscriptKind>) -> Vec<&'static str>;
     const TARGET: Self::Column;
     const HEADERS: Self::Column;
     const ADDRESSED_PEER: Self::Column;
@@ -37,16 +35,12 @@ fn decode(what: &str, error: impl std::fmt::Display) -> StoreError {
 }
 
 impl EventTable for event::Entity {
-    fn kinds(kinds: &std::collections::BTreeSet<airc_core::TranscriptKind>) -> Vec<&'static str> {
-        kinds.iter().map(|kind| kind.as_wire_str()).collect()
-    }
     type Headers = event_header::Entity;
     const CLASS: event::Column = event::Column::Class;
     const CLASS_FAMILY: event::Column = event::Column::ClassFamily;
     const EVENT_ID: event::Column = event::Column::EventId;
     const CLIENT_ID: event::Column = event::Column::ClientId;
     const PEER_ID: event::Column = event::Column::PeerId;
-    const KIND: event::Column = event::Column::Kind;
     const TARGET: event::Column = event::Column::Target;
     const HEADERS: event::Column = event::Column::Headers;
     const ADDRESSED_PEER: event::Column = event::Column::AddressedPeer;
@@ -63,21 +57,12 @@ impl EventTable for event::Entity {
 }
 
 impl EventTable for bus_event::Entity {
-    fn kinds(kinds: &std::collections::BTreeSet<airc_core::TranscriptKind>) -> Vec<&'static str> {
-        airc_bus::Kind::ALL
-            .iter()
-            .copied()
-            .filter(|kind| kinds.contains(&kind.transcript_kind()))
-            .map(crate::bus_sink::kind_to_text)
-            .collect()
-    }
     type Headers = bus_event_header::Entity;
     const CLASS: bus_event::Column = bus_event::Column::Class;
     const CLASS_FAMILY: bus_event::Column = bus_event::Column::ClassFamily;
     const EVENT_ID: bus_event::Column = bus_event::Column::EventId;
     const CLIENT_ID: bus_event::Column = bus_event::Column::ClientId;
     const PEER_ID: bus_event::Column = bus_event::Column::PeerId;
-    const KIND: bus_event::Column = bus_event::Column::Kind;
     const TARGET: bus_event::Column = bus_event::Column::Target;
     const HEADERS: bus_event::Column = bus_event::Column::Headers;
     const ADDRESSED_PEER: bus_event::Column = bus_event::Column::AddressedPeer;

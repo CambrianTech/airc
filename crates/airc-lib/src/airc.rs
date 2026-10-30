@@ -1142,7 +1142,7 @@ impl Airc {
         let body_json = serde_json::to_value(&event)
             .map_err(|e| AircError::Crypto(format!("doctrine event serialize: {e}")))?;
         self.emit_lifecycle(
-            airc_core::TranscriptKind::DoctrinePublished,
+            airc_core::LifecycleKind::DoctrinePublished,
             room.channel,
             airc_core::Body::Json(body_json),
         )
@@ -1219,7 +1219,7 @@ impl Airc {
         let body_json = serde_json::to_value(&event)
             .map_err(|e| AircError::Crypto(format!("channel purpose event serialize: {e}")))?;
         self.emit_lifecycle(
-            airc_core::TranscriptKind::ChannelPurposePublished,
+            airc_core::LifecycleKind::ChannelPurposePublished,
             room.channel,
             airc_core::Body::Json(body_json),
         )
@@ -1297,7 +1297,9 @@ impl Airc {
         if self.is_daemon_attached() {
             self.daemon_publish(
                 room,
-                airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle),
+                airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle(
+                    airc_core::LifecycleKind::WallPostPublished,
+                )),
                 body,
                 airc_core::headers::Headers::new(),
                 // A wall post is history: durable, unchanged by the
@@ -1308,7 +1310,7 @@ impl Airc {
             .await?;
         } else {
             self.emit_lifecycle(
-                airc_core::TranscriptKind::WallPostPublished,
+                airc_core::LifecycleKind::WallPostPublished,
                 room.channel,
                 body,
             )
@@ -1366,25 +1368,15 @@ impl Airc {
         // The wall is a cached projection of the room's transcript, resumed
         // strictly after its snapshot cursor exactly like the work board
         // (2026-09-06: a from-zero walk cost 27–128 s per read on the fleet
-        // and every citizen tick paid a 30 s deadline to it). Discriminate on
-        // each event's self-describing body, NOT its transcript `kind` — see
-        // [`wall_post_from_event`] for why the kind is unreliable on the
-        // daemon-attached read path.
+        // and every citizen tick paid a 30 s deadline to it). The signed
+        // lifecycle subtype selects the wall decoder on every transport path.
         let wall = self
             .project_room_with_cache(
                 room,
                 WALL_PROJECTION_PAGE_SIZE,
-                |events| {
-                    Ok(WallProjection(
-                        events
-                            .into_iter()
-                            .filter_map(wall_post_from_event)
-                            .collect(),
-                    ))
-                },
+                |events| Ok(WallProjection(wall_posts_from_events(events)?)),
                 |wall, events| {
-                    wall.0
-                        .extend(events.into_iter().filter_map(wall_post_from_event));
+                    wall.0.extend(wall_posts_from_events(events)?);
                     Ok(())
                 },
             )
@@ -2050,7 +2042,7 @@ impl Airc {
         })
         .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?;
         let body = airc_core::Body::Json(body_json);
-        self.emit_lifecycle(airc_core::TranscriptKind::RoomJoined, room.channel, body)
+        self.emit_lifecycle(airc_core::LifecycleKind::RoomJoined, room.channel, body)
             .await?;
 
         // Publish this peer's identity card to the new room so peers
@@ -2094,7 +2086,7 @@ impl Airc {
         let body_json = serde_json::to_value(&event)
             .map_err(|e| AircError::Crypto(format!("identity event serialize: {e}")))?;
         let body = airc_core::Body::Json(body_json);
-        self.emit_lifecycle(airc_core::TranscriptKind::IdentityPublished, room_id, body)
+        self.emit_lifecycle(airc_core::LifecycleKind::IdentityPublished, room_id, body)
             .await
     }
 
@@ -2284,7 +2276,7 @@ impl Airc {
         })
         .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?;
         self.emit_lifecycle(
-            airc_core::TranscriptKind::RoomParted,
+            airc_core::LifecycleKind::RoomParted,
             room.channel,
             airc_core::Body::Json(body_json),
         )
@@ -2555,18 +2547,6 @@ mod trust_tier_wire_str {
     }
 }
 
-/// Pure discriminator: recover the `WallPostPublished` carried by a
-/// transcript event's self-describing body, or `None` if the event is
-/// not a wall post.
-///
-/// Deliberately ignores `event.kind`. A daemon-attached client pages
-/// events back through the owner-core, where `project()` flattens every
-/// non-`Message` bus kind to `TranscriptKind::System` (the fine kind
-/// rides the wire, not the coarse bus enum) — so a kind gate would drop
-/// every post for attached clients. The body round-trips intact and only
-/// deserializes to this variant for an actual wall post, so it is the
-/// authoritative identity; doctrine / identity / chat bodies fall through
-/// to `None` (heterogeneous-stream projection, not error-swallowing).
 /// Self-healing join — receive-binding re-derive on identity heal: be
 /// LOUD about every subscription whose stored room UUID was re-bound to
 /// the current derivation of its stored name. A silent rebind would hide
@@ -2609,14 +2589,39 @@ impl crate::work_board_cache::CachedProjection for WallProjection {
 
 fn wall_post_from_event(
     event: airc_core::TranscriptEvent,
-) -> Option<airc_core::doctrine::WallPostPublished> {
-    let airc_core::Body::Json(value) = event.body? else {
-        return None;
-    };
-    match serde_json::from_value::<airc_core::doctrine::DoctrineEvent>(value) {
-        Ok(airc_core::doctrine::DoctrineEvent::WallPostPublished(post)) => Some(post),
-        _ => None,
+) -> Result<Option<airc_core::doctrine::WallPostPublished>, AircError> {
+    if event.class
+        != airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle(
+            airc_core::LifecycleKind::WallPostPublished,
+        ))
+    {
+        return Ok(None);
     }
+    let Some(airc_core::Body::Json(value)) = event.body else {
+        return Err(AircError::Crypto(
+            "wall post requires a JSON payload".into(),
+        ));
+    };
+    match serde_json::from_value::<airc_core::doctrine::DoctrineEvent>(value)
+        .map_err(|error| AircError::Crypto(format!("invalid wall post: {error}")))?
+    {
+        airc_core::doctrine::DoctrineEvent::WallPostPublished(post) => Ok(Some(post)),
+        _ => Err(AircError::Crypto(
+            "wall post class conflicts with payload type".into(),
+        )),
+    }
+}
+
+fn wall_posts_from_events(
+    events: Vec<airc_core::TranscriptEvent>,
+) -> Result<Vec<airc_core::doctrine::WallPostPublished>, AircError> {
+    let mut posts = Vec::new();
+    for event in events {
+        if let Some(post) = wall_post_from_event(event)? {
+            posts.push(post);
+        }
+    }
+    Ok(posts)
 }
 
 /// Pure, sync, no IO — the IO half is `Airc::wall_posts`, which
@@ -2830,18 +2835,22 @@ mod wall_projection_tests {
         assert_eq!(result.len(), 1, "post survives despite unknown parent");
     }
 
-    // --- wall_post_from_event: the body-is-authoritative discriminator ---
+    // Wall projection admits only the signed lifecycle subtype.
 
     use super::wall_post_from_event;
     use airc_core::doctrine::{DoctrineEvent, RoomDoctrinePublished};
     use airc_core::{Body, ClientId, EventId, MentionTarget, TranscriptEvent, TranscriptKind};
 
-    /// Build a transcript event carrying `body` under the given coarse
-    /// `kind` — mirrors what the daemon read path produces after
-    /// `project()` (which flattens non-`Message` kinds to `System`).
+    /// Construct explicitly classified wall or correspondence fixtures.
     fn event_with(kind: TranscriptKind, body: Option<Body>) -> TranscriptEvent {
         TranscriptEvent {
-            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
+            class: if kind == TranscriptKind::WallPostPublished {
+                airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle(
+                    airc_core::LifecycleKind::WallPostPublished,
+                ))
+            } else {
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message)
+            },
             event_id: EventId::from_u128(7),
             room_id: RoomId::from_u128(1),
             peer_id: PeerId::from_u128(99),
@@ -2858,19 +2867,17 @@ mod wall_projection_tests {
         }
     }
 
-    // what this catches: the split-brain READ bug — a daemon-attached
-    // client pages a wall post back with kind flattened to `System`
-    // (the fine kind rode the wire, not the bus enum). If the
-    // discriminator gated on `kind == WallPostPublished` it would drop
-    // every post and the `[room-board]` grounding would be empty. The
-    // self-describing body must still recover it.
     #[test]
-    fn wall_post_recovered_even_when_kind_flattened_to_system() {
+    fn wall_post_requires_explicit_classification() {
         let wall =
             DoctrineEvent::WallPostPublished(post(1, "rules", "use rust-rewrite", None, 100));
         let body = Body::Json(serde_json::to_value(&wall).expect("serialize wall post"));
-        let event = event_with(TranscriptKind::System, Some(body));
-        let recovered = wall_post_from_event(event).expect("wall post recovered from System event");
+        let event = event_with(TranscriptKind::System, Some(body.clone()));
+        assert!(wall_post_from_event(event).expect("not admitted").is_none());
+        let event = event_with(TranscriptKind::WallPostPublished, Some(body));
+        let recovered = wall_post_from_event(event)
+            .expect("valid wall")
+            .expect("admitted wall");
         assert_eq!(recovered.body, "use rust-rewrite");
         assert_eq!(recovered.category, "rules");
     }
@@ -2888,8 +2895,8 @@ mod wall_projection_tests {
             published_at_ms: 100,
         });
         let body = Body::Json(serde_json::to_value(&doctrine).expect("serialize doctrine"));
-        let event = event_with(TranscriptKind::System, Some(body));
-        assert!(wall_post_from_event(event).is_none());
+        let event = event_with(TranscriptKind::WallPostPublished, Some(body));
+        assert!(wall_post_from_event(event).is_err());
     }
 
     // what this catches: a plain chat message (text body, no JSON) must
@@ -2897,9 +2904,16 @@ mod wall_projection_tests {
     #[test]
     fn non_json_body_falls_through() {
         let event = event_with(TranscriptKind::Message, Some(Body::text("hello room")));
-        assert!(wall_post_from_event(event).is_none());
+        assert!(wall_post_from_event(event)
+            .expect("ordinary event")
+            .is_none());
         // And a body-less event (e.g. a receipt) is None, not a panic.
-        assert!(wall_post_from_event(event_with(TranscriptKind::System, None)).is_none());
+        assert!(
+            wall_post_from_event(event_with(TranscriptKind::System, None))
+                .expect("ordinary event")
+                .is_none()
+        );
+        assert!(wall_post_from_event(event_with(TranscriptKind::WallPostPublished, None)).is_err());
     }
 }
 

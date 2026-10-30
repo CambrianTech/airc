@@ -452,23 +452,11 @@ fn decode_empty_buffer_is_typed_error() {
 
 #[test]
 fn typed_semantics_roundtrip_with_opaque_bytes() {
-    use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
-    let classes = [
-        EventClass::Correspondence(CorrespondenceKind::Message),
-        EventClass::Correspondence(CorrespondenceKind::Announcement),
-        EventClass::Activity(ActivityKind::Intent),
-        EventClass::Activity(ActivityKind::WorkReceipt),
-        EventClass::Activity(ActivityKind::WorkState),
-        EventClass::Activity(ActivityKind::Presence),
-        EventClass::Control(ControlKind::Command),
-        EventClass::Control(ControlKind::CommandResult),
-        EventClass::Control(ControlKind::Session),
-        EventClass::Control(ControlKind::Receipt),
-        EventClass::Control(ControlKind::Signal),
-        EventClass::Control(ControlKind::Stream),
-        EventClass::Control(ControlKind::Lifecycle),
-    ];
-    for class in classes {
+    use airc_core::{ControlKind, EventClass};
+    for class in EventClass::ALL
+        .into_iter()
+        .filter(|class| *class != EventClass::Control(ControlKind::Addressed))
+    {
         let mut env = full_envelope(
             Kind::for_class(class).expect("supported class"),
             DeliveryClass::Durable,

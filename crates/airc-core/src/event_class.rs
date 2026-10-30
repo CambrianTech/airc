@@ -24,6 +24,37 @@ pub enum EventFamily {
 }
 
 impl EventClass {
+    pub const ALL: [Self; 26] = [
+        Self::Correspondence(CorrespondenceKind::Message),
+        Self::Correspondence(CorrespondenceKind::Announcement),
+        Self::Activity(ActivityKind::Intent),
+        Self::Activity(ActivityKind::WorkReceipt),
+        Self::Activity(ActivityKind::WorkState),
+        Self::Activity(ActivityKind::Presence),
+        Self::Activity(ActivityKind::WorkPresence),
+        Self::Activity(ActivityKind::Coordination),
+        Self::Control(ControlKind::Command),
+        Self::Control(ControlKind::CommandResult),
+        Self::Control(ControlKind::Session),
+        Self::Control(ControlKind::Receipt),
+        Self::Control(ControlKind::Addressed),
+        Self::Control(ControlKind::Signal),
+        Self::Control(ControlKind::Stream),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::PeerArrived)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::PeerDeparted)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::WireEstablished)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::WireLost)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::RoomJoined)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::RoomParted)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::SubscriptionAdvanced)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::IdentityPublished)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::DoctrinePublished)),
+        Self::Control(ControlKind::Lifecycle(LifecycleKind::WallPostPublished)),
+        Self::Control(ControlKind::Lifecycle(
+            LifecycleKind::ChannelPurposePublished,
+        )),
+    ];
+
     /// Canonical transcript category; admission independently refuses addressed traffic.
     pub const fn transcript_kind(self) -> crate::TranscriptKind {
         use crate::TranscriptKind;
@@ -32,6 +63,7 @@ impl EventClass {
             Self::Activity(_) => TranscriptKind::System,
             Self::Control(ControlKind::Command) => TranscriptKind::Command,
             Self::Control(ControlKind::CommandResult) => TranscriptKind::CommandResult,
+            Self::Control(ControlKind::Lifecycle(kind)) => kind.transcript_kind(),
             Self::Control(_) => TranscriptKind::SessionControl,
         }
     }
@@ -58,11 +90,13 @@ pub enum ActivityKind {
     Intent,
     WorkReceipt,
     WorkState,
+    WorkPresence,
+    Coordination,
     Presence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum ControlKind {
     Command,
     CommandResult,
@@ -71,7 +105,55 @@ pub enum ControlKind {
     Addressed,
     Signal,
     Stream,
-    Lifecycle,
+    Lifecycle(LifecycleKind),
+}
+
+/// Substrate lifecycle semantics, carried in authenticated metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleKind {
+    PeerArrived,
+    PeerDeparted,
+    WireEstablished,
+    WireLost,
+    RoomJoined,
+    RoomParted,
+    SubscriptionAdvanced,
+    IdentityPublished,
+    DoctrinePublished,
+    WallPostPublished,
+    ChannelPurposePublished,
+}
+
+impl LifecycleKind {
+    pub const ALL: [Self; 11] = [
+        Self::PeerArrived,
+        Self::PeerDeparted,
+        Self::WireEstablished,
+        Self::WireLost,
+        Self::RoomJoined,
+        Self::RoomParted,
+        Self::SubscriptionAdvanced,
+        Self::IdentityPublished,
+        Self::DoctrinePublished,
+        Self::WallPostPublished,
+        Self::ChannelPurposePublished,
+    ];
+    pub const fn transcript_kind(self) -> crate::TranscriptKind {
+        match self {
+            Self::PeerArrived => crate::TranscriptKind::PeerArrived,
+            Self::PeerDeparted => crate::TranscriptKind::PeerDeparted,
+            Self::WireEstablished => crate::TranscriptKind::WireEstablished,
+            Self::WireLost => crate::TranscriptKind::WireLost,
+            Self::RoomJoined => crate::TranscriptKind::RoomJoined,
+            Self::RoomParted => crate::TranscriptKind::RoomParted,
+            Self::SubscriptionAdvanced => crate::TranscriptKind::SubscriptionAdvanced,
+            Self::IdentityPublished => crate::TranscriptKind::IdentityPublished,
+            Self::DoctrinePublished => crate::TranscriptKind::DoctrinePublished,
+            Self::WallPostPublished => crate::TranscriptKind::WallPostPublished,
+            Self::ChannelPurposePublished => crate::TranscriptKind::ChannelPurposePublished,
+        }
+    }
 }
 
 /// A subscription can request a whole family or one exact semantic variant.
@@ -115,13 +197,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lifecycle_metadata_roundtrips_without_losing_subtype() {
+        for lifecycle in LifecycleKind::ALL {
+            let class = EventClass::Control(ControlKind::Lifecycle(lifecycle));
+            assert_eq!(class.transcript_kind(), lifecycle.transcript_kind());
+            let encoded = serde_json::to_string(&class).expect("class");
+            assert_eq!(
+                serde_json::from_str::<EventClass>(&encoded).expect("class decode"),
+                class
+            );
+        }
+        assert!(serde_json::from_str::<EventClass>(
+            r#"{"family":"control","kind":{"kind":"lifecycle"}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn control_transcript_projection_is_shared_across_transports() {
         for control in [
             ControlKind::Session,
             ControlKind::Receipt,
             ControlKind::Signal,
             ControlKind::Stream,
-            ControlKind::Lifecycle,
         ] {
             assert_eq!(
                 EventClass::Control(control).transcript_kind(),

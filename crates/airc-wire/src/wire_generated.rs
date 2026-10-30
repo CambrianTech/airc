@@ -477,34 +477,70 @@ mod root {
                 /// The variant `ActivityPresence` in the enum `EventClass`
                 ActivityPresence = 6,
 
+                /// The variant `ActivityWorkPresence` in the enum `EventClass`
+                ActivityWorkPresence = 7,
+
+                /// The variant `ActivityCoordination` in the enum `EventClass`
+                ActivityCoordination = 8,
+
                 /// The variant `ControlCommand` in the enum `EventClass`
-                ControlCommand = 7,
+                ControlCommand = 9,
 
                 /// The variant `ControlCommandResult` in the enum `EventClass`
-                ControlCommandResult = 8,
+                ControlCommandResult = 10,
 
                 /// The variant `ControlSession` in the enum `EventClass`
-                ControlSession = 9,
+                ControlSession = 11,
 
                 /// The variant `ControlReceipt` in the enum `EventClass`
-                ControlReceipt = 10,
+                ControlReceipt = 12,
 
                 /// The variant `ControlAddressed` in the enum `EventClass`
-                ControlAddressed = 11,
+                ControlAddressed = 13,
 
                 /// The variant `ControlSignal` in the enum `EventClass`
-                ControlSignal = 12,
+                ControlSignal = 14,
 
                 /// The variant `ControlStream` in the enum `EventClass`
-                ControlStream = 13,
+                ControlStream = 15,
 
-                /// The variant `ControlLifecycle` in the enum `EventClass`
-                ControlLifecycle = 14,
+                /// The variant `LifecyclePeerArrived` in the enum `EventClass`
+                LifecyclePeerArrived = 16,
+
+                /// The variant `LifecyclePeerDeparted` in the enum `EventClass`
+                LifecyclePeerDeparted = 17,
+
+                /// The variant `LifecycleWireEstablished` in the enum `EventClass`
+                LifecycleWireEstablished = 18,
+
+                /// The variant `LifecycleWireLost` in the enum `EventClass`
+                LifecycleWireLost = 19,
+
+                /// The variant `LifecycleRoomJoined` in the enum `EventClass`
+                LifecycleRoomJoined = 20,
+
+                /// The variant `LifecycleRoomParted` in the enum `EventClass`
+                LifecycleRoomParted = 21,
+
+                /// The variant `LifecycleSubscriptionAdvanced` in the enum `EventClass`
+                LifecycleSubscriptionAdvanced = 22,
+
+                /// The variant `LifecycleIdentityPublished` in the enum `EventClass`
+                LifecycleIdentityPublished = 23,
+
+                /// The variant `LifecycleDoctrinePublished` in the enum `EventClass`
+                LifecycleDoctrinePublished = 24,
+
+                /// The variant `LifecycleWallPostPublished` in the enum `EventClass`
+                LifecycleWallPostPublished = 25,
+
+                /// The variant `LifecycleChannelPurposePublished` in the enum `EventClass`
+                LifecycleChannelPurposePublished = 26,
             }
 
             impl EventClass {
                 /// Array containing all valid variants of EventClass
-                pub const ENUM_VALUES: [Self; 15] = [
+                pub const ENUM_VALUES: [Self; 27] = [
                     Self::Unspecified,
                     Self::CorrespondenceMessage,
                     Self::CorrespondenceAnnouncement,
@@ -512,6 +548,8 @@ mod root {
                     Self::ActivityWorkReceipt,
                     Self::ActivityWorkState,
                     Self::ActivityPresence,
+                    Self::ActivityWorkPresence,
+                    Self::ActivityCoordination,
                     Self::ControlCommand,
                     Self::ControlCommandResult,
                     Self::ControlSession,
@@ -519,7 +557,17 @@ mod root {
                     Self::ControlAddressed,
                     Self::ControlSignal,
                     Self::ControlStream,
-                    Self::ControlLifecycle,
+                    Self::LifecyclePeerArrived,
+                    Self::LifecyclePeerDeparted,
+                    Self::LifecycleWireEstablished,
+                    Self::LifecycleWireLost,
+                    Self::LifecycleRoomJoined,
+                    Self::LifecycleRoomParted,
+                    Self::LifecycleSubscriptionAdvanced,
+                    Self::LifecycleIdentityPublished,
+                    Self::LifecycleDoctrinePublished,
+                    Self::LifecycleWallPostPublished,
+                    Self::LifecycleChannelPurposePublished,
                 ];
             }
 
@@ -539,14 +587,28 @@ mod root {
                         4 => ::core::result::Result::Ok(EventClass::ActivityWorkReceipt),
                         5 => ::core::result::Result::Ok(EventClass::ActivityWorkState),
                         6 => ::core::result::Result::Ok(EventClass::ActivityPresence),
-                        7 => ::core::result::Result::Ok(EventClass::ControlCommand),
-                        8 => ::core::result::Result::Ok(EventClass::ControlCommandResult),
-                        9 => ::core::result::Result::Ok(EventClass::ControlSession),
-                        10 => ::core::result::Result::Ok(EventClass::ControlReceipt),
-                        11 => ::core::result::Result::Ok(EventClass::ControlAddressed),
-                        12 => ::core::result::Result::Ok(EventClass::ControlSignal),
-                        13 => ::core::result::Result::Ok(EventClass::ControlStream),
-                        14 => ::core::result::Result::Ok(EventClass::ControlLifecycle),
+                        7 => ::core::result::Result::Ok(EventClass::ActivityWorkPresence),
+                        8 => ::core::result::Result::Ok(EventClass::ActivityCoordination),
+                        9 => ::core::result::Result::Ok(EventClass::ControlCommand),
+                        10 => ::core::result::Result::Ok(EventClass::ControlCommandResult),
+                        11 => ::core::result::Result::Ok(EventClass::ControlSession),
+                        12 => ::core::result::Result::Ok(EventClass::ControlReceipt),
+                        13 => ::core::result::Result::Ok(EventClass::ControlAddressed),
+                        14 => ::core::result::Result::Ok(EventClass::ControlSignal),
+                        15 => ::core::result::Result::Ok(EventClass::ControlStream),
+                        16 => ::core::result::Result::Ok(EventClass::LifecyclePeerArrived),
+                        17 => ::core::result::Result::Ok(EventClass::LifecyclePeerDeparted),
+                        18 => ::core::result::Result::Ok(EventClass::LifecycleWireEstablished),
+                        19 => ::core::result::Result::Ok(EventClass::LifecycleWireLost),
+                        20 => ::core::result::Result::Ok(EventClass::LifecycleRoomJoined),
+                        21 => ::core::result::Result::Ok(EventClass::LifecycleRoomParted),
+                        22 => ::core::result::Result::Ok(EventClass::LifecycleSubscriptionAdvanced),
+                        23 => ::core::result::Result::Ok(EventClass::LifecycleIdentityPublished),
+                        24 => ::core::result::Result::Ok(EventClass::LifecycleDoctrinePublished),
+                        25 => ::core::result::Result::Ok(EventClass::LifecycleWallPostPublished),
+                        26 => {
+                            ::core::result::Result::Ok(EventClass::LifecycleChannelPurposePublished)
+                        }
 
                         _ => ::core::result::Result::Err(::planus::errors::UnknownEnumTagKind {
                             tag: value as i128,
@@ -684,7 +746,7 @@ mod root {
             /// The enum `DeliveryClass` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Enum `DeliveryClass` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:61`
+            /// * Enum `DeliveryClass` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:73`
             #[derive(
                 Copy,
                 Clone,
@@ -877,7 +939,7 @@ mod root {
             /// The enum `TargetTag` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Enum `TargetTag` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:73`
+            /// * Enum `TargetTag` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:85`
             #[derive(
                 Copy,
                 Clone,
@@ -1070,7 +1132,7 @@ mod root {
             /// The table `Header` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Table `Header` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:84`
+            /// * Table `Header` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:96`
             #[derive(
                 Clone,
                 Debug,
@@ -1391,7 +1453,7 @@ mod root {
             /// The table `Envelope` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Table `Envelope` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:92`
+            /// * Table `Envelope` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:104`
             #[derive(
                 Clone,
                 Debug,

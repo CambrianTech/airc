@@ -597,6 +597,7 @@ impl Airc {
             });
         };
         let rule = airc_core::HistoryMatch {
+            sender: filter.sender,
             selection: filter.selection.clone(),
             headers: &filter.headers_filter,
             addressed_to: None,

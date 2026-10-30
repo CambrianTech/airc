@@ -676,6 +676,7 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
     let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
     let through = rows[rows.len() - 1].cursor();
     let rule = airc_core::HistoryMatch {
+        sender: None,
         kinds: &std::collections::BTreeSet::new(),
         self_echo: None,
         selection: airc_core::EventSelection::All,
@@ -728,6 +729,7 @@ async fn typed_bus_history_selects_before_limit_without_decoding_payload() {
     }
     let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
     let rule = HistoryMatch {
+        sender: None,
         kinds: &std::collections::BTreeSet::new(),
         self_echo: None,
         selection: EventSelection::Correspondence,
@@ -823,4 +825,50 @@ async fn full_live_filter_is_applied_before_tail_limit() {
         .await
         .expect("delivery")
         .is_empty());
+}
+
+#[tokio::test]
+async fn lifecycle_kind_filter_uses_signed_class_before_limit_and_count() {
+    use airc_core::{
+        ControlKind, EventClass, HeaderFilter, HistoryMatch, LifecycleKind, TranscriptKind,
+    };
+    let sink = SqliteDurableSink::in_memory().await.expect("sink");
+    let channel = RoomId::new();
+    let mut wall = durable_at(channel, 1, 1);
+    wall.kind = Kind::Control;
+    wall.class = EventClass::Control(ControlKind::Lifecycle(LifecycleKind::WallPostPublished));
+    let mut other = durable_at(channel, 1, 2);
+    other.kind = Kind::Control;
+    other.class = EventClass::Control(ControlKind::Lifecycle(LifecycleKind::PeerArrived));
+    sink.append_batch(&[&wall, &other]).await.expect("rows");
+    let kinds = [TranscriptKind::WallPostPublished].into_iter().collect();
+    let mut rule = HistoryMatch::headers(&HeaderFilter::Any);
+    rule.kinds = &kinds;
+    let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+    let rows = sink
+        .page_matching(channel, origin, other.cursor(), rule.clone(), 1, true)
+        .await
+        .expect("page");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_id, wall.event_id);
+    assert_eq!(
+        sink.count_matching(channel, origin, other.cursor(), rule.clone(), None)
+            .await
+            .expect("count")
+            .count,
+        1
+    );
+    rule.sender = Some(airc_core::PeerId::new());
+    assert!(sink
+        .page_matching(channel, origin, other.cursor(), rule.clone(), 1, true)
+        .await
+        .expect("sender page")
+        .is_empty());
+    assert_eq!(
+        sink.count_matching(channel, origin, other.cursor(), rule, None)
+            .await
+            .expect("sender count")
+            .count,
+        0
+    );
 }

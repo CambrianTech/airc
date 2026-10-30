@@ -64,6 +64,7 @@ pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use datetime::{iso_to_epoch, DateTimeError};
 pub use event_class::{
     ActivityKind, ControlKind, CorrespondenceKind, EventClass, EventFamily, EventSelection,
+    LifecycleKind,
 };
 pub use filter::{filter_self_echoes, RuntimeSelf, SelfFilter};
 pub use headers::{HeaderFilter, Headers};

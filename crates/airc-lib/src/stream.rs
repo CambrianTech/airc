@@ -128,6 +128,7 @@ impl std::error::Error for LiveLag {}
 /// have crossed into the durable store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
+    pub sender: Option<PeerId>,
     pub selection: airc_core::EventSelection,
     pub channel: Option<RoomId>,
     pub channels: HashSet<RoomId>,
@@ -157,6 +158,7 @@ pub struct SelfEcho {
 impl Default for EventFilter {
     fn default() -> Self {
         Self {
+            sender: None,
             selection: airc_core::EventSelection::All,
             channel: None,
             channels: HashSet::new(),
@@ -192,6 +194,9 @@ impl EventFilter {
     }
 
     pub fn matches(&self, event: &TranscriptEvent) -> bool {
+        if self.sender.is_some_and(|peer| peer != event.peer_id) {
+            return false;
+        }
         if !self.selection.matches(event.class) {
             return false;
         }
@@ -203,7 +208,7 @@ impl EventFilter {
         if !self.channels.is_empty() && !self.channels.contains(&event.room_id) {
             return false;
         }
-        if !self.kinds.is_empty() && !self.kinds.contains(&event.kind) {
+        if !self.kinds.is_empty() && !self.kinds.contains(&event.class.transcript_kind()) {
             return false;
         }
         if let Some(se) = self.self_echo {

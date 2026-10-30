@@ -95,6 +95,7 @@ async fn addressee_scan_selects_candidates_by_indexed_columns() {
         event_id: EventId::from_u128(u128::MAX),
     };
     let rule = airc_core::HistoryMatch {
+        sender: None,
         kinds: &std::collections::BTreeSet::new(),
         self_echo: None,
         selection: airc_core::EventSelection::All,
@@ -134,6 +135,7 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         event_id: EventId::from_u128(u128::MAX),
     };
     let rule = airc_core::HistoryMatch {
+        sender: None,
         kinds: &std::collections::BTreeSet::new(),
         self_echo: None,
         selection: airc_core::EventSelection::All,
@@ -720,6 +722,7 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
         .expect("cursor")
         .expect("events");
     let rule = HistoryMatch {
+        sender: None,
         kinds: &std::collections::BTreeSet::new(),
         self_echo: None,
         selection: EventSelection::Correspondence,
@@ -740,6 +743,7 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
         1
     );
     let exact = HistoryMatch {
+        sender: None,
         kinds: &std::collections::BTreeSet::new(),
         self_echo: None,
         selection: EventSelection::Exact(EventClass::Activity(ActivityKind::WorkReceipt)),
@@ -754,6 +758,7 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
         98
     );
     let union = HistoryMatch {
+        sender: None,
         selection: EventSelection::AnyOf(vec![
             EventSelection::Correspondence,
             EventSelection::AnyOf(vec![EventSelection::Exact(EventClass::Activity(
@@ -779,6 +784,7 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
         2
     );
     let empty = HistoryMatch {
+        sender: None,
         selection: EventSelection::AnyOf(vec![]),
         ..rule
     };
@@ -842,6 +848,7 @@ async fn kind_and_self_echo_share_the_bounded_history_contract() {
     }
     let mut system = make_event(50, room, "system");
     system.kind = TranscriptKind::System;
+    system.class = airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState);
     store.append(system).await.expect("system");
     let origin = TranscriptCursor {
         lamport: 0,
@@ -854,6 +861,7 @@ async fn kind_and_self_echo_share_the_bounded_history_contract() {
         .expect("events");
     let kinds = [TranscriptKind::Message].into_iter().collect();
     let rule = HistoryMatch {
+        sender: None,
         kinds: &kinds,
         self_echo: Some((remote.peer_id, my_client, SelfFilter::ExcludeSameClient)),
         selection: EventSelection::All,
@@ -873,4 +881,52 @@ async fn kind_and_self_echo_share_the_bounded_history_contract() {
             .count,
         1
     );
+}
+
+#[tokio::test]
+async fn sender_is_selected_before_limit_and_count_in_both_store_implementations() {
+    use crate::{CountHistory, InMemoryEventStore};
+    use airc_core::{HeaderFilter, HistoryMatch};
+    let sql = SqliteEventStore::in_memory().await.expect("store");
+    let memory = InMemoryEventStore::new();
+    let room = RoomId::new();
+    let wanted = make_event(1, room, "wanted");
+    sql.append(wanted.clone()).await.expect("SQL append");
+    memory.append(wanted.clone()).await.expect("memory append");
+    for n in 2..80 {
+        let mut other = make_event(n, room, "same class different sender");
+        other.peer_id = PeerId::from_u128(0xbb);
+        sql.append(other.clone()).await.expect("SQL append");
+        memory.append(other).await.expect("memory append");
+    }
+    let origin = TranscriptCursor {
+        lamport: 0,
+        event_id: EventId::from_u128(0),
+    };
+    let through = sql
+        .latest_cursor(Some(room))
+        .await
+        .expect("cursor")
+        .expect("events");
+    let rule = HistoryMatch {
+        sender: Some(wanted.peer_id),
+        ..HistoryMatch::headers(&HeaderFilter::Any)
+    };
+    for store in [&sql as &dyn EventStore, &memory as &dyn EventStore] {
+        let page = store
+            .matching_history(&origin, &through, &[room], rule.clone(), 1, true)
+            .await
+            .expect("page");
+        assert_eq!(page, [wanted.clone()]);
+    }
+    for store in [&sql as &dyn CountHistory, &memory as &dyn CountHistory] {
+        assert_eq!(
+            store
+                .count_history(&origin, &through, &[room], rule.clone(), None)
+                .await
+                .expect("count")
+                .count,
+            1
+        );
+    }
 }

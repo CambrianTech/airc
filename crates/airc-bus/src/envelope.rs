@@ -103,20 +103,6 @@ impl Kind {
         Self::Control,
     ];
 
-    pub const fn transcript_kind(self) -> airc_core::TranscriptKind {
-        use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
-        let class = match self {
-            Self::Message => EventClass::Correspondence(CorrespondenceKind::Message),
-            Self::Event => EventClass::Activity(ActivityKind::Intent),
-            Self::Command => EventClass::Control(ControlKind::Command),
-            Self::CommandResult => EventClass::Control(ControlKind::CommandResult),
-            Self::Signal => EventClass::Control(ControlKind::Signal),
-            Self::StreamChunk => EventClass::Control(ControlKind::Stream),
-            Self::Control => EventClass::Control(ControlKind::Session),
-        };
-        class.transcript_kind()
-    }
-
     /// The only bus projection of producer semantics. Addressed crypto traffic
     /// has a separate owner and cannot enter the ordinary event bus.
     pub fn for_class(class: EventClass) -> crate::Result<Self> {
@@ -132,7 +118,7 @@ impl Kind {
                 return Err(crate::BusError::UnsupportedClass(class))
             }
             EventClass::Control(
-                ControlKind::Session | ControlKind::Receipt | ControlKind::Lifecycle,
+                ControlKind::Session | ControlKind::Receipt | ControlKind::Lifecycle(_),
             ) => Self::Control,
         })
     }

@@ -7,6 +7,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AircError {
+    #[error("work replay: {0}")]
+    WorkReplay(#[from] airc_work::WorkReplayError),
+    #[error("live subscription: {0}")]
+    LiveLag(#[from] crate::stream::LiveLag),
     #[error("identity: {0}")]
     Identity(#[from] airc_identity::IdentityError),
 

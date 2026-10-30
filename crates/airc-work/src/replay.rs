@@ -1,7 +1,6 @@
 //! Replay work-domain events from recorded AIRC transcripts.
 
 use airc_core::{EventId, TranscriptCursor, TranscriptEvent};
-use airc_protocol::HEADER_FORGE_BODY_HINT;
 
 use crate::{decode_work_event, ProjectionError, WorkBoardProjection, WorkEvent};
 
@@ -42,10 +41,7 @@ pub enum WorkReplayError {
 }
 
 pub fn transcript_is_work_event(event: &TranscriptEvent) -> bool {
-    event
-        .headers
-        .get(HEADER_FORGE_BODY_HINT)
-        .is_some_and(|hint| crate::codec::is_work_event_hint(hint))
+    crate::work_event_selection().matches(event.class)
 }
 
 pub fn decode_transcript_work_event(
@@ -58,45 +54,21 @@ pub fn decode_transcript_work_event(
     }
     let mut work_event =
         decode_work_event(&event.headers, event.body.as_ref()).map_err(|source| {
-            // The body discriminator wins over the optional routing hint. A
-            // spoofed hint must not hide corruption in another event family.
-            let body_kind = match event.body.as_ref() {
-                Some(airc_core::Body::Json(value)) => {
-                    value.get("kind").and_then(|kind| kind.as_str())
-                }
-                _ => None,
-            };
-            let kind = body_kind.or_else(|| {
-                event
-                    .headers
-                    .get(crate::HEADER_FORGE_WORK_EVENT_KIND)
-                    .map(String::as_str)
-            });
-            // Nothing under the extension hint may mutate a legacy board. Drop
-            // unsupported/mismatched review packets visibly, exactly as older
-            // readers ignore the extension, while preserving stream progress.
-            if event
-                .headers
-                .get(HEADER_FORGE_BODY_HINT)
-                .is_some_and(|hint| hint == crate::BODY_HINT_FORGE_WORK_REVIEW)
-                || kind == Some("work_submission_reviewed")
-            {
-                WorkReplayError::RejectedReview {
-                    event_id: event.event_id,
-                    source,
-                }
-            } else if kind == Some("work_submitted") {
-                WorkReplayError::RejectedSubmission {
-                    event_id: event.event_id,
-                    source,
-                }
-            } else {
-                WorkReplayError::Codec {
-                    event_id: event.event_id,
-                    source,
-                }
+            WorkReplayError::Codec {
+                event_id: event.event_id,
+                source,
             }
         })?;
+    let expected = crate::work_event_class(&work_event);
+    if event.class != expected {
+        return Err(WorkReplayError::Codec {
+            event_id: event.event_id,
+            source: crate::WorkEventCodecError::ClassMismatch {
+                expected,
+                actual: event.class,
+            },
+        });
+    }
     if let WorkEvent::CardUpdated(update) = &mut work_event {
         if update.claim_selection.as_ref().is_some_and(|choice| {
             choice.owner != event.peer_id || update.updated_by != event.peer_id

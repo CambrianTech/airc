@@ -665,6 +665,7 @@ mod tests;
 /// Predicate-scoped forward scan (or initial tail), bounded by a fixed snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanInboxRequest {
+    pub sender: Option<airc_core::PeerId>,
     pub self_echo: Option<(
         airc_core::PeerId,
         airc_core::ClientId,
@@ -686,6 +687,7 @@ pub struct ScanInboxRequest {
 /// Count the events a [`ScanInboxRequest`] over `(after, through]` would match.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CountInboxRequest {
+    pub sender: Option<airc_core::PeerId>,
     pub self_echo: Option<(
         airc_core::PeerId,
         airc_core::ClientId,

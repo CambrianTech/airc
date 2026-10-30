@@ -74,6 +74,7 @@ impl Airc {
     ) -> Result<EventScan, AircError> {
         let kinds = std::collections::BTreeSet::new();
         let rule = airc_core::HistoryMatch {
+            sender: None,
             selection: agent_event_selection(),
             headers: &HeaderFilter::Any,
             addressed_to,
@@ -113,6 +114,7 @@ impl Airc {
             for channel in channels.iter().copied() {
                 let response = client
                     .scan_inbox(airc_ipc::request::ScanInboxRequest {
+                        sender: rule.sender,
                         channel,
                         after: ipc(after),
                         through: ipc(through),
@@ -193,6 +195,7 @@ impl Airc {
         let predicate = filter.headers_filter;
         let kinds = filter.kinds;
         let rule = airc_core::HistoryMatch {
+            sender: filter.sender,
             selection: filter.selection.clone(),
             headers: &predicate,
             addressed_to: None,
@@ -207,6 +210,7 @@ impl Airc {
             for channel in channels.iter().copied() {
                 let count = client
                     .count_inbox(airc_ipc::request::CountInboxRequest {
+                        sender: rule.sender,
                         channel,
                         after: ipc(after),
                         through: ipc(through),

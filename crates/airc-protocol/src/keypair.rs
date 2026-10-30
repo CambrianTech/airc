@@ -262,6 +262,35 @@ mod tests {
     }
 
     #[test]
+    fn relabelling_lifecycle_subtype_with_same_frame_kind_invalidates_signature() {
+        use airc_core::{ControlKind, EventClass, LifecycleKind};
+        let peer = PeerId::from_u128(0xa1);
+        let keypair = PeerKeypair::generate();
+        let mut envelope = envelope_fixture(peer);
+        envelope.class =
+            EventClass::Control(ControlKind::Lifecycle(LifecycleKind::WallPostPublished));
+        envelope.signature = keypair
+            .sign_envelope(&envelope, peer, 0)
+            .expect("sign wall event");
+        let registry = PeerKeyRegistry::new();
+        registry
+            .enrol(peer, 0, keypair.public_bytes())
+            .expect("enrol signer");
+        let mut frame = Frame {
+            kind: FrameKind::Control,
+            envelope,
+        };
+        assert!(verify(&frame, VerificationPolicy::Strict, &registry).is_ok());
+        frame.envelope.class =
+            EventClass::Control(ControlKind::Lifecycle(LifecycleKind::PeerArrived));
+        assert_eq!(frame.kind, FrameKind::for_class(frame.envelope.class));
+        assert_eq!(
+            verify(&frame, VerificationPolicy::Strict, &registry),
+            Err(VerificationError::BadSignature)
+        );
+    }
+
+    #[test]
     fn tampered_lamport_fails_bad_signature() {
         // Lamport is part of the canonical signed payload — tampering
         // with it must surface as BadSignature. Pins that ordering

@@ -617,6 +617,7 @@ async fn handle_scan_inbox(
             after,
             through,
             airc_core::HistoryMatch {
+                sender: request.sender,
                 selection: request.selection.clone(),
                 kinds: &request.kinds,
                 self_echo: request.self_echo,
@@ -657,6 +658,7 @@ async fn handle_count_inbox(
             after,
             through,
             airc_core::HistoryMatch {
+                sender: request.sender,
                 selection: request.selection.clone(),
                 kinds: &request.kinds,
                 self_echo: request.self_echo,
@@ -761,6 +763,7 @@ mod scan_tests {
         };
         let cap = airc_ipc::codec::MAX_FRAME_BYTES as usize;
         let request = airc_ipc::request::ScanInboxRequest {
+            sender: None,
             selection: airc_core::EventSelection::All,
             kinds: std::collections::BTreeSet::new(),
             self_echo: None,
@@ -820,6 +823,7 @@ mod scan_tests {
             })
             .collect();
         let request = airc_ipc::request::ScanInboxRequest {
+            sender: None,
             selection: airc_core::EventSelection::All,
             kinds: std::collections::BTreeSet::new(),
             self_echo: None,

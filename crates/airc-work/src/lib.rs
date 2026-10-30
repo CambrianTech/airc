@@ -21,12 +21,12 @@ pub mod replay;
 pub use airc_blobs::MediaRef as SubmissionArtifact;
 
 pub use codec::{
-    decode_work_event, encode_work_event, work_event_headers, work_event_subscription,
-    WorkEventCodecError, BODY_HINT_FORGE_WORK_EVENT, BODY_HINT_FORGE_WORK_REVIEW,
-    HEADER_FORGE_WORK_CARD_ID, HEADER_FORGE_WORK_CLAIM_ID, HEADER_FORGE_WORK_EVENT_KIND,
-    HEADER_FORGE_WORK_GIT_BRANCH, HEADER_FORGE_WORK_GIT_COMMIT, HEADER_FORGE_WORK_GOAL_ID,
-    HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID, HEADER_FORGE_WORK_PR_NUMBER,
-    HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_WORKSPACE_ID,
+    decode_work_event, encode_work_event, work_event_class, work_event_headers,
+    work_event_selection, work_event_subscription, WorkEventCodecError, BODY_HINT_FORGE_WORK_EVENT,
+    BODY_HINT_FORGE_WORK_REVIEW, HEADER_FORGE_WORK_CARD_ID, HEADER_FORGE_WORK_CLAIM_ID,
+    HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_GIT_BRANCH, HEADER_FORGE_WORK_GIT_COMMIT,
+    HEADER_FORGE_WORK_GOAL_ID, HEADER_FORGE_WORK_LANE_ID, HEADER_FORGE_WORK_POLICY_RULE_ID,
+    HEADER_FORGE_WORK_PR_NUMBER, HEADER_FORGE_WORK_REPO, HEADER_FORGE_WORK_WORKSPACE_ID,
 };
 pub use drain_policy::{
     evaluate as evaluate_drain_policy, AdmitReason, DrainDecision, GitStatusSummary, PolicyConfig,

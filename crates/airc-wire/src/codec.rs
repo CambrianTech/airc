@@ -92,6 +92,9 @@ fn class_to_fb(class: EventClass) -> fb::EventClass {
         EventClass::Activity(ActivityKind::WorkReceipt) => fb::EventClass::ActivityWorkReceipt,
         EventClass::Activity(ActivityKind::WorkState) => fb::EventClass::ActivityWorkState,
         EventClass::Activity(ActivityKind::Presence) => fb::EventClass::ActivityPresence,
+        EventClass::Activity(ActivityKind::WorkPresence) => fb::EventClass::ActivityWorkPresence,
+        EventClass::Activity(ActivityKind::Coordination) => fb::EventClass::ActivityCoordination,
+
         EventClass::Control(ControlKind::Command) => fb::EventClass::ControlCommand,
         EventClass::Control(ControlKind::CommandResult) => fb::EventClass::ControlCommandResult,
         EventClass::Control(ControlKind::Session) => fb::EventClass::ControlSession,
@@ -99,7 +102,39 @@ fn class_to_fb(class: EventClass) -> fb::EventClass {
         EventClass::Control(ControlKind::Addressed) => fb::EventClass::ControlAddressed,
         EventClass::Control(ControlKind::Signal) => fb::EventClass::ControlSignal,
         EventClass::Control(ControlKind::Stream) => fb::EventClass::ControlStream,
-        EventClass::Control(ControlKind::Lifecycle) => fb::EventClass::ControlLifecycle,
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::PeerArrived)) => {
+            fb::EventClass::LifecyclePeerArrived
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::PeerDeparted)) => {
+            fb::EventClass::LifecyclePeerDeparted
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::WireEstablished)) => {
+            fb::EventClass::LifecycleWireEstablished
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::WireLost)) => {
+            fb::EventClass::LifecycleWireLost
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomJoined)) => {
+            fb::EventClass::LifecycleRoomJoined
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomParted)) => {
+            fb::EventClass::LifecycleRoomParted
+        }
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::SubscriptionAdvanced,
+        )) => fb::EventClass::LifecycleSubscriptionAdvanced,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::IdentityPublished,
+        )) => fb::EventClass::LifecycleIdentityPublished,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::DoctrinePublished,
+        )) => fb::EventClass::LifecycleDoctrinePublished,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::WallPostPublished,
+        )) => fb::EventClass::LifecycleWallPostPublished,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::ChannelPurposePublished,
+        )) => fb::EventClass::LifecycleChannelPurposePublished,
     }
 }
 
@@ -116,6 +151,13 @@ fn class_from_fb(class: fb::EventClass) -> Result<EventClass, WireError> {
         fb::EventClass::ActivityWorkReceipt => Ok(EventClass::Activity(ActivityKind::WorkReceipt)),
         fb::EventClass::ActivityWorkState => Ok(EventClass::Activity(ActivityKind::WorkState)),
         fb::EventClass::ActivityPresence => Ok(EventClass::Activity(ActivityKind::Presence)),
+        fb::EventClass::ActivityWorkPresence => {
+            Ok(EventClass::Activity(ActivityKind::WorkPresence))
+        }
+        fb::EventClass::ActivityCoordination => {
+            Ok(EventClass::Activity(ActivityKind::Coordination))
+        }
+
         fb::EventClass::ControlCommand => Ok(EventClass::Control(ControlKind::Command)),
         fb::EventClass::ControlCommandResult => Ok(EventClass::Control(ControlKind::CommandResult)),
         fb::EventClass::ControlSession => Ok(EventClass::Control(ControlKind::Session)),
@@ -123,7 +165,39 @@ fn class_from_fb(class: fb::EventClass) -> Result<EventClass, WireError> {
         fb::EventClass::ControlAddressed => Ok(EventClass::Control(ControlKind::Addressed)),
         fb::EventClass::ControlSignal => Ok(EventClass::Control(ControlKind::Signal)),
         fb::EventClass::ControlStream => Ok(EventClass::Control(ControlKind::Stream)),
-        fb::EventClass::ControlLifecycle => Ok(EventClass::Control(ControlKind::Lifecycle)),
+        fb::EventClass::LifecyclePeerArrived => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::PeerArrived,
+        ))),
+        fb::EventClass::LifecyclePeerDeparted => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::PeerDeparted,
+        ))),
+        fb::EventClass::LifecycleWireEstablished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::WireEstablished),
+        )),
+        fb::EventClass::LifecycleWireLost => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::WireLost,
+        ))),
+        fb::EventClass::LifecycleRoomJoined => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::RoomJoined,
+        ))),
+        fb::EventClass::LifecycleRoomParted => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::RoomParted,
+        ))),
+        fb::EventClass::LifecycleSubscriptionAdvanced => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::SubscriptionAdvanced),
+        )),
+        fb::EventClass::LifecycleIdentityPublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::IdentityPublished),
+        )),
+        fb::EventClass::LifecycleDoctrinePublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::DoctrinePublished),
+        )),
+        fb::EventClass::LifecycleWallPostPublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::WallPostPublished),
+        )),
+        fb::EventClass::LifecycleChannelPurposePublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::ChannelPurposePublished),
+        )),
     }
 }
 
