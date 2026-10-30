@@ -38,13 +38,10 @@ impl Airc {
             let (closed_tx, closed) = watch::channel(false);
             let airc = self.clone();
             let task = tokio::spawn(async move {
-                loop {
-                    match airc_ipc::codec::read_response_frame(&mut stream).await {
-                        Ok(Some(airc_ipc::Response::Addressed { frame })) => {
-                            airc.receive_addressed(frame).await;
-                        }
-                        _ => break,
-                    }
+                while let Ok(Some(airc_ipc::Response::Addressed { frame })) =
+                    airc_ipc::codec::read_response_frame(&mut stream).await
+                {
+                    airc.receive_addressed(frame).await;
                 }
                 closed_tx.send_replace(true);
             });

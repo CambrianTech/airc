@@ -53,7 +53,7 @@ fn request_and_reply_round_trip_over_lan_without_github() {
             .await
             .expect("alice connects to bob over LAN");
 
-        let handler = respond_once(&bob, "lan-pong");
+        let handler = respond_once(&bob, "lan-pong").await;
 
         let mut headers = Headers::new();
         headers.insert("airc.command_kind".into(), "test.lan.ping".into());
@@ -159,7 +159,7 @@ fn request_and_reply_round_trip_over_relay_without_github_or_lan() {
         alice.replace_transport_health(relay_only).unwrap();
         bob.replace_transport_health(relay_only).unwrap();
 
-        let handler = respond_once(&bob, "relay-pong");
+        let handler = respond_once(&bob, "relay-pong").await;
 
         let mut headers = Headers::new();
         headers.insert("airc.command_kind".into(), "test.relay.ping".into());
@@ -214,7 +214,7 @@ async fn wait_for_relay_peers(relay: &RelayServer, expected: &[PeerId]) {
 }
 
 // Arm before spawning: no timing sleep can stand in for subscription readiness.
-fn respond_once(bob: &Airc, text: &'static str) -> tokio::task::JoinHandle<()> {
+async fn respond_once(bob: &Airc, text: &'static str) -> tokio::task::JoinHandle<()> {
     let mut inbox = bob
         .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
         .await
