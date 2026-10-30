@@ -95,6 +95,15 @@ pub enum IdentityError {
         requested: String,
         found: String,
     },
+    /// A READ of a home that already holds identity material (a key file
+    /// and/or rows for other agents) found no row for the requested agent.
+    /// Identity creation is an explicit act — `airc init` / the mint APIs —
+    /// never a side effect of opening a home, so this refuses instead of
+    /// minting (card 32f7dd97: a `work board` read once regenerated
+    /// identity.key).
+    IdentityNotInitialised {
+        agent_name: String,
+    },
 }
 
 impl std::fmt::Display for IdentityError {
@@ -137,6 +146,11 @@ impl std::fmt::Display for IdentityError {
                 f,
                 "requested local agent {requested:?}, but stored local_identity row is {found:?}"
             ),
+            IdentityError::IdentityNotInitialised { agent_name } => write!(
+                f,
+                "no identity for agent {agent_name:?} in this home — \
+                 identity creation is an explicit act (run `airc init` as that agent, or set AIRC_AGENT_NAME to an existing one); a read never mints one"
+            ),
         }
     }
 }
@@ -152,7 +166,8 @@ impl std::error::Error for IdentityError {
             | IdentityError::PartialState { .. }
             | IdentityError::BadKeyLength(_)
             | IdentityError::InvalidAgentName(_)
-            | IdentityError::AgentNameMismatch { .. } => None,
+            | IdentityError::AgentNameMismatch { .. }
+            | IdentityError::IdentityNotInitialised { .. } => None,
         }
     }
 }
@@ -228,8 +243,10 @@ impl LocalIdentity {
         Self::load_or_generate_as(home, agent_name).await
     }
 
-    /// Load or generate the local identity for an explicit agent name.
-    /// This is the programmatic partner of `airc init --as <name>`.
+    /// Load an existing identity for an explicit agent name, or mint one if
+    /// `home` holds no identity material at all. Programmatic partner of
+    /// `airc init --as <name>`; see [`Self::load_or_generate_as_with_peer_id`]
+    /// for which situations load and which refuse.
     pub async fn load_or_generate_as(
         home: &Path,
         agent_name: impl AsRef<str>,
@@ -237,21 +254,52 @@ impl LocalIdentity {
         Self::load_or_generate_as_with_peer_id(home, agent_name, None).await
     }
 
-    /// Like [`load_or_generate_as`], but lets the caller pin the `peer_id`
-    /// adopted **on a fresh mint**.
+    /// True if `home` holds any per-agent key file (`identity-<name>.key`,
+    /// #402 layout). The shared `identity.key` is deliberately not counted:
+    /// callers ask this only after finding the shared file absent, and a live
+    /// citizen's secret half lives in her own file when she has one — that is
+    /// exactly what makes "rows exist but no key for THIS agent" an unopened
+    /// identity rather than lost material.
+    fn any_per_agent_key(home: &Path) -> bool {
+        std::fs::read_dir(home)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("identity-") && name.ends_with(".key")
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Load an existing identity for `agent_name`, or — on a home that holds
+    /// NO identity material at all (no key file, no legacy json, no rows)
+    /// mint one, adopting the supplied `peer_id` if any.
     ///
-    /// `peer_id`:
-    /// - `Some(id)` → if (and only if) this call mints a brand-new identity
-    ///   (no key + no row on disk), adopt `id` as the `peer_id` so
-    ///   `peer_id()` coheres with a host-derived identifier. See
-    ///   [`generate_and_save_as_with_peer_id`] for the rationale.
-    /// - `None` → mint a random `peer_id`, the historical behavior.
+    /// This is the OPEN path: it must never invent an identity for a home
+    /// that already has some — that would be a read minting over existing
+    /// state. The arms below encode exactly which situations are loadable and
+    /// which must fail, naming what is missing:
     ///
-    /// On EVERY resume/load path the supplied id is ignored — the stored
-    /// identity is authoritative — so an existing citizen is never rotated.
-    /// The id is likewise not consulted by the "key exists, row missing"
-    /// recovery arms (multi-agent-in-one-home); those keep minting a random
-    /// `peer_id`, since a host that pins ids gives each citizen its own home.
+    /// - key + row both present → load.
+    /// - legacy `identity.json` whose agent matches → migrate to the modern
+    ///   layout (a one-way upgrade of THIS identity, not a mint).
+    /// - key present, no row for this agent, rows exist for other agents →
+    ///   [`IdentityError::IdentityNotInitialised`]: opening must never add a
+    ///   citizen beside existing ones; adding an agent to a populated home
+    ///   needs its own explicit verb (the shared-key mint refuses there).
+    /// - legacy `identity.json` describes another agent →
+    ///   [`IdentityError::AgentNameMismatch`]: the stored material belongs to
+    ///   someone else; refuse rather than fall back to it.
+    /// - key present, no row for any agent → [`IdentityError::PartialState`].
+    /// - legacy `identity.json` present, no key file →
+    ///   [`IdentityError::PartialState`]: state exists in its pre-ORM form
+    ///   but the secret half is gone; minting here would rotate an existing
+    ///   citizen.
+    /// - rows present (any agent), no key file → [`IdentityError::PartialState`]:
+    ///   the secret half is gone; minting here would rotate an existing
+    ///   citizen.
+    /// - nothing at all → fresh mint (the ONLY arm that writes).
     pub async fn load_or_generate_as_with_peer_id(
         home: &Path,
         agent_name: impl AsRef<str>,
@@ -259,38 +307,94 @@ impl LocalIdentity {
     ) -> Result<Self, IdentityError> {
         let agent_name = normalise_agent_name(agent_name.as_ref())?;
         let store = open_store(home).await?;
-        let key_path = Self::key_path(home);
-        let key_exists = key_path.exists();
+        let key_exists = Self::key_path(home).exists();
         let stored = store.load_local_identity_by_agent_name(&agent_name).await?;
         match (key_exists, stored) {
             (true, Some(stored)) => Self::load_with_metadata_for_agent(home, stored, &agent_name),
+            // Key present but no row for the requested agent. A legacy
+            // `identity.json` may still carry this identity; migrating it is a
+            // load of existing material, not creation.
             (true, None) => match migrate_legacy_identity_json(home, &store).await? {
                 Some(stored) if stored.agent_name == agent_name => {
                     Self::load_with_metadata(home, stored)
                 }
-                Some(_) => {
-                    Self::generate_and_save_agent_with_own_key(home, &store, &agent_name).await
-                }
+                Some(_) => Err(IdentityError::AgentNameMismatch {
+                    requested: agent_name.to_string(),
+                    found: airc_store::DEFAULT_AGENT_NAME.to_string(),
+                }),
                 None if store.has_local_identity_rows().await? => {
-                    Self::generate_and_save_agent_with_own_key(home, &store, &agent_name).await
+                    // The home holds other agents' rows but no row for this
+                    // name. Refuse rather than mint a fresh twin beside them:
+                    // opening must never add citizens.
+                    Err(IdentityError::IdentityNotInitialised {
+                        agent_name: agent_name.to_string(),
+                    })
                 }
                 None => Err(IdentityError::PartialState {
                     key_exists: true,
                     state_exists: false,
                 }),
             },
-            // The ONLY fresh-mint arm: adopt the supplied peer_id if any.
-            (false, None) => match peer_id {
-                Some(peer_id) => {
-                    Self::generate_and_save_as_with_peer_id(home, &store, &agent_name, peer_id)
-                        .await
+            // The ONLY fresh-mint arm: no shared key file, no row for this
+            // agent.
+            (false, None) => {
+                if store.has_local_identity_rows().await? {
+                    if Self::any_per_agent_key(home) {
+                        // Rows exist under other agents' names and at least
+                        // one citizen's secret half survives in her own key
+                        // file (#402 layout): this home holds living identity
+                        // material. Opening as THIS name must not add a
+                        // citizen beside them — the requested identity simply
+                        // is not initialised here, and adding an agent needs
+                        // its explicit verb.
+                        return Err(IdentityError::IdentityNotInitialised {
+                            agent_name: agent_name.to_string(),
+                        });
+                    }
+                    // Rows exist but NO key material at all: the secret half
+                    // is gone fleet-wide. Minting a fresh identity here would
+                    // rotate an existing citizen's home — refuse and name both
+                    // halves, as the doc above promises.
+                    return Err(IdentityError::PartialState {
+                        key_exists: false,
+                        state_exists: true,
+                    });
                 }
-                None => Self::generate_and_save_as(home, &store, &agent_name).await,
+                if home.join(LEGACY_IDENTITY_JSON_FILENAME).exists() {
+                    // Legacy state without a key file: minting here would
+                    // rotate an existing citizen. Refuse and name both halves.
+                    return Err(IdentityError::PartialState {
+                        key_exists: false,
+                        state_exists: true,
+                    });
+                }
+                match peer_id {
+                    Some(peer_id) => {
+                        Self::generate_and_save_as_with_peer_id(
+                            home, &store, &agent_name, peer_id,
+                        )
+                        .await
+                    }
+                    None => Self::generate_and_save_as(home, &store, &agent_name).await,
+                }
             },
-            (key, state) => Err(IdentityError::PartialState {
-                key_exists: key,
-                state_exists: state.is_some(),
-            }),
+            // A row exists for THIS agent but no shared key file: under the
+            // #402 layout a named citizen's secret lives in its own per-agent
+            // key file, so if that one is present we can load her exactly as
+            // before — this arm must not report "key missing" when her key is
+            // simply elsewhere. If neither her own file nor the shared one
+            // exists, the secret half is genuinely gone: refuse and name both
+            // halves (minting here would rotate an existing citizen).
+            (false, Some(stored)) => {
+                if Self::agent_key_path(home, &agent_name).exists() {
+                    Self::load_with_metadata_for_agent(home, stored, &agent_name)
+                } else {
+                    Err(IdentityError::PartialState {
+                        key_exists: false,
+                        state_exists: true,
+                    })
+                }
+            },
         }
     }
 
@@ -345,65 +449,6 @@ impl LocalIdentity {
             peer_id: stored.peer_id,
             client_id: stored.client_id,
             agent_name: stored.agent_name,
-        })
-    }
-
-    /// Mint a NEW agent identity in a home that already holds one
-    /// (multi-agent-in-one-home).
-    ///
-    /// This used to reuse the home's `identity.key` while stamping a fresh
-    /// random `peer_id` — one keypair, N peer identities. That is the root
-    /// of #402: `PeerKeyRegistry::find_peer` maps a pubkey to exactly ONE
-    /// peer, so the twins were unrepresentable downstream. Peers enrolled a
-    /// row per peer_id, all with the same pubkey, and sends went to whichever
-    /// twin routing chose — usually the endpoint-less one.
-    ///
-    /// A new identity now gets its OWN keypair, written to its own key file.
-    /// Fresh key material is exactly what a fresh identity means; sharing it
-    /// was the bug.
-    async fn generate_and_save_agent_with_own_key(
-        home: &Path,
-        store: &SqliteEventStore,
-        agent_name: &str,
-    ) -> Result<Self, IdentityError> {
-        let keypair = PeerKeypair::generate();
-        let peer_id = PeerId::new();
-        write_owner_only(
-            &Self::agent_key_path(home, agent_name),
-            &keypair.secret_bytes(),
-        )?;
-        let client_id = ClientId::new();
-        let created_at_ms = now_ms()?;
-
-        // Seed the published card's nick from a NAMED citizen's
-        // agent_name (e.g. `attach_as("Claude")` / `init --as Claude`),
-        // so the very first card it publishes carries "Claude" rather
-        // than an empty name that resolves to a raw uuid for peers. The
-        // DEFAULT scope keeps an empty name — that identity is the
-        // user's, filled in later via `airc identity set`, and "default"
-        // is a discriminator, not a display name.
-        let identity = if agent_name == airc_store::DEFAULT_AGENT_NAME {
-            Identity::default()
-        } else {
-            Identity::new(agent_name)
-        };
-
-        store
-            .insert_local_identity(StoredLocalIdentity {
-                peer_id,
-                client_id,
-                version: IDENTITY_STATE_VERSION,
-                created_at_ms,
-                identity,
-                agent_name: agent_name.to_string(),
-            })
-            .await?;
-
-        Ok(Self {
-            keypair,
-            peer_id,
-            client_id,
-            agent_name: agent_name.to_string(),
         })
     }
 
@@ -463,7 +508,15 @@ impl LocalIdentity {
         let client_id = ClientId::new();
         let created_at_ms = now_ms()?;
 
-        write_owner_only(&Self::key_path(home), &keypair.secret_bytes())?;
+        // Each agent's secret lives in its OWN key file (#402): a distinct
+        // peer identity needs distinct key material, and writing every named
+        // agent to the shared `identity.key` would make two citizens of one
+        // home indistinguishable on the wire. The DEFAULT agent keeps the
+        // historical shared filename (agent_key_path resolves it); any other
+        // name gets `identity-<name>.key`. create_new still refuses to
+        // overwrite whatever file already exists at that path — rekeying is a
+        // named operation, not a side effect of this mint.
+        write_owner_only(&Self::agent_key_path(home, &agent_name), &keypair.secret_bytes())?;
 
         store
             .insert_local_identity(StoredLocalIdentity {
@@ -576,6 +629,19 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    // R4 (card 32f7dd97): every key-material write is probed loudly with
+    // the path, the previous fingerprint, and the new fingerprint — a key
+    // change no one can see is equivalent to a citizen silently losing
+    // their identity. `create_new` below means "previous" can only be
+    // non-absent on the refusal path, where we still name it: if this
+    // function ever gains an overwrite mode, the probe already records
+    // both halves.
+    let new_fingerprint = sha256_hex(bytes);
+    let previous_fingerprint = match std::fs::read(path) {
+        Ok(existing) => Some(sha256_hex(&existing)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     // Identity creation must never replace existing key material. In a legacy
     // named-agent home, identity.key still belongs to that agent: adding the
     // default identity must refuse rather than silently rotate the original.
@@ -590,6 +656,11 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let mut file = options.open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
+            eprintln!(
+                "[airc-identity] KEY WRITE REFUSED: {} (previous fingerprint {}, refusing to overwrite)",
+                path.display(),
+                previous_fingerprint.as_deref().unwrap_or("unreadable")
+            );
             std::io::Error::new(error.kind(), format!(
                 "refusing to overwrite existing identity key {}; select the existing named agent or use a separate home",
                 path.display()
@@ -599,7 +670,22 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         }
     })?;
     file.write_all(bytes)?;
+    eprintln!(
+        "[airc-identity] KEY WRITE: {} (previous fingerprint {}, new fingerprint {})",
+        path.display(),
+        previous_fingerprint.as_deref().unwrap_or("absent"),
+        new_fingerprint
+    );
     Ok(())
+}
+
+/// sha256 of `bytes` as lowercase hex — the fingerprint format for the
+/// key-write probes (R4).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {
@@ -650,15 +736,18 @@ mod tests {
         assert_eq!(second.peer_id, identity.peer_id);
         assert_eq!(second.agent_name, "codex");
 
-        // A default CLI read of a legacy named home used to overwrite its key;
-        // the running citizen survived until restart, then failed peer trust.
+        // A default CLI read of a named home used to MINT OVER its key; the
+        // running citizen survived until restart, then failed peer trust.
+        // Now the open refuses outright and names what it found (card 32f7dd97).
         let error = match LocalIdentity::load_or_generate_as(home.path(), "default").await {
             Err(error) => error,
             Ok(_) => panic!("the existing key must not be overwritten"),
         };
-        assert!(
-            matches!(error, IdentityError::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists)
-        );
+        assert!(matches!(
+            error,
+            IdentityError::IdentityNotInitialised { ref agent_name }
+                if agent_name == airc_store::DEFAULT_AGENT_NAME
+        ));
         assert!(store.load_local_identity().await.unwrap().is_none());
         let resumed = LocalIdentity::load_or_generate_as(home.path(), "codex")
             .await
@@ -671,30 +760,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_or_generate_as_adds_named_agent_to_existing_scope() {
+    async fn open_refuses_to_add_a_second_agent_to_an_existing_scope() {
+        // what this catches: #402's layout used to be created by OPENING — a
+        // read that found no row for its name silently minted a second
+        // identity into the home; and in the card 32f7dd97 incident a default
+        // open minted OVER the named citizen's key. The contract is now
+        // inverted: opening never adds citizens to a populated home — it fails,
+        // naming what is missing for the agent asked for.
         let home = TempDir::new().unwrap();
         let default = LocalIdentity::load_or_generate(home.path()).await.unwrap();
-        let codex = LocalIdentity::load_or_generate_as(home.path(), "codex")
-            .await
-            .unwrap();
 
-        assert_eq!(codex.agent_name, "codex");
-        assert_ne!(default.peer_id, codex.peer_id);
-        assert_ne!(default.client_id, codex.client_id);
-        // #402: was assert_eq! — it pinned the shared keypair that made these
-        // two distinct peer_ids indistinguishable on the wire, so every peer
-        // enrolled two rows for one key and sent to the endpoint-less twin.
-        assert_ne!(default.keypair.secret_bytes(), codex.keypair.secret_bytes());
+        let error = match LocalIdentity::load_or_generate_as(home.path(), "codex").await {
+            Err(error) => error,
+            Ok(_) => panic!("opening must not mint a second agent into the home"),
+        };
+        assert!(matches!(
+            error,
+            IdentityError::IdentityNotInitialised { ref agent_name }
+                if agent_name == "codex"
+        ));
 
+        // And the first citizen is untouched: same keypair on reload.
+        let resumed = LocalIdentity::load_or_generate(home.path()).await.unwrap();
+        assert_eq!(resumed.peer_id, default.peer_id);
+        assert_eq!(
+            resumed.keypair.secret_bytes(),
+            default.keypair.secret_bytes()
+        );
+
+        // No codex row was created by the refused open.
         let store = open_store(home.path()).await.unwrap();
-        let default_row = store.load_local_identity().await.unwrap().unwrap();
-        let codex_row = store
+        assert!(store
             .load_local_identity_by_agent_name("codex")
             .await
             .unwrap()
-            .unwrap();
-        assert_eq!(default_row.peer_id, default.peer_id);
-        assert_eq!(codex_row.peer_id, codex.peer_id);
+            .is_none());
     }
 
     #[tokio::test]
@@ -881,10 +981,18 @@ mod tests {
     async fn two_agents_in_one_home_are_cryptographically_distinct() {
         let home = TempDir::new().unwrap();
 
+        // The first agent opens a FRESH home — the only arm where the open
+        // path mints. Adding a second citizen is an explicit act (R1): the
+        // open path must refuse, and `generate_and_save_as` does the minting.
+        let store = open_store(home.path()).await.unwrap();
         let first = LocalIdentity::load_or_generate_as(home.path(), "alpha")
             .await
             .unwrap();
-        let second = LocalIdentity::load_or_generate_as(home.path(), "beta")
+        assert!(matches!(
+            LocalIdentity::load_or_generate_as(home.path(), "beta").await,
+            Err(IdentityError::IdentityNotInitialised { .. })
+        ));
+        let second = LocalIdentity::generate_and_save_as(&home.path(), &store, "beta")
             .await
             .unwrap();
 
