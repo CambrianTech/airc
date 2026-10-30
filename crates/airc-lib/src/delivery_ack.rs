@@ -231,6 +231,7 @@ impl Airc {
         let mut frame = Frame {
             kind: FrameKind::Control,
             envelope: Envelope {
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Receipt),
                 event_id: EventId::new(),
                 sender: self.inner.identity.peer_id,
                 sender_client: self.inner.identity.client_id,

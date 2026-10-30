@@ -654,6 +654,7 @@ mod tests {
         text: &str,
     ) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id,
             peer_id: airc.peer_id(),

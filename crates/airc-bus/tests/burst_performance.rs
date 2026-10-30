@@ -93,6 +93,7 @@ async fn burst_slow_storage() {
                 channel,
                 (PeerId::from_u128(1), ClientId::from_u128(1)),
                 Kind::Message,
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
                 DeliveryClass::Durable,
                 Bytes::from_static(b"burst payload"),
             )

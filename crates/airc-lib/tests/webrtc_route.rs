@@ -285,6 +285,7 @@ async fn webrtc_session_carries_media_tracks_and_control_events() {
         .alice
         .send_frame_to_for_test(
             FrameKind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             MentionTarget::Peer(fixture.bob_spec.peer_id),
             Body::text("avatar control ready"),
             headers,
@@ -370,6 +371,7 @@ async fn webrtc_orchestration_round_trip_over_mesh_signaling() {
         .alice
         .send_frame_to_for_test(
             FrameKind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             MentionTarget::Peer(fixture.bob_spec.peer_id),
             Body::text("webrtc-control-ping"),
             headers,

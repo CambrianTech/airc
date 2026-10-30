@@ -44,20 +44,16 @@ pub(crate) async fn derive_pending(db: &DatabaseConnection) -> Result<(), StoreE
 }
 
 /// A batch's non-default addressing, grouped by value: the rows whose typed
-/// target names each peer, and the rows that open with an `@name`.
+/// target names each peer. No payload is read.
 #[derive(Default)]
 struct Grouped {
     peers: BTreeMap<Uuid, Vec<Uuid>>,
-    leading: Vec<Uuid>,
 }
 
 impl Grouped {
     fn add(&mut self, id: Uuid, addressing: airc_core::Addressing) {
         if let Some(peer) = addressing.peer {
             self.peers.entry(peer.as_uuid()).or_default().push(id);
-        }
-        if addressing.leading_mention {
-            self.leading.push(id);
         }
     }
 }
@@ -68,11 +64,10 @@ async fn derive_batch<T: EventTable>(db: &DatabaseConnection) -> Result<usize, S
 where
     <T::Headers as EntityTrait>::ActiveModel: Send,
 {
-    let rows: Vec<(Uuid, serde_json::Value, T::Content, serde_json::Value)> = T::find()
+    let rows: Vec<(Uuid, serde_json::Value, serde_json::Value)> = T::find()
         .select_only()
         .column(T::EVENT_ID)
         .column(T::TARGET)
-        .column(T::CONTENT)
         .column(T::HEADERS)
         .filter(T::DERIVED_VERSION.lt(DERIVED_VERSION))
         .limit(BATCH)
@@ -86,10 +81,10 @@ where
     let mut ids = Vec::with_capacity(count);
     let mut grouped = Grouped::default();
     let mut headers = Vec::with_capacity(count);
-    for (id, target, content, held) in rows {
+    for (id, target, held) in rows {
         let held: airc_core::Headers = serde_json::from_value(held)
             .map_err(|e| StoreError::Migration(format!("decoding headers: {e}")))?;
-        grouped.add(id, T::addressing(target, content)?);
+        grouped.add(id, T::addressing(target)?);
         headers.push((id, held));
         ids.push(id);
     }
@@ -101,7 +96,6 @@ where
     write_header_rows::<T>(&txn, headers.iter().map(|(id, held)| (*id, held))).await?;
     T::update_many()
         .col_expr(T::ADDRESSED_PEER, Expr::value(Option::<Uuid>::None))
-        .col_expr(T::LEADING_MENTION, Expr::value(false))
         .col_expr(T::DERIVED_VERSION, Expr::value(DERIVED_VERSION))
         .filter(T::EVENT_ID.is_in(ids))
         .exec(&txn)
@@ -113,13 +107,7 @@ where
             .exec(&txn)
             .await?;
     }
-    if !grouped.leading.is_empty() {
-        T::update_many()
-            .col_expr(T::LEADING_MENTION, Expr::value(true))
-            .filter(T::EVENT_ID.is_in(grouped.leading))
-            .exec(&txn)
-            .await?;
-    }
+
     txn.commit().await?;
     Ok(count)
 }
@@ -163,6 +151,8 @@ mod tests {
     /// their defaults after it).
     fn old_row(n: u128, target: MentionTarget, text: &str) -> event::ActiveModel {
         event::ActiveModel {
+            class: sea_orm::ActiveValue::NotSet,
+            class_family: sea_orm::ActiveValue::NotSet,
             event_id: Set(Uuid::from_u128(n)),
             room_id: Set(Uuid::from_u128(7)),
             peer_id: Set(Uuid::from_u128(8)),
@@ -218,8 +208,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             (row.addressed_peer, row.leading_mention, row.derived_version),
-            (Some(me.as_uuid()), true, DERIVED_VERSION)
+            (Some(me.as_uuid()), false, DERIVED_VERSION)
         );
+        assert_eq!(row.class, None, "upgrade must not guess a historical class");
+        assert_eq!(row.class_family, None);
         assert_eq!(event_header::Entity::find().count(&db).await.unwrap(), 1);
     }
 
@@ -269,7 +261,7 @@ mod tests {
             .count(&db)
             .await
             .unwrap();
-        assert_eq!((addressed, leading), (1250, 1250));
+        assert_eq!((addressed, leading), (1250, 0));
         assert_eq!(event_header::Entity::find().count(&db).await.unwrap(), 2500);
     }
 
@@ -288,6 +280,8 @@ mod tests {
             .await
             .unwrap();
         bus_event::Entity::insert(bus_event::ActiveModel {
+            class: sea_orm::ActiveValue::NotSet,
+            class_family: sea_orm::ActiveValue::NotSet,
             event_id: Set(Uuid::from_u128(2)),
             room_id: Set(Uuid::from_u128(7)),
             epoch: Set(1),
@@ -329,7 +323,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (bus.leading_mention, bus.derived_version),
-            (true, DERIVED_VERSION)
+            (false, DERIVED_VERSION)
         );
         assert_eq!(event_header::Entity::find().count(db).await.unwrap(), 1);
         assert_eq!(bus_event_header::Entity::find().count(db).await.unwrap(), 1);

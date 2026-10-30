@@ -19,7 +19,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use airc_core::{ClientId, EventId, Headers, PeerId, RoomId};
+use airc_core::{ClientId, EventClass, EventId, Headers, PeerId, RoomId};
 
 /// Owner-assigned total order = `(epoch, counter)` (§2, §3.8).
 ///
@@ -92,6 +92,59 @@ pub enum Kind {
     Control,
 }
 
+impl Kind {
+    pub const ALL: [Self; 7] = [
+        Self::Message,
+        Self::Event,
+        Self::Command,
+        Self::CommandResult,
+        Self::Signal,
+        Self::StreamChunk,
+        Self::Control,
+    ];
+
+    pub const fn transcript_kind(self) -> airc_core::TranscriptKind {
+        use airc_core::TranscriptKind;
+        match self {
+            Self::Message => TranscriptKind::Message,
+            Self::Command => TranscriptKind::Command,
+            Self::CommandResult => TranscriptKind::CommandResult,
+            Self::Event | Self::Signal | Self::StreamChunk | Self::Control => {
+                TranscriptKind::System
+            }
+        }
+    }
+
+    /// The only bus projection of producer semantics. Addressed crypto traffic
+    /// has a separate owner and cannot enter the ordinary event bus.
+    pub fn for_class(class: EventClass) -> crate::Result<Self> {
+        use airc_core::ControlKind;
+        Ok(match class {
+            EventClass::Correspondence(_) => Self::Message,
+            EventClass::Activity(_) => Self::Event,
+            EventClass::Control(ControlKind::Command) => Self::Command,
+            EventClass::Control(ControlKind::CommandResult) => Self::CommandResult,
+            EventClass::Control(ControlKind::Signal) => Self::Signal,
+            EventClass::Control(ControlKind::Stream) => Self::StreamChunk,
+            EventClass::Control(ControlKind::Addressed) => {
+                return Err(crate::BusError::UnsupportedClass(class))
+            }
+            EventClass::Control(
+                ControlKind::Session | ControlKind::Receipt | ControlKind::Lifecycle,
+            ) => Self::Control,
+        })
+    }
+
+    pub fn validate_class(self, class: EventClass) -> crate::Result<()> {
+        let expected = Self::for_class(class)?;
+        if self == expected {
+            Ok(())
+        } else {
+            Err(crate::BusError::ClassKindMismatch { class, kind: self })
+        }
+    }
+}
+
 /// How an envelope is delivered + retained (§2, §3.3, §3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +199,8 @@ pub struct Envelope {
     /// Addressing (§2).
     pub target: Target,
     pub kind: Kind,
+    /// Required producer-declared semantics; never inferred from payload.
+    pub class: EventClass,
     pub delivery: DeliveryClass,
     /// Owner-assigned order `(epoch, counter)` (§2, §3.8). Assigned at publish.
     pub seq: Seq,
@@ -171,6 +226,7 @@ impl Envelope {
         channel: RoomId,
         from: (PeerId, ClientId),
         kind: Kind,
+        class: EventClass,
         delivery: DeliveryClass,
         payload: Bytes,
     ) -> Self {
@@ -180,6 +236,7 @@ impl Envelope {
             from,
             target: Target::All,
             kind,
+            class,
             delivery,
             seq: Seq::new(0, 0),
             occurred_at_ms: 0,

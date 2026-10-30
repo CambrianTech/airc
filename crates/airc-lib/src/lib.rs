@@ -239,8 +239,9 @@ pub use airc_core::{
     headers::{HeaderFilter, Headers},
     identity::{Identity, PeerIdentityCard},
     transcript::MentionTarget,
-    ClientId, EventId, PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId,
-    TranscriptCursor, TranscriptEvent, TranscriptKind, PERSONA_CAPABILITIES_KEY,
+    ActivityKind, ClientId, ControlKind, CorrespondenceKind, EventClass, EventId, EventSelection,
+    PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId, TranscriptCursor,
+    TranscriptEvent, TranscriptKind, PERSONA_CAPABILITIES_KEY,
 };
 // Trust tiers are the capability-registry ranking axis (card a9580f9d);
 // re-export so consumers ranking candidates don't pull airc-store.

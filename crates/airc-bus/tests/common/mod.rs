@@ -66,6 +66,7 @@ pub fn durable(channel: RoomId, marker: u128, text: &str) -> Envelope {
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         Bytes::copy_from_slice(text.as_bytes()),
     )
@@ -77,7 +78,8 @@ pub fn ephemeral(channel: RoomId, marker: u128, key: &str, payload: &[u8]) -> En
     Envelope::new(
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
-        Kind::Signal,
+        Kind::Event,
+        airc_core::EventClass::Activity(airc_core::ActivityKind::Presence),
         DeliveryClass::EphemeralLatest,
         Bytes::copy_from_slice(payload),
     )

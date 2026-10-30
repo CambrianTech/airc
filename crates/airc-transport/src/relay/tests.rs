@@ -19,6 +19,7 @@ fn dummy_frame(sender: PeerId) -> Frame {
     Frame {
         kind: FrameKind::Message,
         envelope: Envelope {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(1),
             sender,
             sender_client: ClientId::from_u128(2),

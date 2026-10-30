@@ -507,10 +507,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             body_json,
             stdin,
             headers,
-            kind,
+            class,
         } => {
             publish_commands::run_publish(
-                &home, room.room, body_text, body_json, stdin, headers, kind,
+                &home, room.room, body_text, body_json, stdin, headers, class,
             )
             .await
         }

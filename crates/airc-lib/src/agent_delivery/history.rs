@@ -51,7 +51,7 @@ impl AgentDeliveryTurn {
     /// `acknowledge(.., true)` records the turn's progress either way.
     pub async fn history_summary(
         &mut self,
-        count_filter: airc_core::HeaderFilter,
+        filter: crate::EventFilter,
         own_sends: Option<&airc_core::RuntimeSelf>,
         keep: impl Fn(&TranscriptEvent) -> bool,
         me: &crate::Addressee,
@@ -70,7 +70,7 @@ impl AgentDeliveryTurn {
                     &self.state.summarized,
                     &self.state.boundary,
                     &self.channels,
-                    count_filter,
+                    filter.clone(),
                     own_sends,
                 )
                 .await?;
@@ -78,7 +78,8 @@ impl AgentDeliveryTurn {
         };
         let shown = |e: &TranscriptEvent| keep(e) && !own_sends.is_some_and(|r| r.is_self_event(e));
         let recent = if counted.is_some() {
-            self.recent_history(&shown, me, window.page).await?
+            self.recent_history(&filter, &shown, me, window.page)
+                .await?
         } else {
             Vec::new()
         };
@@ -105,18 +106,26 @@ impl AgentDeliveryTurn {
     /// own). One newest-first store read bounded by `page`; never a walk.
     async fn recent_history(
         &self,
+        filter: &crate::EventFilter,
         shown: &impl Fn(&TranscriptEvent) -> bool,
         me: &crate::Addressee,
         page: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
+        let rule = airc_core::HistoryMatch {
+            selection: filter.selection,
+            headers: &filter.headers_filter,
+            addressed_to: None,
+            kinds: &filter.kinds,
+            self_echo: filter.self_echo.map(|v| (v.peer_id, v.client_id, v.filter)),
+        };
         let tail = self
             .airc
-            .scan_agent_feed_in_channels(
+            .scan_matching_channels(
                 None,
                 &self.state.boundary,
                 page.clamp(1, 4096),
                 &self.channels,
-                None,
+                rule,
             )
             .await?;
         Ok(tail

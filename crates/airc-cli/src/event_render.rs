@@ -268,6 +268,7 @@ mod tests {
         };
 
         let base = |headers: Headers, text: &str| TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: PeerId::new(),
@@ -317,6 +318,7 @@ mod tests {
             ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
         };
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: PeerId::new(),
@@ -368,6 +370,7 @@ mod tests {
             ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
         };
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: PeerId::new(),
@@ -418,6 +421,7 @@ mod tests {
         use airc_core::{ClientId, EventId, Headers, PeerId, RoomId, TranscriptKind};
         let room = RoomId::new();
         let event = |target: MentionTarget| TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: room,
             peer_id: PeerId::new(),
@@ -452,6 +456,7 @@ mod tests {
             ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptKind,
         };
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             // Deterministic id whose first 8 hex chars are "0badcafe".
             event_id: EventId::from_u128(0x0bad_cafe_0000_0000_dead_beef_0000_0000),
             room_id: RoomId::new(),

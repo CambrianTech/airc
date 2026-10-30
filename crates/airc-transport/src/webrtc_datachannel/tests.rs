@@ -65,6 +65,7 @@ fn event_frame(lamport: u64, body: &str) -> Frame {
     Frame {
         kind: FrameKind::Event,
         envelope: Envelope {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
             event_id: EventId::from_u128(lamport as u128),
             sender: PeerId::from_u128(0xa1),
             sender_client: ClientId::from_u128(0xc1),
@@ -84,6 +85,8 @@ fn event_frame(lamport: u64, body: &str) -> Frame {
 fn durable_frame() -> Frame {
     let mut frame = event_frame(99, "durable");
     frame.kind = FrameKind::Message;
+    frame.envelope.class =
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message);
     frame
 }
 

@@ -22,6 +22,8 @@ use crate::envelope::{ChannelId, Frame, FrameKind};
 /// frames before this cursor are skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
+    /// Typed semantic selection, applied without interpreting the body.
+    pub selection: airc_core::EventSelection,
     /// Restrict to one channel. `None` = "any channel."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<ChannelId>,
@@ -51,6 +53,7 @@ fn default_any_filter() -> HeaderFilter {
 impl Default for Subscription {
     fn default() -> Self {
         Self {
+            selection: airc_core::EventSelection::All,
             channel: None,
             from_cursor: None,
             kinds: BTreeSet::new(),
@@ -66,6 +69,9 @@ impl Subscription {
     /// `HeaderFilter::matches` does. Adapters call this in a hot loop
     /// during fan-out.
     pub fn matches(&self, frame: &Frame) -> bool {
+        if !self.selection.matches(frame.envelope.class) {
+            return false;
+        }
         if let Some(channel) = self.channel {
             if frame.envelope.channel != channel {
                 return false;
@@ -98,6 +104,9 @@ mod tests {
         Frame {
             kind,
             envelope: Envelope {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 event_id: EventId::from_u128(0x01),
                 sender: PeerId::from_u128(0xa1),
                 sender_client: ClientId::from_u128(0xc1),

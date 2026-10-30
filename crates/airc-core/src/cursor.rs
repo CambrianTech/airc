@@ -100,6 +100,7 @@ mod tests {
     /// assertions are stable across runs.
     fn event_at(lamport: u64, peer_seed: u128, client_seed: u128) -> TranscriptEvent {
         TranscriptEvent {
+            class: crate::EventClass::Correspondence(crate::CorrespondenceKind::Message),
             event_id: EventId::from_u128(lamport as u128),
             room_id: RoomId::from_u128(0xc0ffee),
             peer_id: PeerId::from_u128(peer_seed),

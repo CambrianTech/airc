@@ -27,6 +27,7 @@ fn event() -> Envelope {
         RoomId::new(),
         (PeerId::new(), ClientId::new()),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         bytes::Bytes::from_static(b"test"),
     )

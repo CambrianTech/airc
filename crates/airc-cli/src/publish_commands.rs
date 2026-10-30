@@ -13,7 +13,7 @@ use airc_core::{Body, Headers};
 
 use airc_protocol::FrameKind;
 
-use crate::cli::PublishFrameKind;
+use crate::cli::PublishClass;
 
 pub async fn run_publish(
     home: &Path,
@@ -22,15 +22,22 @@ pub async fn run_publish(
     body_json: Option<String>,
     stdin: bool,
     headers: Vec<String>,
-    kind: PublishFrameKind,
+    class: PublishClass,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::commands::reject_recovery_room(room.as_deref())?;
     let body = load_body(body_text, body_json, stdin)?;
     let parsed_headers = parse_headers(&headers)?;
     let airc = crate::commands::attached_airc(home).await?;
     let target = crate::commands::mesh_publish_target(&airc, room.as_deref()).await?;
+    let class = airc_core::EventClass::from(class);
     let receipt = airc
-        .publish(target, frame_kind_from(kind), body, parsed_headers)
+        .publish(
+            target,
+            FrameKind::for_class(class),
+            class,
+            body,
+            parsed_headers,
+        )
         .await?;
 
     // One-line JSON so callers can pipe into `jq` directly.
@@ -126,14 +133,6 @@ pub async fn run_publish(
         .map_err(|error| format!("serialize publish receipt: {error}"))?;
     println!("{line}");
     Ok(())
-}
-
-fn frame_kind_from(kind: PublishFrameKind) -> FrameKind {
-    match kind {
-        PublishFrameKind::Message => FrameKind::Message,
-        PublishFrameKind::Event => FrameKind::Event,
-        PublishFrameKind::Control => FrameKind::Control,
-    }
 }
 
 fn load_body(

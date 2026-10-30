@@ -453,6 +453,50 @@ fn build_operator_card_created(
     }
 }
 
+/// Producer-owned classification; adding a work event requires an explicit semantic choice.
+fn work_event_class(event: &WorkEvent) -> airc_core::EventClass {
+    use airc_core::{ActivityKind, EventClass};
+    EventClass::Activity(match event {
+        WorkEvent::ClaimHeartbeat(_)
+        | WorkEvent::WorkspaceHeartbeat(_)
+        | WorkEvent::AgentAvailabilityReported(_) => ActivityKind::Presence,
+        WorkEvent::CardCreated(_)
+        | WorkEvent::CardUpdated(_)
+        | WorkEvent::CardClaimed(_)
+        | WorkEvent::ClaimReleased(_)
+        | WorkEvent::CardStateChanged(_)
+        | WorkEvent::WorkSubmitted(_)
+        | WorkEvent::WorkSubmissionReviewed(_)
+        | WorkEvent::SubmissionReviewRequested(_)
+        | WorkEvent::SubmissionRejected(_)
+        | WorkEvent::ReviewRejected(_)
+        | WorkEvent::LaneCreated(_)
+        | WorkEvent::LaneStateChanged(_)
+        | WorkEvent::WorkspaceRequested(_)
+        | WorkEvent::WorkspaceAllocated(_)
+        | WorkEvent::WorkspaceReleased(_)
+        | WorkEvent::WorkspacePressureReported(_)
+        | WorkEvent::WorkspaceDrainRequested(_)
+        | WorkEvent::WorkspaceDrainCompleted(_)
+        | WorkEvent::GitCommitObserved(_)
+        | WorkEvent::GitBranchMoved(_)
+        | WorkEvent::GitDirtyStateChanged(_)
+        | WorkEvent::PullRequestCheckSuiteChanged(_)
+        | WorkEvent::PullRequestReviewSubmitted(_)
+        | WorkEvent::PullRequestMergeStateChanged(_)
+        | WorkEvent::PullRequestLinked(_)
+        | WorkEvent::PullRequestRelinked(_)
+        | WorkEvent::PullRequestMerged(_)
+        | WorkEvent::HygieneReportRecorded(_)
+        | WorkEvent::ManagerHatClaimed(_)
+        | WorkEvent::ManagerHatReleased(_)
+        | WorkEvent::GoalCreated(_)
+        | WorkEvent::GoalAchieved(_)
+        | WorkEvent::GoalAbandoned(_)
+        | WorkEvent::GoalDryTickRecorded(_) => ActivityKind::WorkState,
+    })
+}
+
 impl Airc {
     /// Materialize one peer-review handoff for an accepted candidate in its own
     /// room. Retries (including concurrent publishers) preserve reviewer custody.
@@ -1557,7 +1601,8 @@ impl Airc {
 
     async fn publish_work_event(&self, event: &WorkEvent) -> Result<EventId, AircError> {
         let (headers, body) = encode_work_event(event)?;
-        self.send_frame(FrameKind::Event, body, headers).await
+        self.send_frame(FrameKind::Event, work_event_class(event), body, headers)
+            .await
     }
 
     /// Room-targeted sibling of [`Airc::publish_work_event`]: the event
@@ -1571,6 +1616,7 @@ impl Airc {
         let (headers, body) = encode_work_event(event)?;
         self.send_frame_to_room(
             FrameKind::Event,
+            work_event_class(event),
             crate::MentionTarget::All,
             body,
             headers,

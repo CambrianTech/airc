@@ -112,6 +112,9 @@ async fn attached_filtered_page_pushes_kinds_down_to_the_daemon() {
     for _ in 0..200 {
         client
             .publish(PublishRequest {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 channel: channel.as_uuid(),
                 from_peer: alice.peer_id().as_uuid(),
                 from_client: alice.client_id().as_uuid(),
@@ -177,6 +180,7 @@ async fn attached_subscribed_resume_merges_rooms_by_full_cursor_before_limit() {
             room,
             (observer.peer_id(), observer.client_id()),
             Kind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             DeliveryClass::Durable,
             Bytes::from_static(b"merge fixture"),
         );

@@ -121,6 +121,7 @@ impl Airc {
         let occurred_at_ms = now_ms()?;
         let lamport = self.next_lamport(occurred_at_ms);
         let event = airc_core::TranscriptEvent {
+            class: airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle),
             event_id: EventId::new(),
             room_id,
             peer_id: self.inner.identity.peer_id,

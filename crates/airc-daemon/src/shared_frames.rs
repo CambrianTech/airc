@@ -220,6 +220,7 @@ mod tests {
             RoomId::new(),
             (PeerId::new(), ClientId::new()),
             Kind::StreamChunk,
+            airc_core::EventClass::Control(airc_core::ControlKind::Stream),
             DeliveryClass::StreamChunk,
             payload.into(),
         ))

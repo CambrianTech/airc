@@ -594,6 +594,7 @@ pub(crate) fn bus_envelope_for_inbound(
         frame.envelope.channel,
         (frame.envelope.sender, frame.envelope.sender_client),
         kind,
+        frame.envelope.class,
         delivery,
         bytes::Bytes::from(payload),
     );
@@ -626,6 +627,9 @@ mod tests {
         Frame {
             kind: FrameKind::Message,
             envelope: ProtoEnvelope {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 event_id,
                 sender: PeerId::new(),
                 sender_client: airc_core::ClientId::new(),

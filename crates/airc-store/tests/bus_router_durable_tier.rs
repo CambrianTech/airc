@@ -154,6 +154,18 @@ impl DurableSink for GatedSqliteSink {
             .await
     }
 
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool, BusError> {
         self.inner.contains(event_id).await
     }
@@ -166,6 +178,7 @@ fn durable(channel: RoomId, marker: u128, text: &str) -> Envelope {
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         Bytes::copy_from_slice(text.as_bytes()),
     )

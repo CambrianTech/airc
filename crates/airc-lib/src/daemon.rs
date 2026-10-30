@@ -15,13 +15,11 @@
 
 use std::sync::Arc;
 
-use airc_bus::envelope::{Envelope, Kind, Target};
-use airc_core::{
-    Body, MentionTarget, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
-};
+use airc_bus::envelope::{Envelope, Target};
+use airc_core::{Body, MentionTarget, PeerId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
-    AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind,
+    AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery,
     PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
@@ -63,52 +61,6 @@ fn unpack_seq(lamport: u64) -> (u64, u64) {
     (lamport >> COUNTER_BITS, lamport & COUNTER_MASK)
 }
 
-fn kind_to_transcript(kind: Kind) -> TranscriptKind {
-    match kind {
-        Kind::Message => TranscriptKind::Message,
-        Kind::Command => TranscriptKind::Command,
-        Kind::CommandResult => TranscriptKind::CommandResult,
-        // Non-command event categories retain their coarse System projection.
-        Kind::Event | Kind::Signal | Kind::StreamChunk | Kind::Control => TranscriptKind::System,
-    }
-}
-
-/// Continuum #297 — the inverse of [`kind_to_transcript`], for pushing
-/// a consumer's `EventFilter::kinds` down into the daemon's inbox read
-/// ("newest N events OF THESE KINDS", filtered before the limit).
-///
-/// The push-down must be a SUPERSET of the client-side `filter.matches`
-/// — never narrower, or the daemon would drop events the consumer asked
-/// for. Message and command categories map exactly. Remaining transcript
-/// categories admit the remaining non-command bus categories, with
-/// `filter.matches` refining the decoded page afterwards.
-fn transcript_kinds_to_ipc(kinds: &std::collections::BTreeSet<TranscriptKind>) -> Vec<IpcKind> {
-    let mut out = Vec::new();
-    if kinds.contains(&TranscriptKind::Message) {
-        out.push(IpcKind::Message);
-    }
-    if kinds.contains(&TranscriptKind::Command) {
-        out.push(IpcKind::Command);
-    }
-    if kinds.contains(&TranscriptKind::CommandResult) {
-        out.push(IpcKind::CommandResult);
-    }
-    if kinds.iter().any(|kind| {
-        !matches!(
-            kind,
-            TranscriptKind::Message | TranscriptKind::Command | TranscriptKind::CommandResult
-        )
-    }) {
-        out.extend([
-            IpcKind::Event,
-            IpcKind::Signal,
-            IpcKind::StreamChunk,
-            IpcKind::Control,
-        ]);
-    }
-    out
-}
-
 fn target_to_mention(target: &Target) -> MentionTarget {
     match target {
         Target::Peer(peer) => MentionTarget::Peer(*peer),
@@ -125,11 +77,12 @@ fn target_to_mention(target: &Target) -> MentionTarget {
 /// Project a decoded owner-core envelope to the SDK transcript shape.
 pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
     TranscriptEvent {
+        class: env.class,
         event_id: env.event_id,
         room_id: env.channel,
         peer_id: env.from.0,
         client_id: env.from.1,
-        kind: kind_to_transcript(env.kind),
+        kind: env.kind.transcript_kind(),
         occurred_at_ms: env.occurred_at_ms,
         lamport: pack_seq(env.seq.epoch, env.seq.counter),
         target: target_to_mention(&env.target),
@@ -183,6 +136,9 @@ impl Airc {
         let receipt = self
             .require_daemon_client()?
             .send(SendRequest {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
@@ -202,6 +158,7 @@ impl Airc {
         &self,
         room: &Room,
         kind: FrameKind,
+        class: airc_core::EventClass,
         target: MentionTarget,
         body: Body,
         mut headers: airc_core::Headers,
@@ -217,6 +174,7 @@ impl Airc {
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
+                class,
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
@@ -240,6 +198,7 @@ impl Airc {
         &self,
         room: &Room,
         kind: FrameKind,
+        class: airc_core::EventClass,
         body: Body,
         mut headers: airc_core::Headers,
         delivery: airc_bus::DeliveryClass,
@@ -249,6 +208,7 @@ impl Airc {
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
+                class,
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
@@ -317,34 +277,6 @@ impl Airc {
             .collect()
     }
 
-    /// Continuum #297: [`Airc::daemon_page_recent`] with the consumer's
-    /// kind filter pushed down into the daemon's inbox read (mapped via
-    /// [`transcript_kinds_to_ipc`]), so the daemon pages the newest
-    /// `limit` events OF THOSE KINDS instead of a raw newest-`limit`
-    /// that a StreamChunk flood fills with events the caller discards.
-    pub(crate) async fn daemon_page_recent_of_kinds(
-        &self,
-        channel: RoomId,
-        kinds: &std::collections::BTreeSet<TranscriptKind>,
-        limit: usize,
-    ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let response = self
-            .require_daemon_client()?
-            .inbox(InboxRequest {
-                since: None,
-                channel: Some(channel),
-                limit: Some(limit),
-                kinds: Some(transcript_kinds_to_ipc(kinds)),
-                before: None,
-            })
-            .await?;
-        response
-            .envelopes
-            .into_iter()
-            .map(decode_wire_event)
-            .collect()
-    }
-
     pub(crate) async fn daemon_resume_from(
         &self,
         room: &Room,
@@ -373,31 +305,8 @@ impl Airc {
             .collect()
     }
 
-    /// Most-recent `limit` events across ALL subscribed rooms, via the
-    /// daemon. The owner-core router pages per channel, so this fans the
-    /// query over the subscription set and merges by total order
-    /// `(lamport, event_id)` — the daemon-backed equivalent of the
-    /// `page_recent_subscribed` direct path.
-    pub(crate) async fn daemon_page_recent_subscribed(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let set = self.subscription_set().await?;
-        let mut merged = Vec::new();
-        for subscription in set.all() {
-            let room = subscription.as_room();
-            merged.extend(self.daemon_page_recent(&room, limit).await?);
-        }
-        merged.sort_by_key(|event| event.lamport);
-        if merged.len() > limit {
-            merged = merged.split_off(merged.len() - limit);
-        }
-        Ok(merged)
-    }
-
     /// Events strictly after `cursor` across ALL subscribed rooms, via
-    /// the daemon. Same per-channel fan + merge as
-    /// [`Airc::daemon_page_recent_subscribed`], resuming each room from
+    /// the daemon, resuming each room from
     /// the shared `(epoch, counter)` packed in the cursor.
     pub(crate) async fn daemon_resume_from_subscribed(
         &self,
@@ -579,6 +488,7 @@ impl Airc {
         channels: Vec<RoomId>,
         delivery: Option<Vec<IpcDelivery>>,
         headers: airc_core::HeaderFilter,
+        selection: airc_core::EventSelection,
     ) -> Result<EventStream, AircError> {
         // Own the client so each reader task can re-attach after a daemon
         // restart (the borrow from `require_daemon_client` can't outlive
@@ -602,7 +512,8 @@ impl Airc {
             .attach_channel_sets;
         if daemon_serves_sets && channels.len() > 1 {
             let handle =
-                Self::daemon_subscribe_set(client, channels, delivery, headers, tx).await?;
+                Self::daemon_subscribe_set(client, channels, delivery, headers, selection, tx)
+                    .await?;
             return Ok(EventStream::daemon(rx, vec![handle]));
         }
         let mut handles = Vec::with_capacity(channels.len());
@@ -614,6 +525,7 @@ impl Airc {
                     None,
                     delivery.clone(),
                     headers.clone(),
+                    selection,
                     tx.clone(),
                 )
                 .await?,
@@ -631,6 +543,7 @@ fn channel_request(
     from: Option<IpcCursor>,
     delivery: Option<Vec<IpcDelivery>>,
     headers: airc_core::HeaderFilter,
+    selection: airc_core::EventSelection,
 ) -> AttachRequest {
     let mut request = match from {
         Some(cursor) => AttachRequest::new(channel, AttachStart::After(cursor)),
@@ -639,7 +552,7 @@ fn channel_request(
     if let Some(classes) = delivery {
         request = request.with_delivery(classes);
     }
-    request.with_headers(headers)
+    request.with_headers(headers).with_selection(selection)
 }
 
 /// The attach for a CHANNEL SET: every room with its own resume cursor
@@ -649,6 +562,7 @@ fn channel_set_request(
     cursors: &std::collections::HashMap<RoomId, IpcCursor>,
     delivery: Option<Vec<IpcDelivery>>,
     headers: airc_core::HeaderFilter,
+    selection: airc_core::EventSelection,
 ) -> AttachRequest {
     let mut request = AttachRequest::channel_set(
         channels
@@ -662,7 +576,7 @@ fn channel_set_request(
     if let Some(classes) = delivery {
         request = request.with_delivery(classes);
     }
-    request.with_headers(headers)
+    request.with_headers(headers).with_selection(selection)
 }
 
 /// Aborts the wrapped task when dropped: the per-room readers a set reader
@@ -686,6 +600,7 @@ async fn spawn_channel_reader(
     from: Option<IpcCursor>,
     delivery: Option<Vec<IpcDelivery>>,
     headers: airc_core::HeaderFilter,
+    selection: airc_core::EventSelection,
     tx: mpsc::Sender<Arc<TranscriptEvent>>,
 ) -> Result<tokio::task::JoinHandle<()>, AircError> {
     // Initial attach + ack — fail fast so `subscribe()` errors if
@@ -697,7 +612,7 @@ async fn spawn_channel_reader(
     // stored cursor — see `join_feed`).
     // `from` is the resume point a caller hands over (the set reader
     // falling back after a daemon rollback); `None` is the live edge.
-    let request = channel_request(channel, from, delivery.clone(), headers.clone());
+    let request = channel_request(channel, from, delivery.clone(), headers.clone(), selection);
     let mut stream = client.attach(request).await?; // typed: see `attach_ack`
     attach_ack(read_response_frame(&mut stream).await, "daemon attach")?;
     Ok(tokio::spawn(async move {
@@ -798,7 +713,9 @@ async fn spawn_channel_reader(
                 if let Some(classes) = delivery.clone() {
                     request = request.with_delivery(classes);
                 }
-                request = request.with_headers(headers.clone());
+                request = request
+                    .with_headers(headers.clone())
+                    .with_selection(selection);
                 let mut s = match client.attach(request).await {
                     Ok(s) => s,
                     Err(error) => {
@@ -853,6 +770,7 @@ impl Airc {
         channels: Vec<RoomId>,
         delivery: Option<Vec<IpcDelivery>>,
         headers: airc_core::HeaderFilter,
+        selection: airc_core::EventSelection,
         tx: mpsc::Sender<Arc<TranscriptEvent>>,
     ) -> Result<tokio::task::JoinHandle<()>, AircError> {
         let request_for = {
@@ -860,7 +778,13 @@ impl Airc {
             let delivery = delivery.clone();
             let headers = headers.clone();
             move |cursors: &std::collections::HashMap<RoomId, IpcCursor>| {
-                channel_set_request(&channels, cursors, delivery.clone(), headers.clone())
+                channel_set_request(
+                    &channels,
+                    cursors,
+                    delivery.clone(),
+                    headers.clone(),
+                    selection,
+                )
             }
         };
         let mut cursors: std::collections::HashMap<RoomId, IpcCursor> = Default::default();
@@ -946,6 +870,7 @@ impl Airc {
                                         cursors.get(&channel).copied(),
                                         delivery.clone(),
                                         headers.clone(),
+                                        selection,
                                         tx.clone(),
                                     )
                                     .await
@@ -1068,26 +993,6 @@ fn attach_ack(ack: std::io::Result<Option<Response>>, what: &str) -> Result<(), 
 mod tests {
     use super::*;
 
-    #[test]
-    fn command_categories_survive_projection_and_filter_pushdown() {
-        for (bus, transcript, ipc) in [
-            (Kind::Command, TranscriptKind::Command, IpcKind::Command),
-            (
-                Kind::CommandResult,
-                TranscriptKind::CommandResult,
-                IpcKind::CommandResult,
-            ),
-        ] {
-            assert_eq!(kind_to_transcript(bus), transcript);
-            let requested = std::collections::BTreeSet::from([transcript]);
-            assert_eq!(transcript_kinds_to_ipc(&requested), vec![ipc]);
-        }
-        let system =
-            transcript_kinds_to_ipc(&std::collections::BTreeSet::from([TranscriptKind::System]));
-        assert!(!system.contains(&IpcKind::Command));
-        assert!(!system.contains(&IpcKind::CommandResult));
-    }
-
     // what this catches (Codex on #1603): a replacement daemon that closes the attach before
     // acknowledging it, read as a refusal, which ends a reattaching feed for good. Through
     // the real frame reader: a close (before or inside the frame) is the daemon gone; a
@@ -1135,7 +1040,14 @@ mod tests {
             value_prefix: "airc.heartbeat.".to_string(),
         }));
 
-        let set = channel_set_request(&[a, b], &cursors, delivery.clone(), headers.clone());
+        let selection = airc_core::EventSelection::Correspondence;
+        let set = channel_set_request(
+            &[a, b],
+            &cursors,
+            delivery.clone(),
+            headers.clone(),
+            selection,
+        );
         let entries = set.channels().expect("a set attach");
         assert_eq!(entries[0].start(), AttachStart::After(cursor_a));
         assert_eq!(
@@ -1150,6 +1062,7 @@ mod tests {
                 cursors.get(&room).copied(),
                 delivery.clone(),
                 headers.clone(),
+                selection,
             );
             let expected = if room == a {
                 AttachStart::After(cursor_a)

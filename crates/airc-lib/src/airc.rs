@@ -1297,7 +1297,8 @@ impl Airc {
         if self.is_daemon_attached() {
             self.daemon_publish(
                 room,
-                airc_protocol::FrameKind::Event,
+                airc_protocol::FrameKind::Control,
+                airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle),
                 body,
                 airc_core::headers::Headers::new(),
                 // A wall post is history: durable, unchanged by the
@@ -2841,6 +2842,7 @@ mod wall_projection_tests {
     /// `project()` (which flattens non-`Message` kinds to `System`).
     fn event_with(kind: TranscriptKind, body: Option<Body>) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(7),
             room_id: RoomId::from_u128(1),
             peer_id: PeerId::from_u128(99),

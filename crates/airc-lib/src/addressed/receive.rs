@@ -247,6 +247,7 @@ mod expiry_tests {
         let mut original = Frame {
             kind: FrameKind::Addressed,
             envelope: Envelope {
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Addressed),
                 event_id: airc_core::EventId::new(),
                 sender: alice.peer_id(),
                 sender_client: alice.inner.identity.client_id,

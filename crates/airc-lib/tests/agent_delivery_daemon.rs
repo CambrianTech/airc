@@ -28,7 +28,13 @@ async fn daemon_history_is_counted_once_and_settles_when_searched() {
         page: 8,
     };
     let summary = page
-        .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+        .history_summary(
+            airc_lib::EventFilter::default(),
+            None,
+            |_| true,
+            &me,
+            window,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -50,7 +56,13 @@ async fn daemon_history_is_counted_once_and_settles_when_searched() {
             return;
         }
         let quiet = next
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+            .history_summary(
+                airc_lib::EventFilter::default(),
+                None,
+                |_| true,
+                &me,
+                window,
+            )
             .await
             .unwrap();
         assert!(quiet.is_none(), "count shown once, nothing addressed");
@@ -119,7 +131,13 @@ async fn measure_history_turn_on_a_50k_backlog() {
         let started = std::time::Instant::now();
         let mut turn = airc.prepare_agent_delivery(&consumer, 50, 8).await.unwrap();
         let summary = turn
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+            .history_summary(
+                airc_lib::EventFilter::default(),
+                None,
+                |_| true,
+                &me,
+                window,
+            )
             .await
             .unwrap();
         turn.acknowledge(0, true).await.unwrap();
@@ -133,9 +151,15 @@ async fn measure_history_turn_on_a_50k_backlog() {
             if !turn.has_history() {
                 break;
             }
-            turn.history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
-                .await
-                .unwrap();
+            turn.history_summary(
+                airc_lib::EventFilter::default(),
+                None,
+                |_| true,
+                &me,
+                window,
+            )
+            .await
+            .unwrap();
             turn.acknowledge(0, true).await.unwrap();
             walk_turns += 1;
             slowest = slowest.max(started.elapsed());

@@ -594,6 +594,8 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
         peer_id: ActiveValue::Set(ev.peer_id.as_uuid()),
         client_id: ActiveValue::Set(ev.client_id.as_uuid()),
         kind: ActiveValue::Set(kind.to_owned()),
+        class: ActiveValue::Set(Some(serde_json::to_string(&ev.class)?)),
+        class_family: ActiveValue::Set(Some(ev.class.family() as i32)),
         occurred_at_ms: ActiveValue::Set(ev.occurred_at_ms as i64),
         lamport: ActiveValue::Set(ev.lamport as i64),
         target: ActiveValue::Set(serde_json::to_value(&ev.target)?),
@@ -612,7 +614,7 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
         }),
         metadata: ActiveValue::Set(ev.metadata.clone()),
         addressed_peer: ActiveValue::Set(addressing.peer.map(|peer| peer.as_uuid())),
-        leading_mention: ActiveValue::Set(addressing.leading_mention),
+        leading_mention: ActiveValue::Set(false),
         derived_version: ActiveValue::Set(crate::derive::DERIVED_VERSION),
     })
 }
@@ -643,6 +645,7 @@ fn from_model(m: event::Model) -> Result<TranscriptEvent, StoreError> {
         peer_id: PeerId::from_uuid(m.peer_id),
         client_id: ClientId::from_uuid(m.client_id),
         kind,
+        class: crate::class_query::decode(m.event_id, m.class, m.class_family)?,
         occurred_at_ms: m.occurred_at_ms as u64,
         lamport: m.lamport as u64,
         target,

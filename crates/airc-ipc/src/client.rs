@@ -470,6 +470,9 @@ mod observation_tests {
         let frame = airc_protocol::Frame {
             kind: airc_protocol::FrameKind::Addressed,
             envelope: airc_protocol::Envelope {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 event_id: airc_core::EventId::new(),
                 sender: peer,
                 sender_client: airc_core::ClientId::new(),

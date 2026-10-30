@@ -5,8 +5,6 @@
 use airc_core::{Body, TranscriptEvent};
 use airc_lib::HistorySummary;
 
-use crate::work_suggestions::is_work_queue_event;
-
 /// How many items one hook notification shows: the digest's page, and the
 /// default of `--max-items`. A notification is read between steps, not browsed,
 /// so it carries a screenful and names how to read the rest. Unchanged from the
@@ -20,7 +18,7 @@ pub(super) const DIGEST_BODY_BYTES: usize = 4096;
 
 /// Peer correspondence, as opposed to work-queue churn and liveness beats.
 pub(super) fn is_correspondence(event: &TranscriptEvent) -> bool {
-    !is_work_queue_event(event) && !is_routine_liveness_event(event)
+    airc_core::EventSelection::Correspondence.matches(event.class)
 }
 
 /// An event's original time, to the minute in UTC. A line that shows an event
@@ -191,36 +189,6 @@ fn digest_messages<'a>(
         });
     }
     messages
-}
-
-fn is_routine_liveness_event(event: &TranscriptEvent) -> bool {
-    // Lease renewals are liveness, not agent correspondence. Keep the event in
-    // the durable transcript/raw output, but do not spend the digest budget on it.
-    if event
-        .headers
-        .get(airc_lib::HEADER_FORGE_WORK_EVENT_KIND)
-        .map(String::as_str)
-        == Some("claim_heartbeat")
-    {
-        return true;
-    }
-    let Some(body) = &event.body else {
-        return false;
-    };
-    match body {
-        Body::Binary(_) => false,
-        Body::Json(value) => {
-            body_kind_is_alive(value)
-                || body.as_text().is_some_and(|text| {
-                    serde_json::from_str::<serde_json::Value>(text)
-                        .is_ok_and(|value| body_kind_is_alive(&value))
-                })
-        }
-    }
-}
-
-fn body_kind_is_alive(value: &serde_json::Value) -> bool {
-    value.get("kind").and_then(|kind| kind.as_str()) == Some("alive")
 }
 
 pub(super) fn summarize_body(event: &TranscriptEvent) -> String {

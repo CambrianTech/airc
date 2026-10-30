@@ -84,10 +84,10 @@ pub trait DurableSink: Send + Sync {
         channel: RoomId,
         after: Cursor,
         through: Cursor,
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount> {
-        let _ = (channel, after, through, headers, exclude);
+        let _ = (channel, after, through, rule, exclude);
         Err(crate::BusError::Sink(
             "history count unsupported by sink".into(),
         ))
@@ -275,7 +275,7 @@ impl DurableSink for InMemoryDurableSink {
         channel: RoomId,
         after: Cursor,
         through: Cursor,
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -288,7 +288,7 @@ impl DurableSink for InMemoryDurableSink {
                 e.delivery.is_durable()
                     && e.cursor().is_after(&after)
                     && !e.cursor().is_after(&through)
-                    && headers.matches(&e.headers)
+                    && e.matches_history(rule)
                     && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
             })
             .fold(airc_core::HistoryCount::default(), |count, e| {
@@ -417,6 +417,7 @@ mod tests {
             channel,
             (PeerId::from_u128(1), ClientId::from_u128(1)),
             Kind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             DeliveryClass::Durable,
             Bytes::from_static(b"x"),
         )

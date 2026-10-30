@@ -158,6 +158,7 @@ mod tests {
         headers.insert("a.b\"%_".into(), "🌍_%Case\u{10FFFF}".into());
         let room = RoomId::new();
         let make = |n: u128, headers: Headers| TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(n),
             room_id: room,
             peer_id: PeerId::new(),

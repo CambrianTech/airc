@@ -19,7 +19,7 @@ async fn summarize(
     me: &airc_lib::Addressee,
     keep: impl Fn(&TranscriptEvent) -> bool,
 ) -> Option<airc_lib::HistorySummary> {
-    turn.history_summary(airc_core::HeaderFilter::Any, None, keep, me, WINDOW)
+    turn.history_summary(airc_lib::EventFilter::default(), None, keep, me, WINDOW)
         .await
         .unwrap()
 }
@@ -29,6 +29,7 @@ use crate::integrations::codex::hook::CODEX;
 #[test]
 fn lease_renewals_do_not_bury_peer_messages_and_remain_in_raw_output() {
     let mut renewal = event(Body::Json(json!({"kind":"claim_heartbeat"})));
+    renewal.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Presence);
     renewal.headers.insert(
         airc_lib::HEADER_FORGE_WORK_EVENT_KIND.into(),
         "claim_heartbeat".into(),
@@ -66,13 +67,12 @@ fn consumer_id_uses_the_runtime_verb_and_client() {
 fn digest_suppresses_runtime_alive_events_and_carries_original_times() {
     let mut real = event(Body::text("real update"));
     real.occurred_at_ms = 1_760_000_000_000;
-    let events = vec![
-        event(Body::Json(json!({
-            "kind": "alive",
-            "client_id": "claude:session-1",
-        }))),
-        real,
-    ];
+    let mut presence = event(Body::Json(json!({
+        "kind": "alive",
+        "client_id": "claude:session-1",
+    })));
+    presence.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Presence);
+    let events = vec![presence, real];
     let digest = render_digest(&events, 8, "claude-hook");
     assert!(digest.contains("AIRC: 1 unread"));
     assert!(
@@ -82,7 +82,10 @@ fn digest_suppresses_runtime_alive_events_and_carries_original_times() {
     assert!(!digest.contains("\"kind\":\"alive\""));
     // Raw output keeps them for debugging, including text-encoded beats.
     assert!(render_raw(&events).contains("\"kind\":\"alive\""));
-    assert!(render_digest(&[event(Body::text(r#"{"kind":"alive"}"#))], 8, "x").is_empty());
+    assert!(
+        render_digest(&[event(Body::text(r#"{"kind":"alive"}"#))], 8, "x").contains("alive"),
+        "correspondence content never changes its routing class"
+    );
 }
 
 #[test]
@@ -534,6 +537,7 @@ async fn burst_larger_than_a_turn_becomes_bounded_history_and_keeps_its_requests
 
 fn event(body: Body) -> TranscriptEvent {
     TranscriptEvent {
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         event_id: EventId::new(),
         room_id: RoomId::new(),
         peer_id: PeerId::new(),

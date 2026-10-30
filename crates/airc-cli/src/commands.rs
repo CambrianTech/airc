@@ -3902,7 +3902,7 @@ mod tests {
                     None,
                     false,
                     Vec::new(),
-                    crate::cli::PublishFrameKind::Message,
+                    crate::cli::PublishClass::Message,
                 )
                 .await,
             ] {

@@ -42,6 +42,9 @@ pub struct Model {
     /// `Kind` serialised as snake_case text (self-documenting; no enum
     /// mapping table migration when a kind is added).
     pub kind: String,
+    /// NULL preserves pre-classification rows as audit data, never routable events.
+    pub class: Option<String>,
+    pub class_family: Option<i32>,
     /// `DeliveryClass` serialised as snake_case text. Only `durable`
     /// rows ever reach this table (§3.3 efficiency keystone).
     pub delivery: String,
@@ -69,7 +72,7 @@ pub struct Model {
     /// ([`airc_bus::Envelope::addressing`]) so an addressee scan is indexed.
     /// The stored envelope itself is untouched.
     pub addressed_peer: Option<Uuid>,
-    /// The payload is a `Body` whose text opens with an `@name`.
+    /// Historical audit field; never used for routing.
     pub leading_mention: bool,
     /// The version of this row's derived data (addressing, header rows);
     /// below `crate::derive::DERIVED_VERSION` it is derived on the next open.

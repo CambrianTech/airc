@@ -76,6 +76,7 @@ impl EventStore for SqliteEventStore {
         // "Newest N" = order DESC by (lamport, event_id), take N,
         // then reverse so the caller iterates oldest → newest.
         let mut query = event::Entity::find()
+            .filter(event::Column::Class.is_not_null())
             .order_by_desc(event::Column::Lamport)
             .order_by_desc(event::Column::EventId)
             .limit(limit as u64);
@@ -96,14 +97,13 @@ impl EventStore for SqliteEventStore {
         limit: usize,
         tail: bool,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        let mut branches = Vec::new();
-        for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail) {
-            branches.push(query.all(&self.db).await?);
+        let mut rows = crate::event_query::matching(cursor, through, channels, rule, limit, tail)?
+            .all(&self.db)
+            .await?;
+        if tail {
+            rows.reverse();
         }
-        crate::event_table::merge_branches(branches, |row| (row.lamport, row.event_id), limit, tail)
-            .into_iter()
-            .map(from_model)
-            .collect()
+        rows.into_iter().map(from_model).collect()
     }
 
     async fn resume_from(
@@ -124,6 +124,7 @@ impl EventStore for SqliteEventStore {
                 .eq(cursor_lamport)
                 .and(Expr::col(event::Column::EventId).gt(cursor_event_id)));
         let mut query = event::Entity::find()
+            .filter(event::Column::Class.is_not_null())
             .filter(strictly_after)
             .order_by_asc(event::Column::Lamport)
             .order_by_asc(event::Column::EventId)
@@ -140,6 +141,7 @@ impl EventStore for SqliteEventStore {
         channel: Option<RoomId>,
     ) -> Result<Option<TranscriptCursor>, StoreError> {
         let mut query = event::Entity::find()
+            .filter(event::Column::Class.is_not_null())
             .order_by_desc(event::Column::Lamport)
             .order_by_desc(event::Column::EventId)
             .limit(1);

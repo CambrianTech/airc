@@ -543,7 +543,7 @@ where
     // filter, applied ROUTER-SIDE — the daemon never fans out an event a
     // consumer would discard (Hermes → Command/CommandResult; Continuum →
     // scoped `forge.*` headers; a media tap → StreamChunk only).
-    let mut filter = Filter::channel(channel);
+    let mut filter = Filter::channel(channel).with_selection(parts.selection);
     if let Some(kinds) = parts.kinds {
         match crate::kind_map::bus_kinds(kinds) {
             Ok(kinds) => filter = filter.with_kinds(kinds),
@@ -884,7 +884,7 @@ where
         .map(|d| d.into_iter().map(crate::kind_map::bus_delivery).collect());
     let headers = parts.headers;
     let filter_for = |room: airc_core::RoomId| {
-        let mut filter = Filter::channel(room);
+        let mut filter = Filter::channel(room).with_selection(parts.selection);
         if let Some(kinds) = kinds.clone() {
             filter = filter.with_kinds(kinds);
         }
@@ -1209,6 +1209,7 @@ mod shared_frame_cancellation_tests {
             RoomId::new(),
             (PeerId::new(), ClientId::new()),
             Kind::StreamChunk,
+            airc_core::EventClass::Control(airc_core::ControlKind::Stream),
             DeliveryClass::StreamChunk,
             bytes::Bytes::from_static(b"held by another writer"),
         ));
@@ -1236,6 +1237,7 @@ mod shared_frame_cancellation_tests {
                     channel,
                     (PeerId::new(), ClientId::new()),
                     Kind::StreamChunk,
+                    airc_core::EventClass::Control(airc_core::ControlKind::Stream),
                     DeliveryClass::StreamChunk,
                     bytes::Bytes::from_static(b"must await entry budget"),
                 ))
@@ -1297,6 +1299,7 @@ mod shared_frame_cancellation_tests {
                 channel,
                 (PeerId::new(), ClientId::new()),
                 Kind::Message,
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
                 DeliveryClass::Durable,
                 bytes::Bytes::from_static(text.as_bytes()),
             )

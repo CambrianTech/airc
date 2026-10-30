@@ -356,7 +356,8 @@ impl Airc {
         headers.insert(HEADER_WEBRTC_SIGNALING_KIND.into(), kind);
         headers.insert(HEADER_WEBRTC_SIGNALING_SESSION_ID.into(), session_id);
         self.send_frame_to(
-            FrameKind::Event,
+            FrameKind::Control,
+            airc_core::EventClass::Control(airc_core::ControlKind::Signal),
             airc_core::MentionTarget::Peer(target),
             Body::Json(body),
             headers,

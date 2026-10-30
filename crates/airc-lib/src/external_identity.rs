@@ -190,6 +190,7 @@ impl Airc {
         headers.insert(HEADER_BRIDGE_HANDLE.into(), handle);
         self.send_frame_to(
             FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             MentionTarget::All,
             Body::Json(body),
             headers,
@@ -361,6 +362,7 @@ mod tests {
         let mut headers = airc_core::headers::Headers::new();
         headers.insert(HEADER_BRIDGE_SOURCE.into(), "slack".to_string());
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: airc_core::EventId::new(),
             peer_id: airc_core::PeerId::new(),
             client_id: airc_core::ClientId::new(),

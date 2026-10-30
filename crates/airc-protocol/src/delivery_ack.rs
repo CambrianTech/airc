@@ -158,6 +158,7 @@ mod tests {
         Frame {
             kind: FrameKind::Control,
             envelope: Envelope {
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Receipt),
                 event_id: EventId::from_u128(0x1),
                 sender: PeerId::from_u128(0xa1),
                 sender_client: ClientId::from_u128(0xc1),

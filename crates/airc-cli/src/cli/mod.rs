@@ -327,9 +327,9 @@ pub enum Command {
         /// Header in `key=value` form. Repeatable.
         #[arg(long = "header", value_name = "KEY=VALUE")]
         headers: Vec<String>,
-        /// Frame kind. Defaults to `event` for structured payloads.
-        #[arg(long, value_enum, default_value = "event")]
-        kind: PublishFrameKind,
+        /// Required producer-declared semantic class; payloads are never inspected.
+        #[arg(long, value_enum)]
+        class: PublishClass,
     },
 
     /// Pull buffered frames from a subscribed room's wire. With
@@ -763,12 +763,31 @@ mod tests {
 /// `airc_protocol::FrameKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
-pub enum PublishFrameKind {
-    /// Plain message frame (human-readable chat).
+pub enum PublishClass {
     Message,
-    /// Structured event frame (recommended for typed envelopes
-    /// like Continuum's `AircRealtimeEnvelope`).
-    Event,
-    /// Control-plane signalling.
-    Control,
+    Announcement,
+    Intent,
+    WorkReceipt,
+    WorkState,
+    Presence,
+    Session,
+    Lifecycle,
+}
+
+impl From<PublishClass> for airc_core::EventClass {
+    fn from(value: PublishClass) -> Self {
+        use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
+        match value {
+            PublishClass::Message => EventClass::Correspondence(CorrespondenceKind::Message),
+            PublishClass::Announcement => {
+                EventClass::Correspondence(CorrespondenceKind::Announcement)
+            }
+            PublishClass::Intent => EventClass::Activity(ActivityKind::Intent),
+            PublishClass::WorkReceipt => EventClass::Activity(ActivityKind::WorkReceipt),
+            PublishClass::WorkState => EventClass::Activity(ActivityKind::WorkState),
+            PublishClass::Presence => EventClass::Activity(ActivityKind::Presence),
+            PublishClass::Session => EventClass::Control(ControlKind::Session),
+            PublishClass::Lifecycle => EventClass::Control(ControlKind::Lifecycle),
+        }
+    }
 }

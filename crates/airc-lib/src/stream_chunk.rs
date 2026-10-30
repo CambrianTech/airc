@@ -152,8 +152,14 @@ impl Airc {
             StreamPayload::Text(text) => Body::text(text.clone()),
             StreamPayload::Binary(bytes) => Body::Binary(bytes.clone()),
         };
-        self.send_frame_to(FrameKind::Event, MentionTarget::All, body, headers)
-            .await
+        self.send_frame_to(
+            FrameKind::Control,
+            airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+            MentionTarget::All,
+            body,
+            headers,
+        )
+        .await
     }
 
     /// Live stream of typed [`StreamChunk`]s observed on the substrate.
@@ -168,7 +174,14 @@ impl Airc {
     pub async fn subscribe_stream_chunks(
         &self,
     ) -> Result<impl Stream<Item = (Arc<TranscriptEvent>, StreamChunk)>, AircError> {
-        let inner = self.subscribe().await?;
+        let inner = self
+            .subscribe_filtered(crate::EventFilter {
+                selection: airc_core::EventSelection::Exact(airc_core::EventClass::Control(
+                    airc_core::ControlKind::Stream,
+                )),
+                ..crate::EventFilter::default()
+            })
+            .await?;
         Ok(inner.filter_map(|item| async move {
             let event = item.ok()?;
             let chunk = parse_stream_chunk(&event)?;
@@ -182,6 +195,9 @@ impl Airc {
 /// malformed (a missing/unparseable required header fails the decode —
 /// the chunk is skipped, never silently coerced to a default).
 fn parse_stream_chunk(event: &TranscriptEvent) -> Option<StreamChunk> {
+    if event.class != airc_core::EventClass::Control(airc_core::ControlKind::Stream) {
+        return None;
+    }
     let stream_id = event.headers.get(HEADER_STREAM_ID)?.to_string();
     let seq = event.headers.get(HEADER_STREAM_SEQ)?.parse::<u64>().ok()?;
     let kind = event.headers.get(HEADER_STREAM_KIND)?.to_string();
@@ -213,6 +229,7 @@ mod tests {
     // subscriber. Regresses silent header-key/parse drift.
     fn make_event(headers: Headers, body: Option<Body>) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Control(airc_core::ControlKind::Stream),
             event_id: airc_core::EventId::new(),
             room_id: airc_core::RoomId::from_u128(0xc0ffee),
             peer_id: airc_core::PeerId::from_u128(0xa1),

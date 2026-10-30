@@ -107,7 +107,8 @@ pub(crate) async fn run(
             // is the follow-up.
             let mut attach_start = start;
             loop {
-                let mut request = AttachRequest::new(channel, attach_start);
+                let mut request = AttachRequest::new(channel, attach_start)
+                    .with_selection(airc_core::EventSelection::Correspondence);
                 if coalesce_backlog {
                     request = request.with_coalesced_backlog();
                 }
@@ -390,6 +391,7 @@ mod tests {
 
     fn event(text: &str) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: PeerId::new(),

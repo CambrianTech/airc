@@ -3,7 +3,7 @@
 //! [`CountHistory`] is the narrow capability every [`crate::EventStore`] backing
 //! carries: `COUNT`, `MIN(occurred_at_ms)` and `MAX(occurred_at_ms)` over the
 //! rows in `(after, through]` of the given channels whose headers match a
-//! [`HeaderFilter`]. The header predicate is the store's own query layer
+//! [`HistoryMatch`]. The header predicate is the store's own query layer
 //! ([`crate::header_query`], typed subqueries on the header entity); no event
 //! body is read or allocated.
 
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 
-use airc_core::{HeaderFilter, HistoryCount, RoomId, RuntimeSelf, TranscriptCursor};
+use airc_core::{HistoryCount, HistoryMatch, RoomId, RuntimeSelf, TranscriptCursor};
 
 use crate::entities::event;
 use crate::error::StoreError;
@@ -26,7 +26,7 @@ pub trait CountHistory: Send + Sync {
         after: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[RoomId],
-        headers: &HeaderFilter,
+        rule: HistoryMatch<'_>,
         exclude: Option<&RuntimeSelf>,
     ) -> Result<HistoryCount, StoreError>;
 }
@@ -61,13 +61,13 @@ impl CountHistory for SqliteEventStore {
         after: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[RoomId],
-        headers: &HeaderFilter,
+        rule: HistoryMatch<'_>,
         exclude: Option<&RuntimeSelf>,
     ) -> Result<HistoryCount, StoreError> {
         let mut query = event::Entity::find()
             .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
             .filter(transcript_range(after, through))
-            .filter(crate::header_query::predicate::<event::Entity>(headers));
+            .filter(crate::class_query::matching::<event::Entity>(rule)?);
         if let Some(rule) = exclude {
             query = query.filter(crate::header_query::not_runtime_self::<event::Entity>(rule));
         }

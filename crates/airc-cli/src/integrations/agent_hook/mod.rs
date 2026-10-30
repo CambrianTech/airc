@@ -14,12 +14,11 @@ pub mod settings;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use airc_core::{TranscriptEvent, TranscriptKind};
+use airc_core::TranscriptEvent;
 use airc_lib::{AgentDeliveryTurn, Airc, EventFilter, LiveLag};
 use futures::StreamExt;
 
@@ -79,7 +78,7 @@ impl Default for DeliverySelection {
     fn default() -> Self {
         Self {
             filter: EventFilter {
-                kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
+                selection: airc_core::EventSelection::Correspondence,
                 ..EventFilter::default()
             },
             include_self: false,
@@ -102,22 +101,6 @@ impl DeliverySelection {
         !self
             .own_sends(rule)
             .is_some_and(|own| own.is_self_event(event))
-    }
-
-    /// The rest of the selection as a header predicate, for the store to count
-    /// history without reading events: liveness beats and work-queue churn are
-    /// routed out by their headers. (Own sends go through [`Self::own_sends`].)
-    fn count_filter(&self) -> airc_core::HeaderFilter {
-        use airc_core::HeaderFilter;
-        let absent = |key: &str| {
-            HeaderFilter::Not(Box::new(HeaderFilter::Has {
-                key: key.to_string(),
-            }))
-        };
-        HeaderFilter::All(vec![
-            absent(airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND),
-            absent(airc_lib::HEADER_FORGE_WORK_EVENT_KIND),
-        ])
     }
 }
 
@@ -249,7 +232,7 @@ async fn compose(
     };
     let history = turn
         .history_summary(
-            options.selection.count_filter(),
+            options.selection.filter.clone(),
             options.selection.own_sends(&self_filter),
             |e| {
                 options.selection.filter.matches(e) && (options.raw || render::is_correspondence(e))

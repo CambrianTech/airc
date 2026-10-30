@@ -37,6 +37,25 @@ enum Kind : ubyte {
   Control,
 }
 
+// Producer semantics. Zero is deliberately invalid at the public decode boundary.
+enum EventClass : ubyte {
+  Unspecified = 0,
+  CorrespondenceMessage,
+  CorrespondenceAnnouncement,
+  ActivityIntent,
+  ActivityWorkReceipt,
+  ActivityWorkState,
+  ActivityPresence,
+  ControlCommand,
+  ControlCommandResult,
+  ControlSession,
+  ControlReceipt,
+  ControlAddressed,
+  ControlSignal,
+  ControlStream,
+  ControlLifecycle,
+}
+
 // Delivery + retention class (§2, §3.3, §3.4). Mirrors
 // `airc_bus::envelope::DeliveryClass` exactly.
 enum DeliveryClass : ubyte {
@@ -80,6 +99,7 @@ table Envelope {
 
   // Category + delivery — single bytes.
   kind: Kind;
+  class: EventClass;
   delivery: DeliveryClass;
 
   // Owner-assigned total order `seq = (epoch, counter)` (§2, §3.8) and the

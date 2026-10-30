@@ -171,6 +171,7 @@ fn event(channel: RoomId, marker: u128, delivery: DeliveryClass) -> Envelope {
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         delivery,
         Bytes::from_static(b"tip-probe"),
     )

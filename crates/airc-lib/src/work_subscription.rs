@@ -167,6 +167,7 @@ mod tests {
             "anywhere".to_string(),
         );
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: PeerId::new(),
             client_id: airc_core::ClientId::new(),
@@ -190,6 +191,7 @@ mod tests {
         let other_peer = PeerId::new();
         let filter = WorkEventFilter::new().with_peer(target_peer);
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: other_peer,
             client_id: airc_core::ClientId::new(),
@@ -217,6 +219,7 @@ mod tests {
             "CambrianTech/airc".to_string(),
         );
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: PeerId::new(),
             client_id: airc_core::ClientId::new(),
@@ -244,6 +247,7 @@ mod tests {
             "wrong-org/wrong-repo".to_string(),
         );
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: PeerId::new(),
             client_id: airc_core::ClientId::new(),

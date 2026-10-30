@@ -128,6 +128,7 @@ impl std::error::Error for LiveLag {}
 /// have crossed into the durable store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
+    pub selection: airc_core::EventSelection,
     pub channel: Option<RoomId>,
     pub channels: HashSet<RoomId>,
     pub kinds: BTreeSet<TranscriptKind>,
@@ -156,6 +157,7 @@ pub struct SelfEcho {
 impl Default for EventFilter {
     fn default() -> Self {
         Self {
+            selection: airc_core::EventSelection::All,
             channel: None,
             channels: HashSet::new(),
             kinds: BTreeSet::new(),
@@ -190,6 +192,9 @@ impl EventFilter {
     }
 
     pub fn matches(&self, event: &TranscriptEvent) -> bool {
+        if !self.selection.matches(event.class) {
+            return false;
+        }
         if let Some(channel) = self.channel {
             if event.room_id != channel {
                 return false;
@@ -245,6 +250,7 @@ mod tests {
 
     fn event(room_id: RoomId, kind: TranscriptKind) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id,
             peer_id: PeerId::from_u128(0xa1),
@@ -258,6 +264,26 @@ mod tests {
             attachment: None,
             receipt: None,
             metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn semantic_selection_is_independent_of_body_and_labels() {
+        let filter = EventFilter {
+            selection: airc_core::EventSelection::Correspondence,
+            ..EventFilter::default()
+        };
+        let mut value = event(RoomId::new(), TranscriptKind::Message);
+        for body in [
+            Body::text("Codex: @Fable 🛠️ {\"kind\":\"alive\"}"),
+            Body::Binary(vec![255, 0, 7]),
+        ] {
+            value.body = Some(body);
+            value.class =
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message);
+            assert!(filter.matches(&value));
+            value.class = airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt);
+            assert!(!filter.matches(&value));
         }
     }
 

@@ -448,6 +448,9 @@ mod tests {
         Frame {
             kind: FrameKind::Message,
             envelope: Envelope {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 event_id: EventId::from_u128(lamport as u128),
                 sender: PeerId::from_u128(0xa1),
                 sender_client: ClientId::from_u128(0xc1),

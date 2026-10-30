@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 fn make_event(lamport: u64, room: RoomId, body: &str) -> TranscriptEvent {
     TranscriptEvent {
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         event_id: EventId::new(),
         room_id: room,
         peer_id: PeerId::from_u128(0xa1),
@@ -30,6 +31,13 @@ fn model_with_kind(kind: &str) -> event::Model {
         peer_id: Uuid::new_v4(),
         client_id: Uuid::new_v4(),
         kind: kind.to_string(),
+        class: Some(
+            serde_json::to_string(&airc_core::EventClass::Correspondence(
+                airc_core::CorrespondenceKind::Message,
+            ))
+            .expect("class"),
+        ),
+        class_family: Some(airc_core::EventFamily::Correspondence as i32),
         occurred_at_ms: 1_700_000_000_000,
         lamport: 1,
         target: json!(MentionTarget::All),
@@ -87,6 +95,9 @@ async fn addressee_scan_selects_candidates_by_indexed_columns() {
         event_id: EventId::from_u128(u128::MAX),
     };
     let rule = airc_core::HistoryMatch {
+        kinds: &std::collections::BTreeSet::new(),
+        self_echo: None,
+        selection: airc_core::EventSelection::All,
         headers: &airc_core::HeaderFilter::Any,
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
@@ -94,7 +105,7 @@ async fn addressee_scan_selects_candidates_by_indexed_columns() {
         .matching_history(&origin, &through, &[room], rule, 10, true)
         .await
         .unwrap();
-    assert_eq!(page, [typed, led]);
+    assert_eq!(page, [typed]);
 }
 
 // what this catches: the addressee scan must SEARCH the addressing indexes
@@ -123,14 +134,16 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         event_id: EventId::from_u128(u128::MAX),
     };
     let rule = airc_core::HistoryMatch {
+        kinds: &std::collections::BTreeSet::new(),
+        self_echo: None,
+        selection: airc_core::EventSelection::All,
         headers: &airc_core::HeaderFilter::Any,
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
-    let branches = crate::event_query::matching(&origin, &through, &[room], rule, 10, true);
-    let indexes = [
-        "idx_events_room_addressed_peer",
-        "idx_events_room_leading_mention",
+    let branches = [
+        crate::event_query::matching(&origin, &through, &[room], rule, 10, true).expect("query"),
     ];
+    let indexes = ["idx_events_room_addressed_peer"];
     assert_eq!(branches.len(), indexes.len(), "one select per branch");
     for (query, index) in branches.into_iter().zip(indexes) {
         let built = query.build(sea_orm::DbBackend::Sqlite);
@@ -676,3 +689,145 @@ async fn runtime_cursor_upserts_by_consumer_id() {
 }
 
 mod peer_state;
+
+// Selection happens before LIMIT and ignores text that resembles routing labels.
+#[tokio::test]
+async fn typed_history_survives_activity_flood_and_agrees_with_count() {
+    use crate::CountHistory;
+    use airc_core::{ActivityKind, EventClass, EventSelection, HeaderFilter, HistoryMatch};
+    let store = SqliteEventStore::in_memory().await.expect("store");
+    let room = RoomId::new();
+    let conversation = make_event(1, room, "✓ work receipt; alive; Codex: literal chat");
+    store.append(conversation.clone()).await.expect("chat");
+    for n in 2..100 {
+        let mut activity = make_event(n, room, "please answer this ordinary-looking prose");
+        activity.class = EventClass::Activity(ActivityKind::WorkReceipt);
+        store.append(activity).await.expect("activity");
+    }
+    let origin = TranscriptCursor {
+        lamport: 0,
+        event_id: EventId::from_u128(0),
+    };
+    let through = store
+        .latest_cursor(Some(room))
+        .await
+        .expect("cursor")
+        .expect("events");
+    let rule = HistoryMatch {
+        kinds: &std::collections::BTreeSet::new(),
+        self_echo: None,
+        selection: EventSelection::Correspondence,
+        headers: &HeaderFilter::Any,
+        addressed_to: None,
+    };
+    let page = store
+        .matching_history(&origin, &through, &[room], rule, 1, true)
+        .await
+        .expect("page");
+    assert_eq!(page, [conversation]);
+    assert_eq!(
+        store
+            .count_history(&origin, &through, &[room], rule, None)
+            .await
+            .expect("count")
+            .count,
+        1
+    );
+    let exact = HistoryMatch {
+        kinds: &std::collections::BTreeSet::new(),
+        self_echo: None,
+        selection: EventSelection::Exact(EventClass::Activity(ActivityKind::WorkReceipt)),
+        ..rule
+    };
+    assert_eq!(
+        store
+            .count_history(&origin, &through, &[room], exact, None)
+            .await
+            .expect("count")
+            .count,
+        98
+    );
+}
+
+// Pre-classification rows are preserved, never assigned a guessed class or
+// delivered as correspondence. New typed rows still page normally.
+#[tokio::test]
+async fn unclassified_rows_remain_audit_data() {
+    use sea_orm::{ActiveModelTrait, IntoActiveModel, PaginatorTrait};
+    let store = SqliteEventStore::in_memory().await.expect("store");
+    let mut old = model_with_kind("message");
+    old.class = None;
+    old.class_family = None;
+    let id = old.event_id;
+    old.into_active_model()
+        .insert(store.connection())
+        .await
+        .expect("audit row");
+    assert!(store
+        .page_recent(None, 10)
+        .await
+        .expect("typed page")
+        .is_empty());
+    assert_eq!(
+        event::Entity::find()
+            .count(store.connection())
+            .await
+            .expect("audit count"),
+        1
+    );
+    let row = event::Entity::find_by_id(id)
+        .one(store.connection())
+        .await
+        .expect("read")
+        .expect("preserved");
+    assert!(matches!(from_model(row), Err(StoreError::UnclassifiedEvent(found)) if found == id));
+}
+
+#[tokio::test]
+async fn kind_and_self_echo_share_the_bounded_history_contract() {
+    use crate::CountHistory;
+    use airc_core::{EventSelection, HeaderFilter, HistoryMatch, SelfFilter};
+    let store = SqliteEventStore::in_memory().await.expect("store");
+    let room = RoomId::new();
+    let remote = make_event(1, room, "remote");
+    store.append(remote.clone()).await.expect("remote");
+    let my_client = ClientId::from_u128(99);
+    for n in 2..50 {
+        let mut own = make_event(n, room, "own");
+        own.client_id = my_client;
+        store.append(own).await.expect("own");
+    }
+    let mut system = make_event(50, room, "system");
+    system.kind = TranscriptKind::System;
+    store.append(system).await.expect("system");
+    let origin = TranscriptCursor {
+        lamport: 0,
+        event_id: EventId::from_u128(0),
+    };
+    let through = store
+        .latest_cursor(Some(room))
+        .await
+        .expect("cursor")
+        .expect("events");
+    let kinds = [TranscriptKind::Message].into_iter().collect();
+    let rule = HistoryMatch {
+        kinds: &kinds,
+        self_echo: Some((remote.peer_id, my_client, SelfFilter::ExcludeSameClient)),
+        selection: EventSelection::All,
+        headers: &HeaderFilter::Any,
+        addressed_to: None,
+    };
+    let page = store
+        .matching_history(&origin, &through, &[room], rule, 1, true)
+        .await
+        .expect("page");
+    assert_eq!(page, [remote]);
+    assert_eq!(
+        store
+            .count_history(&origin, &through, &[room], rule, None)
+            .await
+            .expect("count")
+            .count,
+        1
+    );
+}

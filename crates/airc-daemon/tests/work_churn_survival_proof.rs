@@ -190,6 +190,7 @@ fn publish_work_event_request(
         from_peer,
         from_client,
         kind: IpcKind::Event,
+        class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
         delivery: IpcDelivery::Durable,
         target: IpcTarget::All,
         correlation_id: None,

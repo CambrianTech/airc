@@ -38,9 +38,9 @@ mod windows_pipe_security;
 /// that an already-running daemon cannot parse. The default CLI socket
 /// includes this value so `airc join` starts a current daemon instead of
 /// connecting to a stale daemon that speaks the previous protocol.
-// v6: authenticated addressed attach/challenge/proof and opaque addressed
-// frames. A v5 daemon cannot serve this contract; use a distinct endpoint.
-pub const IPC_PROTOCOL_VERSION: u16 = 6;
+// v7: required typed event semantics and subscription selections. Older
+// daemons cannot enforce this contract and must use a distinct endpoint.
+pub const IPC_PROTOCOL_VERSION: u16 = 7;
 
 pub use client::{ClientError, DaemonClient};
 pub use request::{

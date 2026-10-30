@@ -42,6 +42,7 @@ fn transcript(event_id: u128, lamport: u64, work_event: &WorkEvent) -> Transcrip
         peer_id: PeerId::from_u128(2),
         client_id: ClientId::from_u128(3),
         kind: TranscriptKind::System,
+        class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
         occurred_at_ms: work_event.occurred_at_ms(),
         lamport,
         target: MentionTarget::All,

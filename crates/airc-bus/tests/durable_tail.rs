@@ -205,6 +205,19 @@ fn kinded_event(channel: RoomId, marker: u128, kind: Kind, delivery: DeliveryCla
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
         kind,
+        match kind {
+            Kind::Event => airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
+            Kind::Command => airc_core::EventClass::Control(airc_core::ControlKind::Command),
+            Kind::CommandResult => {
+                airc_core::EventClass::Control(airc_core::ControlKind::CommandResult)
+            }
+            Kind::Signal => airc_core::EventClass::Control(airc_core::ControlKind::Signal),
+            Kind::StreamChunk => airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+            Kind::Control => airc_core::EventClass::Control(airc_core::ControlKind::Session),
+            Kind::Message => {
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message)
+            }
+        },
         delivery,
         Bytes::from_static(b"tail-page"),
     )

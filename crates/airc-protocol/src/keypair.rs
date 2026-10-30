@@ -163,6 +163,7 @@ mod tests {
             "forge.persona.turn".to_string(),
         );
         Envelope {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(0x01),
             sender: peer,
             sender_client: ClientId::from_u128(0xc1),
@@ -223,6 +224,37 @@ mod tests {
             kind: FrameKind::Message,
             envelope,
         };
+        assert_eq!(
+            verify(&frame, VerificationPolicy::Strict, &registry),
+            Err(VerificationError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn relabelling_activity_as_correspondence_invalidates_signature() {
+        let peer = PeerId::from_u128(0xa1);
+        let keypair = PeerKeypair::generate();
+        let mut envelope = envelope_fixture(peer);
+        envelope.class = airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt);
+        envelope.signature = keypair
+            .sign_envelope(&envelope, peer, 0)
+            .expect("sign activity");
+        let registry = PeerKeyRegistry::new();
+        registry
+            .enrol(peer, 0, keypair.public_bytes())
+            .expect("enrol signer");
+        let mut frame = Frame {
+            kind: FrameKind::Event,
+            envelope,
+        };
+        assert!(verify(&frame, VerificationPolicy::Strict, &registry).is_ok());
+        frame.kind = FrameKind::Message;
+        assert_eq!(
+            verify(&frame, VerificationPolicy::Strict, &registry),
+            Err(VerificationError::ClassMismatch)
+        );
+        frame.envelope.class =
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message);
         assert_eq!(
             verify(&frame, VerificationPolicy::Strict, &registry),
             Err(VerificationError::BadSignature)

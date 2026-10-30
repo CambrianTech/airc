@@ -16,6 +16,19 @@ fn full_envelope(kind: Kind, delivery: DeliveryClass, target: Target, payload: B
         RoomId::from_u128(0xc0ffee),
         (PeerId::from_u128(0xa1), ClientId::from_u128(0xc1)),
         kind,
+        match kind {
+            Kind::Event => airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
+            Kind::Command => airc_core::EventClass::Control(airc_core::ControlKind::Command),
+            Kind::CommandResult => {
+                airc_core::EventClass::Control(airc_core::ControlKind::CommandResult)
+            }
+            Kind::Signal => airc_core::EventClass::Control(airc_core::ControlKind::Signal),
+            Kind::StreamChunk => airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+            Kind::Control => airc_core::EventClass::Control(airc_core::ControlKind::Session),
+            Kind::Message => {
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message)
+            }
+        },
         delivery,
         payload,
     )
@@ -149,6 +162,7 @@ fn round_trip_optionals_none() {
         RoomId::from_u128(1),
         (PeerId::from_u128(2), ClientId::from_u128(3)),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         Bytes::from_static(b"bare"),
     );
@@ -402,6 +416,7 @@ fn sixteen_byte_payload_envelope_stays_lean() {
         RoomId::from_u128(0xabc),
         (PeerId::from_u128(0xa), ClientId::from_u128(0xb)),
         Kind::StreamChunk,
+        airc_core::EventClass::Control(airc_core::ControlKind::Stream),
         DeliveryClass::StreamChunk,
         Bytes::from_static(&[0u8; 16]),
     );
@@ -433,4 +448,72 @@ fn decode_garbage_is_typed_error_not_panic() {
 fn decode_empty_buffer_is_typed_error() {
     let err = decode(Bytes::new()).expect_err("empty buffer must not decode");
     let _ = format!("{err}");
+}
+
+#[test]
+fn typed_semantics_roundtrip_with_opaque_bytes() {
+    use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
+    let classes = [
+        EventClass::Correspondence(CorrespondenceKind::Message),
+        EventClass::Correspondence(CorrespondenceKind::Announcement),
+        EventClass::Activity(ActivityKind::Intent),
+        EventClass::Activity(ActivityKind::WorkReceipt),
+        EventClass::Activity(ActivityKind::WorkState),
+        EventClass::Activity(ActivityKind::Presence),
+        EventClass::Control(ControlKind::Command),
+        EventClass::Control(ControlKind::CommandResult),
+        EventClass::Control(ControlKind::Session),
+        EventClass::Control(ControlKind::Receipt),
+        EventClass::Control(ControlKind::Signal),
+        EventClass::Control(ControlKind::Stream),
+        EventClass::Control(ControlKind::Lifecycle),
+    ];
+    for class in classes {
+        let mut env = full_envelope(
+            Kind::for_class(class).expect("supported class"),
+            DeliveryClass::Durable,
+            Target::All,
+            Bytes::from_static(&[0xff, 0x80, 0]),
+        );
+        env.class = class;
+        let encoded = encode(&env);
+        assert_eq!(
+            WireEnvelope::read(&encoded)
+                .expect("view")
+                .class()
+                .expect("class"),
+            class
+        );
+        assert_eq!(decode(encoded).expect("decode"), env);
+    }
+}
+
+#[test]
+fn absent_unknown_or_mismatched_class_cannot_be_decoded_as_chat() {
+    let env = full_envelope(
+        Kind::Message,
+        DeliveryClass::Durable,
+        Target::All,
+        Bytes::from_static(b"opaque"),
+    );
+    let encoded = encode(&env);
+    let table = u32::from_le_bytes(encoded[0..4].try_into().expect("root")) as usize;
+    let displacement = i32::from_le_bytes(encoded[table..table + 4].try_into().expect("vtable"));
+    let vtable = (table as i64 - i64::from(displacement)) as usize;
+    // schema slot 5 is EventClass; this assertion pins the schema/codec seam.
+    let slot = vtable + 4 + 5 * 2;
+    let offset =
+        u16::from_le_bytes(encoded[slot..slot + 2].try_into().expect("class slot")) as usize;
+    assert_ne!(offset, 0, "valid producers must encode class");
+    let mut absent = encoded.to_vec();
+    absent[slot..slot + 2].copy_from_slice(&[0, 0]);
+    assert!(decode(Bytes::from(absent)).is_err());
+    let mut unknown = encoded.to_vec();
+    unknown[table + offset] = 255;
+    assert!(decode(Bytes::from(unknown)).is_err());
+    let mut mismatched = env;
+    mismatched.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Presence);
+    assert!(decode(encode(&mismatched)).is_err());
+    mismatched.class = airc_core::EventClass::Control(airc_core::ControlKind::Addressed);
+    assert!(decode(encode(&mismatched)).is_err());
 }

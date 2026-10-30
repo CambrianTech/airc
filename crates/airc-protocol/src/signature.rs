@@ -184,6 +184,8 @@ impl PeerKeyRegistry {
 /// What can go wrong when verifying a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
+    /// Unsigned transport discriminator disagrees with signed semantics.
+    ClassMismatch,
     /// `Signature::Unsigned` submitted under `Strict` policy.
     MissingSignature,
 
@@ -214,6 +216,9 @@ pub enum VerificationError {
 impl std::fmt::Display for VerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            VerificationError::ClassMismatch => {
+                write!(f, "frame kind disagrees with signed event class")
+            }
             VerificationError::MissingSignature => {
                 write!(f, "frame is unsigned and policy is Strict")
             }
@@ -247,6 +252,9 @@ pub fn verify(
     // Step 1: structural validation. Cheaper than crypto, and a mismatch
     // here means *something* is wrong even if the bytes happen to verify.
     check_reply_to_consistency(&frame.envelope)?;
+    if frame.kind != crate::FrameKind::for_class(frame.envelope.class) {
+        return Err(VerificationError::ClassMismatch);
+    }
 
     // Step 2: signature dispatch.
     match &frame.envelope.signature {
@@ -372,6 +380,7 @@ mod tests {
     /// All ids deterministic so failure cases are stable.
     fn envelope_with(sig: Signature) -> Envelope {
         Envelope {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(0x01),
             sender: PeerId::from_u128(0xa1),
             sender_client: ClientId::from_u128(0xc1),

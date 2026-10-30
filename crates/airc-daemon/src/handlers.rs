@@ -129,6 +129,7 @@ async fn publish_envelope(
     channel: uuid::Uuid,
     from: (PeerId, ClientId),
     kind: Kind,
+    class: airc_core::EventClass,
     delivery: DeliveryClass,
     target: Target,
     correlation_id: Option<uuid::Uuid>,
@@ -145,6 +146,7 @@ async fn publish_envelope(
         // intact across the one-daemon-per-machine fan-out.
         from,
         kind,
+        class,
         delivery,
         // Opaque consumer bytes — moved straight into the envelope; the
         // daemon never parses the payload (boundary-encoding discipline).
@@ -182,6 +184,7 @@ async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
             ClientId::from_uuid(send.from_client),
         ),
         Kind::Message,
+        send.class,
         DeliveryClass::Durable,
         Target::All,
         None,
@@ -209,6 +212,7 @@ async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Res
             ClientId::from_uuid(publish.from_client),
         ),
         kind,
+        publish.class,
         crate::kind_map::bus_delivery(publish.delivery),
         map_target(publish.target),
         publish.correlation_id,
@@ -556,6 +560,7 @@ mod tests {
             RoomId::from_u128(7),
             (PeerId::from_u128(1), ClientId::from_u128(2)),
             Kind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             DeliveryClass::Durable,
             Bytes::from(vec![b'x'; payload_len]),
         ))
@@ -612,6 +617,9 @@ async fn handle_scan_inbox(
             after,
             through,
             airc_core::HistoryMatch {
+                selection: request.selection,
+                kinds: &request.kinds,
+                self_echo: request.self_echo,
                 headers: &request.headers,
                 addressed_to: request.addressed_to,
             },
@@ -648,7 +656,13 @@ async fn handle_count_inbox(
             request.channel,
             after,
             through,
-            &request.headers,
+            airc_core::HistoryMatch {
+                selection: request.selection,
+                kinds: &request.kinds,
+                self_echo: request.self_echo,
+                headers: &request.headers,
+                addressed_to: request.addressed_to,
+            },
             request.exclude_self.as_ref(),
         )
         .await
@@ -738,6 +752,7 @@ mod scan_tests {
                 room,
                 (PeerId::from_u128(2), ClientId::from_u128(3)),
                 Kind::Message,
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
                 DeliveryClass::Durable,
                 Bytes::from(vec![255; size]),
             );
@@ -746,6 +761,9 @@ mod scan_tests {
         };
         let cap = airc_ipc::codec::MAX_FRAME_BYTES as usize;
         let request = airc_ipc::request::ScanInboxRequest {
+            selection: airc_core::EventSelection::All,
+            kinds: std::collections::BTreeSet::new(),
+            self_echo: None,
             channel: room,
             after: IpcCursor {
                 epoch: u64::MAX,
@@ -793,6 +811,7 @@ mod scan_tests {
                     room,
                     (PeerId::from_u128(2), ClientId::from_u128(3)),
                     Kind::Message,
+                    airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
                     DeliveryClass::Durable,
                     Bytes::from(vec![0; 1024]),
                 );
@@ -801,6 +820,9 @@ mod scan_tests {
             })
             .collect();
         let request = airc_ipc::request::ScanInboxRequest {
+            selection: airc_core::EventSelection::All,
+            kinds: std::collections::BTreeSet::new(),
+            self_echo: None,
             channel: room,
             after: IpcCursor {
                 epoch: 1,

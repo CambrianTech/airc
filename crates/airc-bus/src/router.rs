@@ -596,6 +596,7 @@ impl EventRouter {
         mut env: Envelope,
         origin: Option<PeerId>,
     ) -> crate::Result<crate::Seq> {
+        env.kind.validate_class(env.class)?;
         // Reserve persistence capacity before exposing the event to the ring,
         // subscribers, or deduplication. Rejection must leave no pinned event
         // with no writer responsible for it. This is nonblocking admission;
@@ -779,6 +780,7 @@ impl EventRouter {
         env: Envelope,
         origin: Option<PeerId>,
     ) -> crate::Result<PublishIfNew> {
+        env.kind.validate_class(env.class)?;
         let already_recent = {
             let mut recent = self
                 .inner

@@ -176,7 +176,7 @@ fn post_tool_hook_session_input_isolates_shared_home_cursors() {
 }
 
 #[test]
-fn hook_reads_current_message_after_typed_legacy_chunk_backlog() {
+fn hook_reads_correspondence_after_activity_backlog() {
     let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
     run_ok(&home, &["init"]);
@@ -199,8 +199,8 @@ fn hook_reads_current_message_after_typed_legacy_chunk_backlog() {
                 "airc.stream.id=legacy",
                 "--header",
                 "airc.client=claude:backlog-peer",
-                "--kind",
-                "event",
+                "--class",
+                "work-receipt",
             ],
         );
     }
@@ -218,8 +218,8 @@ fn hook_reads_current_message_after_typed_legacy_chunk_backlog() {
             "ordinary-system-warning",
             "--header",
             "airc.client=claude:backlog-peer",
-            "--kind",
-            "event",
+            "--class",
+            "announcement",
         ],
     );
     let output = run_hook_with_client(

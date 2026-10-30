@@ -65,6 +65,7 @@ pub fn canonical_signed_bytes(envelope: &Envelope) -> Result<Vec<u8>, CanonicalE
 /// Borrowed so encoding doesn't clone the body/headers/media.
 #[derive(Serialize)]
 struct SignedPayload<'envelope> {
+    class: airc_core::EventClass,
     event_id: &'envelope EventId,
     sender: &'envelope PeerId,
     sender_client: &'envelope ClientId,
@@ -81,6 +82,7 @@ struct SignedPayload<'envelope> {
 impl<'envelope> SignedPayload<'envelope> {
     fn from_envelope(envelope: &'envelope Envelope) -> Self {
         Self {
+            class: envelope.class,
             event_id: &envelope.event_id,
             sender: &envelope.sender,
             sender_client: &envelope.sender_client,
@@ -115,6 +117,7 @@ mod tests {
         );
         headers.insert("airc.trace_id".to_string(), "trace-abc-123".to_string());
         Envelope {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(0x01),
             sender: PeerId::from_u128(0xa1),
             sender_client: ClientId::from_u128(0xc1),

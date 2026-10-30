@@ -37,15 +37,15 @@ fn attach_start_wire_bytes_are_pinned_per_variant() {
     for (start, expected) in [
         (
             AttachStart::Live,
-            r#"{"channel":"00000000-0000-0000-0000-000000000000","from_now":true,"headers":"any"}"#,
+            r#"{"selection":{"select":"all"},"channel":"00000000-0000-0000-0000-000000000000","from_now":true,"headers":"any"}"#,
         ),
         (
             AttachStart::After(cursor(7)),
-            r#"{"channel":"00000000-0000-0000-0000-000000000000","from":{"epoch":1,"counter":7,"event_id":"00000000-0000-0000-0000-00000000feed"},"headers":"any"}"#,
+            r#"{"selection":{"select":"all"},"channel":"00000000-0000-0000-0000-000000000000","from":{"epoch":1,"counter":7,"event_id":"00000000-0000-0000-0000-00000000feed"},"headers":"any"}"#,
         ),
         (
             AttachStart::FromTranscriptStart,
-            r#"{"channel":"00000000-0000-0000-0000-000000000000","headers":"any"}"#,
+            r#"{"selection":{"select":"all"},"channel":"00000000-0000-0000-0000-000000000000","headers":"any"}"#,
         ),
     ] {
         let encoded = serde_json::to_string(&AttachRequest::new(channel, start)).unwrap();
@@ -58,7 +58,10 @@ fn attach_start_wire_bytes_are_pinned_per_variant() {
 /// full transcript replay — so version-skewed peers interoperate.
 #[test]
 fn legacy_bare_attach_decodes_as_transcript_start() {
-    let legacy = format!(r#"{{"channel":"{}"}}"#, Uuid::nil());
+    let legacy = format!(
+        r#"{{"selection":{{"select":"all"}},"channel":"{}"}}"#,
+        Uuid::nil()
+    );
     let decoded: AttachRequest = serde_json::from_str(&legacy).unwrap();
     assert_eq!(decoded.start(), AttachStart::FromTranscriptStart);
     assert!(!decoded.coalesces_backlog());
@@ -70,7 +73,7 @@ fn legacy_bare_attach_decodes_as_transcript_start() {
 #[test]
 fn from_now_takes_precedence_over_cursor_on_the_wire() {
     let skewed = format!(
-        r#"{{"channel":"{}","from":{},"from_now":true}}"#,
+        r#"{{"selection":{{"select":"all"}},"channel":"{}","from":{},"from_now":true}}"#,
         Uuid::nil(),
         serde_json::to_string(&cursor(3)).unwrap(),
     );
@@ -186,6 +189,7 @@ fn remove_peer_roundtrips_with_peer_id() {
 #[test]
 fn send_roundtrips_with_typed_fields() {
     let original = Request::Send(SendRequest {
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         channel: Uuid::nil(),
         from_peer: Uuid::from_u128(0x1),
         from_client: Uuid::from_u128(0x2),
@@ -200,6 +204,7 @@ fn send_roundtrips_with_typed_fields() {
 #[test]
 fn publish_roundtrips_with_typed_body_and_kind() {
     let original = Request::Publish(PublishRequest {
+        class: airc_core::EventClass::Control(airc_core::ControlKind::Command),
         channel: Uuid::nil(),
         from_peer: Uuid::from_u128(0x1),
         from_client: Uuid::from_u128(0x2),
@@ -221,7 +226,7 @@ fn publish_delivery_defaults_to_durable_when_absent() {
     // A client that omits `delivery` (simple chat publish) must
     // decode as Durable — the streaming classes are opt-in.
     let decoded: Request = serde_json::from_str(
-        r#"{"op":"publish","channel":"00000000-0000-0000-0000-000000000000","from_peer":"00000000-0000-0000-0000-000000000001","from_client":"00000000-0000-0000-0000-000000000002","kind":"message","payload":[104,105]}"#,
+        r#"{"op":"publish","channel":"00000000-0000-0000-0000-000000000000","from_peer":"00000000-0000-0000-0000-000000000001","from_client":"00000000-0000-0000-0000-000000000002","class":{"family":"correspondence","kind":"message"},"kind":"message","payload":[104,105]}"#,
     )
     .unwrap();
     match decoded {
@@ -377,5 +382,42 @@ fn stop_serializes_compactly() {
     assert_eq!(
         serde_json::to_string(&Request::Stop).unwrap(),
         r#"{"op":"stop"}"#
+    );
+}
+
+#[test]
+fn missing_or_unknown_semantics_are_rejected() {
+    let request = Request::Publish(PublishRequest {
+        class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
+        channel: Uuid::nil(),
+        from_peer: Uuid::nil(),
+        from_client: Uuid::nil(),
+        kind: IpcKind::Event,
+        delivery: IpcDelivery::Durable,
+        target: IpcTarget::All,
+        correlation_id: None,
+        coalesce_key: None,
+        payload: vec![0xff, 0, 0x80],
+        headers: Headers::new(),
+    });
+    let mut value = serde_json::to_value(request).unwrap();
+    value.as_object_mut().unwrap().remove("class");
+    assert!(serde_json::from_value::<Request>(value.clone()).is_err());
+    value["class"] = serde_json::json!({"family":"activity", "kind":"unknown"});
+    assert!(serde_json::from_value::<Request>(value).is_err());
+    let mut attach = serde_json::to_value(AttachRequest::live(airc_core::RoomId::new())).unwrap();
+    attach.as_object_mut().unwrap().remove("selection");
+    assert!(serde_json::from_value::<AttachRequest>(attach).is_err());
+}
+
+#[test]
+fn attach_selection_roundtrips_and_reaches_serving_parts() {
+    let request = AttachRequest::live(airc_core::RoomId::new())
+        .with_selection(airc_core::EventSelection::Correspondence);
+    let decoded: AttachRequest =
+        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    assert_eq!(
+        decoded.into_parts().selection,
+        airc_core::EventSelection::Correspondence
     );
 }

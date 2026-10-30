@@ -138,6 +138,7 @@ fn control_event_over_udp_without_lan_or_relay() {
         alice
             .send_frame_to_for_test(
                 FrameKind::Event,
+                airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
                 MentionTarget::Peer(bob_spec.peer_id),
                 Body::text("udp-control-ping"),
                 headers,
