@@ -360,7 +360,7 @@ mod tests {
             Some(Response::Ok)
         );
         let mut frame = test_frame(peer);
-        frame.envelope.body = Some(airc_protocol::Body::Binary(vec![0; 1024]));
+        frame.envelope.body = Some(airc_core::Body::Binary(vec![0; 1024]));
         state
             .addressed
             .route(
