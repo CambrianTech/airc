@@ -150,6 +150,18 @@ async fn production_bridges_forward_signed_frames_bidirectionally_without_storag
         .attach_addressed(bob.0, b.state.peer_id, &bob.1, 0)
         .await
         .unwrap();
+    // Opening identities and enrolling peers may emit lifecycle events. Capture
+    // all channels before sending so those records cannot mask new persistence.
+    let mut before = Vec::new();
+    for machine in [&a, &b] {
+        let store =
+            airc_store::SqliteEventStore::open_path(&machine.home.path().join("events.sqlite"))
+                .await
+                .unwrap();
+        let snapshot = store.page_recent(None, 100_000).await.unwrap();
+        assert!(snapshot.len() < 100_000, "baseline scan truncated");
+        before.push(snapshot);
+    }
     for (sender, recipient, client, inbox) in [
         (&alice, bob.0, &a.client, &mut bob_inbox),
         (&bob, alice.0, &b.client, &mut alice_inbox),
@@ -187,12 +199,17 @@ async fn production_bridges_forward_signed_frames_bidirectionally_without_storag
                 .unwrap();
         assert_eq!(received, Some(Response::Addressed { frame }));
     }
-    for machine in [&a, &b] {
+    for (machine, baseline) in [&a, &b].into_iter().zip(before) {
         let store =
             airc_store::SqliteEventStore::open_path(&machine.home.path().join("events.sqlite"))
                 .await
                 .unwrap();
-        assert!(store.page_recent(None, 100).await.unwrap().is_empty());
+        let after = store.page_recent(None, 100_000).await.unwrap();
+        assert!(after.len() < 100_000, "post-send scan truncated");
+        assert_eq!(
+            after, baseline,
+            "addressed exchange changed the durable transcript"
+        );
     }
     drop(alice_inbox);
     drop(bob_inbox);
