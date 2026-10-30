@@ -296,8 +296,13 @@ impl LocalIdentity {
     ///   [`IdentityError::PartialState`]: state exists in its pre-ORM form
     ///   but the secret half is gone; minting here would rotate an existing
     ///   citizen.
-    /// - rows present (any agent), no key file → [`IdentityError::PartialState`]:
-    ///   the secret half is gone; minting here would rotate an existing
+    /// - rows exist under other agents' names, no shared key file, and at
+    ///   least one per-agent key survives → [`IdentityError::IdentityNotInitialised`]:
+    ///   the home holds living citizens; opening must not add a citizen beside them,
+    ///   so the requested identity is simply not initialised here.
+    /// - rows present (any agent), no key material at all →
+    ///   [`IdentityError::PartialState`]:
+    ///   the secret half is gone fleet-wide; minting here would rotate an existing
     ///   citizen.
     /// - nothing at all → fresh mint (the ONLY arm that writes).
     pub async fn load_or_generate_as_with_peer_id(
