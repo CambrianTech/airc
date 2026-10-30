@@ -37,6 +37,7 @@
 pub mod account_registry;
 pub mod account_registry_fs;
 pub mod adapter;
+pub mod addressed;
 mod agent_feed;
 pub mod agent_heartbeat;
 pub mod airc;

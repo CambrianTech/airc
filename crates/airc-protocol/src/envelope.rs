@@ -86,6 +86,9 @@ pub enum FrameKind {
     Command,
     /// Addressed protocol response to a correlated command.
     CommandResult,
+    /// Peer-to-peer traffic readable by its two ends only: a handshake step or
+    /// a sealed command/result (`crate::addressed`). Never persisted.
+    Addressed,
 }
 
 /// One wire-level frame. A transport adapter carries `Frame`s in either

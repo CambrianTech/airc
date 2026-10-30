@@ -19,6 +19,7 @@
 //! so callers say `use airc_protocol::Envelope;` rather than reach
 //! into module paths.
 
+pub mod addressed;
 pub mod assertion;
 pub mod canonical;
 pub mod delivery_ack;

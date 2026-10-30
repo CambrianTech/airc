@@ -32,7 +32,7 @@ use crate::keypair::PeerKeypair;
 use crate::session::{SessionRole, StreamSession};
 use crate::signature::PeerKeyRegistry;
 
-const DOMAIN_INIT: &[u8] = b"airc-stream-handshake-v1-init";
+const DOMAIN_INIT: &[u8] = b"airc-stream-handshake-v2-init";
 const DOMAIN_RESP: &[u8] = b"airc-stream-handshake-v1-resp";
 const DOMAIN_TRANSCRIPT: &[u8] = b"airc-stream-handshake-v1-transcript";
 
@@ -53,6 +53,10 @@ pub enum HandshakeError {
     /// Deriving the [`StreamSession`] keys failed (HKDF) — unreachable for the
     /// fixed key size, propagated rather than panicked (no-panic gate).
     KeyDerivation,
+    /// The init names a different responder. Its signature binds the responder,
+    /// so an init recorded on its way to one peer cannot open a session with
+    /// another.
+    NotAddressedToMe,
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -67,6 +71,9 @@ impl std::fmt::Display for HandshakeError {
                 )
             }
             HandshakeError::KeyDerivation => write!(f, "handshake session key derivation failed"),
+            HandshakeError::NotAddressedToMe => {
+                write!(f, "handshake init names a different responder")
+            }
         }
     }
 }
@@ -83,8 +90,15 @@ pub struct HandshakeInit {
     pub key_id: u32,
     /// The initiator's ephemeral X25519 public key.
     pub eph_pub: [u8; 32],
-    /// Ed25519 over `DOMAIN_INIT || key_id || eph_pub || peer_id` by the
-    /// initiator's identity key.
+    /// The responder this init is for. Signed, so a recorded init cannot be
+    /// replayed to a different peer.
+    pub to: PeerId,
+    /// The initiator's clock when it signed. Signed; a responder accepts only an
+    /// init newer than the last one it accepted from this initiator, so a
+    /// recorded init cannot replace a live session (see `SessionManager::on_init`).
+    pub issued_at_ms: u64,
+    /// Ed25519 over `DOMAIN_INIT || key_id || eph_pub || peer_id || to ||
+    /// issued_at_ms` by the initiator's identity key.
     #[serde(with = "crate::signature::serde_bytes_64")]
     pub sig: [u8; 64],
 }
@@ -120,13 +134,22 @@ fn uuid_bytes(peer: PeerId) -> [u8; 16] {
 }
 
 /// Bytes the initiator signs (and the responder verifies). Binds the advertised
-/// `key_id` so it can't be tampered to point the verifier at a different key.
-fn init_signed_bytes(eph_pub: &[u8; 32], peer: PeerId, key_id: u32) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(DOMAIN_INIT.len() + 4 + 32 + 16);
+/// `key_id` so it can't be tampered to point the verifier at a different key, and
+/// the responder and issue time so the init can't be replayed elsewhere or later.
+fn init_signed_bytes(
+    eph_pub: &[u8; 32],
+    peer: PeerId,
+    key_id: u32,
+    to: PeerId,
+    issued_at_ms: u64,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(DOMAIN_INIT.len() + 4 + 32 + 16 + 16 + 8);
     msg.extend_from_slice(DOMAIN_INIT);
     msg.extend_from_slice(&key_id.to_be_bytes());
     msg.extend_from_slice(eph_pub);
     msg.extend_from_slice(&uuid_bytes(peer));
+    msg.extend_from_slice(&uuid_bytes(to));
+    msg.extend_from_slice(&issued_at_ms.to_be_bytes());
     msg
 }
 
@@ -190,20 +213,30 @@ fn checked_shared(
     Ok(shared.to_bytes())
 }
 
-/// Start a handshake: generate an ephemeral, sign it, return the wire message +
-/// the pending state to complete with the responder's reply.
+/// Start a handshake with `to`: generate an ephemeral, sign it, return the wire
+/// message + the pending state to complete with the responder's reply.
 pub fn initiate(
     keypair: &PeerKeypair,
     my_peer_id: PeerId,
     key_id: u32,
+    to: PeerId,
+    issued_at_ms: u64,
 ) -> (PendingHandshake, HandshakeInit) {
     let secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let eph_pub = PublicKey::from(&secret).to_bytes();
-    let sig = keypair.sign_bytes(&init_signed_bytes(&eph_pub, my_peer_id, key_id));
+    let sig = keypair.sign_bytes(&init_signed_bytes(
+        &eph_pub,
+        my_peer_id,
+        key_id,
+        to,
+        issued_at_ms,
+    ));
     let init = HandshakeInit {
         peer_id: my_peer_id,
         key_id,
         eph_pub,
+        to,
+        issued_at_ms,
         sig,
     };
     (
@@ -230,9 +263,18 @@ pub fn respond(
         registry,
         init.peer_id,
         init.key_id,
-        &init_signed_bytes(&init.eph_pub, init.peer_id, init.key_id),
+        &init_signed_bytes(
+            &init.eph_pub,
+            init.peer_id,
+            init.key_id,
+            init.to,
+            init.issued_at_ms,
+        ),
         &init.sig,
     )?;
+    if init.to != my_peer_id {
+        return Err(HandshakeError::NotAddressedToMe);
+    }
 
     let secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let eph_pub = PublicKey::from(&secret).to_bytes();
@@ -314,7 +356,7 @@ mod tests {
         let (a, b) = (peer(), peer());
         let reg = registry(&[&a, &b]);
 
-        let (pending, init) = initiate(&a.keypair, a.id, 0);
+        let (pending, init) = initiate(&a.keypair, a.id, 0, b.id, 1);
         let (mut b_sess, resp) = respond(&b.keypair, b.id, 0, &init, &reg).unwrap();
         let mut a_sess = pending.complete(&resp, &reg).unwrap();
 
@@ -330,7 +372,7 @@ mod tests {
     fn unknown_initiator_rejected() {
         let (a, b) = (peer(), peer());
         let reg = registry(&[&b]); // a NOT enrolled
-        let (_pending, init) = initiate(&a.keypair, a.id, 0);
+        let (_pending, init) = initiate(&a.keypair, a.id, 0, b.id, 1);
         assert_eq!(
             respond(&b.keypair, b.id, 0, &init, &reg).err(),
             Some(HandshakeError::UnknownPeer)
@@ -343,7 +385,7 @@ mod tests {
     fn tampered_init_rejected() {
         let (a, b) = (peer(), peer());
         let reg = registry(&[&a, &b]);
-        let (_pending, mut init) = initiate(&a.keypair, a.id, 0);
+        let (_pending, mut init) = initiate(&a.keypair, a.id, 0, b.id, 1);
         init.eph_pub[0] ^= 0x01; // swap the ephemeral; sig no longer matches
         assert_eq!(
             respond(&b.keypair, b.id, 0, &init, &reg).err(),
@@ -360,9 +402,9 @@ mod tests {
         let reg = registry(&[&a, &b]);
 
         // Our handshake.
-        let (pending, _init) = initiate(&a.keypair, a.id, 0);
+        let (pending, _init) = initiate(&a.keypair, a.id, 0, b.id, 1);
         // A DIFFERENT initiator ephemeral the responder replied to.
-        let (_other_pending, other_init) = initiate(&a.keypair, a.id, 0);
+        let (_other_pending, other_init) = initiate(&a.keypair, a.id, 0, b.id, 1);
         let (_b_sess, resp_for_other) = respond(&b.keypair, b.id, 0, &other_init, &reg).unwrap();
 
         // Completing OUR pending with a response bound to the other handshake
@@ -381,11 +423,11 @@ mod tests {
         let (a, b) = (peer(), peer());
         let reg = registry(&[&a, &b]);
 
-        let (p1, i1) = initiate(&a.keypair, a.id, 0);
+        let (p1, i1) = initiate(&a.keypair, a.id, 0, b.id, 1);
         let (mut b1, r1) = respond(&b.keypair, b.id, 0, &i1, &reg).unwrap();
         let _a1 = p1.complete(&r1, &reg).unwrap();
 
-        let (p2, i2) = initiate(&a.keypair, a.id, 0);
+        let (p2, i2) = initiate(&a.keypair, a.id, 0, b.id, 1);
         let (_b2, r2) = respond(&b.keypair, b.id, 0, &i2, &reg).unwrap();
         let mut a2 = p2.complete(&r2, &reg).unwrap();
 
@@ -403,11 +445,15 @@ mod tests {
         let (a, b) = (peer(), peer());
         let reg = registry(&[&a, &b]);
         let eph_pub = [0u8; 32]; // low-order / identity point
-        let sig = a.keypair.sign_bytes(&init_signed_bytes(&eph_pub, a.id, 0));
+        let sig = a
+            .keypair
+            .sign_bytes(&init_signed_bytes(&eph_pub, a.id, 0, b.id, 1));
         let init = HandshakeInit {
             peer_id: a.id,
             key_id: 0,
             eph_pub,
+            to: b.id,
+            issued_at_ms: 1,
             sig,
         };
         assert_eq!(
@@ -426,7 +472,7 @@ mod tests {
         reg.enrol(a.id, 1, a.keypair.public_bytes()).unwrap();
         reg.enrol(b.id, 1, b.keypair.public_bytes()).unwrap();
 
-        let (pending, init) = initiate(&a.keypair, a.id, 1);
+        let (pending, init) = initiate(&a.keypair, a.id, 1, b.id, 1);
         let (mut b_sess, resp) = respond(&b.keypair, b.id, 1, &init, &reg).unwrap();
         let mut a_sess = pending.complete(&resp, &reg).unwrap();
         let f = a_sess.seal(b"", b"rotated").unwrap();
@@ -439,10 +485,44 @@ mod tests {
     fn unknown_key_id_rejected() {
         let (a, b) = (peer(), peer());
         let reg = registry(&[&a, &b]); // enrolled under key_id 0 only
-        let (_pending, init) = initiate(&a.keypair, a.id, 1); // advertises key_id 1
+        let (_pending, init) = initiate(&a.keypair, a.id, 1, b.id, 1); // advertises key_id 1
         assert_eq!(
             respond(&b.keypair, b.id, 0, &init, &reg).err(),
             Some(HandshakeError::UnknownPeer)
+        );
+    }
+
+    // what this catches: an init recorded on its way to B and replayed to C is
+    // refused (the signature binds the responder), so it can't key a session
+    // with, or overwrite the live session of, a peer it was never sent to.
+    #[test]
+    fn init_replayed_to_another_responder_rejected() {
+        let (a, b, c) = (peer(), peer(), peer());
+        let reg = registry(&[&a, &b, &c]);
+        let (_pending, init) = initiate(&a.keypair, a.id, 0, b.id, 1);
+        assert_eq!(
+            respond(&c.keypair, c.id, 0, &init, &reg).err(),
+            Some(HandshakeError::NotAddressedToMe)
+        );
+    }
+
+    // what this catches: the responder and issue time are inside the signature,
+    // not trusted metadata: retargeting or re-dating an init breaks it.
+    #[test]
+    fn retargeted_or_redated_init_fails_its_signature() {
+        let (a, b, c) = (peer(), peer(), peer());
+        let reg = registry(&[&a, &b, &c]);
+        let (_p1, mut retargeted) = initiate(&a.keypair, a.id, 0, b.id, 1);
+        retargeted.to = c.id;
+        assert_eq!(
+            respond(&c.keypair, c.id, 0, &retargeted, &reg).err(),
+            Some(HandshakeError::BadSignature)
+        );
+        let (_p2, mut redated) = initiate(&a.keypair, a.id, 0, b.id, 1);
+        redated.issued_at_ms = 2;
+        assert_eq!(
+            respond(&b.keypair, b.id, 0, &redated, &reg).err(),
+            Some(HandshakeError::BadSignature)
         );
     }
 }

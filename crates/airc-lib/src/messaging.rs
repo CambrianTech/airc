@@ -201,7 +201,7 @@ impl Airc {
         let __route = airc_diagnostics::timing::start();
         match self.resolve_send_route(kind, &frame.envelope.target).await {
             Ok(route) => {
-                if let Err(error) = self.execute_send_route(route.kind, room, frame).await {
+                if let Err(error) = self.execute_send_route(route.kind, frame).await {
                     tracing::warn!(
                         target: "airc::messaging",
                         %event_id,
@@ -233,7 +233,7 @@ impl Airc {
         })
     }
 
-    async fn resolve_send_route(
+    pub(crate) async fn resolve_send_route(
         &self,
         kind: FrameKind,
         target: &airc_core::MentionTarget,
@@ -298,7 +298,9 @@ impl Airc {
         // because the sender already persisted, but our local
         // subscribers haven't seen it).
         self.observe_presence(&frame);
-        let event = frame.into_transcript_event();
+        let event = frame
+            .into_transcript_event()
+            .map_err(|refusal| AircError::Route(refusal.to_string()))?;
         let event_id = event.event_id;
         // Routed live, never history: a non-durable class (a backfill reply is
         // a whole page of frames) fans out to live subscribers and stops there.
@@ -672,9 +674,10 @@ impl Airc {
 
 fn route_class_for_frame(kind: FrameKind) -> RouteClass {
     match kind {
-        FrameKind::Message | FrameKind::Command | FrameKind::CommandResult => {
-            RouteClass::DataInteractive
-        }
+        FrameKind::Message
+        | FrameKind::Command
+        | FrameKind::CommandResult
+        | FrameKind::Addressed => RouteClass::DataInteractive,
         FrameKind::Event | FrameKind::Control => RouteClass::ControlInteractive,
     }
 }

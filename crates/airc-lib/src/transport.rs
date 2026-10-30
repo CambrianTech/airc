@@ -287,6 +287,13 @@ impl Airc {
             let _ = self.inner.ack_tx.send(ack);
             return;
         }
+        // Addressed traffic is readable by its two ends only: it goes to its
+        // owner before anything below could store or fan it out, on every
+        // path (scope store, daemon sink, live ring).
+        if frame.kind == airc_protocol::FrameKind::Addressed {
+            self.receive_addressed(frame).await;
+            return;
+        }
         let ack_requested = airc_protocol::wants_delivery_ack(&frame);
         // Card 1998f6cb: the ack must travel back over the LINK the
         // frame arrived on. For a point-to-point send the link peer IS
@@ -321,7 +328,7 @@ impl Airc {
                 .get(crate::backfill::HEADER_AIRC_BACKFILL)
                 .filter(|value| *value == "request")
                 .and_then(|_| {
-                    let event = frame.clone().into_transcript_event();
+                    let event = transcribable(frame.clone())?;
                     (crate::backfill::BackfillRequest::from_event(&event).is_some()
                         && crate::command_bus::reply_addressing(&event).is_some())
                     .then_some(event)
@@ -350,7 +357,9 @@ impl Airc {
                 crate::router_bridge::InboundDeliveryVerdict::Delivered => {
                     // In-process fan-out for any subscriber of THIS
                     // handle, ring-deduped exactly like the store path.
-                    let event = frame.into_transcript_event();
+                    let Some(event) = transcribable(frame) else {
+                        return;
+                    };
                     // Record an observed peer identity card into the durable
                     // index. In daemon-host mode the owner-core sink owns the
                     // transcript, so this handle's index would never see the
@@ -378,7 +387,9 @@ impl Airc {
                     // channel-name header — the addressed UUID binds no
                     // scope here. Fan out + ack under the channel the
                     // frame actually landed in, so both stay truthful.
-                    let mut event = frame.into_transcript_event();
+                    let Some(mut event) = transcribable(frame) else {
+                        return;
+                    };
                     event.room_id = local;
                     self.observe_identity_event(&event).await;
                     if self.mark_broadcast(event_id) {
@@ -465,7 +476,9 @@ impl Airc {
         }
 
         self.observe_presence(&frame);
-        let event = frame.into_transcript_event();
+        let Some(event) = transcribable(frame) else {
+            return;
+        };
         let event_id = event.event_id;
         // The store dedups persistence by event_id —
         // `DuplicateEventId` just means another writer already
@@ -601,6 +614,19 @@ pub(crate) fn link_origin(frame: &Frame) -> airc_core::PeerId {
     match frame.envelope.signature {
         airc_protocol::Signature::Ed25519 { signer, .. } => signer,
         airc_protocol::Signature::Unsigned => frame.envelope.sender,
+    }
+}
+
+/// The transcript form of an inbound frame. Addressed frames are routed to
+/// their owner before any caller reaches here, so a refusal is a routing
+/// defect: logged loudly, and the frame is never stored.
+fn transcribable(frame: Frame) -> Option<airc_core::TranscriptEvent> {
+    match frame.into_transcript_event() {
+        Ok(event) => Some(event),
+        Err(refusal) => {
+            tracing::error!(target: "airc::addressed", %refusal, "addressed frame reached the transcript path");
+            None
+        }
     }
 }
 
