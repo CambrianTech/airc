@@ -192,6 +192,8 @@ This is the boundary Continuum needs:
 
 ## GitHub Governor Semantics
 
+Owned by [NETWORK-AUTHORITY.md](NETWORK-AUTHORITY.md) (contract 5): gh is one resource of the network authority. The rule below stands there.
+
 The GitHub governor only gates GitHub-backed invite and rendezvous operations.
 It must not mark local, LAN, Tailscale, UDP, relay, WebRTC, or Reticulum delivery as
 degraded.
