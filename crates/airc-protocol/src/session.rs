@@ -196,15 +196,9 @@ impl StreamSession {
         })
     }
 
-    /// Open a sealed frame: replay-check (in-window + unseen), then AEAD-verify,
+    /// Open a sealed frame: AEAD-verify, then replay-check (in-window + unseen),
     /// then mark seen. Returns the plaintext, or an error the caller drops on.
     pub fn open(&mut self, frame: &SealedFrame, aad: &[u8]) -> Result<Vec<u8>, SessionError> {
-        // Cheap pre-check before spending a decrypt; the window is only
-        // ADVANCED below, after authentication, so a forged counter can't
-        // poison it.
-        if !self.replay.would_accept(frame.counter) {
-            return Err(SessionError::Replay);
-        }
         let nonce = nonce_from_counter(frame.counter);
         let plaintext = self
             .open_key
@@ -216,6 +210,12 @@ impl StreamSession {
                 },
             )
             .map_err(|_| SessionError::AeadFailed)?;
+        // A restarted peer can reuse a counter under a different session key.
+        // Authenticate before classifying replay so the owner can distinguish
+        // that session mismatch from a genuine duplicate and initiate re-keying.
+        if !self.replay.would_accept(frame.counter) {
+            return Err(SessionError::Replay);
+        }
         self.replay.record(frame.counter);
         Ok(plaintext)
     }
@@ -301,6 +301,22 @@ mod tests {
         let f = i.seal(b"", b"once").unwrap();
         assert_eq!(r.open(&f, b"").unwrap(), b"once");
         assert_eq!(r.open(&f, b""), Err(SessionError::Replay));
+    }
+
+    #[test]
+    fn reused_counter_from_another_session_is_authentication_failure() {
+        let (mut i, mut r) = pair();
+        let original = i.seal(b"", b"original").unwrap();
+        r.open(&original, b"").unwrap();
+        let mut restarted =
+            StreamSession::derive(&[42; 32], b"restarted transcript", SessionRole::Initiator)
+                .unwrap();
+        let changed_session = restarted.seal(b"", b"new session").unwrap();
+        assert_eq!(changed_session.counter, original.counter);
+        assert_eq!(r.open(&changed_session, b""), Err(SessionError::AeadFailed));
+        assert_eq!(r.open(&original, b""), Err(SessionError::Replay));
+        let next = i.seal(b"", b"still valid").unwrap();
+        assert_eq!(r.open(&next, b"").unwrap(), b"still valid");
     }
 
     // what this catches: in-window REORDER is fine (UDP delivers out of order)

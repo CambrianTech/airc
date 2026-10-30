@@ -316,6 +316,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -330,6 +331,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -417,6 +419,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "uuid",
  "x25519-dalek",
 ]
 

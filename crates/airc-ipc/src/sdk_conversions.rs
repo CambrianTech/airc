@@ -56,6 +56,7 @@ impl From<FrameKind> for IpcKind {
             FrameKind::Control => IpcKind::Control,
             FrameKind::Command => IpcKind::Command,
             FrameKind::CommandResult => IpcKind::CommandResult,
+            FrameKind::Addressed => IpcKind::Addressed,
         }
     }
 }

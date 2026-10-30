@@ -58,7 +58,8 @@ pub(super) async fn dispatch_to_subscribers(inner: &Arc<Inner>, frame: Frame) {
             FrameKind::Message
             | FrameKind::Control
             | FrameKind::Command
-            | FrameKind::CommandResult => {
+            | FrameKind::CommandResult
+            | FrameKind::Addressed => {
                 // Backpressure-bearing — block on slow consumer.
                 tx.send(Ok(frame.clone())).await.map_err(|_| ())
             }

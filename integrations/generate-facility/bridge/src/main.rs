@@ -20,14 +20,13 @@ mod llamacpp;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use airc_core::PeerId;
 use airc_core::PersonaCapabilities;
-use airc_core::{PeerId, TranscriptEvent};
-use airc_lib::Airc;
+use airc_lib::{AddressedKind, Airc, VerifiedAddressed};
 use consumer_shapes::continuum::{
     decode_persona_event, encode_capability_offer, reply_turn_emitted, CapabilityOffer,
     PersonaEvent, TurnEmitted, HEADER_FORGE_PERSONA_KIND,
 };
-use futures::StreamExt;
 
 /// Re-advertise cadence — under the registry freshness TTL (cross-grid spine
 /// uses 180s) so a live facility never flaps stale and gets skipped by
@@ -150,7 +149,9 @@ async fn run_bridge(
     base_url: &str,
     cfg: &GenConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = airc.subscribe().await?;
+    let mut stream = airc
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await?;
     let mut readvertise = tokio::time::interval(READVERTISE_EVERY);
     readvertise.tick().await; // first tick is immediate; already advertised at startup
 
@@ -162,28 +163,24 @@ async fn run_bridge(
                 }
             }
             item = stream.next() => {
-                let Some(item) = item else { break };
-                match item {
-                    Ok(event) => {
-                        if is_turn_request(&event, me) {
-                            handle_turn_request(airc, &event, http, base_url, cfg).await;
-                        }
-                    }
-                    Err(lag) => eprintln!("airc-generate-bridge: live stream lagged: {lag}"),
+                let event = item.map_err(|error| format!("addressed command inbox: {error:?}"))?;
+                if is_turn_request(&event, me) {
+                    handle_turn_request(airc, &event, http, base_url, cfg).await;
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// True iff this event is a persona `TurnRequested` from another peer. Cheap:
 /// keys off the projected `forge.persona.kind = turn_requested` header (the
 /// wire kind matching `PersonaEvent::TurnRequested`), no body decode.
-fn is_turn_request(event: &TranscriptEvent, me: PeerId) -> bool {
-    event.peer_id != me
+fn is_turn_request(event: &VerifiedAddressed, me: PeerId) -> bool {
+    event.kind() == AddressedKind::Command
+        && event.to() == me
+        && event.from() != me
         && event
-            .headers
+            .headers()
             .get(HEADER_FORGE_PERSONA_KIND)
             .map(String::as_str)
             == Some("turn_requested")
@@ -195,12 +192,12 @@ fn is_turn_request(event: &TranscriptEvent, me: PeerId) -> bool {
 /// requester's `await_reply` deadlines loudly on a non-reply.
 async fn handle_turn_request(
     airc: &Airc,
-    event: &TranscriptEvent,
+    event: &VerifiedAddressed,
     http: &reqwest::Client,
     base_url: &str,
     cfg: &GenConfig,
 ) {
-    let req = match decode_persona_event(&event.headers, event.body.as_ref()) {
+    let req = match decode_persona_event(event.headers(), Some(event.body())) {
         Ok(PersonaEvent::TurnRequested(r)) => r,
         Ok(_) => return, // some other persona event; not ours to answer
         Err(e) => {
@@ -243,7 +240,7 @@ async fn handle_turn_request(
         text,
         emitted_at_ms: now_ms(),
     };
-    if let Err(e) = reply_turn_emitted(airc, &event.headers, &emitted).await {
+    if let Err(e) = reply_turn_emitted(airc, event, &emitted).await {
         eprintln!(
             "airc-generate-bridge: reply failed for {}: {e}",
             req.turn_id
@@ -261,52 +258,6 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use airc_core::{Body, EventId, RoomId, TranscriptKind};
-
-    fn turn_event(peer: PeerId, kind: &str) -> TranscriptEvent {
-        let mut headers = airc_core::headers::Headers::new();
-        headers.insert(HEADER_FORGE_PERSONA_KIND.to_string(), kind.to_string());
-        TranscriptEvent {
-            event_id: EventId::new(),
-            room_id: RoomId::from_u128(1),
-            peer_id: peer,
-            client_id: airc_core::ClientId::new(),
-            kind: TranscriptKind::Message,
-            occurred_at_ms: 1,
-            lamport: 1,
-            target: airc_core::transcript::MentionTarget::All,
-            headers,
-            body: Some(Body::text("{}")),
-            attachment: None,
-            receipt: None,
-            metadata: serde_json::Value::Null,
-        }
-    }
-
-    #[test]
-    fn detects_turn_request_from_another_peer() {
-        // what this catches: the facility answers TurnRequested from other peers
-        // — the command-bus turn a GridInferenceProvider escalates.
-        let me = PeerId::from_u128(1);
-        let other = PeerId::from_u128(2);
-        assert!(is_turn_request(&turn_event(other, "turn_requested"), me));
-    }
-
-    #[test]
-    fn turn_emitted_is_not_a_request() {
-        // what this catches: the facility answers requests, not replies — a
-        // turn_emitted (its own or another's) must not be treated as inbound work.
-        let me = PeerId::from_u128(1);
-        let other = PeerId::from_u128(2);
-        assert!(!is_turn_request(&turn_event(other, "turn_emitted"), me));
-    }
-
-    #[test]
-    fn own_turn_request_is_ignored() {
-        let me = PeerId::from_u128(1);
-        assert!(!is_turn_request(&turn_event(me, "turn_requested"), me));
-    }
-
     #[test]
     fn capability_offer_advertises_coarse_slug_and_raw_model() {
         // what this catches: model_hint routing matches the RAW model string as
@@ -325,5 +276,48 @@ mod tests {
     fn model_tag_slugifies() {
         assert_eq!(model_tag("Qwen3-Coder-30B"), "ai/generate/qwen3-coder-30b");
         assert_eq!(model_tag("llama 3.1 8b"), "ai/generate/llama-3.1-8b");
+    }
+    #[tokio::test]
+    async fn only_verified_request_for_this_facility_is_admitted() {
+        let sender_home = tempfile::TempDir::new().unwrap();
+        let receiver_home = tempfile::TempDir::new().unwrap();
+        let sender = Airc::open(sender_home.path()).await.unwrap();
+        let receiver = Airc::open(receiver_home.path()).await.unwrap();
+        sender
+            .add_peer(receiver.peer_spec().parse().unwrap())
+            .await
+            .unwrap();
+        receiver
+            .add_peer(sender.peer_spec().parse().unwrap())
+            .await
+            .unwrap();
+        let addr = receiver
+            .listen_lan("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        sender.connect_lan(addr, receiver.peer_id()).await.unwrap();
+        let mut inbox = receiver
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        for (wire_kind, admitted) in [("turn_requested", true), ("turn_emitted", false)] {
+            let mut headers = airc_lib::Headers::new();
+            headers.insert(HEADER_FORGE_PERSONA_KIND.to_string(), wire_kind.to_string());
+            let _pending = sender
+                .request(
+                    airc_lib::MentionTarget::Peer(receiver.peer_id()),
+                    headers,
+                    airc_core::Body::text("{}"),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            let verified = tokio::time::timeout(Duration::from_secs(5), inbox.next())
+                .await
+                .unwrap()
+                .expect("verified delivery");
+            assert_eq!(is_turn_request(&verified, receiver.peer_id()), admitted);
+            assert!(!is_turn_request(&verified, sender.peer_id()));
+        }
     }
 }

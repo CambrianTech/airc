@@ -18,9 +18,8 @@ use airc_bus::{Clock, Seq, SystemClock};
 use airc_core::scoped_state::{ScopeRef, PEER_IDENTITY_STATE_KEY};
 use airc_core::{Body, ClientId, PeerId, RoomId};
 use airc_ipc::request::{
-    AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
-    PeerIdentityCardRequest, PresenceRequest, PublishRequest, RemovePeerRequest, Request,
-    RoomTipRequest, SendRequest,
+    AddPeerRequest, InboxRequest, IpcCursor, IpcTarget, PeerIdentityCardRequest, PresenceRequest,
+    PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 use airc_ipc::response::{
     InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry, PeerIdentityCardResponse,
@@ -43,6 +42,12 @@ const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as 
 /// wire protocol stays uniform.
 pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
     match request {
+        Request::Addressed(request) => {
+            crate::addressed_connection::route_request(&state, request).await
+        }
+        Request::AttachAddressed(_) | Request::ProveAddressed(_) => Response::Error {
+            message: "addressed proof requires its original challenged connection".into(),
+        },
         Request::Ping => Response::Pong,
         Request::Status => {
             let retained = state.router.retention_snapshot();
@@ -102,28 +107,6 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             state.shutdown.notify_waiters();
             Response::Ok
         }
-    }
-}
-
-fn map_kind(kind: IpcKind) -> Kind {
-    match kind {
-        IpcKind::Message => Kind::Message,
-        IpcKind::Event => Kind::Event,
-        IpcKind::Command => Kind::Command,
-        IpcKind::CommandResult => Kind::CommandResult,
-        IpcKind::Signal => Kind::Signal,
-        IpcKind::StreamChunk => Kind::StreamChunk,
-        IpcKind::Control => Kind::Control,
-    }
-}
-
-fn map_delivery(delivery: IpcDelivery) -> DeliveryClass {
-    match delivery {
-        IpcDelivery::Durable => DeliveryClass::Durable,
-        IpcDelivery::EphemeralLatest => DeliveryClass::EphemeralLatest,
-        IpcDelivery::EphemeralWindow => DeliveryClass::EphemeralWindow,
-        IpcDelivery::RequestResponse => DeliveryClass::RequestResponse,
-        IpcDelivery::StreamChunk => DeliveryClass::StreamChunk,
     }
 }
 
@@ -210,6 +193,14 @@ async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
 }
 
 async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Response {
+    let kind = match crate::kind_map::bus_kind(publish.kind) {
+        Ok(kind) => kind,
+        Err(refusal) => {
+            return Response::Error {
+                message: format!("publish: {refusal}"),
+            }
+        }
+    };
     publish_envelope(
         &state,
         publish.channel,
@@ -217,8 +208,8 @@ async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Res
             PeerId::from_uuid(publish.from_peer),
             ClientId::from_uuid(publish.from_client),
         ),
-        map_kind(publish.kind),
-        map_delivery(publish.delivery),
+        kind,
+        crate::kind_map::bus_delivery(publish.delivery),
         map_target(publish.target),
         publish.correlation_id,
         publish.coalesce_key,
@@ -249,11 +240,20 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
     // unfiltered: filtering to nothing is never what a caller means,
     // so an empty list is treated as absent rather than answered with
     // a vacuously empty page.
-    let kinds: Option<Vec<Kind>> = request
+    let kinds: Option<Vec<Kind>> = match request
         .kinds
         .as_ref()
         .filter(|kinds| !kinds.is_empty())
-        .map(|kinds| kinds.iter().map(|k| map_kind(*k)).collect());
+        .map(|kinds| crate::kind_map::bus_kinds(kinds.iter().copied()))
+        .transpose()
+    {
+        Ok(kinds) => kinds,
+        Err(refusal) => {
+            return Response::Error {
+                message: format!("inbox: {refusal}"),
+            }
+        }
+    };
     if request.since.is_some() && request.before.is_some() {
         return Response::Error {
             message: "inbox: `since` pages forward and `before` pages back; pass one".to_string(),
@@ -485,7 +485,10 @@ async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Respon
     }
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&bytes);
-    if let Err(error) = state.registry.enrol(add.peer_id, 0, pubkey) {
+    if let Err(error) =
+        crate::trust_refresh::refresh_peer(&state.registry, &state.home, add.peer_id, Some(pubkey))
+            .await
+    {
         return Response::Error {
             message: format!("add_peer: enrol: {error}"),
         };
