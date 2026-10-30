@@ -511,4 +511,38 @@ mod tests {
         let f = restarted.seal_for(b_id, b"", b"after restart").unwrap();
         assert_eq!(b.open_from(a_id, b"", &f).unwrap(), b"after restart");
     }
+
+    #[test]
+    fn replayed_init_after_restart_does_not_hide_session_mismatch_as_replay() {
+        let reg = Arc::new(PeerKeyRegistry::new());
+        let (a, a_id) = mgr(&reg);
+        let (b, b_id) = mgr(&reg);
+        let recorded = a.begin_handshake(b_id, 1_000);
+        a.on_resp(&b.on_init(&recorded).unwrap()).unwrap();
+        let old = b.seal_for(a_id, b"", b"before restart").unwrap();
+        a.open_from(b_id, b"", &old).unwrap();
+
+        b.reset();
+        let stray_response = b.on_init(&recorded).unwrap();
+        assert_eq!(
+            a.on_resp(&stray_response),
+            Err(SessionManagerError::NoPendingHandshake)
+        );
+        let mismatched = b.seal_for(a_id, b"", b"after restart").unwrap();
+        assert_eq!(mismatched.counter, old.counter);
+        assert_eq!(
+            a.open_from(b_id, b"", &mismatched),
+            Err(SessionManagerError::Session(SessionError::AeadFailed))
+        );
+
+        // This is the transition the receive owner takes on authentication failure.
+        let fresh = a.begin_handshake(b_id, 2_000);
+        a.on_resp(&b.on_init(&fresh).unwrap()).unwrap();
+        let recovered = b.seal_for(a_id, b"", b"recovered").unwrap();
+        assert_eq!(a.open_from(b_id, b"", &recovered).unwrap(), b"recovered");
+        assert_eq!(
+            a.open_from(b_id, b"", &recovered),
+            Err(SessionManagerError::Session(SessionError::Replay))
+        );
+    }
 }

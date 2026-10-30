@@ -170,7 +170,6 @@ async fn run_bridge(
             }
         }
     }
-    Ok(())
 }
 
 /// True iff this event is a persona `TurnRequested` from another peer. Cheap:
