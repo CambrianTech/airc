@@ -1937,7 +1937,7 @@ pub async fn run_daemon(
     // (gated), the dial happens in route refresh — all on this one handle.
     let daemon_airc = Airc::open(&state.home).await?;
     daemon_airc.set_addressed_frame_sink(Arc::new(
-        crate::addressed_bridge::DaemonAddressedSink(state.clone()),
+        crate::addressed_bridge::DaemonAddressedSink(Arc::downgrade(&state)),
     ))?;
     daemon_airc.set_inbound_frame_sink(Arc::new(
         airc_lib::RouterInboundBridge::new(state.router.clone(), state.coordinator_store.clone())

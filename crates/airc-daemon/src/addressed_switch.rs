@@ -32,6 +32,12 @@ pub(crate) struct QueuedFrame {
     pub(crate) _permit: OwnedSemaphorePermit,
 }
 
+/// Only an absent owner permits transport-host resolution. Queue failures do not.
+pub(crate) enum LocalAdmission {
+    Delivered,
+    Unowned(Frame),
+}
+
 pub struct AddressedSwitch {
     entries: Mutex<HashMap<PeerId, Entry>>,
     frames: Arc<Semaphore>,
@@ -85,23 +91,46 @@ impl AddressedSwitch {
 
     /// The caller admits only authenticated addressed envelopes, never room data.
     pub(crate) fn route(&self, peer: PeerId, frame: Frame) -> Result<(), RouteError> {
+        match self.route_if_owned(peer, frame)? {
+            LocalAdmission::Delivered => Ok(()),
+            LocalAdmission::Unowned(frame) => {
+                drop(frame);
+                Err(RouteError::NoReceiver)
+            }
+        }
+    }
+
+    /// Select and enqueue under one lock. Return the intact frame only when no
+    /// authenticated local owner exists; never turn queue pressure into rerouting.
+    pub(crate) fn route_if_owned(
+        &self,
+        peer: PeerId,
+        frame: Frame,
+    ) -> Result<LocalAdmission, RouteError> {
         let entries = self.entries.lock().map_err(|_| RouteError::StatePoisoned)?;
-        let entry = entries.get(&peer).ok_or(RouteError::NoReceiver)?;
-        let permit = self
-            .frames
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| RouteError::Backpressure)?;
+        let Some(entry) = entries.get(&peer) else {
+            return Ok(LocalAdmission::Unowned(frame));
+        };
+        let permit = self.reserve_frame()?;
         entry
             .tx
             .try_send(QueuedFrame {
                 frame,
                 _permit: permit,
             })
+            .map(|()| LocalAdmission::Delivered)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => RouteError::Backpressure,
                 mpsc::error::TrySendError::Closed(_) => RouteError::Closed,
             })
+    }
+
+    /// Local queues and outbound writes share the same node admission budget.
+    pub(crate) fn reserve_frame(&self) -> Result<OwnedSemaphorePermit, RouteError> {
+        self.frames
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RouteError::Backpressure)
     }
 }
 
@@ -144,6 +173,66 @@ impl Drop for ReceiverLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(peer: PeerId) -> Frame {
+        Frame {
+            kind: airc_protocol::FrameKind::Addressed,
+            envelope: airc_protocol::Envelope {
+                event_id: airc_core::EventId::new(),
+                sender: PeerId::new(),
+                sender_client: airc_core::ClientId::new(),
+                channel: airc_protocol::addressed::addressed_channel(),
+                target: airc_core::MentionTarget::Peer(peer),
+                lamport: 1,
+                occurred_at_ms: 1,
+                reply_to: None,
+                headers: Default::default(),
+                body: None,
+                media: Vec::new(),
+                signature: airc_protocol::Signature::Unsigned,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn only_absent_owner_returns_frame_and_budget_covers_inflight_write() {
+        let switch = AddressedSwitch::new(NonZeroUsize::MIN, NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let peer = PeerId::new();
+        let original = frame(peer);
+        let LocalAdmission::Unowned(returned) =
+            switch.route_if_owned(peer, original.clone()).unwrap()
+        else {
+            panic!("absent owner consumed the frame");
+        };
+        assert_eq!(returned, original);
+        let mut owner = switch.register(peer).unwrap();
+        let outbound = switch.reserve_frame().unwrap();
+        assert!(matches!(
+            switch.route_if_owned(peer, frame(peer)),
+            Err(RouteError::Backpressure)
+        ));
+        drop(outbound);
+        assert!(matches!(
+            switch.route_if_owned(peer, frame(peer)),
+            Ok(LocalAdmission::Delivered)
+        ));
+        let writing = owner.rx.recv().await.unwrap();
+        assert!(matches!(
+            switch.reserve_frame(),
+            Err(RouteError::Backpressure)
+        ));
+        assert!(matches!(
+            switch.route_if_owned(peer, frame(peer)),
+            Err(RouteError::Backpressure)
+        ));
+        drop(writing);
+        assert!(switch.reserve_frame().is_ok());
+        owner.rx.close();
+        assert!(matches!(
+            switch.route_if_owned(peer, frame(peer)),
+            Err(RouteError::Closed)
+        ));
+    }
 
     #[test]
     fn live_receiver_cannot_be_replaced_and_receiver_limit_is_hard() {
