@@ -8,6 +8,33 @@ use std::path::{Path, PathBuf};
 const STORE_SRC: &str = "airc-store/src/";
 const ADMISSION_OWNER: &str = "airc-lib/src/store_admission.rs";
 
+fn names_identifier(line: &str, marker: &str) -> bool {
+    line.match_indices(marker).any(|(offset, _)| {
+        !line[..offset]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch == '_' || ch.is_alphanumeric())
+    })
+}
+
+#[test]
+fn admission_scan_distinguishes_unrelated_identifiers() {
+    let marker = ["Admission", "::"].concat();
+    assert!(names_identifier(
+        &format!("custody::{marker}Writer"),
+        &marker
+    ));
+    assert!(names_identifier(&format!("{marker}Daemon"), &marker));
+    assert!(!names_identifier(
+        &format!("Local{marker}Delivered"),
+        &marker
+    ));
+    assert!(!names_identifier(
+        &format!("Other_{marker}Unowned"),
+        &marker
+    ));
+}
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -67,7 +94,7 @@ fn no_store_open_or_admission_outside_their_owners() {
                 .find(|m| line.contains(m.as_str()))
                 .or_else(|| {
                     (relative != ADMISSION_OWNER)
-                        .then(|| admission.iter().find(|m| line.contains(m.as_str())))
+                        .then(|| admission.iter().find(|m| names_identifier(line, m)))
                         .flatten()
                 });
             if let Some(marker) = bypass {
