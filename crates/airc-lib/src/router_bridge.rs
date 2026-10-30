@@ -587,6 +587,9 @@ pub(crate) fn bus_envelope_for_inbound(
             return Err("an addressed frame never enters the bus".to_string());
         }
     };
+    if frame.envelope.channel == airc_protocol::addressed::addressed_channel() {
+        return Err("the addressed channel never enters the bus".to_string());
+    }
     let mut env = airc_bus::envelope::Envelope::new(
         frame.envelope.channel,
         (frame.envelope.sender, frame.envelope.sender_client),

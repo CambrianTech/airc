@@ -10,9 +10,9 @@ use crate::time::now_ms;
 use crate::Airc;
 
 impl Airc {
-    /// Seal `msg` for `msg.to` and send it. Opens a session first when there
-    /// is none, waiting at most until `deadline`. Nothing is stored here or by
-    /// any peer that relays it.
+    /// Seal `msg` for `msg.to` and send it, all of it (session, seal, wire
+    /// write) by `deadline`. Opens a session first when there is none. Nothing
+    /// is stored here or by any peer that relays it.
     pub async fn send_addressed(
         &self,
         msg: AddressedSend,
@@ -21,6 +21,19 @@ impl Airc {
         if self.is_daemon_attached() {
             return Err(AddressedError::DaemonPathNotBuilt);
         }
+        if Instant::now() >= deadline {
+            return Err(AddressedError::DeadlineExceeded);
+        }
+        tokio::time::timeout_at(deadline, self.send_addressed_by(msg, deadline))
+            .await
+            .unwrap_or(Err(AddressedError::DeadlineExceeded))
+    }
+
+    async fn send_addressed_by(
+        &self,
+        msg: AddressedSend,
+        deadline: Instant,
+    ) -> Result<(), AddressedError> {
         let state = &self.inner.addressed;
         if !state.sessions.has_session(msg.to) {
             self.await_session(msg.to, deadline).await?;
@@ -42,9 +55,9 @@ impl Airc {
             .await
     }
 
-    /// Start a handshake to `peer` unless one is already in flight, then wait
-    /// for any session with it. A wait that reaches the deadline abandons our
-    /// handshake, so a lost init or response never blocks the next send.
+    /// Send our init to `peer` (again, if one is unanswered), then wait for
+    /// any session with it. A wait that reaches the deadline abandons our
+    /// handshake, so the next send starts a fresh one.
     async fn await_session(
         &self,
         peer: airc_core::PeerId,
@@ -52,12 +65,7 @@ impl Airc {
     ) -> Result<(), AddressedError> {
         let state = &self.inner.addressed;
         let mut established = state.established.subscribe();
-        if !state.sessions.has_pending(peer) {
-            let now = now_ms().map_err(|error| AddressedError::Transport(error.to_string()))?;
-            let init = state.sessions.begin_handshake(peer, now);
-            self.send_addressed_wire(peer, &AddressedWire::Init(init))
-                .await?;
-        }
+        self.rekey(peer).await?;
         let waited = tokio::time::timeout_at(deadline, async {
             while !state.sessions.has_session(peer) {
                 if established.changed().await.is_err() {

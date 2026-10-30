@@ -185,4 +185,16 @@ mod tests {
             .open_from(a_id, &aad(a_id, PeerId::new()), &frame)
             .is_err());
     }
+
+    // what this catches: the AAD binds the sender too, so a frame relabelled
+    // as coming from someone else does not open under the real sender's
+    // session.
+    #[test]
+    fn a_sealed_frame_with_a_swapped_sender_does_not_open() {
+        let (a, a_id, b, b_id) = pair();
+        let frame = a.seal_for(b_id, &aad(a_id, b_id), b"x").unwrap();
+        assert!(b
+            .open_from(a_id, &aad(PeerId::new(), b_id), &frame)
+            .is_err());
+    }
 }

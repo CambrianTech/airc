@@ -84,6 +84,12 @@ impl From<SessionError> for SessionManagerError {
     }
 }
 
+struct AcceptedInit {
+    issued_at_ms: u64,
+    eph_pub: [u8; 32],
+    resp: HandshakeResp,
+}
+
 /// Owns this peer's identity + the live sessions/handshakes with every other
 /// peer. Cheap to share (`Arc` the whole thing); the inner maps are sharded.
 pub struct SessionManager {
@@ -94,11 +100,14 @@ pub struct SessionManager {
     /// Established sessions, keyed by the OTHER peer's id.
     sessions: DashMap<PeerId, StreamSession>,
     /// In-flight initiations we started, awaiting the responder's reply, keyed
-    /// by the peer we initiated TO.
-    pending: DashMap<PeerId, PendingHandshake>,
-    /// The `issued_at_ms` of the last init accepted from each peer. An init must
-    /// be strictly newer, so a recorded one can't replace a live session.
-    accepted_init_at: DashMap<PeerId, u64>,
+    /// by the peer we initiated TO, each with the init we sent so it can be
+    /// re-sent when it or its reply was lost.
+    pending: DashMap<PeerId, (PendingHandshake, HandshakeInit)>,
+    /// The last init accepted from each peer and the response we gave it. A new
+    /// init must be strictly newer (a recorded one can't replace a live
+    /// session); a duplicate of this one gets the same response again, because
+    /// the initiator lost our reply.
+    accepted: DashMap<PeerId, AcceptedInit>,
     /// The last `issued_at_ms` this side signed, so two inits in the same
     /// millisecond still increase.
     last_issued_ms: std::sync::atomic::AtomicU64,
@@ -113,7 +122,7 @@ impl SessionManager {
             registry,
             sessions: DashMap::new(),
             pending: DashMap::new(),
-            accepted_init_at: DashMap::new(),
+            accepted: DashMap::new(),
             last_issued_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -134,8 +143,23 @@ impl SessionManager {
         self.pending.contains_key(&peer)
     }
 
-    /// Abandon our unanswered handshake to `peer` (its init or response was
-    /// lost), so the next send starts a fresh one.
+    /// Forget every session, handshake and accepted init: exactly what a
+    /// process restart loses (the identity and registry stay).
+    pub fn reset(&self) {
+        self.sessions.clear();
+        self.pending.clear();
+        self.accepted.clear();
+    }
+
+    /// The init of our unanswered handshake to `peer`, to send again: the init
+    /// or its reply was lost, and the responder answers a duplicate with the
+    /// response it already gave.
+    pub fn pending_init(&self, peer: PeerId) -> Option<HandshakeInit> {
+        self.pending.get(&peer).map(|entry| entry.1.clone())
+    }
+
+    /// Abandon our unanswered handshake to `peer`, so the next send starts a
+    /// fresh one.
     pub fn cancel_pending(&self, peer: PeerId) {
         self.pending.remove(&peer);
     }
@@ -162,7 +186,7 @@ impl SessionManager {
         };
         let (pending, init) =
             handshake::initiate(&self.keypair, self.peer_id, self.key_id, peer, issued_at_ms);
-        self.pending.insert(peer, pending);
+        self.pending.insert(peer, (pending, init.clone()));
         init
     }
 
@@ -170,17 +194,21 @@ impl SessionManager {
     /// responder), and return the `HandshakeResp` to send back.
     ///
     /// A crossed handshake (we initiated to them too) completes only the lower
-    /// id's init. An init not newer than the last accepted from that peer is
-    /// refused. A newer one replaces a live session: that is how a restarted
-    /// peer re-keys.
+    /// id's init. A duplicate of the last accepted init gets the same response
+    /// again, with no state change (the initiator lost our reply). Any other
+    /// init not newer than the last accepted is refused. A newer one replaces a
+    /// live session: that is how a restarted peer re-keys.
     pub fn on_init(&self, init: &HandshakeInit) -> Result<HandshakeResp, SessionManagerError> {
         if self.pending.contains_key(&init.peer_id)
             && self.peer_id.as_uuid() < init.peer_id.as_uuid()
         {
             return Err(SessionManagerError::Crossed);
         }
-        if let Some(last) = self.accepted_init_at.get(&init.peer_id) {
-            if init.issued_at_ms <= *last {
+        if let Some(last) = self.accepted.get(&init.peer_id) {
+            if init.issued_at_ms == last.issued_at_ms && init.eph_pub == last.eph_pub {
+                return Ok(last.resp.clone());
+            }
+            if init.issued_at_ms <= last.issued_at_ms {
                 return Err(SessionManagerError::StaleInit);
             }
         }
@@ -192,16 +220,30 @@ impl SessionManager {
             &self.registry,
         )?;
         self.pending.remove(&init.peer_id);
-        self.accepted_init_at
-            .insert(init.peer_id, init.issued_at_ms);
+        self.accepted.insert(
+            init.peer_id,
+            AcceptedInit {
+                issued_at_ms: init.issued_at_ms,
+                eph_pub: init.eph_pub,
+                resp: resp.clone(),
+            },
+        );
         self.sessions.insert(init.peer_id, session);
         Ok(resp)
     }
 
     /// Handle the responder's `HandshakeResp`: complete our pending handshake to
     /// that peer and install the session (as initiator).
+    ///
+    /// The reply is verified against the pending handshake before it is
+    /// consumed, so a stray or replayed reply leaves the real one awaited.
     pub fn on_resp(&self, resp: &HandshakeResp) -> Result<(), SessionManagerError> {
-        let (_peer, pending) = self
+        self.pending
+            .get(&resp.peer_id)
+            .ok_or(SessionManagerError::NoPendingHandshake)?
+            .0
+            .verify(resp, &self.registry)?;
+        let (_peer, (pending, _init)) = self
             .pending
             .remove(&resp.peer_id)
             .ok_or(SessionManagerError::NoPendingHandshake)?;
@@ -367,19 +409,77 @@ mod tests {
 
     // what this catches: a recorded init replayed later must not replace the
     // live session (that would cut the link: the replayer has no ephemeral
-    // secret, so the real peer's frames stop opening).
+    // secret, so the real peer's frames stop opening). An older init is
+    // refused; a duplicate of the latest gets the cached reply and changes
+    // nothing.
     #[test]
     fn replayed_init_does_not_replace_a_live_session() {
         let reg = Arc::new(PeerKeyRegistry::new());
         let (a, a_id) = mgr(&reg);
         let (b, b_id) = mgr(&reg);
-        let init = a.begin_handshake(b_id, 1_000);
-        let resp = b.on_init(&init).unwrap();
-        a.on_resp(&resp).unwrap();
+        let first = a.begin_handshake(b_id, 1_000);
+        a.on_resp(&b.on_init(&first).unwrap()).unwrap();
+        let latest = a.begin_handshake(b_id, 2_000);
+        let latest_resp = b.on_init(&latest).unwrap();
+        a.on_resp(&latest_resp).unwrap();
 
-        assert_eq!(b.on_init(&init).err(), Some(SessionManagerError::StaleInit));
+        assert_eq!(
+            b.on_init(&first).err(),
+            Some(SessionManagerError::StaleInit)
+        );
+        let cached = b.on_init(&latest).unwrap();
+        assert_eq!(
+            (cached.eph_pub, cached.sig),
+            (latest_resp.eph_pub, latest_resp.sig)
+        );
         let f = a.seal_for(b_id, b"", b"still live").unwrap();
         assert_eq!(b.open_from(a_id, b"", &f).unwrap(), b"still live");
+    }
+
+    // what this catches: review F1. The responder installed its session but
+    // its reply was lost, so the initiator can open nothing. Sending the
+    // pending init again gets the same reply (no new session at the
+    // responder), and frames the responder already sealed then open.
+    #[test]
+    fn a_lost_reply_heals_when_the_init_is_sent_again() {
+        let reg = Arc::new(PeerKeyRegistry::new());
+        let (a, a_id) = mgr(&reg);
+        let (b, b_id) = mgr(&reg);
+        let init = a.begin_handshake(b_id, 1_000);
+        let _lost = b.on_init(&init).unwrap();
+        let sealed_before_retry = b.seal_for(a_id, b"", b"b->a").unwrap();
+        assert_eq!(
+            a.open_from(b_id, b"", &sealed_before_retry).err(),
+            Some(SessionManagerError::NoSession)
+        );
+
+        let again = a.pending_init(b_id).unwrap();
+        a.on_resp(&b.on_init(&again).unwrap()).unwrap();
+        assert_eq!(
+            a.open_from(b_id, b"", &sealed_before_retry).unwrap(),
+            b"b->a"
+        );
+    }
+
+    // what this catches: review F3. A reply from an earlier handshake (stray
+    // or replayed) must not consume the handshake in flight: it is refused and
+    // the real reply still completes.
+    #[test]
+    fn a_replayed_reply_leaves_the_real_handshake_awaited() {
+        let reg = Arc::new(PeerKeyRegistry::new());
+        let (a, _a_id) = mgr(&reg);
+        let (b, b_id) = mgr(&reg);
+        let old_resp = b.on_init(&a.begin_handshake(b_id, 1_000)).unwrap();
+        a.on_resp(&old_resp).unwrap();
+
+        let in_flight = a.begin_handshake(b_id, 2_000);
+        assert_eq!(
+            a.on_resp(&old_resp).err(),
+            Some(SessionManagerError::Handshake(HandshakeError::BadSignature))
+        );
+        assert!(a.has_pending(b_id));
+        a.on_resp(&b.on_init(&in_flight).unwrap()).unwrap();
+        assert!(!a.has_pending(b_id));
     }
 
     // what this catches: a peer that restarts (new manager, sessions lost) can

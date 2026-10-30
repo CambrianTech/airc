@@ -41,6 +41,12 @@ impl Frame {
     ///     `attachment` field yet).
     pub fn into_transcript_event(self) -> Result<TranscriptEvent, NotTranscribable> {
         let Frame { kind, envelope } = self;
+        // The kind label sits outside the envelope signature, so a relay can
+        // relabel an addressed frame; its reserved channel cannot be moved
+        // without breaking the signature, so either one refuses.
+        if envelope.channel == crate::addressed::addressed_channel() {
+            return Err(NotTranscribable);
+        }
         let kind = match kind {
             FrameKind::Addressed => return Err(NotTranscribable),
             FrameKind::Message => TranscriptKind::Message,
@@ -209,6 +215,16 @@ mod tests {
     fn an_addressed_frame_is_not_transcribable() {
         let mut frame = message_frame();
         frame.kind = FrameKind::Addressed;
+        assert_eq!(frame.into_transcript_event().err(), Some(NotTranscribable));
+    }
+
+    // what this catches: review F4. A relay relabels an addressed frame as a
+    // Message (the kind is outside the signature); its reserved channel still
+    // keeps it out of every transcript.
+    #[test]
+    fn a_relabelled_addressed_frame_is_not_transcribable() {
+        let mut frame = message_frame();
+        frame.envelope.channel = crate::addressed::addressed_channel();
         assert_eq!(frame.into_transcript_event().err(), Some(NotTranscribable));
     }
 }
