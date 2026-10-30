@@ -17,12 +17,12 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use airc_lib::{Airc, AircError, MentionTarget};
+use airc_lib::{AddressedKind, Airc, AircError, MentionTarget};
 use consumer_shapes::continuum::{
     decode_persona_event, reply_turn_emitted, request_turn, turn_reply_address, PersonaEvent,
     TurnEmitted, TurnRequested, BODY_HINT_FORGE_PERSONA_EVENT, HEADER_FORGE_PERSONA_MODEL_HINT,
 };
-use futures::StreamExt;
+
 use tempfile::TempDir;
 
 const HEADER_FORGE_BODY_HINT: &str = "forge.body_hint";
@@ -89,7 +89,7 @@ async fn turn_request_reply_resolves_await_reply_before_deadline() {
 
     let pending = request_turn(
         &requester,
-        MentionTarget::All,
+        MentionTarget::Peer(persona.peer_id()),
         &turn_request(),
         Duration::from_secs(5),
     )
@@ -102,7 +102,7 @@ async fn turn_request_reply_resolves_await_reply_before_deadline() {
         .await_reply(pending)
         .await
         .expect("await_reply resolves with the TurnEmitted reply");
-    let decoded = decode_persona_event(&reply.headers, reply.body.as_ref())
+    let decoded = decode_persona_event(reply.headers(), Some(reply.body()))
         .expect("reply decodes as a persona event");
     assert_eq!(decoded, PersonaEvent::TurnEmitted(turn_reply()));
 
@@ -110,17 +110,17 @@ async fn turn_request_reply_resolves_await_reply_before_deadline() {
 }
 
 async fn handle_one_turn_request(persona: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = persona.subscribe().await.unwrap();
+    let mut stream = persona.addressed_inbox();
     let _ = ready.send(());
     loop {
-        let Some(Ok(event)) = stream.next().await else {
-            continue;
+        let Some(event) = stream.next().await else {
+            panic!("addressed inbox closed before request");
         };
-        if event.peer_id == persona.peer_id() {
+        if event.kind() != AddressedKind::Command || event.to() != persona.peer_id() {
             continue;
         }
         if event
-            .headers
+            .headers()
             .get(HEADER_FORGE_BODY_HINT)
             .map(String::as_str)
             != Some(BODY_HINT_FORGE_PERSONA_EVENT)
@@ -128,7 +128,7 @@ async fn handle_one_turn_request(persona: Airc, ready: tokio::sync::oneshot::Sen
             continue;
         }
         let PersonaEvent::TurnRequested(request) =
-            decode_persona_event(&event.headers, event.body.as_ref()).unwrap()
+            decode_persona_event(event.headers(), Some(event.body())).unwrap()
         else {
             continue;
         };
@@ -137,7 +137,7 @@ async fn handle_one_turn_request(persona: Airc, ready: tokio::sync::oneshot::Sen
         assert_eq!(request.model_hint.as_deref(), Some("lora-clio-v3"));
         assert_eq!(
             event
-                .headers
+                .headers()
                 .get(HEADER_FORGE_PERSONA_MODEL_HINT)
                 .map(String::as_str),
             Some("lora-clio-v3"),
@@ -145,13 +145,13 @@ async fn handle_one_turn_request(persona: Airc, ready: tokio::sync::oneshot::Sen
 
         // The command bus stamped its correlation + reply-to + deadline
         // headers on the request; the typed view recovers all three.
-        let address = turn_reply_address(&event.headers).unwrap();
+        let address = turn_reply_address(event.headers()).unwrap();
         assert!(
             address.deadline_at_ms.is_some(),
             "Airc::request must stamp airc.deadline on the turn request",
         );
 
-        reply_turn_emitted(&persona, &event.headers, &turn_reply())
+        reply_turn_emitted(&persona, &event, &turn_reply())
             .await
             .expect("turn reply emits");
         return;
@@ -195,7 +195,7 @@ async fn turn_request_with_no_responder_errors_at_deadline() {
 
     let pending = request_turn(
         &requester,
-        MentionTarget::All,
+        MentionTarget::Peer(silent.peer_id()),
         &turn_request(),
         Duration::from_millis(300),
     )

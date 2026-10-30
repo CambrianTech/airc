@@ -19,11 +19,10 @@ use airc_lib::{
     Airc, PeerSpec, TransportHealthSample, TransportHealthState, TransportKind, TransportRole,
 };
 use airc_protocol::{PeerKeyRegistry, PeerKeypair};
-use airc_protocol::{HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_REPLY_TO};
+
 use airc_relay::{RelayServer, RelayServerConfig};
-use futures::stream::StreamExt;
+
 use tempfile::TempDir;
-use uuid::Uuid;
 
 #[test]
 fn request_and_reply_round_trip_over_lan_without_github() {
@@ -54,47 +53,7 @@ fn request_and_reply_round_trip_over_lan_without_github() {
             .await
             .expect("alice connects to bob over LAN");
 
-        let bob_handle = bob.clone();
-        let handler = tokio::spawn(async move {
-            let mut stream = bob_handle.subscribe().await.unwrap();
-            loop {
-                match stream.next().await {
-                    Some(Ok(event)) => {
-                        let Some(correlation) = event.headers.get(HEADER_AIRC_CORRELATION_ID)
-                        else {
-                            continue;
-                        };
-                        let Some(reply_to) = event.headers.get(HEADER_AIRC_REPLY_TO) else {
-                            continue;
-                        };
-                        if event.peer_id == bob_handle.peer_id() {
-                            continue;
-                        }
-                        let correlation_id =
-                            Uuid::parse_str(correlation).expect("valid correlation uuid");
-                        let reply_to_peer = PeerId::from_uuid(
-                            Uuid::parse_str(reply_to).expect("valid reply_to uuid"),
-                        );
-                        let mut headers = Headers::new();
-                        headers.insert("forge.body_hint".into(), "test.lan.result".into());
-                        bob_handle
-                            .reply(
-                                reply_to_peer,
-                                correlation_id,
-                                headers,
-                                Body::text("lan-pong"),
-                            )
-                            .await
-                            .expect("bob replies over LAN");
-                        return;
-                    }
-                    Some(Err(_)) => continue,
-                    None => return,
-                }
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let handler = respond_once(&bob, "lan-pong");
 
         let mut headers = Headers::new();
         headers.insert("airc.command_kind".into(), "test.lan.ping".into());
@@ -110,21 +69,18 @@ fn request_and_reply_round_trip_over_lan_without_github() {
         let correlation_id = pending.correlation_id;
 
         let reply = alice.await_reply(pending).await.expect("alice gets reply");
-        assert_eq!(reply.peer_id, bob.peer_id());
+        assert_eq!(reply.from(), bob.peer_id());
         assert_eq!(
-            reply.target,
-            MentionTarget::Peer(alice.peer_id()),
+            reply.to(),
+            alice.peer_id(),
             "LAN reply must be directed at the requester"
         );
         assert_eq!(
-            reply.headers.get(HEADER_AIRC_CORRELATION_ID),
-            Some(&correlation_id.to_string()),
+            reply.correlation(),
+            correlation_id,
             "LAN reply must preserve the correlation id"
         );
-        assert_eq!(
-            reply.body.as_ref().and_then(Body::as_text),
-            Some("lan-pong")
-        );
+        assert_eq!(reply.body().as_text(), Some("lan-pong"));
 
         handler.await.expect("handler completes");
     });
@@ -203,53 +159,13 @@ fn request_and_reply_round_trip_over_relay_without_github_or_lan() {
         alice.replace_transport_health(relay_only).unwrap();
         bob.replace_transport_health(relay_only).unwrap();
 
-        let bob_handle = bob.clone();
-        let handler = tokio::spawn(async move {
-            let mut stream = bob_handle.subscribe().await.unwrap();
-            loop {
-                match stream.next().await {
-                    Some(Ok(event)) => {
-                        let Some(correlation) = event.headers.get(HEADER_AIRC_CORRELATION_ID)
-                        else {
-                            continue;
-                        };
-                        let Some(reply_to) = event.headers.get(HEADER_AIRC_REPLY_TO) else {
-                            continue;
-                        };
-                        if event.peer_id == bob_handle.peer_id() {
-                            continue;
-                        }
-                        let correlation_id =
-                            Uuid::parse_str(correlation).expect("valid correlation uuid");
-                        let reply_to_peer = PeerId::from_uuid(
-                            Uuid::parse_str(reply_to).expect("valid reply_to uuid"),
-                        );
-                        let mut headers = Headers::new();
-                        headers.insert("forge.body_hint".into(), "test.relay.result".into());
-                        bob_handle
-                            .reply(
-                                reply_to_peer,
-                                correlation_id,
-                                headers,
-                                Body::text("relay-pong"),
-                            )
-                            .await
-                            .expect("bob replies over relay");
-                        return;
-                    }
-                    Some(Err(_)) => continue,
-                    None => return,
-                }
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let handler = respond_once(&bob, "relay-pong");
 
         let mut headers = Headers::new();
         headers.insert("airc.command_kind".into(), "test.relay.ping".into());
         let pending = alice
             .request(
-                MentionTarget::All,
+                MentionTarget::Peer(bob.peer_id()),
                 headers,
                 Body::text("relay-ping"),
                 Duration::from_secs(3),
@@ -260,19 +176,16 @@ fn request_and_reply_round_trip_over_relay_without_github_or_lan() {
 
         let reply = alice.await_reply(pending).await.expect("alice gets reply");
         assert_eq!(
-            reply.target,
-            MentionTarget::Peer(alice.peer_id()),
+            reply.to(),
+            alice.peer_id(),
             "relay reply must be directed at the requester"
         );
         assert_eq!(
-            reply.headers.get(HEADER_AIRC_CORRELATION_ID),
-            Some(&correlation_id.to_string()),
+            reply.correlation(),
+            correlation_id,
             "relay reply must preserve the correlation id"
         );
-        assert_eq!(
-            reply.body.as_ref().and_then(Body::as_text),
-            Some("relay-pong")
-        );
+        assert_eq!(reply.body().as_text(), Some("relay-pong"));
 
         handler.await.expect("handler completes");
         relay.shutdown();
@@ -298,4 +211,21 @@ async fn wait_for_relay_peers(relay: &RelayServer, expected: &[PeerId]) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+// Arm before spawning: no timing sleep can stand in for subscription readiness.
+fn respond_once(bob: &Airc, text: &'static str) -> tokio::task::JoinHandle<()> {
+    let mut inbox = bob.addressed_inbox();
+    let bob = bob.clone();
+    tokio::spawn(async move {
+        let event = tokio::time::timeout(Duration::from_secs(3), inbox.next())
+            .await
+            .expect("request arrives before deadline")
+            .expect("inbox stays open");
+        assert_eq!(event.kind(), airc_lib::AddressedKind::Command);
+        assert_eq!(event.to(), bob.peer_id());
+        bob.reply(&event, Headers::new(), Body::text(text))
+            .await
+            .expect("sealed reply");
+    })
 }

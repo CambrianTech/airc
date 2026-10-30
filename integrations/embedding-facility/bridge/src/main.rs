@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use airc_core::PersonaCapabilities;
 use airc_core::{PeerId, TranscriptEvent, TranscriptKind};
-use airc_lib::Airc;
+use airc_lib::{AddressedKind, Airc, VerifiedAddressed};
 use consumer_shapes::continuum::{
     decode_embedding_event, encode_capability_offer, reply_embedding_emitted, CapabilityOffer,
     EmbeddingEmitted, EmbeddingEvent, HEADER_FORGE_AI_EMBEDDING_KIND,
@@ -140,6 +140,7 @@ async fn run_bridge(
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = airc.subscribe().await?;
+    let mut commands = airc.addressed_inbox();
     let mut readvertise = tokio::time::interval(READVERTISE_EVERY);
     readvertise.tick().await; // first tick fires immediately; we already advertised at startup
 
@@ -150,15 +151,18 @@ async fn run_bridge(
                     eprintln!("airc-embedding-bridge: re-advertise failed: {e}");
                 }
             }
+            command = commands.next() => {
+                let Some(event) = command else {
+                    return Err("addressed command inbox closed".into());
+                };
+                if is_embedding_request(&event, me) {
+                    handle_embedding_request(airc, &event, http, base_url, model).await;
+                }
+            }
             item = stream.next() => {
                 let Some(item) = item else { break }; // stream ended
                 match item {
                     Ok(event) => {
-                        // Machine path (slice 2b): typed command-bus embedding request.
-                        if is_embedding_request(&event, me) {
-                            handle_embedding_request(airc, &event, http, base_url, model).await;
-                            continue;
-                        }
                         // Human path (slice 2a): the /embed live smoke probe.
                         let Some(text) = probe_input(&event, me) else { continue };
                         let reply = match llamacpp::embed(http, base_url, &[text.to_string()], Some(model)).await {
@@ -178,10 +182,12 @@ async fn run_bridge(
 /// True iff this event is a typed embedding REQUEST from another peer. Cheap:
 /// keys off the projected `forge.ai.embedding.kind = requested` header, no body
 /// decode. (Our own posts and `emitted` replies are not requests.)
-fn is_embedding_request(event: &TranscriptEvent, me: PeerId) -> bool {
-    event.peer_id != me
+fn is_embedding_request(event: &VerifiedAddressed, me: PeerId) -> bool {
+    event.kind() == AddressedKind::Command
+        && event.to() == me
+        && event.from() != me
         && event
-            .headers
+            .headers()
             .get(HEADER_FORGE_AI_EMBEDDING_KIND)
             .map(String::as_str)
             == Some("requested")
@@ -194,12 +200,12 @@ fn is_embedding_request(event: &TranscriptEvent, me: PeerId) -> bool {
 /// the requester's `await_reply` deadlines loudly on a non-reply.
 async fn handle_embedding_request(
     airc: &Airc,
-    event: &TranscriptEvent,
+    event: &VerifiedAddressed,
     http: &reqwest::Client,
     base_url: &str,
     model: &str,
 ) {
-    let req = match decode_embedding_event(&event.headers, event.body.as_ref()) {
+    let req = match decode_embedding_event(event.headers(), Some(event.body())) {
         Ok(EmbeddingEvent::Requested(r)) => r,
         Ok(EmbeddingEvent::Emitted(_)) => return, // we answer requests, not replies
         Err(e) => {
@@ -234,7 +240,7 @@ async fn handle_embedding_request(
         dim,
         emitted_at_ms: now_ms(),
     };
-    if let Err(e) = reply_embedding_emitted(airc, &event.headers, &emitted).await {
+    if let Err(e) = reply_embedding_emitted(airc, event, &emitted).await {
         eprintln!(
             "airc-embedding-bridge: reply failed for {}: {e}",
             req.request_id
@@ -391,43 +397,50 @@ mod tests {
             "reply previews leading components: {reply}"
         );
     }
-
-    fn with_kind(peer: PeerId, kind: &str) -> TranscriptEvent {
-        let mut ev = msg(peer, "{}");
-        ev.headers
-            .insert(HEADER_FORGE_AI_EMBEDDING_KIND.to_string(), kind.to_string());
-        ev
-    }
-
-    #[test]
-    fn detects_typed_embedding_request_from_another_peer() {
-        // what this catches: the MACHINE path (slice 2b) must fire on a typed
-        // `requested` frame from another peer — that's the command-bus request
-        // slice 3's GridEmbeddingProvider sends.
-        let me = PeerId::from_u128(1);
-        let other = PeerId::from_u128(2);
-        assert!(is_embedding_request(&with_kind(other, "requested"), me));
-    }
-
-    #[test]
-    fn emitted_frame_is_not_a_request() {
-        // what this catches: the bridge answers REQUESTS, never replies — an
-        // `emitted` frame must not be treated as inbound work (would loop).
-        let me = PeerId::from_u128(1);
-        let other = PeerId::from_u128(2);
-        assert!(!is_embedding_request(&with_kind(other, "emitted"), me));
-    }
-
-    #[test]
-    fn own_embedding_request_is_ignored() {
-        let me = PeerId::from_u128(1);
-        assert!(!is_embedding_request(&with_kind(me, "requested"), me));
-    }
-
-    #[test]
-    fn plain_message_is_not_an_embedding_request() {
-        let me = PeerId::from_u128(1);
-        let other = PeerId::from_u128(2);
-        assert!(!is_embedding_request(&msg(other, "hello"), me));
+    #[tokio::test]
+    async fn only_verified_request_for_this_facility_is_admitted() {
+        let sender_home = tempfile::TempDir::new().unwrap();
+        let receiver_home = tempfile::TempDir::new().unwrap();
+        let sender = Airc::open(sender_home.path()).await.unwrap();
+        let receiver = Airc::open(receiver_home.path()).await.unwrap();
+        sender
+            .add_peer(receiver.peer_spec().parse().unwrap())
+            .await
+            .unwrap();
+        receiver
+            .add_peer(sender.peer_spec().parse().unwrap())
+            .await
+            .unwrap();
+        let addr = receiver
+            .listen_lan("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        sender.connect_lan(addr, receiver.peer_id()).await.unwrap();
+        let mut inbox = receiver.addressed_inbox();
+        for (wire_kind, admitted) in [("requested", true), ("emitted", false)] {
+            let mut headers = airc_lib::Headers::new();
+            headers.insert(
+                HEADER_FORGE_AI_EMBEDDING_KIND.to_string(),
+                wire_kind.to_string(),
+            );
+            let _pending = sender
+                .request(
+                    airc_lib::MentionTarget::Peer(receiver.peer_id()),
+                    headers,
+                    airc_core::Body::text("{}"),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            let verified = tokio::time::timeout(Duration::from_secs(5), inbox.next())
+                .await
+                .unwrap()
+                .expect("verified delivery");
+            assert_eq!(
+                is_embedding_request(&verified, receiver.peer_id()),
+                admitted
+            );
+            assert!(!is_embedding_request(&verified, sender.peer_id()));
+        }
     }
 }

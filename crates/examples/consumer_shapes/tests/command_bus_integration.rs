@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use airc_lib::{Airc, Body, Headers, MentionTarget, PeerId, TranscriptEvent};
+use airc_lib::{Airc, Body, Headers, MentionTarget, PeerId, VerifiedAddressed};
 use consumer_shapes::continuum::{
     decode_persona_event, encode_persona_event, PersonaEvent, TurnEmitted, TurnRequested,
     BODY_HINT_FORGE_PERSONA_EVENT,
@@ -21,13 +21,10 @@ use consumer_shapes::openclaw::{
     decode_openclaw_event, encode_openclaw_event, ChatMessagePosted, OpenClawEvent, ThreadCreated,
     BODY_HINT_FORGE_OPENCLAW_EVENT,
 };
-use futures::StreamExt;
+
 use tempfile::TempDir;
-use uuid::Uuid;
 
 const HEADER_FORGE_BODY_HINT: &str = "forge.body_hint";
-const HEADER_AIRC_CORRELATION_ID: &str = "airc.correlation_id";
-const HEADER_AIRC_REPLY_TO: &str = "airc.reply_to";
 
 #[tokio::test]
 async fn consumer_contracts_round_trip_over_lan_command_bus() {
@@ -59,7 +56,7 @@ async fn consumer_contracts_round_trip_over_lan_command_bus() {
     ready_rx.await.expect("bob subscriber is ready");
 
     assert_eq!(
-        request_persona_turn(&alice).await,
+        request_persona_turn(&alice, bob.peer_id()).await,
         PersonaEvent::TurnEmitted(TurnEmitted {
             persona_id: "clio".to_string(),
             activity_id: "activity-chat".to_string(),
@@ -69,7 +66,7 @@ async fn consumer_contracts_round_trip_over_lan_command_bus() {
         })
     );
     assert_eq!(
-        request_openclaw_thread(&alice).await,
+        request_openclaw_thread(&alice, bob.peer_id()).await,
         OpenClawEvent::ThreadCreated(ThreadCreated {
             openclaw_user_id: "u-agent".to_string(),
             openclaw_thread_id: "t-router-debug".to_string(),
@@ -79,7 +76,7 @@ async fn consumer_contracts_round_trip_over_lan_command_bus() {
         })
     );
     assert_eq!(
-        request_hermes_tool(&alice).await,
+        request_hermes_tool(&alice, bob.peer_id()).await,
         HermesEvent::AgentResultReturned(AgentResultReturned {
             agent_id: "hermes-orchestrator".to_string(),
             command_id: "cmd-lora-001".to_string(),
@@ -94,18 +91,18 @@ async fn consumer_contracts_round_trip_over_lan_command_bus() {
 }
 
 async fn handle_three_consumer_requests(bob: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = bob.subscribe().await.unwrap();
+    let mut stream = bob.addressed_inbox();
     let _ = ready.send(());
     let mut handled = 0usize;
     while handled < 3 {
-        let Some(Ok(event)) = stream.next().await else {
+        let Some(event) = stream.next().await else {
             continue;
         };
-        if event.peer_id == bob.peer_id() {
+        if event.from() == bob.peer_id() {
             continue;
         }
         let Some(body_hint) = event
-            .headers
+            .headers()
             .get(HEADER_FORGE_BODY_HINT)
             .map(String::as_str)
         else {
@@ -114,7 +111,7 @@ async fn handle_three_consumer_requests(bob: Airc, ready: tokio::sync::oneshot::
         match body_hint {
             BODY_HINT_FORGE_PERSONA_EVENT => {
                 let PersonaEvent::TurnRequested(request) =
-                    decode_persona_event(&event.headers, event.body.as_ref()).unwrap()
+                    decode_persona_event(event.headers(), Some(event.body())).unwrap()
                 else {
                     continue;
                 };
@@ -130,7 +127,7 @@ async fn handle_three_consumer_requests(bob: Airc, ready: tokio::sync::oneshot::
             }
             BODY_HINT_FORGE_OPENCLAW_EVENT => {
                 let OpenClawEvent::ChatMessagePosted(request) =
-                    decode_openclaw_event(&event.headers, event.body.as_ref()).unwrap()
+                    decode_openclaw_event(event.headers(), Some(event.body())).unwrap()
                 else {
                     continue;
                 };
@@ -146,7 +143,7 @@ async fn handle_three_consumer_requests(bob: Airc, ready: tokio::sync::oneshot::
             }
             BODY_HINT_FORGE_HERMES_EVENT => {
                 let HermesEvent::AgentCommandIssued(request) =
-                    decode_hermes_event(&event.headers, event.body.as_ref()).unwrap()
+                    decode_hermes_event(event.headers(), Some(event.body())).unwrap()
                 else {
                     continue;
                 };
@@ -166,7 +163,7 @@ async fn handle_three_consumer_requests(bob: Airc, ready: tokio::sync::oneshot::
     }
 }
 
-async fn request_persona_turn(alice: &Airc) -> PersonaEvent {
+async fn request_persona_turn(alice: &Airc, recipient: PeerId) -> PersonaEvent {
     let request = PersonaEvent::TurnRequested(TurnRequested {
         persona_id: "clio".to_string(),
         activity_id: "activity-chat".to_string(),
@@ -175,11 +172,11 @@ async fn request_persona_turn(alice: &Airc) -> PersonaEvent {
         model_hint: None,
         requested_at_ms: 1_700_000_000_000,
     });
-    let reply = request_typed(alice, encode_persona_event(&request).unwrap()).await;
-    decode_persona_event(&reply.headers, reply.body.as_ref()).unwrap()
+    let reply = request_typed(alice, recipient, encode_persona_event(&request).unwrap()).await;
+    decode_persona_event(reply.headers(), Some(reply.body())).unwrap()
 }
 
-async fn request_openclaw_thread(alice: &Airc) -> OpenClawEvent {
+async fn request_openclaw_thread(alice: &Airc, recipient: PeerId) -> OpenClawEvent {
     let request = OpenClawEvent::ChatMessagePosted(ChatMessagePosted {
         openclaw_user_id: "u-human".to_string(),
         openclaw_thread_id: "t-router-debug".to_string(),
@@ -187,11 +184,11 @@ async fn request_openclaw_thread(alice: &Airc) -> OpenClawEvent {
         text: "please create a routed thread".to_string(),
         posted_at_ms: 1_700_000_000_010,
     });
-    let reply = request_typed(alice, encode_openclaw_event(&request).unwrap()).await;
-    decode_openclaw_event(&reply.headers, reply.body.as_ref()).unwrap()
+    let reply = request_typed(alice, recipient, encode_openclaw_event(&request).unwrap()).await;
+    decode_openclaw_event(reply.headers(), Some(reply.body())).unwrap()
 }
 
-async fn request_hermes_tool(alice: &Airc) -> HermesEvent {
+async fn request_hermes_tool(alice: &Airc, recipient: PeerId) -> HermesEvent {
     let request = HermesEvent::AgentCommandIssued(AgentCommandIssued {
         agent_id: "hermes-orchestrator".to_string(),
         command_id: "cmd-lora-001".to_string(),
@@ -199,40 +196,31 @@ async fn request_hermes_tool(alice: &Airc) -> HermesEvent {
         input: serde_json::json!({"adapter_id": "lora-clio", "prompt": "summarize"}),
         issued_at_ms: 1_700_000_000_020,
     });
-    let reply = request_typed(alice, encode_hermes_event(&request).unwrap()).await;
-    decode_hermes_event(&reply.headers, reply.body.as_ref()).unwrap()
+    let reply = request_typed(alice, recipient, encode_hermes_event(&request).unwrap()).await;
+    decode_hermes_event(reply.headers(), Some(reply.body())).unwrap()
 }
 
-async fn request_typed(alice: &Airc, payload: (Headers, Body)) -> TranscriptEvent {
+async fn request_typed(
+    alice: &Airc,
+    recipient: PeerId,
+    payload: (Headers, Body),
+) -> std::sync::Arc<VerifiedAddressed> {
     let (headers, body) = payload;
     let pending = alice
-        .request(MentionTarget::All, headers, body, Duration::from_secs(3))
+        .request(
+            MentionTarget::Peer(recipient),
+            headers,
+            body,
+            Duration::from_secs(3),
+        )
         .await
         .expect("request emits");
     alice.await_reply(pending).await.expect("reply returns")
 }
 
-async fn reply_with(bob: &Airc, request: &TranscriptEvent, payload: (Headers, Body)) {
+async fn reply_with(bob: &Airc, request: &VerifiedAddressed, payload: (Headers, Body)) {
     let (headers, body) = payload;
-    let reply_to_peer = request_peer(request);
-    let correlation_id = request_correlation(request);
-    bob.reply(reply_to_peer, correlation_id, headers, body)
+    bob.reply(request, headers, body)
         .await
         .expect("reply emits");
-}
-
-fn request_peer(event: &TranscriptEvent) -> PeerId {
-    let value = event
-        .headers
-        .get(HEADER_AIRC_REPLY_TO)
-        .expect("request carries reply peer");
-    PeerId::from_uuid(Uuid::parse_str(value).expect("reply peer is uuid"))
-}
-
-fn request_correlation(event: &TranscriptEvent) -> Uuid {
-    let value = event
-        .headers
-        .get(HEADER_AIRC_CORRELATION_ID)
-        .expect("request carries correlation id");
-    Uuid::parse_str(value).expect("correlation is uuid")
 }

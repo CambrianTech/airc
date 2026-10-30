@@ -17,7 +17,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use airc_lib::{Airc, Headers, MentionTarget};
+use airc_lib::{AddressedKind, Airc, Headers, MentionTarget};
 use consumer_shapes::continuum::{
     any_embedding_event_filter, decode_embedding_event, encode_embedding_event,
     reply_embedding_emitted, request_embedding, EmbeddingEmitted, EmbeddingEvent,
@@ -25,7 +25,7 @@ use consumer_shapes::continuum::{
     HEADER_FORGE_AI_EMBEDDING_KIND, HEADER_FORGE_AI_EMBEDDING_MODEL,
     HEADER_FORGE_AI_EMBEDDING_REQUEST_ID,
 };
-use futures::StreamExt;
+
 use tempfile::TempDir;
 
 const MODEL: &str = "qwen3-embedding-0.6b";
@@ -177,7 +177,7 @@ async fn embedding_request_reply_resolves_before_deadline() {
 
     let pending = request_embedding(
         &requester,
-        MentionTarget::All,
+        MentionTarget::Peer(facility.peer_id()),
         &request(),
         Duration::from_secs(5),
     )
@@ -189,7 +189,7 @@ async fn embedding_request_reply_resolves_before_deadline() {
         .await
         .expect("await_reply resolves with the EmbeddingEmitted reply");
     let decoded =
-        decode_embedding_event(&reply.headers, reply.body.as_ref()).expect("reply decodes");
+        decode_embedding_event(reply.headers(), Some(reply.body())).expect("reply decodes");
     assert_eq!(decoded, EmbeddingEvent::Emitted(emitted()));
 
     responder.await.expect("responder completes");
@@ -199,17 +199,17 @@ async fn embedding_request_reply_resolves_before_deadline() {
 /// the model slug rode as a header (the routing/space identity), and reply
 /// `EmbeddingEmitted` correlating the command bus.
 async fn facility_answers_one_embedding(facility: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = facility.subscribe().await.unwrap();
+    let mut stream = facility.addressed_inbox();
     let _ = ready.send(());
     loop {
-        let Some(Ok(event)) = stream.next().await else {
-            continue;
+        let Some(event) = stream.next().await else {
+            panic!("addressed inbox closed before request");
         };
-        if event.peer_id == facility.peer_id() {
+        if event.kind() != AddressedKind::Command || event.to() != facility.peer_id() {
             continue;
         }
         if event
-            .headers
+            .headers()
             .get(HEADER_FORGE_AI_EMBEDDING_KIND)
             .map(String::as_str)
             != Some("requested")
@@ -220,19 +220,19 @@ async fn facility_answers_one_embedding(facility: Airc, ready: tokio::sync::ones
         // wrong-space request off this without decoding the body.
         assert_eq!(
             event
-                .headers
+                .headers()
                 .get(HEADER_FORGE_AI_EMBEDDING_MODEL)
                 .map(String::as_str),
             Some(MODEL),
         );
         let EmbeddingEvent::Requested(req) =
-            decode_embedding_event(&event.headers, event.body.as_ref()).unwrap()
+            decode_embedding_event(event.headers(), Some(event.body())).unwrap()
         else {
             continue;
         };
         assert_eq!(req.inputs.len(), 2, "both inputs rode the request");
 
-        reply_embedding_emitted(&facility, &event.headers, &emitted())
+        reply_embedding_emitted(&facility, &event, &emitted())
             .await
             .expect("embedding reply emits");
         return;

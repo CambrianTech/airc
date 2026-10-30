@@ -322,37 +322,6 @@ impl Airc {
         if let Some(sink) = self.inbound_frame_sink() {
             let verdict = sink.deliver(&frame).await;
             let event_id = frame.envelope.event_id;
-            let backfill_request = frame
-                .envelope
-                .headers
-                .get(crate::backfill::HEADER_AIRC_BACKFILL)
-                .filter(|value| *value == "request")
-                .and_then(|_| {
-                    let event = transcribable(frame.clone())?;
-                    (crate::backfill::BackfillRequest::from_event(&event).is_some()
-                        && crate::command_bus::reply_addressing(&event).is_some())
-                    .then_some(event)
-                });
-            let answerable_backfill = backfill_request.is_some();
-            if answerable_backfill
-                && !matches!(
-                    verdict,
-                    crate::router_bridge::InboundDeliveryVerdict::Failed(_)
-                )
-            {
-                // A requester can host rooms this peer does not. The owner
-                // history boundary must answer that case explicitly, rather
-                // than making recovery of later shared rooms wait for timeout.
-                // Keep one dispatch path for bound, remapped and unbound rooms.
-                let me = self.clone();
-                tokio::spawn(async move {
-                    if let Some(request) = backfill_request {
-                        if let Err(error) = me.serve_backfill(&request).await {
-                            tracing::warn!(target: "airc::backfill", %error, "could not serve a backfill request");
-                        }
-                    }
-                });
-            }
             match verdict {
                 crate::router_bridge::InboundDeliveryVerdict::Delivered => {
                     // In-process fan-out for any subscriber of THIS
@@ -412,25 +381,23 @@ impl Airc {
                     // Loud regardless of whether an ack was requested —
                     // a durable frame no scope will surface is the
                     // silent-drop class this card closes.
-                    if !answerable_backfill {
-                        self.emit_diag(
-                            DiagnosticEvent::error(
-                                DiagnosticComponent::Subscriber,
-                                DiagnosticCode::FrameUndeliverable,
-                                "inbound frame routed to the machine transcript, but no scope \
+                    self.emit_diag(
+                        DiagnosticEvent::error(
+                            DiagnosticComponent::Subscriber,
+                            DiagnosticCode::FrameUndeliverable,
+                            "inbound frame routed to the machine transcript, but no scope \
                              on this machine has the channel bound — no transcript surface \
                              will show it",
-                            )
-                            .with_field(
-                                "reason",
-                                airc_protocol::UndeliverableReason::UnknownChannel.as_str(),
-                            )
-                            .with_field("event_id", event_id)
-                            .with_field("sender", ack_origin)
-                            .with_field("channel", frame_channel)
-                            .with_field("persisted", true),
-                        );
-                    }
+                        )
+                        .with_field(
+                            "reason",
+                            airc_protocol::UndeliverableReason::UnknownChannel.as_str(),
+                        )
+                        .with_field("event_id", event_id)
+                        .with_field("sender", ack_origin)
+                        .with_field("channel", frame_channel)
+                        .with_field("persisted", true),
+                    );
                     if ack_requested {
                         self.respond_delivery_ack(
                             ack_origin,

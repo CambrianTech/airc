@@ -7,11 +7,10 @@ use airc_lib::{
     Airc, PeerSpec, TransportHealthSample, TransportHealthState, TransportKind, TransportRole,
 };
 use airc_protocol::{
-    PeerKeyRegistry, PeerKeypair, HEADER_AIRC_COMMAND_KIND, HEADER_AIRC_CORRELATION_ID,
-    HEADER_AIRC_REPLY_TO, HEADER_FORGE_BODY_HINT,
+    PeerKeyRegistry, PeerKeypair, HEADER_AIRC_COMMAND_KIND, HEADER_FORGE_BODY_HINT,
 };
 use airc_relay::{RelayServer, RelayServerConfig};
-use futures::StreamExt;
+
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -63,7 +62,14 @@ async fn proof_lan_loopback(
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let start = Instant::now();
-    let reply = issue_ping(&alice, timeout, "route.proof.lan.ping", "lan-ping").await?;
+    let reply = issue_ping(
+        &alice,
+        bob.peer_id(),
+        timeout,
+        "route.proof.lan.ping",
+        "lan-ping",
+    )
+    .await?;
     join_reply_handler(handler).await?;
 
     Ok(RouteProofReport {
@@ -133,7 +139,14 @@ async fn proof_relay_loopback(
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let start = Instant::now();
-    let reply = issue_ping(&alice, timeout, "route.proof.relay.ping", "relay-ping").await?;
+    let reply = issue_ping(
+        &alice,
+        bob.peer_id(),
+        timeout,
+        "route.proof.relay.ping",
+        "relay-ping",
+    )
+    .await?;
     join_reply_handler(handler).await?;
     relay.shutdown();
 
@@ -199,37 +212,23 @@ fn spawn_reply_handler(
     responder: Airc,
     result_hint: &'static str,
 ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+    let mut inbox = responder.addressed_inbox();
     tokio::spawn(async move {
-        let mut stream = responder.subscribe().await?;
-        while let Some(next) = stream.next().await {
-            let event = next?;
-            if event.peer_id == responder.peer_id() {
-                continue;
-            }
-            let Some(correlation) = event.headers.get(HEADER_AIRC_CORRELATION_ID) else {
-                continue;
-            };
-            let Some(reply_to) = event.headers.get(HEADER_AIRC_REPLY_TO) else {
-                continue;
-            };
-            let correlation_id = Uuid::parse_str(correlation)?;
-            let reply_to_peer = PeerId::from_uuid(Uuid::parse_str(reply_to)?);
-            let mut headers = Headers::new();
-            headers.insert(HEADER_FORGE_BODY_HINT.into(), result_hint.into());
-            responder
-                .reply(
-                    reply_to_peer,
-                    correlation_id,
-                    headers,
-                    Body::text("route-proof-pong"),
-                )
-                .await?;
-            return Ok(());
+        let event = inbox
+            .next()
+            .await
+            .ok_or("addressed inbox closed before request")?;
+        if event.kind() != airc_lib::AddressedKind::Command {
+            return Err("route proof received a non-request".into());
         }
-        Err("reply handler stream ended before request arrived".into())
+        let mut headers = Headers::new();
+        headers.insert(HEADER_FORGE_BODY_HINT.into(), result_hint.into());
+        responder
+            .reply(&event, headers, Body::text("route-proof-pong"))
+            .await?;
+        Ok(())
     })
 }
-
 async fn join_reply_handler(
     handler: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -241,6 +240,7 @@ async fn join_reply_handler(
 
 async fn issue_ping(
     requester: &Airc,
+    recipient: PeerId,
     timeout: Duration,
     command_kind: &str,
     body: &str,
@@ -248,15 +248,19 @@ async fn issue_ping(
     let mut headers = Headers::new();
     headers.insert(HEADER_AIRC_COMMAND_KIND.into(), command_kind.into());
     let pending = requester
-        .request(MentionTarget::All, headers, Body::text(body), timeout)
+        .request(
+            MentionTarget::Peer(recipient),
+            headers,
+            Body::text(body),
+            timeout,
+        )
         .await?;
     let correlation_id = pending.correlation_id;
     let reply = requester.await_reply(pending).await?;
     let body = reply
-        .body
-        .as_ref()
-        .and_then(Body::as_text)
-        .unwrap_or("")
+        .body()
+        .as_text()
+        .ok_or("route proof reply has no text body")?
         .to_string();
     Ok(ProofReply {
         correlation_id,

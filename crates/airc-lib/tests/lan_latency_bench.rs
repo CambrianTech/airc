@@ -13,24 +13,20 @@ use std::time::{Duration, Instant};
 
 use airc_core::{Body, Headers, MentionTarget, PeerId};
 use airc_lib::Airc;
-use airc_protocol::{
-    HEADER_AIRC_COMMAND_KIND, HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_REPLY_TO,
-    HEADER_FORGE_BODY_HINT,
-};
-use futures::stream::StreamExt;
+use airc_protocol::{HEADER_AIRC_COMMAND_KIND, HEADER_FORGE_BODY_HINT};
+
 use tempfile::TempDir;
-use uuid::Uuid;
 
 /// Returns (send_leg_us, wait_leg_us): time for `request()` (encode→sign→flush
 /// to the wire) vs `await_reply()` (peer processes + replies + delivery back).
 /// Splitting the round-trip localizes which half owns the latency.
-async fn one_round_trip(alice: &Airc) -> (u64, u64) {
+async fn one_round_trip(alice: &Airc, recipient: PeerId) -> (u64, u64) {
     let mut headers = Headers::new();
     headers.insert(HEADER_AIRC_COMMAND_KIND.into(), "lat.ping".into());
     let t0 = Instant::now();
     let pending = alice
         .request(
-            MentionTarget::All,
+            MentionTarget::Peer(recipient),
             headers,
             Body::text("ping"),
             Duration::from_secs(3),
@@ -66,34 +62,22 @@ fn lan_request_reply_latency() {
         alice.connect_lan(bob_addr, bob.peer_id()).await.unwrap();
 
         // Persistent echo responder.
+        let mut inbox = bob.addressed_inbox();
         let bob_handle = bob.clone();
         tokio::spawn(async move {
-            let mut stream = bob_handle.subscribe().await.unwrap();
-            while let Some(ev) = stream.next().await {
-                let Ok(event) = ev else { continue };
-                if event.peer_id == bob_handle.peer_id() {
-                    continue;
-                }
-                let (Some(corr), Some(rt)) = (
-                    event.headers.get(HEADER_AIRC_CORRELATION_ID),
-                    event.headers.get(HEADER_AIRC_REPLY_TO),
-                ) else {
-                    continue;
-                };
-                let correlation_id = Uuid::parse_str(corr).unwrap();
-                let reply_to = PeerId::from_uuid(Uuid::parse_str(rt).unwrap());
-                let mut h = Headers::new();
-                h.insert(HEADER_FORGE_BODY_HINT.into(), "lat.pong".into());
-                let _ = bob_handle
-                    .reply(reply_to, correlation_id, h, Body::text("pong"))
-                    .await;
+            while let Some(event) = inbox.next().await {
+                assert_eq!(event.kind(), airc_lib::AddressedKind::Command);
+                let mut headers = Headers::new();
+                headers.insert(HEADER_FORGE_BODY_HINT.into(), "lat.pong".into());
+                bob_handle
+                    .reply(&event, headers, Body::text("pong"))
+                    .await
+                    .expect("echo reply");
             }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         const N: usize = 200;
         for _ in 0..5 {
-            one_round_trip(&alice).await; // warmup
+            one_round_trip(&alice, bob.peer_id()).await; // warmup
         }
         // Turn on seam timing AFTER warmup so the breakdown reflects steady state.
         airc_diagnostics::timing::reset();
@@ -103,7 +87,7 @@ fn lan_request_reply_latency() {
         let mut wait = Vec::with_capacity(N);
         for _ in 0..N {
             let t0 = Instant::now();
-            let (s, w) = one_round_trip(&alice).await;
+            let (s, w) = one_round_trip(&alice, bob.peer_id()).await;
             total.push(t0.elapsed().as_micros() as u64);
             send.push(s);
             wait.push(w);
