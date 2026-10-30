@@ -92,6 +92,7 @@ mod transport_commands;
 mod update_artifact;
 mod update_commands;
 mod update_legacy;
+mod update_preflight;
 mod update_rollback;
 #[cfg(windows)]
 mod update_session;
@@ -507,10 +508,10 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             body_json,
             stdin,
             headers,
-            kind,
+            class,
         } => {
             publish_commands::run_publish(
-                &home, room.room, body_text, body_json, stdin, headers, kind,
+                &home, room.room, body_text, body_json, stdin, headers, class,
             )
             .await
         }
@@ -655,6 +656,12 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Version => commands::run_version(),
+        Command::StorePublishFresh { destination } => {
+            update_preflight::publish_fresh(&home, &destination).await
+        }
+        Command::StorePreflight { fresh_install } => {
+            update_preflight::run(&home, fresh_install).await
+        }
 
         #[cfg(windows)]
         Command::SetupRecoverElevatedOwner {

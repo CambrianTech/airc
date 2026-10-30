@@ -58,7 +58,8 @@ async fn lagging_subscriber_never_stalls_fanout_and_resumes_from_sink() {
         let env = tokio::time::timeout(Duration::from_secs(5), fast_stream.next())
             .await
             .expect("fast subscriber STALLED — fan-out was blocked by the slow one")
-            .expect("fast stream ended early");
+            .expect("fast stream ended early")
+            .expect("subscription read must succeed");
         seen.push(env.event_id.0.as_u128());
     }
 

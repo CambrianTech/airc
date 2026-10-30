@@ -131,7 +131,8 @@ mod tests {
         Envelope::new(
             RoomId::from_u128(1),
             (PeerId::from_u128(1), ClientId::from_u128(1)),
-            Kind::Signal,
+            Kind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::Presence),
             DeliveryClass::EphemeralLatest,
             Bytes::copy_from_slice(&[seq_marker]),
         )

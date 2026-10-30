@@ -15,13 +15,11 @@
 
 use std::sync::Arc;
 
-use airc_bus::envelope::{Envelope, Kind, Target};
-use airc_core::{
-    Body, MentionTarget, PeerId, RoomId, TranscriptCursor, TranscriptEvent, TranscriptKind,
-};
+use airc_bus::envelope::{Envelope, Target};
+use airc_core::{Body, MentionTarget, PeerId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
-    AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind,
+    AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery,
     PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
@@ -30,7 +28,7 @@ use tokio::sync::mpsc;
 use crate::error::AircError;
 use crate::publish::PublishReceipt;
 use crate::room::Room;
-use crate::stream::EventStream;
+use crate::stream::{EventStream, StreamError};
 use crate::Airc;
 
 /// Low bits of the packed `lamport` that hold the per-epoch counter; the
@@ -63,52 +61,6 @@ fn unpack_seq(lamport: u64) -> (u64, u64) {
     (lamport >> COUNTER_BITS, lamport & COUNTER_MASK)
 }
 
-fn kind_to_transcript(kind: Kind) -> TranscriptKind {
-    match kind {
-        Kind::Message => TranscriptKind::Message,
-        Kind::Command => TranscriptKind::Command,
-        Kind::CommandResult => TranscriptKind::CommandResult,
-        // Non-command event categories retain their coarse System projection.
-        Kind::Event | Kind::Signal | Kind::StreamChunk | Kind::Control => TranscriptKind::System,
-    }
-}
-
-/// Continuum #297 — the inverse of [`kind_to_transcript`], for pushing
-/// a consumer's `EventFilter::kinds` down into the daemon's inbox read
-/// ("newest N events OF THESE KINDS", filtered before the limit).
-///
-/// The push-down must be a SUPERSET of the client-side `filter.matches`
-/// — never narrower, or the daemon would drop events the consumer asked
-/// for. Message and command categories map exactly. Remaining transcript
-/// categories admit the remaining non-command bus categories, with
-/// `filter.matches` refining the decoded page afterwards.
-fn transcript_kinds_to_ipc(kinds: &std::collections::BTreeSet<TranscriptKind>) -> Vec<IpcKind> {
-    let mut out = Vec::new();
-    if kinds.contains(&TranscriptKind::Message) {
-        out.push(IpcKind::Message);
-    }
-    if kinds.contains(&TranscriptKind::Command) {
-        out.push(IpcKind::Command);
-    }
-    if kinds.contains(&TranscriptKind::CommandResult) {
-        out.push(IpcKind::CommandResult);
-    }
-    if kinds.iter().any(|kind| {
-        !matches!(
-            kind,
-            TranscriptKind::Message | TranscriptKind::Command | TranscriptKind::CommandResult
-        )
-    }) {
-        out.extend([
-            IpcKind::Event,
-            IpcKind::Signal,
-            IpcKind::StreamChunk,
-            IpcKind::Control,
-        ]);
-    }
-    out
-}
-
 fn target_to_mention(target: &Target) -> MentionTarget {
     match target {
         Target::Peer(peer) => MentionTarget::Peer(*peer),
@@ -125,11 +77,12 @@ fn target_to_mention(target: &Target) -> MentionTarget {
 /// Project a decoded owner-core envelope to the SDK transcript shape.
 pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
     TranscriptEvent {
+        class: env.class,
         event_id: env.event_id,
         room_id: env.channel,
         peer_id: env.from.0,
         client_id: env.from.1,
-        kind: kind_to_transcript(env.kind),
+        kind: env.class.transcript_kind(),
         occurred_at_ms: env.occurred_at_ms,
         lamport: pack_seq(env.seq.epoch, env.seq.counter),
         target: target_to_mention(&env.target),
@@ -183,6 +136,9 @@ impl Airc {
         let receipt = self
             .require_daemon_client()?
             .send(SendRequest {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
@@ -202,10 +158,16 @@ impl Airc {
         &self,
         room: &Room,
         kind: FrameKind,
+        class: airc_core::EventClass,
         target: MentionTarget,
         body: Body,
         mut headers: airc_core::Headers,
     ) -> Result<crate::messaging::SendFrameResult, AircError> {
+        if kind != FrameKind::for_class(class) {
+            return Err(AircError::Route(
+                "frame kind conflicts with event class".into(),
+            ));
+        }
         room.stamp_name_header(&mut headers);
         // The FRAME's class, read from its own header — never a pin. This was
         // hardcoded `Durable` while `daemon_publish` beside it had already been
@@ -217,10 +179,13 @@ impl Airc {
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
+                class,
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
-                kind: kind.into(),
+                kind: airc_bus::Kind::for_class(class)
+                    .map_err(|error| AircError::Route(error.to_string()))?
+                    .into(),
                 delivery: ipc_delivery(delivery),
                 target: target.into(),
                 correlation_id: None,
@@ -239,7 +204,7 @@ impl Airc {
     pub(crate) async fn daemon_publish(
         &self,
         room: &Room,
-        kind: FrameKind,
+        class: airc_core::EventClass,
         body: Body,
         mut headers: airc_core::Headers,
         delivery: airc_bus::DeliveryClass,
@@ -249,10 +214,13 @@ impl Airc {
         let response = self
             .require_daemon_client()?
             .publish(PublishRequest {
+                class,
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
-                kind: kind.into(),
+                kind: airc_bus::Kind::for_class(class)
+                    .map_err(|error| AircError::Route(error.to_string()))?
+                    .into(),
                 // The CALLER's class, not a pin. This was hardcoded
                 // `Durable`, which meant a citizen's presence line — a
                 // glyph, a pose, a thought marker — became an ORM row and
@@ -317,34 +285,6 @@ impl Airc {
             .collect()
     }
 
-    /// Continuum #297: [`Airc::daemon_page_recent`] with the consumer's
-    /// kind filter pushed down into the daemon's inbox read (mapped via
-    /// [`transcript_kinds_to_ipc`]), so the daemon pages the newest
-    /// `limit` events OF THOSE KINDS instead of a raw newest-`limit`
-    /// that a StreamChunk flood fills with events the caller discards.
-    pub(crate) async fn daemon_page_recent_of_kinds(
-        &self,
-        channel: RoomId,
-        kinds: &std::collections::BTreeSet<TranscriptKind>,
-        limit: usize,
-    ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let response = self
-            .require_daemon_client()?
-            .inbox(InboxRequest {
-                since: None,
-                channel: Some(channel),
-                limit: Some(limit),
-                kinds: Some(transcript_kinds_to_ipc(kinds)),
-                before: None,
-            })
-            .await?;
-        response
-            .envelopes
-            .into_iter()
-            .map(decode_wire_event)
-            .collect()
-    }
-
     pub(crate) async fn daemon_resume_from(
         &self,
         room: &Room,
@@ -371,50 +311,6 @@ impl Airc {
             .into_iter()
             .map(decode_wire_event)
             .collect()
-    }
-
-    /// Most-recent `limit` events across ALL subscribed rooms, via the
-    /// daemon. The owner-core router pages per channel, so this fans the
-    /// query over the subscription set and merges by total order
-    /// `(lamport, event_id)` — the daemon-backed equivalent of the
-    /// `page_recent_subscribed` direct path.
-    pub(crate) async fn daemon_page_recent_subscribed(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let set = self.subscription_set().await?;
-        let mut merged = Vec::new();
-        for subscription in set.all() {
-            let room = subscription.as_room();
-            merged.extend(self.daemon_page_recent(&room, limit).await?);
-        }
-        merged.sort_by_key(|event| event.lamport);
-        if merged.len() > limit {
-            merged = merged.split_off(merged.len() - limit);
-        }
-        Ok(merged)
-    }
-
-    /// Events strictly after `cursor` across ALL subscribed rooms, via
-    /// the daemon. Same per-channel fan + merge as
-    /// [`Airc::daemon_page_recent_subscribed`], resuming each room from
-    /// the shared `(epoch, counter)` packed in the cursor.
-    pub(crate) async fn daemon_resume_from_subscribed(
-        &self,
-        cursor: &TranscriptCursor,
-        limit: usize,
-    ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let set = self.subscription_set().await?;
-        let mut merged = Vec::new();
-        for subscription in set.all() {
-            let room = subscription.as_room();
-            merged.extend(self.daemon_resume_from(&room, cursor, limit).await?);
-            // Keep at most one retained page plus the next room's page in
-            // memory, and use the full cursor order before trimming ties.
-            merged.sort_unstable_by_key(|event| (event.lamport, event.event_id.0));
-            merged.truncate(limit);
-        }
-        Ok(merged)
     }
 
     /// Fetch every transcript event on `channel` strictly after
@@ -579,6 +475,7 @@ impl Airc {
         channels: Vec<RoomId>,
         delivery: Option<Vec<IpcDelivery>>,
         headers: airc_core::HeaderFilter,
+        selection: airc_core::EventSelection,
     ) -> Result<EventStream, AircError> {
         // Own the client so each reader task can re-attach after a daemon
         // restart (the borrow from `require_daemon_client` can't outlive
@@ -588,7 +485,7 @@ impl Airc {
             .daemon_client
             .clone()
             .ok_or_else(|| AircError::Route("daemon client is not attached".to_string()))?;
-        let (tx, rx) = mpsc::channel::<Arc<TranscriptEvent>>(1024);
+        let (tx, rx) = mpsc::channel::<Result<Arc<TranscriptEvent>, StreamError>>(1024);
         // ONE socket for the whole set when the daemon serves channel sets
         // (`StatusResponse::attach_channel_sets`, the typed capability): a
         // 15-subscriber core held ~960 per-channel attach sockets to its
@@ -602,7 +499,8 @@ impl Airc {
             .attach_channel_sets;
         if daemon_serves_sets && channels.len() > 1 {
             let handle =
-                Self::daemon_subscribe_set(client, channels, delivery, headers, tx).await?;
+                Self::daemon_subscribe_set(client, channels, delivery, headers, selection, tx)
+                    .await?;
             return Ok(EventStream::daemon(rx, vec![handle]));
         }
         let mut handles = Vec::with_capacity(channels.len());
@@ -614,6 +512,7 @@ impl Airc {
                     None,
                     delivery.clone(),
                     headers.clone(),
+                    selection.clone(),
                     tx.clone(),
                 )
                 .await?,
@@ -631,6 +530,7 @@ fn channel_request(
     from: Option<IpcCursor>,
     delivery: Option<Vec<IpcDelivery>>,
     headers: airc_core::HeaderFilter,
+    selection: airc_core::EventSelection,
 ) -> AttachRequest {
     let mut request = match from {
         Some(cursor) => AttachRequest::new(channel, AttachStart::After(cursor)),
@@ -639,7 +539,7 @@ fn channel_request(
     if let Some(classes) = delivery {
         request = request.with_delivery(classes);
     }
-    request.with_headers(headers)
+    request.with_headers(headers).with_selection(selection)
 }
 
 /// The attach for a CHANNEL SET: every room with its own resume cursor
@@ -649,6 +549,7 @@ fn channel_set_request(
     cursors: &std::collections::HashMap<RoomId, IpcCursor>,
     delivery: Option<Vec<IpcDelivery>>,
     headers: airc_core::HeaderFilter,
+    selection: airc_core::EventSelection,
 ) -> AttachRequest {
     let mut request = AttachRequest::channel_set(
         channels
@@ -662,7 +563,7 @@ fn channel_set_request(
     if let Some(classes) = delivery {
         request = request.with_delivery(classes);
     }
-    request.with_headers(headers)
+    request.with_headers(headers).with_selection(selection)
 }
 
 /// Aborts the wrapped task when dropped: the per-room readers a set reader
@@ -686,7 +587,8 @@ async fn spawn_channel_reader(
     from: Option<IpcCursor>,
     delivery: Option<Vec<IpcDelivery>>,
     headers: airc_core::HeaderFilter,
-    tx: mpsc::Sender<Arc<TranscriptEvent>>,
+    selection: airc_core::EventSelection,
+    tx: mpsc::Sender<Result<Arc<TranscriptEvent>, StreamError>>,
 ) -> Result<tokio::task::JoinHandle<()>, AircError> {
     // Initial attach + ack — fail fast so `subscribe()` errors if
     // the daemon is down right now (don't silently spin).
@@ -697,7 +599,13 @@ async fn spawn_channel_reader(
     // stored cursor — see `join_feed`).
     // `from` is the resume point a caller hands over (the set reader
     // falling back after a daemon rollback); `None` is the live edge.
-    let request = channel_request(channel, from, delivery.clone(), headers.clone());
+    let request = channel_request(
+        channel,
+        from,
+        delivery.clone(),
+        headers.clone(),
+        selection.clone(),
+    );
     let mut stream = client.attach(request).await?; // typed: see `attach_ack`
     attach_ack(read_response_frame(&mut stream).await, "daemon attach")?;
     Ok(tokio::spawn(async move {
@@ -717,7 +625,7 @@ async fn spawn_channel_reader(
                         match decode_wire_event(envelope) {
                             Ok(event) => {
                                 from = Some(cursor_after(&event));
-                                if tx.send(Arc::new(event)).await.is_err() {
+                                if tx.send(Ok(Arc::new(event))).await.is_err() {
                                     return; // consumer gone
                                 }
                                 backoff_ms = RECONNECT_BACKOFF_START_MS;
@@ -737,6 +645,11 @@ async fn spawn_channel_reader(
                                     error = %error,
                                     "airc subscribe: dropping subscription — decode_wire_event failed"
                                 );
+                                let _ = tx
+                                    .send(Err(StreamError::Decode {
+                                        message: error.to_string(),
+                                    }))
+                                    .await;
                                 return;
                             }
                         }
@@ -749,17 +662,25 @@ async fn spawn_channel_reader(
                         // below — 3,100 lines/min on a 16-citizen core, rotating the log
                         // every 15 minutes (2026-09-14, airc #1411).
                     }
+                    Ok(Some(Response::Error { message })) => {
+                        let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                        return;
+                    }
                     Ok(Some(other)) => {
-                        // Non-Event frames on a live subscription
-                        // are unexpected (ack already consumed); a
-                        // recurring stream of these indicates the
-                        // daemon is sending shapes the SDK doesn't
-                        // recognise.
-                        tracing::warn!(
-                            channel = %channel,
-                            frame = ?other,
-                            "airc subscribe: ignoring non-Event frame"
-                        );
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: format!("unexpected attach frame: {other:?}"),
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: error.to_string(),
+                            }))
+                            .await;
+                        return;
                     }
                     Ok(None) | Err(_) => {
                         // Card 807193ab: surface stream drops so a
@@ -798,7 +719,9 @@ async fn spawn_channel_reader(
                 if let Some(classes) = delivery.clone() {
                     request = request.with_delivery(classes);
                 }
-                request = request.with_headers(headers.clone());
+                request = request
+                    .with_headers(headers.clone())
+                    .with_selection(selection.clone());
                 let mut s = match client.attach(request).await {
                     Ok(s) => s,
                     Err(error) => {
@@ -821,12 +744,25 @@ async fn spawn_channel_reader(
                         backoff_ms = RECONNECT_BACKOFF_START_MS;
                         break; // reconnected; resume draining
                     }
+                    Ok(Some(Response::Error { message })) => {
+                        let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                        return;
+                    }
                     Ok(Some(other)) => {
-                        tracing::warn!(
-                            channel = %channel,
-                            frame = ?other,
-                            "airc subscribe: reattach ack mismatch — expected Ok"
-                        );
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: format!("unexpected attach frame: {other:?}"),
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: error.to_string(),
+                            }))
+                            .await;
+                        return;
                     }
                     Ok(None) | Err(_) => {
                         tracing::warn!(
@@ -853,14 +789,22 @@ impl Airc {
         channels: Vec<RoomId>,
         delivery: Option<Vec<IpcDelivery>>,
         headers: airc_core::HeaderFilter,
-        tx: mpsc::Sender<Arc<TranscriptEvent>>,
+        selection: airc_core::EventSelection,
+        tx: mpsc::Sender<Result<Arc<TranscriptEvent>, StreamError>>,
     ) -> Result<tokio::task::JoinHandle<()>, AircError> {
         let request_for = {
             let channels = channels.clone();
             let delivery = delivery.clone();
             let headers = headers.clone();
+            let selection = selection.clone();
             move |cursors: &std::collections::HashMap<RoomId, IpcCursor>| {
-                channel_set_request(&channels, cursors, delivery.clone(), headers.clone())
+                channel_set_request(
+                    &channels,
+                    cursors,
+                    delivery.clone(),
+                    headers.clone(),
+                    selection.clone(),
+                )
             }
         };
         let mut cursors: std::collections::HashMap<RoomId, IpcCursor> = Default::default();
@@ -879,7 +823,7 @@ impl Airc {
                         {
                             Ok(event) => {
                                 cursors.insert(event.room_id, cursor_after(&event));
-                                if tx.send(Arc::new(event)).await.is_err() {
+                                if tx.send(Ok(Arc::new(event))).await.is_err() {
                                     return; // consumer gone
                                 }
                                 backoff_ms = RECONNECT_BACKOFF_START_MS;
@@ -890,12 +834,34 @@ impl Airc {
                                     error = %error,
                                     "airc subscribe (set): dropping subscription — decode_wire_event failed"
                                 );
+                                let _ = tx
+                                    .send(Err(StreamError::Decode {
+                                        message: error.to_string(),
+                                    }))
+                                    .await;
                                 return;
                             }
                         },
                         Ok(Some(Response::AttachCursorAdvanced { .. })) => {}
+                        Ok(Some(Response::Error { message })) => {
+                            let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                            return;
+                        }
                         Ok(Some(other)) => {
-                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): ignoring non-Event frame");
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: format!("unexpected attach frame: {other:?}"),
+                                }))
+                                .await;
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: error.to_string(),
+                                }))
+                                .await;
+                            return;
                         }
                         Ok(None) | Err(_) => {
                             tracing::warn!(
@@ -946,11 +912,16 @@ impl Airc {
                                         cursors.get(&channel).copied(),
                                         delivery.clone(),
                                         headers.clone(),
+                                        selection.clone(),
                                         tx.clone(),
                                     )
                                     .await
                                     {
                                         Ok(handle) => children.push(AbortOnDrop(handle)),
+                                        Err(AircError::Stream(error)) => {
+                                            let _ = tx.send(Err(error)).await;
+                                            return;
+                                        }
                                         Err(error) => {
                                             tracing::warn!(channel = %channel, retry_ms, error = %error, "airc subscribe (set): per-room fallback attach failed — retrying with its cursor");
                                             still.push(channel);
@@ -989,8 +960,25 @@ impl Airc {
                             backoff_ms = RECONNECT_BACKOFF_START_MS;
                             break;
                         }
+                        Ok(Some(Response::Error { message })) => {
+                            let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                            return;
+                        }
                         Ok(Some(other)) => {
-                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): reattach ack mismatch — expected Ok");
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: format!("unexpected attach frame: {other:?}"),
+                                }))
+                                .await;
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: error.to_string(),
+                                }))
+                                .await;
+                            return;
                         }
                         Ok(None) | Err(_) => {
                             tracing::warn!(
@@ -1039,27 +1027,30 @@ fn ipc_delivery(delivery: airc_bus::DeliveryClass) -> IpcDelivery {
 
 /// An attach's acknowledgment, typed by cause (Codex on #1603). A daemon that refuses the
 /// attach, or answers with a frame that is not an acknowledgment or not a frame at all, is a
-/// real error (`Route`). A connection that closes or fails before the acknowledgment is the
+/// terminal typed stream error. A connection that closes or fails before the acknowledgment is the
 /// daemon going away, which happens in an update's handoff: it is `DaemonClient(Io)`, which
 /// `AircError::is_daemon_absent` reads, so a waiting reader attaches again instead of ending.
 fn attach_ack(ack: std::io::Result<Option<Response>>, what: &str) -> Result<(), AircError> {
     match ack {
         Ok(Some(Response::Ok)) => Ok(()),
-        Ok(Some(Response::Error { message })) => {
-            Err(AircError::Route(format!("{what}: {message}")))
+        Ok(Some(Response::Error { message })) => Err(StreamError::OwnerRejected {
+            message: format!("{what}: {message}"),
         }
-        Ok(Some(other)) => Err(AircError::Route(format!(
-            "{what}: not an acknowledgment: {other:?}"
-        ))),
+        .into()),
+        Ok(Some(other)) => Err(StreamError::Decode {
+            message: format!("{what}: not an acknowledgment: {other:?}"),
+        }
+        .into()),
         Ok(None) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(
             std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!("{what}: closed before acknowledging"),
             ),
         ))),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(AircError::Route(
-            format!("{what}: malformed acknowledgment: {error}"),
-        )),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(StreamError::Decode {
+            message: format!("{what}: malformed acknowledgment: {error}"),
+        }
+        .into()),
         Err(error) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(error))),
     }
 }
@@ -1067,26 +1058,6 @@ fn attach_ack(ack: std::io::Result<Option<Response>>, what: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn command_categories_survive_projection_and_filter_pushdown() {
-        for (bus, transcript, ipc) in [
-            (Kind::Command, TranscriptKind::Command, IpcKind::Command),
-            (
-                Kind::CommandResult,
-                TranscriptKind::CommandResult,
-                IpcKind::CommandResult,
-            ),
-        ] {
-            assert_eq!(kind_to_transcript(bus), transcript);
-            let requested = std::collections::BTreeSet::from([transcript]);
-            assert_eq!(transcript_kinds_to_ipc(&requested), vec![ipc]);
-        }
-        let system =
-            transcript_kinds_to_ipc(&std::collections::BTreeSet::from([TranscriptKind::System]));
-        assert!(!system.contains(&IpcKind::Command));
-        assert!(!system.contains(&IpcKind::CommandResult));
-    }
 
     // what this catches (Codex on #1603): a replacement daemon that closes the attach before
     // acknowledging it, read as a refusal, which ends a reattaching feed for good. Through
@@ -1105,10 +1076,15 @@ mod tests {
             })),
             "attach",
         );
-        assert!(!refused.unwrap_err().is_daemon_absent());
+        assert!(
+            matches!(refused, Err(AircError::Stream(StreamError::OwnerRejected { message })) if message == "attach: no such room")
+        );
         let mut garbage: &[u8] = &[0, 0, 0, 1, 0xff];
         let garbage = attach_ack(read_response_frame(&mut garbage).await, "attach");
-        assert!(!garbage.unwrap_err().is_daemon_absent());
+        assert!(matches!(
+            garbage,
+            Err(AircError::Stream(StreamError::Decode { .. }))
+        ));
     }
 
     // what this catches (Astra's re-review of airc #1523): a daemon rolled back
@@ -1135,7 +1111,14 @@ mod tests {
             value_prefix: "airc.heartbeat.".to_string(),
         }));
 
-        let set = channel_set_request(&[a, b], &cursors, delivery.clone(), headers.clone());
+        let selection = airc_core::EventSelection::Correspondence;
+        let set = channel_set_request(
+            &[a, b],
+            &cursors,
+            delivery.clone(),
+            headers.clone(),
+            selection.clone(),
+        );
         let entries = set.channels().expect("a set attach");
         assert_eq!(entries[0].start(), AttachStart::After(cursor_a));
         assert_eq!(
@@ -1150,6 +1133,7 @@ mod tests {
                 cursors.get(&room).copied(),
                 delivery.clone(),
                 headers.clone(),
+                selection.clone(),
             );
             let expected = if room == a {
                 AttachStart::After(cursor_a)

@@ -18,22 +18,13 @@
 //! [`HEADER_AIRC_DELIVERY_ACK`] header to [`DELIVERY_ACK_REQUEST`] on
 //! an ordinary frame. A receiver that understands the header responds
 //! on the same connection with a `FrameKind::Control` frame whose
-//! headers carry [`DELIVERY_ACK_RESPONSE`] and whose JSON body is a
+//! signed class is `Control(Receipt)` and whose JSON body is a
 //! [`DeliveryAck`] — emitted only AFTER the persistence decision, so
 //! `delivered` means "durably in my transcript store on a channel this
 //! scope has bound", never "accepted".
 //!
-//! ## Wire compatibility
-//!
-//! No new `FrameKind` and no new top-level wire shape: both the
-//! request marker and the response travel as plain headers + JSON body
-//! on existing frame kinds, so peers running older builds decode them
-//! as ordinary frames. An old receiver simply never responds — the new
-//! sender times out and reports "no ack" distinctly (the frame may
-//! still have been delivered). An old sender never sets the request
-//! header, so it never receives ack frames at all. The JSON shapes
-//! below are pinned by literal-JSON tests; renaming any field or
-//! variant breaks the pins (mutation-verified).
+//! The signed class selects the receipt decoder. Invalid receipt payloads
+//! are refused; they cannot fall through into conversation history.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,16 +32,12 @@ use airc_core::{Body, EventId, PeerId, RoomId, TranscriptCursor};
 
 use crate::envelope::Frame;
 
-/// Header key marking a frame as ack-requesting (value
-/// [`DELIVERY_ACK_REQUEST`]) or as an ack response (value
-/// [`DELIVERY_ACK_RESPONSE`]). Substrate-owned `airc.*` namespace.
+/// Header key requesting a receipt (value [`DELIVERY_ACK_REQUEST`]).
+/// Response routing uses the signed class, not this request policy header.
 pub const HEADER_AIRC_DELIVERY_ACK: &str = "airc.delivery_ack";
 
 /// Header value: "sender requests a delivery ack for this frame."
 pub const DELIVERY_ACK_REQUEST: &str = "request";
-
-/// Header value: "this frame's body is a [`DeliveryAck`]."
-pub const DELIVERY_ACK_RESPONSE: &str = "response";
 
 /// Typed delivery receipt — the JSON body of an ack-response frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,25 +114,35 @@ pub fn wants_delivery_ack(frame: &Frame) -> bool {
 }
 
 /// If this frame is an ack response, decode its [`DeliveryAck`] body.
-/// Returns `None` for ordinary frames (no header / wrong value) and
-/// for marked frames whose body does not parse — callers treat those
-/// as ordinary frames rather than failing the ingest path.
-pub fn decode_delivery_ack(frame: &Frame) -> Option<DeliveryAck> {
-    if frame
-        .envelope
-        .headers
-        .get(HEADER_AIRC_DELIVERY_ACK)
-        .map(String::as_str)
-        != Some(DELIVERY_ACK_RESPONSE)
-    {
-        return None;
+/// The signed class determines receipt routing. Ordinary frames return `None`;
+/// malformed receipt payloads are refused and never enter conversation history.
+pub fn decode_delivery_ack(frame: &Frame) -> Result<Option<DeliveryAck>, DeliveryAckDecodeError> {
+    if frame.envelope.class != airc_core::EventClass::Control(airc_core::ControlKind::Receipt) {
+        return Ok(None);
     }
-    let body = frame.envelope.body.as_ref()?;
-    match body {
-        Body::Json(value) => serde_json::from_value(value.clone()).ok(),
-        Body::Binary(_) => None,
+    let Some(Body::Json(value)) = frame.envelope.body.as_ref() else {
+        return Err(DeliveryAckDecodeError::ExpectedJson);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(DeliveryAckDecodeError::InvalidPayload)
+}
+
+#[derive(Debug)]
+pub enum DeliveryAckDecodeError {
+    ExpectedJson,
+    InvalidPayload(serde_json::Error),
+}
+
+impl std::fmt::Display for DeliveryAckDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExpectedJson => write!(f, "delivery receipt requires a JSON payload"),
+            Self::InvalidPayload(error) => write!(f, "invalid delivery receipt: {error}"),
+        }
     }
 }
+impl std::error::Error for DeliveryAckDecodeError {}
 
 #[cfg(test)]
 mod tests {
@@ -158,6 +155,7 @@ mod tests {
         Frame {
             kind: FrameKind::Control,
             envelope: Envelope {
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Receipt),
                 event_id: EventId::from_u128(0x1),
                 sender: PeerId::from_u128(0xa1),
                 sender_client: ClientId::from_u128(0xc1),
@@ -261,7 +259,6 @@ mod tests {
         // pinned so a rename is caught here, not in the field.
         assert_eq!(HEADER_AIRC_DELIVERY_ACK, "airc.delivery_ack");
         assert_eq!(DELIVERY_ACK_REQUEST, "request");
-        assert_eq!(DELIVERY_ACK_RESPONSE, "response");
     }
 
     #[test]
@@ -281,7 +278,7 @@ mod tests {
         let mut response_headers = Headers::new();
         response_headers.insert(
             HEADER_AIRC_DELIVERY_ACK.to_string(),
-            DELIVERY_ACK_RESPONSE.to_string(),
+            "invalid-request-policy".to_string(),
         );
         assert!(!wants_delivery_ack(&frame_with_headers(
             response_headers,
@@ -298,20 +295,24 @@ mod tests {
                 reason: UndeliverableReason::PersistFailed,
             },
         };
-        let mut headers = Headers::new();
-        headers.insert(
-            HEADER_AIRC_DELIVERY_ACK.to_string(),
-            DELIVERY_ACK_RESPONSE.to_string(),
-        );
         let frame = frame_with_headers(
-            headers,
+            Headers::new(),
             Some(Body::Json(serde_json::to_value(&ack).expect("encode"))),
         );
-        assert_eq!(decode_delivery_ack(&frame), Some(ack));
+        assert_eq!(
+            decode_delivery_ack(&frame).expect("decode receipt"),
+            Some(ack)
+        );
 
-        // Ordinary frames (no marker header) never decode as acks even
-        // if their body happens to look like one.
-        let plain = frame_with_headers(Headers::new(), None);
-        assert_eq!(decode_delivery_ack(&plain), None);
+        // Classification alone selects the decoder; missing receipt data
+        // is an error, while correspondence is never decoded as a receipt.
+        let mut plain = frame_with_headers(Headers::new(), None);
+        assert!(
+            decode_delivery_ack(&plain).is_err(),
+            "malformed receipt cannot become chat"
+        );
+        plain.envelope.class =
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message);
+        assert_eq!(decode_delivery_ack(&plain).expect("ordinary frame"), None);
     }
 }

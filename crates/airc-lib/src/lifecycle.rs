@@ -16,7 +16,7 @@
 //! lifecycle history from their cursor. Filter them out at
 //! subscription time if you don't want them in the chat stream.
 
-use airc_core::{Body, ClientId, EventId, MentionTarget, PeerId, RoomId, TranscriptKind};
+use airc_core::{Body, ClientId, EventId, MentionTarget, PeerId, RoomId};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AircError;
@@ -110,22 +110,20 @@ impl Airc {
     /// All seven Phase 2 lifecycle variants are now wired.
     pub(crate) async fn emit_lifecycle(
         &self,
-        kind: TranscriptKind,
+        kind: airc_core::LifecycleKind,
         room_id: RoomId,
         body: Body,
     ) -> Result<(), AircError> {
-        debug_assert!(
-            kind.is_lifecycle(),
-            "emit_lifecycle called with non-lifecycle kind {kind:?}",
-        );
         let occurred_at_ms = now_ms()?;
         let lamport = self.next_lamport(occurred_at_ms);
         let event = airc_core::TranscriptEvent {
+            class: airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle(kind)),
             event_id: EventId::new(),
             room_id,
             peer_id: self.inner.identity.peer_id,
             client_id: ClientId::new(),
-            kind,
+            kind: airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle(kind))
+                .transcript_kind(),
             occurred_at_ms,
             lamport,
             target: MentionTarget::All,
@@ -170,14 +168,19 @@ impl Airc {
             })
             .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
         );
-        self.emit_lifecycle(TranscriptKind::SubscriptionAdvanced, room_id, body)
-            .await
+        self.emit_lifecycle(
+            airc_core::LifecycleKind::SubscriptionAdvanced,
+            room_id,
+            body,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use airc_core::TranscriptKind;
 
     #[test]
     fn lifecycle_kinds_round_trip_through_is_lifecycle() {

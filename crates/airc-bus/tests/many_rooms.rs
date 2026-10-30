@@ -65,7 +65,8 @@ async fn idle_channels_allocate_nothing_and_never_wake() {
     let got = tokio::time::timeout(Duration::from_secs(5), active_stream.next())
         .await
         .expect("active subscriber should wake")
-        .expect("stream ended");
+        .expect("stream ended")
+        .expect("subscription read must succeed");
     assert_eq!(got.event_id.0.as_u128(), 1);
 
     // The idle subscriber NEVER wakes within the window — no per-room task is

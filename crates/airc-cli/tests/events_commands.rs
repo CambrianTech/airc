@@ -57,7 +57,7 @@ fn events_list_json_emits_machine_readable_contract() {
         &home,
         &[
             "publish",
-            "--kind",
+            "--class",
             "message",
             "--body-json",
             "-",

@@ -11,9 +11,15 @@ fn position(c: &TranscriptCursor) -> (u64, u128) {
 async fn chunk(airc: &Airc, n: usize) {
     let mut h = Headers::new();
     h.insert(HEADER_STREAM_ID.into(), format!("legacy-{n}"));
-    airc.send_frame_to_for_test(FrameKind::Event, MentionTarget::All, Body::text("token"), h)
-        .await
-        .unwrap();
+    airc.send_frame_to_for_test(
+        FrameKind::Control,
+        airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+        MentionTarget::All,
+        Body::text("token"),
+        h,
+    )
+    .await
+    .unwrap();
 }
 async fn exercise(airc: &Airc) {
     airc.join("a").await.unwrap();
@@ -28,10 +34,15 @@ async fn exercise(airc: &Airc) {
         for n in 0..80 {
             chunk(airc, n).await;
         }
-        expected.push(airc.say("same text 🌍").await.unwrap());
+        expected.push(
+            airc.say("@Fable 🛠️ observed a result — this is real speech")
+                .await
+                .unwrap(),
+        );
         expected.push(
             airc.send_frame_to_for_test(
-                FrameKind::Event,
+                FrameKind::Message,
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Announcement),
                 MentionTarget::All,
                 Body::text("System warning"),
                 Headers::new(),
@@ -42,6 +53,37 @@ async fn exercise(airc: &Airc) {
         for n in 80..96 {
             chunk(airc, n).await;
         }
+        // Opaque activity payloads and chat-looking work text never reach the correspondence feed.
+        for n in 0..96 {
+            let body = if n % 2 == 0 {
+                Body::Binary(vec![0, 255, 127])
+            } else {
+                Body::text("Codex: @Fable please review this")
+            };
+            airc.send_frame_to_for_test(
+                FrameKind::Event,
+                airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
+                MentionTarget::All,
+                body,
+                Headers::new(),
+            )
+            .await
+            .unwrap();
+        }
+        let filtered = airc
+            .page_recent_filtered(
+                airc_lib::EventFilter {
+                    selection: airc_core::EventSelection::Correspondence,
+                    ..airc_lib::EventFilter::default()
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            expected[expected.len() - 2..]
+        );
     }
     let through = airc.latest_subscribed_cursor().await.unwrap().unwrap();
     let future = airc.say("after snapshot").await.unwrap();
@@ -90,12 +132,28 @@ async fn exercise(airc: &Airc) {
     airc.publish_stream_chunk(&StreamChunk::text_token("live", 0, "part"))
         .await
         .unwrap();
+    let work_change = airc
+        .send_frame_to_for_test(
+            FrameKind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
+            MentionTarget::All,
+            Body::Binary(vec![255, 0]),
+            Headers::new(),
+        )
+        .await
+        .unwrap();
     let settled = airc.say("settled").await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
+        let mut observed_work = false;
         loop {
             let e = live.next().await.unwrap().unwrap();
             assert!(!e.headers.contains_key(HEADER_STREAM_ID));
+            observed_work |= e.event_id == work_change;
             if e.event_id == settled {
+                assert!(
+                    observed_work,
+                    "actionable work-state events share the agent subscription"
+                );
                 break;
             }
         }

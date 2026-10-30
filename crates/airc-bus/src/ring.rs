@@ -230,6 +230,7 @@ mod tests {
             RoomId::from_u128(1),
             (PeerId::from_u128(1), ClientId::from_u128(1)),
             Kind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             delivery,
             Bytes::from_static(b"x"),
         )

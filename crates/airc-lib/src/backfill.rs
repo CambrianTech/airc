@@ -641,6 +641,7 @@ mod tests {
             RoomId::from_uuid(uuid::Uuid::from_u128(9)),
             (PeerId::from_u128(8), airc_core::ClientId::new()),
             airc_bus::envelope::Kind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             airc_bus::envelope::DeliveryClass::Durable,
             bytes::Bytes::new(),
         );

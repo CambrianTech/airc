@@ -49,6 +49,7 @@ fn work_transcript(
         peer_id: PeerId::from_u128(2),
         client_id: ClientId::from_u128(3),
         kind: TranscriptKind::System,
+        class: airc_work::work_event_class(event),
         occurred_at_ms: event.occurred_at_ms(),
         lamport,
         target: MentionTarget::All,
@@ -67,6 +68,7 @@ fn chat_transcript(event_id: u128, room_id: RoomId, lamport: u64) -> TranscriptE
         peer_id: PeerId::from_u128(2),
         client_id: ClientId::from_u128(3),
         kind: TranscriptKind::Message,
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         occurred_at_ms: 1000 + lamport,
         lamport,
         target: MentionTarget::All,
@@ -386,11 +388,7 @@ fn review_handoff_replays_once_with_candidate_and_author_custody() {
         &WorkEvent::SubmissionReviewRequested(request.clone()),
     );
     wire.peer_id = submitted.publisher;
-    let legacy_filter = airc_core::HeaderFilter::Exact {
-        key: airc_protocol::HEADER_FORGE_BODY_HINT.into(),
-        value: airc_work::BODY_HINT_FORGE_WORK_EVENT.into(),
-    };
-    assert!(!legacy_filter.matches(&wire.headers));
+    assert!(airc_work::work_event_selection().matches(wire.class));
     let mut events = prefix.clone();
     events.push(wire.clone());
     events.push(work_transcript(5, room, 5, &card_claimed(id, 91, 3, 6000)));
@@ -412,15 +410,6 @@ fn review_handoff_replays_once_with_candidate_and_author_custody() {
         apply_transcripts(&mut restored, events[split..].to_vec()).unwrap();
         assert_eq!(restored, full, "split {split}");
     }
-    let legacy = project_transcripts(
-        events
-            .into_iter()
-            .filter(|e| legacy_filter.matches(&e.headers))
-            .collect(),
-    )
-    .unwrap();
-    assert_eq!(legacy.card(parent), full.card(parent));
-    assert!(legacy.card(id).is_none());
     wire.peer_id = PeerId::from_u128(999);
     let mut forged = project_transcripts(prefix.clone()).unwrap();
     apply_transcripts(&mut forged, vec![wire]).unwrap();
@@ -476,13 +465,6 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
         evidence: candidate.artifact.clone(),
         reviewed_at_ms: 7000,
     };
-    // Legacy hash-only receipts remain readable; new signed words must match their reference.
-    let legacy = serde_json::to_value(&review).unwrap();
-    assert!(legacy.get("evidence_text").is_none());
-    assert_eq!(
-        serde_json::from_value::<WorkSubmissionReview>(legacy).unwrap(),
-        review
-    );
     let mut review = review;
     let words = "Changes requested: compare the selected branch, not HEAD.";
     review.evidence = airc_blobs::MediaRef {
@@ -506,19 +488,11 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
         );
         assert!(!bad.same_judgement(&review));
     }
-    let (headers, _) =
-        encode_work_event(&WorkEvent::WorkSubmissionReviewed(review.clone())).unwrap();
-    let legacy_filter = airc_core::HeaderFilter::Exact {
-        key: airc_protocol::HEADER_FORGE_BODY_HINT.into(),
-        value: airc_work::BODY_HINT_FORGE_WORK_EVENT.into(),
-    };
     assert!(
-        !legacy_filter.matches(&headers),
-        "legacy work readers must ignore the extension"
+        airc_work::work_event_selection().matches(airc_work::work_event_class(
+            &WorkEvent::WorkSubmissionReviewed(review.clone()),
+        ))
     );
-    assert!(airc_work::work_event_subscription()
-        .headers_filter
-        .matches(&headers));
     let mut repeated = review.clone();
     repeated.reviewed_at_ms = 900_000; // old claim is now expired/closed
     let mut conflict = repeated.clone();
@@ -555,14 +529,6 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
     let full = project_transcripts(transcripts.clone()).unwrap();
     assert_eq!(full.submission_review(review.review_id), Some(&review));
     assert_eq!(full.snapshot().submission_reviews, vec![review.clone()]);
-    let mut legacy_snapshot = serde_json::to_value(full.snapshot()).unwrap();
-    legacy_snapshot
-        .as_object_mut()
-        .unwrap()
-        .remove("submission_reviews");
-    let restored: airc_work::BoardSnapshot = serde_json::from_value(legacy_snapshot).unwrap();
-    assert!(restored.submission_reviews.is_empty());
-    assert_eq!(restored.cards, full.snapshot().cards);
     assert_eq!(full.submission_reviews_for(review.submission_id).count(), 1);
     assert_eq!(
         full.last_review_rejection(parent).unwrap().reason,
@@ -670,59 +636,8 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
             outcome
         );
     }
-    // A typed extension cannot hide legacy mutations from old readers. Exercise
-    // the actual full projection on each side of that filter, not only decoding.
-    let mut disguised = prefix.clone();
-    for (i, event) in [
-        card_created(WorkCardId::from_u128(999)),
-        card_claimed(parent, 999, 4, 900_000),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut wire = work_transcript(20 + i as u128, room, 20 + i as u64, &event);
-        wire.headers.insert(
-            airc_protocol::HEADER_FORGE_BODY_HINT.into(),
-            airc_work::BODY_HINT_FORGE_WORK_REVIEW.into(),
-        );
-        assert!(matches!(
-            airc_work::decode_work_event(&wire.headers, wire.body.as_ref()),
-            Err(airc_work::WorkEventCodecError::VariantHintMismatch { .. })
-        ));
-        disguised.push(wire);
-    }
-    let mut unknown = work_transcript(
-        22,
-        room,
-        22,
-        &WorkEvent::WorkSubmissionReviewed(review.clone()),
-    );
-    unknown.body = Some(Body::Json(serde_json::json!({"kind":"unsupported_review"})));
-    unknown
-        .headers
-        .remove(airc_work::HEADER_FORGE_WORK_EVENT_KIND);
-    disguised.push(unknown);
-    disguised.push(work_transcript(
-        23,
-        room,
-        23,
-        &card_created(WorkCardId::from_u128(998)),
-    ));
-    let old_visible = disguised
-        .iter()
-        .filter(|event| legacy_filter.matches(&event.headers))
-        .cloned()
-        .collect();
-    let legacy = project_transcripts(old_visible).unwrap();
-    let upgraded = project_transcripts(disguised).unwrap();
-    assert_eq!(upgraded, legacy);
-    assert!(upgraded.card(WorkCardId::from_u128(999)).is_none());
-    assert!(upgraded.card(WorkCardId::from_u128(998)).is_some());
-    assert_eq!(
-        upgraded.card(parent).unwrap().owner,
-        Some(PeerId::from_u128(2))
-    );
-
+    // Labels do not determine admission or codec behavior; malformed selected
+    // payloads are errors, never silently skipped to advance the board.
     let mut wrong_hint = work_transcript(
         10,
         room,
@@ -731,21 +646,17 @@ async fn reviewed_submission_preserves_signed_authority_across_every_replay_boun
     );
     wrong_hint.headers.insert(
         airc_protocol::HEADER_FORGE_BODY_HINT.into(),
-        airc_work::BODY_HINT_FORGE_WORK_EVENT.into(),
+        "unrelated".into(),
     );
-    let before = project_transcripts(prefix.clone()).unwrap();
-    let mut after = before.clone();
-    apply_transcripts(&mut after, vec![wrong_hint]).unwrap();
-    assert_eq!(after, before, "review under legacy hint cannot be accepted");
-
+    assert!(airc_work::decode_work_event(&wrong_hint.headers, wrong_hint.body.as_ref()).is_ok());
     let mut malformed = work_transcript(10, room, 10, &WorkEvent::WorkSubmissionReviewed(review));
     malformed.body = Some(Body::Json(
         serde_json::json!({"kind":"work_submission_reviewed", "reviewer":"broken"}),
     ));
     let before = project_transcripts(prefix).unwrap();
     let mut after = before.clone();
-    apply_transcripts(&mut after, vec![malformed]).unwrap();
-    assert_eq!(after, before, "malformed review cannot poison the board");
+    assert!(apply_transcripts(&mut after, vec![malformed]).is_err());
+    assert_eq!(after, before, "failed codec cannot mutate the board");
 }
 
 #[tokio::test]
@@ -810,9 +721,32 @@ async fn submissions_survive_retry_conflict_settle_and_every_snapshot_boundary()
 }
 
 #[tokio::test]
-async fn malformed_submission_cannot_poison_board_or_hide_other_corruption() {
+async fn malformed_submission_is_an_explicit_replay_failure_regardless_of_hint() {
     let room = RoomId::from_u128(10);
     let id = WorkCardId::from_u128(20);
+    // Positive control: the same valid work before/after the corrupt row
+    // projects normally when it is genuinely a complete, valid history.
+    let valid = vec![
+        work_transcript(1, room, 1, &card_created(id)),
+        work_transcript(3, room, 3, &card_state_changed(id)),
+    ];
+    let expected = project_transcripts(valid.clone()).expect("valid history");
+    assert_eq!(expected.card(id).expect("card").state, CardState::Review);
+    assert_eq!(
+        airc_work::project_transcript_work_events(valid.clone()).expect("domain projection"),
+        expected
+    );
+    let valid_store = InMemoryEventStore::new();
+    for event in valid {
+        valid_store.append(event).await.expect("append");
+    }
+    assert_eq!(
+        WorkEventStore::new(&valid_store)
+            .project_complete(Some(room), 1)
+            .await
+            .expect("paged valid projection"),
+        expected
+    );
     for header in [None, Some("card_created"), Some("work_submitted")] {
         let mut malformed = work_transcript(2, room, 2, &WorkEvent::WorkSubmitted(submission(id)));
         malformed.body = Some(Body::Json(
@@ -832,22 +766,20 @@ async fn malformed_submission_cannot_poison_board_or_hide_other_corruption() {
             malformed,
             work_transcript(3, room, 3, &card_state_changed(id)),
         ];
-        let full = project_transcripts(transcripts.clone()).unwrap();
-        assert_eq!(full.card(id).unwrap().state, CardState::Review);
-        assert_eq!(
-            airc_work::project_transcript_work_events(transcripts.clone()).unwrap(),
-            full
+        let corrupt_id = transcripts[1].event_id;
+        assert!(matches!(project_transcripts(transcripts.clone()),
+            Err(WorkStoreError::Replay(airc_work::WorkReplayError::Codec { event_id, .. })) if event_id == corrupt_id));
+        assert!(
+            matches!(airc_work::project_transcript_work_events(transcripts.clone()),
+            Err(airc_work::WorkReplayError::Codec { event_id, .. }) if event_id == corrupt_id)
         );
         let store = InMemoryEventStore::new();
         for event in transcripts {
-            store.append(event).await.unwrap();
+            store.append(event).await.expect("append");
         }
-        assert_eq!(
-            WorkEventStore::new(&store)
-                .project_complete(Some(room), 1)
-                .await
-                .unwrap(),
-            full
+        assert!(
+            matches!(WorkEventStore::new(&store).project_complete(Some(room), 1).await,
+            Err(WorkStoreError::Replay(airc_work::WorkReplayError::Codec { event_id, .. })) if event_id == corrupt_id)
         );
     }
     let mut unrelated = work_transcript(4, room, 4, &card_created(id));

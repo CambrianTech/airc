@@ -36,6 +36,7 @@ pub mod channel_purpose;
 pub mod cursor;
 pub mod datetime;
 pub mod doctrine;
+pub mod event_class;
 pub mod filter;
 pub mod gh_executable;
 pub mod headers;
@@ -56,11 +57,15 @@ pub mod transcript;
 // use `airc_core::Foo`; internal cross-module references use the explicit
 // module paths so refactors stay clear.
 
-pub use addressing::{leading_mentions, AddresseeFilter, Addressing};
+pub use addressing::{AddresseeFilter, Addressing};
 pub use attachment::AttachmentManifest;
 pub use body::Body;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use datetime::{iso_to_epoch, DateTimeError};
+pub use event_class::{
+    ActivityKind, ControlKind, CorrespondenceKind, EventClass, EventFamily, EventSelection,
+    LifecycleKind,
+};
 pub use filter::{filter_self_echoes, RuntimeSelf, SelfFilter};
 pub use headers::{HeaderFilter, Headers};
 pub use history_count::HistoryCount;

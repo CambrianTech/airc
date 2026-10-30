@@ -1,25 +1,13 @@
 use airc_core::TranscriptEvent;
-use airc_lib::{
-    Airc, RepoId, WorkQueueStatus, WorkQueueStatusQuery, HEADER_FORGE_WORK_EVENT_KIND,
-    HEADER_FORGE_WORK_REPO,
-};
+use airc_lib::{Airc, RepoId, WorkQueueStatus, WorkQueueStatusQuery, HEADER_FORGE_WORK_REPO};
 
 const DEFAULT_LIMIT: usize = 5;
 
 pub(crate) fn is_work_queue_event(event: &TranscriptEvent) -> bool {
-    matches!(
-        event
-            .headers
-            .get(HEADER_FORGE_WORK_EVENT_KIND)
-            .map(String::as_str),
-        Some(
-            "card_created"
-                | "card_claimed"
-                | "claim_released"
-                | "card_state_changed"
-                | "agent_availability_reported",
-        )
-    )
+    airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
+        airc_core::ActivityKind::WorkState,
+    ))
+    .matches(event.class)
 }
 
 pub(crate) async fn render_claimable_work(
@@ -117,22 +105,10 @@ mod tests {
     #[test]
     fn detects_queue_events_only() {
         let mut event = transcript();
-        event.headers.insert(
-            HEADER_FORGE_WORK_EVENT_KIND.to_string(),
-            "card_created".to_string(),
-        );
         assert!(is_work_queue_event(&event));
-
-        event.headers.insert(
-            HEADER_FORGE_WORK_EVENT_KIND.to_string(),
-            "claim_heartbeat".to_string(),
-        );
+        event.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Presence);
         assert!(!is_work_queue_event(&event));
-
-        event.headers.insert(
-            HEADER_FORGE_WORK_EVENT_KIND.to_string(),
-            "agent_availability_reported".to_string(),
-        );
+        event.class = airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState);
         assert!(is_work_queue_event(&event));
     }
 
@@ -206,6 +182,7 @@ mod tests {
 
     fn transcript() -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: PeerId::new(),

@@ -327,9 +327,9 @@ pub enum Command {
         /// Header in `key=value` form. Repeatable.
         #[arg(long = "header", value_name = "KEY=VALUE")]
         headers: Vec<String>,
-        /// Frame kind. Defaults to `event` for structured payloads.
-        #[arg(long, value_enum, default_value = "event")]
-        kind: PublishFrameKind,
+        /// Required producer-declared semantic class; payloads are never inspected.
+        #[arg(long, value_enum)]
+        class: PublishClass,
     },
 
     /// Pull buffered frames from a subscribed room's wire. With
@@ -489,6 +489,19 @@ pub enum Command {
     /// are on the same build. (`--version` flag prints just the
     /// package version.)
     Version,
+
+    /// Validate existing stores without mutation before adopting this binary.
+    #[command(hide = true)]
+    StorePublishFresh {
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    #[command(hide = true)]
+    StorePreflight {
+        /// Refuse any existing store: direct installation cannot quiesce its writer.
+        #[arg(long)]
+        fresh_install: bool,
+    },
 
     /// Print the resolved daemon IPC socket path for this scope and exit.
     ///
@@ -759,16 +772,80 @@ mod tests {
     }
 }
 
-/// Frame kind selector for `airc publish`. Maps 1:1 onto
-/// `airc_protocol::FrameKind`.
+/// Explicit semantic class for `airc publish`; transport kind is derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
-pub enum PublishFrameKind {
-    /// Plain message frame (human-readable chat).
+pub enum PublishClass {
     Message,
-    /// Structured event frame (recommended for typed envelopes
-    /// like Continuum's `AircRealtimeEnvelope`).
-    Event,
-    /// Control-plane signalling.
-    Control,
+    Announcement,
+    Intent,
+    WorkReceipt,
+    WorkState,
+    WorkPresence,
+    Coordination,
+    Presence,
+    Session,
+    PeerArrived,
+    PeerDeparted,
+    WireEstablished,
+    WireLost,
+    RoomJoined,
+    RoomParted,
+    SubscriptionAdvanced,
+    IdentityPublished,
+    DoctrinePublished,
+    WallPostPublished,
+    ChannelPurposePublished,
+}
+
+impl From<PublishClass> for airc_core::EventClass {
+    fn from(value: PublishClass) -> Self {
+        use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
+        match value {
+            PublishClass::Message => EventClass::Correspondence(CorrespondenceKind::Message),
+            PublishClass::Announcement => {
+                EventClass::Correspondence(CorrespondenceKind::Announcement)
+            }
+            PublishClass::Intent => EventClass::Activity(ActivityKind::Intent),
+            PublishClass::WorkReceipt => EventClass::Activity(ActivityKind::WorkReceipt),
+            PublishClass::WorkState => EventClass::Activity(ActivityKind::WorkState),
+            PublishClass::WorkPresence => EventClass::Activity(ActivityKind::WorkPresence),
+            PublishClass::Coordination => EventClass::Activity(ActivityKind::Coordination),
+            PublishClass::Presence => EventClass::Activity(ActivityKind::Presence),
+            PublishClass::Session => EventClass::Control(ControlKind::Session),
+            PublishClass::PeerArrived => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::PeerArrived,
+            )),
+            PublishClass::PeerDeparted => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::PeerDeparted,
+            )),
+            PublishClass::WireEstablished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::WireEstablished,
+            )),
+            PublishClass::WireLost => {
+                EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::WireLost))
+            }
+            PublishClass::RoomJoined => {
+                EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomJoined))
+            }
+            PublishClass::RoomParted => {
+                EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomParted))
+            }
+            PublishClass::SubscriptionAdvanced => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::SubscriptionAdvanced,
+            )),
+            PublishClass::IdentityPublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::IdentityPublished,
+            )),
+            PublishClass::DoctrinePublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::DoctrinePublished,
+            )),
+            PublishClass::WallPostPublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::WallPostPublished,
+            )),
+            PublishClass::ChannelPurposePublished => EventClass::Control(ControlKind::Lifecycle(
+                airc_core::LifecycleKind::ChannelPurposePublished,
+            )),
+        }
+    }
 }

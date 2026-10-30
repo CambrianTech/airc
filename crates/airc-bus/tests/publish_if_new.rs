@@ -52,12 +52,14 @@ async fn second_arrival_of_same_event_id_is_duplicate_at_every_tier() {
     let first_seen = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("first event")
-        .expect("stream open");
+        .expect("stream open")
+        .expect("subscription read must succeed");
     assert_eq!(first_seen.payload.as_ref(), b"from the wire");
     let next_seen = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("second event")
-        .expect("stream open");
+        .expect("stream open")
+        .expect("subscription read must succeed");
     assert_eq!(
         next_seen.payload.as_ref(),
         b"sentinel",
@@ -151,6 +153,30 @@ struct FlakyContainsSink {
 
 #[async_trait]
 impl DurableSink for FlakyContainsSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         self.inner.append(e).await
     }
@@ -230,4 +256,33 @@ async fn failed_publish_does_not_poison_the_window_for_a_retry() {
     );
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(sink.inner.len(ch), 1, "the retried event is durable once");
+}
+
+#[tokio::test]
+async fn invalid_semantics_refuse_before_reserving_identity_or_mutating_ring() {
+    let room = RoomId::new();
+    let owner = Owner::new(RouterConfig::default());
+    let valid = durable(room, 0xabc, "same identity after refusal");
+    let mut invalid = valid.clone();
+    invalid.class = airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt);
+    assert!(matches!(
+        owner.router.publish_if_new(invalid).await,
+        Err(airc_bus::BusError::ClassKindMismatch { .. })
+    ));
+    assert_eq!(owner.router.ring_len(room), 0);
+    let mut addressed = valid.clone();
+    addressed.class = airc_core::EventClass::Control(airc_core::ControlKind::Addressed);
+    assert!(matches!(
+        owner.router.publish(addressed).await,
+        Err(airc_bus::BusError::UnsupportedClass(_))
+    ));
+    assert_eq!(owner.router.ring_len(room), 0);
+    assert!(matches!(
+        owner
+            .router
+            .publish_if_new(valid)
+            .await
+            .expect("valid retry"),
+        PublishIfNew::Published(_)
+    ));
 }

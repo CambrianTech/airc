@@ -23,6 +23,8 @@ fn publish_emits_json_receipt_with_event_id_and_channel() {
         &home,
         &[
             "publish",
+            "--class",
+            "message",
             "--body-json",
             "-",
             "--header",
@@ -63,6 +65,8 @@ fn publish_refuses_unsubscribed_room_with_clear_error() {
         &home,
         &[
             "publish",
+            "--class",
+            "message",
             "--room",
             "definitely-not-joined",
             "--body-text",
@@ -86,13 +90,22 @@ fn publish_requires_one_body_source() {
     let home = workspace.path().join("agent");
 
     run_ok(&home, &["init"]);
-    let stderr = run_expect_failure(&home, &["publish"]);
+    let stderr = run_expect_failure(&home, &["publish", "--class", "message"]);
     assert!(
         stderr.contains("--body-text")
             || stderr.contains("--body-json")
             || stderr.contains("required"),
         "stderr should explain that a body source is required, got: {stderr}"
     );
+}
+
+#[test]
+fn publish_refuses_missing_class_even_when_body_looks_like_a_message() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    let stderr = run_expect_failure(&home, &["publish", "--body-text", "please answer"]);
+    assert!(stderr.contains("--class"), "{stderr}");
 }
 
 fn run_ok(home: &Path, args: &[&str]) -> String {

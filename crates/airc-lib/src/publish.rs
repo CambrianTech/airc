@@ -106,10 +106,11 @@ impl Airc {
         &self,
         target: PublishTarget,
         kind: FrameKind,
+        class: airc_core::EventClass,
         body: Body,
         headers: Headers,
     ) -> Result<PublishReceipt, AircError> {
-        self.publish_with_delivery(target, kind, body, headers, DeliveryClass::Durable)
+        self.publish_with_delivery(target, kind, class, body, headers, DeliveryClass::Durable)
             .await
     }
 
@@ -138,10 +139,16 @@ impl Airc {
         &self,
         target: PublishTarget,
         kind: FrameKind,
+        class: airc_core::EventClass,
         body: Body,
         mut headers: Headers,
         delivery: DeliveryClass,
     ) -> Result<PublishReceipt, AircError> {
+        if kind != FrameKind::for_class(class) {
+            return Err(AircError::Route(
+                "frame kind conflicts with event class".into(),
+            ));
+        }
         // Stamp before the split so BOTH paths (daemon-attached and the
         // direct send below) carry the class — a receiver must not have to
         // know which path a publisher happened to take.
@@ -153,11 +160,11 @@ impl Airc {
         let room = self.resolve_publish_target(&target).await?;
         if self.is_daemon_attached() {
             return self
-                .daemon_publish(&room, kind, body, headers, delivery, recipient)
+                .daemon_publish(&room, class, body, headers, delivery, recipient)
                 .await;
         }
         let result = self
-            .send_frame_to_room(kind, recipient, body, headers, &room)
+            .send_frame_to_room(kind, class, recipient, body, headers, &room)
             .await?;
         Ok(PublishReceipt {
             event_id: result.event_id,

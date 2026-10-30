@@ -25,9 +25,10 @@ pub struct EventStream {
 }
 
 enum EventStreamInner {
+    Closed,
     Broadcast(BroadcastStream<Arc<TranscriptEvent>>),
     Daemon {
-        rx: ReceiverStream<Arc<TranscriptEvent>>,
+        rx: ReceiverStream<Result<Arc<TranscriptEvent>, StreamError>>,
         /// Aborts the per-channel attach tasks when the stream drops, so
         /// closing a subscription tears down its IPC connections.
         _guard: DaemonAttachGuard,
@@ -42,7 +43,7 @@ impl EventStream {
     }
 
     pub(crate) fn daemon(
-        rx: mpsc::Receiver<Arc<TranscriptEvent>>,
+        rx: mpsc::Receiver<Result<Arc<TranscriptEvent>, StreamError>>,
         handles: Vec<JoinHandle<()>>,
     ) -> Self {
         Self {
@@ -70,29 +71,43 @@ impl Drop for DaemonAttachGuard {
 }
 
 impl Stream for EventStream {
-    type Item = Result<Arc<TranscriptEvent>, LiveLag>;
+    type Item = Result<Arc<TranscriptEvent>, StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match &mut this.inner {
+            EventStreamInner::Closed => Poll::Ready(None),
             EventStreamInner::Broadcast(stream) => match Pin::new(stream).poll_next(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(event))),
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    Poll::Ready(Some(Err(LiveLag { skipped: n })))
+                    Poll::Ready(Some(Err(StreamError::Lag(LiveLag { skipped: n }))))
                 }
                 Poll::Ready(None) => Poll::Ready(None),
             },
-            // The daemon attach loop handles lag internally (resume-from-
-            // cursor on the IPC side), so the SDK consumer only ever sees
-            // delivered events here.
             EventStreamInner::Daemon { rx, .. } => match Pin::new(rx).poll_next(cx) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(event)) => Poll::Ready(Some(Ok(event))),
+                Poll::Ready(Some(Err(error))) => {
+                    // Terminate sibling readers with the same subscription on refusal.
+                    this.inner = EventStreamInner::Closed;
+                    Poll::Ready(Some(Err(error)))
+                }
+                Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(event))),
                 Poll::Ready(None) => Poll::Ready(None),
             },
         }
     }
+}
+
+/// Delivery failures are distinct from recoverable broadcast lag.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StreamError {
+    #[error(transparent)]
+    Lag(#[from] LiveLag),
+    #[error("event owner rejected delivery: {message}")]
+    OwnerRejected { message: String },
+    #[error("event stream decode failed: {message}")]
+    Decode { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +143,8 @@ impl std::error::Error for LiveLag {}
 /// have crossed into the durable store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
+    pub sender: Option<PeerId>,
+    pub selection: airc_core::EventSelection,
     pub channel: Option<RoomId>,
     pub channels: HashSet<RoomId>,
     pub kinds: BTreeSet<TranscriptKind>,
@@ -156,6 +173,8 @@ pub struct SelfEcho {
 impl Default for EventFilter {
     fn default() -> Self {
         Self {
+            sender: None,
+            selection: airc_core::EventSelection::All,
             channel: None,
             channels: HashSet::new(),
             kinds: BTreeSet::new(),
@@ -190,6 +209,12 @@ impl EventFilter {
     }
 
     pub fn matches(&self, event: &TranscriptEvent) -> bool {
+        if self.sender.is_some_and(|peer| peer != event.peer_id) {
+            return false;
+        }
+        if !self.selection.matches(event.class) {
+            return false;
+        }
         if let Some(channel) = self.channel {
             if event.room_id != channel {
                 return false;
@@ -198,7 +223,7 @@ impl EventFilter {
         if !self.channels.is_empty() && !self.channels.contains(&event.room_id) {
             return false;
         }
-        if !self.kinds.is_empty() && !self.kinds.contains(&event.kind) {
+        if !self.kinds.is_empty() && !self.kinds.contains(&event.class.transcript_kind()) {
             return false;
         }
         if let Some(se) = self.self_echo {
@@ -216,7 +241,7 @@ pub struct FilteredEventStream {
 }
 
 impl Stream for FilteredEventStream {
-    type Item = Result<Arc<TranscriptEvent>, LiveLag>;
+    type Item = Result<Arc<TranscriptEvent>, StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -243,13 +268,14 @@ mod tests {
 
     use super::*;
 
-    fn event(room_id: RoomId, kind: TranscriptKind) -> TranscriptEvent {
+    fn event(room_id: RoomId) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id,
             peer_id: PeerId::from_u128(0xa1),
             client_id: ClientId::from_u128(0xc1),
-            kind,
+            kind: TranscriptKind::Message,
             occurred_at_ms: 1,
             lamport: 1,
             target: MentionTarget::All,
@@ -261,8 +287,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantic_selection_is_independent_of_body_and_labels() {
+        let filter = EventFilter {
+            selection: airc_core::EventSelection::Correspondence,
+            ..EventFilter::default()
+        };
+        let mut value = event(RoomId::new());
+        for body in [
+            Body::text("Codex: @Fable 🛠️ {\"kind\":\"alive\"}"),
+            Body::Binary(vec![255, 0, 7]),
+        ] {
+            value.body = Some(body);
+            value.class =
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message);
+            assert!(filter.matches(&value));
+            value.class = airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt);
+            assert!(!filter.matches(&value));
+        }
+    }
+
     fn event_from(room_id: RoomId, peer: PeerId, client: ClientId) -> TranscriptEvent {
-        let mut ev = event(room_id, TranscriptKind::Message);
+        let mut ev = event(room_id);
         ev.peer_id = peer;
         ev.client_id = client;
         ev
@@ -277,8 +323,8 @@ mod tests {
             ..EventFilter::default()
         };
 
-        assert!(filter.matches(&event(admitted, TranscriptKind::Message)));
-        assert!(!filter.matches(&event(other, TranscriptKind::Message)));
+        assert!(filter.matches(&event(admitted)));
+        assert!(!filter.matches(&event(other)));
     }
 
     // what this catches: the DISPLAY-only self-echo suppression. An agent's
@@ -317,5 +363,61 @@ mod tests {
             "own broadcast must be hidden"
         );
         assert!(agent_feed.matches(&peer_send), "peer messages stay visible");
+    }
+    #[tokio::test]
+    async fn owner_failure_reaches_filtered_consumer_and_ends_all_readers() {
+        use futures::StreamExt;
+        let (tx, rx) = mpsc::channel(4);
+        let failure = StreamError::OwnerRejected {
+            message: "durable replay unavailable".into(),
+        };
+        tx.send(Err(failure.clone())).await.expect("failure");
+        tx.send(Ok(Arc::new(event(RoomId::new()))))
+            .await
+            .expect("queued sibling event");
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        let mut stream = FilteredEventStream {
+            inner: EventStream::daemon(rx, vec![task]),
+            filter: EventFilter::default(),
+        };
+        assert!(matches!(stream.next().await, Some(Err(error)) if error == failure));
+        assert!(
+            stream.next().await.is_none(),
+            "no events after owner refusal"
+        );
+        assert!(tx.is_closed());
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "sibling task must terminate");
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_remains_a_distinct_recoverable_variant() {
+        use futures::StreamExt;
+        let (tx, rx) = broadcast::channel(1);
+        let mut stream = EventStream::from_broadcast(rx);
+        tx.send(Arc::new(event(RoomId::new()))).expect("first");
+        tx.send(Arc::new(event(RoomId::new()))).expect("second");
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(StreamError::Lag(LiveLag { skipped: 1 })))
+        ));
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+    }
+    #[tokio::test]
+    async fn decode_failure_is_terminal_without_becoming_lag() {
+        use futures::StreamExt;
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Err(StreamError::Decode {
+            message: "invalid wire class".into(),
+        }))
+        .await
+        .expect("decode failure");
+        let mut stream = EventStream::daemon(rx, Vec::new());
+        assert!(
+            matches!(stream.next().await, Some(Err(StreamError::Decode { message })) if message == "invalid wire class")
+        );
+        assert!(stream.next().await.is_none());
+        assert!(tx.is_closed());
     }
 }

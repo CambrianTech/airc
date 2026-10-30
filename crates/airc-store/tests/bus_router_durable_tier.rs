@@ -154,6 +154,30 @@ impl DurableSink for GatedSqliteSink {
             .await
     }
 
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool, BusError> {
         self.inner.contains(event_id).await
     }
@@ -166,6 +190,7 @@ fn durable(channel: RoomId, marker: u128, text: &str) -> Envelope {
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         Bytes::copy_from_slice(text.as_bytes()),
     )
@@ -176,14 +201,17 @@ fn durable(channel: RoomId, marker: u128, text: &str) -> Envelope {
 /// (a hang) rather than passing trivially.
 async fn take_n<S>(mut stream: S, n: usize) -> Vec<Arc<Envelope>>
 where
-    S: futures::Stream<Item = Arc<Envelope>> + Unpin,
+    S: futures::Stream<Item = Result<Arc<Envelope>, airc_bus::BusError>> + Unpin,
 {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("timed out waiting for an event — a gap/miss would hang here");
-        out.push(next.expect("stream ended early — missing events"));
+        out.push(
+            next.expect("stream ended early — missing events")
+                .expect("durable replay failed"),
+        );
     }
     out
 }
@@ -282,11 +310,21 @@ async fn evicted_pending_durable_is_served_from_real_sqlite_not_skipped() {
     // an unrelated subscriber overflow from the flood.
     for i in 0..384u128 {
         let mut event = durable(ch, 1_000 + i, "non-durable during failed commit");
-        (event.kind, event.delivery) = match i % 3 {
-            0 => (Kind::CommandResult, DeliveryClass::RequestResponse),
-            1 => (Kind::StreamChunk, DeliveryClass::StreamChunk),
-            _ => (Kind::Event, DeliveryClass::EphemeralWindow),
+        (event.class, event.delivery) = match i % 3 {
+            0 => (
+                airc_core::EventClass::Control(airc_core::ControlKind::CommandResult),
+                DeliveryClass::RequestResponse,
+            ),
+            1 => (
+                airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+                DeliveryClass::StreamChunk,
+            ),
+            _ => (
+                airc_core::EventClass::Activity(airc_core::ActivityKind::Presence),
+                DeliveryClass::EphemeralWindow,
+            ),
         };
+        event.kind = Kind::for_class(event.class).expect("fixture class");
         r.publish(event).await.expect("non-durable stays available");
         assert_eq!(r.pinned_in_ring(ch), 8);
         assert_eq!(r.ring_len(ch), 8, "only the accepted durable floor remains");

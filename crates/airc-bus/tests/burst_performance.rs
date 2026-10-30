@@ -22,6 +22,30 @@ impl DelayedSink {
 
 #[async_trait]
 impl DurableSink for DelayedSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         self.inner.append(e).await
     }
@@ -93,6 +117,7 @@ async fn burst_slow_storage() {
                 channel,
                 (PeerId::from_u128(1), ClientId::from_u128(1)),
                 Kind::Message,
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
                 DeliveryClass::Durable,
                 Bytes::from_static(b"burst payload"),
             )

@@ -5,24 +5,24 @@ const _: () = ::planus::check_version_compatibility("planus-1.3.0");
 /// The root namespace
 ///
 /// Generated from these locations:
-/// * File `crates/airc-wire/src/schema/wire.fbs`
+/// * File `/tmp/airc-typed-wire.9DWeQt/wire.fbs`
 #[no_implicit_prelude]
 #[allow(clippy::needless_lifetimes)]
 mod root {
     /// The namespace `airc`
     ///
     /// Generated from these locations:
-    /// * File `crates/airc-wire/src/schema/wire.fbs`
+    /// * File `/tmp/airc-typed-wire.9DWeQt/wire.fbs`
     pub mod airc {
         /// The namespace `airc.wire`
         ///
         /// Generated from these locations:
-        /// * File `crates/airc-wire/src/schema/wire.fbs`
+        /// * File `/tmp/airc-typed-wire.9DWeQt/wire.fbs`
         pub mod wire {
             /// The struct `Uuid` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Struct `Uuid` in the file `crates/airc-wire/src/schema/wire.fbs:23`
+            /// * Struct `Uuid` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:23`
             #[derive(
                 Copy,
                 Clone,
@@ -238,7 +238,7 @@ mod root {
             /// The enum `Kind` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Enum `Kind` in the file `crates/airc-wire/src/schema/wire.fbs:30`
+            /// * Enum `Kind` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:30`
             #[derive(
                 Copy,
                 Clone,
@@ -438,10 +438,315 @@ mod root {
                 }
             }
 
+            /// The enum `EventClass` in the namespace `airc.wire`
+            ///
+            /// Generated from these locations:
+            /// * Enum `EventClass` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:41`
+            #[derive(
+                Copy,
+                Clone,
+                Debug,
+                PartialEq,
+                Eq,
+                PartialOrd,
+                Ord,
+                Hash,
+                ::serde::Serialize,
+                ::serde::Deserialize,
+            )]
+            #[repr(u8)]
+            pub enum EventClass {
+                /// The variant `Unspecified` in the enum `EventClass`
+                Unspecified = 0,
+
+                /// The variant `CorrespondenceMessage` in the enum `EventClass`
+                CorrespondenceMessage = 1,
+
+                /// The variant `CorrespondenceAnnouncement` in the enum `EventClass`
+                CorrespondenceAnnouncement = 2,
+
+                /// The variant `ActivityIntent` in the enum `EventClass`
+                ActivityIntent = 3,
+
+                /// The variant `ActivityWorkReceipt` in the enum `EventClass`
+                ActivityWorkReceipt = 4,
+
+                /// The variant `ActivityWorkState` in the enum `EventClass`
+                ActivityWorkState = 5,
+
+                /// The variant `ActivityPresence` in the enum `EventClass`
+                ActivityPresence = 6,
+
+                /// The variant `ActivityWorkPresence` in the enum `EventClass`
+                ActivityWorkPresence = 7,
+
+                /// The variant `ActivityCoordination` in the enum `EventClass`
+                ActivityCoordination = 8,
+
+                /// The variant `ControlCommand` in the enum `EventClass`
+                ControlCommand = 9,
+
+                /// The variant `ControlCommandResult` in the enum `EventClass`
+                ControlCommandResult = 10,
+
+                /// The variant `ControlSession` in the enum `EventClass`
+                ControlSession = 11,
+
+                /// The variant `ControlReceipt` in the enum `EventClass`
+                ControlReceipt = 12,
+
+                /// The variant `ControlAddressed` in the enum `EventClass`
+                ControlAddressed = 13,
+
+                /// The variant `ControlSignal` in the enum `EventClass`
+                ControlSignal = 14,
+
+                /// The variant `ControlStream` in the enum `EventClass`
+                ControlStream = 15,
+
+                /// The variant `LifecyclePeerArrived` in the enum `EventClass`
+                LifecyclePeerArrived = 16,
+
+                /// The variant `LifecyclePeerDeparted` in the enum `EventClass`
+                LifecyclePeerDeparted = 17,
+
+                /// The variant `LifecycleWireEstablished` in the enum `EventClass`
+                LifecycleWireEstablished = 18,
+
+                /// The variant `LifecycleWireLost` in the enum `EventClass`
+                LifecycleWireLost = 19,
+
+                /// The variant `LifecycleRoomJoined` in the enum `EventClass`
+                LifecycleRoomJoined = 20,
+
+                /// The variant `LifecycleRoomParted` in the enum `EventClass`
+                LifecycleRoomParted = 21,
+
+                /// The variant `LifecycleSubscriptionAdvanced` in the enum `EventClass`
+                LifecycleSubscriptionAdvanced = 22,
+
+                /// The variant `LifecycleIdentityPublished` in the enum `EventClass`
+                LifecycleIdentityPublished = 23,
+
+                /// The variant `LifecycleDoctrinePublished` in the enum `EventClass`
+                LifecycleDoctrinePublished = 24,
+
+                /// The variant `LifecycleWallPostPublished` in the enum `EventClass`
+                LifecycleWallPostPublished = 25,
+
+                /// The variant `LifecycleChannelPurposePublished` in the enum `EventClass`
+                LifecycleChannelPurposePublished = 26,
+            }
+
+            impl EventClass {
+                /// Array containing all valid variants of EventClass
+                pub const ENUM_VALUES: [Self; 27] = [
+                    Self::Unspecified,
+                    Self::CorrespondenceMessage,
+                    Self::CorrespondenceAnnouncement,
+                    Self::ActivityIntent,
+                    Self::ActivityWorkReceipt,
+                    Self::ActivityWorkState,
+                    Self::ActivityPresence,
+                    Self::ActivityWorkPresence,
+                    Self::ActivityCoordination,
+                    Self::ControlCommand,
+                    Self::ControlCommandResult,
+                    Self::ControlSession,
+                    Self::ControlReceipt,
+                    Self::ControlAddressed,
+                    Self::ControlSignal,
+                    Self::ControlStream,
+                    Self::LifecyclePeerArrived,
+                    Self::LifecyclePeerDeparted,
+                    Self::LifecycleWireEstablished,
+                    Self::LifecycleWireLost,
+                    Self::LifecycleRoomJoined,
+                    Self::LifecycleRoomParted,
+                    Self::LifecycleSubscriptionAdvanced,
+                    Self::LifecycleIdentityPublished,
+                    Self::LifecycleDoctrinePublished,
+                    Self::LifecycleWallPostPublished,
+                    Self::LifecycleChannelPurposePublished,
+                ];
+            }
+
+            impl ::core::convert::TryFrom<u8> for EventClass {
+                type Error = ::planus::errors::UnknownEnumTagKind;
+                #[inline]
+                fn try_from(
+                    value: u8,
+                ) -> ::core::result::Result<Self, ::planus::errors::UnknownEnumTagKind>
+                {
+                    #[allow(clippy::match_single_binding)]
+                    match value {
+                        0 => ::core::result::Result::Ok(EventClass::Unspecified),
+                        1 => ::core::result::Result::Ok(EventClass::CorrespondenceMessage),
+                        2 => ::core::result::Result::Ok(EventClass::CorrespondenceAnnouncement),
+                        3 => ::core::result::Result::Ok(EventClass::ActivityIntent),
+                        4 => ::core::result::Result::Ok(EventClass::ActivityWorkReceipt),
+                        5 => ::core::result::Result::Ok(EventClass::ActivityWorkState),
+                        6 => ::core::result::Result::Ok(EventClass::ActivityPresence),
+                        7 => ::core::result::Result::Ok(EventClass::ActivityWorkPresence),
+                        8 => ::core::result::Result::Ok(EventClass::ActivityCoordination),
+                        9 => ::core::result::Result::Ok(EventClass::ControlCommand),
+                        10 => ::core::result::Result::Ok(EventClass::ControlCommandResult),
+                        11 => ::core::result::Result::Ok(EventClass::ControlSession),
+                        12 => ::core::result::Result::Ok(EventClass::ControlReceipt),
+                        13 => ::core::result::Result::Ok(EventClass::ControlAddressed),
+                        14 => ::core::result::Result::Ok(EventClass::ControlSignal),
+                        15 => ::core::result::Result::Ok(EventClass::ControlStream),
+                        16 => ::core::result::Result::Ok(EventClass::LifecyclePeerArrived),
+                        17 => ::core::result::Result::Ok(EventClass::LifecyclePeerDeparted),
+                        18 => ::core::result::Result::Ok(EventClass::LifecycleWireEstablished),
+                        19 => ::core::result::Result::Ok(EventClass::LifecycleWireLost),
+                        20 => ::core::result::Result::Ok(EventClass::LifecycleRoomJoined),
+                        21 => ::core::result::Result::Ok(EventClass::LifecycleRoomParted),
+                        22 => ::core::result::Result::Ok(EventClass::LifecycleSubscriptionAdvanced),
+                        23 => ::core::result::Result::Ok(EventClass::LifecycleIdentityPublished),
+                        24 => ::core::result::Result::Ok(EventClass::LifecycleDoctrinePublished),
+                        25 => ::core::result::Result::Ok(EventClass::LifecycleWallPostPublished),
+                        26 => {
+                            ::core::result::Result::Ok(EventClass::LifecycleChannelPurposePublished)
+                        }
+
+                        _ => ::core::result::Result::Err(::planus::errors::UnknownEnumTagKind {
+                            tag: value as i128,
+                        }),
+                    }
+                }
+            }
+
+            impl ::core::convert::From<EventClass> for u8 {
+                #[inline]
+                fn from(value: EventClass) -> Self {
+                    value as u8
+                }
+            }
+
+            /// # Safety
+            /// The Planus compiler correctly calculates `ALIGNMENT` and `SIZE`.
+            unsafe impl ::planus::Primitive for EventClass {
+                const ALIGNMENT: usize = 1;
+                const SIZE: usize = 1;
+            }
+
+            impl ::planus::WriteAsPrimitive<EventClass> for EventClass {
+                #[inline]
+                fn write<const N: usize>(
+                    &self,
+                    cursor: ::planus::Cursor<'_, N>,
+                    buffer_position: u32,
+                ) {
+                    (*self as u8).write(cursor, buffer_position);
+                }
+            }
+
+            impl ::planus::WriteAs<EventClass> for EventClass {
+                type Prepared = Self;
+
+                #[inline]
+                fn prepare(&self, _builder: &mut ::planus::Builder) -> EventClass {
+                    *self
+                }
+            }
+
+            impl ::planus::WriteAsDefault<EventClass, EventClass> for EventClass {
+                type Prepared = Self;
+
+                #[inline]
+                fn prepare(
+                    &self,
+                    _builder: &mut ::planus::Builder,
+                    default: &EventClass,
+                ) -> ::core::option::Option<EventClass> {
+                    if self == default {
+                        ::core::option::Option::None
+                    } else {
+                        ::core::option::Option::Some(*self)
+                    }
+                }
+            }
+
+            impl ::planus::WriteAsOptional<EventClass> for EventClass {
+                type Prepared = Self;
+
+                #[inline]
+                fn prepare(
+                    &self,
+                    _builder: &mut ::planus::Builder,
+                ) -> ::core::option::Option<EventClass> {
+                    ::core::option::Option::Some(*self)
+                }
+            }
+
+            impl<'buf> ::planus::TableRead<'buf> for EventClass {
+                #[inline]
+                fn from_buffer(
+                    buffer: ::planus::SliceWithStartOffset<'buf>,
+                    offset: usize,
+                ) -> ::core::result::Result<Self, ::planus::errors::ErrorKind> {
+                    let n: u8 = ::planus::TableRead::from_buffer(buffer, offset)?;
+                    ::core::result::Result::Ok(::core::convert::TryInto::try_into(n)?)
+                }
+            }
+
+            impl<'buf> ::planus::VectorReadInner<'buf> for EventClass {
+                type Error = ::planus::errors::UnknownEnumTag;
+                const STRIDE: usize = 1;
+                #[inline]
+                unsafe fn from_buffer(
+                    buffer: ::planus::SliceWithStartOffset<'buf>,
+                    offset: usize,
+                ) -> ::core::result::Result<Self, ::planus::errors::UnknownEnumTag>
+                {
+                    let value = unsafe { *buffer.buffer.get_unchecked(offset) };
+                    let value: ::core::result::Result<Self, _> =
+                        ::core::convert::TryInto::try_into(value);
+                    value.map_err(|error_kind| {
+                        error_kind.with_error_location(
+                            "EventClass",
+                            "VectorRead::from_buffer",
+                            buffer.offset_from_start,
+                        )
+                    })
+                }
+            }
+
+            /// # Safety
+            /// The planus compiler generates implementations that initialize
+            /// the bytes in `write_values`.
+            unsafe impl ::planus::VectorWrite<EventClass> for EventClass {
+                const STRIDE: usize = 1;
+
+                type Value = Self;
+
+                #[inline]
+                fn prepare(&self, _builder: &mut ::planus::Builder) -> Self {
+                    *self
+                }
+
+                #[inline]
+                unsafe fn write_values(
+                    values: &[Self],
+                    bytes: *mut ::core::mem::MaybeUninit<u8>,
+                    buffer_position: u32,
+                ) {
+                    let bytes = bytes as *mut [::core::mem::MaybeUninit<u8>; 1];
+                    for (i, v) in ::core::iter::Iterator::enumerate(values.iter()) {
+                        ::planus::WriteAsPrimitive::write(
+                            v,
+                            ::planus::Cursor::new(unsafe { &mut *bytes.add(i) }),
+                            buffer_position - i as u32,
+                        );
+                    }
+                }
+            }
+
             /// The enum `DeliveryClass` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Enum `DeliveryClass` in the file `crates/airc-wire/src/schema/wire.fbs:42`
+            /// * Enum `DeliveryClass` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:73`
             #[derive(
                 Copy,
                 Clone,
@@ -634,7 +939,7 @@ mod root {
             /// The enum `TargetTag` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Enum `TargetTag` in the file `crates/airc-wire/src/schema/wire.fbs:54`
+            /// * Enum `TargetTag` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:85`
             #[derive(
                 Copy,
                 Clone,
@@ -827,7 +1132,7 @@ mod root {
             /// The table `Header` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Table `Header` in the file `crates/airc-wire/src/schema/wire.fbs:65`
+            /// * Table `Header` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:96`
             #[derive(
                 Clone,
                 Debug,
@@ -1148,7 +1453,7 @@ mod root {
             /// The table `Envelope` in the namespace `airc.wire`
             ///
             /// Generated from these locations:
-            /// * Table `Envelope` in the file `crates/airc-wire/src/schema/wire.fbs:73`
+            /// * Table `Envelope` in the file `/tmp/airc-typed-wire.9DWeQt/wire.fbs:104`
             #[derive(
                 Clone,
                 Debug,
@@ -1171,6 +1476,8 @@ mod root {
                 pub client_id: ::core::option::Option<self::Uuid>,
                 /// The field `kind` in the table `Envelope`
                 pub kind: self::Kind,
+                /// The field `class` in the table `Envelope`
+                pub class: self::EventClass,
                 /// The field `delivery` in the table `Envelope`
                 pub delivery: self::DeliveryClass,
                 /// The field `epoch` in the table `Envelope`
@@ -1206,6 +1513,7 @@ mod root {
                         peer_id: ::core::default::Default::default(),
                         client_id: ::core::default::Default::default(),
                         kind: self::Kind::Message,
+                        class: self::EventClass::Unspecified,
                         delivery: self::DeliveryClass::Durable,
                         epoch: 0,
                         counter: 0,
@@ -1237,6 +1545,7 @@ mod root {
                     field_peer_id: impl ::planus::WriteAsOptional<self::Uuid>,
                     field_client_id: impl ::planus::WriteAsOptional<self::Uuid>,
                     field_kind: impl ::planus::WriteAsDefault<self::Kind, self::Kind>,
+                    field_class: impl ::planus::WriteAsDefault<self::EventClass, self::EventClass>,
                     field_delivery: impl ::planus::WriteAsDefault<
                         self::DeliveryClass,
                         self::DeliveryClass,
@@ -1264,6 +1573,8 @@ mod root {
                     let prepared_peer_id = field_peer_id.prepare(builder);
                     let prepared_client_id = field_client_id.prepare(builder);
                     let prepared_kind = field_kind.prepare(builder, &self::Kind::Message);
+                    let prepared_class =
+                        field_class.prepare(builder, &self::EventClass::Unspecified);
                     let prepared_delivery =
                         field_delivery.prepare(builder, &self::DeliveryClass::Durable);
                     let prepared_epoch = field_epoch.prepare(builder, &0);
@@ -1279,7 +1590,7 @@ mod root {
                     let prepared_headers = field_headers.prepare(builder);
                     let prepared_payload = field_payload.prepare(builder);
 
-                    let mut table_writer: ::planus::table_writer::TableWriter<38> =
+                    let mut table_writer: ::planus::table_writer::TableWriter<40> =
                         ::core::default::Default::default();
                     if prepared_event_id.is_some() {
                         table_writer.write_entry::<self::Uuid>(0);
@@ -1294,44 +1605,47 @@ mod root {
                         table_writer.write_entry::<self::Uuid>(3);
                     }
                     if prepared_epoch.is_some() {
-                        table_writer.write_entry::<u64>(6);
-                    }
-                    if prepared_counter.is_some() {
                         table_writer.write_entry::<u64>(7);
                     }
-                    if prepared_occurred_at_ms.is_some() {
+                    if prepared_counter.is_some() {
                         table_writer.write_entry::<u64>(8);
                     }
+                    if prepared_occurred_at_ms.is_some() {
+                        table_writer.write_entry::<u64>(9);
+                    }
                     if prepared_correlation_id.is_some() {
-                        table_writer.write_entry::<self::Uuid>(9);
+                        table_writer.write_entry::<self::Uuid>(10);
                     }
                     if prepared_target_peer.is_some() {
-                        table_writer.write_entry::<self::Uuid>(12);
-                    }
-                    if prepared_target_reply.is_some() {
                         table_writer.write_entry::<self::Uuid>(13);
                     }
+                    if prepared_target_reply.is_some() {
+                        table_writer.write_entry::<self::Uuid>(14);
+                    }
                     if prepared_coalesce_key.is_some() {
-                        table_writer.write_entry::<::planus::Offset<str>>(10);
+                        table_writer.write_entry::<::planus::Offset<str>>(11);
                     }
                     if prepared_target_text.is_some() {
-                        table_writer.write_entry::<::planus::Offset<str>>(14);
+                        table_writer.write_entry::<::planus::Offset<str>>(15);
                     }
                     if prepared_headers.is_some() {
                         table_writer
-                            .write_entry::<::planus::Offset<[::planus::Offset<self::Header>]>>(15);
+                            .write_entry::<::planus::Offset<[::planus::Offset<self::Header>]>>(16);
                     }
                     if prepared_payload.is_some() {
-                        table_writer.write_entry::<::planus::Offset<[u8]>>(16);
+                        table_writer.write_entry::<::planus::Offset<[u8]>>(17);
                     }
                     if prepared_kind.is_some() {
                         table_writer.write_entry::<self::Kind>(4);
                     }
+                    if prepared_class.is_some() {
+                        table_writer.write_entry::<self::EventClass>(5);
+                    }
                     if prepared_delivery.is_some() {
-                        table_writer.write_entry::<self::DeliveryClass>(5);
+                        table_writer.write_entry::<self::DeliveryClass>(6);
                     }
                     if prepared_target_tag.is_some() {
-                        table_writer.write_entry::<self::TargetTag>(11);
+                        table_writer.write_entry::<self::TargetTag>(12);
                     }
 
                     unsafe {
@@ -1402,6 +1716,9 @@ mod root {
                             if let ::core::option::Option::Some(prepared_kind) = prepared_kind {
                                 object_writer.write::<_, _, 1>(&prepared_kind);
                             }
+                            if let ::core::option::Option::Some(prepared_class) = prepared_class {
+                                object_writer.write::<_, _, 1>(&prepared_class);
+                            }
                             if let ::core::option::Option::Some(prepared_delivery) =
                                 prepared_delivery
                             {
@@ -1449,6 +1766,7 @@ mod root {
                         self.peer_id,
                         self.client_id,
                         self.kind,
+                        self.class,
                         self.delivery,
                         self.epoch,
                         self.counter,
@@ -1574,15 +1892,40 @@ mod root {
             }
 
             impl<T0, T1, T2, T3, T4> EnvelopeBuilder<(T0, T1, T2, T3, T4)> {
-                /// Setter for the [`delivery` field](Envelope#structfield.delivery).
+                /// Setter for the [`class` field](Envelope#structfield.class).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn delivery<T5>(self, value: T5) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5)>
+                pub fn class<T5>(self, value: T5) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5)>
                 where
-                    T5: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
+                    T5: ::planus::WriteAsDefault<self::EventClass, self::EventClass>,
                 {
                     let (v0, v1, v2, v3, v4) = self.0;
                     EnvelopeBuilder((v0, v1, v2, v3, v4, value))
+                }
+
+                /// Sets the [`class` field](Envelope#structfield.class) to the default value.
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn class_as_default(
+                    self,
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, ::planus::DefaultValue)> {
+                    self.class(::planus::DefaultValue)
+                }
+            }
+
+            impl<T0, T1, T2, T3, T4, T5> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5)> {
+                /// Setter for the [`delivery` field](Envelope#structfield.delivery).
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn delivery<T6>(
+                    self,
+                    value: T6,
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6)>
+                where
+                    T6: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
+                {
+                    let (v0, v1, v2, v3, v4, v5) = self.0;
+                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, value))
                 }
 
                 /// Sets the [`delivery` field](Envelope#structfield.delivery) to the default value.
@@ -1590,39 +1933,17 @@ mod root {
                 #[allow(clippy::type_complexity)]
                 pub fn delivery_as_default(
                     self,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, ::planus::DefaultValue)> {
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, ::planus::DefaultValue)>
+                {
                     self.delivery(::planus::DefaultValue)
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5)> {
+            impl<T0, T1, T2, T3, T4, T5, T6> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6)> {
                 /// Setter for the [`epoch` field](Envelope#structfield.epoch).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn epoch<T6>(self, value: T6) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6)>
-                where
-                    T6: ::planus::WriteAsDefault<u64, u64>,
-                {
-                    let (v0, v1, v2, v3, v4, v5) = self.0;
-                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, value))
-                }
-
-                /// Sets the [`epoch` field](Envelope#structfield.epoch) to the default value.
-                #[inline]
-                #[allow(clippy::type_complexity)]
-                pub fn epoch_as_default(
-                    self,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, ::planus::DefaultValue)>
-                {
-                    self.epoch(::planus::DefaultValue)
-                }
-            }
-
-            impl<T0, T1, T2, T3, T4, T5, T6> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6)> {
-                /// Setter for the [`counter` field](Envelope#structfield.counter).
-                #[inline]
-                #[allow(clippy::type_complexity)]
-                pub fn counter<T7>(
+                pub fn epoch<T7>(
                     self,
                     value: T7,
                 ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7)>
@@ -1633,22 +1954,22 @@ mod root {
                     EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, value))
                 }
 
-                /// Sets the [`counter` field](Envelope#structfield.counter) to the default value.
+                /// Sets the [`epoch` field](Envelope#structfield.epoch) to the default value.
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn counter_as_default(
+                pub fn epoch_as_default(
                     self,
                 ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, ::planus::DefaultValue)>
                 {
-                    self.counter(::planus::DefaultValue)
+                    self.epoch(::planus::DefaultValue)
                 }
             }
 
             impl<T0, T1, T2, T3, T4, T5, T6, T7> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7)> {
-                /// Setter for the [`occurred_at_ms` field](Envelope#structfield.occurred_at_ms).
+                /// Setter for the [`counter` field](Envelope#structfield.counter).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn occurred_at_ms<T8>(
+                pub fn counter<T8>(
                     self,
                     value: T8,
                 ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8)>
@@ -1659,30 +1980,58 @@ mod root {
                     EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, value))
                 }
 
+                /// Sets the [`counter` field](Envelope#structfield.counter) to the default value.
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn counter_as_default(
+                    self,
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, ::planus::DefaultValue)>
+                {
+                    self.counter(::planus::DefaultValue)
+                }
+            }
+
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8)> {
+                /// Setter for the [`occurred_at_ms` field](Envelope#structfield.occurred_at_ms).
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn occurred_at_ms<T9>(
+                    self,
+                    value: T9,
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9)>
+                where
+                    T9: ::planus::WriteAsDefault<u64, u64>,
+                {
+                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8) = self.0;
+                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, value))
+                }
+
                 /// Sets the [`occurred_at_ms` field](Envelope#structfield.occurred_at_ms) to the default value.
                 #[inline]
                 #[allow(clippy::type_complexity)]
                 pub fn occurred_at_ms_as_default(
                     self,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, ::planus::DefaultValue)>
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, ::planus::DefaultValue)>
                 {
                     self.occurred_at_ms(::planus::DefaultValue)
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8)> {
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9>
+                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9)>
+            {
                 /// Setter for the [`correlation_id` field](Envelope#structfield.correlation_id).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn correlation_id<T9>(
+                pub fn correlation_id<T10>(
                     self,
-                    value: T9,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9)>
+                    value: T10,
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10)>
                 where
-                    T9: ::planus::WriteAsOptional<self::Uuid>,
+                    T10: ::planus::WriteAsOptional<self::Uuid>,
                 {
-                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8) = self.0;
-                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, value))
+                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9) = self.0;
+                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, value))
                 }
 
                 /// Sets the [`correlation_id` field](Envelope#structfield.correlation_id) to null.
@@ -1690,26 +2039,26 @@ mod root {
                 #[allow(clippy::type_complexity)]
                 pub fn correlation_id_as_null(
                     self,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, ())> {
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, ())> {
                     self.correlation_id(())
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9>
-                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9)>
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>
+                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10)>
             {
                 /// Setter for the [`coalesce_key` field](Envelope#structfield.coalesce_key).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn coalesce_key<T10>(
+                pub fn coalesce_key<T11>(
                     self,
-                    value: T10,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10)>
+                    value: T11,
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>
                 where
-                    T10: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T11: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
                 {
-                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9) = self.0;
-                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, value))
+                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10) = self.0;
+                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, value))
                 }
 
                 /// Sets the [`coalesce_key` field](Envelope#structfield.coalesce_key) to null.
@@ -1717,26 +2066,27 @@ mod root {
                 #[allow(clippy::type_complexity)]
                 pub fn coalesce_key_as_null(
                     self,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, ())> {
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, ())>
+                {
                     self.coalesce_key(())
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>
-                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10)>
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>
+                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>
             {
                 /// Setter for the [`target_tag` field](Envelope#structfield.target_tag).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn target_tag<T11>(
+                pub fn target_tag<T12>(
                     self,
-                    value: T11,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>
+                    value: T12,
+                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>
                 where
-                    T11: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
+                    T12: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
                 {
-                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10) = self.0;
-                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, value))
+                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11) = self.0;
+                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, value))
                 }
 
                 /// Sets the [`target_tag` field](Envelope#structfield.target_tag) to the default value.
@@ -1756,47 +2106,20 @@ mod root {
                     T8,
                     T9,
                     T10,
+                    T11,
                     ::planus::DefaultValue,
                 )> {
                     self.target_tag(::planus::DefaultValue)
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>
-                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11)>
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>
+                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>
             {
                 /// Setter for the [`target_peer` field](Envelope#structfield.target_peer).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn target_peer<T12>(
-                    self,
-                    value: T12,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>
-                where
-                    T12: ::planus::WriteAsOptional<self::Uuid>,
-                {
-                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11) = self.0;
-                    EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, value))
-                }
-
-                /// Sets the [`target_peer` field](Envelope#structfield.target_peer) to null.
-                #[inline]
-                #[allow(clippy::type_complexity)]
-                pub fn target_peer_as_null(
-                    self,
-                ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, ())>
-                {
-                    self.target_peer(())
-                }
-            }
-
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>
-                EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12)>
-            {
-                /// Setter for the [`target_reply` field](Envelope#structfield.target_reply).
-                #[inline]
-                #[allow(clippy::type_complexity)]
-                pub fn target_reply<T13>(
+                pub fn target_peer<T13>(
                     self,
                     value: T13,
                 ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13)>
@@ -1807,24 +2130,24 @@ mod root {
                     EnvelopeBuilder((v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, value))
                 }
 
-                /// Sets the [`target_reply` field](Envelope#structfield.target_reply) to null.
+                /// Sets the [`target_peer` field](Envelope#structfield.target_peer) to null.
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn target_reply_as_null(
+                pub fn target_peer_as_null(
                     self,
                 ) -> EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, ())>
                 {
-                    self.target_reply(())
+                    self.target_peer(())
                 }
             }
 
             impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>
                 EnvelopeBuilder<(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13)>
             {
-                /// Setter for the [`target_text` field](Envelope#structfield.target_text).
+                /// Setter for the [`target_reply` field](Envelope#structfield.target_reply).
                 #[inline]
                 #[allow(clippy::type_complexity)]
-                pub fn target_text<T14>(
+                pub fn target_reply<T14>(
                     self,
                     value: T14,
                 ) -> EnvelopeBuilder<(
@@ -1845,11 +2168,89 @@ mod root {
                     T14,
                 )>
                 where
-                    T14: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T14: ::planus::WriteAsOptional<self::Uuid>,
                 {
                     let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13) = self.0;
                     EnvelopeBuilder((
                         v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, value,
+                    ))
+                }
+
+                /// Sets the [`target_reply` field](Envelope#structfield.target_reply) to null.
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn target_reply_as_null(
+                    self,
+                ) -> EnvelopeBuilder<(
+                    T0,
+                    T1,
+                    T2,
+                    T3,
+                    T4,
+                    T5,
+                    T6,
+                    T7,
+                    T8,
+                    T9,
+                    T10,
+                    T11,
+                    T12,
+                    T13,
+                    (),
+                )> {
+                    self.target_reply(())
+                }
+            }
+
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>
+                EnvelopeBuilder<(
+                    T0,
+                    T1,
+                    T2,
+                    T3,
+                    T4,
+                    T5,
+                    T6,
+                    T7,
+                    T8,
+                    T9,
+                    T10,
+                    T11,
+                    T12,
+                    T13,
+                    T14,
+                )>
+            {
+                /// Setter for the [`target_text` field](Envelope#structfield.target_text).
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn target_text<T15>(
+                    self,
+                    value: T15,
+                ) -> EnvelopeBuilder<(
+                    T0,
+                    T1,
+                    T2,
+                    T3,
+                    T4,
+                    T5,
+                    T6,
+                    T7,
+                    T8,
+                    T9,
+                    T10,
+                    T11,
+                    T12,
+                    T13,
+                    T14,
+                    T15,
+                )>
+                where
+                    T15: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                {
+                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14) = self.0;
+                    EnvelopeBuilder((
+                        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, value,
                     ))
                 }
 
@@ -1873,38 +2274,15 @@ mod root {
                     T11,
                     T12,
                     T13,
+                    T14,
                     (),
                 )> {
                     self.target_text(())
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>
                 EnvelopeBuilder<(
-                    T0,
-                    T1,
-                    T2,
-                    T3,
-                    T4,
-                    T5,
-                    T6,
-                    T7,
-                    T8,
-                    T9,
-                    T10,
-                    T11,
-                    T12,
-                    T13,
-                    T14,
-                )>
-            {
-                /// Setter for the [`headers` field](Envelope#structfield.headers).
-                #[inline]
-                #[allow(clippy::type_complexity)]
-                pub fn headers<T15>(
-                    self,
-                    value: T15,
-                ) -> EnvelopeBuilder<(
                     T0,
                     T1,
                     T2,
@@ -1922,14 +2300,41 @@ mod root {
                     T14,
                     T15,
                 )>
+            {
+                /// Setter for the [`headers` field](Envelope#structfield.headers).
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn headers<T16>(
+                    self,
+                    value: T16,
+                ) -> EnvelopeBuilder<(
+                    T0,
+                    T1,
+                    T2,
+                    T3,
+                    T4,
+                    T5,
+                    T6,
+                    T7,
+                    T8,
+                    T9,
+                    T10,
+                    T11,
+                    T12,
+                    T13,
+                    T14,
+                    T15,
+                    T16,
+                )>
                 where
-                    T15: ::planus::WriteAsOptional<
+                    T16: ::planus::WriteAsOptional<
                         ::planus::Offset<[::planus::Offset<self::Header>]>,
                     >,
                 {
-                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14) = self.0;
+                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15) =
+                        self.0;
                     EnvelopeBuilder((
-                        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, value,
+                        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, value,
                     ))
                 }
 
@@ -1954,39 +2359,15 @@ mod root {
                     T12,
                     T13,
                     T14,
+                    T15,
                     (),
                 )> {
                     self.headers(())
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>
+            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>
                 EnvelopeBuilder<(
-                    T0,
-                    T1,
-                    T2,
-                    T3,
-                    T4,
-                    T5,
-                    T6,
-                    T7,
-                    T8,
-                    T9,
-                    T10,
-                    T11,
-                    T12,
-                    T13,
-                    T14,
-                    T15,
-                )>
-            {
-                /// Setter for the [`payload` field](Envelope#structfield.payload).
-                #[inline]
-                #[allow(clippy::type_complexity)]
-                pub fn payload<T16>(
-                    self,
-                    value: T16,
-                ) -> EnvelopeBuilder<(
                     T0,
                     T1,
                     T2,
@@ -2005,13 +2386,41 @@ mod root {
                     T15,
                     T16,
                 )>
+            {
+                /// Setter for the [`payload` field](Envelope#structfield.payload).
+                #[inline]
+                #[allow(clippy::type_complexity)]
+                pub fn payload<T17>(
+                    self,
+                    value: T17,
+                ) -> EnvelopeBuilder<(
+                    T0,
+                    T1,
+                    T2,
+                    T3,
+                    T4,
+                    T5,
+                    T6,
+                    T7,
+                    T8,
+                    T9,
+                    T10,
+                    T11,
+                    T12,
+                    T13,
+                    T14,
+                    T15,
+                    T16,
+                    T17,
+                )>
                 where
-                    T16: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
+                    T17: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
                 {
-                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15) =
+                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16) =
                         self.0;
                     EnvelopeBuilder((
-                        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, value,
+                        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16,
+                        value,
                     ))
                 }
 
@@ -2037,13 +2446,33 @@ mod root {
                     T13,
                     T14,
                     T15,
+                    T16,
                     (),
                 )> {
                     self.payload(())
                 }
             }
 
-            impl<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>
+            impl<
+                    T0,
+                    T1,
+                    T2,
+                    T3,
+                    T4,
+                    T5,
+                    T6,
+                    T7,
+                    T8,
+                    T9,
+                    T10,
+                    T11,
+                    T12,
+                    T13,
+                    T14,
+                    T15,
+                    T16,
+                    T17,
+                >
                 EnvelopeBuilder<(
                     T0,
                     T1,
@@ -2062,6 +2491,7 @@ mod root {
                     T14,
                     T15,
                     T16,
+                    T17,
                 )>
             {
                 /// Finish writing the builder to get an [Offset](::planus::Offset) to a serialized [Envelope].
@@ -2080,18 +2510,19 @@ mod root {
                     T2: ::planus::WriteAsOptional<self::Uuid>,
                     T3: ::planus::WriteAsOptional<self::Uuid>,
                     T4: ::planus::WriteAsDefault<self::Kind, self::Kind>,
-                    T5: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
-                    T6: ::planus::WriteAsDefault<u64, u64>,
+                    T5: ::planus::WriteAsDefault<self::EventClass, self::EventClass>,
+                    T6: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
                     T7: ::planus::WriteAsDefault<u64, u64>,
                     T8: ::planus::WriteAsDefault<u64, u64>,
-                    T9: ::planus::WriteAsOptional<self::Uuid>,
-                    T10: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
-                    T11: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
-                    T12: ::planus::WriteAsOptional<self::Uuid>,
+                    T9: ::planus::WriteAsDefault<u64, u64>,
+                    T10: ::planus::WriteAsOptional<self::Uuid>,
+                    T11: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T12: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
                     T13: ::planus::WriteAsOptional<self::Uuid>,
-                    T14: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
-                    T15: ::planus::WriteAsOptional<::planus::Offset<[::planus::Offset<self::Header>]>>,
-                    T16: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
+                    T14: ::planus::WriteAsOptional<self::Uuid>,
+                    T15: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T16: ::planus::WriteAsOptional<::planus::Offset<[::planus::Offset<self::Header>]>>,
+                    T17: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
                 > ::planus::WriteAs<::planus::Offset<Envelope>>
                 for EnvelopeBuilder<(
                     T0,
@@ -2111,6 +2542,7 @@ mod root {
                     T14,
                     T15,
                     T16,
+                    T17,
                 )>
             {
                 type Prepared = ::planus::Offset<Envelope>;
@@ -2127,18 +2559,19 @@ mod root {
                     T2: ::planus::WriteAsOptional<self::Uuid>,
                     T3: ::planus::WriteAsOptional<self::Uuid>,
                     T4: ::planus::WriteAsDefault<self::Kind, self::Kind>,
-                    T5: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
-                    T6: ::planus::WriteAsDefault<u64, u64>,
+                    T5: ::planus::WriteAsDefault<self::EventClass, self::EventClass>,
+                    T6: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
                     T7: ::planus::WriteAsDefault<u64, u64>,
                     T8: ::planus::WriteAsDefault<u64, u64>,
-                    T9: ::planus::WriteAsOptional<self::Uuid>,
-                    T10: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
-                    T11: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
-                    T12: ::planus::WriteAsOptional<self::Uuid>,
+                    T9: ::planus::WriteAsDefault<u64, u64>,
+                    T10: ::planus::WriteAsOptional<self::Uuid>,
+                    T11: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T12: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
                     T13: ::planus::WriteAsOptional<self::Uuid>,
-                    T14: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
-                    T15: ::planus::WriteAsOptional<::planus::Offset<[::planus::Offset<self::Header>]>>,
-                    T16: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
+                    T14: ::planus::WriteAsOptional<self::Uuid>,
+                    T15: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T16: ::planus::WriteAsOptional<::planus::Offset<[::planus::Offset<self::Header>]>>,
+                    T17: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
                 > ::planus::WriteAsOptional<::planus::Offset<Envelope>>
                 for EnvelopeBuilder<(
                     T0,
@@ -2158,6 +2591,7 @@ mod root {
                     T14,
                     T15,
                     T16,
+                    T17,
                 )>
             {
                 type Prepared = ::planus::Offset<Envelope>;
@@ -2177,18 +2611,19 @@ mod root {
                     T2: ::planus::WriteAsOptional<self::Uuid>,
                     T3: ::planus::WriteAsOptional<self::Uuid>,
                     T4: ::planus::WriteAsDefault<self::Kind, self::Kind>,
-                    T5: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
-                    T6: ::planus::WriteAsDefault<u64, u64>,
+                    T5: ::planus::WriteAsDefault<self::EventClass, self::EventClass>,
+                    T6: ::planus::WriteAsDefault<self::DeliveryClass, self::DeliveryClass>,
                     T7: ::planus::WriteAsDefault<u64, u64>,
                     T8: ::planus::WriteAsDefault<u64, u64>,
-                    T9: ::planus::WriteAsOptional<self::Uuid>,
-                    T10: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
-                    T11: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
-                    T12: ::planus::WriteAsOptional<self::Uuid>,
+                    T9: ::planus::WriteAsDefault<u64, u64>,
+                    T10: ::planus::WriteAsOptional<self::Uuid>,
+                    T11: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T12: ::planus::WriteAsDefault<self::TargetTag, self::TargetTag>,
                     T13: ::planus::WriteAsOptional<self::Uuid>,
-                    T14: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
-                    T15: ::planus::WriteAsOptional<::planus::Offset<[::planus::Offset<self::Header>]>>,
-                    T16: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
+                    T14: ::planus::WriteAsOptional<self::Uuid>,
+                    T15: ::planus::WriteAsOptional<::planus::Offset<::core::primitive::str>>,
+                    T16: ::planus::WriteAsOptional<::planus::Offset<[::planus::Offset<self::Header>]>>,
+                    T17: ::planus::WriteAsOptional<::planus::Offset<[u8]>>,
                 > ::planus::WriteAsOffset<Envelope>
                 for EnvelopeBuilder<(
                     T0,
@@ -2208,15 +2643,34 @@ mod root {
                     T14,
                     T15,
                     T16,
+                    T17,
                 )>
             {
                 #[inline]
                 fn prepare(&self, builder: &mut ::planus::Builder) -> ::planus::Offset<Envelope> {
-                    let (v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16) =
-                        &self.0;
+                    let (
+                        v0,
+                        v1,
+                        v2,
+                        v3,
+                        v4,
+                        v5,
+                        v6,
+                        v7,
+                        v8,
+                        v9,
+                        v10,
+                        v11,
+                        v12,
+                        v13,
+                        v14,
+                        v15,
+                        v16,
+                        v17,
+                    ) = &self.0;
                     Envelope::create(
                         builder, v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14,
-                        v15, v16,
+                        v15, v16, v17,
                     )
                 }
             }
@@ -2268,12 +2722,22 @@ mod root {
                     )
                 }
 
+                /// Getter for the [`class` field](Envelope#structfield.class).
+                #[inline]
+                pub fn class(&self) -> ::planus::Result<self::EventClass> {
+                    ::core::result::Result::Ok(
+                        self.0
+                            .access(5, "Envelope", "class")?
+                            .unwrap_or(self::EventClass::Unspecified),
+                    )
+                }
+
                 /// Getter for the [`delivery` field](Envelope#structfield.delivery).
                 #[inline]
                 pub fn delivery(&self) -> ::planus::Result<self::DeliveryClass> {
                     ::core::result::Result::Ok(
                         self.0
-                            .access(5, "Envelope", "delivery")?
+                            .access(6, "Envelope", "delivery")?
                             .unwrap_or(self::DeliveryClass::Durable),
                     )
                 }
@@ -2281,14 +2745,14 @@ mod root {
                 /// Getter for the [`epoch` field](Envelope#structfield.epoch).
                 #[inline]
                 pub fn epoch(&self) -> ::planus::Result<u64> {
-                    ::core::result::Result::Ok(self.0.access(6, "Envelope", "epoch")?.unwrap_or(0))
+                    ::core::result::Result::Ok(self.0.access(7, "Envelope", "epoch")?.unwrap_or(0))
                 }
 
                 /// Getter for the [`counter` field](Envelope#structfield.counter).
                 #[inline]
                 pub fn counter(&self) -> ::planus::Result<u64> {
                     ::core::result::Result::Ok(
-                        self.0.access(7, "Envelope", "counter")?.unwrap_or(0),
+                        self.0.access(8, "Envelope", "counter")?.unwrap_or(0),
                     )
                 }
 
@@ -2296,7 +2760,7 @@ mod root {
                 #[inline]
                 pub fn occurred_at_ms(&self) -> ::planus::Result<u64> {
                     ::core::result::Result::Ok(
-                        self.0.access(8, "Envelope", "occurred_at_ms")?.unwrap_or(0),
+                        self.0.access(9, "Envelope", "occurred_at_ms")?.unwrap_or(0),
                     )
                 }
 
@@ -2305,7 +2769,7 @@ mod root {
                 pub fn correlation_id(
                     &self,
                 ) -> ::planus::Result<::core::option::Option<self::UuidRef<'a>>> {
-                    self.0.access(9, "Envelope", "correlation_id")
+                    self.0.access(10, "Envelope", "correlation_id")
                 }
 
                 /// Getter for the [`coalesce_key` field](Envelope#structfield.coalesce_key).
@@ -2314,7 +2778,7 @@ mod root {
                     &self,
                 ) -> ::planus::Result<::core::option::Option<&'a ::core::primitive::str>>
                 {
-                    self.0.access(10, "Envelope", "coalesce_key")
+                    self.0.access(11, "Envelope", "coalesce_key")
                 }
 
                 /// Getter for the [`target_tag` field](Envelope#structfield.target_tag).
@@ -2322,7 +2786,7 @@ mod root {
                 pub fn target_tag(&self) -> ::planus::Result<self::TargetTag> {
                     ::core::result::Result::Ok(
                         self.0
-                            .access(11, "Envelope", "target_tag")?
+                            .access(12, "Envelope", "target_tag")?
                             .unwrap_or(self::TargetTag::All),
                     )
                 }
@@ -2332,7 +2796,7 @@ mod root {
                 pub fn target_peer(
                     &self,
                 ) -> ::planus::Result<::core::option::Option<self::UuidRef<'a>>> {
-                    self.0.access(12, "Envelope", "target_peer")
+                    self.0.access(13, "Envelope", "target_peer")
                 }
 
                 /// Getter for the [`target_reply` field](Envelope#structfield.target_reply).
@@ -2340,7 +2804,7 @@ mod root {
                 pub fn target_reply(
                     &self,
                 ) -> ::planus::Result<::core::option::Option<self::UuidRef<'a>>> {
-                    self.0.access(13, "Envelope", "target_reply")
+                    self.0.access(14, "Envelope", "target_reply")
                 }
 
                 /// Getter for the [`target_text` field](Envelope#structfield.target_text).
@@ -2349,7 +2813,7 @@ mod root {
                     &self,
                 ) -> ::planus::Result<::core::option::Option<&'a ::core::primitive::str>>
                 {
-                    self.0.access(14, "Envelope", "target_text")
+                    self.0.access(15, "Envelope", "target_text")
                 }
 
                 /// Getter for the [`headers` field](Envelope#structfield.headers).
@@ -2361,13 +2825,13 @@ mod root {
                         ::planus::Vector<'a, ::planus::Result<self::HeaderRef<'a>>>,
                     >,
                 > {
-                    self.0.access(15, "Envelope", "headers")
+                    self.0.access(16, "Envelope", "headers")
                 }
 
                 /// Getter for the [`payload` field](Envelope#structfield.payload).
                 #[inline]
                 pub fn payload(&self) -> ::planus::Result<::core::option::Option<&'a [u8]>> {
-                    self.0.access(16, "Envelope", "payload")
+                    self.0.access(17, "Envelope", "payload")
                 }
             }
 
@@ -2393,6 +2857,7 @@ mod root {
                         f.field("client_id", &field_client_id);
                     }
                     f.field("kind", &self.kind());
+                    f.field("class", &self.class());
                     f.field("delivery", &self.delivery());
                     f.field("epoch", &self.epoch());
                     f.field("counter", &self.counter());
@@ -2446,6 +2911,7 @@ mod root {
                         peer_id: value.peer_id()?.map(::core::convert::Into::into),
                         client_id: value.client_id()?.map(::core::convert::Into::into),
                         kind: ::core::convert::TryInto::try_into(value.kind()?)?,
+                        class: ::core::convert::TryInto::try_into(value.class()?)?,
                         delivery: ::core::convert::TryInto::try_into(value.delivery()?)?,
                         epoch: ::core::convert::TryInto::try_into(value.epoch()?)?,
                         counter: ::core::convert::TryInto::try_into(value.counter()?)?,

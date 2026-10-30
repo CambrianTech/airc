@@ -42,6 +42,7 @@ fn transcript(event_id: u128, lamport: u64, work_event: &WorkEvent) -> Transcrip
         peer_id: PeerId::from_u128(2),
         client_id: ClientId::from_u128(3),
         kind: TranscriptKind::System,
+        class: crate::work_event_class(work_event),
         occurred_at_ms: work_event.occurred_at_ms(),
         lamport,
         target: MentionTarget::All,
@@ -116,6 +117,8 @@ fn replay_rejects_non_work_transcript_explicitly() {
     let mut transcript = transcript(10, 1, &card_created(WorkCardId::from_u128(10), 1000));
     transcript.headers = Headers::new();
     transcript.body = Some(Body::text("plain chat"));
+    transcript.class =
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message);
 
     assert!(matches!(
         project_transcript_work_events(vec![transcript]),
@@ -138,7 +141,7 @@ fn replay_rejects_invalid_work_payload_with_event_id() {
 }
 
 #[test]
-fn work_event_detection_uses_body_hint_header_only() {
+fn work_event_detection_uses_typed_class_only() {
     let mut transcript = transcript(10, 1, &card_created(WorkCardId::from_u128(10), 1000));
     assert!(transcript_is_work_event(&transcript));
 
@@ -146,11 +149,28 @@ fn work_event_detection_uses_body_hint_header_only() {
         HEADER_FORGE_BODY_HINT.to_string(),
         "forge.persona.turn".to_string(),
     );
-    assert!(!transcript_is_work_event(&transcript));
+    assert!(transcript_is_work_event(&transcript));
 
     transcript.headers.insert(
         HEADER_FORGE_BODY_HINT.to_string(),
         BODY_HINT_FORGE_WORK_EVENT.to_string(),
     );
     assert!(transcript_is_work_event(&transcript));
+}
+
+#[test]
+fn body_kind_cannot_change_codec_failure_classification() {
+    let mut event = transcript(11, 1, &card_created(WorkCardId::from_u128(10), 1000));
+    event.body = Some(Body::Json(
+        serde_json::json!({"kind":"work_submission_reviewed"}),
+    ));
+    assert!(matches!(
+        decode_transcript_work_event(&event),
+        Err(WorkReplayError::Codec {
+            source: crate::WorkEventCodecError::Json(_),
+            ..
+        })
+    ));
+    event.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Coordination);
+    assert!(!transcript_is_work_event(&event));
 }

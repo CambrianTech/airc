@@ -543,7 +543,7 @@ where
     // filter, applied ROUTER-SIDE — the daemon never fans out an event a
     // consumer would discard (Hermes → Command/CommandResult; Continuum →
     // scoped `forge.*` headers; a media tap → StreamChunk only).
-    let mut filter = Filter::channel(channel);
+    let mut filter = Filter::channel(channel).with_selection(parts.selection.clone());
     if let Some(kinds) = parts.kinds {
         match crate::kind_map::bus_kinds(kinds) {
             Ok(kinds) => filter = filter.with_kinds(kinds),
@@ -651,7 +651,11 @@ where
                 // Client gone: drop the subscription with the stream.
                 _ = &mut hangup => return Ok(()),
                 next = stream.next() => match next {
-                    Some(env) => {
+                    Some(Err(error)) => {
+                        write_response(&mut writer, &Response::Error { message: error.to_string() }).await?;
+                        return Ok(());
+                    }
+                    Some(Ok(env)) => {
                         if env.delivery.is_durable()
                             && seen_through.is_some_and(|through| !env.cursor().is_after(&through))
                         {
@@ -751,7 +755,7 @@ fn resubscribe_lagged(
     subs: &mut std::collections::HashMap<airc_core::RoomId, RoomSub>,
     merged: &mut tokio_stream::StreamMap<
         airc_core::RoomId,
-        futures::stream::BoxStream<'static, Arc<Envelope>>,
+        futures::stream::BoxStream<'static, airc_bus::Result<Arc<Envelope>>>,
     >,
 ) {
     // Only a room that dropped a live push is re-subscribed,
@@ -884,7 +888,7 @@ where
         .map(|d| d.into_iter().map(crate::kind_map::bus_delivery).collect());
     let headers = parts.headers;
     let filter_for = |room: airc_core::RoomId| {
-        let mut filter = Filter::channel(room);
+        let mut filter = Filter::channel(room).with_selection(parts.selection.clone());
         if let Some(kinds) = kinds.clone() {
             filter = filter.with_kinds(kinds);
         }
@@ -903,7 +907,7 @@ where
     let mut pages: Vec<(airc_core::RoomId, Option<Cursor>)> = Vec::new();
     let mut merged: tokio_stream::StreamMap<
         airc_core::RoomId,
-        futures::stream::BoxStream<'static, Arc<Envelope>>,
+        futures::stream::BoxStream<'static, airc_bus::Result<Arc<Envelope>>>,
     > = tokio_stream::StreamMap::new();
     for entry in entries {
         if subs.contains_key(&entry.channel) {
@@ -991,7 +995,11 @@ where
                 }
                 merged.next().await
             } => match next {
-                Some((room, env)) => {
+                Some((_, Err(error))) => {
+                    write_response(&mut writer, &Response::Error { message: error.to_string() }).await?;
+                    return Ok(());
+                }
+                Some((room, Ok(env))) => {
                     let already_paged = subs.get(&room).and_then(|sub| sub.seen_through).is_some_and(
                         |through| env.delivery.is_durable() && !env.cursor().is_after(&through),
                     );
@@ -1041,12 +1049,7 @@ pub(crate) const ATTACH_PAGE: usize = 10;
 /// "at least this many". Counting is a bounded store read, never a stream.
 const UNREAD_COUNT_CAP: u64 = 10_000;
 
-/// How many durable rows one attach's backward walk reads, matched or not.
-/// The match cap alone let a rarely-matching filter scan the whole store
-/// (Fable on #1543); past this the count is reported as "at least".
-const PAGE_SCAN_ROWS_CAP: u64 = 50_000;
-
-/// Durable rows read per backward step of the page-and-count walk.
+/// Matching durable rows read per backward step of the page-and-count walk.
 const PAGE_SCAN_STEP: usize = 256;
 
 /// `None` = the live edge only; `Some(None)` = the transcript start;
@@ -1107,13 +1110,12 @@ async fn attach_page(
     let mut newest_first: Vec<Arc<Envelope>> = Vec::new();
     let mut skipped: u64 = 0;
     let mut skipped_at_least = false;
-    let mut scanned: u64 = 0;
     let mut through: Option<Cursor> = None;
     let mut before: Option<Cursor> = None;
     'walk: loop {
         let rows = state
             .router
-            .durable_tail_before(channel, before, PAGE_SCAN_STEP)
+            .filtered_tail_before(channel, before, PAGE_SCAN_STEP, filter)
             .await
             .map_err(|error| format!("attach page: {error}"))?;
         let exhausted = rows.len() < PAGE_SCAN_STEP;
@@ -1122,14 +1124,6 @@ async fn attach_page(
             through.get_or_insert(cursor);
             if bookmark.is_some_and(|b| !cursor.is_after(&b)) {
                 break 'walk; // reached what the consumer had already read
-            }
-            scanned += 1;
-            if scanned > PAGE_SCAN_ROWS_CAP {
-                skipped_at_least = true;
-                break 'walk;
-            }
-            if !filter.matches(env) {
-                continue;
             }
             if newest_first.len() < ATTACH_PAGE {
                 newest_first.push(env.clone());
@@ -1209,6 +1203,7 @@ mod shared_frame_cancellation_tests {
             RoomId::new(),
             (PeerId::new(), ClientId::new()),
             Kind::StreamChunk,
+            airc_core::EventClass::Control(airc_core::ControlKind::Stream),
             DeliveryClass::StreamChunk,
             bytes::Bytes::from_static(b"held by another writer"),
         ));
@@ -1236,6 +1231,7 @@ mod shared_frame_cancellation_tests {
                     channel,
                     (PeerId::new(), ClientId::new()),
                     Kind::StreamChunk,
+                    airc_core::EventClass::Control(airc_core::ControlKind::Stream),
                     DeliveryClass::StreamChunk,
                     bytes::Bytes::from_static(b"must await entry budget"),
                 ))
@@ -1297,6 +1293,7 @@ mod shared_frame_cancellation_tests {
                 channel,
                 (PeerId::new(), ClientId::new()),
                 Kind::Message,
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
                 DeliveryClass::Durable,
                 bytes::Bytes::from_static(text.as_bytes()),
             )
@@ -1830,7 +1827,7 @@ mod shared_frame_cancellation_tests {
             let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
             let mut merged: tokio_stream::StreamMap<
                 RoomId,
-                futures::stream::BoxStream<'static, Arc<Envelope>>,
+                futures::stream::BoxStream<'static, airc_bus::Result<Arc<Envelope>>>,
             > = tokio_stream::StreamMap::new();
             merged.insert(room, stream.boxed());
             for i in 0..1100 {

@@ -1,74 +1,25 @@
-//! Whether an event is addressed to this reader: the one predicate behind "an
-//! authorized direct request is never filtered out or reduced to a count".
-//!
-//! An event is addressed to me when its typed target is my peer, or when its body
-//! opens with `@names` and one of them is mine: my display name or agent name
-//! (case-insensitive), or a shown-id prefix of my peer id. Today's requests are
-//! mostly `@name` text broadcast to the room, so the typed target alone missed
-//! them. Only LEADING names address; a name mid-sentence is a mention, not a
-//! request ([`airc_core::leading_mentions`]). Receiver-side: every fact is
-//! local, no roster is read.
-
-use airc_core::shown_id::Shown;
-use airc_core::{leading_mentions, AddresseeFilter, MentionTarget, PeerId, TranscriptEvent};
-
+//! Direct addressing is exclusively the signed typed target.
 use crate::{Airc, AircError};
+use airc_core::{AddresseeFilter, MentionTarget, PeerId, TranscriptEvent};
 
-/// Who "me" is for addressing.
 #[derive(Clone, Debug)]
 pub struct Addressee {
     peer: PeerId,
-    names: Vec<String>,
 }
-
 impl Addressee {
-    /// `names` are the names this identity answers to; blanks are dropped.
-    pub fn new(peer: PeerId, names: impl IntoIterator<Item = String>) -> Self {
-        let mut names: Vec<String> = names
-            .into_iter()
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .collect();
-        names.dedup();
-        Self { peer, names }
+    pub fn new(peer: PeerId) -> Self {
+        Self { peer }
     }
-
-    /// The store-side candidate pre-filter for this addressee: a superset of
-    /// what [`Self::is_addressed`] keeps, answered from indexed columns.
     pub fn filter(&self) -> AddresseeFilter {
         AddresseeFilter { peer: self.peer }
     }
-
     pub fn is_addressed(&self, event: &TranscriptEvent) -> bool {
         event.target == MentionTarget::Peer(self.peer)
-            || event
-                .body
-                .as_ref()
-                .and_then(|body| body.as_text())
-                .is_some_and(|text| leading_mentions(text).any(|name| self.answers_to(name)))
-    }
-
-    fn answers_to(&self, mention: &str) -> bool {
-        self.names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(mention))
-            || Shown::<PeerId>::try_from(mention)
-                .is_ok_and(|shown| shown.resolve([self.peer]).is_ok())
     }
 }
-
 impl Airc {
-    /// This identity as an addressee: its peer id, its agent name and the
-    /// name on its local identity card.
     pub async fn addressee(&self) -> Result<Addressee, AircError> {
-        let card = self
-            .event_store()
-            .load_local_identity_by_agent_name(self.agent_name())
-            .await
-            .map_err(AircError::from)?;
-        let mut names = vec![self.agent_name().to_string()];
-        names.extend(card.map(|stored| stored.identity.name));
-        Ok(Addressee::new(self.peer_id(), names))
+        Ok(Addressee::new(self.peer_id()))
     }
 }
 
@@ -79,6 +30,7 @@ mod tests {
 
     fn text(body: &str, target: MentionTarget) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: PeerId::new(),
@@ -95,23 +47,14 @@ mod tests {
         }
     }
 
-    // what this catches: @name requests (target All) are addressed to every leading
-    // name, case-insensitively, by name or shown peer id; a mid-sentence name is not.
     #[test]
-    fn leading_names_address_and_mid_sentence_names_do_not() {
-        let fable = Addressee::new(PeerId::from_u128(0x7711fe60 << 96), ["Fable".into()]);
-        let codex = Addressee::new(PeerId::new(), ["Codex".into()]);
-        let both = text("@Fable @Codex, review #1617", MentionTarget::All);
-        assert!(fable.is_addressed(&both) && codex.is_addressed(&both));
-        assert!(fable.is_addressed(&text("@fable: ping", MentionTarget::All)));
-        assert!(fable.is_addressed(&text("@7711fe60 ping", MentionTarget::All)));
-        assert!(!fable.is_addressed(&text("I asked Fable and @Fable later", MentionTarget::All)));
-        assert!(!fable.is_addressed(&text("@Fabled ping", MentionTarget::All)));
-        assert!(!fable.is_addressed(&text("@77 too short to be an id", MentionTarget::All)));
-        let typed = text(
-            "no names",
-            MentionTarget::Peer(PeerId::from_u128(0x7711fe60 << 96)),
-        );
-        assert!(fable.is_addressed(&typed));
+    fn only_typed_target_addresses_a_reader() {
+        let peer = PeerId::new();
+        let reader = Addressee::new(peer);
+        for body in ["@Fable @Codex, review", "@7711fe60 ping", "ordinary text"] {
+            assert!(!reader.is_addressed(&text(body, MentionTarget::All)));
+            assert!(reader.is_addressed(&text(body, MentionTarget::Peer(peer))));
+            assert!(!reader.is_addressed(&text(body, MentionTarget::Peer(PeerId::new()))));
+        }
     }
 }

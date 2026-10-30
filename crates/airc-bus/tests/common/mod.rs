@@ -66,6 +66,7 @@ pub fn durable(channel: RoomId, marker: u128, text: &str) -> Envelope {
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         Bytes::copy_from_slice(text.as_bytes()),
     )
@@ -77,7 +78,8 @@ pub fn ephemeral(channel: RoomId, marker: u128, key: &str, payload: &[u8]) -> En
     Envelope::new(
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
-        Kind::Signal,
+        Kind::Event,
+        airc_core::EventClass::Activity(airc_core::ActivityKind::Presence),
         DeliveryClass::EphemeralLatest,
         Bytes::copy_from_slice(payload),
     )
@@ -121,6 +123,30 @@ impl GatedSink {
 
 #[async_trait]
 impl DurableSink for GatedSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         while !self.is_open.load(std::sync::atomic::Ordering::SeqCst) {
             self.open.notified().await;

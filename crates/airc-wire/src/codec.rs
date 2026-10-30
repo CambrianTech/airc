@@ -19,7 +19,10 @@ use bytes::Bytes;
 use uuid::Uuid;
 
 use airc_bus::envelope::{DeliveryClass, Envelope, Kind, Seq, Target};
-use airc_core::{ClientId, EventId, Headers, PeerId, RoomId};
+use airc_core::{
+    ActivityKind, ClientId, ControlKind, CorrespondenceKind, EventClass, EventId, Headers, PeerId,
+    RoomId,
+};
 
 use crate::error::WireError;
 use crate::wire_generated::airc::wire as fb;
@@ -74,6 +77,127 @@ fn kind_from_fb(kind: fb::Kind) -> Kind {
         fb::Kind::Signal => Kind::Signal,
         fb::Kind::StreamChunk => Kind::StreamChunk,
         fb::Kind::Control => Kind::Control,
+    }
+}
+
+fn class_to_fb(class: EventClass) -> fb::EventClass {
+    match class {
+        EventClass::Correspondence(CorrespondenceKind::Message) => {
+            fb::EventClass::CorrespondenceMessage
+        }
+        EventClass::Correspondence(CorrespondenceKind::Announcement) => {
+            fb::EventClass::CorrespondenceAnnouncement
+        }
+        EventClass::Activity(ActivityKind::Intent) => fb::EventClass::ActivityIntent,
+        EventClass::Activity(ActivityKind::WorkReceipt) => fb::EventClass::ActivityWorkReceipt,
+        EventClass::Activity(ActivityKind::WorkState) => fb::EventClass::ActivityWorkState,
+        EventClass::Activity(ActivityKind::Presence) => fb::EventClass::ActivityPresence,
+        EventClass::Activity(ActivityKind::WorkPresence) => fb::EventClass::ActivityWorkPresence,
+        EventClass::Activity(ActivityKind::Coordination) => fb::EventClass::ActivityCoordination,
+
+        EventClass::Control(ControlKind::Command) => fb::EventClass::ControlCommand,
+        EventClass::Control(ControlKind::CommandResult) => fb::EventClass::ControlCommandResult,
+        EventClass::Control(ControlKind::Session) => fb::EventClass::ControlSession,
+        EventClass::Control(ControlKind::Receipt) => fb::EventClass::ControlReceipt,
+        EventClass::Control(ControlKind::Addressed) => fb::EventClass::ControlAddressed,
+        EventClass::Control(ControlKind::Signal) => fb::EventClass::ControlSignal,
+        EventClass::Control(ControlKind::Stream) => fb::EventClass::ControlStream,
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::PeerArrived)) => {
+            fb::EventClass::LifecyclePeerArrived
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::PeerDeparted)) => {
+            fb::EventClass::LifecyclePeerDeparted
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::WireEstablished)) => {
+            fb::EventClass::LifecycleWireEstablished
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::WireLost)) => {
+            fb::EventClass::LifecycleWireLost
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomJoined)) => {
+            fb::EventClass::LifecycleRoomJoined
+        }
+        EventClass::Control(ControlKind::Lifecycle(airc_core::LifecycleKind::RoomParted)) => {
+            fb::EventClass::LifecycleRoomParted
+        }
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::SubscriptionAdvanced,
+        )) => fb::EventClass::LifecycleSubscriptionAdvanced,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::IdentityPublished,
+        )) => fb::EventClass::LifecycleIdentityPublished,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::DoctrinePublished,
+        )) => fb::EventClass::LifecycleDoctrinePublished,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::WallPostPublished,
+        )) => fb::EventClass::LifecycleWallPostPublished,
+        EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::ChannelPurposePublished,
+        )) => fb::EventClass::LifecycleChannelPurposePublished,
+    }
+}
+
+fn class_from_fb(class: fb::EventClass) -> Result<EventClass, WireError> {
+    match class {
+        fb::EventClass::Unspecified => Err(WireError::MissingField("class")),
+        fb::EventClass::CorrespondenceMessage => {
+            Ok(EventClass::Correspondence(CorrespondenceKind::Message))
+        }
+        fb::EventClass::CorrespondenceAnnouncement => {
+            Ok(EventClass::Correspondence(CorrespondenceKind::Announcement))
+        }
+        fb::EventClass::ActivityIntent => Ok(EventClass::Activity(ActivityKind::Intent)),
+        fb::EventClass::ActivityWorkReceipt => Ok(EventClass::Activity(ActivityKind::WorkReceipt)),
+        fb::EventClass::ActivityWorkState => Ok(EventClass::Activity(ActivityKind::WorkState)),
+        fb::EventClass::ActivityPresence => Ok(EventClass::Activity(ActivityKind::Presence)),
+        fb::EventClass::ActivityWorkPresence => {
+            Ok(EventClass::Activity(ActivityKind::WorkPresence))
+        }
+        fb::EventClass::ActivityCoordination => {
+            Ok(EventClass::Activity(ActivityKind::Coordination))
+        }
+
+        fb::EventClass::ControlCommand => Ok(EventClass::Control(ControlKind::Command)),
+        fb::EventClass::ControlCommandResult => Ok(EventClass::Control(ControlKind::CommandResult)),
+        fb::EventClass::ControlSession => Ok(EventClass::Control(ControlKind::Session)),
+        fb::EventClass::ControlReceipt => Ok(EventClass::Control(ControlKind::Receipt)),
+        fb::EventClass::ControlAddressed => Ok(EventClass::Control(ControlKind::Addressed)),
+        fb::EventClass::ControlSignal => Ok(EventClass::Control(ControlKind::Signal)),
+        fb::EventClass::ControlStream => Ok(EventClass::Control(ControlKind::Stream)),
+        fb::EventClass::LifecyclePeerArrived => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::PeerArrived,
+        ))),
+        fb::EventClass::LifecyclePeerDeparted => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::PeerDeparted,
+        ))),
+        fb::EventClass::LifecycleWireEstablished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::WireEstablished),
+        )),
+        fb::EventClass::LifecycleWireLost => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::WireLost,
+        ))),
+        fb::EventClass::LifecycleRoomJoined => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::RoomJoined,
+        ))),
+        fb::EventClass::LifecycleRoomParted => Ok(EventClass::Control(ControlKind::Lifecycle(
+            airc_core::LifecycleKind::RoomParted,
+        ))),
+        fb::EventClass::LifecycleSubscriptionAdvanced => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::SubscriptionAdvanced),
+        )),
+        fb::EventClass::LifecycleIdentityPublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::IdentityPublished),
+        )),
+        fb::EventClass::LifecycleDoctrinePublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::DoctrinePublished),
+        )),
+        fb::EventClass::LifecycleWallPostPublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::WallPostPublished),
+        )),
+        fb::EventClass::LifecycleChannelPurposePublished => Ok(EventClass::Control(
+            ControlKind::Lifecycle(airc_core::LifecycleKind::ChannelPurposePublished),
+        )),
     }
 }
 
@@ -158,6 +282,7 @@ pub fn encode(env: &Envelope) -> Bytes {
         Some(uuid_to_fb(env.from.0.as_uuid())),
         Some(uuid_to_fb(env.from.1.as_uuid())),
         kind_to_fb(env.kind),
+        class_to_fb(env.class),
         delivery_to_fb(env.delivery),
         env.seq.epoch,
         env.seq.counter,
@@ -201,6 +326,7 @@ pub fn decode(buf: Bytes) -> Result<Envelope, WireError> {
     let client_id = ClientId::from_uuid(require_uuid(view.client_id_ref()?, "client_id")?);
 
     let kind = view.kind()?;
+    let class = view.class()?;
     let delivery = view.delivery()?;
     let seq = view.seq()?;
     let occurred_at_ms = view.occurred_at_ms()?;
@@ -226,6 +352,7 @@ pub fn decode(buf: Bytes) -> Result<Envelope, WireError> {
         from: (peer_id, client_id),
         target,
         kind,
+        class,
         delivery,
         seq,
         occurred_at_ms,
@@ -257,11 +384,13 @@ pub struct WireEnvelope<'buf> {
 
 impl<'buf> WireEnvelope<'buf> {
     /// Parse the FlatBuffer root from a borrowed buffer. Cheap: validates
-    /// the root offset/vtable, reads no field bodies.
+    /// the root offset/vtable and typed routing metadata, reads no payload.
     pub fn read(buf: &'buf [u8]) -> Result<Self, WireError> {
         use planus::ReadAsRoot;
         let inner = fb::EnvelopeRef::read_as_root(buf)?;
-        Ok(Self { inner })
+        let view = Self { inner };
+        view.kind()?.validate_class(view.class()?)?;
+        Ok(view)
     }
 
     /// The opaque payload as a slice INTO the buffer — zero copy. `None`
@@ -277,6 +406,11 @@ impl<'buf> WireEnvelope<'buf> {
     }
 
     /// Delivery / retention class (§2, §3.3, §3.4).
+    pub fn class(&self) -> Result<EventClass, WireError> {
+        class_from_fb(self.inner.class()?)
+    }
+
+    /// Delivery and retention policy, independent of semantic classification.
     pub fn delivery(&self) -> Result<DeliveryClass, WireError> {
         Ok(delivery_from_fb(self.inner.delivery()?))
     }

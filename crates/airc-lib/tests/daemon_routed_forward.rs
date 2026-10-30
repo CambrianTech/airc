@@ -300,6 +300,7 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
             room.channel,
             (publisher.peer_id(), airc_core::ClientId::new()),
             Kind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             DeliveryClass::Durable,
             bytes::Bytes::from(Body::text(format!("offline history {n}")).to_payload()),
         );
@@ -626,6 +627,7 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
         room.channel,
         (publisher.peer_id(), airc_core::ClientId::new()),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         bytes::Bytes::from(Body::text("persisted after the active page snapshot").to_payload()),
     );

@@ -31,9 +31,8 @@ use std::path::Path;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sea_orm::{
-    sea_query::{Expr, OnConflict},
-    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    sea_query::Expr, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
@@ -213,6 +212,25 @@ impl SqliteDurableSink {
         })
     }
 
+    /// Read-only candidate admission. An incompatible populated store is a
+    /// typed refusal before the installer displaces the currently running build.
+    pub async fn check_classification_adoption(&self) -> Result<(), crate::StoreError> {
+        crate::migration::check_classification_adoption(&self.readers).await
+    }
+
+    /// Retrieve original pre-classification records without migrations or
+    /// interpretation. Open with `open_read_only_path` to inspect a refused
+    /// store. Cursor is the last returned event ID; the requested limit is a
+    /// required nonzero bound. This never manufactures routable envelopes.
+    pub async fn audit_page(
+        &self,
+        table: crate::audit::AuditTable,
+        after: Option<uuid::Uuid>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<Vec<crate::audit::AuditRecord>, crate::StoreError> {
+        crate::audit::page(&self.readers, table, after, limit).await
+    }
+
     /// Open an ephemeral in-memory durable tier. Convenience for tests.
     pub async fn in_memory() -> Result<Self, BusError> {
         Self::open("sqlite::memory:", crate::custody::Admission::Unmanaged).await
@@ -239,7 +257,7 @@ impl DurableSink for SqliteDurableSink {
         self.append_batch(&[e]).await
     }
 
-    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the
+    /// Group-commit: engine-bounded INSERTs … ON CONFLICT DO NOTHING for the
     /// events and their header rows, in ONE transaction (one commit per batch,
     /// not per event); fsync work is amortized at WAL checkpoint under
     /// synchronous=NORMAL. Same idempotent-on-`event_id` contract: a replayed
@@ -257,20 +275,13 @@ impl DurableSink for SqliteDurableSink {
             .map(|e| to_active_model(e))
             .collect::<Result<Vec<_>, _>>()?;
         let txn = self.db.begin().await.map_err(sink)?;
-        match bus_event::Entity::insert_many(actives)
-            .on_conflict(
-                OnConflict::column(bus_event::Column::EventId)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(&txn)
-            .await
-        {
-            // Every row in the batch already existed (all conflicted) — the
-            // DO-NOTHING all-dupes path. Idempotent success, not an error.
-            Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
-            Err(err) => return Err(sink(err)),
-        }
+        crate::sqlite_batch::insert_ignoring::<bus_event::Entity>(
+            &txn,
+            actives,
+            [bus_event::Column::EventId],
+        )
+        .await
+        .map_err(sink)?;
         crate::header_query::write_header_rows::<bus_event::Entity>(
             &txn,
             events.iter().map(|e| (e.event_id.as_uuid(), &e.headers)),
@@ -298,24 +309,14 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
-        let mut branches = Vec::new();
-        for query in page_rows(channel, after, through, rule, bounded, tail) {
-            branches.push(
-                query
-                    .all(&self.readers)
-                    .await
-                    .map_err(BusError::sink_source)?,
-            );
+        let mut rows = page_rows(channel, after, through, rule, bounded, tail)?
+            .all(&self.readers)
+            .await
+            .map_err(BusError::sink_source)?;
+        if tail {
+            rows.reverse();
         }
-        crate::event_table::merge_branches(
-            branches,
-            |row| (row.epoch, row.counter, row.event_id),
-            limit,
-            tail,
-        )
-        .into_iter()
-        .map(from_model)
-        .collect()
+        rows.into_iter().map(from_model).collect()
     }
 
     async fn count_matching(
@@ -323,10 +324,10 @@ impl DurableSink for SqliteDurableSink {
         channel: RoomId,
         after: Cursor,
         through: Cursor,
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, BusError> {
-        let mut rows = matching_rows(channel, after, through, headers);
+        let mut rows = matching_rows(channel, after, through, rule)?;
         if let Some(rule) = exclude {
             rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
                 rule,
@@ -362,99 +363,25 @@ impl DurableSink for SqliteDurableSink {
         from_cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Envelope>, BusError> {
-        // Bounded by `limit`. The trait caller (the router's deep-replay)
-        // may pass a very large limit to mean "the whole tail"; clamp to
-        // `i64::MAX` so the SQL bind never overflows and we never use
-        // `usize::MAX` as a sentinel. The query stays indexed: ORDER BY
-        // rides the composite index, LIMIT only caps the row count.
-        let bounded = u64::try_from(limit)
-            .unwrap_or(u64::MAX)
-            .min(i64::MAX as u64);
-
-        let mut query =
-            bus_event::Entity::find().filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
-
-        // Strictly after the cursor in generational order:
-        //   epoch > c.epoch
-        //   OR (epoch == c.epoch AND counter > c.counter)
-        //   OR (epoch == c.epoch AND counter == c.counter
-        //       AND event_id > c.event_id).
-        // event_id is the deterministic tiebreaker (§3.5); within one
-        // epoch the monotonic counter forbids a tie, but the tiebreak
-        // keeps the order total independent of how `seq` was produced.
-        if let Some(c) = from_cursor {
-            let epoch = c.seq.epoch as i64;
-            let counter = c.seq.counter as i64;
-            let event_id = c.event_id.as_uuid();
-            let strictly_after = Expr::col(bus_event::Column::Epoch)
-                .gt(epoch)
-                .or(Expr::col(bus_event::Column::Epoch)
-                    .eq(epoch)
-                    .and(Expr::col(bus_event::Column::Counter).gt(counter)))
-                .or(Expr::col(bus_event::Column::Epoch)
-                    .eq(epoch)
-                    .and(Expr::col(bus_event::Column::Counter).eq(counter))
-                    .and(Expr::col(bus_event::Column::EventId).gt(event_id)));
-            query = query.filter(strictly_after);
-        }
-
-        let rows = query
-            .order_by_asc(bus_event::Column::Epoch)
-            .order_by_asc(bus_event::Column::Counter)
-            .order_by_asc(bus_event::Column::EventId)
-            .limit(bounded)
-            .all(&self.readers)
-            .await
-            .map_err(BusError::sink_source)?;
-
-        rows.into_iter().map(from_model).collect()
+        self.filtered_page_after(
+            channel,
+            from_cursor,
+            limit,
+            &airc_bus::Filter::channel(channel),
+        )
+        .await
     }
 
-    /// Card 8428ae8c: the reverse-paging leg of "most recent N". One
-    /// indexed query — `ORDER BY (epoch, counter, event_id) DESC
-    /// LIMIT n` rides the same composite
-    /// `(room_id, epoch, counter, event_id)` index as [`Self::page`]
-    /// (SQLite B-tree indexes serve both scan directions) — then the
-    /// page is reversed in memory so callers get ascending total
-    /// order. Cost is bounded by `limit`, never by channel depth.
     async fn page_tail(
         &self,
         channel: RoomId,
         before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Envelope>, BusError> {
-        // Same bind clamp as `page`: a huge limit means "the whole
-        // tail", never a `usize::MAX` sentinel reaching SQL.
-        let bounded = u64::try_from(limit)
-            .unwrap_or(u64::MAX)
-            .min(i64::MAX as u64);
-
-        let mut query =
-            bus_event::Entity::find().filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
-
-        if let Some(c) = before {
-            query = query.filter(strictly_before(c));
-        }
-
-        let rows = query
-            .order_by_desc(bus_event::Column::Epoch)
-            .order_by_desc(bus_event::Column::Counter)
-            .order_by_desc(bus_event::Column::EventId)
-            .limit(bounded)
-            .all(&self.readers)
+        self.filtered_tail_before(channel, before, limit, &airc_bus::Filter::channel(channel))
             .await
-            .map_err(BusError::sink_source)?;
-
-        // DESC off the index, ascending to the caller.
-        rows.into_iter().rev().map(from_model).collect()
     }
 
-    /// Continuum #297: `page_tail` with the kind predicate applied by
-    /// the DATABASE, before `LIMIT` — the store leg of "newest N events
-    /// of these kinds". Same composite-index DESC scan as
-    /// [`Self::page_tail`] plus one indexed-column `IN` predicate; a
-    /// chunk-flooded room answers with the newest N matching rows
-    /// instead of N chunks the caller would throw away.
     async fn page_tail_of_kinds(
         &self,
         channel: RoomId,
@@ -462,18 +389,57 @@ impl DurableSink for SqliteDurableSink {
         kinds: &[Kind],
         limit: usize,
     ) -> Result<Vec<Envelope>, BusError> {
+        self.filtered_tail_before(
+            channel,
+            before,
+            limit,
+            &airc_bus::Filter::channel(channel).with_kinds(kinds.to_vec()),
+        )
+        .await
+    }
+
+    /// Every live subscription axis is evaluated by the store before LIMIT.
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
         let bounded = u64::try_from(limit)
-            .unwrap_or(u64::MAX)
+            .map_err(BusError::sink_source)?
             .min(i64::MAX as u64);
-
-        let mut query = bus_event::Entity::find()
-            .filter(bus_event::Column::RoomId.eq(channel.as_uuid()))
-            .filter(bus_event::Column::Kind.is_in(kinds.iter().map(|k| kind_to_text(*k))));
-
-        if let Some(c) = before {
-            query = query.filter(strictly_before(c));
+        let mut query = filtered_bus_rows(channel, filter)?;
+        if let Some(cursor) = after {
+            query = query.filter(strictly_after(cursor));
         }
+        query
+            .order_by_asc(bus_event::Column::Epoch)
+            .order_by_asc(bus_event::Column::Counter)
+            .order_by_asc(bus_event::Column::EventId)
+            .limit(bounded)
+            .all(&self.readers)
+            .await
+            .map_err(BusError::sink_source)?
+            .into_iter()
+            .map(from_model)
+            .collect()
+    }
 
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        let bounded = u64::try_from(limit)
+            .map_err(BusError::sink_source)?
+            .min(i64::MAX as u64);
+        let mut query = filtered_bus_rows(channel, filter)?;
+        if let Some(cursor) = before {
+            query = query.filter(strictly_before(cursor));
+        }
         let rows = query
             .order_by_desc(bus_event::Column::Epoch)
             .order_by_desc(bus_event::Column::Counter)
@@ -482,7 +448,6 @@ impl DurableSink for SqliteDurableSink {
             .all(&self.readers)
             .await
             .map_err(BusError::sink_source)?;
-
         rows.into_iter().rev().map(from_model).collect()
     }
 
@@ -493,6 +458,7 @@ impl DurableSink for SqliteDurableSink {
     /// composite index — bounded cost regardless of channel depth.
     async fn head_cursor(&self, channel: RoomId) -> Result<Option<Cursor>, BusError> {
         let row = bus_event::Entity::find()
+            .filter(bus_event::Column::Class.is_not_null())
             .filter(bus_event::Column::RoomId.eq(channel.as_uuid()))
             .order_by_desc(bus_event::Column::Epoch)
             .order_by_desc(bus_event::Column::Counter)
@@ -519,6 +485,29 @@ impl DurableSink for SqliteDurableSink {
     }
 }
 
+fn filtered_bus_rows(
+    channel: RoomId,
+    filter: &airc_bus::Filter,
+) -> Result<sea_orm::Select<bus_event::Entity>, BusError> {
+    let mut query = bus_event::Entity::find()
+        .filter(bus_event::Column::RoomId.eq(channel.as_uuid()))
+        .filter(bus_event::Column::RoomId.eq(filter.channel.as_uuid()))
+        .filter(
+            crate::class_query::selection::<bus_event::Entity>(&filter.selection, &filter.headers)
+                .map_err(BusError::sink_source)?,
+        );
+    if let Some(kinds) = &filter.kinds {
+        query =
+            query.filter(bus_event::Column::Kind.is_in(kinds.iter().copied().map(kind_to_text)));
+    }
+    if let Some(delivery) = &filter.delivery {
+        query = query.filter(
+            bus_event::Column::Delivery.is_in(delivery.iter().copied().map(delivery_to_text)),
+        );
+    }
+    Ok(query)
+}
+
 /// The ONE sanctioned `Envelope -> row` serialize (§3.3). Lives only
 /// here; no other copy of this mapping exists.
 fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
@@ -529,6 +518,8 @@ fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
         epoch: Set(u64_to_i64("bus_events.epoch", e.seq.epoch)?),
         counter: Set(u64_to_i64("bus_events.counter", e.seq.counter)?),
         kind: Set(kind_to_text(e.kind).to_owned()),
+        class: Set(Some(serde_json::to_string(&e.class).map_err(codec)?)),
+        class_family: Set(Some(e.class.family() as i32)),
         delivery: Set(delivery_to_text(e.delivery).to_owned()),
         target: Set(serde_json::to_value(&e.target).map_err(codec)?),
         correlation_id: Set(e.correlation_id),
@@ -539,7 +530,7 @@ fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
         client_id: Set(e.from.1.as_uuid()),
         occurred_at_ms: Set(u64_to_i64("bus_events.occurred_at_ms", e.occurred_at_ms)?),
         addressed_peer: Set(addressing.peer.map(|peer| peer.as_uuid())),
-        leading_mention: Set(addressing.leading_mention),
+        leading_mention: Set(false),
         derived_version: Set(crate::derive::DERIVED_VERSION),
     })
 }
@@ -558,6 +549,8 @@ fn from_model(m: bus_event::Model) -> Result<Envelope, BusError> {
         ),
         target,
         kind: kind_from_text(&m.kind)?,
+        class: crate::class_query::decode(m.event_id, m.class, m.class_family)
+            .map_err(BusError::sink_source)?,
         delivery: delivery_from_text(&m.delivery)?,
         seq: Seq::new(
             i64_to_u64("bus_events.epoch", m.epoch)?,
@@ -583,10 +576,11 @@ fn matching_rows(
     channel: RoomId,
     after: Cursor,
     through: Cursor,
-    headers: &airc_core::HeaderFilter,
-) -> sea_orm::Select<bus_event::Entity> {
-    let mut query =
-        bus_event::Entity::find().filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
+    rule: airc_core::HistoryMatch<'_>,
+) -> Result<sea_orm::Select<bus_event::Entity>, BusError> {
+    let mut query = bus_event::Entity::find()
+        .filter(bus_event::Column::Class.is_not_null())
+        .filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
 
     // Strictly after the cursor in generational order:
     //   epoch > c.epoch
@@ -613,18 +607,20 @@ fn matching_rows(
         query = query.filter(strictly_after);
     }
 
-    query
+    Ok(query
         .filter(
             strictly_before(through)
                 .or(Expr::col(bus_event::Column::EventId).eq(through.event_id.as_uuid())),
         )
-        .filter(crate::header_query::predicate::<bus_event::Entity>(headers))
-        .filter(bus_event::Column::Delivery.eq("durable"))
+        .filter(
+            crate::class_query::matching::<bus_event::Entity>(rule)
+                .map_err(BusError::sink_source)?,
+        )
+        .filter(bus_event::Column::Delivery.eq("durable")))
 }
 
 /// The selects `page_matching` reads: [`matching_rows`], the first `limit` in
-/// cursor order (the last, for `tail`); with an addressee filter, one per
-/// branch ([`crate::event_table::addressee_branches`]).
+/// cursor order (the last, for `tail`). All predicates run before LIMIT.
 fn page_rows(
     channel: RoomId,
     after: Cursor,
@@ -632,23 +628,38 @@ fn page_rows(
     rule: airc_core::HistoryMatch<'_>,
     limit: u64,
     tail: bool,
-) -> Vec<sea_orm::Select<bus_event::Entity>> {
+) -> Result<sea_orm::Select<bus_event::Entity>, BusError> {
     let order = if tail {
         sea_orm::Order::Desc
     } else {
         sea_orm::Order::Asc
     };
-    let query = matching_rows(channel, after, through, rule.headers)
+    let query = matching_rows(channel, after, through, rule)?
         .order_by(bus_event::Column::Epoch, order.clone())
         .order_by(bus_event::Column::Counter, order.clone())
         .order_by(bus_event::Column::EventId, order)
         .limit(limit);
-    crate::event_table::addressee_branches(query, rule.addressed_to)
+    Ok(query)
 }
 
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],
 /// [`DurableSink::page_tail_of_kinds`]) so the ordering contract has
 /// exactly one home.
+fn strictly_after(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
+    let epoch = c.seq.epoch as i64;
+    let counter = c.seq.counter as i64;
+    let event_id = c.event_id.as_uuid();
+    Expr::col(bus_event::Column::Epoch)
+        .gt(epoch)
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).gt(counter)))
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).eq(counter))
+            .and(Expr::col(bus_event::Column::EventId).gt(event_id)))
+}
+
 fn strictly_before(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
     let epoch = c.seq.epoch as i64;
     let counter = c.seq.counter as i64;
@@ -664,7 +675,7 @@ fn strictly_before(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
             .and(Expr::col(bus_event::Column::EventId).lt(event_id)))
 }
 
-fn kind_to_text(kind: Kind) -> &'static str {
+pub(crate) fn kind_to_text(kind: Kind) -> &'static str {
     match kind {
         Kind::Message => "message",
         Kind::Event => "event",

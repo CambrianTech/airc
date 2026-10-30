@@ -24,7 +24,7 @@ impl EventRouter {
         &self,
         filter: Filter,
         from_cursor: Option<Cursor>,
-    ) -> impl Stream<Item = Arc<Envelope>> {
+    ) -> impl Stream<Item = crate::Result<Arc<Envelope>>> {
         self.subscribe_with_lag(filter, from_cursor).0
     }
 
@@ -36,7 +36,7 @@ impl EventRouter {
         &self,
         filter: Filter,
         from_cursor: Option<Cursor>,
-    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+    ) -> (impl Stream<Item = crate::Result<Arc<Envelope>>>, LagFlag) {
         self.subscribe_mode(filter, from_cursor, false)
     }
 
@@ -44,7 +44,7 @@ impl EventRouter {
     pub fn subscribe_live_with_lag(
         &self,
         filter: Filter,
-    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+    ) -> (impl Stream<Item = crate::Result<Arc<Envelope>>>, LagFlag) {
         self.subscribe_mode(filter, None, true)
     }
 
@@ -53,7 +53,7 @@ impl EventRouter {
         filter: Filter,
         from_cursor: Option<Cursor>,
         live_only: bool,
-    ) -> (impl Stream<Item = Arc<Envelope>>, LagFlag) {
+    ) -> (impl Stream<Item = crate::Result<Arc<Envelope>>>, LagFlag) {
         let inner = Arc::clone(&self.inner);
         let channel = filter.channel;
         let id = inner.next_subscription.fetch_add(1, Ordering::Relaxed);
@@ -120,18 +120,13 @@ impl EventRouter {
         );
 
         let lag_flag = LagFlag(Arc::clone(&lagged));
-        let stream = async_stream::stream! {
+        let stream = async_stream::try_stream! {
             // Captured even before first poll: dropping an unpolled stream
             // unregisters immediately, with no later publish needed for cleanup.
             let _registration = registration;
             // --- step 2: deep replay leg from the sink ---
-            // Card ddbab098 — sibling of #1389 on the attach path. The old code
-            // pulled everything after `from_cursor` in one unbounded query and
-            // filtered it in memory; now we page the sink in bounded chunks, so
-            // attaching to a deep channel costs bounded time and never
-            // materializes the whole tail. Delivery semantics are unchanged:
-            // every row strictly after `from_cursor` and before the ring's
-            // oldest is still delivered, in total order.
+            // The durable owner applies the same typed predicate before LIMIT.
+            // A failed read terminates with an error; never advance past missing history.
             const DEEP_REPLAY_PAGE: usize = 1024;
             let mut high: Option<Cursor> = from_cursor;
             if !live_only {
@@ -139,13 +134,8 @@ impl EventRouter {
                 'deep: loop {
                     let deep = inner
                         .sink
-                        .page(channel, page_from, DEEP_REPLAY_PAGE)
-                        .await
-                        .unwrap_or_default();
-                    // A short or empty page means the sink holds nothing further
-                    // past `page_from` — the tail is exhausted. (A failed query
-                    // surfaces as a short page too: same posture as the old single
-                    // fetch, where steps 3/4 still deliver recent + live.)
+                        .filtered_page_after(channel, page_from, DEEP_REPLAY_PAGE, &filter)
+                        .await?;
                     let full_page = deep.len() >= DEEP_REPLAY_PAGE;
                     let last_cursor = deep.last().map(|e| e.cursor());
                     for env in deep {
@@ -166,7 +156,7 @@ impl EventRouter {
                         // so the stream item type stays uniform with the
                         // (already-`Arc`) ring and live legs.
                         let env = Arc::new(env);
-                        if after_gate && filter.matches(&env) {
+                        if after_gate {
                             high = Some(cursor);
                             yield env;
                         }
@@ -174,11 +164,7 @@ impl EventRouter {
                     if !full_page {
                         break 'deep;
                     }
-                    // A full page (>= DEEP_REPLAY_PAGE rows) always has a last cursor; `None`
-                    // here would mean the sink contradicted its own length. Bail rather than panic:
-                    // steps 3/4 still hand off from there on.
-                    let Some(next_from) = last_cursor else { break 'deep; };
-                    page_from = Some(next_from);
+                    page_from = last_cursor;
                 }
             }
 

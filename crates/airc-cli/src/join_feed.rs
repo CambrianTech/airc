@@ -7,7 +7,7 @@
 //! of replaying the full transcript.
 
 use airc_core::{MentionTarget, PeerId, RoomId, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, LiveLag};
+use airc_lib::{Airc, StreamError};
 use futures::stream::StreamExt;
 use std::io::Write;
 
@@ -60,7 +60,8 @@ pub async fn run(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
             next = stream.next() => match next {
                 Some(Ok(_)) => {},
-                Some(Err(lag @ LiveLag { .. })) => eprintln!("airc: {lag}; recovering from durable delivery state"),
+                Some(Err(StreamError::Lag(lag))) => eprintln!("airc: {lag}; recovering from durable delivery state"),
+                Some(Err(error)) => return Err(error.into()),
                 None => stream = reattach(airc, home).await?,
             },
         }
@@ -230,9 +231,10 @@ async fn print_delivery_turn(
                 && crate::event_render::render_feed_line(e).is_some()
         };
         // The feed renders no liveness beat, so the count routes them out by header.
-        let count_filter = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
-            key: airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND.to_string(),
-        }));
+        let count_filter = airc_lib::EventFilter {
+            selection: airc_core::EventSelection::Correspondence,
+            ..airc_lib::EventFilter::default()
+        };
         // The feed's own self rule, the one print_event applies to live lines.
         turn.history_summary(count_filter, Some(self_filter), keep, &me, window)
             .await?
@@ -340,6 +342,7 @@ mod tests {
         airc.publish(
             airc_lib::PublishTarget::RoomByName(other.to_string()).to_peer(airc.peer_id()),
             airc_protocol::FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             Body::text("direct-challenge"),
             Headers::from([(HEADER_AIRC_CLIENT.to_string(), "claude:peer".to_string())]),
         )
@@ -504,7 +507,8 @@ mod tests {
         let (_dir, airc, room) = fixture().await;
         for n in 1..=130 {
             let mut chunk = event(&airc, room, n, "claude:peer", "fragment");
-            chunk.kind = TranscriptKind::System;
+            chunk.class = airc_core::EventClass::Control(airc_core::ControlKind::Stream);
+            chunk.kind = chunk.class.transcript_kind();
             chunk
                 .headers
                 .insert(airc_lib::HEADER_STREAM_ID.into(), "stream-test".into());
@@ -519,7 +523,9 @@ mod tests {
                 .unwrap(),
         );
         let mut warning = event(&airc, room, 132, "claude:peer", "ordinary warning");
-        warning.kind = TranscriptKind::System;
+        warning.class =
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Announcement);
+        warning.kind = warning.class.transcript_kind();
         airc.append_event(warning).await.unwrap();
         let filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
@@ -654,6 +660,7 @@ mod tests {
         text: &str,
     ) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id,
             peer_id: airc.peer_id(),

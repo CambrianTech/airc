@@ -91,6 +91,21 @@ pub enum FrameKind {
     Addressed,
 }
 
+impl FrameKind {
+    /// Transport projection of the signed semantic class. Never inspect payloads.
+    pub const fn for_class(class: airc_core::EventClass) -> Self {
+        use airc_core::{ControlKind, EventClass};
+        match class {
+            EventClass::Correspondence(_) => Self::Message,
+            EventClass::Activity(_) => Self::Event,
+            EventClass::Control(ControlKind::Command) => Self::Command,
+            EventClass::Control(ControlKind::CommandResult) => Self::CommandResult,
+            EventClass::Control(ControlKind::Addressed) => Self::Addressed,
+            EventClass::Control(_) => Self::Control,
+        }
+    }
+}
+
 /// One wire-level frame. A transport adapter carries `Frame`s in either
 /// direction; the substrate decides delivery semantics by `kind`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,6 +123,9 @@ pub struct Frame {
 /// against that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
+    /// Producer-declared semantic class, authenticated with the payload.
+    /// Required on the wire: absence is a contract violation.
+    pub class: airc_core::EventClass,
     pub event_id: EventId,
     pub sender: PeerId,
     pub sender_client: ClientId,
@@ -150,6 +168,7 @@ mod tests {
 
     fn envelope_fixture() -> Envelope {
         Envelope {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(0x01),
             sender: PeerId::from_u128(0xa1),
             sender_client: ClientId::from_u128(0xc1),
@@ -171,6 +190,13 @@ mod tests {
         let encoded = serde_json::to_value(&envelope).unwrap();
         let decoded: Envelope = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn envelope_without_class_is_refused() {
+        let mut encoded = serde_json::to_value(envelope_fixture()).expect("encode fixture");
+        encoded.as_object_mut().expect("object").remove("class");
+        assert!(serde_json::from_value::<Envelope>(encoded).is_err());
     }
 
     #[test]

@@ -1,29 +1,9 @@
-//! Typed work-event subscription surface.
-//!
-//! Closes work card e1f8e2e0 (P0): "Work subscription API: typed
-//! kanban/PR event stream for agents." Before this module, consumers
-//! wanting work-card / claim / PR / availability events had to
-//! subscribe to the raw substrate stream, call
-//! `transcript_is_work_event` on each event, decode the body, then
-//! pattern-match. After this module, consumers call
-//! [`Airc::subscribe_work_events`] / [`Airc::recent_work_events`]
-//! with a [`WorkEventFilter`] and get typed [`WorkEvent`] values.
-//!
-//! The substrate primitives this builds on were already shipped:
-//! - `airc-work::transcript_is_work_event` — header-based discriminator
-//! - `airc-work::decode_transcript_work_event` — decoder
-//! - Headers `forge.work.repo` / `forge.work.lane_id` / `forge.work.card_id`
-//!
-//! This module adds the SDK API on top so consumers (Continuum
-//! managers, agent schedulers, dashboards) don't reinvent the
-//! filter + decode loop.
+//! Typed work subscriptions share the substrate selector before paging and decoding.
 
 use std::sync::Arc;
 
 use airc_core::{PeerId, TranscriptEvent};
-use airc_work::{
-    decode_transcript_work_event, transcript_is_work_event, LaneId, RepoId, WorkEvent,
-};
+use airc_work::{decode_transcript_work_event, LaneId, RepoId, WorkEvent};
 use futures::stream::{Stream, StreamExt};
 
 use crate::error::AircError;
@@ -68,28 +48,31 @@ impl WorkEventFilter {
         self
     }
 
-    /// Cheap header-only check; avoids decoding the body if the
-    /// substrate-level filters already rule the event out.
-    pub(crate) fn matches_transcript(&self, event: &TranscriptEvent) -> bool {
-        if let Some(peer) = self.peer {
-            if event.peer_id != peer {
-                return false;
-            }
+    fn event_filter(&self) -> crate::EventFilter {
+        let mut headers = Vec::new();
+        if let Some(repo) = &self.repo {
+            headers.push(airc_core::HeaderFilter::Exact {
+                key: HEADER_WORK_REPO.into(),
+                value: repo.as_str().into(),
+            });
         }
-        if let Some(repo) = self.repo.as_ref() {
-            match event.headers.get(HEADER_WORK_REPO) {
-                Some(value) if value == repo.as_str() => {}
-                _ => return false,
-            }
+        if let Some(lane) = &self.lane_id {
+            headers.push(airc_core::HeaderFilter::Exact {
+                key: HEADER_WORK_LANE_ID.into(),
+                value: lane.to_string(),
+            });
         }
-        if let Some(lane_id) = self.lane_id.as_ref() {
-            let expected = lane_id.to_string();
-            match event.headers.get(HEADER_WORK_LANE_ID) {
-                Some(value) if *value == expected => {}
-                _ => return false,
-            }
+        crate::EventFilter {
+            sender: self.peer,
+            selection: airc_work::work_event_selection(),
+            headers_filter: airc_core::HeaderFilter::All(headers),
+            ..Default::default()
         }
-        true
+    }
+
+    #[cfg(test)]
+    fn matches_transcript(&self, event: &TranscriptEvent) -> bool {
+        self.event_filter().matches(event)
     }
 }
 
@@ -102,48 +85,27 @@ impl Airc {
     pub async fn subscribe_work_events(
         &self,
         filter: WorkEventFilter,
-    ) -> Result<impl Stream<Item = (Arc<TranscriptEvent>, WorkEvent)>, AircError> {
-        let inner = self.subscribe().await?;
-        Ok(inner.filter_map(move |item| {
-            let filter = filter.clone();
-            async move {
-                let event = item.ok()?;
-                if !transcript_is_work_event(&event) {
-                    return None;
-                }
-                if !filter.matches_transcript(&event) {
-                    return None;
-                }
-                let item = decode_transcript_work_event(&event).ok()?;
-                Some((event, item.event))
-            }
+    ) -> Result<impl Stream<Item = Result<(Arc<TranscriptEvent>, WorkEvent), AircError>>, AircError>
+    {
+        let inner = self.subscribe_filtered(filter.event_filter()).await?;
+        Ok(inner.map(|item| {
+            let event = item?;
+            let decoded = decode_transcript_work_event(&event)?;
+            Ok((event, decoded.event))
         }))
     }
 
-    /// Query recent work events from the persisted transcript.
-    /// Walks the last `window` events, filters, decodes, and returns
-    /// the matching `WorkEvent`s in transcript order (oldest →
-    /// newest). Useful for "current state" queries that don't need
-    /// a live subscription.
+    /// Return recent matching work events, applying all predicates before LIMIT.
     pub async fn recent_work_events(
         &self,
         filter: WorkEventFilter,
         window: usize,
     ) -> Result<Vec<WorkEvent>, AircError> {
-        let recent = self.page_recent(window).await?;
-        let mut out = Vec::with_capacity(recent.len().min(window));
-        for transcript_event in recent {
-            if !transcript_is_work_event(&transcript_event) {
-                continue;
-            }
-            if !filter.matches_transcript(&transcript_event) {
-                continue;
-            }
-            if let Ok(item) = decode_transcript_work_event(&transcript_event) {
-                out.push(item.event);
-            }
-        }
-        Ok(out)
+        self.page_recent_filtered(filter.event_filter(), window)
+            .await?
+            .iter()
+            .map(|event| Ok(decode_transcript_work_event(event)?.event))
+            .collect()
     }
 }
 
@@ -167,6 +129,7 @@ mod tests {
             "anywhere".to_string(),
         );
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: PeerId::new(),
             client_id: airc_core::ClientId::new(),
@@ -190,6 +153,7 @@ mod tests {
         let other_peer = PeerId::new();
         let filter = WorkEventFilter::new().with_peer(target_peer);
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: other_peer,
             client_id: airc_core::ClientId::new(),
@@ -217,6 +181,7 @@ mod tests {
             "CambrianTech/airc".to_string(),
         );
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: PeerId::new(),
             client_id: airc_core::ClientId::new(),
@@ -244,6 +209,7 @@ mod tests {
             "wrong-org/wrong-repo".to_string(),
         );
         let event = TranscriptEvent {
+            class: airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
             event_id: airc_core::EventId::new(),
             peer_id: PeerId::new(),
             client_id: airc_core::ClientId::new(),

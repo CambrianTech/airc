@@ -46,6 +46,20 @@ pub const COUNTER_BITS: u32 = 40;
 /// Mask for the low [`COUNTER_BITS`] bits — the per-epoch counter range.
 pub const COUNTER_MASK: u64 = (1u64 << COUNTER_BITS) - 1;
 
+impl From<airc_bus::Kind> for IpcKind {
+    fn from(kind: airc_bus::Kind) -> Self {
+        match kind {
+            airc_bus::Kind::Message => Self::Message,
+            airc_bus::Kind::Event => Self::Event,
+            airc_bus::Kind::Command => Self::Command,
+            airc_bus::Kind::CommandResult => Self::CommandResult,
+            airc_bus::Kind::Signal => Self::Signal,
+            airc_bus::Kind::StreamChunk => Self::StreamChunk,
+            airc_bus::Kind::Control => Self::Control,
+        }
+    }
+}
+
 impl From<FrameKind> for IpcKind {
     /// Preserve protocol categories across the daemon boundary. Commands
     /// must never become conversational messages during SDK projection.
@@ -108,6 +122,16 @@ mod tests {
     use super::*;
     use airc_core::{EventId, RoomId};
     use uuid::Uuid;
+
+    #[test]
+    fn bus_signal_and_stream_remain_distinct_across_ipc() {
+        assert_eq!(IpcKind::from(airc_bus::Kind::Signal), IpcKind::Signal);
+        assert_eq!(
+            IpcKind::from(airc_bus::Kind::StreamChunk),
+            IpcKind::StreamChunk
+        );
+        assert_eq!(IpcKind::from(airc_bus::Kind::Control), IpcKind::Control);
+    }
 
     #[test]
     fn frame_kind_message_event_control_map_to_ipc_kind() {

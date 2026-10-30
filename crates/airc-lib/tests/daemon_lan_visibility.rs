@@ -127,6 +127,7 @@ fn inbound_frame(channel: RoomId, event_id: EventId, text: &str) -> Frame {
     Frame {
         kind: FrameKind::Message,
         envelope: ProtoEnvelope {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id,
             sender: PeerId::new(),
             sender_client: airc_core::ClientId::new(),

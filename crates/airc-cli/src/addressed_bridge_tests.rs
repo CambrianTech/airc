@@ -169,6 +169,7 @@ async fn production_bridges_forward_signed_frames_bidirectionally_without_storag
         let mut frame = Frame {
             kind: airc_protocol::FrameKind::Addressed,
             envelope: airc_protocol::Envelope {
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Addressed),
                 event_id: airc_core::EventId::new(),
                 sender: sender.0,
                 sender_client: airc_core::ClientId::new(),

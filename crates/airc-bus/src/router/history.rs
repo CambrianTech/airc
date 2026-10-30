@@ -161,10 +161,25 @@ impl EventRouter {
         kinds: Option<&[Kind]>,
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
+        let mut filter = crate::Filter::channel(channel);
+        if let Some(kinds) = kinds {
+            filter = filter.with_kinds(kinds.to_vec());
+        }
+        self.filtered_tail_before(channel, before, limit, &filter)
+            .await
+    }
+
+    /// Complete subscription predicate, applied in both ring and store before LIMIT.
+    pub async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &crate::Filter,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let matches_kind = |env: &Envelope| kinds.is_none_or(|kinds| kinds.contains(&env.kind));
         let (mut tail, ring_oldest) = {
             let shard = self.shard_for(channel);
             let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
@@ -176,7 +191,7 @@ impl EventRouter {
                         .into_iter()
                         .filter(|env| {
                             env.delivery.is_durable()
-                                && matches_kind(env)
+                                && filter.matches(env)
                                 && before.is_none_or(|gate| env.cursor().is_before(&gate))
                         })
                         .collect::<Vec<_>>(),
@@ -201,20 +216,11 @@ impl EventRouter {
             (_, Some(oldest)) => Some(oldest),
             (before, None) => before,
         };
-        let older = match kinds {
-            None => {
-                self.inner
-                    .sink
-                    .page_tail(channel, sink_before, remainder)
-                    .await?
-            }
-            Some(kinds) => {
-                self.inner
-                    .sink
-                    .page_tail_of_kinds(channel, sink_before, kinds, remainder)
-                    .await?
-            }
-        };
+        let older = self
+            .inner
+            .sink
+            .filtered_tail_before(channel, sink_before, remainder, filter)
+            .await?;
         let mut out: Vec<Arc<Envelope>> = older.into_iter().map(Arc::new).collect();
         out.append(&mut tail);
         Ok(out)
@@ -261,7 +267,7 @@ impl EventRouter {
                             e.delivery.is_durable()
                                 && e.cursor().is_after(&after)
                                 && !e.cursor().is_after(&through)
-                                && e.matches_history(rule)
+                                && e.matches_history(&rule)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -352,7 +358,7 @@ impl EventRouter {
         channel: RoomId,
         after: Cursor,
         through: Cursor,
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> crate::Result<airc_core::HistoryCount> {
         let sink_head = self.inner.sink.head_cursor(channel).await?;
@@ -364,7 +370,7 @@ impl EventRouter {
         let durable = if durable_through.is_after(&after) {
             self.inner
                 .sink
-                .count_matching(channel, after, durable_through, headers, exclude)
+                .count_matching(channel, after, durable_through, rule.clone(), exclude)
                 .await?
         } else {
             airc_core::HistoryCount::default()
@@ -387,7 +393,7 @@ impl EventRouter {
                             e.delivery.is_durable()
                                 && e.cursor().is_after(&pending_after)
                                 && !e.cursor().is_after(&through)
-                                && headers.matches(&e.headers)
+                                && e.matches_history(&rule)
                                 && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
                         })
                         .fold(airc_core::HistoryCount::default(), |count, e| {
@@ -409,7 +415,7 @@ mod tests {
     // once whether it is still pending in the ring or already persisted, and header
     // routing applies on both legs.
     #[tokio::test]
-    async fn count_is_exact_across_ring_and_sink_and_routes_by_header() {
+    async fn count_is_exact_across_ring_and_sink_and_routes_by_class() {
         let sink = Arc::new(crate::InMemoryDurableSink::new());
         let router = EventRouter::new(
             RouterConfig::default(),
@@ -428,11 +434,13 @@ mod tests {
                 room,
                 from,
                 Kind::Message,
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
                 DeliveryClass::Durable,
                 bytes::Bytes::from_static(b"x"),
             );
             if n == 0 {
-                env = env.with_header("airc.heartbeat.kind", "alive");
+                env.kind = Kind::Event;
+                env.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Presence);
             }
             let id = env.event_id;
             let seq = router.publish(env).await.unwrap();
@@ -440,9 +448,16 @@ mod tests {
         }
         let through = last.unwrap();
         let after = Cursor::new(crate::Seq::new(0, 0), airc_core::EventId::from_u128(0));
-        let routed = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
-            key: "airc.heartbeat.kind".into(),
-        }));
+        let all_headers = airc_core::HeaderFilter::Any;
+        let kinds = std::collections::BTreeSet::new();
+        let routed = airc_core::HistoryMatch {
+            sender: None,
+            kinds: &kinds,
+            self_echo: None,
+            selection: airc_core::EventSelection::Correspondence,
+            headers: &all_headers,
+            addressed_to: None,
+        };
         let expect = |count| airc_core::HistoryCount {
             count,
             oldest_ms: Some(7),
@@ -451,14 +466,20 @@ mod tests {
         let any = airc_core::HeaderFilter::Any;
         assert_eq!(
             router
-                .count_matching(room, after, through, &any, None)
+                .count_matching(
+                    room,
+                    after,
+                    through,
+                    airc_core::HistoryMatch::headers(&any),
+                    None
+                )
                 .await
                 .unwrap(),
             expect(6)
         );
         assert_eq!(
             router
-                .count_matching(room, after, through, &routed, None)
+                .count_matching(room, after, through, routed.clone(), None)
                 .await
                 .unwrap(),
             expect(5)
@@ -478,20 +499,32 @@ mod tests {
         // client's own unstamped send, so excluding self leaves nothing.
         let me = airc_core::RuntimeSelf::new(from.1, None);
         let own = router
-            .count_matching(room, after, through, &any, Some(&me))
+            .count_matching(
+                room,
+                after,
+                through,
+                airc_core::HistoryMatch::headers(&any),
+                Some(&me),
+            )
             .await
             .unwrap();
         assert_eq!(own.count, 0);
         assert_eq!(
             router
-                .count_matching(room, after, through, &any, None)
+                .count_matching(
+                    room,
+                    after,
+                    through,
+                    airc_core::HistoryMatch::headers(&any),
+                    None
+                )
                 .await
                 .unwrap(),
             expect(6)
         );
         assert_eq!(
             router
-                .count_matching(room, after, through, &routed, None)
+                .count_matching(room, after, through, routed.clone(), None)
                 .await
                 .unwrap(),
             expect(5)

@@ -259,6 +259,8 @@ pub struct TranscriptEvent {
     pub peer_id: PeerId,
     pub client_id: ClientId,
     pub kind: TranscriptKind,
+    /// Producer-declared, authenticated routing semantics.
+    pub class: crate::EventClass,
     pub occurred_at_ms: u64,
     pub lamport: u64,
     pub target: MentionTarget,

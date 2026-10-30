@@ -20,6 +20,19 @@ fn durable_kind_at(channel: RoomId, kind: Kind, epoch: u64, counter: u64) -> Env
         channel,
         (PeerId::from_u128(0xa1), ClientId::from_u128(0xc1)),
         kind,
+        match kind {
+            Kind::Message => {
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message)
+            }
+            Kind::Event => airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
+            Kind::Command => airc_core::EventClass::Control(airc_core::ControlKind::Command),
+            Kind::CommandResult => {
+                airc_core::EventClass::Control(airc_core::ControlKind::CommandResult)
+            }
+            Kind::Signal => airc_core::EventClass::Control(airc_core::ControlKind::Signal),
+            Kind::StreamChunk => airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+            Kind::Control => airc_core::EventClass::Control(airc_core::ControlKind::Session),
+        },
         DeliveryClass::Durable,
         Bytes::from(format!("payload-{epoch}-{counter}")),
     )
@@ -597,7 +610,13 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
     assert_eq!(sink.page(ch, None, 600).await.unwrap().len(), 514);
     // The count is the same range, counted in the store: it agrees with the page.
     let routed = sink
-        .count_matching(ch, origin, second.cursor(), &filter, None)
+        .count_matching(
+            ch,
+            origin,
+            second.cursor(),
+            airc_core::HistoryMatch::headers(&filter),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(routed.count, 2);
@@ -606,7 +625,7 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
             ch,
             origin,
             second.cursor(),
-            &airc_core::HeaderFilter::Any,
+            airc_core::HistoryMatch::headers(&airc_core::HeaderFilter::Any),
             None,
         )
         .await
@@ -614,7 +633,13 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
     assert_eq!(all.count, 514);
     assert!(all.oldest_ms <= all.newest_ms);
     let empty = sink
-        .count_matching(ch, second.cursor(), second.cursor(), &filter, None)
+        .count_matching(
+            ch,
+            second.cursor(),
+            second.cursor(),
+            airc_core::HistoryMatch::headers(&filter),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(empty, airc_core::HistoryCount::default());
@@ -650,22 +675,23 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
     let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
     let through = rows[rows.len() - 1].cursor();
     let rule = airc_core::HistoryMatch {
+        sender: None,
+        kinds: &std::collections::BTreeSet::new(),
+        self_echo: None,
+        selection: airc_core::EventSelection::All,
         headers: &airc_core::HeaderFilter::Any,
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
     let page = sink
-        .page_matching(ch, origin, through, rule, 10, true)
+        .page_matching(ch, origin, through, rule.clone(), 10, true)
         .await
         .unwrap();
     let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids, [typed.event_id, led.event_id]);
+    assert_eq!(ids, [typed.event_id]);
     // Index evidence: each branch SEARCHes its own addressing index (rows
     // touched are candidates), never walks the room in cursor order.
-    let branches = page_rows(ch, origin, through, rule, 10, true);
-    let indexes = [
-        "idx_bus_events_room_addressed_peer",
-        "idx_bus_events_room_leading_mention",
-    ];
+    let branches = [page_rows(ch, origin, through, rule.clone(), 10, true).expect("query")];
+    let indexes = ["idx_bus_events_room_addressed_peer"];
     assert_eq!(branches.len(), indexes.len(), "one select per branch");
     for (query, index) in branches.iter().zip(indexes) {
         let built = sea_orm::QueryTrait::build(query, sea_orm::DbBackend::Sqlite);
@@ -682,4 +708,206 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
             "no table walk: {plan:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn typed_bus_history_selects_before_limit_without_decoding_payload() {
+    use airc_core::{ActivityKind, EventClass, EventSelection, HeaderFilter, HistoryMatch};
+    let sink = SqliteDurableSink::in_memory().await.expect("sink");
+    let channel = RoomId::new();
+    let mut chat = durable_at(channel, 1, 1);
+    chat.payload = Bytes::from_static(&[255, 0, 128]);
+    sink.append(&chat).await.expect("chat");
+    let mut last = chat.cursor();
+    for n in 2..100 {
+        let mut activity = durable_at(channel, 1, n);
+        activity.class = EventClass::Activity(ActivityKind::WorkReceipt);
+        activity.kind = Kind::Event;
+        last = activity.cursor();
+        sink.append(&activity).await.expect("activity");
+    }
+    let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+    let rule = HistoryMatch {
+        sender: None,
+        kinds: &std::collections::BTreeSet::new(),
+        self_echo: None,
+        selection: EventSelection::Correspondence,
+        headers: &HeaderFilter::Any,
+        addressed_to: None,
+    };
+    let page = sink
+        .page_matching(channel, origin, last, rule.clone(), 1, true)
+        .await
+        .expect("page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].event_id, chat.event_id);
+    assert_eq!(page[0].payload, chat.payload);
+    assert_eq!(
+        sink.count_matching(channel, origin, last, rule.clone(), None)
+            .await
+            .expect("count")
+            .count,
+        1
+    );
+}
+
+// Attach replay uses the identical live filter in SQLite before LIMIT. A long
+// activity flood, wrong kind and wrong headers cannot exhaust an arbitrary raw
+// page cap or cause a matching correspondence to disappear.
+#[tokio::test]
+async fn full_live_filter_is_applied_before_tail_limit() {
+    use airc_core::{ActivityKind, EventClass, EventSelection, HeaderFilter};
+    let sink = SqliteDurableSink::in_memory().await.expect("sink");
+    let channel = RoomId::new();
+    let wanted = durable_at(channel, 1, 1).with_header("consumer", "agent");
+    let mut rows = vec![wanted.clone()];
+    for n in 2..5200 {
+        let mut event = durable_at(channel, 1, n).with_header("consumer", "agent");
+        event.class = EventClass::Activity(ActivityKind::WorkReceipt);
+        event.kind = Kind::Event;
+        rows.push(event);
+    }
+    let wrong_header = durable_at(channel, 1, 5200).with_header("consumer", "other");
+    rows.push(wrong_header);
+    let mut wrong_kind = durable_at(channel, 1, 5201).with_header("consumer", "agent");
+    wrong_kind.kind = Kind::Control;
+    wrong_kind.class = EventClass::Control(airc_core::ControlKind::Session);
+    rows.push(wrong_kind);
+    sink.append_batch(&rows.iter().collect::<Vec<_>>())
+        .await
+        .expect("batch");
+    let filter = airc_bus::Filter::channel(channel)
+        .with_selection(EventSelection::Correspondence)
+        .with_kinds(vec![Kind::Message])
+        .with_delivery(vec![DeliveryClass::Durable])
+        .with_headers(HeaderFilter::Exact {
+            key: "consumer".into(),
+            value: "agent".into(),
+        });
+    let page = sink
+        .filtered_tail_before(channel, None, 1, &filter)
+        .await
+        .expect("page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].event_id, wanted.event_id);
+    assert!(filter.matches(&page[0]));
+    assert!(sink
+        .filtered_tail_before(channel, Some(wanted.cursor()), 1, &filter)
+        .await
+        .expect("before")
+        .is_empty());
+    assert!(sink
+        .filtered_tail_before(channel, None, 1, &filter.clone().with_kinds(vec![]))
+        .await
+        .expect("empty kinds")
+        .is_empty());
+    let later = durable_at(channel, 1, 5202).with_header("consumer", "agent");
+    sink.append(&later).await.expect("later correspondence");
+    let forward = sink
+        .filtered_page_after(channel, Some(wanted.cursor()), 1, &filter)
+        .await
+        .expect("forward page");
+    assert_eq!(forward.len(), 1);
+    assert_eq!(forward[0].event_id, later.event_id);
+    assert!(sink
+        .filtered_page_after(channel, Some(later.cursor()), 1, &filter)
+        .await
+        .expect("after last")
+        .is_empty());
+    assert!(sink
+        .filtered_tail_before(
+            channel,
+            None,
+            1,
+            &filter.with_delivery(vec![DeliveryClass::EphemeralLatest])
+        )
+        .await
+        .expect("delivery")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn lifecycle_kind_filter_uses_signed_class_before_limit_and_count() {
+    use airc_core::{
+        ControlKind, EventClass, HeaderFilter, HistoryMatch, LifecycleKind, TranscriptKind,
+    };
+    let sink = SqliteDurableSink::in_memory().await.expect("sink");
+    let channel = RoomId::new();
+    let mut wall = durable_at(channel, 1, 1);
+    wall.kind = Kind::Control;
+    wall.class = EventClass::Control(ControlKind::Lifecycle(LifecycleKind::WallPostPublished));
+    let mut other = durable_at(channel, 1, 2);
+    other.kind = Kind::Control;
+    other.class = EventClass::Control(ControlKind::Lifecycle(LifecycleKind::PeerArrived));
+    sink.append_batch(&[&wall, &other]).await.expect("rows");
+    let kinds = [TranscriptKind::WallPostPublished].into_iter().collect();
+    let mut rule = HistoryMatch::headers(&HeaderFilter::Any);
+    rule.kinds = &kinds;
+    let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+    let rows = sink
+        .page_matching(channel, origin, other.cursor(), rule.clone(), 1, true)
+        .await
+        .expect("page");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_id, wall.event_id);
+    assert_eq!(
+        sink.count_matching(channel, origin, other.cursor(), rule.clone(), None)
+            .await
+            .expect("count")
+            .count,
+        1
+    );
+    rule.sender = Some(airc_core::PeerId::new());
+    assert!(sink
+        .page_matching(channel, origin, other.cursor(), rule.clone(), 1, true)
+        .await
+        .expect("sender page")
+        .is_empty());
+    assert_eq!(
+        sink.count_matching(channel, origin, other.cursor(), rule, None)
+            .await
+            .expect("sender count")
+            .count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn later_bind_chunk_failure_rolls_back_earlier_event_chunks() {
+    use sea_orm::{Iterable, PaginatorTrait};
+    let sink = SqliteDurableSink::in_memory().await.expect("sink");
+    let channel = RoomId::new();
+    let capacity = crate::sqlite_batch::bind_capacity(&sink.db)
+        .await
+        .expect("measured bind capacity");
+    let rows_per_statement = capacity / bus_event::Column::iter().count();
+    let mut rows = (0..=rows_per_statement)
+        .map(|n| to_active_model(&durable_at(channel, 1, n as u64)).expect("model"))
+        .collect::<Vec<_>>();
+    // Missing required room fails the last statement, after an earlier full
+    // statement succeeded. The caller's one transaction must own both.
+    rows.last_mut().expect("rows").room_id = sea_orm::ActiveValue::NotSet;
+    let transaction = sink.db.begin().await.expect("transaction");
+    assert!(crate::sqlite_batch::insert_ignoring::<bus_event::Entity>(
+        &transaction,
+        rows,
+        [bus_event::Column::EventId],
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        bus_event::Entity::find()
+            .count(&transaction)
+            .await
+            .expect("earlier rows"),
+        rows_per_statement as u64
+    );
+    transaction.rollback().await.expect("rollback");
+    assert_eq!(
+        bus_event::Entity::find()
+            .count(&sink.db)
+            .await
+            .expect("no partial persistence"),
+        0
+    );
 }

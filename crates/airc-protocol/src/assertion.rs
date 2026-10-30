@@ -186,6 +186,7 @@ mod tests {
         assert!(assertion_bytes.starts_with(ASSERTION_DOMAIN));
 
         let envelope = Envelope {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::from_u128(0x01),
             sender: PeerId::new(),
             sender_client: ClientId::from_u128(0xc1),

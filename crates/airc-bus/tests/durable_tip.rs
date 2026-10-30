@@ -54,6 +54,31 @@ impl CountingSink {
 
 #[async_trait]
 impl DurableSink for CountingSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.page_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         self.inner.append(e).await
     }
@@ -105,6 +130,26 @@ struct FailingHeadSink;
 
 #[async_trait]
 impl DurableSink for FailingHeadSink {
+    async fn filtered_page_after(
+        &self,
+        _channel: RoomId,
+        _after: Option<Cursor>,
+        _limit: usize,
+        _filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        Err(BusError::Sink("reverse index unavailable".into()))
+    }
+
+    async fn filtered_tail_before(
+        &self,
+        _channel: RoomId,
+        _before: Option<Cursor>,
+        _limit: usize,
+        _filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        Err(BusError::Sink("reverse index unavailable".into()))
+    }
+
     async fn append(&self, _e: &Envelope) -> Result<(), BusError> {
         Ok(())
     }
@@ -171,6 +216,7 @@ fn event(channel: RoomId, marker: u128, delivery: DeliveryClass) -> Envelope {
         channel,
         (PeerId::from_u128(1), ClientId::from_u128(1)),
         Kind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         delivery,
         Bytes::from_static(b"tip-probe"),
     )

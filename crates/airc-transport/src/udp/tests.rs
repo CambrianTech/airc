@@ -11,10 +11,11 @@ use futures::StreamExt;
 use crate::transport::Transport;
 use crate::udp::{UdpAdapter, UdpConfig, UdpError};
 
-fn frame(kind: FrameKind, lamport: u64, target: MentionTarget, body: &str) -> Frame {
+fn frame(class: airc_core::EventClass, lamport: u64, target: MentionTarget, body: &str) -> Frame {
     Frame {
-        kind,
+        kind: FrameKind::for_class(class),
         envelope: Envelope {
+            class,
             event_id: EventId::from_u128(lamport as u128),
             sender: PeerId::from_u128(0xa1),
             sender_client: ClientId::from_u128(0xc1),
@@ -52,7 +53,7 @@ async fn event_round_trips_between_two_udp_adapters() {
 
     let mut bob_stream = bob.subscribe(Subscription::default()).await.unwrap();
     let outbound = frame(
-        FrameKind::Event,
+        airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
         1,
         MentionTarget::Peer(bob_id),
         "udp hello",
@@ -71,7 +72,7 @@ async fn event_round_trips_between_two_udp_adapters() {
 }
 
 #[tokio::test]
-async fn channel_subscription_filters_udp_events() {
+async fn channel_and_typed_subscription_filter_udp_events() {
     let wanted = RoomId::from_u128(0x11);
     let other = RoomId::from_u128(0x22);
     let bob_id = PeerId::from_u128(0xb2);
@@ -84,17 +85,38 @@ async fn channel_subscription_filters_udp_events() {
     let mut stream = bob
         .subscribe(Subscription {
             channel: Some(wanted),
+            selection: airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
+                airc_core::ActivityKind::WorkReceipt,
+            )),
             ..Default::default()
         })
         .await
         .unwrap();
 
-    let mut wrong = frame(FrameKind::Event, 1, MentionTarget::Peer(bob_id), "wrong");
+    let mut wrong = frame(
+        airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
+        1,
+        MentionTarget::Peer(bob_id),
+        "wrong",
+    );
     wrong.envelope.channel = other;
-    let mut right = frame(FrameKind::Event, 2, MentionTarget::Peer(bob_id), "right");
+    let mut right = frame(
+        airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
+        2,
+        MentionTarget::Peer(bob_id),
+        "right",
+    );
     right.envelope.channel = wanted;
 
+    let mut wrong_class = frame(
+        airc_core::EventClass::Activity(airc_core::ActivityKind::Intent),
+        3,
+        MentionTarget::Peer(bob_id),
+        "right",
+    );
+    wrong_class.envelope.channel = wanted;
     alice.send(wrong).await.unwrap();
+    alice.send(wrong_class).await.unwrap();
     alice.send(right.clone()).await.unwrap();
 
     let received = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -115,7 +137,7 @@ async fn durable_frames_fail_closed_on_udp() {
 
     let error = alice
         .send(frame(
-            FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             1,
             MentionTarget::Peer(bob_id),
             "must not silently send",
@@ -136,7 +158,7 @@ async fn unknown_direct_peer_fails_before_socket_send() {
 
     let error = alice
         .send(frame(
-            FrameKind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
             1,
             MentionTarget::Peer(missing),
             "missing peer",

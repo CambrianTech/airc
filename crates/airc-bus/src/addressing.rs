@@ -1,31 +1,31 @@
-//! Who an envelope could be addressed to, as the durable tier indexes it.
-//!
-//! The router never parses a payload to ROUTE; this is the one place the
-//! durable tier reads it, to index addressing beside the stored row (the
-//! envelope bytes stay untouched). A payload that is not an airc `Body` has no
-//! text and so no leading mention, exactly as the SDK projects it.
+//! Typed envelope addressing. Payload bytes never participate in routing.
 
-use airc_core::{Addressing, Body};
+use airc_core::Addressing;
 
 use crate::{Envelope, Target};
 
-/// The addressing of an envelope's parts: a typed peer target, and a `Body`
-/// payload whose text opens with an `@name`.
-pub fn addressing_of(target: &Target, payload: &[u8]) -> Addressing {
+/// The addressed peer supplied by the producer.
+pub fn addressing_of(target: &Target) -> Addressing {
     let peer = match target {
         Target::Peer(peer) => Some(*peer),
         Target::All | Target::Endpoint(_) | Target::Reply(_) | Target::Capability(_) => None,
     };
-    Addressing::of(peer, Body::from_payload(payload).ok().as_ref())
+    Addressing::of(peer)
 }
 
 impl Envelope {
     pub fn addressing(&self) -> Addressing {
-        addressing_of(&self.target, &self.payload)
+        addressing_of(&self.target)
     }
 
     /// Whether this envelope matches a bounded history scan's predicate.
-    pub fn matches_history(&self, rule: airc_core::HistoryMatch<'_>) -> bool {
-        rule.matches_with(&self.headers, || self.addressing())
+    pub fn matches_history(&self, rule: &airc_core::HistoryMatch<'_>) -> bool {
+        rule.matches_with(
+            self.class,
+            self.class.transcript_kind(),
+            self.from,
+            &self.headers,
+            || self.addressing(),
+        )
     }
 }

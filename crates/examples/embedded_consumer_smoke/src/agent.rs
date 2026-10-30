@@ -80,6 +80,10 @@ impl AgentConsumer {
         let mut kinds = std::collections::BTreeSet::new();
         kinds.insert(TranscriptKind::Message);
         let filter = EventFilter {
+            sender: None,
+            selection: airc_lib::EventSelection::Exact(airc_lib::EventClass::Correspondence(
+                airc_lib::CorrespondenceKind::Message,
+            )),
             channel: None,
             channels: HashSet::new(),
             kinds,
@@ -105,6 +109,10 @@ impl AgentConsumer {
         let mut kinds = std::collections::BTreeSet::new();
         kinds.insert(TranscriptKind::Message);
         let filter = EventFilter {
+            sender: None,
+            selection: airc_lib::EventSelection::Exact(airc_lib::EventClass::Correspondence(
+                airc_lib::CorrespondenceKind::Message,
+            )),
             channel: None,
             channels: HashSet::new(),
             kinds,

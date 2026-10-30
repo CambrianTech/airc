@@ -305,6 +305,8 @@ pub enum AttachStart {
 /// as [`AttachStart::FromTranscriptStart`], exactly its legacy meaning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachRequest {
+    /// Required typed subscription; absent selection is not guessed.
+    selection: airc_core::EventSelection,
     /// The channel (room) to attach to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     channel: Option<airc_core::RoomId>,
@@ -394,6 +396,7 @@ impl AttachRequest {
     /// version contract.
     pub fn channel_set(channels: Vec<ChannelAttach>) -> Self {
         Self {
+            selection: airc_core::EventSelection::All,
             channel: None,
             from: None,
             from_now: false,
@@ -422,6 +425,7 @@ impl AttachRequest {
             AttachStart::FromTranscriptStart => (None, false),
         };
         Self {
+            selection: airc_core::EventSelection::All,
             channel: Some(channel),
             from,
             from_now,
@@ -468,6 +472,15 @@ impl AttachRequest {
     /// (the rest are coalesced). `None` = coalesce everything.
     pub fn backlog_tail(&self) -> Option<u32> {
         self.backlog_tail
+    }
+
+    pub fn with_selection(mut self, selection: airc_core::EventSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    pub fn selection(&self) -> airc_core::EventSelection {
+        self.selection.clone()
     }
 
     /// Deliver only these event kinds.
@@ -522,6 +535,7 @@ impl AttachRequest {
     pub fn into_parts(self) -> AttachParts {
         let start = self.start();
         AttachParts {
+            selection: self.selection,
             channel: self.channel,
             start,
             coalesce_backlog: self.coalesce_backlog,
@@ -538,6 +552,7 @@ impl AttachRequest {
 /// Owned view of an [`AttachRequest`] for the serving side. Produced by
 /// [`AttachRequest::into_parts`]; not constructible into a request.
 pub struct AttachParts {
+    pub selection: airc_core::EventSelection,
     pub channel: Option<airc_core::RoomId>,
     pub start: AttachStart,
     pub coalesce_backlog: bool,
@@ -575,6 +590,7 @@ pub struct RemovePeerRequest {
 /// Parameters for `Send`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SendRequest {
+    pub class: airc_core::EventClass,
     /// Channel UUID. Stable across peers in the same room.
     pub channel: Uuid,
     /// Originating participant identity — the agent/tab that authored
@@ -597,6 +613,7 @@ pub struct SendRequest {
 /// Parameters for `Publish`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PublishRequest {
+    pub class: airc_core::EventClass,
     /// Channel UUID. Stable across peers in the same room.
     pub channel: Uuid,
     /// Originating participant identity — the agent/tab that authored
@@ -648,12 +665,19 @@ mod tests;
 /// Predicate-scoped forward scan (or initial tail), bounded by a fixed snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanInboxRequest {
+    pub sender: Option<airc_core::PeerId>,
+    pub self_echo: Option<(
+        airc_core::PeerId,
+        airc_core::ClientId,
+        airc_core::SelfFilter,
+    )>,
+    pub kinds: std::collections::BTreeSet<airc_core::TranscriptKind>,
+    pub selection: airc_core::EventSelection,
     pub channel: airc_core::RoomId,
     pub after: IpcCursor,
     pub through: IpcCursor,
     pub headers: HeaderFilter,
-    /// Only events that could be addressed to this peer (its typed target, or
-    /// a body opening with an `@name`), selected by the store before `limit`.
+    /// Only events addressed to this peer by typed target, before `limit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addressed_to: Option<airc_core::AddresseeFilter>,
     pub limit: usize,
@@ -663,6 +687,15 @@ pub struct ScanInboxRequest {
 /// Count the events a [`ScanInboxRequest`] over `(after, through]` would match.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CountInboxRequest {
+    pub sender: Option<airc_core::PeerId>,
+    pub self_echo: Option<(
+        airc_core::PeerId,
+        airc_core::ClientId,
+        airc_core::SelfFilter,
+    )>,
+    pub kinds: std::collections::BTreeSet<airc_core::TranscriptKind>,
+    pub addressed_to: Option<airc_core::AddresseeFilter>,
+    pub selection: airc_core::EventSelection,
     pub channel: airc_core::RoomId,
     pub after: IpcCursor,
     pub through: IpcCursor,

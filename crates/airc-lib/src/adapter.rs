@@ -330,6 +330,7 @@ mod tests {
         let mut headers = Headers::new();
         headers.insert(HEADER_AIRC_BODY_HINT.to_string(), hint.to_string());
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::from_u128(0xcafe),
             peer_id: PeerId::new(),
@@ -378,6 +379,7 @@ mod tests {
         use airc_core::transcript::MentionTarget;
         use airc_core::{ClientId, EventId, PeerId, RoomId, TranscriptKind};
         let env = TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::from_u128(0xcafe),
             peer_id: PeerId::new(),

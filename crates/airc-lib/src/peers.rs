@@ -201,7 +201,7 @@ impl Airc {
             })
             .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
         );
-        self.emit_lifecycle(airc_core::TranscriptKind::PeerDeparted, room_id, body)
+        self.emit_lifecycle(airc_core::LifecycleKind::PeerDeparted, room_id, body)
             .await?;
         Ok(true)
     }
@@ -240,7 +240,7 @@ impl Airc {
             })
             .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
         );
-        self.emit_lifecycle(airc_core::TranscriptKind::PeerArrived, room_id, body)
+        self.emit_lifecycle(airc_core::LifecycleKind::PeerArrived, room_id, body)
             .await?;
         Ok(())
     }

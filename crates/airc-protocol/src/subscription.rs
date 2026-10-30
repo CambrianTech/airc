@@ -22,6 +22,8 @@ use crate::envelope::{ChannelId, Frame, FrameKind};
 /// frames before this cursor are skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
+    /// Typed semantic selection, applied without interpreting the body.
+    pub selection: airc_core::EventSelection,
     /// Restrict to one channel. `None` = "any channel."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<ChannelId>,
@@ -51,6 +53,7 @@ fn default_any_filter() -> HeaderFilter {
 impl Default for Subscription {
     fn default() -> Self {
         Self {
+            selection: airc_core::EventSelection::All,
             channel: None,
             from_cursor: None,
             kinds: BTreeSet::new(),
@@ -66,6 +69,9 @@ impl Subscription {
     /// `HeaderFilter::matches` does. Adapters call this in a hot loop
     /// during fan-out.
     pub fn matches(&self, frame: &Frame) -> bool {
+        if !self.selection.matches(frame.envelope.class) {
+            return false;
+        }
         if let Some(channel) = self.channel {
             if frame.envelope.channel != channel {
                 return false;
@@ -95,9 +101,20 @@ mod tests {
         for (k, v) in headers {
             h.insert(k.to_string(), v.to_string());
         }
+        // Test fixture semantics are explicit for every transport category.
+        use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
+        let class = match kind {
+            FrameKind::Message => EventClass::Correspondence(CorrespondenceKind::Message),
+            FrameKind::Event => EventClass::Activity(ActivityKind::WorkState),
+            FrameKind::Control => EventClass::Control(ControlKind::Session),
+            FrameKind::Command => EventClass::Control(ControlKind::Command),
+            FrameKind::CommandResult => EventClass::Control(ControlKind::CommandResult),
+            FrameKind::Addressed => EventClass::Control(ControlKind::Addressed),
+        };
         Frame {
             kind,
             envelope: Envelope {
+                class,
                 event_id: EventId::from_u128(0x01),
                 sender: PeerId::from_u128(0xa1),
                 sender_client: ClientId::from_u128(0xc1),
@@ -126,6 +143,7 @@ mod tests {
     #[test]
     fn channel_restriction_drops_other_channels() {
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             channel: Some(RoomId::from_u128(0xa)),
             ..Default::default()
         };
@@ -156,6 +174,7 @@ mod tests {
         let mut kinds = BTreeSet::new();
         kinds.insert(FrameKind::Event);
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             kinds,
             ..Default::default()
         };
@@ -178,6 +197,7 @@ mod tests {
         let mut kinds = BTreeSet::new();
         kinds.insert(FrameKind::Message);
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             channel: Some(RoomId::from_u128(0xa)),
             from_cursor: None,
             kinds,
@@ -211,6 +231,7 @@ mod tests {
         kinds.insert(FrameKind::Message);
         kinds.insert(FrameKind::Event);
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             channel: Some(RoomId::from_u128(0xc0ffee)),
             from_cursor: Some(TranscriptCursor {
                 lamport: 42,

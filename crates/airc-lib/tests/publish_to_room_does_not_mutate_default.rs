@@ -51,6 +51,7 @@ async fn publish_to_room_by_name_does_not_change_current_room() {
         .publish(
             PublishTarget::RoomByName(other.name.clone()),
             FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             Body::text("targeted at other-room, sender stays on home-room"),
             airc_core::Headers::new(),
         )
@@ -86,6 +87,7 @@ async fn directed_publish_preserves_peer_and_room_through_daemon() {
         .publish(
             PublishTarget::RoomByName(other.name.clone()).to_peer(bob.peer_id()),
             FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             Body::text("cross-room directed challenge"),
             airc_core::Headers::new(),
         )
@@ -106,6 +108,7 @@ async fn directed_publish_preserves_peer_and_room_through_daemon() {
         .publish(
             PublishTarget::RoomByName("not-subscribed".into()).to_peer(bob.peer_id()),
             FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             Body::text("must refuse"),
             airc_core::Headers::new(),
         )
@@ -122,6 +125,7 @@ async fn directed_publish_preserves_recipient_without_daemon() {
         .publish(
             PublishTarget::CurrentRoom.to_peer(alice.peer_id()),
             FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             Body::text("typed self message"),
             airc_core::Headers::new(),
         )

@@ -515,6 +515,8 @@ pub fn capability_offer_filter() -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -728,6 +730,8 @@ pub fn any_persona_event_filter() -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -744,6 +748,8 @@ pub fn activity_event_filter(activity_id: &str) -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -922,6 +928,8 @@ pub fn any_embedding_event_filter() -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),

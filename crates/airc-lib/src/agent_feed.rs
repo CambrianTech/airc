@@ -3,6 +3,20 @@ use crate::{Airc, AircError, EventFilter, EventScan, FilteredEventStream};
 use airc_core::{EventId, HeaderFilter, TranscriptCursor};
 use airc_ipc::{IpcCursor, COUNTER_BITS, COUNTER_MASK};
 
+/// Native agent subscriptions: speech and actionable work-state changes.
+/// Presence, work receipts and stream traffic do not enter this feed.
+pub fn agent_event_selection() -> airc_core::EventSelection {
+    airc_core::EventSelection::AnyOf(vec![
+        airc_core::EventSelection::Correspondence,
+        airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
+            airc_core::ActivityKind::WorkState,
+        )),
+        airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
+            airc_core::ActivityKind::Coordination,
+        )),
+    ])
+}
+
 fn key(c: &TranscriptCursor) -> (u64, u128) {
     (c.lamport, c.event_id.0.as_u128())
 }
@@ -19,34 +33,13 @@ fn cursor(c: IpcCursor) -> TranscriptCursor {
         event_id: c.event_id,
     }
 }
-fn headers() -> HeaderFilter {
-    HeaderFilter::Not(Box::new(HeaderFilter::Has {
-        key: crate::HEADER_STREAM_ID.into(),
-    }))
-}
 
 impl Airc {
     /// Same policy in embedded and daemon modes; router attach filters before fanout.
     pub async fn subscribe_agent_feed(&self) -> Result<FilteredEventStream, AircError> {
-        let mut predicate = headers();
-        if self.daemon_client().is_none() {
-            // Embedded frames carry their delivery class in the signed header.
-            predicate = HeaderFilter::All(vec![
-                predicate,
-                HeaderFilter::AnyOf(vec![
-                    HeaderFilter::Not(Box::new(HeaderFilter::Has {
-                        key: "airc.delivery_class".into(),
-                    })),
-                    HeaderFilter::Exact {
-                        key: "airc.delivery_class".into(),
-                        value: "durable".into(),
-                    },
-                ]),
-            ]);
-        }
         self.subscribe_subscribed_delivery(
             EventFilter {
-                headers_filter: predicate,
+                selection: agent_event_selection(),
                 ..EventFilter::default()
             },
             Some(vec![airc_ipc::IpcDelivery::Durable]),
@@ -82,6 +75,27 @@ impl Airc {
         channels: &[airc_core::RoomId],
         addressed_to: Option<airc_core::AddresseeFilter>,
     ) -> Result<EventScan, AircError> {
+        let kinds = std::collections::BTreeSet::new();
+        let rule = airc_core::HistoryMatch {
+            sender: None,
+            selection: agent_event_selection(),
+            headers: &HeaderFilter::Any,
+            addressed_to,
+            kinds: &kinds,
+            self_echo: None,
+        };
+        self.scan_matching_channels(after, through, limit, channels, rule)
+            .await
+    }
+
+    pub(crate) async fn scan_matching_channels(
+        &self,
+        after: Option<&TranscriptCursor>,
+        through: &TranscriptCursor,
+        limit: usize,
+        channels: &[airc_core::RoomId],
+        rule: airc_core::HistoryMatch<'_>,
+    ) -> Result<EventScan, AircError> {
         if limit == 0 || limit > 4096 {
             return Err(AircError::Route("agent scan limit must be 1..4096".into()));
         }
@@ -97,22 +111,21 @@ impl Airc {
                 scanned_through: Some(after.clone()),
             });
         }
-        let predicate = headers();
-        let rule = airc_core::HistoryMatch {
-            headers: &predicate,
-            addressed_to,
-        };
         let mut events = Vec::new();
         let mut safe = through.clone();
         if let Some(client) = self.daemon_client() {
             for channel in channels.iter().copied() {
                 let response = client
                     .scan_inbox(airc_ipc::request::ScanInboxRequest {
+                        sender: rule.sender,
                         channel,
                         after: ipc(after),
                         through: ipc(through),
-                        headers: predicate.clone(),
-                        addressed_to,
+                        headers: rule.headers.clone(),
+                        selection: rule.selection.clone(),
+                        kinds: rule.kinds.clone(),
+                        self_echo: rule.self_echo,
+                        addressed_to: rule.addressed_to,
                         limit,
                         tail,
                     })
@@ -179,10 +192,19 @@ impl Airc {
         after: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[airc_core::RoomId],
-        extra: HeaderFilter,
+        filter: crate::EventFilter,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, AircError> {
-        let predicate = HeaderFilter::All(vec![headers(), extra]);
+        let predicate = filter.headers_filter;
+        let kinds = filter.kinds;
+        let rule = airc_core::HistoryMatch {
+            sender: filter.sender,
+            selection: filter.selection.clone(),
+            headers: &predicate,
+            addressed_to: None,
+            kinds: &kinds,
+            self_echo: filter.self_echo.map(|v| (v.peer_id, v.client_id, v.filter)),
+        };
         let mut total = airc_core::HistoryCount::default();
         if key(after) >= key(through) {
             return Ok(total);
@@ -191,10 +213,15 @@ impl Airc {
             for channel in channels.iter().copied() {
                 let count = client
                     .count_inbox(airc_ipc::request::CountInboxRequest {
+                        sender: rule.sender,
                         channel,
                         after: ipc(after),
                         through: ipc(through),
                         headers: predicate.clone(),
+                        selection: rule.selection.clone(),
+                        kinds: kinds.clone(),
+                        addressed_to: None,
+                        self_echo: rule.self_echo,
                         exclude_self: exclude.cloned(),
                     })
                     .await?;
@@ -205,7 +232,7 @@ impl Airc {
         Ok(self
             .inner
             .store
-            .count_history(after, through, channels, &predicate, exclude)
+            .count_history(after, through, channels, rule, exclude)
             .await?)
     }
 }

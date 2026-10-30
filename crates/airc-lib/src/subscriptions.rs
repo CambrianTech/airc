@@ -699,6 +699,7 @@ mod tests {
 
     fn make_event(lamport: u64, room_id: RoomId, body: &str) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id,
             peer_id: PeerId::from_u128(0xa1),

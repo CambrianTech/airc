@@ -14,13 +14,12 @@ pub mod settings;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use airc_core::{TranscriptEvent, TranscriptKind};
-use airc_lib::{AgentDeliveryTurn, Airc, EventFilter, LiveLag};
+use airc_core::TranscriptEvent;
+use airc_lib::{AgentDeliveryTurn, Airc, EventFilter, StreamError};
 use futures::StreamExt;
 
 use crate::client_id::{agent_process_client_id, current_client_id, explicit_client_id};
@@ -79,7 +78,7 @@ impl Default for DeliverySelection {
     fn default() -> Self {
         Self {
             filter: EventFilter {
-                kinds: BTreeSet::from([TranscriptKind::Message, TranscriptKind::System]),
+                selection: airc_lib::agent_event_selection(),
                 ..EventFilter::default()
             },
             include_self: false,
@@ -102,22 +101,6 @@ impl DeliverySelection {
         !self
             .own_sends(rule)
             .is_some_and(|own| own.is_self_event(event))
-    }
-
-    /// The rest of the selection as a header predicate, for the store to count
-    /// history without reading events: liveness beats and work-queue churn are
-    /// routed out by their headers. (Own sends go through [`Self::own_sends`].)
-    fn count_filter(&self) -> airc_core::HeaderFilter {
-        use airc_core::HeaderFilter;
-        let absent = |key: &str| {
-            HeaderFilter::Not(Box::new(HeaderFilter::Has {
-                key: key.to_string(),
-            }))
-        };
-        HeaderFilter::All(vec![
-            absent(airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND),
-            absent(airc_lib::HEADER_FORGE_WORK_EVENT_KIND),
-        ])
     }
 }
 
@@ -247,9 +230,11 @@ async fn compose(
         candidates: options.count.max(1),
         page: turn.budget,
     };
+    let mut correspondence = options.selection.filter.clone();
+    correspondence.selection = airc_core::EventSelection::Correspondence;
     let history = turn
         .history_summary(
-            options.selection.count_filter(),
+            correspondence,
             options.selection.own_sends(&self_filter),
             |e| {
                 options.selection.filter.matches(e) && (options.raw || render::is_correspondence(e))
@@ -408,9 +393,13 @@ fn consumer_id(runtime: &HookRuntime, runtime_client: Option<&str>) -> String {
 
 async fn wait_for_one_event(airc: &Airc, wait_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = airc.subscribe_agent_feed().await?;
-    // Any outcome ends the wait: an event, a lag, a closed stream or the deadline.
-    // The durable turn prepared next is what decides what is delivered.
-    let _woke: Result<Option<Result<_, LiveLag>>, _> =
-        tokio::time::timeout(Duration::from_millis(wait_ms), stream.next()).await;
+    // Lag wakes a durable scan; owner/codec refusal must reach the caller.
+    if let Ok(Some(Err(error))) =
+        tokio::time::timeout(Duration::from_millis(wait_ms), stream.next()).await
+    {
+        if !matches!(error, StreamError::Lag(_)) {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }

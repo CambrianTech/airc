@@ -1,8 +1,4 @@
-//! The `events` selects a bounded history scan runs: one builder, so the store
-//! and the index-evidence tests read the same statements.
-//! An addressee scan is one select per branch
-//! ([`crate::event_table::addressee_branches`]); the caller merges them
-//! ([`crate::event_table::merge_branches`]).
+//! One indexed typed history predicate applied before ordering and LIMIT.
 
 use airc_core::{HistoryMatch, RoomId, TranscriptCursor};
 use sea_orm::{
@@ -13,7 +9,7 @@ use crate::entities::event;
 
 /// Events of `channels` in `(cursor, through]` matching `rule`, the first
 /// `limit` in transcript order (the last `limit`, newest first, for `tail`):
-/// one select, or one per addressee branch.
+/// one select over the typed header indexes.
 pub(crate) fn matching(
     cursor: &TranscriptCursor,
     through: &TranscriptCursor,
@@ -21,7 +17,7 @@ pub(crate) fn matching(
     rule: HistoryMatch<'_>,
     limit: usize,
     tail: bool,
-) -> Vec<Select<event::Entity>> {
+) -> Result<Select<event::Entity>, crate::StoreError> {
     // Strictly after the cursor: lamport > c.lamport
     //   OR (lamport == c.lamport AND event_id > c.event_id).
     // Two-key tiebreak so events with identical lamports remain
@@ -44,9 +40,7 @@ pub(crate) fn matching(
         .order_by(event::Column::EventId, order)
         .limit(limit as u64)
         .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
-        .filter(crate::header_query::predicate::<event::Entity>(
-            rule.headers,
-        ))
+        .filter(crate::class_query::matching::<event::Entity>(rule)?)
         .filter(
             Expr::col(event::Column::Lamport)
                 .lt(through.lamport as i64)
@@ -54,5 +48,5 @@ pub(crate) fn matching(
                     .eq(through.lamport as i64)
                     .and(Expr::col(event::Column::EventId).lte(through.event_id.as_uuid()))),
         );
-    crate::event_table::addressee_branches(query, rule.addressed_to)
+    Ok(query)
 }

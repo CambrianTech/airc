@@ -38,6 +38,8 @@ mod m20260723_000020_add_peer_trust_endpoints_peer;
 mod m20261029_000021_add_event_addressing;
 mod m20261029_000022_create_event_headers;
 
+mod m20261030_000023_event_class;
+
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -66,6 +68,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260723_000020_add_peer_trust_endpoints_peer::Migration),
             Box::new(m20261029_000021_add_event_addressing::Migration),
             Box::new(m20261029_000022_create_event_headers::Migration),
+            Box::new(m20261030_000023_event_class::Migration),
         ]
     }
 }
@@ -128,6 +131,13 @@ async fn unknown_applied(db: &impl ConnectionTrait) -> Result<Vec<String>, Store
         .map(|row| row.version)
         .filter(|version| !known.contains(version))
         .collect())
+}
+
+/// Read-only classification admission shared with the schema migration itself.
+pub(crate) async fn check_classification_adoption(
+    db: &DatabaseConnection,
+) -> Result<(), StoreError> {
+    m20261030_000023_event_class::check_adoption(&SchemaManager::new(db)).await
 }
 
 #[cfg(test)]

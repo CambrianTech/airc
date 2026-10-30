@@ -24,6 +24,7 @@ async fn append(airc: &Airc, room: RoomId, n: u64) {
 /// Event `n` saying `text` to the whole room (target All).
 async fn say(airc: &Airc, room: RoomId, n: u64, text: &str) {
     airc.append_event(TranscriptEvent {
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         event_id: EventId::from_u128(n as u128),
         room_id: room,
         peer_id: airc.peer_id(),
@@ -47,7 +48,7 @@ const WINDOW: AddressedWindow = AddressedWindow {
 };
 async fn summary(turn: &mut AgentDeliveryTurn, airc: &Airc) -> Option<HistorySummary> {
     let me = airc.addressee().await.unwrap();
-    turn.history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, WINDOW)
+    turn.history_summary(crate::EventFilter::default(), None, |_| true, &me, WINDOW)
         .await
         .unwrap()
 }
@@ -128,6 +129,7 @@ async fn backlog_is_counted_once_and_settles_when_searched() {
         append(&airc, room, n).await;
     }
     airc.append_event(TranscriptEvent {
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         event_id: EventId::from_u128(5000),
         room_id: room,
         peer_id: airc.peer_id(),
@@ -154,9 +156,14 @@ async fn backlog_is_counted_once_and_settles_when_searched() {
     assert!(found.addressed.is_empty());
     let routed = initial
         .history_summary(
-            airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
-                key: "airc.test.hidden".into(),
-            })),
+            crate::EventFilter {
+                headers_filter: airc_core::HeaderFilter::Not(Box::new(
+                    airc_core::HeaderFilter::Has {
+                        key: "airc.test.hidden".into(),
+                    },
+                )),
+                ..crate::EventFilter::default()
+            },
             None,
             |_| true,
             &airc.addressee().await.unwrap(),
@@ -216,6 +223,7 @@ async fn backlog_is_counted_once_and_settles_when_searched() {
 }
 fn request(airc: &Airc, room: RoomId, n: u64) -> TranscriptEvent {
     TranscriptEvent {
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         event_id: EventId::from_u128(n as u128),
         room_id: room,
         peer_id: airc.peer_id(),
@@ -269,15 +277,14 @@ async fn addressed_requests_page_across_turns_until_every_one_is_shown() {
 }
 // what this catches (Codex on #1617): when a turn's candidate budget cannot
 // cover the whole range, it never settles past a request it has not reached: an
-// old request under 30 newer `@Codex` requests (store candidates, addressed to
-// someone else) is shown on the turn that reaches it, and the history settles
+// old request under 30 newer typed requests excluded by the display predicate is shown on the turn that reaches it, and the history settles
 // only after that.
 #[tokio::test]
 async fn an_incomplete_search_never_settles_past_an_unseen_request() {
     let (_dir, airc, room) = fixture().await;
     airc.append_event(request(&airc, room, 1)).await.unwrap();
     for n in 2..=31 {
-        say(&airc, room, n, "@Codex take this one").await;
+        airc.append_event(request(&airc, room, n)).await.unwrap();
     }
     let narrow = AddressedWindow {
         candidates: 10,
@@ -292,7 +299,13 @@ async fn an_incomplete_search_never_settles_past_an_unseen_request() {
             "not settled before the request is shown"
         );
         let found = turn
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, narrow)
+            .history_summary(
+                crate::EventFilter::default(),
+                None,
+                |e| e.lamport == 1,
+                &me,
+                narrow,
+            )
             .await
             .unwrap();
         if let Some(found) = &found {
@@ -312,6 +325,15 @@ async fn an_incomplete_search_never_settles_past_an_unseen_request() {
 /// Walk summary turns on `consumer` until its history settles; every
 /// addressed lamport shown, in order.
 async fn walk(airc: &Airc, consumer: &str, window: AddressedWindow, attach: bool) -> Vec<u64> {
+    walk_kept(airc, consumer, window, attach, |_| true).await
+}
+async fn walk_kept(
+    airc: &Airc,
+    consumer: &str,
+    window: AddressedWindow,
+    attach: bool,
+    keep: impl Fn(&TranscriptEvent) -> bool,
+) -> Vec<u64> {
     let me = airc.addressee().await.unwrap();
     let mut shown = Vec::new();
     for turn_no in 0..64 {
@@ -323,7 +345,7 @@ async fn walk(airc: &Airc, consumer: &str, window: AddressedWindow, attach: bool
             return shown;
         }
         if let Some(found) = turn
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+            .history_summary(crate::EventFilter::default(), None, &keep, &me, window)
             .await
             .unwrap()
         {
@@ -362,12 +384,12 @@ async fn an_old_request_beyond_the_tail_survives_a_dropped_reattach_and_restart(
 }
 // what this catches (Codex (b) on #1617): the addressed checkpoint moves only
 // through the candidates a turn actually scanned; the unscanned rest stays
-// unsettled (30 `@Codex` candidates, a budget of 10).
+// unsettled (30 typed candidates, a budget of 10).
 #[tokio::test]
 async fn the_addressed_checkpoint_moves_only_through_scanned_ranges() {
     let (_dir, airc, room) = fixture().await;
     for n in 1..=30 {
-        say(&airc, room, n, "@Codex take this one").await;
+        airc.append_event(request(&airc, room, n)).await.unwrap();
     }
     let narrow = AddressedWindow {
         candidates: 10,
@@ -376,7 +398,7 @@ async fn the_addressed_checkpoint_moves_only_through_scanned_ranges() {
     let mut turn = airc.prepare_agent_delivery("scan", 64, 8).await.unwrap();
     let start = turn.state.summarized.clone();
     let me = airc.addressee().await.unwrap();
-    turn.history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, narrow)
+    turn.history_summary(crate::EventFilter::default(), None, |_| false, &me, narrow)
         .await
         .unwrap();
     turn.acknowledge(0, true).await.unwrap();
@@ -408,7 +430,7 @@ async fn the_ambient_count_once_does_not_suppress_later_addressed_pages() {
     for turn_no in 0..2 {
         let mut turn = airc.prepare_agent_delivery("mixed", 64, 8).await.unwrap();
         let found = turn
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, WINDOW)
+            .history_summary(crate::EventFilter::default(), None, |_| true, &me, WINDOW)
             .await
             .unwrap()
             .unwrap();
@@ -459,7 +481,7 @@ async fn a_request_from_a_second_outage_is_emitted_exactly_once() {
         .await
         .unwrap();
     let page = first
-        .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, WINDOW)
+        .history_summary(crate::EventFilter::default(), None, |_| true, &me, WINDOW)
         .await
         .unwrap()
         .unwrap();
@@ -483,14 +505,14 @@ async fn a_request_from_a_second_outage_is_emitted_exactly_once() {
 
 // what this catches (Cormac on #1617): at the scan cap, "reached the start" is
 // read from the candidate scan itself. With --count 4096 and more than 4096
-// candidates (`@Codex` requests, someone else's) below an exclusive top, the
+// typed candidates excluded by the display predicate below an exclusive top, the
 // oldest event (a request to me) is still emitted, not settled unseen.
 #[tokio::test]
 async fn at_the_scan_cap_the_oldest_request_is_still_emitted() {
     let (_dir, airc, room) = fixture().await;
     airc.append_event(request(&airc, room, 1)).await.unwrap();
     for n in 2..=8300 {
-        say(&airc, room, n, "@Codex take this one").await;
+        airc.append_event(request(&airc, room, n)).await.unwrap();
     }
     let me = airc.addressee().await.unwrap();
     // At the cap, and (Codex) far above it: both clamp to one 4096-event scan.
@@ -506,7 +528,13 @@ async fn at_the_scan_cap_the_oldest_request_is_still_emitted() {
             .await
             .unwrap();
         first
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, window)
+            .history_summary(
+                crate::EventFilter::default(),
+                None,
+                |e| e.lamport == 1,
+                &me,
+                window,
+            )
             .await
             .unwrap();
         first.acknowledge(0, true).await.unwrap();
@@ -523,7 +551,7 @@ async fn at_the_scan_cap_the_oldest_request_is_still_emitted() {
         // Turn 2 hits the cap on that exclusive range; the request is still
         // emitted on a later turn, never settled unseen.
         assert_eq!(
-            walk(&airc, consumer, window, false).await,
+            walk_kept(&airc, consumer, window, false, |e| e.lamport == 1).await,
             vec![1],
             "{consumer}"
         );
@@ -576,6 +604,7 @@ async fn a_dropped_reattach_does_not_move_the_delivered_position() {
 async fn history_applies_the_one_self_echo_rule_in_the_store() {
     let (_dir, airc, room) = fixture().await;
     let send = |n: u64, stamp: Option<&str>, target: MentionTarget| TranscriptEvent {
+        class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         event_id: EventId::from_u128(n as u128),
         room_id: room,
         peer_id: airc.peer_id(),
@@ -618,7 +647,7 @@ async fn history_applies_the_one_self_echo_rule_in_the_store() {
     let own = airc_core::RuntimeSelf::new(airc.client_id(), None);
     let found = turn
         .history_summary(
-            airc_core::HeaderFilter::Any,
+            crate::EventFilter::default(),
             Some(&own),
             |_| true,
             &me,
@@ -840,9 +869,7 @@ async fn a_consumer_further_behind_than_a_turn_reattaches_at_the_present() {
     );
 }
 // what this catches (Codex on the addressee index): the store pre-filter keeps
-// the exact Addressee semantics. A typed-target request, my name in another case
-// and my shown id are shown; `@Codex` (a store candidate, someone else's) and my
-// name mid-sentence are not, under a range of ambient events.
+// exact typed target semantics. Names and shown ids in a body never address a reader.
 #[tokio::test]
 async fn the_addressee_index_keeps_exact_addressing() {
     let (_dir, airc, room) = fixture().await;
@@ -856,7 +883,7 @@ async fn the_addressee_index_keeps_exact_addressing() {
     for n in 6..=200 {
         append(&airc, room, n).await;
     }
-    assert_eq!(walk(&airc, "exact", WINDOW, false).await, vec![3, 2, 1]);
+    assert_eq!(walk(&airc, "exact", WINDOW, false).await, vec![1]);
 }
 // what this catches (Codex on #1618): an addressed obligation survives output
 // that is never acknowledged: a turn that showed the request is dropped, the
@@ -961,7 +988,7 @@ async fn an_old_request_is_shown_under_a_flood_before_every_poll() {
                 .map(|e| (poll, e.lamport)),
         );
         if let Some(found) = turn
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, WINDOW)
+            .history_summary(crate::EventFilter::default(), None, |_| true, &me, WINDOW)
             .await
             .unwrap()
         {
@@ -1021,7 +1048,7 @@ async fn new_addressed_traffic_never_starves_an_older_pending_request() {
                 .map(|e| (poll, e.lamport)),
         );
         if let Some(found) = turn
-            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, small)
+            .history_summary(crate::EventFilter::default(), None, |_| true, &me, small)
             .await
             .unwrap()
         {

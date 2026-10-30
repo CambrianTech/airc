@@ -482,6 +482,7 @@ mod tests {
     async fn frame_round_trips_newline_bearing_payload() {
         let mut bytes = Vec::new();
         let request = Request::Send(crate::request::SendRequest {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             channel: uuid::Uuid::nil(),
             from_peer: uuid::Uuid::from_u128(0x1),
             from_client: uuid::Uuid::from_u128(0x2),
@@ -544,6 +545,7 @@ mod tests {
         headers.insert("continuum.widget".to_string(), "video-room".to_string());
         headers.insert("x-correlation".to_string(), "req-7e88c34d-1234".to_string());
         Request::Send(crate::request::SendRequest {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             channel: uuid::Uuid::from_u128(0xc0ffee),
             from_peer: uuid::Uuid::from_u128(0xa1),
             from_client: uuid::Uuid::from_u128(0xc1),

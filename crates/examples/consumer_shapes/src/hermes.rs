@@ -172,6 +172,8 @@ pub fn any_hermes_event_filter() -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),
@@ -189,6 +191,8 @@ pub fn agent_event_filter(agent_id: &str) -> EventFilter {
     EventFilter {
         // #1271 added EventFilter.self_echo; consumers see everything (None).
         self_echo: None,
+        sender: None,
+        selection: airc_lib::EventSelection::All,
         channel: None,
         channels: HashSet::new(),
         kinds: BTreeSet::new(),

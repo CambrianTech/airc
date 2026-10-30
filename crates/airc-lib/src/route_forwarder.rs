@@ -851,6 +851,7 @@ pub(crate) fn build_forward_frame(
     let mut frame = Frame {
         kind,
         envelope: ProtoEnvelope {
+            class: env.class,
             event_id: env.event_id,
             sender: env.from.0,
             sender_client: env.from.1,
@@ -930,6 +931,19 @@ mod tests {
             RoomId::new(),
             (PeerId::new(), airc_core::ClientId::new()),
             kind,
+            match kind {
+                Kind::Message => {
+                    airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message)
+                }
+                Kind::Event => airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
+                Kind::Command => airc_core::EventClass::Control(airc_core::ControlKind::Command),
+                Kind::CommandResult => {
+                    airc_core::EventClass::Control(airc_core::ControlKind::CommandResult)
+                }
+                Kind::Signal => airc_core::EventClass::Control(airc_core::ControlKind::Signal),
+                Kind::StreamChunk => airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+                Kind::Control => airc_core::EventClass::Control(airc_core::ControlKind::Session),
+            },
             DeliveryClass::Durable,
             Bytes::from(Body::text("routed").to_payload()),
         );

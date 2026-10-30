@@ -1557,7 +1557,13 @@ impl Airc {
 
     async fn publish_work_event(&self, event: &WorkEvent) -> Result<EventId, AircError> {
         let (headers, body) = encode_work_event(event)?;
-        self.send_frame(FrameKind::Event, body, headers).await
+        self.send_frame(
+            FrameKind::Event,
+            airc_work::work_event_class(event),
+            body,
+            headers,
+        )
+        .await
     }
 
     /// Room-targeted sibling of [`Airc::publish_work_event`]: the event
@@ -1571,6 +1577,7 @@ impl Airc {
         let (headers, body) = encode_work_event(event)?;
         self.send_frame_to_room(
             FrameKind::Event,
+            airc_work::work_event_class(event),
             crate::MentionTarget::All,
             body,
             headers,

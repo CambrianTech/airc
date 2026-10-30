@@ -28,6 +28,9 @@ pub struct Model {
     /// and so adding a new kind doesn't require an enum mapping
     /// table migration.
     pub kind: String,
+    /// NULL preserves pre-classification rows as audit data, never routable events.
+    pub class: Option<String>,
+    pub class_family: Option<i32>,
     pub occurred_at_ms: i64,
     /// Lamport (sender's monotonic counter). Primary ordering key.
     pub lamport: i64,
@@ -46,7 +49,7 @@ pub struct Model {
     /// The peer a `MentionTarget::Peer` target names, else NULL: derived at
     /// append ([`airc_core::Addressing`]) so an addressee scan is indexed.
     pub addressed_peer: Option<Uuid>,
-    /// The body text opens with an `@name` ([`airc_core::leading_mentions`]).
+    /// Historical audit field; never used for routing.
     pub leading_mention: bool,
     /// The version of this row's derived data (addressing, header rows);
     /// below `crate::derive::DERIVED_VERSION` it is derived on the next open.

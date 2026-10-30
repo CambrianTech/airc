@@ -8,16 +8,6 @@ use crate::stream::{EventFilter, EventScan, EventStream, FilteredEventStream};
 use crate::time::now_ms;
 use crate::Airc;
 
-/// Continuum #297: how many raw events the LOCAL-store filtered page
-/// reads per requested match. The local store has no kind-pushdown
-/// query (the daemon does — see [`Airc::daemon_page_recent_of_kinds`]),
-/// so [`Airc::page_recent_filtered`] pages `limit * 8` raw, filters,
-/// and keeps the newest `limit` matches — a bounded overscan instead of
-/// the old newest-`limit`-raw-then-filter, whose page a StreamChunk
-/// flood fills with events the filter discards. Exhausting the window
-/// before `limit` matches is logged (no silent caps).
-const STORE_FILTER_OVERSCAN: usize = 8;
-
 /// Event metadata returned by [`Airc::send_frame_to_room`]. Carries
 /// enough to build a typed receipt for the public publish API.
 #[derive(Debug, Clone, Copy)]
@@ -48,17 +38,24 @@ impl Airc {
 
     /// Send a frame with typed body and arbitrary headers.
     pub async fn send(&self, body: Body, headers: Headers) -> Result<EventId, AircError> {
-        self.send_frame_to(FrameKind::Message, MentionTarget::All, body, headers)
-            .await
+        self.send_frame_to(
+            FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
+            MentionTarget::All,
+            body,
+            headers,
+        )
+        .await
     }
 
     pub(crate) async fn send_frame(
         &self,
         kind: FrameKind,
+        class: airc_core::EventClass,
         body: Body,
         headers: Headers,
     ) -> Result<EventId, AircError> {
-        self.send_frame_to(kind, MentionTarget::All, body, headers)
+        self.send_frame_to(kind, class, MentionTarget::All, body, headers)
             .await
     }
 
@@ -72,22 +69,24 @@ impl Airc {
     pub async fn send_frame_to_for_test(
         &self,
         kind: FrameKind,
+        class: airc_core::EventClass,
         target: MentionTarget,
         body: Body,
         headers: Headers,
     ) -> Result<EventId, AircError> {
-        self.send_frame_to(kind, target, body, headers).await
+        self.send_frame_to(kind, class, target, body, headers).await
     }
 
     pub(crate) async fn send_frame_to(
         &self,
         kind: FrameKind,
+        class: airc_core::EventClass,
         target: MentionTarget,
         body: Body,
         headers: Headers,
     ) -> Result<EventId, AircError> {
         let room = self.current_room().await?;
-        self.send_frame_to_room(kind, target, body, headers, &room)
+        self.send_frame_to_room(kind, class, target, body, headers, &room)
             .await
             .map(|receipt| receipt.event_id)
     }
@@ -104,11 +103,17 @@ impl Airc {
     pub(crate) async fn send_frame_to_room(
         &self,
         kind: FrameKind,
+        class: airc_core::EventClass,
         target: MentionTarget,
         body: Body,
         mut headers: Headers,
         room: &crate::Room,
     ) -> Result<SendFrameResult, AircError> {
+        if kind != FrameKind::for_class(class) {
+            return Err(AircError::Route(
+                "frame kind conflicts with event class".into(),
+            ));
+        }
         // Cross-machine name reconvergence (blind-room heal): every
         // room send carries the human channel name so a receiver whose
         // identity-scoped channel derivation diverged from ours can
@@ -119,7 +124,7 @@ impl Airc {
         // Keeps the write path consistent with the daemon read path.
         if self.is_daemon_attached() {
             return self
-                .daemon_send_frame(room, kind, target, body, headers)
+                .daemon_send_frame(room, kind, class, target, body, headers)
                 .await;
         }
         // Debounced: the verifier registry is for INBOUND verification and
@@ -132,6 +137,7 @@ impl Airc {
         let mut frame = Frame {
             kind,
             envelope: Envelope {
+                class,
                 event_id,
                 sender: self.inner.identity.peer_id,
                 sender_client: self.inner.identity.client_id,
@@ -327,7 +333,12 @@ impl Airc {
         let room = self.current_room().await?;
         if self.is_daemon_attached() {
             return self
-                .daemon_subscribe(vec![room.channel], None, airc_core::HeaderFilter::Any)
+                .daemon_subscribe(
+                    vec![room.channel],
+                    None,
+                    airc_core::HeaderFilter::Any,
+                    airc_core::EventSelection::All,
+                )
                 .await;
         }
         let rx = self.inner.live_tx.subscribe();
@@ -341,10 +352,21 @@ impl Airc {
         filter: EventFilter,
     ) -> Result<FilteredEventStream, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
-        Ok(FilteredEventStream {
-            inner: self.subscribe().await?,
-            filter,
-        })
+        let inner = if self.is_daemon_attached() {
+            let channel = filter
+                .channel
+                .ok_or_else(|| AircError::Route("subscription requires a channel".into()))?;
+            self.daemon_subscribe(
+                vec![channel],
+                None,
+                filter.headers_filter.clone(),
+                filter.selection.clone(),
+            )
+            .await?
+        } else {
+            EventStream::from_broadcast(self.inner.live_tx.subscribe())
+        };
+        Ok(FilteredEventStream { inner, filter })
     }
 
     /// Subscribe to live events from all subscribed rooms. This is
@@ -389,7 +411,12 @@ impl Airc {
                 .collect();
             return Ok(FilteredEventStream {
                 inner: self
-                    .daemon_subscribe(channels, delivery, filter.headers_filter.clone())
+                    .daemon_subscribe(
+                        channels,
+                        delivery,
+                        filter.headers_filter.clone(),
+                        filter.selection.clone(),
+                    )
                     .await?,
                 filter,
             });
@@ -444,91 +471,14 @@ impl Airc {
     /// flood fills a raw page and evicts every durable Message,
     /// deafening working personas to direction). Daemon-attached, the
     /// kinds are pushed down into the daemon's inbox read; the local
-    /// store path uses a bounded overscan. Either way `filter.matches`
-    /// still runs on the result (headers / self-echo are client-side).
+    /// store path uses the same typed matching predicate before LIMIT.
     pub async fn page_recent_filtered(
         &self,
         filter: EventFilter,
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
-        // Route to the DAEMON whenever one is attached — the kinds filter
-        // selects WHICH daemon read, it does not decide whether to use one.
-        //
-        // It used to: the daemon branch required `!filter.kinds.is_empty()`, so
-        // an attached caller passing a filter with no kind restriction fell
-        // through to `self.inner.store` — the CLIENT's local store, which for an
-        // attached client holds nothing, because the daemon owns the events.
-        // The call returned an empty page and looked like it had worked.
-        //
-        // Caught 2026-08-08 by `tests/room_roster.rs`, which went red the moment
-        // `active_agents` started paging through this function with a
-        // channel-only filter: "self must be present in its own room roster" —
-        // the roster was empty because the read had quietly consulted the wrong
-        // store. Nothing about the signature suggests that a kind-less filter is
-        // the unsupported case.
-        if self.is_daemon_attached() {
-            if let Some(channel) = filter.channel {
-                if !filter.kinds.is_empty() {
-                    return Ok(self
-                        .daemon_page_recent_of_kinds(channel, &filter.kinds, limit)
-                        .await?
-                        .into_iter()
-                        .filter(|event| filter.matches(event))
-                        .collect());
-                }
-                // No kind restriction: page the whole room from the daemon,
-                // exactly what `page_recent` fetches.
-                //
-                // Only when the channel is one this scope actually subscribes
-                // to. An UNSUBSCRIBED channel deliberately falls through to the
-                // local-store path below rather than returning empty — that is
-                // the pre-existing behaviour and two integration tests depend on
-                // it (`unknown_channel_auto_rebinds_from_account_registry_cache`,
-                // `delivered_ack_means_visible_to_subscribed_scopes_not_just_durable`),
-                // because a frame can land in the local transcript for a channel
-                // the subscription set has not converged on yet. Returning empty
-                // there would break the rebind path this crate heals with.
-                if let Some(room) = self.room_by_channel(channel).await? {
-                    return Ok(self
-                        .daemon_page_recent(&room, limit)
-                        .await?
-                        .into_iter()
-                        .filter(|event| filter.matches(event))
-                        .collect());
-                }
-            }
-        }
-        // Local store path: bounded overscan — page a wider raw window,
-        // filter, keep the newest `limit` matches. With a pass-all
-        // filter this is exactly the newest `limit` (today's behavior).
-        let overscan = limit.saturating_mul(STORE_FILTER_OVERSCAN);
-        let raw = self
-            .inner
-            .store
-            .page_recent(filter.channel, overscan)
-            .await?;
-        let scanned = raw.len();
-        let mut matches: Vec<TranscriptEvent> = raw
-            .into_iter()
-            .filter(|event| filter.matches(event))
-            .collect();
-        if matches.len() < limit && scanned == overscan {
-            // No silent caps: the overscan window filled before finding
-            // `limit` matches — older matching events may exist beyond it.
-            tracing::debug!(
-                target: "airc::messaging",
-                limit,
-                overscan,
-                found = matches.len(),
-                "page_recent_filtered: overscan window exhausted before \
-                 finding `limit` matching events"
-            );
-        }
-        if matches.len() > limit {
-            matches.drain(..matches.len() - limit);
-        }
-        Ok(matches)
+        Ok(self.filtered_history(None, filter, limit).await?.events)
     }
 
     /// Fetch recent events from the subscribed room set.
@@ -538,22 +488,7 @@ impl Airc {
         limit: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
-        if self.is_daemon_attached() {
-            return Ok(self
-                .daemon_page_recent_subscribed(limit)
-                .await?
-                .into_iter()
-                .filter(|event| filter.matches(event))
-                .collect());
-        }
-        Ok(self
-            .inner
-            .store
-            .page_recent(filter.channel, limit)
-            .await?
-            .into_iter()
-            .filter(|event| filter.matches(event))
-            .collect())
+        Ok(self.filtered_history(None, filter, limit).await?.events)
     }
 
     /// Fetch up to `limit` events strictly after `cursor` in the current room.
@@ -598,13 +533,9 @@ impl Airc {
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let filter = self.scope_filter_to_current_room(filter).await?;
         Ok(self
-            .inner
-            .store
-            .resume_from(cursor, filter.channel, limit)
+            .filtered_history(Some(cursor), filter, limit)
             .await?
-            .into_iter()
-            .filter(|event| filter.matches(event))
-            .collect())
+            .events)
     }
 
     /// Fetch events strictly after `cursor` from the subscribed room set.
@@ -631,20 +562,52 @@ impl Airc {
         limit: usize,
     ) -> Result<EventScan, AircError> {
         let filter = self.subscribed_event_filter(filter).await?;
-        let mut events = if self.is_daemon_attached() {
-            self.daemon_resume_from_subscribed(cursor, limit).await?
-        } else {
-            self.inner
-                .store
-                .resume_from(cursor, filter.channel, limit)
-                .await?
+        self.filtered_history(Some(cursor), filter, limit).await
+    }
+
+    /// One store predicate governs paging before LIMIT in both embedded and IPC modes.
+    async fn filtered_history(
+        &self,
+        after: Option<&TranscriptCursor>,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<EventScan, AircError> {
+        let channels: Vec<_> = match filter.channel {
+            Some(channel) if filter.channels.is_empty() || filter.channels.contains(&channel) => {
+                vec![channel]
+            }
+            Some(_) => Vec::new(),
+            None => filter.channels.iter().copied().collect(),
         };
-        let scanned_through = events.last().map(TranscriptEvent::cursor);
-        events.retain(|event| filter.matches(event));
-        Ok(EventScan {
-            events,
-            scanned_through,
-        })
+        let mut through = None;
+        for channel in &channels {
+            if let Some(cursor) = self.channel_latest_cursor(*channel).await? {
+                if through.as_ref().is_none_or(|old: &TranscriptCursor| {
+                    (cursor.lamport, cursor.event_id.as_uuid())
+                        > (old.lamport, old.event_id.as_uuid())
+                }) {
+                    through = Some(cursor);
+                }
+            }
+        }
+        let Some(through) = through else {
+            return Ok(EventScan {
+                events: Vec::new(),
+                scanned_through: None,
+            });
+        };
+        let rule = airc_core::HistoryMatch {
+            sender: filter.sender,
+            selection: filter.selection.clone(),
+            headers: &filter.headers_filter,
+            addressed_to: None,
+            kinds: &filter.kinds,
+            self_echo: filter
+                .self_echo
+                .map(|value| (value.peer_id, value.client_id, value.filter)),
+        };
+        self.scan_matching_channels(after, &through, limit, &channels, rule)
+            .await
     }
 
     /// Cursor of the newest event in the current room — via the daemon

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::io::Write;
 use std::path::Path;
 
-use airc_core::{Body, MentionTarget, RoomId, TranscriptEvent, TranscriptKind};
+use airc_core::{Body, MentionTarget, RoomId, TranscriptEvent};
 use airc_ipc::{codec::read_response_frame, AttachRequest, AttachStart, DaemonClient, Response};
 use airc_lib::{decode_wire_event, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
@@ -107,7 +107,8 @@ pub(crate) async fn run(
             // is the follow-up.
             let mut attach_start = start;
             loop {
-                let mut request = AttachRequest::new(channel, attach_start);
+                let mut request = AttachRequest::new(channel, attach_start)
+                    .with_selection(airc_lib::agent_event_selection());
                 if coalesce_backlog {
                     request = request.with_coalesced_backlog();
                 }
@@ -204,7 +205,7 @@ pub(crate) async fn run(
                 if let Some(text) = render_claimable_work_for_event(&airc, &event).await? {
                     sandbox.emit_contract_once();
                     render_text_event(&event, &text, &mut sandbox);
-                } else if matches!(event.kind, TranscriptKind::Message | TranscriptKind::System) {
+                } else if airc_core::EventSelection::Correspondence.matches(event.class) {
                     render_event(&event, &self_filter, &mut sandbox);
                 }
             }
@@ -390,11 +391,12 @@ mod tests {
 
     fn event(text: &str) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: PeerId::new(),
             client_id: ClientId::new(),
-            kind: TranscriptKind::Message,
+            kind: airc_core::TranscriptKind::Message,
             occurred_at_ms: 1,
             lamport: 1,
             target: MentionTarget::All,

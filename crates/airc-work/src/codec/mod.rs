@@ -4,10 +4,8 @@
 //! the opaque body so substrate transports do not need to understand
 //! kanban, workspaces, GitHub, Codex, Continuum, OpenClaw, or Hermes.
 
-use std::collections::BTreeSet;
-
-use airc_core::{Body, HeaderFilter, Headers};
-use airc_protocol::{FrameKind, Subscription, HEADER_FORGE_BODY_HINT};
+use airc_core::{Body, Headers};
+use airc_protocol::Subscription;
 use serde::Deserialize;
 
 use crate::event::WorkEvent;
@@ -25,16 +23,8 @@ pub use headers::{
 };
 
 pub const BODY_HINT_FORGE_WORK_EVENT: &str = "forge.work.event.v1";
-/// Separate typed extension: legacy work readers skip this hint rather than
-/// failing to deserialize an unfamiliar variant in their closed WorkEvent enum.
+/// Descriptive schema metadata only; semantic selection uses EventClass.
 pub const BODY_HINT_FORGE_WORK_REVIEW: &str = "forge.work.review.v1";
-
-pub(crate) fn is_work_event_hint(hint: &str) -> bool {
-    matches!(
-        hint,
-        BODY_HINT_FORGE_WORK_EVENT | BODY_HINT_FORGE_WORK_REVIEW
-    )
-}
 
 pub(crate) fn work_event_body_hint(event: &WorkEvent) -> &'static str {
     match event {
@@ -86,15 +76,10 @@ pub enum WorkEventCodecError {
     MissingBody,
     #[error("work event body must be JSON")]
     NonJsonBody,
-    #[error("work event body uses hint {actual:?}, expected {expected:?}")]
-    BodyHintMismatch {
-        actual: Option<String>,
-        expected: &'static str,
-    },
-    #[error("work event variant requires hint {expected:?}, received {actual:?}")]
-    VariantHintMismatch {
-        actual: Option<String>,
-        expected: &'static str,
+    #[error("work payload class {expected:?} differs from signed class {actual:?}")]
+    ClassMismatch {
+        expected: airc_core::EventClass,
+        actual: airc_core::EventClass,
     },
     #[error("work event JSON codec failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -108,52 +93,31 @@ pub fn encode_work_event(event: &WorkEvent) -> Result<(Headers, Body), WorkEvent
 }
 
 pub fn decode_work_event(
-    headers: &Headers,
+    _headers: &Headers,
     body: Option<&Body>,
 ) -> Result<WorkEvent, WorkEventCodecError> {
-    require_work_event_hint(headers)?;
     let Some(body) = body else {
         return Err(WorkEventCodecError::MissingBody);
     };
     let Body::Json(value) = body else {
         return Err(WorkEventCodecError::NonJsonBody);
     };
-    // Decode from the existing tree. Cloning it first allocates every JSON
-    // key/container on each replay; owned WorkEvent fields are sufficient.
-    let event = WorkEvent::deserialize(value)?;
-    let expected = work_event_body_hint(&event);
-    if headers.get(HEADER_FORGE_BODY_HINT).map(String::as_str) != Some(expected) {
-        return Err(WorkEventCodecError::VariantHintMismatch {
-            actual: headers.get(HEADER_FORGE_BODY_HINT).cloned(),
-            expected,
-        });
-    }
-    Ok(event)
+    Ok(WorkEvent::deserialize(value)?)
+}
+
+/// Exact typed work-domain payloads, including lease/availability updates.
+pub fn work_event_selection() -> airc_core::EventSelection {
+    use airc_core::{ActivityKind, EventClass, EventSelection};
+    EventSelection::AnyOf(vec![
+        EventSelection::Exact(EventClass::Activity(ActivityKind::WorkState)),
+        EventSelection::Exact(EventClass::Activity(ActivityKind::WorkPresence)),
+    ])
 }
 
 pub fn work_event_subscription() -> Subscription {
     Subscription {
-        kinds: BTreeSet::from([FrameKind::Event]),
-        headers_filter: HeaderFilter::AnyOf(
-            [BODY_HINT_FORGE_WORK_EVENT, BODY_HINT_FORGE_WORK_REVIEW]
-                .into_iter()
-                .map(|value| HeaderFilter::Exact {
-                    key: HEADER_FORGE_BODY_HINT.to_string(),
-                    value: value.to_string(),
-                })
-                .collect(),
-        ),
+        selection: work_event_selection(),
         ..Default::default()
-    }
-}
-
-fn require_work_event_hint(headers: &Headers) -> Result<(), WorkEventCodecError> {
-    match headers.get(HEADER_FORGE_BODY_HINT) {
-        Some(value) if is_work_event_hint(value) => Ok(()),
-        actual => Err(WorkEventCodecError::BodyHintMismatch {
-            actual: actual.cloned(),
-            expected: BODY_HINT_FORGE_WORK_EVENT,
-        }),
     }
 }
 
@@ -197,4 +161,47 @@ pub(crate) fn event_kind(event: &WorkEvent) -> &'static str {
         WorkEvent::GoalAbandoned(_) => "goal_abandoned",
         WorkEvent::GoalDryTickRecorded(_) => "goal_dry_tick_recorded",
     }
+}
+
+pub fn work_event_class(event: &WorkEvent) -> airc_core::EventClass {
+    use airc_core::{ActivityKind, EventClass};
+    EventClass::Activity(match event {
+        WorkEvent::ClaimHeartbeat(_)
+        | WorkEvent::WorkspaceHeartbeat(_)
+        | WorkEvent::AgentAvailabilityReported(_) => ActivityKind::WorkPresence,
+        WorkEvent::CardCreated(_)
+        | WorkEvent::CardUpdated(_)
+        | WorkEvent::CardClaimed(_)
+        | WorkEvent::ClaimReleased(_)
+        | WorkEvent::CardStateChanged(_)
+        | WorkEvent::WorkSubmitted(_)
+        | WorkEvent::WorkSubmissionReviewed(_)
+        | WorkEvent::SubmissionReviewRequested(_)
+        | WorkEvent::SubmissionRejected(_)
+        | WorkEvent::ReviewRejected(_)
+        | WorkEvent::LaneCreated(_)
+        | WorkEvent::LaneStateChanged(_)
+        | WorkEvent::WorkspaceRequested(_)
+        | WorkEvent::WorkspaceAllocated(_)
+        | WorkEvent::WorkspaceReleased(_)
+        | WorkEvent::WorkspacePressureReported(_)
+        | WorkEvent::WorkspaceDrainRequested(_)
+        | WorkEvent::WorkspaceDrainCompleted(_)
+        | WorkEvent::GitCommitObserved(_)
+        | WorkEvent::GitBranchMoved(_)
+        | WorkEvent::GitDirtyStateChanged(_)
+        | WorkEvent::PullRequestCheckSuiteChanged(_)
+        | WorkEvent::PullRequestReviewSubmitted(_)
+        | WorkEvent::PullRequestMergeStateChanged(_)
+        | WorkEvent::PullRequestLinked(_)
+        | WorkEvent::PullRequestRelinked(_)
+        | WorkEvent::PullRequestMerged(_)
+        | WorkEvent::HygieneReportRecorded(_)
+        | WorkEvent::ManagerHatClaimed(_)
+        | WorkEvent::ManagerHatReleased(_)
+        | WorkEvent::GoalCreated(_)
+        | WorkEvent::GoalAchieved(_)
+        | WorkEvent::GoalAbandoned(_)
+        | WorkEvent::GoalDryTickRecorded(_) => ActivityKind::WorkState,
+    })
 }

@@ -19,6 +19,22 @@ fn write(path: &Path, text: &str) {
     }
 }
 
+// This standalone rustc harness exercises the PreparedInstall callback seam.
+// Production BinarySwap's fingerprint/rollback behavior is tested in its own
+// module. The fixture owner retains the old file and publishes its prepared
+// snapshot before install.sh is allowed to perform integration work.
+fn publish_owned_fixture(
+    prepared: &update_artifact::PreparedInstall,
+    current: &Path,
+    previous: &Path,
+) -> std::io::Result<()> {
+    std::fs::rename(current, previous)?;
+    // Both fixture paths are on the test volume. Atomic no-replace publication
+    // also makes an unexpected competing writer fail this test.
+    std::fs::hard_link(prepared.artifact(), current)?;
+    Ok(())
+}
+
 #[test]
 fn public_handoff_builds_once_before_stop_and_rejects_bad_preparations() {
     let root = std::env::temp_dir().join(format!("airc-handoff-proof-{}", std::process::id()));
@@ -167,6 +183,9 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
             "#!/bin/sh\necho 'build: deadbee'\n",
         );
         std::fs::remove_file(root.join("events")).unwrap();
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        let original = "original installation retained by fixture owner";
+        write(&home.join("bin/airc"), original);
         let prepared = update_artifact::PreparedInstall::prepare(
             &bash,
             &source,
@@ -181,8 +200,13 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
             "#!/bin/sh\necho 'build: deadbee'\n",
         );
         prepared
-            .install_after(|| {
+            .install_after(&home, || {
                 std::fs::write(root.join("stopped"), "daemon maintenance")?;
+                publish_owned_fixture(
+                    &prepared,
+                    &home.join("bin/airc"),
+                    &home.join("previous-source"),
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -194,6 +218,10 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
         assert_eq!(
             std::fs::read_to_string(home.join("bin/airc")).unwrap(),
             good
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("previous-source")).unwrap(),
+            original
         );
         assert!(!home.join("wrong-dir").exists());
         assert!(!home.join("wrong-target").exists());
@@ -266,13 +294,22 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
         // Replacing the input after prepare must not affect the installation.
         write(&input, "#!/bin/sh\necho 'build: deadbee'\n");
         prepared
-            .install_after(|| {
+            .install_after(&home, || {
                 std::fs::write(root.join("stopped"), "daemon maintenance")?;
+                publish_owned_fixture(
+                    &prepared,
+                    &home.join("bin/airc"),
+                    &home.join("previous-prebuilt"),
+                )?;
                 Ok(())
             })
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(home.join("bin/airc")).unwrap(),
+            good
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("previous-prebuilt")).unwrap(),
             good
         );
         std::fs::remove_file(root.join("stopped")).unwrap();
@@ -341,6 +378,8 @@ try{$out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadTo
                 .arg(source.join("install.sh"))
                 .env("AIRC_DIR", &source)
                 .env("AIRC_INSTALL_NO_PULL", "1")
+                .env("BIN_DIR", home.join("bin"))
+                .env("BIN_TARGET", home.join("bin"))
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);

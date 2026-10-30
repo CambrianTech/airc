@@ -297,6 +297,7 @@ mod tests {
 
     fn msg(peer: PeerId, text: &str) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::from_u128(1),
             peer_id: peer,

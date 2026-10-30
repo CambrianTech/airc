@@ -54,6 +54,7 @@ async fn reading_another_subscribed_room_does_not_move_the_default_room_pointer(
     airc.publish(
         PublishTarget::RoomByName("elsewhere".to_string()),
         FrameKind::Message,
+        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         Body::text("message that lives in the other room"),
         std::collections::BTreeMap::new(),
     )

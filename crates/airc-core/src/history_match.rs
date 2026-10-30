@@ -4,8 +4,15 @@
 
 use crate::{AddresseeFilter, Addressing, HeaderFilter, TranscriptEvent};
 
-#[derive(Debug, Clone, Copy)]
+static EMPTY_KINDS: std::collections::BTreeSet<crate::TranscriptKind> =
+    std::collections::BTreeSet::new();
+
+#[derive(Debug, Clone)]
 pub struct HistoryMatch<'a> {
+    pub sender: Option<crate::PeerId>,
+    pub kinds: &'a std::collections::BTreeSet<crate::TranscriptKind>,
+    pub self_echo: Option<(crate::PeerId, crate::ClientId, crate::SelfFilter)>,
+    pub selection: crate::EventSelection,
     pub headers: &'a HeaderFilter,
     /// `None` matches regardless of addressing.
     pub addressed_to: Option<AddresseeFilter>,
@@ -14,6 +21,10 @@ pub struct HistoryMatch<'a> {
 impl<'a> HistoryMatch<'a> {
     pub fn headers(headers: &'a HeaderFilter) -> Self {
         Self {
+            sender: None,
+            kinds: &EMPTY_KINDS,
+            self_echo: None,
+            selection: crate::EventSelection::All,
             headers,
             addressed_to: None,
         }
@@ -23,16 +34,35 @@ impl<'a> HistoryMatch<'a> {
     /// addressing is only computed when an addressee filter is set.
     pub fn matches_with(
         &self,
+        class: crate::EventClass,
+        kind: crate::TranscriptKind,
+        from: (crate::PeerId, crate::ClientId),
         headers: &crate::Headers,
         addressing: impl FnOnce() -> Addressing,
     ) -> bool {
-        self.headers.matches(headers)
+        self.selection.matches(class)
+            && self.sender.is_none_or(|sender| sender == from.0)
+            && (self.kinds.is_empty() || self.kinds.contains(&kind))
+            && self
+                .self_echo
+                .is_none_or(|(peer, client, filter)| match filter {
+                    crate::SelfFilter::IncludeAll => true,
+                    crate::SelfFilter::ExcludeSameClient => from.1 != client,
+                    crate::SelfFilter::ExcludeSamePeer => from.0 != peer,
+                })
+            && self.headers.matches(headers)
             && self
                 .addressed_to
                 .is_none_or(|filter| addressing().admitted_by(&filter))
     }
 
     pub fn matches_event(&self, event: &TranscriptEvent) -> bool {
-        self.matches_with(&event.headers, || Addressing::of_event(event))
+        self.matches_with(
+            event.class,
+            event.class.transcript_kind(),
+            (event.peer_id, event.client_id),
+            &event.headers,
+            || Addressing::of_event(event),
+        )
     }
 }

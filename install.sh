@@ -964,12 +964,21 @@ _install_airc_binary() {
     exit 0
   fi
   fi
-  mkdir -p "$BIN_DIR"
+  # Replacement is owned exclusively by the updater's stop/displace/publish
+  # transaction. Equal bytes here only verify publication, never adopt state.
+  local preflight_home="${AIRC_HOME:-$HOME/.airc}" destination="$BIN_DIR/airc"
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*)
+    preflight_home="$(_to_win_path "$preflight_home")"; destination="$destination.exe" ;;
+  esac
+  if [ -e "$destination" ]; then
+    cmp -s "$built" "$destination" || fail 'Direct replacement refused; use airc update for owned maintenance and publication'
+  else
+    local publish_destination="$destination"
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) publish_destination="$(_to_win_path "$destination")" ;; esac
+    "$built" --home "$preflight_home" store-publish-fresh --destination "$publish_destination" || fail 'Fresh publication refused; existing state and binaries retained'
+  fi
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      if ! cmp -s "$built" "$BIN_DIR/airc.exe"; then
-        cp -f "$built" "$BIN_DIR/airc.exe"
-      fi
       "$BIN_DIR/airc.exe" --version >/dev/null || fail 'Installed Windows binary cannot run'
       if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$BIN_DIR/airc.exe"; fi
       ok "Installed airc: $BIN_DIR/airc.exe"
@@ -981,10 +990,6 @@ _install_airc_binary() {
         -File "$(_to_win_path "$CLONE_DIR/windows/register-bin-path.ps1")" -BinDirectory "$(_to_win_path "$BIN_DIR")"
       ;;
     *)
-      local tmp="$BIN_DIR/.airc.tmp.$$"
-      cp -f "$built" "$tmp"
-      chmod +x "$tmp"
-      mv -f "$tmp" "$BIN_DIR/airc"
       # VERIFY THE DEPLOY. "Installed" is a claim about a file existing;
       # it is not evidence the binary RUNS. On macOS an invalidly-signed
       # executable is SIGKILLed before `main` — exit 137, no output, no

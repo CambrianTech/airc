@@ -26,7 +26,7 @@ impl CountHistory for InMemoryEventStore {
         after: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[RoomId],
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, StoreError> {
         let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
@@ -36,7 +36,7 @@ impl CountHistory for InMemoryEventStore {
                 channels.contains(&e.room_id)
                     && strictly_after(e, after)
                     && !strictly_after(e, through)
-                    && headers.matches(&e.headers)
+                    && rule.matches_event(e)
                     && !exclude.is_some_and(|rule| rule.is_self_event(e))
             })
             .fold(airc_core::HistoryCount::default(), |count, e| {
@@ -437,6 +437,7 @@ mod tests {
 
     fn make_event(lamport: u64, room: RoomId, body: &str) -> TranscriptEvent {
         TranscriptEvent {
+            class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: room,
             peer_id: PeerId::from_u128(0xa1),

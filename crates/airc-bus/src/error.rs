@@ -6,6 +6,13 @@ use thiserror::Error;
 /// router's write-behind path.
 #[derive(Debug, Error)]
 pub enum BusError {
+    #[error("event class {0:?} cannot enter the ordinary event bus")]
+    UnsupportedClass(airc_core::EventClass),
+    #[error("event class {class:?} does not permit bus kind {kind:?}")]
+    ClassKindMismatch {
+        class: airc_core::EventClass,
+        kind: crate::Kind,
+    },
     /// The write-behind queue is full and a fire-and-forget durable publish
     /// was shed rather than block or OOM (§3.8 bounded write-behind). A
     /// `Durable` publisher that opted into backpressure blocks instead of

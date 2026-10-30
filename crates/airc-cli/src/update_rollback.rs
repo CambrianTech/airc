@@ -58,6 +58,16 @@ impl BinarySwap {
         })
     }
 
+    /// Publication belongs to the same transaction that displaced the original.
+    /// Stage privately, verify the pinned hash, then publish without replacing
+    /// any name another process created meanwhile.
+    pub(crate) fn publish(&self, candidate: &Path) -> Result<(), Error> {
+        let staged = self.previous.with_file_name("verified-candidate");
+        stage_verified(candidate, &staged, self.candidate_hash)?;
+        transaction_move("publish", &staged, &self.current)?;
+        Ok(())
+    }
+
     pub(crate) fn previous(&self) -> &Path {
         &self.previous
     }
@@ -117,6 +127,38 @@ impl BinarySwap {
 /// Move a regular file without the overwrite semantics of std::fs::rename.
 /// Destination collisions must preserve both parties, even if created after a
 /// prior existence check. All transaction paths share the installation volume.
+/// Fresh publication shares the same verified staging and no-replace primitive
+/// as owned updates. An interrupted copy is never visible at the public path.
+pub(crate) fn publish_fresh(candidate: &Path, destination: &Path) -> Result<(), Error> {
+    let parent = destination
+        .parent()
+        .ok_or("fresh destination has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let directory = tempfile::Builder::new()
+        .prefix(".airc-publish-")
+        .tempdir_in(parent)?;
+    let staged = directory.path().join("verified-candidate");
+    stage_verified(candidate, &staged, fingerprint(candidate)?)?;
+    transaction_move("publish-fresh", &staged, destination)?;
+    Ok(())
+}
+
+fn stage_verified(candidate: &Path, staged: &Path, expected: [u8; 32]) -> Result<(), Error> {
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged)?;
+    let mut input = std::fs::File::open(candidate)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::set_permissions(staged, input.metadata()?.permissions())?;
+    if fingerprint(staged)? != expected {
+        return Err("candidate changed before publication; original retained".into());
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn move_without_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -177,6 +219,82 @@ mod tests {
         process::{Child, Command, Stdio},
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn fresh_publication_is_verified_and_never_replaces_existing_destination() {
+        let dir = tempfile::tempdir().expect("directory");
+        let destination = dir.path().join("airc");
+        let candidate = dir.path().join("candidate");
+        std::fs::write(&candidate, b"complete candidate").expect("candidate");
+        publish_fresh(&candidate, &destination).expect("fresh publish");
+        assert_eq!(
+            std::fs::read(&destination).expect("published"),
+            b"complete candidate"
+        );
+        std::fs::write(&candidate, b"different candidate").expect("different candidate");
+        assert!(publish_fresh(&candidate, &destination).is_err());
+        assert_eq!(
+            std::fs::read(&destination).expect("preserved"),
+            b"complete candidate"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).expect("directory").count(), 2);
+    }
+
+    #[test]
+    fn failed_fresh_staging_does_not_leave_a_public_binary() {
+        let dir = tempfile::tempdir().expect("directory");
+        let destination = dir.path().join("airc");
+        assert!(publish_fresh(&dir.path().join("missing"), &destination).is_err());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).expect("directory").count(), 0);
+        let candidate = dir.path().join("candidate");
+        std::fs::write(&candidate, b"retry").expect("candidate");
+        publish_fresh(&candidate, &destination).expect("normal retry succeeds");
+    }
+
+    #[test]
+    fn publication_owns_verified_bytes_and_never_replaces_another_writer() {
+        for conflicting in [false, true] {
+            let dir = tempfile::tempdir().expect("directory");
+            let current = dir.path().join("airc");
+            let candidate = dir.path().join("candidate");
+            std::fs::write(&current, b"original").expect("original");
+            std::fs::write(&candidate, b"candidate").expect("candidate");
+            let swap = BinarySwap::displace(&current, &candidate).expect("displace");
+            if conflicting {
+                std::fs::write(&current, b"other owner").expect("conflict");
+                assert!(swap.publish(&candidate).is_err());
+                assert_eq!(
+                    std::fs::read(&current).expect("other preserved"),
+                    b"other owner"
+                );
+                assert_eq!(
+                    std::fs::read(swap.previous()).expect("original preserved"),
+                    b"original"
+                );
+            } else {
+                swap.publish(&candidate).expect("publish");
+                assert_eq!(std::fs::read(&current).expect("published"), b"candidate");
+                swap.rollback().expect("rollback");
+                assert_eq!(std::fs::read(&current).expect("restored"), b"original");
+            }
+        }
+    }
+
+    #[test]
+    fn changed_candidate_refuses_publication_and_original_can_be_restored() {
+        let dir = tempfile::tempdir().expect("directory");
+        let current = dir.path().join("airc");
+        let candidate = dir.path().join("candidate");
+        std::fs::write(&current, b"original").expect("original");
+        std::fs::write(&candidate, b"candidate").expect("candidate");
+        let swap = BinarySwap::displace(&current, &candidate).expect("displace");
+        std::fs::write(&candidate, b"changed").expect("tamper");
+        assert!(swap.publish(&candidate).is_err());
+        assert!(!current.exists());
+        swap.rollback().expect("rollback without candidate");
+        assert_eq!(std::fs::read(&current).expect("restored"), b"original");
+    }
 
     struct OwnedChild(Child);
     impl Drop for OwnedChild {

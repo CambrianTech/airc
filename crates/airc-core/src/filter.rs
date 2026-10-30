@@ -93,6 +93,7 @@ mod tests {
     /// UUIDs so assertions can name them.
     fn event_at(seed: u128, lamport: u64, peer_id: PeerId, client_id: ClientId) -> TranscriptEvent {
         TranscriptEvent {
+            class: crate::EventClass::Correspondence(crate::CorrespondenceKind::Message),
             event_id: EventId::from_u128(seed),
             room_id: RoomId::from_u128(0xc0ffee),
             peer_id,
@@ -153,6 +154,7 @@ mod tests {
         let self_filter = RuntimeSelf::new(local_client, Some("codex:thread-1"));
         let no_runtime = RuntimeSelf::new(local_client, None);
         let mut event = TranscriptEvent {
+            class: crate::EventClass::Correspondence(crate::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id: RoomId::new(),
             peer_id: local_peer,

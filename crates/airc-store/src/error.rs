@@ -6,6 +6,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("classification upgrade refused: {table:?} contains pre-classification history; preserve this store and running binary; export audit records and resolve durable work obligations before adoption")]
+    PreclassificationHistory { table: crate::audit::AuditTable },
+    #[error("event {0} has no authenticated classification; retained as audit data")]
+    UnclassifiedEvent(uuid::Uuid),
     /// Local filesystem failure while preparing the database path.
     #[error("store I/O error: {0}")]
     Io(#[from] std::io::Error),

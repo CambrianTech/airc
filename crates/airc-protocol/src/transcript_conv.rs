@@ -13,7 +13,7 @@
 //! Lives in airc-protocol rather than airc-core because the function
 //! body touches `Frame`, and Frame lives here.
 
-use airc_core::transcript::{TranscriptEvent, TranscriptKind};
+use airc_core::transcript::TranscriptEvent;
 use serde_json::Value as JsonValue;
 
 use crate::envelope::{Frame, FrameKind};
@@ -44,17 +44,15 @@ impl Frame {
         // The kind label sits outside the envelope signature, so a relay can
         // relabel an addressed frame; its reserved channel cannot be moved
         // without breaking the signature, so either one refuses.
-        if envelope.channel == crate::addressed::addressed_channel() {
+        if envelope.channel == crate::addressed::addressed_channel()
+            || kind != FrameKind::for_class(envelope.class)
+        {
             return Err(NotTranscribable);
         }
-        let kind = match kind {
-            FrameKind::Addressed => return Err(NotTranscribable),
-            FrameKind::Message => TranscriptKind::Message,
-            FrameKind::Event => TranscriptKind::System,
-            FrameKind::Control => TranscriptKind::SessionControl,
-            FrameKind::Command => TranscriptKind::Command,
-            FrameKind::CommandResult => TranscriptKind::CommandResult,
-        };
+        if kind == FrameKind::Addressed {
+            return Err(NotTranscribable);
+        }
+        let kind = envelope.class.transcript_kind();
 
         let mut metadata = serde_json::Map::new();
         if let Some(reply_to) = envelope.reply_to {
@@ -71,6 +69,7 @@ impl Frame {
         }
 
         Ok(TranscriptEvent {
+            class: envelope.class,
             event_id: envelope.event_id,
             room_id: envelope.channel,
             peer_id: envelope.sender,
@@ -106,6 +105,7 @@ mod tests {
     use super::*;
     use crate::envelope::{Envelope, FrameKind};
     use crate::signature::Signature;
+    use airc_core::TranscriptKind;
     use airc_core::{
         body::Body, headers::Headers, transcript::MentionTarget, ClientId, EventId, PeerId, RoomId,
     };
@@ -114,6 +114,9 @@ mod tests {
         Frame {
             kind: FrameKind::Message,
             envelope: Envelope {
+                class: airc_core::EventClass::Correspondence(
+                    airc_core::CorrespondenceKind::Message,
+                ),
                 event_id: EventId::from_u128(0x01),
                 sender: PeerId::from_u128(0xa1),
                 sender_client: ClientId::from_u128(0xc1),
@@ -157,12 +160,18 @@ mod tests {
         ] {
             let mut frame = message_frame();
             frame.kind = wire_kind;
+            frame.envelope.class = airc_core::EventClass::Control(match wire_kind {
+                FrameKind::Command => airc_core::ControlKind::Command,
+                FrameKind::CommandResult => airc_core::ControlKind::CommandResult,
+                _ => unreachable!("test cases are commands"),
+            });
             // Deliberately opaque bytes: classification cannot inspect JSON.
             frame.envelope.body = None;
             assert_eq!(frame.into_transcript_event().unwrap().kind, event_kind);
         }
         let mut frame = message_frame();
         frame.kind = FrameKind::Event;
+        frame.envelope.class = airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState);
         assert_eq!(
             frame.into_transcript_event().unwrap().kind,
             TranscriptKind::System,
@@ -171,6 +180,7 @@ mod tests {
 
         let mut frame = message_frame();
         frame.kind = FrameKind::Control;
+        frame.envelope.class = airc_core::EventClass::Control(airc_core::ControlKind::Session);
         assert_eq!(
             frame.into_transcript_event().unwrap().kind,
             TranscriptKind::SessionControl

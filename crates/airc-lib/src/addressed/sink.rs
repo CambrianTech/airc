@@ -91,6 +91,7 @@ mod tests {
         let frame = Frame {
             kind: FrameKind::Addressed,
             envelope: Envelope {
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Addressed),
                 event_id: EventId::new(),
                 sender: PeerId::new(),
                 sender_client: ClientId::new(),

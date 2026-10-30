@@ -39,6 +39,7 @@ pub mod account_registry_fs;
 pub mod adapter;
 pub mod addressed;
 mod agent_feed;
+pub use agent_feed::agent_event_selection;
 pub mod agent_heartbeat;
 pub mod airc;
 pub mod backfill;
@@ -111,7 +112,7 @@ pub use airc_protocol::{
     HEADER_AIRC_REPLY_TO,
 };
 pub use airc_protocol::{
-    DeliveryAck, DeliveryOutcome, UndeliverableReason, DELIVERY_ACK_REQUEST, DELIVERY_ACK_RESPONSE,
+    DeliveryAck, DeliveryOutcome, UndeliverableReason, DELIVERY_ACK_REQUEST,
     HEADER_AIRC_DELIVERY_ACK,
 };
 pub use capability_registry::{
@@ -200,7 +201,7 @@ pub use route::{
 };
 pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};
-pub use stream::{EventFilter, EventScan, EventStream, FilteredEventStream, LiveLag};
+pub use stream::{EventFilter, EventScan, EventStream, FilteredEventStream, LiveLag, StreamError};
 pub use subscriptions::{
     derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
     SubscriptionSet,
@@ -239,8 +240,9 @@ pub use airc_core::{
     headers::{HeaderFilter, Headers},
     identity::{Identity, PeerIdentityCard},
     transcript::MentionTarget,
-    ClientId, EventId, PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId,
-    TranscriptCursor, TranscriptEvent, TranscriptKind, PERSONA_CAPABILITIES_KEY,
+    ActivityKind, ClientId, ControlKind, CorrespondenceKind, EventClass, EventId, EventSelection,
+    PeerId, PersonaCapabilities, PersonaCapabilitiesError, RoomId, TranscriptCursor,
+    TranscriptEvent, TranscriptKind, PERSONA_CAPABILITIES_KEY,
 };
 // Trust tiers are the capability-registry ranking axis (card a9580f9d);
 // re-export so consumers ranking candidates don't pull airc-store.

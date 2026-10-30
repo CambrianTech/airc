@@ -112,6 +112,7 @@ async fn attached_filtered_page_pushes_kinds_down_to_the_daemon() {
     for _ in 0..200 {
         client
             .publish(PublishRequest {
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Stream),
                 channel: channel.as_uuid(),
                 from_peer: alice.peer_id().as_uuid(),
                 from_client: alice.client_id().as_uuid(),
@@ -177,6 +178,7 @@ async fn attached_subscribed_resume_merges_rooms_by_full_cursor_before_limit() {
             room,
             (observer.peer_id(), observer.client_id()),
             Kind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             DeliveryClass::Durable,
             Bytes::from_static(b"merge fixture"),
         );
@@ -248,4 +250,32 @@ async fn attached_structured_send_keeps_its_declared_class_not_a_durable_pin() {
         "a request_response frame became the durable tip — daemon_send_frame is \
          pinning Durable again instead of honouring the frame's declared class"
     );
+}
+
+/// Signed semantic classes retain their distinct bus categories through IPC.
+#[tokio::test]
+async fn attached_signal_and_stream_classes_are_admitted_without_kind_conflicts() {
+    use airc_core::{Body, ControlKind, EventClass, Headers, MentionTarget};
+    use airc_protocol::FrameKind;
+    let machine = Machine::boot().await;
+    let (alice, bob) = machine.pair_in("typed-control-categories").await;
+    for class in [
+        EventClass::Control(ControlKind::Signal),
+        EventClass::Control(ControlKind::Stream),
+    ] {
+        let id = alice
+            .send_frame_to_for_test(
+                FrameKind::for_class(class),
+                class,
+                MentionTarget::All,
+                Body::Binary(vec![255, 0, 7]),
+                Headers::new(),
+            )
+            .await
+            .expect("typed control admitted");
+        let events = bob.page_recent(10).await.expect("history");
+        assert!(events
+            .iter()
+            .any(|event| event.event_id == id && event.class == class));
+    }
 }

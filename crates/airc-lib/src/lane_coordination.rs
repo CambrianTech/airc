@@ -271,6 +271,7 @@ impl Airc {
 
         self.send_frame_to(
             FrameKind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::Coordination),
             MentionTarget::All,
             Body::Json(body),
             headers,

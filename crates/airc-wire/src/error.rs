@@ -10,6 +10,8 @@ use thiserror::Error;
 /// unknown enum tag from a newer/foreign producer.
 #[derive(Debug, Error)]
 pub enum WireError {
+    #[error("invalid routing metadata: {0}")]
+    InvalidClass(#[from] airc_bus::BusError),
     /// The buffer is not a valid FlatBuffer root, or a field access walked
     /// off the buffer / hit a malformed offset. Wraps the underlying
     /// `planus` read error.
