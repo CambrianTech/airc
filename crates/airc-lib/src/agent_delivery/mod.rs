@@ -11,6 +11,14 @@
 //! ([`AgentDeliveryTurn::history_summary`]). Requests addressed to this identity
 //! page on later turns until every one is shown, and only then does the range
 //! settle. The history itself stays durable for `airc inbox`.
+//!
+//! Live delivery is oldest first, but only within what one turn can read. A
+//! consumer further behind than one turn re-attaches at the present
+//! (`prepare_delivery_owned`, the one owner of that decision): what it missed is
+//! deliberately presented as bounded history (the count with its times, the
+//! newest page whole, and every addressed request until emitted) instead of
+//! being replayed in ambient live order. The re-attach never moves `live`, the
+//! delivery proof: nothing it reclassified was shown.
 use crate::{Airc, AircError, EventFilter, EventScan};
 use airc_core::{EventId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_store::StoredScopedState;
@@ -176,7 +184,12 @@ fn prefix(
     if end > page.events.len() {
         return Err(fail("invalid delivered prefix"));
     }
-    Ok(if end == page.events.len() {
+    // Nothing shown is nothing delivered: an empty acknowledgment never moves the live proof,
+    // even when the scan ran past events (a re-attach scans from its boundary; the backlog below
+    // it is history, accounted by the summary, never delivery). Codex on airc#1618.
+    Ok(if end == 0 {
+        previous.clone()
+    } else if end == page.events.len() {
         page.scanned_through
             .clone()
             .unwrap_or_else(|| previous.clone())
@@ -307,6 +320,27 @@ impl Airc {
                 persist(self, &consumer, &state).await?;
                 state
             };
+        // A consumer further behind than one turn can read re-attaches: what it missed becomes
+        // history (counted, with what was addressed to it emitted oldest range first), and live
+        // delivery restarts at the present; ambient live order is deliberately given up for a
+        // bounded history presentation, and `live` (the delivery proof) does not move. Paged oldest first, a hook whose peers post faster
+        // than its page never caught up: a Claude Code session read its 10-26 backlog on 10-29,
+        // nine events a call, and every message addressed to it that day stayed out of reach.
+        let attaching = attaching || {
+            let probe = self
+                .scan_agent_feed_in_channels(
+                    Some(state.scan_from()),
+                    &tip,
+                    scan_limit,
+                    &channels,
+                    None,
+                )
+                .await?;
+            probe
+                .scanned_through
+                .as_ref()
+                .is_some_and(|through| key(through) < key(&tip))
+        };
         if attaching {
             // What arrived while detached becomes this attachment's history: the
             // new boundary is the present. `live`, the delivery proof, does not
@@ -348,7 +382,7 @@ impl Airc {
             tip
         };
         let live = self
-            .scan_agent_feed_in_channels(Some(&scan_from), &through, scan_limit, &channels)
+            .scan_agent_feed_in_channels(Some(&scan_from), &through, scan_limit, &channels, None)
             .await?;
         if rooms(self).await? != channels {
             return Err(fail(

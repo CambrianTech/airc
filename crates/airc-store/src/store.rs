@@ -94,17 +94,18 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// This is the "give me what I haven't seen yet" call subscribers
     /// use to resume from disk after a restart or after the in-memory
     /// fan-out path missed a frame.
-    /// Match headers before the page limit within a fixed snapshot.
+    /// Match `rule` (headers, and addressee when set) before the page limit
+    /// within a fixed snapshot.
     async fn matching_history(
         &self,
         after: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[RoomId],
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        let _ = (after, through, channels, headers, limit, tail);
+        let _ = (after, through, channels, rule, limit, tail);
         Err(StoreError::Database(sea_orm::DbErr::Custom(
             "filtered history unsupported".into(),
         )))

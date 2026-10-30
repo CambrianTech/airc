@@ -116,7 +116,6 @@ use uuid::Uuid;
 
 use airc_core::PeerId;
 
-use airc_identity::LocalIdentity;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction, SosAction};
 use collaboration_cli::CollaborationAction;
@@ -197,6 +196,8 @@ async fn async_main() -> ExitCode {
     // never blocks. The single highest-friction onboarding issue.
     staleness::warn_if_stale();
 
+    // One rule for every store this process opens (airc_lib::store_admission).
+    airc_lib::store_admission::install();
     let parsed = Cli::parse();
     match dispatch(parsed).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -417,9 +418,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Daemon { socket } => {
-            let identity = LocalIdentity::load_or_generate(&home).await?;
             let socket = default_or(socket, &home);
-            commands::run_daemon(&home, identity, parsed.peers, socket).await
+            commands::run_daemon(&home, parsed.peers, socket).await
         }
 
         Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,

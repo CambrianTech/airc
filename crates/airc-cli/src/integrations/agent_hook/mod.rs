@@ -242,7 +242,8 @@ async fn compose(
     let live_end = delivery_end(turn, options.raw, shows);
     let me = airc.addressee().await?;
     let window = airc_lib::AddressedWindow {
-        // The interim addressed search reads the hook's own scan size (`--count`).
+        // Addressee candidates (store-selected, never ambient traffic) one turn
+        // may read: the hook's own scan size (`--count`).
         candidates: options.count.max(1),
         page: turn.budget,
     };

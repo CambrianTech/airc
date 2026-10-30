@@ -155,7 +155,7 @@ impl EventStore for InMemoryEventStore {
         after: &TranscriptCursor,
         through: &TranscriptCursor,
         channels: &[RoomId],
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
@@ -165,7 +165,7 @@ impl EventStore for InMemoryEventStore {
                 channels.contains(&e.room_id)
                     && strictly_after(e, after)
                     && !strictly_after(e, through)
-                    && headers.matches(&e.headers)
+                    && rule.matches_event(e)
             }),
             |e| (e.lamport, e.event_id.0),
             limit,

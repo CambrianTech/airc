@@ -565,6 +565,16 @@ fn ensure_runtime_integrations() {
             eprintln!("airc: Codex hook setup skipped: {error}");
         }
     }
+    match crate::integrations::claude::install_hooks_for_default_config_if_present() {
+        Ok(None) => {}
+        Ok(Some(path)) => println!(
+            "runtime: installed AIRC UserPromptSubmit and PostToolUse hooks in {}",
+            path.display()
+        ),
+        Err(error) => {
+            eprintln!("airc: Claude Code hook setup skipped: {error}");
+        }
+    }
 }
 
 /// `version` — print package version + install dir. Distinct from
@@ -1787,7 +1797,6 @@ pub async fn run_lan_listen(
 /// `daemon` — run the long-lived daemon process on the given socket.
 pub async fn run_daemon(
     home: &Path,
-    identity: LocalIdentity,
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1856,6 +1865,12 @@ pub async fn run_daemon(
     // A parent may time out or die before this child binds. Keep startup
     // observable to stop even after that parent's admission lock is gone.
     let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home)?;
+    // From here this process's store writes are the daemon's: no lifecycle lock.
+    airc_lib::store_admission::declare_daemon(&startup.custody());
+    // Loaded only now: during an `airc update` the updater holds maintenance
+    // while this child starts, and a store write before the declaration above
+    // would be refused as a CLI writer's.
+    let identity = LocalIdentity::load_or_generate(home).await?;
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call

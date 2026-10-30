@@ -114,11 +114,74 @@ impl ClaudeHookArgs {
 /// Claude Code's user settings file: `$CLAUDE_CONFIG_DIR/settings.json` when the
 /// runtime is configured there, else `$HOME/.claude/settings.json`.
 fn default_settings() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(default_config_dir()?.join("settings.json"))
+}
+
+/// Claude Code's config directory: `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
+fn default_config_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
-        return Ok(PathBuf::from(dir).join("settings.json"));
+        return Ok(PathBuf::from(dir));
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .ok_or("neither HOME nor USERPROFILE is set; pass --settings")?;
-    Ok(PathBuf::from(home).join(".claude").join("settings.json"))
+    Ok(PathBuf::from(home).join(".claude"))
+}
+
+/// What `airc join` does for Claude Code, as it does for Codex
+/// (`codex::install::install_hooks_for_default_home_if_present`): when Claude
+/// Code's config directory exists, install (or refresh) the AIRC hooks in its
+/// `settings.json`. Idempotent; `Some(path)` only when the file changed.
+pub fn install_hooks_for_default_config_if_present(
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    install_hooks_if_present(&default_config_dir()?)
+}
+
+fn install_hooks_if_present(
+    config_dir: &Path,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    if !config_dir.is_dir() {
+        return Ok(None);
+    }
+    let path = config_dir.join("settings.json");
+    Ok(settings::install(&path, &CLAUDE_HOOKS)?.then_some(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // what this catches: `airc join` installs Claude Code's hooks exactly once. A
+    // second install changes nothing and leaves one entry per hook; a machine
+    // without Claude Code (no config directory) gets no file.
+    #[test]
+    fn join_installs_claude_hooks_once_and_only_where_claude_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("no-claude");
+        assert_eq!(install_hooks_if_present(&absent).unwrap(), None);
+        assert!(!absent.exists());
+
+        let config = dir.path().join(".claude");
+        std::fs::create_dir(&config).unwrap();
+        let settings = config.join("settings.json");
+        assert_eq!(
+            install_hooks_if_present(&config).unwrap(),
+            Some(settings.clone())
+        );
+        let first = std::fs::read_to_string(&settings).unwrap();
+        assert_eq!(
+            install_hooks_if_present(&config).unwrap(),
+            None,
+            "idempotent"
+        );
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), first);
+        for hook in CLAUDE_HOOKS.hooks {
+            assert_eq!(
+                first.matches(hook.args).count(),
+                1,
+                "{}: {first}",
+                hook.args
+            );
+        }
+    }
 }

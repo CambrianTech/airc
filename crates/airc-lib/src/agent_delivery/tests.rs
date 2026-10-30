@@ -19,6 +19,10 @@ async fn fixture() -> (tempfile::TempDir, Airc, RoomId) {
     (dir, airc, room)
 }
 async fn append(airc: &Airc, room: RoomId, n: u64) {
+    say(airc, room, n, &format!("event-{n}")).await;
+}
+/// Event `n` saying `text` to the whole room (target All).
+async fn say(airc: &Airc, room: RoomId, n: u64, text: &str) {
     airc.append_event(TranscriptEvent {
         event_id: EventId::from_u128(n as u128),
         room_id: room,
@@ -29,7 +33,7 @@ async fn append(airc: &Airc, room: RoomId, n: u64) {
         lamport: n,
         target: MentionTarget::All,
         headers: Headers::new(),
-        body: Some(Body::text(format!("event-{n}"))),
+        body: Some(Body::text(text)),
         attachment: None,
         receipt: None,
         metadata: serde_json::Value::Null,
@@ -112,9 +116,11 @@ async fn native_attach_summarizes_only_the_detached_gap() {
     assert_eq!(fresh.live_events()[0].lamport, 5);
 }
 // what this catches: card ba22c72c. A long backlog is counted by the store once,
-// with its original times (header-routed, no event read); it settles only when
-// the bounded addressed search has covered it, and never shows the count twice;
-// only events newer than attachment deliver, across a restart.
+// with its original times (header-routed, no event read); with no request
+// addressed here, the store's addressee scan finds no candidate and the backlog
+// settles on the turn that showed its count, never walking the ambient events;
+// the count is never shown twice; only events newer than attachment deliver,
+// across a restart.
 #[tokio::test]
 async fn backlog_is_counted_once_and_settles_when_searched() {
     let (dir, airc, room) = fixture().await;
@@ -174,24 +180,13 @@ async fn backlog_is_counted_once_and_settles_when_searched() {
     assert_eq!(first.live_events()[0].lamport, 5001);
     assert!(summary(&mut first, &airc).await.unwrap().counted.is_some());
     first.acknowledge(1, true).await.unwrap();
-    // The interim addressed search walks one window (64) per turn, silently,
-    // until it reaches the start: no turn settles past what it searched, and
-    // the count is never shown again.
-    let mut turns = 1;
-    loop {
-        let mut turn = airc
-            .prepare_agent_delivery("consumer", 64, 8)
-            .await
-            .unwrap();
-        if !turn.has_history() {
-            break;
-        }
-        assert!(summary(&mut turn, &airc).await.is_none(), "silent walk");
-        turn.acknowledge(0, true).await.unwrap();
-        turns += 1;
-        assert!(turns <= 5000 / 64 + 2, "the walk progresses every turn");
-    }
-    assert_eq!(turns, 5000 / 64 + 1);
+    // One candidate scan covered the whole backlog: nothing is left to walk.
+    let next = airc
+        .prepare_agent_delivery("consumer", 64, 8)
+        .await
+        .unwrap();
+    assert!(!next.has_history(), "settled by one addressee scan");
+    drop(next);
     assert!(airc
         .load_runtime_cursor("consumer")
         .await
@@ -206,7 +201,7 @@ async fn backlog_is_counted_once_and_settles_when_searched() {
         .unwrap();
     assert!(
         !settled.has_history(),
-        "settled once the walk reached the start"
+        "settled once the scan reached the start"
     );
     assert!(summary(&mut settled, &reopened).await.is_none());
     assert!(settled.is_empty());
@@ -272,16 +267,17 @@ async fn addressed_requests_page_across_turns_until_every_one_is_shown() {
     let done = airc.prepare_agent_delivery("paged", 64, 8).await.unwrap();
     assert!(!done.has_history());
 }
-// what this catches (Codex on #1617): when the bounded interim search cannot see
-// the whole range, it never settles past a request it has not reached: an old
-// request under 30 newer events is shown on the turn that reaches it, and the
-// history settles only after that.
+// what this catches (Codex on #1617): when a turn's candidate budget cannot
+// cover the whole range, it never settles past a request it has not reached: an
+// old request under 30 newer `@Codex` requests (store candidates, addressed to
+// someone else) is shown on the turn that reaches it, and the history settles
+// only after that.
 #[tokio::test]
 async fn an_incomplete_search_never_settles_past_an_unseen_request() {
     let (_dir, airc, room) = fixture().await;
     airc.append_event(request(&airc, room, 1)).await.unwrap();
     for n in 2..=31 {
-        append(&airc, room, n).await;
+        say(&airc, room, n, "@Codex take this one").await;
     }
     let narrow = AddressedWindow {
         candidates: 10,
@@ -365,12 +361,13 @@ async fn an_old_request_beyond_the_tail_survives_a_dropped_reattach_and_restart(
     assert_eq!(walk(&restarted, "old", WINDOW, true).await, vec![1]);
 }
 // what this catches (Codex (b) on #1617): the addressed checkpoint moves only
-// through the range a turn actually scanned; the unscanned rest stays unsettled.
+// through the candidates a turn actually scanned; the unscanned rest stays
+// unsettled (30 `@Codex` candidates, a budget of 10).
 #[tokio::test]
 async fn the_addressed_checkpoint_moves_only_through_scanned_ranges() {
     let (_dir, airc, room) = fixture().await;
     for n in 1..=30 {
-        append(&airc, room, n).await;
+        say(&airc, room, n, "@Codex take this one").await;
     }
     let narrow = AddressedWindow {
         candidates: 10,
@@ -447,7 +444,8 @@ async fn a_crash_after_output_replays_the_page_and_never_skips() {
 }
 // what this catches (Cormac on #1617): a request that arrives during a SECOND
 // outage, while older addressed pages are still owed, is searched too and
-// emitted exactly once; no shown request is emitted again.
+// emitted exactly once, after the older obligations (FIFO over ranges); no
+// shown request is emitted again.
 #[tokio::test]
 async fn a_request_from_a_second_outage_is_emitted_exactly_once() {
     let (_dir, airc, room) = fixture().await;
@@ -478,21 +476,21 @@ async fn a_request_from_a_second_outage_is_emitted_exactly_once() {
     );
     assert_eq!(&shown[..8], (13..=20).rev().collect::<Vec<_>>().as_slice());
     assert_eq!(
-        shown[8], 21,
-        "the late request is searched first, newest range first"
+        shown[20], 21,
+        "the late request follows the older obligations: oldest range first"
     );
 }
 
 // what this catches (Cormac on #1617): at the scan cap, "reached the start" is
-// read from the raw scan. With --count 4096 and more than 4096 events below an
-// exclusive top, the oldest event (a request to me) is still emitted, not settled
-// unseen.
+// read from the candidate scan itself. With --count 4096 and more than 4096
+// candidates (`@Codex` requests, someone else's) below an exclusive top, the
+// oldest event (a request to me) is still emitted, not settled unseen.
 #[tokio::test]
 async fn at_the_scan_cap_the_oldest_request_is_still_emitted() {
     let (_dir, airc, room) = fixture().await;
     airc.append_event(request(&airc, room, 1)).await.unwrap();
     for n in 2..=8300 {
-        append(&airc, room, n).await;
+        say(&airc, room, n, "@Codex take this one").await;
     }
     let me = airc.addressee().await.unwrap();
     // At the cap, and (Codex) far above it: both clamp to one 4096-event scan.
@@ -796,4 +794,248 @@ async fn unknown_state_version_refuses_without_overwriting() {
             .version,
         99
     );
+}
+// what this catches: a hook that never catches up. Paged oldest first, a consumer whose peers
+// posted faster than its page read a three-day-old backlog nine events a call, and everything
+// addressed to it that day stayed out of reach (a Claude Code session, 2026-10-29). Further
+// behind than one turn can read, it re-attaches: the backlog is counted as history, nothing of
+// it replays as live, the delivery proof `live` does not move past output never shown, and the
+// next message is delivered live.
+#[tokio::test]
+async fn a_consumer_further_behind_than_a_turn_reattaches_at_the_present() {
+    let (_dir, airc, room) = fixture().await;
+    let first = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
+    let delivered = first.state.live.clone();
+    first.acknowledge(0, true).await.unwrap();
+    for n in 1..=10 {
+        append(&airc, room, n).await;
+    }
+    let mut behind = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
+    assert!(
+        behind.live_events().is_empty(),
+        "the backlog never replays as live"
+    );
+    assert_eq!(
+        summary(&mut behind, &airc).await.unwrap().counted.unwrap(),
+        counted(10, 1, 10)
+    );
+    assert_eq!(
+        behind.state.live, delivered,
+        "the re-attach never advances the delivery proof"
+    );
+    behind.acknowledge(0, true).await.unwrap();
+    append(&airc, room, 11).await;
+    let present = airc.prepare_agent_delivery("hook", 4, 4).await.unwrap();
+    assert_eq!(
+        present.state.live, delivered,
+        "nothing of the backlog was shown live, so nothing is marked delivered"
+    );
+    assert_eq!(
+        present
+            .live_events()
+            .iter()
+            .map(|e| e.lamport)
+            .collect::<Vec<_>>(),
+        vec![11]
+    );
+}
+// what this catches (Codex on the addressee index): the store pre-filter keeps
+// the exact Addressee semantics. A typed-target request, my name in another case
+// and my shown id are shown; `@Codex` (a store candidate, someone else's) and my
+// name mid-sentence are not, under a range of ambient events.
+#[tokio::test]
+async fn the_addressee_index_keeps_exact_addressing() {
+    let (_dir, airc, room) = fixture().await;
+    let name = airc.agent_name().to_uppercase();
+    let shown = airc.peer_id().shown();
+    airc.append_event(request(&airc, room, 1)).await.unwrap();
+    say(&airc, room, 2, &format!("@{name} please look")).await;
+    say(&airc, room, 3, &format!(" ,@{shown} ping")).await;
+    say(&airc, room, 4, "@Codex not for you").await;
+    say(&airc, room, 5, &format!("ask @{name} later")).await;
+    for n in 6..=200 {
+        append(&airc, room, n).await;
+    }
+    assert_eq!(walk(&airc, "exact", WINDOW, false).await, vec![3, 2, 1]);
+}
+// what this catches (Codex on #1618): an addressed obligation survives output
+// that is never acknowledged: a turn that showed the request is dropped, the
+// consumer re-attaches, then the process restarts, and the request is shown
+// each time until a turn acknowledges it.
+#[tokio::test]
+async fn a_request_shown_without_ack_survives_reattach_and_restart() {
+    let (dir, airc, room) = fixture().await;
+    airc.prepare_native_delivery("pending", true, 64, 64)
+        .await
+        .unwrap()
+        .acknowledge(0, true)
+        .await
+        .unwrap();
+    airc.append_event(request(&airc, room, 1)).await.unwrap();
+    for n in 2..=100 {
+        append(&airc, room, n).await;
+    }
+    let addressed = |found: Option<HistorySummary>| -> Vec<u64> {
+        found
+            .map(|f| f.addressed.iter().map(|e| e.lamport).collect())
+            .unwrap_or_default()
+    };
+    let mut first = airc
+        .prepare_native_delivery("pending", true, 64, 64)
+        .await
+        .unwrap();
+    assert_eq!(addressed(summary(&mut first, &airc).await), vec![1]);
+    drop(first); // shown, never acknowledged
+    let mut again = airc
+        .prepare_native_delivery("pending", true, 64, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        addressed(summary(&mut again, &airc).await),
+        vec![1],
+        "a re-attach keeps it"
+    );
+    drop(again);
+    drop(airc);
+    let restarted = Airc::open_with_wire_root_for_test(dir.path(), dir.path())
+        .await
+        .unwrap();
+    let mut after = restarted
+        .prepare_native_delivery("pending", true, 64, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        addressed(summary(&mut after, &restarted).await),
+        vec![1],
+        "a restart keeps it"
+    );
+    after.acknowledge(0, true).await.unwrap();
+    let done = restarted
+        .prepare_native_delivery("pending", false, 64, 64)
+        .await
+        .unwrap();
+    assert!(!done.has_history(), "acknowledged, it settles");
+}
+// what this catches (Codex on #1618): under sustained ambient traffic every poll
+// re-attaches and appends a new unsearched range; when the flood per poll exceeds
+// the candidate budget, an older request stayed below the newest range forever.
+// With the store selecting candidates, the old request is shown on the first
+// poll, and a request arriving mid-flood is shown on the very next poll.
+#[tokio::test]
+async fn an_old_request_is_shown_under_a_flood_before_every_poll() {
+    let (_dir, airc, room) = fixture().await;
+    airc.prepare_native_delivery("flood", true, 64, 64)
+        .await
+        .unwrap()
+        .acknowledge(0, true)
+        .await
+        .unwrap();
+    airc.append_event(request(&airc, room, 1)).await.unwrap();
+    let me = airc.addressee().await.unwrap();
+    let mut n = 1;
+    let mut late = None;
+    let mut shown = Vec::new(); // (poll, lamport)
+    for poll in 0..6 {
+        // More than the candidate budget (64) and the scan limit, every poll.
+        for _ in 0..200 {
+            n += 1;
+            append(&airc, room, n).await;
+        }
+        if poll == 3 {
+            n += 1;
+            airc.append_event(request(&airc, room, n)).await.unwrap();
+            late = Some(n);
+            for _ in 0..200 {
+                n += 1;
+                append(&airc, room, n).await;
+            }
+        }
+        let mut turn = airc
+            .prepare_native_delivery("flood", false, 64, 64)
+            .await
+            .unwrap();
+        shown.extend(
+            turn.live_events()
+                .iter()
+                .filter(|e| me.is_addressed(e))
+                .map(|e| (poll, e.lamport)),
+        );
+        if let Some(found) = turn
+            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, WINDOW)
+            .await
+            .unwrap()
+        {
+            shown.extend(found.addressed.iter().map(|e| (poll, e.lamport)));
+        }
+        let live_end = turn.live_events().len();
+        turn.acknowledge(live_end, true).await.unwrap();
+    }
+    assert_eq!(shown, vec![(0, 1), (3, late.unwrap())]);
+}
+// what this catches (Codex on #1618): starvation by NEW addressed traffic. With the
+// newest range served first, every re-attach's fresh requests took the page and an older
+// pending request R0 was never reached. Before every poll a flood arrives with three new
+// requests and 200 ambient events (a re-attach each time) at a page of two: R0 is emitted by
+// the second poll, and once the floods stop every request is emitted exactly once.
+#[tokio::test]
+async fn new_addressed_traffic_never_starves_an_older_pending_request() {
+    let (_dir, airc, room) = fixture().await;
+    airc.prepare_native_delivery("fifo", true, 64, 64)
+        .await
+        .unwrap()
+        .acknowledge(0, true)
+        .await
+        .unwrap();
+    airc.append_event(request(&airc, room, 1)).await.unwrap();
+    let me = airc.addressee().await.unwrap();
+    let small = AddressedWindow {
+        candidates: 64,
+        page: 2,
+    };
+    let mut n = 1;
+    let mut requests = vec![1];
+    let mut shown = Vec::new(); // (poll, lamport)
+    for poll in 0..40 {
+        if poll < 6 {
+            for k in 0..203 {
+                n += 1;
+                if k % 70 == 0 {
+                    airc.append_event(request(&airc, room, n)).await.unwrap();
+                    requests.push(n);
+                } else {
+                    append(&airc, room, n).await;
+                }
+            }
+        }
+        let mut turn = airc
+            .prepare_native_delivery("fifo", false, 64, 64)
+            .await
+            .unwrap();
+        if poll >= 6 && !turn.has_history() {
+            break;
+        }
+        shown.extend(
+            turn.live_events()
+                .iter()
+                .filter(|e| me.is_addressed(e))
+                .map(|e| (poll, e.lamport)),
+        );
+        if let Some(found) = turn
+            .history_summary(airc_core::HeaderFilter::Any, None, |_| true, &me, small)
+            .await
+            .unwrap()
+        {
+            shown.extend(found.addressed.iter().map(|e| (poll, e.lamport)));
+        }
+        let live_end = turn.live_events().len();
+        turn.acknowledge(live_end, true).await.unwrap();
+    }
+    let r0 = shown.iter().find(|(_, lamport)| *lamport == 1);
+    assert!(
+        r0.is_some_and(|(poll, _)| *poll <= 1),
+        "R0 within two polls: {shown:?}"
+    );
+    let mut emitted: Vec<u64> = shown.iter().map(|(_, lamport)| *lamport).collect();
+    emitted.sort_unstable();
+    assert_eq!(emitted, requests, "every request exactly once: {shown:?}");
 }

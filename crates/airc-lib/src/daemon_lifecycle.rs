@@ -6,6 +6,8 @@ use std::path::Path;
 
 use fs2::FileExt;
 
+use airc_store::custody::{try_shared, LIFECYCLE_LOCK, MAINTENANCE_LOCK};
+
 pub struct DaemonLifecycleGuard {
     active: File,
     _maintenance_intent: Option<File>,
@@ -19,7 +21,24 @@ pub struct DaemonStartupGuard {
     owner: crate::MachineAccountHome,
 }
 
+/// Proof that this process is the daemon admitted through
+/// [`DaemonStartupGuard::acquire`]. Presented once to
+/// [`crate::store_admission::declare_daemon`], it makes this process's store
+/// writes take no lifecycle lock (an `airc update` excludes the daemon by
+/// stopping it), so they never contend with the startup guard.
+/// Constructed only by [`DaemonStartupGuard::custody`].
+#[derive(Clone, Debug)]
+pub struct DaemonCustody {
+    _admitted: (),
+}
+
 impl DaemonStartupGuard {
+    /// This daemon's custody proof, minted while startup is held; it stays
+    /// valid after [`Self::bound`] for the process's lifetime.
+    pub fn custody(&self) -> DaemonCustody {
+        DaemonCustody { _admitted: () }
+    }
+
     pub fn acquire(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
         let active = DaemonLifecycleGuard::open(&owner, "daemon-startup.lock")?;
@@ -52,20 +71,10 @@ impl DaemonLifecycleGuard {
         // Hold the admission gate only while acquiring the active read lock.
         // A waiting updater closes this gate before draining existing readers,
         // so continuous new CLI calls cannot starve installation.
-        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
-        FileExt::try_lock_shared(&intent).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("daemon maintenance requested; autostart refused: {error}"),
-            )
-        })?;
-        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
-        FileExt::try_lock_shared(&file).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("daemon maintenance in progress; autostart refused: {error}"),
-            )
-        })?;
+        let intent = Self::open(&owner, MAINTENANCE_LOCK)?;
+        try_shared(&intent)?;
+        let file = Self::open(&owner, LIFECYCLE_LOCK)?;
+        try_shared(&file)?;
         let guard = Self {
             active: file,
             _maintenance_intent: None,
@@ -82,9 +91,9 @@ impl DaemonLifecycleGuard {
     /// Process cancellation releases both locks, including a pending acquisition.
     pub fn maintenance(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
-        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
+        let intent = Self::open(&owner, MAINTENANCE_LOCK)?;
         FileExt::lock_exclusive(&intent)?;
-        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
+        let file = Self::open(&owner, LIFECYCLE_LOCK)?;
         FileExt::lock_exclusive(&file).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -163,13 +172,7 @@ impl DaemonLifecycleGuard {
     }
 
     fn open(owner: &crate::MachineAccountHome, name: &str) -> io::Result<File> {
-        std::fs::create_dir_all(owner)?;
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(owner.join(name))
+        airc_store::custody::lock_file(owner.as_path(), name)
     }
 }
 
@@ -208,6 +211,37 @@ impl Drop for DaemonLifecycleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use airc_store::custody::is_maintenance_in_progress;
+
+    // what this catches (Codex on #1618): a CLI auto-start attempted in the update's
+    // stop/swap window, from another thread as a hook would from another process, is
+    // refused with the typed maintenance error (never a spawn); and an update that FAILS
+    // while holding maintenance releases it, so the next auto-start is admitted.
+    #[test]
+    fn an_update_window_refuses_autostart_typed_and_a_failed_update_releases_it() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_owned();
+        let (held, window) = mpsc::channel();
+        let (finish, finished) = mpsc::channel::<()>();
+        let updater = std::thread::spawn(move || -> Result<(), io::Error> {
+            let _custody = DaemonLifecycleGuard::maintenance(&home)?;
+            held.send(()).map_err(io::Error::other)?;
+            finished.recv().map_err(io::Error::other)?;
+            Err(io::Error::other("injected update failure after the stop"))
+        });
+        window.recv().unwrap();
+        let refused = DaemonLifecycleGuard::autostart(dir.path()).err().unwrap();
+        assert!(is_maintenance_in_progress(&refused), "{refused}");
+        assert!(refused.to_string().contains("update"), "{refused}");
+        finish.send(()).unwrap();
+        assert!(updater.join().unwrap().is_err(), "the update failed");
+        assert!(
+            DaemonLifecycleGuard::autostart(dir.path()).is_ok(),
+            "custody released on the failure path"
+        );
+    }
 
     // A reconnect must not respawn the old executable inside stop/install;
     // releasing the updater's OS lock must immediately restore autostart.

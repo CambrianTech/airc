@@ -73,6 +73,7 @@ pub mod route_forwarder;
 pub mod router_bridge;
 pub mod runtime_dir;
 pub mod socket_path;
+pub mod store_admission;
 mod stream;
 pub mod stream_chunk;
 pub mod subscriptions;
@@ -254,5 +255,5 @@ pub use airc_work::{
 
 mod addressing;
 mod agent_delivery;
-pub use addressing::{leading_mentions, Addressee};
+pub use addressing::Addressee;
 pub use agent_delivery::{AddressedWindow, AgentDeliveryTurn, HistorySummary};

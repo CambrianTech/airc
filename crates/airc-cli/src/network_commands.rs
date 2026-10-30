@@ -9,7 +9,6 @@ use airc_lib::{
     coordinator_snapshot_store, machine_account_home, resolve_mesh_identity, Airc,
     CoordinatorConfig, PresenceBeacon, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
-use airc_store::SqliteEventStore;
 
 pub fn run_lan_ip() -> Result<(), Box<dyn Error>> {
     if let Some(ip) = detect_lan_ip() {
@@ -300,7 +299,7 @@ pub async fn run_network(home: &Path, show_all_stale: bool) -> Result<(), Box<dy
     // daemon's coordinator writes beacons into. Reading it shows what
     // THIS daemon knows about the mesh, with no gh round-trip.
     let db_path = machine_account_home(home).join("events.sqlite");
-    let store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    let store = Arc::new(airc_store::SqliteEventStore::open_path(&db_path).await?);
     let identity = resolve_mesh_identity(store.as_ref())
         .await?
         .as_mesh_identity();

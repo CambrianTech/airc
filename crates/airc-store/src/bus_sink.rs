@@ -33,7 +33,7 @@ use bytes::Bytes;
 use sea_orm::{
     sea_query::{Expr, OnConflict},
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
@@ -64,6 +64,8 @@ const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 pub struct SqliteDurableSink {
     db: DatabaseConnection,
     readers: DatabaseConnection,
+    /// How this sink's writes are admitted ([`crate::custody`]).
+    custody: crate::custody::WriteGate,
 }
 
 impl SqliteDurableSink {
@@ -80,27 +82,33 @@ impl SqliteDurableSink {
     ///
     /// For an in-memory store use `"sqlite::memory:"`; for a file store
     /// use `"sqlite://<path>?mode=rwc"`.
-    pub async fn open(db_url: &str) -> Result<Self, BusError> {
+    pub(crate) async fn open(
+        db_url: &str,
+        admission: crate::custody::Admission,
+    ) -> Result<Self, BusError> {
+        let custody = crate::custody::WriteGate::new(admission).map_err(BusError::sink_source)?;
         let mut opts = Self::pool_options(db_url);
         // WAL + the busy timeout ride the connection options so the journal switch
         // never needs a separate exclusive statement racing another opener — see
         // `SqliteEventStore::open` (2026-09-14: "database is locked" at attach on
-        // Windows CI). `set_wal` stays as the idempotent belt for an old DB.
+        // Windows CI). The driver applies them to every connection it opens, an
+        // old DB's included (§3.3: WAL lets deep-replay reads run beside the one
+        // writer; `synchronous=NORMAL` fsyncs per checkpoint, not per commit).
         opts.map_sqlx_sqlite_opts(|so| {
             use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
             so.journal_mode(SqliteJournalMode::Wal)
                 .synchronous(SqliteSynchronous::Normal)
                 .busy_timeout(POOL_ACQUIRE_TIMEOUT)
         });
+        let write = custody.admit().map_err(BusError::sink_source)?;
         let db = Database::connect(opts)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
-        set_wal(&db).await?;
-        // Forward-compatible both directions: tolerate a DB migrated
-        // ahead of this binary (version skew must not brick the sink).
+            .map_err(BusError::sink_source)?;
+        // Migrate forward atomically, derive what rows owe, and refuse a DB
+        // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         // Inspect the driver's resolved mode rather than guessing from the
         // input URL. Reopening a memory URL can create a different database;
         // shared-cache memory also lacks file-WAL reader/writer isolation.
@@ -145,9 +153,24 @@ impl SqliteDurableSink {
             opts.map_sqlx_sqlite_opts(move |_| read_options.clone());
             Database::connect(opts)
                 .await
-                .map_err(|e| BusError::Sink(e.to_string()))?
+                .map_err(BusError::sink_source)?
         };
-        Ok(Self { db, readers })
+        drop(write);
+        Ok(Self {
+            db,
+            readers,
+            custody,
+        })
+    }
+
+    /// Admit one write: custody, then no migration past this binary since
+    /// open ([`crate::SqliteEventStore::admit_write`] is the same rule).
+    async fn admit_write(&self) -> Result<crate::custody::WriteTicket<'_>, BusError> {
+        let ticket = self.custody.admit().map_err(BusError::sink_source)?;
+        crate::migration::refuse_if_ahead(&self.db)
+            .await
+            .map_err(BusError::sink_source)?;
+        Ok(ticket)
     }
 
     /// Open a file-backed durable tier from a filesystem path. Keeps
@@ -155,10 +178,11 @@ impl SqliteDurableSink {
     pub async fn open_path(path: &Path) -> Result<Self, BusError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| BusError::Sink(e.to_string()))?;
+                std::fs::create_dir_all(parent).map_err(BusError::sink_source)?;
             }
         }
-        Self::open(&sqlite_file_url(path)).await
+        let admission = crate::custody::resolve(path).map_err(BusError::sink_source)?;
+        Self::open(&sqlite_file_url(path), admission).await
     }
 
     /// Inspect an existing owner store without creating it, migrating it, or
@@ -179,16 +203,19 @@ impl SqliteDurableSink {
         });
         let db = Database::connect(opts)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
+        // Read-only: SQLite refuses its writes, so they need no admission.
         Ok(Self {
             readers: db.clone(),
             db,
+            custody: crate::custody::WriteGate::new(crate::custody::Admission::Unmanaged)
+                .map_err(BusError::sink_source)?,
         })
     }
 
     /// Open an ephemeral in-memory durable tier. Convenience for tests.
     pub async fn in_memory() -> Result<Self, BusError> {
-        Self::open("sqlite::memory:").await
+        Self::open("sqlite::memory:", crate::custody::Admission::Unmanaged).await
     }
 
     /// Bump the persisted generational epoch on **this** ORM and return
@@ -197,6 +224,7 @@ impl SqliteDurableSink {
     /// transcript (`bus_event`) and the epoch cell (`bus_epoch`) in one
     /// ORM — the single-writer machine store (§3.3 / §3.8).
     pub async fn bump_epoch(&self) -> Result<crate::SqliteEpochStore, BusError> {
+        let _write = self.admit_write().await?;
         crate::SqliteEpochStore::bump(&self.db).await
     }
 }
@@ -208,54 +236,48 @@ impl DurableSink for SqliteDurableSink {
         // must not double-store. ON CONFLICT DO NOTHING — a duplicate is
         // a silent no-op, never an error (the router treats append as
         // at-least-once).
-        let active = to_active_model(e)?;
-        let res = bus_event::Entity::insert(active)
-            .on_conflict(
-                OnConflict::column(bus_event::Column::EventId)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(&self.db)
-            .await;
-        match res {
-            Ok(_) => Ok(()),
-            // `RecordNotInserted` is the DO-NOTHING path: the event_id
-            // already exists. Idempotent success, not an error.
-            Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
-            Err(err) => Err(BusError::Sink(err.to_string())),
-        }
+        self.append_batch(&[e]).await
     }
 
-    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the whole
-    /// batch = ONE transaction commit (vs one per event in `append`); fsync work
-    /// is amortized at WAL checkpoint under synchronous=NORMAL. Same
-    /// idempotent-on-`event_id` contract. SQLite executes a multi-VALUES insert
-    /// as one atomic statement, so on error nothing is committed and the caller
-    /// re-pins the whole batch (no partial-persist ambiguity — verified by
-    /// `append_batch_mixed_persists_every_new_event`).
+    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the
+    /// events and their header rows, in ONE transaction (one commit per batch,
+    /// not per event); fsync work is amortized at WAL checkpoint under
+    /// synchronous=NORMAL. Same idempotent-on-`event_id` contract: a replayed
+    /// event and its headers conflict and are skipped. On error nothing is
+    /// committed and the caller re-pins the whole batch (no partial-persist
+    /// ambiguity — verified by `append_batch_mixed_persists_every_new_event`).
     async fn append_batch(&self, events: &[&Envelope]) -> Result<(), BusError> {
         if events.is_empty() {
             return Ok(());
         }
+        let sink = |err: sea_orm::DbErr| BusError::Sink(err.to_string());
+        let _write = self.admit_write().await?;
         let actives = events
             .iter()
             .map(|e| to_active_model(e))
             .collect::<Result<Vec<_>, _>>()?;
-        let res = bus_event::Entity::insert_many(actives)
+        let txn = self.db.begin().await.map_err(sink)?;
+        match bus_event::Entity::insert_many(actives)
             .on_conflict(
                 OnConflict::column(bus_event::Column::EventId)
                     .do_nothing()
                     .to_owned(),
             )
-            .exec(&self.db)
-            .await;
-        match res {
-            Ok(_) => Ok(()),
+            .exec(&txn)
+            .await
+        {
             // Every row in the batch already existed (all conflicted) — the
             // DO-NOTHING all-dupes path. Idempotent success, not an error.
-            Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
-            Err(err) => Err(BusError::Sink(err.to_string())),
+            Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
+            Err(err) => return Err(sink(err)),
         }
+        crate::header_query::write_header_rows::<bus_event::Entity>(
+            &txn,
+            events.iter().map(|e| (e.event_id.as_uuid(), &e.headers)),
+        )
+        .await
+        .map_err(sink)?;
+        txn.commit().await.map_err(sink)
     }
 
     async fn page_matching(
@@ -263,7 +285,7 @@ impl DurableSink for SqliteDurableSink {
         channel: RoomId,
         after: Cursor,
         through: Cursor,
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
     ) -> Result<Vec<Envelope>, BusError> {
@@ -276,26 +298,24 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
-        let query = matching_rows(channel, after, through, headers);
-        let order = if tail {
-            sea_orm::Order::Desc
-        } else {
-            sea_orm::Order::Asc
-        };
-        let rows = query
-            .order_by(bus_event::Column::Epoch, order.clone())
-            .order_by(bus_event::Column::Counter, order.clone())
-            .order_by(bus_event::Column::EventId, order)
-            .limit(bounded)
-            .all(&self.readers)
-            .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
-
-        let mut rows = rows;
-        if tail {
-            rows.reverse();
+        let mut branches = Vec::new();
+        for query in page_rows(channel, after, through, rule, bounded, tail) {
+            branches.push(
+                query
+                    .all(&self.readers)
+                    .await
+                    .map_err(BusError::sink_source)?,
+            );
         }
-        rows.into_iter().map(from_model).collect()
+        crate::event_table::merge_branches(
+            branches,
+            |row| (row.epoch, row.counter, row.event_id),
+            limit,
+            tail,
+        )
+        .into_iter()
+        .map(from_model)
+        .collect()
     }
 
     async fn count_matching(
@@ -308,9 +328,8 @@ impl DurableSink for SqliteDurableSink {
     ) -> Result<airc_core::HistoryCount, BusError> {
         let mut rows = matching_rows(channel, after, through, headers);
         if let Some(rule) = exclude {
-            rows = rows.filter(crate::header_query::not_runtime_self(
+            rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
                 rule,
-                bus_event::Column::ClientId,
             ));
         }
         // COUNT/MIN/MAX in the store: no row, header JSON or payload leaves SQLite.
@@ -322,7 +341,7 @@ impl DurableSink for SqliteDurableSink {
             .into_tuple()
             .one(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         let Some((count, oldest, newest)) = row else {
             return Ok(airc_core::HistoryCount::default());
         };
@@ -386,7 +405,7 @@ impl DurableSink for SqliteDurableSink {
             .limit(bounded)
             .all(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
 
         rows.into_iter().map(from_model).collect()
     }
@@ -424,7 +443,7 @@ impl DurableSink for SqliteDurableSink {
             .limit(bounded)
             .all(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
 
         // DESC off the index, ascending to the caller.
         rows.into_iter().rev().map(from_model).collect()
@@ -462,7 +481,7 @@ impl DurableSink for SqliteDurableSink {
             .limit(bounded)
             .all(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
 
         rows.into_iter().rev().map(from_model).collect()
     }
@@ -480,7 +499,7 @@ impl DurableSink for SqliteDurableSink {
             .order_by_desc(bus_event::Column::EventId)
             .one(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         Ok(row.map(|r| {
             Cursor::new(
                 airc_bus::Seq::new(r.epoch as u64, r.counter as u64),
@@ -495,32 +514,15 @@ impl DurableSink for SqliteDurableSink {
         let row = bus_event::Entity::find_by_id(event_id.as_uuid())
             .one(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         Ok(row.is_some())
     }
-}
-
-/// Put the connection in WAL journal mode (§3.3). WAL lets the
-/// deep-replay reads run concurrently with the single writer without
-/// blocking it; `synchronous=NORMAL` is the standard WAL durability
-/// trade (an fsync per checkpoint, not per commit) and is safe for the
-/// deliver-first / persist-async contract (§3.3 — the ORM is the source
-/// of truth; a crash loses only the un-flushed tail, replayable from
-/// peers). In-memory databases ignore the pragma.
-async fn set_wal(db: &DatabaseConnection) -> Result<(), BusError> {
-    use sea_orm::{ConnectionTrait, Statement};
-    let backend = db.get_database_backend();
-    for pragma in ["PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;"] {
-        db.execute(Statement::from_string(backend, pragma.to_owned()))
-            .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
-    }
-    Ok(())
 }
 
 /// The ONE sanctioned `Envelope -> row` serialize (§3.3). Lives only
 /// here; no other copy of this mapping exists.
 fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
+    let addressing = e.addressing();
     Ok(bus_event::ActiveModel {
         event_id: Set(e.event_id.as_uuid()),
         room_id: Set(e.channel.as_uuid()),
@@ -536,6 +538,9 @@ fn to_active_model(e: &Envelope) -> Result<bus_event::ActiveModel, BusError> {
         peer_id: Set(e.from.0.as_uuid()),
         client_id: Set(e.from.1.as_uuid()),
         occurred_at_ms: Set(u64_to_i64("bus_events.occurred_at_ms", e.occurred_at_ms)?),
+        addressed_peer: Set(addressing.peer.map(|peer| peer.as_uuid())),
+        leading_mention: Set(addressing.leading_mention),
+        derived_version: Set(crate::derive::DERIVED_VERSION),
     })
 }
 
@@ -613,8 +618,32 @@ fn matching_rows(
             strictly_before(through)
                 .or(Expr::col(bus_event::Column::EventId).eq(through.event_id.as_uuid())),
         )
-        .filter(crate::header_query::predicate(headers))
+        .filter(crate::header_query::predicate::<bus_event::Entity>(headers))
         .filter(bus_event::Column::Delivery.eq("durable"))
+}
+
+/// The selects `page_matching` reads: [`matching_rows`], the first `limit` in
+/// cursor order (the last, for `tail`); with an addressee filter, one per
+/// branch ([`crate::event_table::addressee_branches`]).
+fn page_rows(
+    channel: RoomId,
+    after: Cursor,
+    through: Cursor,
+    rule: airc_core::HistoryMatch<'_>,
+    limit: u64,
+    tail: bool,
+) -> Vec<sea_orm::Select<bus_event::Entity>> {
+    let order = if tail {
+        sea_orm::Order::Desc
+    } else {
+        sea_orm::Order::Asc
+    };
+    let query = matching_rows(channel, after, through, rule.headers)
+        .order_by(bus_event::Column::Epoch, order.clone())
+        .order_by(bus_event::Column::Counter, order.clone())
+        .order_by(bus_event::Column::EventId, order)
+        .limit(limit);
+    crate::event_table::addressee_branches(query, rule.addressed_to)
 }
 
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],

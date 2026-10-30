@@ -15,7 +15,10 @@
 //! not survive a restart, so the daemon must use this cell.
 
 use airc_bus::{BusError, EpochStore};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{DatabaseConnection, EntityTrait, Set, TransactionTrait};
+
+use crate::entities::bus_epoch;
 
 /// ORM-backed persisted epoch cell (the singleton `bus_epoch` row).
 pub struct SqliteEpochStore {
@@ -24,27 +27,38 @@ pub struct SqliteEpochStore {
 
 impl SqliteEpochStore {
     /// Atomically increment the persisted epoch and capture the new value.
-    /// One round-trip; run once per daemon start. The first-ever bump
+    /// One transaction; run once per daemon start. The first-ever bump
     /// yields `1` (epoch `0` is the "never started" sentinel reserved for
     /// unstamped envelopes). The single-writer daemon owns the store, and
     /// the UPSERT is atomic regardless.
     pub async fn bump(db: &DatabaseConnection) -> Result<Self, BusError> {
-        let backend = db.get_database_backend();
-        // Insert-or-increment in one statement. In SQLite's UPSERT, an
-        // unqualified column in DO UPDATE refers to the existing row, so
-        // `epoch = epoch + 1` increments; RETURNING hands back the new
-        // value atomically.
-        let sql = "INSERT INTO bus_epoch (id, epoch) VALUES (0, 1) \
-                   ON CONFLICT(id) DO UPDATE SET epoch = epoch + 1 \
-                   RETURNING epoch";
-        let row = db
-            .query_one(Statement::from_string(backend, sql.to_owned()))
+        let sink = |e: sea_orm::DbErr| BusError::Sink(e.to_string());
+        // Insert-or-increment, then read the row back, in one transaction.
+        // In SQLite's UPSERT the qualified column in DO UPDATE is the existing
+        // row, so `epoch = bus_epoch.epoch + 1` increments.
+        let txn = db.begin().await.map_err(sink)?;
+        bus_epoch::Entity::insert(bus_epoch::ActiveModel {
+            id: Set(0),
+            epoch: Set(1),
+        })
+        .on_conflict(
+            OnConflict::column(bus_epoch::Column::Id)
+                .value(
+                    bus_epoch::Column::Epoch,
+                    Expr::col((bus_epoch::Entity, bus_epoch::Column::Epoch)).add(1),
+                )
+                .to_owned(),
+        )
+        .exec(&txn)
+        .await
+        .map_err(sink)?;
+        let epoch = bus_epoch::Entity::find_by_id(0)
+            .one(&txn)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?
-            .ok_or_else(|| BusError::Sink("bus_epoch bump returned no row".to_owned()))?;
-        let epoch: i64 = row
-            .try_get("", "epoch")
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(sink)?
+            .ok_or_else(|| BusError::Sink("bus_epoch bump left no row".to_owned()))?
+            .epoch;
+        txn.commit().await.map_err(sink)?;
         let epoch = u64::try_from(epoch)
             .map_err(|_| BusError::Sink(format!("bus_epoch out of u64 range: {epoch}")))?;
         Ok(Self { epoch })

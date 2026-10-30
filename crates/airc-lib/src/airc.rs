@@ -663,6 +663,9 @@ impl Airc {
         // an `agent_name` (the anonymous default-scope path never pins ids).
         peer_id: Option<PeerId>,
     ) -> Result<Self, AircError> {
+        // Every store this opens (identity, trust, the scope and coordinator
+        // stores) is admitted by this process's rule (`store_admission`).
+        crate::store_admission::install();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let identity = match agent_name {
             Some(agent_name) => {

@@ -10,6 +10,9 @@
 //!     `TranscriptEvent`). Composite index on
 //!     `(room_id, epoch, counter, event_id)` — the generational cursor
 //!     order — keeps `DurableSink::page` a single indexed range scan.
+//!   - `event_headers` / `bus_event_headers` — one row per header of an
+//!     `events` / `bus_events` row: the typed, indexed copy header
+//!     predicates query (`crate::header_query`).
 //!   - `runtime_cursors` — per-consumer replay cursors.
 //!   - `peer_trust` / `peer_rotation_audit` — trust anchors and
 //!     signed key-rotation audit rows.
@@ -34,8 +37,11 @@
 pub mod account_registry;
 pub mod beacon;
 pub mod beacon_channel;
+pub mod bus_epoch;
 pub mod bus_event;
+pub mod bus_event_header;
 pub mod event;
+pub mod event_header;
 pub mod local_identity;
 pub mod mesh_identity;
 pub mod peer_rotation_audit;

@@ -15,9 +15,10 @@ use super::key;
 ///   request in it emitted). Moves only when a summary turn finishes the range.
 /// - `history_counted`: the ambient count of `(summarized, boundary]` was shown.
 /// - `unsearched`: the stretches of `(summarized, boundary]` whose addressed
-///   requests are not yet all emitted, oldest first. A turn pages the newest one
-///   down; an unsettled reattach appends the new top segment rather than losing
-///   it. Nothing is ever reset, so no shown request is emitted twice, and the
+///   requests are not yet all emitted, oldest first. A turn serves the oldest
+///   one first (FIFO, so new addressed traffic cannot starve an older request),
+///   paging each down from its top; an unsettled reattach appends the new top
+///   segment rather than losing it. Nothing is ever reset, so no shown request is emitted twice, and the
 ///   range settles only when this list is empty.
 ///
 /// Settling a summary marks nothing delivered, delivering marks no history

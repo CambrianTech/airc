@@ -234,13 +234,14 @@ impl EventRouter {
     /// transcript (academy 244k rows, cambriantech 472k), so a from-zero
     /// walk was O(n²/page) and never returned inside the callers' 30 s
     /// deadline, while the board — resuming from a saved cursor — was instant.
-    /// Snapshot-bounded, header-filtered durable page. Hot pending writes remain visible.
+    /// Snapshot-bounded durable page filtered by `rule` (headers, and addressee
+    /// when set) before the limit. Hot pending writes remain visible.
     pub async fn matching_history(
         &self,
         channel: RoomId,
         after: Cursor,
         through: Cursor,
-        headers: &airc_core::HeaderFilter,
+        rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
@@ -260,7 +261,7 @@ impl EventRouter {
                             e.delivery.is_durable()
                                 && e.cursor().is_after(&after)
                                 && !e.cursor().is_after(&through)
-                                && headers.matches(&e.headers)
+                                && e.matches_history(rule)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -269,7 +270,7 @@ impl EventRouter {
         rows.extend(
             self.inner
                 .sink
-                .page_matching(channel, after, through, headers, limit, tail)
+                .page_matching(channel, after, through, rule, limit, tail)
                 .await?
                 .into_iter()
                 .map(Arc::new),
