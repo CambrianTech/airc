@@ -22,6 +22,39 @@ impl crate::Airc {
             .map_err(|_| AddressedError::Transport("addressed frame sink already installed".into()))
     }
 
+    /// Forward an intact addressed frame over an already connected host session.
+    /// Host selection and durable admission belong to the daemon; this adapter
+    /// never dials, broadcasts, changes the signature, or enters a room store.
+    pub async fn forward_addressed_frame(
+        &self,
+        host: airc_core::PeerId,
+        frame: Frame,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), AddressedError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AddressedError::DeadlineExceeded);
+        }
+        if frame.kind != airc_protocol::FrameKind::Addressed
+            || frame.envelope.channel != airc_protocol::addressed::addressed_channel()
+            || !matches!(frame.envelope.target, airc_core::MentionTarget::Peer(_))
+        {
+            return Err(AddressedError::Transport(
+                "opaque forwarding requires an addressed peer frame".into(),
+            ));
+        }
+        tokio::time::timeout_at(deadline, async {
+            let adapter = self.inner.lan_tcp.lock().await.clone().ok_or_else(|| {
+                AddressedError::Transport("addressed host transport is not running".into())
+            })?;
+            adapter
+                .send_to(host, frame)
+                .await
+                .map_err(|error| AddressedError::Transport(error.to_string()))
+        })
+        .await
+        .unwrap_or(Err(AddressedError::DeadlineExceeded))
+    }
+
     pub(crate) async fn dispatch_addressed_frame(&self, frame: Frame) {
         if let Some(sink) = self.inner.addressed.sink.get() {
             if let Err(error) = sink.deliver(frame).await {
@@ -72,6 +105,23 @@ mod tests {
                 signature: Signature::Unsigned,
             },
         };
+        assert!(matches!(
+            host.forward_addressed_frame(PeerId::new(), frame.clone(), tokio::time::Instant::now())
+                .await,
+            Err(AddressedError::DeadlineExceeded)
+        ));
+        assert!(host
+            .forward_addressed_frame(
+                PeerId::new(),
+                frame.clone(),
+                tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT
+            )
+            .await
+            .is_err());
+        assert!(
+            host.inner.lan_tcp.lock().await.is_none(),
+            "forwarding must not create a transport"
+        );
         host.append_received_frame(frame.clone()).await;
         assert_eq!(*sink.0.lock().await, vec![frame]);
         assert!(host
