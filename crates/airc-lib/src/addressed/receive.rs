@@ -46,10 +46,13 @@ impl Airc {
             &envelope.headers,
             std::time::SystemTime::now(),
         ) {
-            Ok(budget) => budget.min(airc_ipc::client::DEFAULT_RPC_TIMEOUT),
+            Ok(budget) => budget,
             Err(error) => return refuse(from, &format!("sender expiry: {error:?}")),
         };
-        let deadline = monotonic + budget;
+        let Some(deadline) = monotonic.checked_add(budget) else {
+            return refuse(from, "sender expiry exceeds monotonic clock range");
+        };
+        let transport_deadline = deadline.min(monotonic + airc_ipc::client::DEFAULT_RPC_TIMEOUT);
 
         let wire = match envelope.body.as_ref().map(AddressedWire::from_body) {
             Some(Ok(wire)) => wire,
@@ -66,7 +69,11 @@ impl Airc {
                     Ok(resp) => {
                         state.session_installed();
                         if let Err(error) = self
-                            .send_addressed_wire(from, &AddressedWire::Resp(resp), deadline)
+                            .send_addressed_wire(
+                                from,
+                                &AddressedWire::Resp(resp),
+                                transport_deadline,
+                            )
                             .await
                         {
                             refuse(from, &format!("handshake response not sent: {error}"));
@@ -96,7 +103,9 @@ impl Airc {
                     // This side lost its session (a restart): re-key, so the
                     // sender's retry opens. Its current frame is gone, which
                     // its deadline reports.
-                    Err(SessionManagerError::NoSession) => self.rekey_logged(from, deadline).await,
+                    Err(SessionManagerError::NoSession) => {
+                        self.rekey_logged(from, transport_deadline).await
+                    }
                     // The same frame by a second route: already delivered.
                     Err(SessionManagerError::Session(SessionError::Replay)) => {}
                     // The peer seals under a session this side does not hold
@@ -108,7 +117,7 @@ impl Airc {
                         ),
                     ) => {
                         refuse(from, &error.to_string());
-                        self.rekey_logged(from, deadline).await;
+                        self.rekey_logged(from, transport_deadline).await;
                     }
                     Err(error) => refuse(from, &error.to_string()),
                 }
@@ -160,9 +169,8 @@ impl Airc {
 
     /// Open, or re-open, the session with `peer`: send our unanswered init
     /// again (the responder answers a duplicate with the reply it already
-    /// gave), or start one. Called once per frame that could not be opened
-    /// and once per send attempt, so it heals a lost init or reply without a
-    /// timer and never storms.
+    /// gave), or start one. Session waiters serialize periodic retransmission
+    /// per peer; inbound unopenable frames also request re-keying.
     pub(super) async fn rekey(
         &self,
         peer: airc_core::PeerId,
@@ -256,7 +264,7 @@ mod expiry_tests {
         airc_protocol::addressed_deadline::stamp(
             &mut original.envelope.headers,
             std::time::SystemTime::now(),
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60),
         )
         .unwrap();
         original.envelope.signature = alice
@@ -288,10 +296,17 @@ mod expiry_tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         bob.receive_addressed(original).await;
+        // Application work may outlive a single transport RPC. Advancing the
+        // clock catches accidental reuse of the five-second write timeout.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(1), inbox.next())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(accepted.body().as_text(), Some("original"));
+        assert!(
+            accepted.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(40)
+        );
     }
 }

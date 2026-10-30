@@ -148,13 +148,23 @@ pub enum InboxError {
     /// The handle is gone: no payload will arrive again.
     Closed,
     /// A queued payload expired before this consumer retrieved it.
-    Expired,
+    Expired {
+        from: PeerId,
+        to: PeerId,
+        kind: AddressedKind,
+        correlation: Uuid,
+    },
 }
 
 impl AddressedInbox {
     fn admit(item: Arc<VerifiedAddressed>) -> Result<Arc<VerifiedAddressed>, InboxError> {
         if tokio::time::Instant::now() >= item.deadline {
-            Err(InboxError::Expired)
+            Err(InboxError::Expired {
+                from: item.from(),
+                to: item.to(),
+                kind: item.kind(),
+                correlation: item.correlation(),
+            })
         } else {
             Ok(item)
         }
@@ -194,6 +204,7 @@ impl AddressedInbox {
 
 /// Per-identity addressed state, shared by every handle on the identity.
 pub(crate) struct AddressedState {
+    pub(super) handshake_waiters: send::HandshakeWaiters,
     sink: std::sync::OnceLock<Arc<dyn AddressedFrameSink>>,
     sessions: SessionManager,
     daemon_owner: tokio::sync::Mutex<std::sync::Weak<daemon::DaemonOwner>>,
@@ -211,6 +222,7 @@ impl AddressedState {
     ) -> Self {
         let (inbox_tx, _) = broadcast::channel(inbox_capacity);
         Self {
+            handshake_waiters: Default::default(),
             sink: std::sync::OnceLock::new(),
             daemon_owner: tokio::sync::Mutex::new(std::sync::Weak::new()),
             sessions: SessionManager::new(identity.keypair.clone(), identity.peer_id, registry),
@@ -247,6 +259,64 @@ impl crate::Airc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unrelated_expired_result_does_not_abort_pending_exchange() {
+        let home = tempfile::tempdir().unwrap();
+        let airc = crate::Airc::open(home.path()).await.unwrap();
+        let peer = PeerId::new();
+        let correlation = Uuid::new_v4();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (tx, rx) = broadcast::channel(4);
+        let pending = crate::command_bus::PendingCommand::for_test(
+            AddressedInbox { rx, owner: None },
+            peer,
+            airc.peer_id(),
+            correlation,
+            deadline,
+        );
+        for (id, expires) in [
+            (Uuid::new_v4(), tokio::time::Instant::now()),
+            (correlation, deadline),
+        ] {
+            tx.send(Arc::new(VerifiedAddressed {
+                deadline: expires,
+                from: peer,
+                to: airc.peer_id(),
+                kind: AddressedKind::CommandResult,
+                correlation: id,
+                headers: Headers::new(),
+                body: Body::text("result"),
+            }))
+            .unwrap();
+        }
+        assert_eq!(
+            airc.await_reply(pending).await.unwrap().correlation(),
+            correlation
+        );
+        let pending = crate::command_bus::PendingCommand::for_test(
+            AddressedInbox {
+                rx: tx.subscribe(),
+                owner: None,
+            },
+            peer,
+            airc.peer_id(),
+            correlation,
+            deadline,
+        );
+        tx.send(Arc::new(VerifiedAddressed {
+            deadline: tokio::time::Instant::now(),
+            from: peer,
+            to: airc.peer_id(),
+            kind: AddressedKind::CommandResult,
+            correlation,
+            headers: Headers::new(),
+            body: Body::text("expired matching result"),
+        }))
+        .unwrap();
+        assert!(matches!(airc.await_reply(pending).await,
+            Err(crate::AircError::CommandDeadline { correlation_id }) if correlation_id == correlation));
+    }
 
     #[tokio::test]
     async fn reply_cannot_renew_expired_outer_budget_with_future_inner_deadline() {
@@ -288,9 +358,15 @@ mod tests {
             body: Body::text("expired"),
         });
         tx.send(item.clone()).unwrap();
-        assert_eq!(inbox.next().await.err(), Some(InboxError::Expired));
+        assert!(matches!(
+            inbox.next().await,
+            Err(InboxError::Expired { .. })
+        ));
         tx.send(item).unwrap();
-        assert_eq!(inbox.drain_closed().err(), Some(InboxError::Expired));
+        assert!(matches!(
+            inbox.drain_closed(),
+            Err(InboxError::Expired { .. })
+        ));
     }
 
     #[tokio::test]

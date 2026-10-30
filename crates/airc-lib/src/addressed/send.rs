@@ -3,11 +3,36 @@
 use airc_core::{EventId, MentionTarget};
 use airc_protocol::addressed::{aad, addressed_channel, AddressedWire, SealedInner};
 use airc_protocol::{Envelope, Frame, FrameKind, Signature};
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use tokio::time::Instant;
 
 use super::{AddressedError, AddressedSend};
 use crate::time::now_ms;
 use crate::Airc;
+
+/// Weak leases avoid retaining a retry worker or an entry per historical peer.
+/// The per-peer lock is held by one waiting request, and its next-attempt time
+/// survives ownership handoff to other live waiters after cancellation.
+type HandshakeSchedule = tokio::sync::Mutex<Instant>;
+
+#[derive(Default)]
+pub(crate) struct HandshakeWaiters {
+    peers: tokio::sync::Mutex<HashMap<airc_core::PeerId, Weak<HandshakeSchedule>>>,
+}
+
+impl HandshakeWaiters {
+    async fn lease(&self, peer: airc_core::PeerId) -> Arc<HandshakeSchedule> {
+        let mut peers = self.peers.lock().await;
+        peers.retain(|_, lease| lease.strong_count() != 0);
+        if let Some(lease) = peers.get(&peer).and_then(Weak::upgrade) {
+            return lease;
+        }
+        let lease = Arc::new(tokio::sync::Mutex::new(Instant::now()));
+        peers.insert(peer, Arc::downgrade(&lease));
+        lease
+    }
+}
 
 impl Airc {
     /// Seal `msg` for `msg.to` and send it, all of it (session, seal, wire
@@ -53,29 +78,45 @@ impl Airc {
             .await
     }
 
-    /// Send our init to `peer` (again, if one is unanswered), then wait for
-    /// any session with it. Expiry ends only this caller's wait; other callers
-    /// and a later retry retain the same outstanding authenticated init.
+    /// One request owns retransmission for this peer, using the existing route
+    /// retry cadence. Re-send the same pending init until a session arrives or
+    /// this caller expires. Followers share ownership, not their deadlines.
     async fn await_session(
         &self,
         peer: airc_core::PeerId,
         deadline: Instant,
     ) -> Result<(), AddressedError> {
         let state = &self.inner.addressed;
-        let mut established = state.established.subscribe();
-        self.rekey(peer, deadline).await?;
-        let waited = tokio::time::timeout_at(deadline, async {
+        tokio::time::timeout_at(deadline, async {
+            let lease = state.handshake_waiters.lease(peer).await;
+            let mut next_attempt = lease.lock().await;
+            let mut established = state.established.subscribe();
+            let retry_delay =
+                crate::route_forwarder::RoutedForwarderConfig::default().retry_backoff;
             while !state.sessions.has_session(peer) {
-                if established.changed().await.is_err() {
-                    return;
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(AddressedError::DeadlineExceeded);
+                    }
+                    changed = established.changed() => {
+                        if changed.is_err() {
+                            return Err(AddressedError::DeadlineExceeded);
+                        }
+                    }
+                    _ = tokio::time::sleep_until(*next_attempt) => {
+                        // Set before awaiting the write: cancellation must not
+                        // let a live follower immediately repeat the attempt.
+                        *next_attempt = Instant::now() + retry_delay;
+                        self.rekey(peer, deadline).await?;
+                        *next_attempt = Instant::now() + retry_delay;
+                    }
                 }
             }
+            Ok(())
         })
-        .await;
-        if waited.is_err() || !state.sessions.has_session(peer) {
-            return Err(AddressedError::DeadlineExceeded);
-        }
-        Ok(())
+        .await
+        .unwrap_or(Err(AddressedError::DeadlineExceeded))
     }
 
     /// Put one addressed frame on the wire to `to`. Never appended anywhere.
@@ -152,3 +193,7 @@ impl Airc {
             .map_err(|error| AddressedError::Transport(error.to_string()))
     }
 }
+
+#[cfg(test)]
+#[path = "send_retry_tests.rs"]
+mod retry_tests;

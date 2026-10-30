@@ -36,6 +36,24 @@ impl std::fmt::Debug for PendingCommand {
 }
 
 impl PendingCommand {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        inbox: AddressedInbox,
+        expected_peer: PeerId,
+        requester: PeerId,
+        correlation_id: Uuid,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            inbox,
+            expected_peer,
+            requester,
+            correlation_id,
+            deadline,
+            deadline_at_ms: 0,
+        }
+    }
+
     pub fn remaining(&self) -> Option<Duration> {
         self.deadline.checked_duration_since(Instant::now())
     }
@@ -186,10 +204,36 @@ impl Airc {
                 .await
                 .map_err(|_| AircError::CommandDeadline {
                     correlation_id: pending.correlation_id,
-                })?
-                .map_err(|error| {
-                    AircError::Transport(format!("addressed reply inbox: {error:?}"))
                 })?;
+            let event = match event {
+                Ok(event) => event,
+                Err(crate::addressed::InboxError::Expired {
+                    from,
+                    to,
+                    kind,
+                    correlation,
+                }) => {
+                    if matches_reply(
+                        kind,
+                        (from, to, correlation),
+                        (
+                            pending.expected_peer,
+                            pending.requester,
+                            pending.correlation_id,
+                        ),
+                    ) {
+                        return Err(AircError::CommandDeadline {
+                            correlation_id: pending.correlation_id,
+                        });
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(AircError::Transport(format!(
+                        "addressed reply inbox: {error:?}"
+                    )))
+                }
+            };
             if matches_reply(
                 event.kind(),
                 (event.from(), event.to(), event.correlation()),

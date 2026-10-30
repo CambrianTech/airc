@@ -154,9 +154,7 @@ async fn run_bridge(
                 }
             }
             command = commands.next() => {
-                let Ok(event) = command else {
-                    return Err("addressed command inbox closed".into());
-                };
+                let event = command.map_err(|error| format!("addressed command inbox: {error:?}"))?;
                 if is_embedding_request(&event, me) {
                     handle_embedding_request(airc, &event, http, base_url, model).await;
                 }

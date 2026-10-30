@@ -163,9 +163,7 @@ async fn run_bridge(
                 }
             }
             item = stream.next() => {
-                let Ok(event) = item else {
-                    return Err("addressed command inbox closed".into());
-                };
+                let event = item.map_err(|error| format!("addressed command inbox: {error:?}"))?;
                 if is_turn_request(&event, me) {
                     handle_turn_request(airc, &event, http, base_url, cfg).await;
                 }
