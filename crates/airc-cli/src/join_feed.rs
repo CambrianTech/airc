@@ -507,7 +507,8 @@ mod tests {
         let (_dir, airc, room) = fixture().await;
         for n in 1..=130 {
             let mut chunk = event(&airc, room, n, "claude:peer", "fragment");
-            chunk.kind = TranscriptKind::System;
+            chunk.class = airc_core::EventClass::Control(airc_core::ControlKind::Stream);
+            chunk.kind = chunk.class.transcript_kind();
             chunk
                 .headers
                 .insert(airc_lib::HEADER_STREAM_ID.into(), "stream-test".into());
@@ -522,7 +523,9 @@ mod tests {
                 .unwrap(),
         );
         let mut warning = event(&airc, room, 132, "claude:peer", "ordinary warning");
-        warning.kind = TranscriptKind::System;
+        warning.class =
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Announcement);
+        warning.kind = warning.class.transcript_kind();
         airc.append_event(warning).await.unwrap();
         let filter = airc_core::RuntimeSelf::new(airc.client_id(), Some("codex:local"));
         let mut output = Vec::new();
