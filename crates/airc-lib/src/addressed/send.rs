@@ -85,6 +85,20 @@ impl Airc {
         wire: &AddressedWire,
         deadline: Instant,
     ) -> Result<(), AddressedError> {
+        if Instant::now() >= deadline {
+            return Err(AddressedError::DeadlineExceeded);
+        }
+        tokio::time::timeout_at(deadline, self.write_addressed_wire(to, wire, deadline))
+            .await
+            .unwrap_or(Err(AddressedError::DeadlineExceeded))
+    }
+
+    async fn write_addressed_wire(
+        &self,
+        to: airc_core::PeerId,
+        wire: &AddressedWire,
+        deadline: Instant,
+    ) -> Result<(), AddressedError> {
         let body = wire
             .to_body()
             .map_err(|error| AddressedError::Codec(error.to_string()))?;

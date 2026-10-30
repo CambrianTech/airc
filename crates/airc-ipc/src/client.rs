@@ -376,12 +376,15 @@ impl DaemonClient {
                 .as_millis(),
         )
         .map_err(|_| ClientError::Timeout)?;
-        match self
-            .call(Request::Addressed(crate::request::AddressedRequest {
+        match tokio::time::timeout_at(
+            deadline,
+            self.call(Request::Addressed(crate::request::AddressedRequest {
                 frame,
                 deadline_unix_ms,
-            }))
-            .await?
+            })),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout)??
         {
             Response::Ok => Ok(()),
             other => Err(ClientError::UnexpectedResponse(Box::new(other))),
@@ -447,6 +450,51 @@ mod observation_tests {
     use super::*;
     use crate::transport::IpcListener;
 
+    #[tokio::test]
+    async fn addressed_send_uses_callers_deadline_when_daemon_stalls() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("addressed-timeout.sock");
+        let listener = IpcListener::bind(&socket).await.unwrap();
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_frame::<_, Request>(&mut stream).await.unwrap(),
+                Some(Request::Addressed(_))
+            ));
+            let _ = hold.await;
+            drop(stream);
+            listener.cleanup();
+        });
+        let peer = airc_core::PeerId::new();
+        let frame = airc_protocol::Frame {
+            kind: airc_protocol::FrameKind::Addressed,
+            envelope: airc_protocol::Envelope {
+                event_id: airc_core::EventId::new(),
+                sender: peer,
+                sender_client: airc_core::ClientId::new(),
+                channel: airc_protocol::addressed::addressed_channel(),
+                target: airc_core::MentionTarget::Peer(peer),
+                lamport: 1,
+                occurred_at_ms: 1,
+                reply_to: None,
+                headers: Default::default(),
+                body: None,
+                media: Vec::new(),
+                signature: airc_protocol::Signature::Unsigned,
+            },
+        };
+        let client = DaemonClient::new(socket);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let result = timeout(
+            Duration::from_secs(2),
+            client.send_addressed(frame, deadline),
+        )
+        .await;
+        let _ = release.send(());
+        server.await.unwrap();
+        assert!(matches!(result, Ok(Err(ClientError::Timeout))));
+    }
     // A server that holds the connection open must still hit the normal RPC
     // deadline, without reporting the unfinished response phase as complete.
     #[tokio::test]
