@@ -135,14 +135,8 @@ impl Airc {
     /// timer and never storms.
     pub(super) async fn rekey(&self, peer: airc_core::PeerId) -> Result<(), super::AddressedError> {
         let sessions = &self.inner.addressed.sessions;
-        let init = match sessions.pending_init(peer) {
-            Some(init) => init,
-            None => {
-                let now = now_ms()
-                    .map_err(|error| super::AddressedError::Transport(error.to_string()))?;
-                sessions.begin_handshake(peer, now)
-            }
-        };
+        let now = now_ms().map_err(|error| super::AddressedError::Transport(error.to_string()))?;
+        let init = sessions.ensure_handshake(peer, now);
         self.send_addressed_wire(peer, &AddressedWire::Init(init))
             .await
     }

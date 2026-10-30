@@ -160,22 +160,29 @@ impl SessionManager {
             .and_then(|state| state.pending.as_ref().map(|entry| entry.1.clone()))
     }
 
-    /// Abandon our unanswered handshake to `peer`, so the next send starts a
-    /// fresh one.
-    pub fn cancel_pending(&self, peer: PeerId) {
-        if let Some(mut state) = self.peers.get_mut(&peer) {
-            state.pending = None;
-        }
-    }
-
     /// Begin a handshake to `peer`: returns the `HandshakeInit` to send and
     /// records the pending state to finish with [`on_resp`](Self::on_resp).
     /// Re-initiating replaces any prior pending handshake to that peer. `now_ms`
     /// is this side's wall clock; the signed issue time is strictly increasing
     /// even when two inits share a millisecond.
     pub fn begin_handshake(&self, peer: PeerId, now_ms: u64) -> HandshakeInit {
+        self.begin_handshake_inner(peer, now_ms, false)
+    }
+
+    /// Atomically reuse an outstanding init or create one. Concurrent callers
+    /// waiting for the same peer share its handshake without replacing it.
+    pub fn ensure_handshake(&self, peer: PeerId, now_ms: u64) -> HandshakeInit {
+        self.begin_handshake_inner(peer, now_ms, true)
+    }
+
+    fn begin_handshake_inner(&self, peer: PeerId, now_ms: u64, reuse: bool) -> HandshakeInit {
         use std::sync::atomic::Ordering;
         let mut state = self.peers.entry(peer).or_default();
+        if reuse {
+            if let Some((_, init)) = &state.pending {
+                return init.clone();
+            }
+        }
         let mut last = self.last_issued_ms.load(Ordering::Acquire);
         let issued_at_ms = loop {
             let next = now_ms.max(last.saturating_add(1));
@@ -603,5 +610,38 @@ mod tests {
             b.open_from(a_id, b"", &sealed),
             Err(SessionManagerError::Session(SessionError::Replay))
         );
+    }
+
+    #[test]
+    fn concurrent_waiters_share_one_pending_init() {
+        let reg = Arc::new(PeerKeyRegistry::new());
+        let (a, a_id) = mgr(&reg);
+        let (b, b_id) = mgr(&reg);
+        let barrier = std::sync::Barrier::new(8);
+        let inits = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|n| {
+                    scope.spawn({
+                        let a = &a;
+                        let barrier = &barrier;
+                        move || {
+                            barrier.wait();
+                            a.ensure_handshake(b_id, 1_000 + n)
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for init in &inits {
+            assert_eq!(init.eph_pub, inits[0].eph_pub);
+            assert_eq!(init.issued_at_ms, inits[0].issued_at_ms);
+        }
+        a.on_resp(&b.on_init(&inits[0]).unwrap()).unwrap();
+        let sealed = a.seal_for(b_id, b"", b"shared session").unwrap();
+        assert_eq!(b.open_from(a_id, b"", &sealed).unwrap(), b"shared session");
     }
 }

@@ -56,8 +56,8 @@ impl Airc {
     }
 
     /// Send our init to `peer` (again, if one is unanswered), then wait for
-    /// any session with it. A wait that reaches the deadline abandons our
-    /// handshake, so the next send starts a fresh one.
+    /// any session with it. Expiry ends only this caller's wait; other callers
+    /// and a later retry retain the same outstanding authenticated init.
     async fn await_session(
         &self,
         peer: airc_core::PeerId,
@@ -75,7 +75,6 @@ impl Airc {
         })
         .await;
         if waited.is_err() || !state.sessions.has_session(peer) {
-            state.sessions.cancel_pending(peer);
             return Err(AddressedError::DeadlineExceeded);
         }
         Ok(())
