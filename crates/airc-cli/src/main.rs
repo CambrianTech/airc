@@ -78,6 +78,7 @@ mod registry_commands;
 mod route_cli;
 mod route_commands;
 mod route_proof_commands;
+mod runtime;
 mod runtime_context;
 mod runtime_dir;
 mod sos_commands;
@@ -141,44 +142,12 @@ fn parse_peer_id(input: &str) -> Result<PeerId, Box<dyn std::error::Error>> {
     Ok(PeerId::from_uuid(uuid))
 }
 
-#[cfg(windows)]
-const WINDOWS_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
-
 fn main() -> ExitCode {
-    // Clippy on Windows flags an early `return` here as unneeded — and
-    // it's right: with the cfg-split, each branch is the function's
-    // tail expression. (First caught by the first-ever Windows clippy
-    // run, on bigmama; the hosted clippy gate is ubuntu-only.)
-    #[cfg(windows)]
-    {
-        match std::thread::Builder::new()
-            .name("airc-main".to_string())
-            .stack_size(WINDOWS_MAIN_STACK_BYTES)
-            .spawn(run_main)
-        {
-            Ok(handle) => match handle.join() {
-                Ok(code) => code,
-                Err(_) => {
-                    eprintln!("airc: main thread panicked");
-                    ExitCode::FAILURE
-                }
-            },
-            Err(error) => {
-                eprintln!("airc: failed to start main thread: {error}");
-                ExitCode::FAILURE
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    run_main()
+    runtime::run_entry(run_main)
 }
 
 fn run_main() -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match runtime::process_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("airc: failed to start tokio runtime: {error}");
