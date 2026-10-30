@@ -95,6 +95,7 @@ mod tests {
         let payload = Body::text("important chat-looking content");
         for class in [
             EventClass::Activity(ActivityKind::Presence),
+            EventClass::Activity(ActivityKind::WorkPresence),
             EventClass::Activity(ActivityKind::WorkReceipt),
             EventClass::Control(ControlKind::Stream),
             EventClass::Control(ControlKind::Receipt),
@@ -108,6 +109,11 @@ mod tests {
         assert!(render_feed_line(&state)
             .expect("work state is admitted")
             .contains("changed"));
+        let coordination = event(
+            EventClass::Activity(ActivityKind::Coordination),
+            Body::text("lane ownership changed"),
+        );
+        assert!(render_feed_line(&coordination).is_some());
     }
 
     #[test]

@@ -201,7 +201,7 @@ pub use route::{
 };
 pub use route_forwarder::{RoutedForwarder, RoutedForwarderConfig};
 pub use router_bridge::{InboundDeliveryVerdict, InboundFrameSink, RouterInboundBridge};
-pub use stream::{EventFilter, EventScan, EventStream, FilteredEventStream, LiveLag};
+pub use stream::{EventFilter, EventScan, EventStream, FilteredEventStream, LiveLag, StreamError};
 pub use subscriptions::{
     derive_room_id, ChannelName, ChannelNameError, MeshIdentity, Subscription, SubscriptionError,
     SubscriptionSet,

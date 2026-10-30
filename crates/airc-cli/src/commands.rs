@@ -2909,7 +2909,7 @@ async fn print_event_stream_until_signal<S>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: futures::stream::Stream<
-            Item = Result<std::sync::Arc<airc_core::TranscriptEvent>, airc_lib::LiveLag>,
+            Item = Result<std::sync::Arc<airc_core::TranscriptEvent>, airc_lib::StreamError>,
         > + Unpin,
 {
     let sigint = tokio::signal::ctrl_c();
@@ -2925,13 +2925,14 @@ where
             next = stream.next() => {
                 match next {
                     Some(Ok(event)) => print_event(&event),
-                    Some(Err(lag)) => {
+                    Some(Err(airc_lib::StreamError::Lag(lag))) => {
                         // LiveLag is the explicit signal that the
                         // consumer fell behind broadcast capacity.
                         // Print and continue — the operating doc
                         // says lag must surface, not silently drop.
                         eprintln!("{lag}");
                     }
+                    Some(Err(error)) => return Err(error.into()),
                     None => {
                         println!("stream closed; exiting.");
                         return Ok(());

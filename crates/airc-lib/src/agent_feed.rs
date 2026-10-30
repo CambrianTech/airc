@@ -11,6 +11,9 @@ pub fn agent_event_selection() -> airc_core::EventSelection {
         airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
             airc_core::ActivityKind::WorkState,
         )),
+        airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
+            airc_core::ActivityKind::Coordination,
+        )),
     ])
 }
 

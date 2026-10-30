@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use airc_core::TranscriptEvent;
-use airc_lib::{AgentDeliveryTurn, Airc, EventFilter, LiveLag};
+use airc_lib::{AgentDeliveryTurn, Airc, EventFilter, StreamError};
 use futures::StreamExt;
 
 use crate::client_id::{agent_process_client_id, current_client_id, explicit_client_id};
@@ -393,9 +393,13 @@ fn consumer_id(runtime: &HookRuntime, runtime_client: Option<&str>) -> String {
 
 async fn wait_for_one_event(airc: &Airc, wait_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = airc.subscribe_agent_feed().await?;
-    // Any outcome ends the wait: an event, a lag, a closed stream or the deadline.
-    // The durable turn prepared next is what decides what is delivered.
-    let _woke: Result<Option<Result<_, LiveLag>>, _> =
-        tokio::time::timeout(Duration::from_millis(wait_ms), stream.next()).await;
+    // Lag wakes a durable scan; owner/codec refusal must reach the caller.
+    if let Ok(Some(Err(error))) =
+        tokio::time::timeout(Duration::from_millis(wait_ms), stream.next()).await
+    {
+        if !matches!(error, StreamError::Lag(_)) {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }

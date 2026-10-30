@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use crate::error::AircError;
 use crate::publish::PublishReceipt;
 use crate::room::Room;
-use crate::stream::EventStream;
+use crate::stream::{EventStream, StreamError};
 use crate::Airc;
 
 /// Low bits of the packed `lamport` that hold the per-epoch counter; the
@@ -485,7 +485,7 @@ impl Airc {
             .daemon_client
             .clone()
             .ok_or_else(|| AircError::Route("daemon client is not attached".to_string()))?;
-        let (tx, rx) = mpsc::channel::<Arc<TranscriptEvent>>(1024);
+        let (tx, rx) = mpsc::channel::<Result<Arc<TranscriptEvent>, StreamError>>(1024);
         // ONE socket for the whole set when the daemon serves channel sets
         // (`StatusResponse::attach_channel_sets`, the typed capability): a
         // 15-subscriber core held ~960 per-channel attach sockets to its
@@ -588,7 +588,7 @@ async fn spawn_channel_reader(
     delivery: Option<Vec<IpcDelivery>>,
     headers: airc_core::HeaderFilter,
     selection: airc_core::EventSelection,
-    tx: mpsc::Sender<Arc<TranscriptEvent>>,
+    tx: mpsc::Sender<Result<Arc<TranscriptEvent>, StreamError>>,
 ) -> Result<tokio::task::JoinHandle<()>, AircError> {
     // Initial attach + ack — fail fast so `subscribe()` errors if
     // the daemon is down right now (don't silently spin).
@@ -625,7 +625,7 @@ async fn spawn_channel_reader(
                         match decode_wire_event(envelope) {
                             Ok(event) => {
                                 from = Some(cursor_after(&event));
-                                if tx.send(Arc::new(event)).await.is_err() {
+                                if tx.send(Ok(Arc::new(event))).await.is_err() {
                                     return; // consumer gone
                                 }
                                 backoff_ms = RECONNECT_BACKOFF_START_MS;
@@ -645,6 +645,11 @@ async fn spawn_channel_reader(
                                     error = %error,
                                     "airc subscribe: dropping subscription — decode_wire_event failed"
                                 );
+                                let _ = tx
+                                    .send(Err(StreamError::Decode {
+                                        message: error.to_string(),
+                                    }))
+                                    .await;
                                 return;
                             }
                         }
@@ -657,17 +662,25 @@ async fn spawn_channel_reader(
                         // below — 3,100 lines/min on a 16-citizen core, rotating the log
                         // every 15 minutes (2026-09-14, airc #1411).
                     }
+                    Ok(Some(Response::Error { message })) => {
+                        let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                        return;
+                    }
                     Ok(Some(other)) => {
-                        // Non-Event frames on a live subscription
-                        // are unexpected (ack already consumed); a
-                        // recurring stream of these indicates the
-                        // daemon is sending shapes the SDK doesn't
-                        // recognise.
-                        tracing::warn!(
-                            channel = %channel,
-                            frame = ?other,
-                            "airc subscribe: ignoring non-Event frame"
-                        );
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: format!("unexpected attach frame: {other:?}"),
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: error.to_string(),
+                            }))
+                            .await;
+                        return;
                     }
                     Ok(None) | Err(_) => {
                         // Card 807193ab: surface stream drops so a
@@ -731,12 +744,25 @@ async fn spawn_channel_reader(
                         backoff_ms = RECONNECT_BACKOFF_START_MS;
                         break; // reconnected; resume draining
                     }
+                    Ok(Some(Response::Error { message })) => {
+                        let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                        return;
+                    }
                     Ok(Some(other)) => {
-                        tracing::warn!(
-                            channel = %channel,
-                            frame = ?other,
-                            "airc subscribe: reattach ack mismatch — expected Ok"
-                        );
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: format!("unexpected attach frame: {other:?}"),
+                            }))
+                            .await;
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        let _ = tx
+                            .send(Err(StreamError::Decode {
+                                message: error.to_string(),
+                            }))
+                            .await;
+                        return;
                     }
                     Ok(None) | Err(_) => {
                         tracing::warn!(
@@ -764,7 +790,7 @@ impl Airc {
         delivery: Option<Vec<IpcDelivery>>,
         headers: airc_core::HeaderFilter,
         selection: airc_core::EventSelection,
-        tx: mpsc::Sender<Arc<TranscriptEvent>>,
+        tx: mpsc::Sender<Result<Arc<TranscriptEvent>, StreamError>>,
     ) -> Result<tokio::task::JoinHandle<()>, AircError> {
         let request_for = {
             let channels = channels.clone();
@@ -797,7 +823,7 @@ impl Airc {
                         {
                             Ok(event) => {
                                 cursors.insert(event.room_id, cursor_after(&event));
-                                if tx.send(Arc::new(event)).await.is_err() {
+                                if tx.send(Ok(Arc::new(event))).await.is_err() {
                                     return; // consumer gone
                                 }
                                 backoff_ms = RECONNECT_BACKOFF_START_MS;
@@ -808,12 +834,34 @@ impl Airc {
                                     error = %error,
                                     "airc subscribe (set): dropping subscription — decode_wire_event failed"
                                 );
+                                let _ = tx
+                                    .send(Err(StreamError::Decode {
+                                        message: error.to_string(),
+                                    }))
+                                    .await;
                                 return;
                             }
                         },
                         Ok(Some(Response::AttachCursorAdvanced { .. })) => {}
+                        Ok(Some(Response::Error { message })) => {
+                            let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                            return;
+                        }
                         Ok(Some(other)) => {
-                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): ignoring non-Event frame");
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: format!("unexpected attach frame: {other:?}"),
+                                }))
+                                .await;
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: error.to_string(),
+                                }))
+                                .await;
+                            return;
                         }
                         Ok(None) | Err(_) => {
                             tracing::warn!(
@@ -870,6 +918,10 @@ impl Airc {
                                     .await
                                     {
                                         Ok(handle) => children.push(AbortOnDrop(handle)),
+                                        Err(AircError::Stream(error)) => {
+                                            let _ = tx.send(Err(error)).await;
+                                            return;
+                                        }
                                         Err(error) => {
                                             tracing::warn!(channel = %channel, retry_ms, error = %error, "airc subscribe (set): per-room fallback attach failed — retrying with its cursor");
                                             still.push(channel);
@@ -908,8 +960,25 @@ impl Airc {
                             backoff_ms = RECONNECT_BACKOFF_START_MS;
                             break;
                         }
+                        Ok(Some(Response::Error { message })) => {
+                            let _ = tx.send(Err(StreamError::OwnerRejected { message })).await;
+                            return;
+                        }
                         Ok(Some(other)) => {
-                            tracing::warn!(rooms, frame = ?other, "airc subscribe (set): reattach ack mismatch — expected Ok");
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: format!("unexpected attach frame: {other:?}"),
+                                }))
+                                .await;
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                            let _ = tx
+                                .send(Err(StreamError::Decode {
+                                    message: error.to_string(),
+                                }))
+                                .await;
+                            return;
                         }
                         Ok(None) | Err(_) => {
                             tracing::warn!(
@@ -958,27 +1027,30 @@ fn ipc_delivery(delivery: airc_bus::DeliveryClass) -> IpcDelivery {
 
 /// An attach's acknowledgment, typed by cause (Codex on #1603). A daemon that refuses the
 /// attach, or answers with a frame that is not an acknowledgment or not a frame at all, is a
-/// real error (`Route`). A connection that closes or fails before the acknowledgment is the
+/// terminal typed stream error. A connection that closes or fails before the acknowledgment is the
 /// daemon going away, which happens in an update's handoff: it is `DaemonClient(Io)`, which
 /// `AircError::is_daemon_absent` reads, so a waiting reader attaches again instead of ending.
 fn attach_ack(ack: std::io::Result<Option<Response>>, what: &str) -> Result<(), AircError> {
     match ack {
         Ok(Some(Response::Ok)) => Ok(()),
-        Ok(Some(Response::Error { message })) => {
-            Err(AircError::Route(format!("{what}: {message}")))
+        Ok(Some(Response::Error { message })) => Err(StreamError::OwnerRejected {
+            message: format!("{what}: {message}"),
         }
-        Ok(Some(other)) => Err(AircError::Route(format!(
-            "{what}: not an acknowledgment: {other:?}"
-        ))),
+        .into()),
+        Ok(Some(other)) => Err(StreamError::Decode {
+            message: format!("{what}: not an acknowledgment: {other:?}"),
+        }
+        .into()),
         Ok(None) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(
             std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!("{what}: closed before acknowledging"),
             ),
         ))),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(AircError::Route(
-            format!("{what}: malformed acknowledgment: {error}"),
-        )),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(StreamError::Decode {
+            message: format!("{what}: malformed acknowledgment: {error}"),
+        }
+        .into()),
         Err(error) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(error))),
     }
 }
@@ -1004,10 +1076,15 @@ mod tests {
             })),
             "attach",
         );
-        assert!(!refused.unwrap_err().is_daemon_absent());
+        assert!(
+            matches!(refused, Err(AircError::Stream(StreamError::OwnerRejected { message })) if message == "attach: no such room")
+        );
         let mut garbage: &[u8] = &[0, 0, 0, 1, 0xff];
         let garbage = attach_ack(read_response_frame(&mut garbage).await, "attach");
-        assert!(!garbage.unwrap_err().is_daemon_absent());
+        assert!(matches!(
+            garbage,
+            Err(AircError::Stream(StreamError::Decode { .. }))
+        ));
     }
 
     // what this catches (Astra's re-review of airc #1523): a daemon rolled back

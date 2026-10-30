@@ -7,7 +7,7 @@
 //! of replaying the full transcript.
 
 use airc_core::{MentionTarget, PeerId, RoomId, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, LiveLag};
+use airc_lib::{Airc, StreamError};
 use futures::stream::StreamExt;
 use std::io::Write;
 
@@ -60,7 +60,8 @@ pub async fn run(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
             next = stream.next() => match next {
                 Some(Ok(_)) => {},
-                Some(Err(lag @ LiveLag { .. })) => eprintln!("airc: {lag}; recovering from durable delivery state"),
+                Some(Err(StreamError::Lag(lag))) => eprintln!("airc: {lag}; recovering from durable delivery state"),
+                Some(Err(error)) => return Err(error.into()),
                 None => stream = reattach(airc, home).await?,
             },
         }
