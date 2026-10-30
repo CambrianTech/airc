@@ -160,7 +160,7 @@ impl Airc {
         let room = self.resolve_publish_target(&target).await?;
         if self.is_daemon_attached() {
             return self
-                .daemon_publish(&room, kind, class, body, headers, delivery, recipient)
+                .daemon_publish(&room, class, body, headers, delivery, recipient)
                 .await;
         }
         let result = self

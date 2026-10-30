@@ -972,13 +972,10 @@ _install_airc_binary() {
   esac
   if [ -e "$destination" ]; then
     cmp -s "$built" "$destination" || fail 'Direct replacement refused; use airc update for owned maintenance and publication'
-    "$built" --home "$preflight_home" store-preflight || fail 'Candidate store preflight refused; installed binary retained'
   else
-    "$built" --home "$preflight_home" store-preflight --fresh-install || fail 'Direct installation refused existing state; use airc update'
-    mkdir -p "$BIN_DIR"
-    # noclobber keeps a concurrent publication from being overwritten.
-    (set -o noclobber; cat "$built" > "$destination") || fail 'Fresh binary destination is already owned'
-    chmod +x "$destination"
+    local publish_destination="$destination"
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) publish_destination="$(_to_win_path "$destination")" ;; esac
+    "$built" --home "$preflight_home" store-publish-fresh --destination "$publish_destination" || fail 'Fresh publication refused; existing state and binaries retained'
   fi
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)

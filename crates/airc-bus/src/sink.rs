@@ -138,25 +138,18 @@ pub trait DurableSink: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Envelope>>;
 
-    /// **Continuum #297.** [`DurableSink::page_tail`] restricted to
-    /// envelopes whose [`crate::envelope::Kind`] is in `kinds` — the
-    /// sink leg of "newest N events OF THESE KINDS". The kind predicate
-    /// is applied by the STORE, before `limit`, so a chunk-flooded room
-    /// still answers with the newest N matching events; a client-side
-    /// newest-N-raw-then-filter yields crumbs (three personas streaming
-    /// ~4 chunks/sec evict every `Message` from a 50-event page).
-    ///
-    /// Same order/bound contract as `page_tail`: ascending total order,
-    /// work bounded by the matching rows (SQLite: the composite
-    /// `(room_id, epoch, counter, event_id)` index scanned DESC with the
-    /// kind predicate; in-memory: a reverse filtered scan). There is
-    /// deliberately NO default impl (same posture as `page_tail`, card
-    /// 8428ae8c): a sink that cannot kind-filter its reverse page is a
-    /// compile error, never a silent fetch-everything-then-filter.
-    /// `kinds` is never empty — callers normalize empty to the
-    /// unfiltered [`DurableSink::page_tail`].
-    /// Apply the complete live subscription predicate BEFORE LIMIT.
-    /// Required: implementations cannot substitute a raw page and post-filter.
+    /// Apply the complete live subscription predicate BEFORE LIMIT and return
+    /// rows strictly after `after` in ascending cursor order. A sink must
+    /// implement this contract; raw paging followed by filtering is forbidden.
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &crate::Filter,
+    ) -> Result<Vec<Envelope>>;
+
+    /// Complete live predicate before LIMIT, newest rows before `before`, returned ascending.
     async fn filtered_tail_before(
         &self,
         channel: RoomId,
@@ -165,6 +158,7 @@ pub trait DurableSink: Send + Sync {
         filter: &crate::Filter,
     ) -> Result<Vec<Envelope>>;
 
+    /// Kind-constrained reverse page, using the shared full-filter query owner.
     async fn page_tail_of_kinds(
         &self,
         channel: RoomId,
@@ -365,6 +359,26 @@ impl DurableSink for InMemoryDurableSink {
     ) -> Result<Vec<Envelope>> {
         self.filtered_tail_before(channel, before, limit, &crate::Filter::channel(channel))
             .await
+    }
+
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &crate::Filter,
+    ) -> Result<Vec<Envelope>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.page_count += 1;
+        let Some(bucket) = guard.events.get(&channel.0.as_u128()) else {
+            return Ok(Vec::new());
+        };
+        Ok(bucket
+            .iter()
+            .filter(|e| after.is_none_or(|a| e.cursor().is_after(&a)) && filter.matches(e))
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     async fn filtered_tail_before(

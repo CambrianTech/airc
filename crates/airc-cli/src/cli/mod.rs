@@ -492,6 +492,11 @@ pub enum Command {
 
     /// Validate existing stores without mutation before adopting this binary.
     #[command(hide = true)]
+    StorePublishFresh {
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    #[command(hide = true)]
     StorePreflight {
         /// Refuse any existing store: direct installation cannot quiesce its writer.
         #[arg(long)]

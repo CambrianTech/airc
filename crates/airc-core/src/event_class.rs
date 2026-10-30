@@ -24,6 +24,18 @@ pub enum EventFamily {
 }
 
 impl EventClass {
+    /// Canonical transcript category; admission independently refuses addressed traffic.
+    pub const fn transcript_kind(self) -> crate::TranscriptKind {
+        use crate::TranscriptKind;
+        match self {
+            Self::Correspondence(_) => TranscriptKind::Message,
+            Self::Activity(_) => TranscriptKind::System,
+            Self::Control(ControlKind::Command) => TranscriptKind::Command,
+            Self::Control(ControlKind::CommandResult) => TranscriptKind::CommandResult,
+            Self::Control(_) => TranscriptKind::SessionControl,
+        }
+    }
+
     pub const fn family(self) -> EventFamily {
         match self {
             Self::Correspondence(_) => EventFamily::Correspondence,
@@ -101,6 +113,26 @@ impl EventSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_transcript_projection_is_shared_across_transports() {
+        for control in [
+            ControlKind::Session,
+            ControlKind::Receipt,
+            ControlKind::Signal,
+            ControlKind::Stream,
+            ControlKind::Lifecycle,
+        ] {
+            assert_eq!(
+                EventClass::Control(control).transcript_kind(),
+                crate::TranscriptKind::SessionControl
+            );
+        }
+        assert_eq!(
+            EventClass::Control(ControlKind::Command).transcript_kind(),
+            crate::TranscriptKind::Command
+        );
+    }
 
     #[test]
     fn selection_accepts_only_the_declared_family_or_exact_variant() {

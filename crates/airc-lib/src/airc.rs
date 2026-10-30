@@ -1297,7 +1297,6 @@ impl Airc {
         if self.is_daemon_attached() {
             self.daemon_publish(
                 room,
-                airc_protocol::FrameKind::Control,
                 airc_core::EventClass::Control(airc_core::ControlKind::Lifecycle),
                 body,
                 airc_core::headers::Headers::new(),

@@ -77,6 +77,20 @@ impl CountingSink {
 
 #[async_trait]
 impl DurableSink for CountingSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.page_calls.fetch_add(1, Ordering::SeqCst);
+        self.max_page_limit.fetch_max(limit, Ordering::SeqCst);
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
     async fn filtered_tail_before(
         &self,
         channel: RoomId,
@@ -149,6 +163,16 @@ struct FailingTailSink;
 
 #[async_trait]
 impl DurableSink for FailingTailSink {
+    async fn filtered_page_after(
+        &self,
+        _channel: RoomId,
+        _after: Option<Cursor>,
+        _limit: usize,
+        _filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        Err(BusError::Sink("reverse index unavailable".into()))
+    }
+
     async fn filtered_tail_before(
         &self,
         _channel: RoomId,
@@ -565,6 +589,33 @@ async fn tail_surfaces_sink_error_instead_of_scanning() {
         .is_err());
 }
 
+/// A replay failure cannot be hidden by pending ring/live events.
+#[tokio::test]
+async fn replay_failure_is_returned_before_ring_events_and_terminates_subscription() {
+    let epoch_store = InMemoryEpochStore::new();
+    let router = EventRouter::new(
+        RouterConfig::default(),
+        Arc::new(ManualClock::new(1_700_000_000_000)),
+        Arc::new(SeqSource::start(&epoch_store)),
+        Arc::new(FailingTailSink),
+    );
+    let room = RoomId::new();
+    router
+        .publish(event(room, 0, DeliveryClass::Durable))
+        .await
+        .expect("ring event");
+    let stream = router.subscribe(airc_bus::Filter::channel(room), None);
+    futures::pin_mut!(stream);
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("replay failure delivered");
+    assert!(matches!(first, Some(Err(BusError::Sink(_)))));
+    assert!(tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("failed stream terminates")
+        .is_none());
+}
+
 /// Walk beyond the old fixed500 tail, across the ring/store seam. Every
 /// envelope has the SAME measured timestamp, so a timestamp continuation
 /// cannot pass this test. Each read remains bounded by its requested page.
@@ -718,7 +769,8 @@ async fn attach_deep_leg_pages_bounded_and_delivers_every_event_once() {
         let env = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("attach replay stalled — deep leg looped or deadlocked")
-            .expect("live tail ended mid-replay");
+            .expect("live tail ended mid-replay")
+            .expect("subscription read must succeed");
         assert_eq!(
             env.event_id.0.as_u128() - 1,
             expected,
@@ -784,7 +836,8 @@ async fn attach_deep_leg_advances_past_filtered_pages() {
         let env = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("attach replay stalled — raw cursor must advance past filtered rows")
-            .expect("live tail ended mid-replay");
+            .expect("live tail ended mid-replay")
+            .expect("subscription read must succeed");
         assert_eq!(
             env.event_id.0.as_u128() - 1,
             EVENTS + expected,

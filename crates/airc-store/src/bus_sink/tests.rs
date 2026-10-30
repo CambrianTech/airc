@@ -800,6 +800,19 @@ async fn full_live_filter_is_applied_before_tail_limit() {
         .await
         .expect("empty kinds")
         .is_empty());
+    let later = durable_at(channel, 1, 5202).with_header("consumer", "agent");
+    sink.append(&later).await.expect("later correspondence");
+    let forward = sink
+        .filtered_page_after(channel, Some(wanted.cursor()), 1, &filter)
+        .await
+        .expect("forward page");
+    assert_eq!(forward.len(), 1);
+    assert_eq!(forward[0].event_id, later.event_id);
+    assert!(sink
+        .filtered_page_after(channel, Some(later.cursor()), 1, &filter)
+        .await
+        .expect("after last")
+        .is_empty());
     assert!(sink
         .filtered_tail_before(
             channel,

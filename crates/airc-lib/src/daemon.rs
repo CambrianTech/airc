@@ -204,18 +204,12 @@ impl Airc {
     pub(crate) async fn daemon_publish(
         &self,
         room: &Room,
-        kind: FrameKind,
         class: airc_core::EventClass,
         body: Body,
         mut headers: airc_core::Headers,
         delivery: airc_bus::DeliveryClass,
         target: MentionTarget,
     ) -> Result<PublishReceipt, AircError> {
-        if kind != FrameKind::for_class(class) {
-            return Err(AircError::Route(
-                "frame kind conflicts with event class".into(),
-            ));
-        }
         room.stamp_name_header(&mut headers);
         let response = self
             .require_daemon_client()?
@@ -317,27 +311,6 @@ impl Airc {
             .into_iter()
             .map(decode_wire_event)
             .collect()
-    }
-
-    /// Events strictly after `cursor` across ALL subscribed rooms, via
-    /// the daemon, resuming each room from
-    /// the shared `(epoch, counter)` packed in the cursor.
-    pub(crate) async fn daemon_resume_from_subscribed(
-        &self,
-        cursor: &TranscriptCursor,
-        limit: usize,
-    ) -> Result<Vec<TranscriptEvent>, AircError> {
-        let set = self.subscription_set().await?;
-        let mut merged = Vec::new();
-        for subscription in set.all() {
-            let room = subscription.as_room();
-            merged.extend(self.daemon_resume_from(&room, cursor, limit).await?);
-            // Keep at most one retained page plus the next room's page in
-            // memory, and use the full cursor order before trimming ties.
-            merged.sort_unstable_by_key(|event| (event.lamport, event.event_id.0));
-            merged.truncate(limit);
-        }
-        Ok(merged)
     }
 
     /// Fetch every transcript event on `channel` strictly after

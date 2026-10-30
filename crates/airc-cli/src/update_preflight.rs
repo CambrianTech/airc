@@ -11,6 +11,9 @@ struct StoreRefusal {
     source: airc_store::StoreError,
 }
 
+// Deployment is blocked until durable consumer inventory covers sibling scopes.
+// This checks only the requested scope and its account; expiring presence
+// beacons are not an authoritative inventory and are deliberately not used.
 pub async fn run(scope_home: &Path, fresh_install: bool) -> Result<(), Error> {
     let account = airc_lib::machine_account_home(scope_home);
     // Both stores can hold durable work. Do not create absent stores or mutate
@@ -33,6 +36,11 @@ pub async fn run(scope_home: &Path, fresh_install: bool) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+pub async fn publish_fresh(home: &Path, destination: &Path) -> Result<(), Error> {
+    run(home, true).await?;
+    crate::update_rollback::publish_fresh(&std::env::current_exe()?, destination)
 }
 
 pub fn candidate(artifact: &Path, home: &Path) -> Result<(), Error> {

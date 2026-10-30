@@ -54,6 +54,19 @@ impl CountingSink {
 
 #[async_trait]
 impl DurableSink for CountingSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.page_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
     async fn filtered_tail_before(
         &self,
         channel: RoomId,
@@ -117,6 +130,16 @@ struct FailingHeadSink;
 
 #[async_trait]
 impl DurableSink for FailingHeadSink {
+    async fn filtered_page_after(
+        &self,
+        _channel: RoomId,
+        _after: Option<Cursor>,
+        _limit: usize,
+        _filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        Err(BusError::Sink("reverse index unavailable".into()))
+    }
+
     async fn filtered_tail_before(
         &self,
         _channel: RoomId,

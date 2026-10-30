@@ -651,7 +651,11 @@ where
                 // Client gone: drop the subscription with the stream.
                 _ = &mut hangup => return Ok(()),
                 next = stream.next() => match next {
-                    Some(env) => {
+                    Some(Err(error)) => {
+                        write_response(&mut writer, &Response::Error { message: error.to_string() }).await?;
+                        return Ok(());
+                    }
+                    Some(Ok(env)) => {
                         if env.delivery.is_durable()
                             && seen_through.is_some_and(|through| !env.cursor().is_after(&through))
                         {
@@ -751,7 +755,7 @@ fn resubscribe_lagged(
     subs: &mut std::collections::HashMap<airc_core::RoomId, RoomSub>,
     merged: &mut tokio_stream::StreamMap<
         airc_core::RoomId,
-        futures::stream::BoxStream<'static, Arc<Envelope>>,
+        futures::stream::BoxStream<'static, airc_bus::Result<Arc<Envelope>>>,
     >,
 ) {
     // Only a room that dropped a live push is re-subscribed,
@@ -903,7 +907,7 @@ where
     let mut pages: Vec<(airc_core::RoomId, Option<Cursor>)> = Vec::new();
     let mut merged: tokio_stream::StreamMap<
         airc_core::RoomId,
-        futures::stream::BoxStream<'static, Arc<Envelope>>,
+        futures::stream::BoxStream<'static, airc_bus::Result<Arc<Envelope>>>,
     > = tokio_stream::StreamMap::new();
     for entry in entries {
         if subs.contains_key(&entry.channel) {
@@ -991,7 +995,11 @@ where
                 }
                 merged.next().await
             } => match next {
-                Some((room, env)) => {
+                Some((_, Err(error))) => {
+                    write_response(&mut writer, &Response::Error { message: error.to_string() }).await?;
+                    return Ok(());
+                }
+                Some((room, Ok(env))) => {
                     let already_paged = subs.get(&room).and_then(|sub| sub.seen_through).is_some_and(
                         |through| env.delivery.is_durable() && !env.cursor().is_after(&through),
                     );
@@ -1819,7 +1827,7 @@ mod shared_frame_cancellation_tests {
             let (stream, lag) = state.router.subscribe_live_with_lag(filter_for(room));
             let mut merged: tokio_stream::StreamMap<
                 RoomId,
-                futures::stream::BoxStream<'static, Arc<Envelope>>,
+                futures::stream::BoxStream<'static, airc_bus::Result<Arc<Envelope>>>,
             > = tokio_stream::StreamMap::new();
             merged.insert(room, stream.boxed());
             for i in 0..1100 {

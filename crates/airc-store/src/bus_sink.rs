@@ -371,53 +371,13 @@ impl DurableSink for SqliteDurableSink {
         from_cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Envelope>, BusError> {
-        // Bounded by `limit`. The trait caller (the router's deep-replay)
-        // may pass a very large limit to mean "the whole tail"; clamp to
-        // `i64::MAX` so the SQL bind never overflows and we never use
-        // `usize::MAX` as a sentinel. The query stays indexed: ORDER BY
-        // rides the composite index, LIMIT only caps the row count.
-        let bounded = u64::try_from(limit)
-            .unwrap_or(u64::MAX)
-            .min(i64::MAX as u64);
-
-        let mut query = bus_event::Entity::find()
-            .filter(bus_event::Column::Class.is_not_null())
-            .filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
-
-        // Strictly after the cursor in generational order:
-        //   epoch > c.epoch
-        //   OR (epoch == c.epoch AND counter > c.counter)
-        //   OR (epoch == c.epoch AND counter == c.counter
-        //       AND event_id > c.event_id).
-        // event_id is the deterministic tiebreaker (§3.5); within one
-        // epoch the monotonic counter forbids a tie, but the tiebreak
-        // keeps the order total independent of how `seq` was produced.
-        if let Some(c) = from_cursor {
-            let epoch = c.seq.epoch as i64;
-            let counter = c.seq.counter as i64;
-            let event_id = c.event_id.as_uuid();
-            let strictly_after = Expr::col(bus_event::Column::Epoch)
-                .gt(epoch)
-                .or(Expr::col(bus_event::Column::Epoch)
-                    .eq(epoch)
-                    .and(Expr::col(bus_event::Column::Counter).gt(counter)))
-                .or(Expr::col(bus_event::Column::Epoch)
-                    .eq(epoch)
-                    .and(Expr::col(bus_event::Column::Counter).eq(counter))
-                    .and(Expr::col(bus_event::Column::EventId).gt(event_id)));
-            query = query.filter(strictly_after);
-        }
-
-        let rows = query
-            .order_by_asc(bus_event::Column::Epoch)
-            .order_by_asc(bus_event::Column::Counter)
-            .order_by_asc(bus_event::Column::EventId)
-            .limit(bounded)
-            .all(&self.readers)
-            .await
-            .map_err(BusError::sink_source)?;
-
-        rows.into_iter().map(from_model).collect()
+        self.filtered_page_after(
+            channel,
+            from_cursor,
+            limit,
+            &airc_bus::Filter::channel(channel),
+        )
+        .await
     }
 
     async fn page_tail(
@@ -447,6 +407,33 @@ impl DurableSink for SqliteDurableSink {
     }
 
     /// Every live subscription axis is evaluated by the store before LIMIT.
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        let bounded = u64::try_from(limit)
+            .map_err(BusError::sink_source)?
+            .min(i64::MAX as u64);
+        let mut query = filtered_bus_rows(channel, filter)?;
+        if let Some(cursor) = after {
+            query = query.filter(strictly_after(cursor));
+        }
+        query
+            .order_by_asc(bus_event::Column::Epoch)
+            .order_by_asc(bus_event::Column::Counter)
+            .order_by_asc(bus_event::Column::EventId)
+            .limit(bounded)
+            .all(&self.readers)
+            .await
+            .map_err(BusError::sink_source)?
+            .into_iter()
+            .map(from_model)
+            .collect()
+    }
+
     async fn filtered_tail_before(
         &self,
         channel: RoomId,
@@ -457,25 +444,7 @@ impl DurableSink for SqliteDurableSink {
         let bounded = u64::try_from(limit)
             .map_err(BusError::sink_source)?
             .min(i64::MAX as u64);
-        let mut query = bus_event::Entity::find()
-            .filter(bus_event::Column::RoomId.eq(channel.as_uuid()))
-            .filter(bus_event::Column::RoomId.eq(filter.channel.as_uuid()))
-            .filter(
-                crate::class_query::selection::<bus_event::Entity>(
-                    &filter.selection,
-                    &filter.headers,
-                )
-                .map_err(BusError::sink_source)?,
-            );
-        if let Some(kinds) = &filter.kinds {
-            query = query
-                .filter(bus_event::Column::Kind.is_in(kinds.iter().copied().map(kind_to_text)));
-        }
-        if let Some(delivery) = &filter.delivery {
-            query = query.filter(
-                bus_event::Column::Delivery.is_in(delivery.iter().copied().map(delivery_to_text)),
-            );
-        }
+        let mut query = filtered_bus_rows(channel, filter)?;
         if let Some(cursor) = before {
             query = query.filter(strictly_before(cursor));
         }
@@ -522,6 +491,29 @@ impl DurableSink for SqliteDurableSink {
             .map_err(BusError::sink_source)?;
         Ok(row.is_some())
     }
+}
+
+fn filtered_bus_rows(
+    channel: RoomId,
+    filter: &airc_bus::Filter,
+) -> Result<sea_orm::Select<bus_event::Entity>, BusError> {
+    let mut query = bus_event::Entity::find()
+        .filter(bus_event::Column::RoomId.eq(channel.as_uuid()))
+        .filter(bus_event::Column::RoomId.eq(filter.channel.as_uuid()))
+        .filter(
+            crate::class_query::selection::<bus_event::Entity>(&filter.selection, &filter.headers)
+                .map_err(BusError::sink_source)?,
+        );
+    if let Some(kinds) = &filter.kinds {
+        query =
+            query.filter(bus_event::Column::Kind.is_in(kinds.iter().copied().map(kind_to_text)));
+    }
+    if let Some(delivery) = &filter.delivery {
+        query = query.filter(
+            bus_event::Column::Delivery.is_in(delivery.iter().copied().map(delivery_to_text)),
+        );
+    }
+    Ok(query)
 }
 
 /// The ONE sanctioned `Envelope -> row` serialize (§3.3). Lives only
@@ -661,6 +653,21 @@ fn page_rows(
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],
 /// [`DurableSink::page_tail_of_kinds`]) so the ordering contract has
 /// exactly one home.
+fn strictly_after(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
+    let epoch = c.seq.epoch as i64;
+    let counter = c.seq.counter as i64;
+    let event_id = c.event_id.as_uuid();
+    Expr::col(bus_event::Column::Epoch)
+        .gt(epoch)
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).gt(counter)))
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).eq(counter))
+            .and(Expr::col(bus_event::Column::EventId).gt(event_id)))
+}
+
 fn strictly_before(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
     let epoch = c.seq.epoch as i64;
     let counter = c.seq.counter as i64;

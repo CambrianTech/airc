@@ -688,7 +688,8 @@ mod tests {
             let received = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
                 .await
                 .expect("live delivery")
-                .expect("subscriber open");
+                .expect("subscriber open")
+                .expect("subscription read succeeds");
             assert_eq!(received.event_id, f.envelope.event_id);
             assert_eq!(received.delivery, delivery);
         }

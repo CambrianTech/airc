@@ -104,15 +104,17 @@ impl Kind {
     ];
 
     pub const fn transcript_kind(self) -> airc_core::TranscriptKind {
-        use airc_core::TranscriptKind;
-        match self {
-            Self::Message => TranscriptKind::Message,
-            Self::Command => TranscriptKind::Command,
-            Self::CommandResult => TranscriptKind::CommandResult,
-            Self::Event | Self::Signal | Self::StreamChunk | Self::Control => {
-                TranscriptKind::System
-            }
-        }
+        use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
+        let class = match self {
+            Self::Message => EventClass::Correspondence(CorrespondenceKind::Message),
+            Self::Event => EventClass::Activity(ActivityKind::Intent),
+            Self::Command => EventClass::Control(ControlKind::Command),
+            Self::CommandResult => EventClass::Control(ControlKind::CommandResult),
+            Self::Signal => EventClass::Control(ControlKind::Signal),
+            Self::StreamChunk => EventClass::Control(ControlKind::Stream),
+            Self::Control => EventClass::Control(ControlKind::Session),
+        };
+        class.transcript_kind()
     }
 
     /// The only bus projection of producer semantics. Addressed crypto traffic

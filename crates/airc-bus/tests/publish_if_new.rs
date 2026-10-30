@@ -52,12 +52,14 @@ async fn second_arrival_of_same_event_id_is_duplicate_at_every_tier() {
     let first_seen = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("first event")
-        .expect("stream open");
+        .expect("stream open")
+        .expect("subscription read must succeed");
     assert_eq!(first_seen.payload.as_ref(), b"from the wire");
     let next_seen = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("second event")
-        .expect("stream open");
+        .expect("stream open")
+        .expect("subscription read must succeed");
     assert_eq!(
         next_seen.payload.as_ref(),
         b"sentinel",
@@ -151,6 +153,18 @@ struct FlakyContainsSink {
 
 #[async_trait]
 impl DurableSink for FlakyContainsSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
     async fn filtered_tail_before(
         &self,
         channel: RoomId,

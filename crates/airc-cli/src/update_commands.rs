@@ -481,15 +481,36 @@ fn install_prepared_update(
         return Err("installer returned without an owned binary transaction".into());
     };
 
-    let failure = match installed {
-        Err(error) => Some(format!("installer failed: {error}")),
-        Ok(()) if !smoke_test_new_binary(airc_exe, expected) => Some(format!(
-            "installed binary does not run and report expected build {expected}"
-        )),
-        Ok(()) => None,
-    };
+    let mut candidate_owner = None;
+    let failure = installed
+        .and_then(|()| {
+            if !smoke_test_new_binary(airc_exe, expected) {
+                return Err(format!(
+                    "installed binary does not run and report expected build {expected}"
+                )
+                .into());
+            }
+            if restart_owner {
+                candidate_owner = Some(spawn_restarted_daemon(
+                    daemon_command(airc_exe, home, "daemon", socket),
+                    home,
+                )?);
+                wait_daemon_ready(home, socket)?;
+                verify_daemon_build(airc_exe, home, socket, expected)?;
+            }
+            Ok(())
+        })
+        .err();
     if let Some(failure) = failure {
         eprintln!("Update failed ({failure}); restoring the owned previous binary.");
+        // A failed readiness check can leave a child still initializing before
+        // it binds IPC. Retain its process handle: endpoint absence alone never
+        // establishes that this candidate cannot later become a second owner.
+        if let Some(owner) = candidate_owner.as_mut() {
+            stop_candidate_owner(owner, || stop_daemon(socket)).map_err(|error| {
+                format!("update failed ({failure}); candidate shutdown failed ({error}); previous binary retained at {}", swap.previous().display())
+            })?;
+        }
         swap.rollback().map_err(|error| {
             format!(
             "update failed ({failure}); rollback failed ({error}); previous binary retained at {}",
@@ -516,11 +537,6 @@ fn install_prepared_update(
         .into());
     }
 
-    if restart_owner {
-        restart_daemon(airc_exe, home, socket)?;
-        wait_daemon_ready(home, socket)?;
-        verify_daemon_build(airc_exe, home, socket, expected)?;
-    }
     Ok(InstalledUpdate {
         previous_build,
         previous_path: swap.previous().to_owned(),
@@ -667,13 +683,13 @@ fn restart_daemon(
     home: &Path,
     socket: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    spawn_restarted_daemon(daemon_command(airc_exe, home, "daemon", socket), home)
+    spawn_restarted_daemon(daemon_command(airc_exe, home, "daemon", socket), home).map(|_| ())
 }
 
 fn spawn_restarted_daemon(
     mut command: Command,
     home: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(home)?;
     let log = home.join("airc-daemon.log");
     let stdout = std::fs::OpenOptions::new()
@@ -685,7 +701,24 @@ fn spawn_restarted_daemon(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    crate::commands::spawn_daemon(command)?;
+    Ok(crate::commands::spawn_daemon(command)?)
+}
+
+/// Gracefully stop a reachable owner, then reap the exact child we spawned.
+/// A candidate still initializing without IPC is terminated through that owned
+/// handle, never a discovered PID or an unrelated process.
+fn stop_candidate_owner(
+    owner: &mut std::process::Child,
+    graceful_stop: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if owner.try_wait()?.is_some() {
+        return Ok(());
+    }
+    graceful_stop()?;
+    if owner.try_wait()?.is_none() {
+        owner.kill()?;
+    }
+    owner.wait()?;
     Ok(())
 }
 
@@ -910,6 +943,43 @@ fn command_error(label: &str, output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_candidate_is_reaped_before_binary_recovery_even_without_ipc() {
+        const MODE: &str = "AIRC_UPDATE_CANDIDATE_REAP_FIXTURE";
+        if let Some(ready) = std::env::var_os(MODE) {
+            std::fs::write(ready, b"ready").expect("fixture ready");
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            return;
+        }
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let ready = dir.path().join("ready");
+        let mut command =
+            airc_core::process::background(std::env::current_exe().expect("test binary"));
+        let mut child = command.args([
+            "--exact", "update_commands::tests::failed_candidate_is_reaped_before_binary_recovery_even_without_ipc",
+        ]).env(MODE, &ready).stdout(std::process::Stdio::null()).spawn().expect("candidate");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("cleanup");
+                child.wait().expect("reap");
+                panic!("candidate fixture did not start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Unknown shutdown is a refusal, never permission to replace/restart.
+        assert!(
+            super::stop_candidate_owner(&mut child, || Err("unknown endpoint".into())).is_err()
+        );
+        assert!(child.try_wait().expect("status").is_none());
+        // IPC absence while initialization is pending still requires child exit.
+        super::stop_candidate_owner(&mut child, || Ok(())).expect("owned candidate reaped");
+        assert!(child.try_wait().expect("status").is_some());
+        // A child already exited needs no endpoint observation.
+        super::stop_candidate_owner(&mut child, || panic!("exited child needs no stop"))
+            .expect("already reaped");
+    }
+
     #[test]
     fn published_revision_pin_survives_a_newer_channel_tip_without_mutating_source() {
         let temp = tempfile::tempdir().unwrap();

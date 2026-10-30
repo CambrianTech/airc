@@ -70,7 +70,8 @@ async fn ephemeral_firehose_never_touches_the_sink_and_coalesces() {
     let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("ephemeral live push timed out")
-        .expect("stream ended");
+        .expect("stream ended")
+        .expect("subscription read must succeed");
     assert_eq!(
         next.payload.as_ref(),
         &1001u128.to_le_bytes(),

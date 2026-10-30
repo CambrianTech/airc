@@ -22,7 +22,7 @@ use common::{durable, GatedSink};
 /// — the zero-copy fan-out yields refcounted handles, not owned envelopes.
 async fn take_n<S>(mut stream: S, n: usize) -> Vec<Arc<airc_bus::Envelope>>
 where
-    S: futures::Stream<Item = Arc<airc_bus::Envelope>> + Unpin,
+    S: futures::Stream<Item = airc_bus::Result<Arc<airc_bus::Envelope>>> + Unpin,
 {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {

@@ -123,6 +123,18 @@ impl GatedSink {
 
 #[async_trait]
 impl DurableSink for GatedSink {
+    async fn filtered_page_after(
+        &self,
+        channel: RoomId,
+        after: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_page_after(channel, after, limit, filter)
+            .await
+    }
+
     async fn filtered_tail_before(
         &self,
         channel: RoomId,

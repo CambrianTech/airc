@@ -656,6 +656,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Version => commands::run_version(),
+        Command::StorePublishFresh { destination } => {
+            update_preflight::publish_fresh(&home, &destination).await
+        }
         Command::StorePreflight { fresh_install } => {
             update_preflight::run(&home, fresh_install).await
         }

@@ -13,7 +13,7 @@
 //! Lives in airc-protocol rather than airc-core because the function
 //! body touches `Frame`, and Frame lives here.
 
-use airc_core::transcript::{TranscriptEvent, TranscriptKind};
+use airc_core::transcript::TranscriptEvent;
 use serde_json::Value as JsonValue;
 
 use crate::envelope::{Frame, FrameKind};
@@ -49,14 +49,10 @@ impl Frame {
         {
             return Err(NotTranscribable);
         }
-        let kind = match kind {
-            FrameKind::Addressed => return Err(NotTranscribable),
-            FrameKind::Message => TranscriptKind::Message,
-            FrameKind::Event => TranscriptKind::System,
-            FrameKind::Control => TranscriptKind::SessionControl,
-            FrameKind::Command => TranscriptKind::Command,
-            FrameKind::CommandResult => TranscriptKind::CommandResult,
-        };
+        if kind == FrameKind::Addressed {
+            return Err(NotTranscribable);
+        }
+        let kind = envelope.class.transcript_kind();
 
         let mut metadata = serde_json::Map::new();
         if let Some(reply_to) = envelope.reply_to {
@@ -109,6 +105,7 @@ mod tests {
     use super::*;
     use crate::envelope::{Envelope, FrameKind};
     use crate::signature::Signature;
+    use airc_core::TranscriptKind;
     use airc_core::{
         body::Body, headers::Headers, transcript::MentionTarget, ClientId, EventId, PeerId, RoomId,
     };
