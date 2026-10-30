@@ -11,6 +11,7 @@ pub mod event;
 pub mod goal;
 pub mod goal_event;
 pub mod ids;
+pub mod issue_mirror;
 pub mod local_git;
 pub mod model;
 pub mod projection;
