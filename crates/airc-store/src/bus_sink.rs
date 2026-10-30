@@ -31,9 +31,8 @@ use std::path::Path;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sea_orm::{
-    sea_query::{Expr, OnConflict},
-    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    sea_query::Expr, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use airc_bus::envelope::{Cursor, DeliveryClass, Envelope, Kind, Target};
@@ -258,7 +257,7 @@ impl DurableSink for SqliteDurableSink {
         self.append_batch(&[e]).await
     }
 
-    /// Group-commit: one multi-row INSERT … ON CONFLICT DO NOTHING for the
+    /// Group-commit: engine-bounded INSERTs … ON CONFLICT DO NOTHING for the
     /// events and their header rows, in ONE transaction (one commit per batch,
     /// not per event); fsync work is amortized at WAL checkpoint under
     /// synchronous=NORMAL. Same idempotent-on-`event_id` contract: a replayed
@@ -276,20 +275,13 @@ impl DurableSink for SqliteDurableSink {
             .map(|e| to_active_model(e))
             .collect::<Result<Vec<_>, _>>()?;
         let txn = self.db.begin().await.map_err(sink)?;
-        match bus_event::Entity::insert_many(actives)
-            .on_conflict(
-                OnConflict::column(bus_event::Column::EventId)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(&txn)
-            .await
-        {
-            // Every row in the batch already existed (all conflicted) — the
-            // DO-NOTHING all-dupes path. Idempotent success, not an error.
-            Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
-            Err(err) => return Err(sink(err)),
-        }
+        crate::sqlite_batch::insert_ignoring::<bus_event::Entity>(
+            &txn,
+            actives,
+            [bus_event::Column::EventId],
+        )
+        .await
+        .map_err(sink)?;
         crate::header_query::write_header_rows::<bus_event::Entity>(
             &txn,
             events.iter().map(|e| (e.event_id.as_uuid(), &e.headers)),

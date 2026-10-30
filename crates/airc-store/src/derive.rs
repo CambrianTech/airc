@@ -208,7 +208,16 @@ mod tests {
             .has_column("events", "class")
             .await
             .unwrap());
-        assert_eq!(event::Entity::find().count(&db).await.unwrap(), 1);
+        // Read only columns present at this historical schema boundary.
+        assert_eq!(
+            event::Entity::find()
+                .select_only()
+                .column(event::Column::EventId)
+                .count(&db)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     // what this catches (Codex on #1618): a derivation interrupted midway is never

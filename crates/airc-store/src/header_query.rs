@@ -7,19 +7,13 @@
 //! range the prefix opens; `Not`/`All`/`AnyOf` compose. No JSON is parsed in SQL.
 
 use airc_core::{HeaderFilter, Headers};
-use sea_orm::sea_query::{Expr, OnConflict, Query, SelectStatement, SimpleExpr};
+use sea_orm::sea_query::{Expr, Query, SelectStatement, SimpleExpr};
 use sea_orm::{ActiveModelTrait, ConnectionTrait, DbErr, EntityTrait};
 use uuid::Uuid;
 
 use crate::event_table::EventTable;
 
-/// Header rows written per INSERT: three bound values each, well under
-/// SQLite's 32,766 host parameters per statement.
-const HEADER_ROWS_PER_INSERT: usize = 5_000;
-
-/// Write the header rows of `events` (id and headers) into `T`'s header
-/// entity, in INSERTs of at most [`HEADER_ROWS_PER_INSERT`] rows; a row that is
-/// already there (a replayed event) is skipped.
+/// Write idempotent header rows through the shared engine-bounded batch owner.
 pub(crate) async fn write_header_rows<'a, T: EventTable>(
     db: &impl ConnectionTrait,
     events: impl IntoIterator<Item = (Uuid, &'a Headers)>,
@@ -37,21 +31,12 @@ where
             rows.push(row);
         }
     }
-    for chunk in rows.chunks(HEADER_ROWS_PER_INSERT) {
-        match T::Headers::insert_many(chunk.to_vec())
-            .on_conflict(
-                OnConflict::columns([T::HEADER_EVENT_ID, T::HEADER_KEY])
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(db)
-            .await
-        {
-            Ok(_) | Err(DbErr::RecordNotInserted) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
+    crate::sqlite_batch::insert_ignoring::<T::Headers>(
+        db,
+        rows,
+        [T::HEADER_EVENT_ID, T::HEADER_KEY],
+    )
+    .await
 }
 
 /// Rows of `T` that are NOT this runtime's own sends: [`airc_core::RuntimeSelf`]

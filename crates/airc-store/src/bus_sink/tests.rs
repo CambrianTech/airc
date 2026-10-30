@@ -871,3 +871,43 @@ async fn lifecycle_kind_filter_uses_signed_class_before_limit_and_count() {
         0
     );
 }
+
+#[tokio::test]
+async fn later_bind_chunk_failure_rolls_back_earlier_event_chunks() {
+    use sea_orm::{Iterable, PaginatorTrait};
+    let sink = SqliteDurableSink::in_memory().await.expect("sink");
+    let channel = RoomId::new();
+    let capacity = crate::sqlite_batch::bind_capacity(&sink.db)
+        .await
+        .expect("measured bind capacity");
+    let rows_per_statement = capacity / bus_event::Column::iter().count();
+    let mut rows = (0..=rows_per_statement)
+        .map(|n| to_active_model(&durable_at(channel, 1, n as u64)).expect("model"))
+        .collect::<Vec<_>>();
+    // Missing required room fails the last statement, after an earlier full
+    // statement succeeded. The caller's one transaction must own both.
+    rows.last_mut().expect("rows").room_id = sea_orm::ActiveValue::NotSet;
+    let transaction = sink.db.begin().await.expect("transaction");
+    assert!(crate::sqlite_batch::insert_ignoring::<bus_event::Entity>(
+        &transaction,
+        rows,
+        [bus_event::Column::EventId],
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        bus_event::Entity::find()
+            .count(&transaction)
+            .await
+            .expect("earlier rows"),
+        rows_per_statement as u64
+    );
+    transaction.rollback().await.expect("rollback");
+    assert_eq!(
+        bus_event::Entity::find()
+            .count(&sink.db)
+            .await
+            .expect("no partial persistence"),
+        0
+    );
+}

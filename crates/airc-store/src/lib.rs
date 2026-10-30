@@ -59,6 +59,7 @@ pub mod refresh_lock;
 pub mod retention;
 pub mod scoped_state;
 pub mod sqlite;
+mod sqlite_batch;
 mod sqlite_only;
 pub mod store;
 pub mod subscriptions;
