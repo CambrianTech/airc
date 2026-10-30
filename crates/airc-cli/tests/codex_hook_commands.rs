@@ -306,7 +306,7 @@ fn codex_hook_suggests_claimable_work_on_work_events() {
 }
 
 #[test]
-fn codex_hook_suggests_availability_on_availability_events() {
+fn codex_hook_keeps_presence_quiet_and_reports_availability_with_correspondence() {
     let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
 
@@ -328,6 +328,12 @@ fn codex_hook_suggests_availability_on_availability_events() {
         ],
     );
 
+    let output = run_hook(&home, &["codex-hook", "user-prompt-submit"], "{}");
+    assert!(
+        output.trim().is_empty(),
+        "presence alone must not interrupt: {output}"
+    );
+    run_ok(&home, &["send", "please coordinate the next work item"]);
     let output = run_hook(&home, &["codex-hook", "user-prompt-submit"], "{}");
     let context = additional_context(&output);
 
