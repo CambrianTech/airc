@@ -32,6 +32,10 @@ use crate::ids::{ClientId, EventId, PeerId, RoomId};
 pub enum TranscriptKind {
     /// Conversational message body — the bulk of chat traffic.
     Message,
+    /// Protocol request, excluded from conversational perception.
+    Command,
+    /// Protocol response, excluded from conversational perception.
+    CommandResult,
     /// File / media attachment — `attachment` field populated.
     Attachment,
     /// Delivery / read / applied receipt — `receipt` field populated.
@@ -160,6 +164,8 @@ impl TranscriptKind {
             TranscriptKind::Presence => "presence",
             TranscriptKind::SessionControl => "session_control",
             TranscriptKind::System => "system",
+            TranscriptKind::Command => "command",
+            TranscriptKind::CommandResult => "command_result",
             TranscriptKind::PeerArrived => "peer_arrived",
             TranscriptKind::PeerDeparted => "peer_departed",
             TranscriptKind::WireEstablished => "wire_established",
@@ -180,6 +186,8 @@ impl TranscriptKind {
     pub fn from_wire_str(s: &str) -> Option<Self> {
         Some(match s {
             "message" => TranscriptKind::Message,
+            "command" => TranscriptKind::Command,
+            "command_result" => TranscriptKind::CommandResult,
             "attachment" => TranscriptKind::Attachment,
             "receipt" => TranscriptKind::Receipt,
             "presence" => TranscriptKind::Presence,
@@ -207,6 +215,8 @@ impl TranscriptKind {
     /// sync guard for the fan-out problem captured in card 0cfcc8db.
     pub const ALL_VARIANTS: &'static [TranscriptKind] = &[
         TranscriptKind::Message,
+        TranscriptKind::Command,
+        TranscriptKind::CommandResult,
         TranscriptKind::Attachment,
         TranscriptKind::Receipt,
         TranscriptKind::Presence,

@@ -672,7 +672,9 @@ impl Airc {
 
 fn route_class_for_frame(kind: FrameKind) -> RouteClass {
     match kind {
-        FrameKind::Message => RouteClass::DataInteractive,
+        FrameKind::Message | FrameKind::Command | FrameKind::CommandResult => {
+            RouteClass::DataInteractive
+        }
         FrameKind::Event | FrameKind::Control => RouteClass::ControlInteractive,
     }
 }

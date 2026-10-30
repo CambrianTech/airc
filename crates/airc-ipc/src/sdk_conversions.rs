@@ -47,15 +47,15 @@ pub const COUNTER_BITS: u32 = 40;
 pub const COUNTER_MASK: u64 = (1u64 << COUNTER_BITS) - 1;
 
 impl From<FrameKind> for IpcKind {
-    /// Lossless: the three chat-flavored `FrameKind` variants are a
-    /// subset of the seven `IpcKind` variants. RPC/grid consumers that
-    /// need `Command`/`CommandResult`/`Signal`/`StreamChunk` construct
-    /// `IpcKind` directly without going through `FrameKind`.
+    /// Preserve protocol categories across the daemon boundary. Commands
+    /// must never become conversational messages during SDK projection.
     fn from(kind: FrameKind) -> Self {
         match kind {
             FrameKind::Message => IpcKind::Message,
             FrameKind::Event => IpcKind::Event,
             FrameKind::Control => IpcKind::Control,
+            FrameKind::Command => IpcKind::Command,
+            FrameKind::CommandResult => IpcKind::CommandResult,
         }
     }
 }
@@ -115,6 +115,14 @@ mod tests {
             IpcKind::Message
         ));
         assert!(matches!(IpcKind::from(FrameKind::Event), IpcKind::Event));
+        assert!(matches!(
+            IpcKind::from(FrameKind::Command),
+            IpcKind::Command
+        ));
+        assert!(matches!(
+            IpcKind::from(FrameKind::CommandResult),
+            IpcKind::CommandResult
+        ));
         assert!(matches!(
             IpcKind::from(FrameKind::Control),
             IpcKind::Control
