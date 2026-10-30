@@ -42,6 +42,7 @@ pub enum AddressedAdmissionError {
     Signature(airc_protocol::VerificationError),
     Queue(crate::addressed_switch::RouteError),
     Forward(crate::addressed_switch::ForwardError),
+    Expiry(airc_protocol::addressed_deadline::DeadlineError),
 }
 
 impl std::fmt::Display for AddressedAdmissionError {
@@ -88,6 +89,7 @@ async fn admit_local(
     deadline: tokio::time::Instant,
 ) -> Result<(), AddressedAdmissionError> {
     let peer = verify_addressed(state, &frame).await?;
+    let deadline = sender_deadline(&frame, deadline)?;
     state
         .addressed
         .route(peer, frame, deadline)
@@ -100,6 +102,7 @@ async fn admit_ipc(
     deadline: tokio::time::Instant,
 ) -> Result<(), AddressedAdmissionError> {
     let peer = verify_addressed(state, &frame).await?;
+    let deadline = sender_deadline(&frame, deadline)?;
     match state
         .addressed
         .route_if_owned(peer, frame, deadline)
@@ -112,6 +115,20 @@ async fn admit_ipc(
             .await
             .map_err(AddressedAdmissionError::Forward),
     }
+}
+
+fn sender_deadline(
+    frame: &Frame,
+    local: tokio::time::Instant,
+) -> Result<tokio::time::Instant, AddressedAdmissionError> {
+    let monotonic = tokio::time::Instant::now();
+    let remaining = airc_protocol::addressed_deadline::remaining(
+        &frame.envelope.headers,
+        std::time::SystemTime::now(),
+    )
+    .map_err(AddressedAdmissionError::Expiry)?;
+    // Cap before adding, so a malicious far-future expiry cannot overflow Instant.
+    Ok(monotonic + remaining.min(local.saturating_duration_since(monotonic)))
 }
 
 async fn verify_addressed(
@@ -276,6 +293,46 @@ mod tests {
     use airc_store::InMemoryEventStore;
     use tokio::io::AsyncWriteExt;
 
+    #[tokio::test]
+    async fn signed_missing_or_expired_sender_budget_never_reaches_local_queue() {
+        let (_home, state, peer, key) = fixture().await;
+        let mut receiver = state.addressed.register(peer).unwrap();
+        let mut frame = test_frame(peer);
+        frame.envelope.signature = key.sign_envelope(&frame.envelope, peer, 0).unwrap();
+        assert!(matches!(
+            state.receive_addressed_frame(frame.clone()).await,
+            Err(AddressedAdmissionError::Expiry(
+                airc_protocol::addressed_deadline::DeadlineError::Missing
+            ))
+        ));
+        frame.envelope.headers.insert(
+            airc_protocol::addressed_deadline::EXPIRY_HEADER.into(),
+            "1".into(),
+        );
+        frame.envelope.signature = key.sign_envelope(&frame.envelope, peer, 0).unwrap();
+        assert!(matches!(
+            state.receive_addressed_frame(frame.clone()).await,
+            Err(AddressedAdmissionError::Expiry(
+                airc_protocol::addressed_deadline::DeadlineError::Elapsed
+            ))
+        ));
+        airc_protocol::addressed_deadline::stamp(
+            &mut frame.envelope.headers,
+            std::time::SystemTime::now(),
+            airc_ipc::client::DEFAULT_RPC_TIMEOUT,
+        )
+        .unwrap();
+        // Extending the signed header without the sender's key is not authority.
+        assert!(matches!(
+            state.receive_addressed_frame(frame).await,
+            Err(AddressedAdmissionError::Signature(_))
+        ));
+        assert!(matches!(
+            receiver.rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[derive(Default)]
     struct RecordingForwarder(std::sync::Mutex<Vec<Frame>>);
 
@@ -299,6 +356,12 @@ mod tests {
         let forwarder = Arc::new(RecordingForwarder::default());
         state.addressed.set_forwarder(forwarder.clone()).unwrap();
         let mut frame = test_frame(peer);
+        airc_protocol::addressed_deadline::stamp(
+            &mut frame.envelope.headers,
+            std::time::SystemTime::now(),
+            airc_ipc::client::DEFAULT_RPC_TIMEOUT,
+        )
+        .unwrap();
         frame.envelope.signature = key.sign_envelope(&frame.envelope, peer, 0).unwrap();
         let deadline = tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT;
         let mut owner = state.addressed.register(peer).unwrap();

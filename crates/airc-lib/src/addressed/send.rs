@@ -122,6 +122,15 @@ impl Airc {
                 signature: Signature::Unsigned,
             },
         };
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(AddressedError::DeadlineExceeded)?;
+        airc_protocol::addressed_deadline::stamp(
+            &mut frame.envelope.headers,
+            std::time::SystemTime::now(),
+            remaining,
+        )
+        .map_err(|error| AddressedError::Codec(format!("addressed expiry: {error:?}")))?;
         frame.envelope.signature = self
             .inner
             .identity

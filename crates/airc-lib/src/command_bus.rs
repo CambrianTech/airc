@@ -144,7 +144,13 @@ impl Airc {
             .checked_add(Duration::from_millis(remaining))
             .ok_or_else(|| {
                 AircError::Transport("reply deadline exceeds monotonic clock range".into())
-            })?;
+            })?
+            .min(request.deadline());
+        if Instant::now() >= deadline {
+            return Err(AircError::CommandDeadline {
+                correlation_id: request.correlation(),
+            });
+        }
         headers.insert(
             HEADER_AIRC_CORRELATION_ID.into(),
             request.correlation().to_string(),

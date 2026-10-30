@@ -45,6 +45,7 @@ pub struct AddressedSend {
 /// one, so holding it means the session authenticated every field.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedAddressed {
+    deadline: tokio::time::Instant,
     from: PeerId,
     to: PeerId,
     kind: AddressedKind,
@@ -54,8 +55,19 @@ pub struct VerifiedAddressed {
 }
 
 impl VerifiedAddressed {
-    fn opened(from: PeerId, to: PeerId, inner: airc_protocol::addressed::SealedInner) -> Self {
+    /// Retained local monotonic expiry; consumers must respect it after retrieval.
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    fn opened(
+        from: PeerId,
+        to: PeerId,
+        inner: airc_protocol::addressed::SealedInner,
+        deadline: tokio::time::Instant,
+    ) -> Self {
         Self {
+            deadline,
             from,
             to,
             kind: inner.kind,
@@ -135,12 +147,21 @@ pub enum InboxError {
     Lagged { lost: u64 },
     /// The handle is gone: no payload will arrive again.
     Closed,
+    /// A queued payload expired before this consumer retrieved it.
+    Expired,
 }
 
 impl AddressedInbox {
+    fn admit(item: Arc<VerifiedAddressed>) -> Result<Arc<VerifiedAddressed>, InboxError> {
+        if tokio::time::Instant::now() >= item.deadline {
+            Err(InboxError::Expired)
+        } else {
+            Ok(item)
+        }
+    }
     fn drain_closed(&mut self) -> Result<Arc<VerifiedAddressed>, InboxError> {
         match self.rx.try_recv() {
-            Ok(item) => Ok(item),
+            Ok(item) => Self::admit(item),
             Err(broadcast::error::TryRecvError::Lagged(lost)) => Err(InboxError::Lagged { lost }),
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
                 Err(InboxError::Closed)
@@ -164,7 +185,7 @@ impl AddressedInbox {
             self.rx.recv().await
         };
         match received {
-            Ok(item) => Ok(item),
+            Ok(item) => Self::admit(item),
             Err(broadcast::error::RecvError::Lagged(lost)) => Err(InboxError::Lagged { lost }),
             Err(broadcast::error::RecvError::Closed) => Err(InboxError::Closed),
         }
@@ -228,6 +249,51 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn reply_cannot_renew_expired_outer_budget_with_future_inner_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let airc = crate::Airc::open(home.path()).await.unwrap();
+        let mut headers = Headers::new();
+        headers.insert(
+            airc_protocol::HEADER_AIRC_DEADLINE.into(),
+            (crate::time::now_ms().unwrap() + 60_000).to_string(),
+        );
+        let request = VerifiedAddressed {
+            deadline: tokio::time::Instant::now(),
+            from: PeerId::new(),
+            to: airc.peer_id(),
+            kind: AddressedKind::Command,
+            correlation: Uuid::new_v4(),
+            headers,
+            body: Body::text("late"),
+        };
+        assert!(matches!(
+            airc.reply(&request, Headers::new(), Body::text("reply"))
+                .await,
+            Err(crate::AircError::CommandDeadline { .. })
+        ));
+        assert!(airc.inner.lan_tcp.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_payload_is_refused_even_when_draining_closed_owner() {
+        let (tx, rx) = broadcast::channel(1);
+        let mut inbox = AddressedInbox { rx, owner: None };
+        let item = Arc::new(VerifiedAddressed {
+            deadline: tokio::time::Instant::now(),
+            from: PeerId::new(),
+            to: PeerId::new(),
+            kind: AddressedKind::Command,
+            correlation: Uuid::new_v4(),
+            headers: Headers::new(),
+            body: Body::text("expired"),
+        });
+        tx.send(item.clone()).unwrap();
+        assert_eq!(inbox.next().await.err(), Some(InboxError::Expired));
+        tx.send(item).unwrap();
+        assert_eq!(inbox.drain_closed().err(), Some(InboxError::Expired));
+    }
+
+    #[tokio::test]
     async fn result_then_eof_is_drained_before_closed() {
         let (tx, rx) = broadcast::channel(1);
         let (closed_tx, closed) = watch::channel(false);
@@ -240,6 +306,7 @@ mod tests {
             owner: Some(owner),
         };
         let item = Arc::new(VerifiedAddressed {
+            deadline: tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT,
             from: PeerId::new(),
             to: PeerId::new(),
             kind: AddressedKind::CommandResult,
@@ -265,6 +332,7 @@ mod tests {
         let mut inbox = AddressedInbox { rx, owner: None };
         let item = |n: u128| {
             Arc::new(VerifiedAddressed {
+                deadline: tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT,
                 from: PeerId::from_u128(n),
                 to: PeerId::from_u128(0),
                 kind: AddressedKind::Command,

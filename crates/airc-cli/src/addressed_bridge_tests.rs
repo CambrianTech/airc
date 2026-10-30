@@ -183,6 +183,12 @@ async fn production_bridges_forward_signed_frames_bidirectionally_without_storag
                 signature: airc_protocol::Signature::Unsigned,
             },
         };
+        airc_protocol::addressed_deadline::stamp(
+            &mut frame.envelope.headers,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         frame.envelope.signature = sender
             .1
             .sign_envelope(&frame.envelope, sender.0, 0)

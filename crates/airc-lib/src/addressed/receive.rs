@@ -17,6 +17,20 @@ impl Airc {
     /// handshake step (answered) or a sealed payload (opened into the inbox).
     pub(crate) async fn receive_addressed(&self, frame: Frame) {
         let me = self.peer_id();
+        if !matches!(&frame.envelope.signature, airc_protocol::Signature::Ed25519 { signer, .. } if *signer == frame.envelope.sender)
+        {
+            return refuse(frame.envelope.sender, "addressed original sender must sign");
+        }
+        if let Err(error) = airc_protocol::verify(
+            &frame,
+            airc_protocol::VerificationPolicy::Strict,
+            &self.inner.registry,
+        ) {
+            return refuse(
+                frame.envelope.sender,
+                &format!("addressed sender signature: {error}"),
+            );
+        }
         let envelope = frame.envelope;
         if envelope.target != MentionTarget::Peer(me) || envelope.channel != addressed_channel() {
             tracing::trace!(
@@ -27,6 +41,16 @@ impl Airc {
             return;
         }
         let from = envelope.sender;
+        let monotonic = tokio::time::Instant::now();
+        let budget = match airc_protocol::addressed_deadline::remaining(
+            &envelope.headers,
+            std::time::SystemTime::now(),
+        ) {
+            Ok(budget) => budget.min(airc_ipc::client::DEFAULT_RPC_TIMEOUT),
+            Err(error) => return refuse(from, &format!("sender expiry: {error:?}")),
+        };
+        let deadline = monotonic + budget;
+
         let wire = match envelope.body.as_ref().map(AddressedWire::from_body) {
             Some(Ok(wire)) => wire,
             Some(Err(error)) => return refuse(from, &error.to_string()),
@@ -42,11 +66,7 @@ impl Airc {
                     Ok(resp) => {
                         state.session_installed();
                         if let Err(error) = self
-                            .send_addressed_wire(
-                                from,
-                                &AddressedWire::Resp(resp),
-                                tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT,
-                            )
+                            .send_addressed_wire(from, &AddressedWire::Resp(resp), deadline)
                             .await
                         {
                             refuse(from, &format!("handshake response not sent: {error}"));
@@ -69,15 +89,14 @@ impl Airc {
             AddressedWire::Sealed(sealed) => {
                 match state.sessions.open_from(from, &aad(from, me), &sealed) {
                     Ok(plaintext) => match SealedInner::from_plaintext(&plaintext) {
-                        Ok(inner) => {
-                            self.deliver_opened(VerifiedAddressed::opened(from, me, inner))
-                        }
+                        Ok(inner) => self
+                            .deliver_opened(VerifiedAddressed::opened(from, me, inner, deadline)),
                         Err(error) => refuse(from, &error.to_string()),
                     },
                     // This side lost its session (a restart): re-key, so the
                     // sender's retry opens. Its current frame is gone, which
                     // its deadline reports.
-                    Err(SessionManagerError::NoSession) => self.rekey_logged(from).await,
+                    Err(SessionManagerError::NoSession) => self.rekey_logged(from, deadline).await,
                     // The same frame by a second route: already delivered.
                     Err(SessionManagerError::Session(SessionError::Replay)) => {}
                     // The peer seals under a session this side does not hold
@@ -89,7 +108,7 @@ impl Airc {
                         ),
                     ) => {
                         refuse(from, &error.to_string());
-                        self.rekey_logged(from).await;
+                        self.rekey_logged(from, deadline).await;
                     }
                     Err(error) => refuse(from, &error.to_string()),
                 }
@@ -105,6 +124,9 @@ impl Airc {
     /// consumer's dedup on (from, correlation).
     fn deliver_opened(&self, verified: VerifiedAddressed) {
         let from = verified.from();
+        if tokio::time::Instant::now() >= verified.deadline {
+            return refuse(from, "payload expired before delivery");
+        }
         if verified.kind() == super::AddressedKind::Command
             && verified
                 .headers()
@@ -113,8 +135,12 @@ impl Airc {
         {
             let owner = self.clone();
             tokio::spawn(async move {
-                if let Err(error) = owner.serve_backfill(&verified).await {
-                    refuse(from, &format!("addressed backfill failed: {error}"));
+                match tokio::time::timeout_at(verified.deadline, owner.serve_backfill(&verified))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => refuse(from, &format!("addressed backfill failed: {error}")),
+                    Err(_) => refuse(from, "addressed backfill expired"),
                 }
             });
             return;
@@ -149,14 +175,8 @@ impl Airc {
             .await
     }
 
-    async fn rekey_logged(&self, peer: airc_core::PeerId) {
-        if let Err(error) = self
-            .rekey(
-                peer,
-                tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT,
-            )
-            .await
-        {
+    async fn rekey_logged(&self, peer: airc_core::PeerId, deadline: tokio::time::Instant) {
+        if let Err(error) = self.rekey(peer, deadline).await {
             refuse(peer, &format!("re-key init not sent: {error}"));
         }
     }
@@ -165,4 +185,113 @@ impl Airc {
 /// A refused addressed frame: loud, never echoed (no payload is logged).
 fn refuse(from: airc_core::PeerId, reason: &str) {
     tracing::warn!(target: "airc::addressed", %from, reason, "addressed frame refused");
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use airc_core::{Body, Headers};
+    use airc_protocol::{Envelope, FrameKind, Signature};
+
+    #[tokio::test]
+    async fn intermediary_cannot_extend_expiry_or_consume_original_replay_counter() {
+        let ah = tempfile::tempdir().unwrap();
+        let bh = tempfile::tempdir().unwrap();
+        let ch = tempfile::tempdir().unwrap();
+        let alice = Airc::open(ah.path()).await.unwrap();
+        let bob = Airc::open(bh.path()).await.unwrap();
+        let carol = Airc::open(ch.path()).await.unwrap();
+        alice
+            .add_peer(bob.peer_spec().parse().unwrap())
+            .await
+            .unwrap();
+        bob.add_peer(alice.peer_spec().parse().unwrap())
+            .await
+            .unwrap();
+        bob.add_peer(carol.peer_spec().parse().unwrap())
+            .await
+            .unwrap();
+        let init = alice
+            .inner
+            .addressed
+            .sessions
+            .ensure_handshake(bob.peer_id(), now_ms().unwrap());
+        let resp = bob.inner.addressed.sessions.on_init(&init).unwrap();
+        alice.inner.addressed.sessions.on_resp(&resp).unwrap();
+        let plaintext = SealedInner {
+            kind: super::super::AddressedKind::Command,
+            correlation: uuid::Uuid::new_v4(),
+            headers: Headers::new(),
+            body: Body::text("original"),
+        }
+        .to_plaintext()
+        .unwrap();
+        let sealed = alice
+            .inner
+            .addressed
+            .sessions
+            .seal_for(
+                bob.peer_id(),
+                &aad(alice.peer_id(), bob.peer_id()),
+                &plaintext,
+            )
+            .unwrap();
+        let mut original = Frame {
+            kind: FrameKind::Addressed,
+            envelope: Envelope {
+                event_id: airc_core::EventId::new(),
+                sender: alice.peer_id(),
+                sender_client: alice.inner.identity.client_id,
+                channel: addressed_channel(),
+                target: MentionTarget::Peer(bob.peer_id()),
+                lamport: 1,
+                occurred_at_ms: now_ms().unwrap(),
+                reply_to: None,
+                headers: Headers::new(),
+                body: Some(AddressedWire::Sealed(sealed).to_body().unwrap()),
+                media: Vec::new(),
+                signature: Signature::Unsigned,
+            },
+        };
+        airc_protocol::addressed_deadline::stamp(
+            &mut original.envelope.headers,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        original.envelope.signature = alice
+            .inner
+            .identity
+            .keypair
+            .sign_envelope(&original.envelope, alice.peer_id(), 0)
+            .unwrap();
+        let mut forged = original.clone();
+        airc_protocol::addressed_deadline::stamp(
+            &mut forged.envelope.headers,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        forged.envelope.signature = carol
+            .inner
+            .identity
+            .keypair
+            .sign_envelope(&forged.envelope, carol.peer_id(), 0)
+            .unwrap();
+        let mut inbox = bob
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        bob.receive_addressed(forged).await;
+        assert!(matches!(
+            inbox.rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        bob.receive_addressed(original).await;
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(1), inbox.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.body().as_text(), Some("original"));
+    }
 }
