@@ -176,7 +176,8 @@ async fn dispatch(inner: &Arc<Inner>, frame: Frame) {
             airc_protocol::FrameKind::Message
             | airc_protocol::FrameKind::Control
             | airc_protocol::FrameKind::Command
-            | airc_protocol::FrameKind::CommandResult => {
+            | airc_protocol::FrameKind::CommandResult
+            | airc_protocol::FrameKind::Addressed => {
                 // Durable: backpressure (await capacity).
                 let _ = tx.send(Ok(frame.clone())).await;
             }

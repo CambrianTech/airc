@@ -129,6 +129,17 @@ impl SessionManager {
         self.sessions.contains_key(&peer)
     }
 
+    /// Is a handshake we started to `peer` still awaiting its response?
+    pub fn has_pending(&self, peer: PeerId) -> bool {
+        self.pending.contains_key(&peer)
+    }
+
+    /// Abandon our unanswered handshake to `peer` (its init or response was
+    /// lost), so the next send starts a fresh one.
+    pub fn cancel_pending(&self, peer: PeerId) {
+        self.pending.remove(&peer);
+    }
+
     /// Begin a handshake to `peer`: returns the `HandshakeInit` to send and
     /// records the pending state to finish with [`on_resp`](Self::on_resp).
     /// Re-initiating replaces any prior pending handshake to that peer. `now_ms`
@@ -163,7 +174,9 @@ impl SessionManager {
     /// refused. A newer one replaces a live session: that is how a restarted
     /// peer re-keys.
     pub fn on_init(&self, init: &HandshakeInit) -> Result<HandshakeResp, SessionManagerError> {
-        if self.pending.contains_key(&init.peer_id) && self.peer_id.as_uuid() < init.peer_id.as_uuid() {
+        if self.pending.contains_key(&init.peer_id)
+            && self.peer_id.as_uuid() < init.peer_id.as_uuid()
+        {
             return Err(SessionManagerError::Crossed);
         }
         if let Some(last) = self.accepted_init_at.get(&init.peer_id) {
@@ -179,7 +192,8 @@ impl SessionManager {
             &self.registry,
         )?;
         self.pending.remove(&init.peer_id);
-        self.accepted_init_at.insert(init.peer_id, init.issued_at_ms);
+        self.accepted_init_at
+            .insert(init.peer_id, init.issued_at_ms);
         self.sessions.insert(init.peer_id, session);
         Ok(resp)
     }
@@ -338,7 +352,10 @@ mod tests {
         let lo_init = lo.begin_handshake(hi_id, 1_000);
         let hi_init = hi.begin_handshake(lo_id, 1_000);
 
-        assert_eq!(lo.on_init(&hi_init).err(), Some(SessionManagerError::Crossed));
+        assert_eq!(
+            lo.on_init(&hi_init).err(),
+            Some(SessionManagerError::Crossed)
+        );
         let resp = hi.on_init(&lo_init).unwrap();
         lo.on_resp(&resp).unwrap();
 
@@ -383,7 +400,11 @@ mod tests {
         assert!(second.issued_at_ms > first.issued_at_ms);
         b.on_init(&first).unwrap();
 
-        let restarted = SessionManager::new(PeerKeypair::from_secret_bytes(&keypair_bytes), a_id, Arc::clone(&reg));
+        let restarted = SessionManager::new(
+            PeerKeypair::from_secret_bytes(&keypair_bytes),
+            a_id,
+            Arc::clone(&reg),
+        );
         let init = restarted.begin_handshake(b_id, 2_000);
         let resp = b.on_init(&init).unwrap();
         restarted.on_resp(&resp).unwrap();

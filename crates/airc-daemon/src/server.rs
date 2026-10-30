@@ -28,7 +28,7 @@ use airc_diagnostics::{
     DiagnosticCode, DiagnosticComponent, DiagnosticEvent, DiagnosticSink, StderrJsonDiagnosticSink,
 };
 use airc_ipc::codec::{read_frame, write_encoded_frame, write_frame};
-use airc_ipc::request::{AttachRequest, AttachStart, IpcDelivery, IpcKind, Request};
+use airc_ipc::request::{AttachRequest, AttachStart, Request};
 use airc_ipc::response::Response;
 use airc_ipc::transport::{IpcAcceptError, IpcListener, IpcStream};
 
@@ -427,28 +427,6 @@ fn lock_path_for(socket_path: &Path) -> PathBuf {
     PathBuf::from(raw)
 }
 
-fn map_ipc_kind(kind: IpcKind) -> Kind {
-    match kind {
-        IpcKind::Message => Kind::Message,
-        IpcKind::Event => Kind::Event,
-        IpcKind::Command => Kind::Command,
-        IpcKind::CommandResult => Kind::CommandResult,
-        IpcKind::Signal => Kind::Signal,
-        IpcKind::StreamChunk => Kind::StreamChunk,
-        IpcKind::Control => Kind::Control,
-    }
-}
-
-fn map_ipc_delivery(delivery: IpcDelivery) -> DeliveryClass {
-    match delivery {
-        IpcDelivery::Durable => DeliveryClass::Durable,
-        IpcDelivery::EphemeralLatest => DeliveryClass::EphemeralLatest,
-        IpcDelivery::EphemeralWindow => DeliveryClass::EphemeralWindow,
-        IpcDelivery::RequestResponse => DeliveryClass::RequestResponse,
-        IpcDelivery::StreamChunk => DeliveryClass::StreamChunk,
-    }
-}
-
 /// If the previous daemon left a stale socket file behind, unlink
 /// it. If a process is actively holding it (live daemon), bail with
 /// AddrInUse rather than silently steal the listener.
@@ -564,10 +542,23 @@ where
     // scoped `forge.*` headers; a media tap → StreamChunk only).
     let mut filter = Filter::channel(channel);
     if let Some(kinds) = parts.kinds {
-        filter = filter.with_kinds(kinds.into_iter().map(map_ipc_kind).collect());
+        match crate::kind_map::bus_kinds(kinds) {
+            Ok(kinds) => filter = filter.with_kinds(kinds),
+            Err(refusal) => {
+                let refusal = Response::Error {
+                    message: format!("attach: {refusal}"),
+                };
+                return write_response(&mut writer, &refusal).await;
+            }
+        }
     }
     if let Some(delivery) = parts.delivery {
-        filter = filter.with_delivery(delivery.into_iter().map(map_ipc_delivery).collect());
+        filter = filter.with_delivery(
+            delivery
+                .into_iter()
+                .map(crate::kind_map::bus_delivery)
+                .collect(),
+        );
     }
     filter = filter.with_headers(parts.headers);
 
@@ -879,12 +870,15 @@ where
         )
         .await;
     }
-    let kinds: Option<Vec<Kind>> = parts
-        .kinds
-        .map(|k| k.into_iter().map(map_ipc_kind).collect());
+    let kinds: Option<Vec<Kind>> = match parts.kinds.map(crate::kind_map::bus_kinds).transpose() {
+        Ok(kinds) => kinds,
+        Err(refusal) => {
+            return write_response(&mut writer, &refuse(&format!("attach: {refusal}"))).await;
+        }
+    };
     let delivery: Option<Vec<DeliveryClass>> = parts
         .delivery
-        .map(|d| d.into_iter().map(map_ipc_delivery).collect());
+        .map(|d| d.into_iter().map(crate::kind_map::bus_delivery).collect());
     let headers = parts.headers;
     let filter_for = |room: airc_core::RoomId| {
         let mut filter = Filter::channel(room);

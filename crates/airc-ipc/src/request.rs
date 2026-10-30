@@ -69,6 +69,9 @@ pub enum IpcKind {
     Signal,
     StreamChunk,
     Control,
+    /// Peer-to-peer traffic readable by its two ends only (a handshake step or
+    /// a sealed command/result). Never enters the bus or any transcript.
+    Addressed,
 }
 
 /// A cursor into a channel's total order: the owner-assigned

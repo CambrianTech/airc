@@ -71,7 +71,9 @@ impl std::fmt::Display for HandshakeError {
                 )
             }
             HandshakeError::KeyDerivation => write!(f, "handshake session key derivation failed"),
-            HandshakeError::NotAddressedToMe => write!(f, "handshake init names a different responder"),
+            HandshakeError::NotAddressedToMe => {
+                write!(f, "handshake init names a different responder")
+            }
         }
     }
 }
@@ -222,7 +224,13 @@ pub fn initiate(
 ) -> (PendingHandshake, HandshakeInit) {
     let secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let eph_pub = PublicKey::from(&secret).to_bytes();
-    let sig = keypair.sign_bytes(&init_signed_bytes(&eph_pub, my_peer_id, key_id, to, issued_at_ms));
+    let sig = keypair.sign_bytes(&init_signed_bytes(
+        &eph_pub,
+        my_peer_id,
+        key_id,
+        to,
+        issued_at_ms,
+    ));
     let init = HandshakeInit {
         peer_id: my_peer_id,
         key_id,
@@ -437,7 +445,9 @@ mod tests {
         let (a, b) = (peer(), peer());
         let reg = registry(&[&a, &b]);
         let eph_pub = [0u8; 32]; // low-order / identity point
-        let sig = a.keypair.sign_bytes(&init_signed_bytes(&eph_pub, a.id, 0, b.id, 1));
+        let sig = a
+            .keypair
+            .sign_bytes(&init_signed_bytes(&eph_pub, a.id, 0, b.id, 1));
         let init = HandshakeInit {
             peer_id: a.id,
             key_id: 0,

@@ -36,6 +36,7 @@ pub mod auto_update;
 #[cfg(unix)]
 mod file_capacity;
 pub mod handlers;
+mod kind_map;
 pub(crate) mod reclaim;
 pub mod route_refresh;
 pub mod server;
