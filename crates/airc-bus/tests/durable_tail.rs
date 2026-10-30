@@ -792,11 +792,11 @@ async fn attach_deep_leg_pages_bounded_and_delivers_every_event_once() {
     );
 }
 
-/// A kinds filter that drops ~4 full pages must not stall the raw cursor:
-/// filtered rows advance the paging cursor (no infinite loop), and accepted
-/// rows still arrive exactly once through to the ring boundary.
+/// Durable selection excludes unrelated kinds before the page limit. Accepted
+/// rows still arrive exactly once through the ring boundary without transferring
+/// pages of excluded events to the replay owner.
 #[tokio::test]
-async fn attach_deep_leg_advances_past_filtered_pages() {
+async fn attach_deep_leg_filters_before_paging() {
     const EVENTS: u128 = 5_000; // all Kind::Event — filtered out by the subscription
     const MESSAGES: u128 = 1_000; // tail is Messages; the ring boundary sits inside it
 
@@ -845,12 +845,12 @@ async fn attach_deep_leg_advances_past_filtered_pages() {
         );
     }
 
-    // The deep leg walked ~5,936 raw rows — four-plus full filtered pages plus
-    // the partial page holding accepted messages — before the ring boundary.
-    assert!(
-        sink.page_calls() >= 6,
-        "filtered pages must still be paged past, got {}",
-        sink.page_calls()
+    // All 1,000 selected messages fit in one bounded page; the 5,000 excluded
+    // events must not inflate the number of pages returned to the replay owner.
+    assert_eq!(
+        sink.page_calls(),
+        1,
+        "selection must precede the page limit"
     );
     assert!(sink.max_page_limit() <= ATTACH_DEEP_REPLAY_PAGE);
 }
