@@ -34,9 +34,7 @@ pub(crate) async fn open_pr_and_link(
     // The caller resolved this room once; the lookup, the link and the review sibling
     // it spawns all bind to THAT room (#1447 extended to the review-transition path).
     let board = airc.work_board_in(room).await?;
-    let card = board
-        .card(card_id)
-        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+    let card = crate::work_commands::board_card(&board, card_id, Some(room), airc.home())?;
     if card.reviews.is_some() || card.pull_request.is_some() {
         // Review-only verdicts and already-linked PRs keep their existing path.
         return Ok(());
@@ -315,9 +313,7 @@ pub(crate) async fn relink_card_pr(
     let board = airc
         .work_board_complete(airc_lib::WORK_BOARD_PROJECTION_PAGE_SIZE)
         .await?;
-    let card = board
-        .card(card_id)
-        .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
+    let card = crate::work_commands::board_card(&board, card_id, None, airc.home())?;
     let Some(current) = &card.pull_request else {
         return Err(format!(
             "card {card_id} has no linked pull_request to supersede — \
