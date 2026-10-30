@@ -216,3 +216,126 @@ async fn production_bridges_forward_signed_frames_bidirectionally_without_storag
     a.shutdown().await;
     b.shutdown().await;
 }
+
+#[tokio::test]
+async fn attached_sdk_scopes_exchange_encrypted_command_and_result() {
+    use airc_lib::addressed::{AddressedKind, AddressedSend};
+    let a = Machine::boot().await;
+    let b = Machine::boot().await;
+    a.gateway
+        .add_peer(b.gateway.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    b.gateway
+        .add_peer(a.gateway.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    let addr = b
+        .gateway
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    a.gateway
+        .connect_lan(addr, b.gateway.peer_id())
+        .await
+        .unwrap();
+    let alice =
+        airc_lib::Airc::attach_as(a.home.path(), "alice", a._socket_home.path().join("a.sock"))
+            .await
+            .unwrap();
+    let bob = airc_lib::Airc::attach_as(b.home.path(), "bob", b._socket_home.path().join("a.sock"))
+        .await
+        .unwrap();
+    for gateway in [&a.gateway, &b.gateway, &alice, &bob] {
+        for scope in [&alice, &bob] {
+            gateway
+                .add_peer(scope.peer_spec().parse().unwrap())
+                .await
+                .unwrap();
+        }
+    }
+    for machine in [&a, &b] {
+        for (scope, host) in [(&alice, a.state.peer_id), (&bob, b.state.peer_id)] {
+            airc_trust::set_endpoints_json(
+                machine.home.path(),
+                scope.peer_id(),
+                None,
+                1,
+                Some(host),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut alice_inbox = alice.addressed_inbox(deadline).await.unwrap();
+    let mut bob_inbox = bob.addressed_inbox(deadline).await.unwrap();
+    let mut before = Vec::new();
+    for machine in [&a, &b] {
+        let store =
+            airc_store::SqliteEventStore::open_path(&machine.home.path().join("events.sqlite"))
+                .await
+                .unwrap();
+        let snapshot = store.page_recent(None, 100_000).await.unwrap();
+        assert!(snapshot.len() < 100_000);
+        before.push(snapshot);
+    }
+    let correlation = uuid::Uuid::new_v4();
+    for (sender, recipient, inbox, kind, body) in [
+        (
+            &alice,
+            &bob,
+            &mut bob_inbox,
+            AddressedKind::Command,
+            "private daemon request",
+        ),
+        (
+            &bob,
+            &alice,
+            &mut alice_inbox,
+            AddressedKind::CommandResult,
+            "private daemon result",
+        ),
+    ] {
+        sender
+            .send_addressed(
+                AddressedSend {
+                    to: recipient.peer_id(),
+                    kind,
+                    correlation,
+                    headers: Default::default(),
+                    body: airc_core::Body::text(body),
+                },
+                deadline,
+            )
+            .await
+            .unwrap();
+        let received = tokio::time::timeout_at(deadline, inbox.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.from(), sender.peer_id());
+        assert_eq!(received.to(), recipient.peer_id());
+        assert_eq!(received.kind(), kind);
+        assert_eq!(received.correlation(), correlation);
+        assert_eq!(received.body().as_text(), Some(body));
+    }
+    for (machine, baseline) in [&a, &b].into_iter().zip(before) {
+        let store =
+            airc_store::SqliteEventStore::open_path(&machine.home.path().join("events.sqlite"))
+                .await
+                .unwrap();
+        let after = store.page_recent(None, 100_000).await.unwrap();
+        assert!(after.len() < 100_000);
+        assert_eq!(
+            after, baseline,
+            "encrypted command exchange persisted transcript data"
+        );
+    }
+    drop(alice_inbox);
+    drop(bob_inbox);
+    drop(alice);
+    drop(bob);
+    a.shutdown().await;
+    b.shutdown().await;
+}
