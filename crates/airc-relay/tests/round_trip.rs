@@ -213,3 +213,41 @@ async fn unenrolled_client_is_never_registered_at_server() {
 
     server.shutdown();
 }
+
+// what this catches (review of #1498): closing an adapter only cleared its sender; the
+// read loop kept the TLS stream, so the relay still held the connection. Closing must
+// retire the socket.
+#[tokio::test]
+async fn closing_an_adapter_closes_its_relay_connection() {
+    ensure_crypto_provider();
+    let relay = TestIdentity::new(0x00c1_05e1);
+    let client = TestIdentity::new(0x00c1_05e2);
+    let server = RelayServer::start(RelayServerConfig {
+        peer_id: relay.peer_id,
+        keypair: relay.keypair.clone(),
+        registry: enrolled_registry(&[&client]),
+        bind: "127.0.0.1:0".parse().unwrap(),
+    })
+    .await
+    .unwrap();
+    let adapter = RelayAdapter::new(RelayClientConfig {
+        self_peer_id: client.peer_id,
+        self_keypair: client.keypair.clone(),
+        relay_peer_id: relay.peer_id,
+        relay_addr: server.local_addr(),
+        registry: enrolled_registry(&[&relay]),
+    });
+    adapter.connect().await.unwrap();
+    wait_for_peers(&server, &[client.peer_id]).await;
+
+    adapter.close().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.connected_peers().await.contains(&client.peer_id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the relay still holds a closed adapter's connection"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    server.shutdown();
+}
