@@ -38,17 +38,55 @@ pub struct AddressedSend {
     pub body: Body,
 }
 
-/// One addressed payload received and opened.
+/// One addressed payload received and opened. Only the receive path builds
+/// one, so holding it means the session authenticated every field.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedAddressed {
+    from: PeerId,
+    to: PeerId,
+    kind: AddressedKind,
+    correlation: Uuid,
+    headers: Headers,
+    body: Body,
+}
+
+impl VerifiedAddressed {
+    fn opened(from: PeerId, to: PeerId, inner: airc_protocol::addressed::SealedInner) -> Self {
+        Self {
+            from,
+            to,
+            kind: inner.kind,
+            correlation: inner.correlation,
+            headers: inner.headers,
+            body: inner.body,
+        }
+    }
+
     /// The session's handshake-pinned identity, never a header.
-    pub from: PeerId,
+    pub fn from(&self) -> PeerId {
+        self.from
+    }
+
     /// This scope's identity.
-    pub to: PeerId,
-    pub kind: AddressedKind,
-    pub correlation: Uuid,
-    pub headers: Headers,
-    pub body: Body,
+    pub fn to(&self) -> PeerId {
+        self.to
+    }
+
+    pub fn kind(&self) -> AddressedKind {
+        self.kind
+    }
+
+    pub fn correlation(&self) -> Uuid {
+        self.correlation
+    }
+
+    pub fn headers(&self) -> &Headers {
+        &self.headers
+    }
+
+    pub fn body(&self) -> &Body {
+        &self.body
+    }
 }
 
 /// Why an addressed send did not go out.
@@ -91,23 +129,24 @@ pub struct AddressedInbox {
     rx: broadcast::Receiver<Arc<VerifiedAddressed>>,
 }
 
+/// Why [`AddressedInbox::next`] returned no payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxError {
+    /// This consumer fell a full buffer behind and `lost` payloads were
+    /// dropped for it. The inbox continues with the next payload; what was
+    /// lost is the caller's to account for (its senders see their deadlines).
+    Lagged { lost: u64 },
+    /// The handle is gone: no payload will arrive again.
+    Closed,
+}
+
 impl AddressedInbox {
-    /// The next payload, or `None` once the handle is gone. A consumer that
-    /// falls a full buffer behind loses the overflow: the loss is logged, and
-    /// a lost command surfaces to its sender as its own deadline.
-    pub async fn next(&mut self) -> Option<Arc<VerifiedAddressed>> {
-        loop {
-            match self.rx.recv().await {
-                Ok(item) => return Some(item),
-                Err(broadcast::error::RecvError::Lagged(lost)) => {
-                    tracing::error!(
-                        target: "airc::addressed",
-                        lost,
-                        "addressed inbox consumer fell behind; payloads were dropped"
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
+    /// The next payload, or why there is none.
+    pub async fn next(&mut self) -> Result<Arc<VerifiedAddressed>, InboxError> {
+        match self.rx.recv().await {
+            Ok(item) => Ok(item),
+            Err(broadcast::error::RecvError::Lagged(lost)) => Err(InboxError::Lagged { lost }),
+            Err(broadcast::error::RecvError::Closed) => Err(InboxError::Closed),
         }
     }
 }
@@ -141,10 +180,55 @@ impl AddressedState {
 }
 
 impl crate::Airc {
+    /// Lose every addressed session, as a restart does, while the transport
+    /// stays up. Dropping a handle does not close its LAN connections, so an
+    /// in-process reopen cannot stand in for a restart in tests.
+    #[doc(hidden)]
+    pub fn forget_addressed_sessions_for_test(&self) {
+        self.inner.addressed.sessions.reset();
+    }
+
     /// Every payload addressed to this identity, from any peer, in any room.
     pub fn addressed_inbox(&self) -> AddressedInbox {
         AddressedInbox {
             rx: self.inner.addressed.inbox_tx.subscribe(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // what this catches: a consumer that falls behind is told how many
+    // payloads it lost, as a typed outcome, instead of the loss being logged
+    // and the next payload handed over as if nothing happened.
+    #[tokio::test]
+    async fn a_lagging_inbox_reports_its_loss_then_continues() {
+        let (tx, rx) = broadcast::channel(1);
+        let mut inbox = AddressedInbox { rx };
+        let item = |n: u128| {
+            Arc::new(VerifiedAddressed {
+                from: PeerId::from_u128(n),
+                to: PeerId::from_u128(0),
+                kind: AddressedKind::Command,
+                correlation: Uuid::from_u128(n),
+                headers: Headers::new(),
+                body: Body::text("x"),
+            })
+        };
+        for n in 1..=3 {
+            tx.send(item(n)).unwrap();
+        }
+        assert_eq!(
+            inbox.next().await.err(),
+            Some(InboxError::Lagged { lost: 2 })
+        );
+        assert_eq!(
+            inbox.next().await.unwrap().correlation(),
+            Uuid::from_u128(3)
+        );
+        drop(tx);
+        assert_eq!(inbox.next().await.err(), Some(InboxError::Closed));
     }
 }

@@ -299,6 +299,23 @@ pub fn respond(
 }
 
 impl PendingHandshake {
+    /// Check that `resp` answers THIS handshake (signed by the responder over
+    /// our ephemeral) without consuming the one-shot secret, so a stray or
+    /// replayed reply can be refused while the real one is still awaited.
+    pub fn verify(
+        &self,
+        resp: &HandshakeResp,
+        registry: &PeerKeyRegistry,
+    ) -> Result<(), HandshakeError> {
+        verify_sig(
+            registry,
+            resp.peer_id,
+            resp.key_id,
+            &resp_signed_bytes(&resp.eph_pub, &self.eph_pub, resp.peer_id, resp.key_id),
+            &resp.sig,
+        )
+    }
+
     /// Complete the handshake with the responder's reply: verify it (bound to
     /// our ephemeral), run the ECDH, and derive the session (as
     /// [`SessionRole::Initiator`]). Consumes `self` — the ephemeral secret is
@@ -308,13 +325,7 @@ impl PendingHandshake {
         resp: &HandshakeResp,
         registry: &PeerKeyRegistry,
     ) -> Result<StreamSession, HandshakeError> {
-        verify_sig(
-            registry,
-            resp.peer_id,
-            resp.key_id,
-            &resp_signed_bytes(&resp.eph_pub, &self.eph_pub, resp.peer_id, resp.key_id),
-            &resp.sig,
-        )?;
+        self.verify(resp, registry)?;
 
         let shared = checked_shared(self.secret, &resp.eph_pub)?;
         let transcript = transcript(&self.eph_pub, &resp.eph_pub, self.my_peer_id, resp.peer_id);

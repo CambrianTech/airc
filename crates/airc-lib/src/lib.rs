@@ -97,6 +97,9 @@ pub use account_registry::{
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 pub use account_registry_fs::FsAccountRegistryStore;
+pub use addressed::{
+    AddressedError, AddressedInbox, AddressedKind, AddressedSend, InboxError, VerifiedAddressed,
+};
 pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
     RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,

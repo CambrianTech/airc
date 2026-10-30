@@ -290,7 +290,11 @@ impl Airc {
         // Addressed traffic is readable by its two ends only: it goes to its
         // owner before anything below could store or fan it out, on every
         // path (scope store, daemon sink, live ring).
-        if frame.kind == airc_protocol::FrameKind::Addressed {
+        // Routed by kind OR channel: the kind label is outside the signature,
+        // the channel is not, so a relabelled addressed frame still lands here.
+        if frame.kind == airc_protocol::FrameKind::Addressed
+            || frame.envelope.channel == airc_protocol::addressed::addressed_channel()
+        {
             self.receive_addressed(frame).await;
             return;
         }

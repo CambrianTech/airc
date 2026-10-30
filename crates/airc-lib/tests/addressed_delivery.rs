@@ -97,18 +97,18 @@ fn an_addressed_request_and_its_result_reach_only_their_two_ends() {
         let request = timeout(Duration::from_secs(10), bob_inbox.next())
             .await
             .expect("bob receives in time")
-            .expect("bob's inbox open");
-        assert_eq!(request.from, alice.peer_id());
-        assert_eq!(request.to, bob.peer_id());
-        assert_eq!(request.kind, AddressedKind::Command);
-        assert_eq!(request.correlation, correlation);
-        assert_eq!(request.body.as_text(), Some(REQUEST_SECRET));
+            .expect("bob's inbox yields");
+        assert_eq!(request.from(), alice.peer_id());
+        assert_eq!(request.to(), bob.peer_id());
+        assert_eq!(request.kind(), AddressedKind::Command);
+        assert_eq!(request.correlation(), correlation);
+        assert_eq!(request.body().as_text(), Some(REQUEST_SECRET));
 
         bob.send_addressed(
             AddressedSend {
-                to: request.from,
+                to: request.from(),
                 kind: AddressedKind::CommandResult,
-                correlation: request.correlation,
+                correlation: request.correlation(),
                 headers: Headers::new(),
                 body: Body::text(RESULT_SECRET),
             },
@@ -119,11 +119,11 @@ fn an_addressed_request_and_its_result_reach_only_their_two_ends() {
         let result = timeout(Duration::from_secs(10), alice_inbox.next())
             .await
             .expect("alice receives in time")
-            .expect("alice's inbox open");
-        assert_eq!(result.from, bob.peer_id());
-        assert_eq!(result.kind, AddressedKind::CommandResult);
-        assert_eq!(result.correlation, correlation);
-        assert_eq!(result.body.as_text(), Some(RESULT_SECRET));
+            .expect("alice's inbox yields");
+        assert_eq!(result.from(), bob.peer_id());
+        assert_eq!(result.kind(), AddressedKind::CommandResult);
+        assert_eq!(result.correlation(), correlation);
+        assert_eq!(result.body().as_text(), Some(RESULT_SECRET));
 
         // Carol's links carry both senders' traffic: their room messages land
         // in her store, so the absence below is not a disconnected link.
@@ -162,5 +162,131 @@ fn an_addressed_request_and_its_result_reach_only_their_two_ends() {
                 assert!(!text.contains(REQUEST_SECRET) && !text.contains(RESULT_SECRET));
             }
         }
+    });
+}
+
+async fn trusted_pair(homes: &[TempDir]) -> (Airc, Airc) {
+    let alice = Airc::open(homes[0].path()).await.expect("alice opens");
+    let bob = Airc::open(homes[1].path()).await.expect("bob opens");
+    alice
+        .add_peer(bob.peer_spec().parse().expect("spec"))
+        .await
+        .expect("trust");
+    bob.add_peer(alice.peer_spec().parse().expect("spec"))
+        .await
+        .expect("trust");
+    (alice, bob)
+}
+
+fn command(to: airc_core::PeerId, text: &str) -> AddressedSend {
+    AddressedSend {
+        to,
+        kind: AddressedKind::Command,
+        correlation: Uuid::new_v4(),
+        headers: Headers::new(),
+        body: Body::text(text),
+    }
+}
+
+#[test]
+fn a_lost_first_init_ends_in_its_deadline_and_the_next_send_completes() {
+    // what this catches: the very first init is lost (no link yet) and no
+    // other traffic follows. The send ends in an explicit refusal by its
+    // deadline, never a hang or another route; the abandoned handshake does
+    // not block the next send, which completes once the link exists.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let homes: Vec<TempDir> = (0..2).map(|_| TempDir::new().expect("home")).collect();
+        let (alice, bob) = trusted_pair(&homes).await;
+        for _ in 0..2 {
+            let sent = alice
+                .send_addressed(
+                    command(bob.peer_id(), REQUEST_SECRET),
+                    Instant::now() + Duration::from_millis(300),
+                )
+                .await;
+            assert!(sent.is_err(), "a send with no session must be refused");
+        }
+        for text in texts(&stored(homes[0].path()).await) {
+            assert!(!text.contains(REQUEST_SECRET));
+        }
+
+        let addr = bob
+            .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bob listens");
+        alice
+            .connect_lan(addr, bob.peer_id())
+            .await
+            .expect("connect");
+        let mut inbox = bob.addressed_inbox();
+        alice
+            .send_addressed(
+                command(bob.peer_id(), "once linked"),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .expect("the next send completes");
+        let opened = timeout(Duration::from_secs(10), inbox.next())
+            .await
+            .expect("bob receives in time")
+            .expect("bob's inbox yields");
+        assert_eq!(opened.body().as_text(), Some("once linked"));
+    });
+}
+
+#[test]
+fn a_restarted_addressee_rekeys_and_the_next_send_opens() {
+    // what this catches: review F2 end to end. Bob loses every session (a
+    // restart); alice still seals under the old one. Bob's failure to open it
+    // must re-key (no timer, no restart of alice), so alice's retry opens.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let homes: Vec<TempDir> = (0..2).map(|_| TempDir::new().expect("home")).collect();
+        let (alice, bob) = trusted_pair(&homes).await;
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
+        let addr = bob.listen_lan(loopback).await.expect("bob listens");
+        alice
+            .connect_lan(addr, bob.peer_id())
+            .await
+            .expect("connect");
+        let mut inbox = bob.addressed_inbox();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        alice
+            .send_addressed(command(bob.peer_id(), "before restart"), deadline)
+            .await
+            .expect("first send");
+        timeout(Duration::from_secs(10), inbox.next())
+            .await
+            .expect("bob receives before restart")
+            .expect("bob's inbox yields");
+
+        // Bob loses every session, as a restart does; alice still holds hers.
+        bob.forget_addressed_sessions_for_test();
+        let bob_id = bob.peer_id();
+        let correlation = Uuid::new_v4();
+
+        let opened = timeout(Duration::from_secs(10), async {
+            loop {
+                let mut retry = command(bob_id, "after restart");
+                retry.correlation = correlation;
+                alice
+                    .send_addressed(retry, Instant::now() + Duration::from_secs(2))
+                    .await
+                    .expect("send after restart");
+                if let Ok(Ok(item)) = timeout(Duration::from_millis(500), inbox.next()).await {
+                    return item;
+                }
+            }
+        })
+        .await
+        .expect("a send after bob's restart opens");
+        assert_eq!(opened.from(), alice.peer_id());
+        assert_eq!(
+            opened.correlation(),
+            correlation,
+            "a retry keeps its correlation"
+        );
+        assert_eq!(opened.body().as_text(), Some("after restart"));
     });
 }
