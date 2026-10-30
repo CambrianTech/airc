@@ -35,7 +35,7 @@ pub(crate) struct QueuedFrame {
 /// Only an absent owner permits transport-host resolution. Queue failures do not.
 pub(crate) enum LocalAdmission {
     Delivered,
-    Unowned(Frame),
+    Unowned(Box<Frame>),
 }
 
 pub struct AddressedSwitch {
@@ -109,7 +109,7 @@ impl AddressedSwitch {
     ) -> Result<LocalAdmission, RouteError> {
         let entries = self.entries.lock().map_err(|_| RouteError::StatePoisoned)?;
         let Some(entry) = entries.get(&peer) else {
-            return Ok(LocalAdmission::Unowned(frame));
+            return Ok(LocalAdmission::Unowned(Box::new(frame)));
         };
         let permit = self.reserve_frame()?;
         entry
@@ -204,7 +204,7 @@ mod tests {
         else {
             panic!("absent owner consumed the frame");
         };
-        assert_eq!(returned, original);
+        assert_eq!(*returned, original);
         let mut owner = switch.register(peer).unwrap();
         let outbound = switch.reserve_frame().unwrap();
         assert!(matches!(
