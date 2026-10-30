@@ -77,6 +77,20 @@ impl CountingSink {
 
 #[async_trait]
 impl DurableSink for CountingSink {
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.page_tail_calls.fetch_add(1, Ordering::SeqCst);
+        self.max_page_tail_limit.fetch_max(limit, Ordering::SeqCst);
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         self.inner.append(e).await
     }
@@ -135,6 +149,16 @@ struct FailingTailSink;
 
 #[async_trait]
 impl DurableSink for FailingTailSink {
+    async fn filtered_tail_before(
+        &self,
+        _channel: RoomId,
+        _before: Option<Cursor>,
+        _limit: usize,
+        _filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        Err(BusError::Sink("reverse index unavailable".into()))
+    }
+
     async fn append(&self, _e: &Envelope) -> Result<(), BusError> {
         Ok(())
     }
@@ -776,4 +800,48 @@ async fn attach_deep_leg_advances_past_filtered_pages() {
         sink.page_calls()
     );
     assert!(sink.max_page_limit() <= ATTACH_DEEP_REPLAY_PAGE);
+}
+
+#[tokio::test]
+async fn full_subscription_predicate_precedes_sink_limit_under_activity_flood() {
+    let (router, sink) = counted_router(8);
+    let room = RoomId::new();
+    for n in 1..=512 {
+        let mut env = kinded_event(
+            room,
+            n,
+            if n <= 2 { Kind::Message } else { Kind::Event },
+            DeliveryClass::Durable,
+        );
+        env.seq = airc_bus::Seq::new(1, n as u64);
+        env.payload = bytes::Bytes::from_static(&[0xff, 0, 0x80]);
+        env.headers.insert("scope".into(), "review".into());
+        sink.append(&env).await.expect("persist fixture");
+    }
+    let filter = airc_bus::Filter::channel(room)
+        .with_selection(airc_core::EventSelection::Correspondence)
+        .with_kinds(vec![Kind::Message])
+        .with_delivery(vec![DeliveryClass::Durable]);
+    let rows = router
+        .filtered_tail_before(room, None, 2, &filter)
+        .await
+        .expect("filtered tail");
+    assert_eq!(
+        rows.iter().map(|e| e.seq.counter).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let older = router
+        .filtered_tail_before(room, Some(rows[1].cursor()), 2, &filter)
+        .await
+        .expect("older matching page");
+    assert_eq!(
+        older.iter().map(|e| e.seq.counter).collect::<Vec<_>>(),
+        vec![1]
+    );
+    let empty = filter.with_delivery(vec![DeliveryClass::StreamChunk]);
+    assert!(router
+        .filtered_tail_before(room, None, 2, &empty)
+        .await
+        .expect("empty matching set")
+        .is_empty());
 }

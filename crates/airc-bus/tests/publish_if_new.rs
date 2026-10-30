@@ -151,6 +151,18 @@ struct FlakyContainsSink {
 
 #[async_trait]
 impl DurableSink for FlakyContainsSink {
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         self.inner.append(e).await
     }

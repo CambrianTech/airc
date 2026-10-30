@@ -20,7 +20,19 @@ fn durable_kind_at(channel: RoomId, kind: Kind, epoch: u64, counter: u64) -> Env
         channel,
         (PeerId::from_u128(0xa1), ClientId::from_u128(0xc1)),
         kind,
-        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
+        match kind {
+            Kind::Message => {
+                airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message)
+            }
+            Kind::Event => airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
+            Kind::Command => airc_core::EventClass::Control(airc_core::ControlKind::Command),
+            Kind::CommandResult => {
+                airc_core::EventClass::Control(airc_core::ControlKind::CommandResult)
+            }
+            Kind::Signal => airc_core::EventClass::Control(airc_core::ControlKind::Signal),
+            Kind::StreamChunk => airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+            Kind::Control => airc_core::EventClass::Control(airc_core::ControlKind::Session),
+        },
         DeliveryClass::Durable,
         Bytes::from(format!("payload-{epoch}-{counter}")),
     )
@@ -710,6 +722,7 @@ async fn typed_bus_history_selects_before_limit_without_decoding_payload() {
     for n in 2..100 {
         let mut activity = durable_at(channel, 1, n);
         activity.class = EventClass::Activity(ActivityKind::WorkReceipt);
+        activity.kind = Kind::Event;
         last = activity.cursor();
         sink.append(&activity).await.expect("activity");
     }
@@ -735,4 +748,66 @@ async fn typed_bus_history_selects_before_limit_without_decoding_payload() {
             .count,
         1
     );
+}
+
+// Attach replay uses the identical live filter in SQLite before LIMIT. A long
+// activity flood, wrong kind and wrong headers cannot exhaust an arbitrary raw
+// page cap or cause a matching correspondence to disappear.
+#[tokio::test]
+async fn full_live_filter_is_applied_before_tail_limit() {
+    use airc_core::{ActivityKind, EventClass, EventSelection, HeaderFilter};
+    let sink = SqliteDurableSink::in_memory().await.expect("sink");
+    let channel = RoomId::new();
+    let wanted = durable_at(channel, 1, 1).with_header("consumer", "agent");
+    let mut rows = vec![wanted.clone()];
+    for n in 2..5200 {
+        let mut event = durable_at(channel, 1, n).with_header("consumer", "agent");
+        event.class = EventClass::Activity(ActivityKind::WorkReceipt);
+        event.kind = Kind::Event;
+        rows.push(event);
+    }
+    let wrong_header = durable_at(channel, 1, 5200).with_header("consumer", "other");
+    rows.push(wrong_header);
+    let mut wrong_kind = durable_at(channel, 1, 5201).with_header("consumer", "agent");
+    wrong_kind.kind = Kind::Control;
+    wrong_kind.class = EventClass::Control(airc_core::ControlKind::Session);
+    rows.push(wrong_kind);
+    sink.append_batch(&rows.iter().collect::<Vec<_>>())
+        .await
+        .expect("batch");
+    let filter = airc_bus::Filter::channel(channel)
+        .with_selection(EventSelection::Correspondence)
+        .with_kinds(vec![Kind::Message])
+        .with_delivery(vec![DeliveryClass::Durable])
+        .with_headers(HeaderFilter::Exact {
+            key: "consumer".into(),
+            value: "agent".into(),
+        });
+    let page = sink
+        .filtered_tail_before(channel, None, 1, &filter)
+        .await
+        .expect("page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].event_id, wanted.event_id);
+    assert!(filter.matches(&page[0]));
+    assert!(sink
+        .filtered_tail_before(channel, Some(wanted.cursor()), 1, &filter)
+        .await
+        .expect("before")
+        .is_empty());
+    assert!(sink
+        .filtered_tail_before(channel, None, 1, &filter.clone().with_kinds(vec![]))
+        .await
+        .expect("empty kinds")
+        .is_empty());
+    assert!(sink
+        .filtered_tail_before(
+            channel,
+            None,
+            1,
+            &filter.with_delivery(vec![DeliveryClass::EphemeralLatest])
+        )
+        .await
+        .expect("delivery")
+        .is_empty());
 }

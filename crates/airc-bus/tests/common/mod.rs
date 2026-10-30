@@ -123,6 +123,18 @@ impl GatedSink {
 
 #[async_trait]
 impl DurableSink for GatedSink {
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         while !self.is_open.load(std::sync::atomic::Ordering::SeqCst) {
             self.open.notified().await;

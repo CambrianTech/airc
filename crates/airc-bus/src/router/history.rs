@@ -161,10 +161,25 @@ impl EventRouter {
         kinds: Option<&[Kind]>,
         limit: usize,
     ) -> crate::Result<Vec<Arc<Envelope>>> {
+        let mut filter = crate::Filter::channel(channel);
+        if let Some(kinds) = kinds {
+            filter = filter.with_kinds(kinds.to_vec());
+        }
+        self.filtered_tail_before(channel, before, limit, &filter)
+            .await
+    }
+
+    /// Complete subscription predicate, applied in both ring and store before LIMIT.
+    pub async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &crate::Filter,
+    ) -> crate::Result<Vec<Arc<Envelope>>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let matches_kind = |env: &Envelope| kinds.is_none_or(|kinds| kinds.contains(&env.kind));
         let (mut tail, ring_oldest) = {
             let shard = self.shard_for(channel);
             let map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
@@ -176,7 +191,7 @@ impl EventRouter {
                         .into_iter()
                         .filter(|env| {
                             env.delivery.is_durable()
-                                && matches_kind(env)
+                                && filter.matches(env)
                                 && before.is_none_or(|gate| env.cursor().is_before(&gate))
                         })
                         .collect::<Vec<_>>(),
@@ -201,20 +216,11 @@ impl EventRouter {
             (_, Some(oldest)) => Some(oldest),
             (before, None) => before,
         };
-        let older = match kinds {
-            None => {
-                self.inner
-                    .sink
-                    .page_tail(channel, sink_before, remainder)
-                    .await?
-            }
-            Some(kinds) => {
-                self.inner
-                    .sink
-                    .page_tail_of_kinds(channel, sink_before, kinds, remainder)
-                    .await?
-            }
-        };
+        let older = self
+            .inner
+            .sink
+            .filtered_tail_before(channel, sink_before, remainder, filter)
+            .await?;
         let mut out: Vec<Arc<Envelope>> = older.into_iter().map(Arc::new).collect();
         out.append(&mut tail);
         Ok(out)

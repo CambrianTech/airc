@@ -1041,12 +1041,7 @@ pub(crate) const ATTACH_PAGE: usize = 10;
 /// "at least this many". Counting is a bounded store read, never a stream.
 const UNREAD_COUNT_CAP: u64 = 10_000;
 
-/// How many durable rows one attach's backward walk reads, matched or not.
-/// The match cap alone let a rarely-matching filter scan the whole store
-/// (Fable on #1543); past this the count is reported as "at least".
-const PAGE_SCAN_ROWS_CAP: u64 = 50_000;
-
-/// Durable rows read per backward step of the page-and-count walk.
+/// Matching durable rows read per backward step of the page-and-count walk.
 const PAGE_SCAN_STEP: usize = 256;
 
 /// `None` = the live edge only; `Some(None)` = the transcript start;
@@ -1107,13 +1102,12 @@ async fn attach_page(
     let mut newest_first: Vec<Arc<Envelope>> = Vec::new();
     let mut skipped: u64 = 0;
     let mut skipped_at_least = false;
-    let mut scanned: u64 = 0;
     let mut through: Option<Cursor> = None;
     let mut before: Option<Cursor> = None;
     'walk: loop {
         let rows = state
             .router
-            .durable_tail_before(channel, before, PAGE_SCAN_STEP)
+            .filtered_tail_before(channel, before, PAGE_SCAN_STEP, filter)
             .await
             .map_err(|error| format!("attach page: {error}"))?;
         let exhausted = rows.len() < PAGE_SCAN_STEP;
@@ -1122,14 +1116,6 @@ async fn attach_page(
             through.get_or_insert(cursor);
             if bookmark.is_some_and(|b| !cursor.is_after(&b)) {
                 break 'walk; // reached what the consumer had already read
-            }
-            scanned += 1;
-            if scanned > PAGE_SCAN_ROWS_CAP {
-                skipped_at_least = true;
-                break 'walk;
-            }
-            if !filter.matches(env) {
-                continue;
             }
             if newest_first.len() < ATTACH_PAGE {
                 newest_first.push(env.clone());

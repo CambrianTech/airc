@@ -155,6 +155,16 @@ pub trait DurableSink: Send + Sync {
     /// compile error, never a silent fetch-everything-then-filter.
     /// `kinds` is never empty — callers normalize empty to the
     /// unfiltered [`DurableSink::page_tail`].
+    /// Apply the complete live subscription predicate BEFORE LIMIT.
+    /// Required: implementations cannot substitute a raw page and post-filter.
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &crate::Filter,
+    ) -> Result<Vec<Envelope>>;
+
     async fn page_tail_of_kinds(
         &self,
         channel: RoomId,
@@ -353,18 +363,34 @@ impl DurableSink for InMemoryDurableSink {
         before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Envelope>> {
+        self.filtered_tail_before(channel, before, limit, &crate::Filter::channel(channel))
+            .await
+    }
+
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &crate::Filter,
+    ) -> Result<Vec<Envelope>> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(bucket) = guard.events.get(&channel.0.as_u128()) else {
             return Ok(Vec::new());
         };
-        // The bucket is kept in ascending total order on insert, so the
-        // tail strictly before `before` is a contiguous back slice.
-        let end = match &before {
-            None => bucket.len(),
-            Some(b) => bucket.partition_point(|e| e.cursor().is_before(b)),
-        };
-        let start = end.saturating_sub(limit);
-        Ok(bucket[start..end].to_vec())
+        let mut out: Vec<_> = bucket
+            .iter()
+            .rev()
+            .filter(|e| {
+                e.delivery.is_durable()
+                    && before.is_none_or(|b| e.cursor().is_before(&b))
+                    && filter.matches(e)
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        out.reverse();
+        Ok(out)
     }
 
     async fn page_tail_of_kinds(
@@ -374,25 +400,13 @@ impl DurableSink for InMemoryDurableSink {
         kinds: &[Kind],
         limit: usize,
     ) -> Result<Vec<Envelope>> {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(bucket) = guard.events.get(&channel.0.as_u128()) else {
-            return Ok(Vec::new());
-        };
-        let end = match &before {
-            None => bucket.len(),
-            Some(b) => bucket.partition_point(|e| e.cursor().is_before(b)),
-        };
-        // Newest-first over the pre-cursor slice, kind predicate BEFORE
-        // `take(limit)` — then back to ascending for the caller.
-        let mut out: Vec<Envelope> = bucket[..end]
-            .iter()
-            .rev()
-            .filter(|e| kinds.contains(&e.kind))
-            .take(limit)
-            .cloned()
-            .collect();
-        out.reverse();
-        Ok(out)
+        self.filtered_tail_before(
+            channel,
+            before,
+            limit,
+            &crate::Filter::channel(channel).with_kinds(kinds.to_vec()),
+        )
+        .await
     }
 
     async fn contains(&self, event_id: airc_core::EventId) -> Result<bool> {

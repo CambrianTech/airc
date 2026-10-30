@@ -54,6 +54,18 @@ impl CountingSink {
 
 #[async_trait]
 impl DurableSink for CountingSink {
+    async fn filtered_tail_before(
+        &self,
+        channel: RoomId,
+        before: Option<Cursor>,
+        limit: usize,
+        filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        self.inner
+            .filtered_tail_before(channel, before, limit, filter)
+            .await
+    }
+
     async fn append(&self, e: &Envelope) -> Result<(), BusError> {
         self.inner.append(e).await
     }
@@ -105,6 +117,16 @@ struct FailingHeadSink;
 
 #[async_trait]
 impl DurableSink for FailingHeadSink {
+    async fn filtered_tail_before(
+        &self,
+        _channel: RoomId,
+        _before: Option<Cursor>,
+        _limit: usize,
+        _filter: &airc_bus::Filter,
+    ) -> Result<Vec<Envelope>, BusError> {
+        Err(BusError::Sink("reverse index unavailable".into()))
+    }
+
     async fn append(&self, _e: &Envelope) -> Result<(), BusError> {
         Ok(())
     }

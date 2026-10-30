@@ -135,6 +135,7 @@ mod tests {
     #[test]
     fn channel_restriction_drops_other_channels() {
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             channel: Some(RoomId::from_u128(0xa)),
             ..Default::default()
         };
@@ -165,6 +166,7 @@ mod tests {
         let mut kinds = BTreeSet::new();
         kinds.insert(FrameKind::Event);
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             kinds,
             ..Default::default()
         };
@@ -187,6 +189,7 @@ mod tests {
         let mut kinds = BTreeSet::new();
         kinds.insert(FrameKind::Message);
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             channel: Some(RoomId::from_u128(0xa)),
             from_cursor: None,
             kinds,
@@ -220,6 +223,7 @@ mod tests {
         kinds.insert(FrameKind::Message);
         kinds.insert(FrameKind::Event);
         let sub = Subscription {
+            selection: airc_core::EventSelection::All,
             channel: Some(RoomId::from_u128(0xc0ffee)),
             from_cursor: Some(TranscriptCursor {
                 lamport: 42,
