@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 pub(super) struct DaemonOwner {
-    task: tokio::task::JoinHandle<()>,
+    pub(super) task: tokio::task::JoinHandle<()>,
     pub closed: watch::Receiver<bool>,
 }
 impl Drop for DaemonOwner {
@@ -32,7 +32,7 @@ impl Airc {
                 return Ok(Some(owner));
             }
             let status = client.status().await.map_err(|e| AddressedError::Transport(e.to_string()))?;
-            let daemon = status.peer_id.parse().map_err(|e| AddressedError::Transport(format!("invalid daemon identity: {e}")))?;
+            let daemon = uuid::Uuid::parse_str(&status.peer_id).map(airc_core::PeerId::from_uuid).map_err(|e| AddressedError::Transport(format!("invalid daemon identity: {e}")))?;
             let mut stream = client.attach_addressed(self.peer_id(), daemon, &self.inner.identity.keypair, 0)
                 .await.map_err(|e| AddressedError::Transport(e.to_string()))?;
             let (closed_tx, closed) = watch::channel(false);

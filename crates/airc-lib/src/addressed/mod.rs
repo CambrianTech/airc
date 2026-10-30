@@ -136,17 +136,27 @@ pub enum InboxError {
 }
 
 impl AddressedInbox {
+    fn drain_closed(&mut self) -> Result<Arc<VerifiedAddressed>, InboxError> {
+        match self.rx.try_recv() {
+            Ok(item) => Ok(item),
+            Err(broadcast::error::TryRecvError::Lagged(lost)) => Err(InboxError::Lagged { lost }),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                Err(InboxError::Closed)
+            }
+        }
+    }
+
     /// The next payload, or why there is none.
     pub async fn next(&mut self) -> Result<Arc<VerifiedAddressed>, InboxError> {
         let received = if let Some(owner) = &self.owner {
             let mut closed = owner.closed.clone();
             if *closed.borrow() {
-                return Err(InboxError::Closed);
+                return self.drain_closed();
             }
             tokio::select! {
                 biased;
-                _ = closed.changed() => return Err(InboxError::Closed),
                 result = self.rx.recv() => result,
+                _ = closed.changed() => return self.drain_closed(),
             }
         } else {
             self.rx.recv().await
@@ -212,6 +222,35 @@ impl crate::Airc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn result_then_eof_is_drained_before_closed() {
+        let (tx, rx) = broadcast::channel(1);
+        let (closed_tx, closed) = watch::channel(false);
+        let owner = Arc::new(daemon::DaemonOwner {
+            task: tokio::spawn(async {}),
+            closed,
+        });
+        let mut inbox = AddressedInbox {
+            rx,
+            owner: Some(owner),
+        };
+        let item = Arc::new(VerifiedAddressed {
+            from: PeerId::new(),
+            to: PeerId::new(),
+            kind: AddressedKind::CommandResult,
+            correlation: Uuid::new_v4(),
+            headers: Headers::new(),
+            body: Body::text("completed"),
+        });
+        tx.send(item.clone()).unwrap();
+        closed_tx.send_replace(true);
+        assert_eq!(
+            inbox.next().await.unwrap().correlation(),
+            item.correlation()
+        );
+        assert_eq!(inbox.next().await.err(), Some(InboxError::Closed));
+    }
 
     // what this catches: a consumer that falls behind is told how many
     // payloads it lost, as a typed outcome, instead of the loss being logged
