@@ -16,12 +16,19 @@ use crate::error::AircError;
 use crate::time::now_ms;
 use crate::{AddressedInbox, AddressedKind, AddressedSend, Airc, VerifiedAddressed};
 
+/// Authenticated progress cannot settle a command. Only Completed is its result.
+#[derive(Debug)]
+pub enum CommandEvent {
+    Progress(Arc<VerifiedAddressed>),
+    Completed(Arc<VerifiedAddressed>),
+}
+
 /// An armed reply receiver with one monotonic end-to-end deadline.
 pub struct PendingCommand {
     pub correlation_id: Uuid,
     pub deadline_at_ms: u64,
     deadline: Instant,
-    inbox: AddressedInbox,
+    inbox: Option<AddressedInbox>,
     expected_peer: PeerId,
     requester: PeerId,
 }
@@ -45,7 +52,7 @@ impl PendingCommand {
         deadline: Instant,
     ) -> Self {
         Self {
-            inbox,
+            inbox: Some(inbox),
             expected_peer,
             requester,
             correlation_id,
@@ -79,7 +86,10 @@ fn matches_reply(
     actual: (PeerId, PeerId, Uuid),
     expected: (PeerId, PeerId, Uuid),
 ) -> bool {
-    kind == AddressedKind::CommandResult && actual == expected
+    matches!(
+        kind,
+        AddressedKind::CommandResult | AddressedKind::CommandProgress
+    ) && actual == expected
 }
 
 impl Airc {
@@ -128,7 +138,7 @@ impl Airc {
             correlation_id,
             deadline_at_ms,
             deadline,
-            inbox,
+            inbox: Some(inbox),
             expected_peer: peer,
             requester: self.peer_id(),
         })
@@ -138,8 +148,31 @@ impl Airc {
     pub async fn reply(
         &self,
         request: &VerifiedAddressed,
+        headers: Headers,
+        body: Body,
+    ) -> Result<(), AircError> {
+        self.respond(request, headers, body, AddressedKind::CommandResult)
+            .await
+    }
+
+    /// Send progress inside the original exchange; even its final chunk is not
+    /// the settled command result.
+    pub async fn reply_progress(
+        &self,
+        request: &VerifiedAddressed,
+        headers: Headers,
+        body: Body,
+    ) -> Result<(), AircError> {
+        self.respond(request, headers, body, AddressedKind::CommandProgress)
+            .await
+    }
+
+    async fn respond(
+        &self,
+        request: &VerifiedAddressed,
         mut headers: Headers,
         body: Body,
+        kind: AddressedKind,
     ) -> Result<(), AircError> {
         if request.kind() != AddressedKind::Command || request.to() != self.peer_id() {
             return Err(AircError::Transport(
@@ -177,7 +210,7 @@ impl Airc {
         self.send_addressed(
             AddressedSend {
                 to: request.from(),
-                kind: AddressedKind::CommandResult,
+                kind,
                 correlation: request.correlation(),
                 headers,
                 body,
@@ -194,13 +227,46 @@ impl Airc {
         mut pending: PendingCommand,
     ) -> Result<Arc<VerifiedAddressed>, AircError> {
         loop {
+            if let CommandEvent::Completed(result) = self.next_command_event(&mut pending).await? {
+                return Ok(result);
+            }
+        }
+    }
+
+    /// Read the next authenticated event from the one inbox armed before send.
+    /// Completion or a terminal error releases its lease; subsequent reads fail
+    /// with CommandFinished. Progress bodies are application-defined.
+    pub async fn next_command_event(
+        &self,
+        pending: &mut PendingCommand,
+    ) -> Result<CommandEvent, AircError> {
+        let result = self.read_command_event(pending).await;
+        if !matches!(&result, Ok(CommandEvent::Progress(_))) {
+            pending.inbox.take();
+        }
+        result
+    }
+
+    async fn read_command_event(
+        &self,
+        pending: &mut PendingCommand,
+    ) -> Result<CommandEvent, AircError> {
+        loop {
+            if pending.inbox.is_none() {
+                return Err(AircError::CommandFinished {
+                    correlation_id: pending.correlation_id,
+                });
+            }
             let remaining = pending
                 .remaining()
                 .filter(|duration| !duration.is_zero())
                 .ok_or(AircError::CommandDeadline {
                     correlation_id: pending.correlation_id,
                 })?;
-            let event = tokio::time::timeout(remaining, pending.inbox.next())
+            let inbox = pending.inbox.as_mut().ok_or(AircError::CommandFinished {
+                correlation_id: pending.correlation_id,
+            })?;
+            let event = tokio::time::timeout(remaining, inbox.next())
                 .await
                 .map_err(|_| AircError::CommandDeadline {
                     correlation_id: pending.correlation_id,
@@ -229,9 +295,10 @@ impl Airc {
                     continue;
                 }
                 Err(error) => {
-                    return Err(AircError::Transport(format!(
-                        "addressed reply inbox: {error:?}"
-                    )))
+                    return Err(AircError::CommandInbox {
+                        correlation_id: pending.correlation_id,
+                        source: error,
+                    })
                 }
             };
             if matches_reply(
@@ -243,7 +310,11 @@ impl Airc {
                     pending.correlation_id,
                 ),
             ) {
-                return Ok(event);
+                match event.kind() {
+                    AddressedKind::CommandProgress => return Ok(CommandEvent::Progress(event)),
+                    AddressedKind::CommandResult => return Ok(CommandEvent::Completed(event)),
+                    AddressedKind::Command => continue,
+                }
             }
         }
     }

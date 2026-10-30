@@ -156,6 +156,14 @@ pub enum InboxError {
     },
 }
 
+impl std::fmt::Display for InboxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for InboxError {}
+
 impl AddressedInbox {
     fn admit(item: Arc<VerifiedAddressed>) -> Result<Arc<VerifiedAddressed>, InboxError> {
         if tokio::time::Instant::now() >= item.deadline {
@@ -259,6 +267,140 @@ impl crate::Airc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_command_errors_release_the_inbox() {
+        let home = tempfile::tempdir().unwrap();
+        let airc = crate::Airc::open(home.path()).await.unwrap();
+        for case in ["lagged", "deadline", "expired", "closed"] {
+            let peer = PeerId::new();
+            let correlation = Uuid::new_v4();
+            let now = tokio::time::Instant::now();
+            let deadline = if case == "deadline" {
+                now
+            } else {
+                now + std::time::Duration::from_secs(5)
+            };
+            let (tx, rx) = broadcast::channel(1);
+            let mut pending = crate::command_bus::PendingCommand::for_test(
+                AddressedInbox { rx, owner: None },
+                peer,
+                airc.peer_id(),
+                correlation,
+                deadline,
+            );
+            let item = Arc::new(VerifiedAddressed {
+                deadline: if case == "expired" { now } else { deadline },
+                from: peer,
+                to: airc.peer_id(),
+                kind: AddressedKind::CommandProgress,
+                correlation,
+                headers: Headers::new(),
+                body: Body::text("progress"),
+            });
+            if case == "expired" || case == "lagged" {
+                tx.send(item.clone()).unwrap();
+            }
+            if case == "lagged" {
+                tx.send(item).unwrap();
+            }
+            let tx = if case == "closed" {
+                drop(tx);
+                None
+            } else {
+                Some(tx)
+            };
+            let result = airc.next_command_event(&mut pending).await;
+            match case {
+                "lagged" => assert!(matches!(
+                    result,
+                    Err(crate::AircError::CommandInbox {
+                        source: InboxError::Lagged { .. },
+                        ..
+                    })
+                )),
+                "closed" => assert!(matches!(
+                    result,
+                    Err(crate::AircError::CommandInbox {
+                        source: InboxError::Closed,
+                        ..
+                    })
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(crate::AircError::CommandDeadline { .. })
+                )),
+            }
+            if let Some(tx) = tx {
+                assert_eq!(tx.receiver_count(), 0);
+            }
+            assert!(matches!(
+                airc.next_command_event(&mut pending).await,
+                Err(crate::AircError::CommandFinished { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_and_stream_end_cannot_settle_a_command() {
+        let home = tempfile::tempdir().unwrap();
+        let airc = crate::Airc::open(home.path()).await.unwrap();
+        let peer = PeerId::new();
+        let correlation = Uuid::new_v4();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (tx, rx) = broadcast::channel(8);
+        let make_pending = |rx| {
+            crate::command_bus::PendingCommand::for_test(
+                AddressedInbox { rx, owner: None },
+                peer,
+                airc.peer_id(),
+                correlation,
+                deadline,
+            )
+        };
+        let mut events = make_pending(rx);
+        let settled = make_pending(tx.subscribe());
+        for (from, kind, body) in [
+            (PeerId::new(), AddressedKind::CommandResult, "wrong peer"),
+            (peer, AddressedKind::CommandProgress, "last chunk"),
+            (peer, AddressedKind::CommandResult, "settled"),
+        ] {
+            let mut headers = Headers::new();
+            headers.insert(crate::HEADER_STREAM_FINAL.into(), "true".into());
+            tx.send(Arc::new(VerifiedAddressed {
+                deadline,
+                from,
+                to: airc.peer_id(),
+                kind,
+                correlation,
+                headers,
+                body: Body::text(body),
+            }))
+            .unwrap();
+        }
+        assert!(
+            matches!(airc.next_command_event(&mut events).await.unwrap(),
+            crate::CommandEvent::Progress(frame) if frame.body().as_text() == Some("last chunk"))
+        );
+        assert!(
+            matches!(airc.next_command_event(&mut events).await.unwrap(),
+            crate::CommandEvent::Completed(frame) if frame.body().as_text() == Some("settled"))
+        );
+        assert!(matches!(
+            airc.next_command_event(&mut events).await,
+            Err(crate::AircError::CommandFinished { .. })
+        ));
+        assert_eq!(
+            tx.receiver_count(),
+            1,
+            "completed exchange releases its inbox"
+        );
+        assert_eq!(
+            airc.await_reply(settled).await.unwrap().body().as_text(),
+            Some("settled")
+        );
+        assert_eq!(tx.receiver_count(), 0);
+    }
 
     #[tokio::test]
     async fn unrelated_expired_result_does_not_abort_pending_exchange() {

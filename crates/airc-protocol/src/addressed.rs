@@ -32,12 +32,14 @@ pub fn addressed_channel() -> ChannelId {
     ChannelId::from_u128(0)
 }
 
-/// What an addressed exchange carries. Inner-only: neither kind ever travels as
+/// What an addressed exchange carries. Inner-only: no kind ever travels as
 /// a plaintext frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AddressedKind {
     Command,
     CommandResult,
+    /// Application-defined progress; even a final stream marker is not a result.
+    CommandProgress,
 }
 
 /// The body of an addressed frame.
@@ -153,26 +155,32 @@ mod tests {
     #[test]
     fn a_sealed_command_round_trips_and_is_not_readable_on_the_wire() {
         let (a, a_id, b, b_id) = pair();
-        let inner = SealedInner {
-            kind: AddressedKind::Command,
-            correlation: Uuid::new_v4(),
-            headers: Headers::new(),
-            body: Body::text("resident prompt: private"),
-        };
-        let sealed = a
-            .seal_for(b_id, &aad(a_id, b_id), &inner.to_plaintext().unwrap())
-            .unwrap();
-        let body = AddressedWire::Sealed(sealed).to_body().unwrap();
-        let Body::Binary(wire) = &body else {
-            panic!("binary body")
-        };
-        assert!(!wire.windows(7).any(|w| w == b"private"));
+        for kind in [
+            AddressedKind::Command,
+            AddressedKind::CommandProgress,
+            AddressedKind::CommandResult,
+        ] {
+            let inner = SealedInner {
+                kind,
+                correlation: Uuid::new_v4(),
+                headers: Headers::new(),
+                body: Body::text("resident prompt: private"),
+            };
+            let sealed = a
+                .seal_for(b_id, &aad(a_id, b_id), &inner.to_plaintext().unwrap())
+                .unwrap();
+            let body = AddressedWire::Sealed(sealed).to_body().unwrap();
+            let Body::Binary(wire) = &body else {
+                panic!("binary body")
+            };
+            assert!(!wire.windows(7).any(|w| w == b"private"));
 
-        let AddressedWire::Sealed(frame) = AddressedWire::from_body(&body).unwrap() else {
-            panic!("sealed round-trip")
-        };
-        let opened = b.open_from(a_id, &aad(a_id, b_id), &frame).unwrap();
-        assert_eq!(SealedInner::from_plaintext(&opened).unwrap(), inner);
+            let AddressedWire::Sealed(frame) = AddressedWire::from_body(&body).unwrap() else {
+                panic!("sealed round-trip")
+            };
+            let opened = b.open_from(a_id, &aad(a_id, b_id), &frame).unwrap();
+            assert_eq!(SealedInner::from_plaintext(&opened).unwrap(), inner);
+        }
     }
 
     // what this catches: the AAD binds the addressee, so a forwarder that
