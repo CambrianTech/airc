@@ -682,6 +682,63 @@ mod tests {
     // end must see the stream fully released (a write into it fails), which only holds if
     // the writer was aborted. The check never reads, so it cannot unblock the writer itself.
     #[tokio::test]
+    async fn cancelled_writer_removes_session_and_closes_both_split_halves() {
+        use tokio::io::AsyncReadExt;
+        let (_, alice, bob_id, bob) = make_paired_adapters();
+        let (events, mut disconnected) = tokio::sync::mpsc::unbounded_channel();
+        alice.set_disconnect_observer(Arc::new(move |peer| {
+            let _ = events.send(peer);
+        }));
+        let (near, mut far) = tokio::io::duplex(1);
+        let (reader, writer) = tokio::io::split(near);
+        super::connection::install_and_spawn_loops(
+            alice.inner.clone(),
+            bob_id,
+            bob.inner.keypair.public_bytes(),
+            reader,
+            writer,
+        )
+        .await;
+        let outbound = alice
+            .inner
+            .connections
+            .lock()
+            .await
+            .get(&bob_id)
+            .unwrap()
+            .outbound
+            .clone();
+        let (flushed, wait) = tokio::sync::oneshot::channel();
+        assert!(outbound
+            .send(Outbound {
+                payload: vec![7; 4096],
+                flushed
+            })
+            .await
+            .is_ok());
+        let mut first = [0];
+        tokio::time::timeout(Duration::from_secs(1), far.read_exact(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(wait);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), disconnected.recv())
+                .await
+                .unwrap(),
+            Some(bob_id)
+        );
+        assert!(!alice.inner.connections.lock().await.contains_key(&bob_id));
+        let mut tail = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), far.read_to_end(&mut tail))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tail.len() < 4099);
+        assert!(outbound.is_closed());
+    }
+
+    #[tokio::test]
     async fn a_redial_releases_a_session_whose_writer_is_blocked() {
         let (alice_id, alice, bob_id, _bob) = make_paired_adapters();
         let _ = alice_id;

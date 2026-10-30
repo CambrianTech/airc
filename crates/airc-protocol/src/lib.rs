@@ -20,6 +20,8 @@
 //! into module paths.
 
 pub mod addressed;
+pub mod addressed_attach;
+pub mod addressed_deadline;
 pub mod assertion;
 pub mod canonical;
 pub mod delivery_ack;

@@ -483,6 +483,9 @@ async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) -> Result
         return stream_attach(reader, writer, state, attach).await;
     }
 
+    if let Request::AttachAddressed(attach) = request {
+        return crate::addressed_connection::serve(reader, writer, state, attach.peer).await;
+    }
     let response = dispatch(state, request).await;
     write_response(&mut writer, &response).await?;
     // Drop reader+writer (and thus the underlying stream) so the

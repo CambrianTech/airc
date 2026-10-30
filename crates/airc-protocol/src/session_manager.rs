@@ -90,6 +90,13 @@ struct AcceptedInit {
     resp: HandshakeResp,
 }
 
+#[derive(Default)]
+struct PeerSessionState {
+    session: Option<StreamSession>,
+    pending: Option<(PendingHandshake, HandshakeInit)>,
+    accepted: Option<AcceptedInit>,
+}
+
 /// Owns this peer's identity + the live sessions/handshakes with every other
 /// peer. Cheap to share (`Arc` the whole thing); the inner maps are sharded.
 pub struct SessionManager {
@@ -97,17 +104,10 @@ pub struct SessionManager {
     peer_id: PeerId,
     key_id: u32,
     registry: Arc<PeerKeyRegistry>,
-    /// Established sessions, keyed by the OTHER peer's id.
-    sessions: DashMap<PeerId, StreamSession>,
-    /// In-flight initiations we started, awaiting the responder's reply, keyed
-    /// by the peer we initiated TO, each with the init we sent so it can be
-    /// re-sent when it or its reply was lost.
-    pending: DashMap<PeerId, (PendingHandshake, HandshakeInit)>,
-    /// The last init accepted from each peer and the response we gave it. A new
-    /// init must be strictly newer (a recorded one can't replace a live
-    /// session); a duplicate of this one gets the same response again, because
-    /// the initiator lost our reply.
-    accepted: DashMap<PeerId, AcceptedInit>,
+    /// One lock owns each peer's pending, accepted and established state.
+    /// A handshake transition cannot race another transport reader between
+    /// verification, consuming pending state and installing its session.
+    peers: DashMap<PeerId, PeerSessionState>,
     /// The last `issued_at_ms` this side signed, so two inits in the same
     /// millisecond still increase.
     last_issued_ms: std::sync::atomic::AtomicU64,
@@ -120,9 +120,7 @@ impl SessionManager {
             peer_id,
             key_id: 0,
             registry,
-            sessions: DashMap::new(),
-            pending: DashMap::new(),
-            accepted: DashMap::new(),
+            peers: DashMap::new(),
             last_issued_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -135,33 +133,31 @@ impl SessionManager {
 
     /// Is there a live session with `peer`?
     pub fn has_session(&self, peer: PeerId) -> bool {
-        self.sessions.contains_key(&peer)
+        self.peers
+            .get(&peer)
+            .is_some_and(|state| state.session.is_some())
     }
 
     /// Is a handshake we started to `peer` still awaiting its response?
     pub fn has_pending(&self, peer: PeerId) -> bool {
-        self.pending.contains_key(&peer)
+        self.peers
+            .get(&peer)
+            .is_some_and(|state| state.pending.is_some())
     }
 
     /// Forget every session, handshake and accepted init: exactly what a
     /// process restart loses (the identity and registry stay).
     pub fn reset(&self) {
-        self.sessions.clear();
-        self.pending.clear();
-        self.accepted.clear();
+        self.peers.clear();
     }
 
     /// The init of our unanswered handshake to `peer`, to send again: the init
     /// or its reply was lost, and the responder answers a duplicate with the
     /// response it already gave.
     pub fn pending_init(&self, peer: PeerId) -> Option<HandshakeInit> {
-        self.pending.get(&peer).map(|entry| entry.1.clone())
-    }
-
-    /// Abandon our unanswered handshake to `peer`, so the next send starts a
-    /// fresh one.
-    pub fn cancel_pending(&self, peer: PeerId) {
-        self.pending.remove(&peer);
+        self.peers
+            .get(&peer)
+            .and_then(|state| state.pending.as_ref().map(|entry| entry.1.clone()))
     }
 
     /// Begin a handshake to `peer`: returns the `HandshakeInit` to send and
@@ -170,7 +166,23 @@ impl SessionManager {
     /// is this side's wall clock; the signed issue time is strictly increasing
     /// even when two inits share a millisecond.
     pub fn begin_handshake(&self, peer: PeerId, now_ms: u64) -> HandshakeInit {
+        self.begin_handshake_inner(peer, now_ms, false)
+    }
+
+    /// Atomically reuse an outstanding init or create one. Concurrent callers
+    /// waiting for the same peer share its handshake without replacing it.
+    pub fn ensure_handshake(&self, peer: PeerId, now_ms: u64) -> HandshakeInit {
+        self.begin_handshake_inner(peer, now_ms, true)
+    }
+
+    fn begin_handshake_inner(&self, peer: PeerId, now_ms: u64, reuse: bool) -> HandshakeInit {
         use std::sync::atomic::Ordering;
+        let mut state = self.peers.entry(peer).or_default();
+        if reuse {
+            if let Some((_, init)) = &state.pending {
+                return init.clone();
+            }
+        }
         let mut last = self.last_issued_ms.load(Ordering::Acquire);
         let issued_at_ms = loop {
             let next = now_ms.max(last.saturating_add(1));
@@ -186,7 +198,7 @@ impl SessionManager {
         };
         let (pending, init) =
             handshake::initiate(&self.keypair, self.peer_id, self.key_id, peer, issued_at_ms);
-        self.pending.insert(peer, (pending, init.clone()));
+        state.pending = Some((pending, init.clone()));
         init
     }
 
@@ -199,12 +211,11 @@ impl SessionManager {
     /// init not newer than the last accepted is refused. A newer one replaces a
     /// live session: that is how a restarted peer re-keys.
     pub fn on_init(&self, init: &HandshakeInit) -> Result<HandshakeResp, SessionManagerError> {
-        if self.pending.contains_key(&init.peer_id)
-            && self.peer_id.as_uuid() < init.peer_id.as_uuid()
-        {
+        let mut state = self.peers.entry(init.peer_id).or_default();
+        if state.pending.is_some() && self.peer_id.as_uuid() < init.peer_id.as_uuid() {
             return Err(SessionManagerError::Crossed);
         }
-        if let Some(last) = self.accepted.get(&init.peer_id) {
+        if let Some(last) = state.accepted.as_ref() {
             if init.issued_at_ms == last.issued_at_ms && init.eph_pub == last.eph_pub {
                 return Ok(last.resp.clone());
             }
@@ -212,23 +223,30 @@ impl SessionManager {
                 return Err(SessionManagerError::StaleInit);
             }
         }
-        let (session, resp) = handshake::respond(
+        let response = handshake::respond(
             &self.keypair,
             self.peer_id,
             self.key_id,
             init,
             &self.registry,
-        )?;
-        self.pending.remove(&init.peer_id);
-        self.accepted.insert(
-            init.peer_id,
-            AcceptedInit {
-                issued_at_ms: init.issued_at_ms,
-                eph_pub: init.eph_pub,
-                resp: resp.clone(),
-            },
         );
-        self.sessions.insert(init.peer_id, session);
+        let (session, resp) = match response {
+            Ok(response) => response,
+            Err(error) => {
+                drop(state);
+                self.peers.remove_if(&init.peer_id, |_, state| {
+                    state.session.is_none() && state.pending.is_none() && state.accepted.is_none()
+                });
+                return Err(error.into());
+            }
+        };
+        state.pending = None;
+        state.accepted = Some(AcceptedInit {
+            issued_at_ms: init.issued_at_ms,
+            eph_pub: init.eph_pub,
+            resp: resp.clone(),
+        });
+        state.session = Some(session);
         Ok(resp)
     }
 
@@ -238,17 +256,22 @@ impl SessionManager {
     /// The reply is verified against the pending handshake before it is
     /// consumed, so a stray or replayed reply leaves the real one awaited.
     pub fn on_resp(&self, resp: &HandshakeResp) -> Result<(), SessionManagerError> {
-        self.pending
-            .get(&resp.peer_id)
+        let mut state = self
+            .peers
+            .get_mut(&resp.peer_id)
+            .ok_or(SessionManagerError::NoPendingHandshake)?;
+        state
+            .pending
+            .as_ref()
             .ok_or(SessionManagerError::NoPendingHandshake)?
             .0
             .verify(resp, &self.registry)?;
-        let (_peer, (pending, _init)) = self
+        let (pending, _init) = state
             .pending
-            .remove(&resp.peer_id)
+            .take()
             .ok_or(SessionManagerError::NoPendingHandshake)?;
         let session = pending.complete(resp, &self.registry)?;
-        self.sessions.insert(resp.peer_id, session);
+        state.session = Some(session);
         Ok(())
     }
 
@@ -260,9 +283,13 @@ impl SessionManager {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<SealedFrame, SessionManagerError> {
-        let mut session = self
-            .sessions
+        let mut state = self
+            .peers
             .get_mut(&peer)
+            .ok_or(SessionManagerError::NoSession)?;
+        let session = state
+            .session
+            .as_mut()
             .ok_or(SessionManagerError::NoSession)?;
         Ok(session.seal(aad, plaintext)?)
     }
@@ -274,9 +301,13 @@ impl SessionManager {
         aad: &[u8],
         frame: &SealedFrame,
     ) -> Result<Vec<u8>, SessionManagerError> {
-        let mut session = self
-            .sessions
+        let mut state = self
+            .peers
             .get_mut(&peer)
+            .ok_or(SessionManagerError::NoSession)?;
+        let session = state
+            .session
+            .as_mut()
             .ok_or(SessionManagerError::NoSession)?;
         Ok(session.open(frame, aad)?)
     }
@@ -510,5 +541,107 @@ mod tests {
         restarted.on_resp(&resp).unwrap();
         let f = restarted.seal_for(b_id, b"", b"after restart").unwrap();
         assert_eq!(b.open_from(a_id, b"", &f).unwrap(), b"after restart");
+    }
+
+    #[test]
+    fn replayed_init_after_restart_does_not_hide_session_mismatch_as_replay() {
+        let reg = Arc::new(PeerKeyRegistry::new());
+        let (a, a_id) = mgr(&reg);
+        let (b, b_id) = mgr(&reg);
+        let recorded = a.begin_handshake(b_id, 1_000);
+        a.on_resp(&b.on_init(&recorded).unwrap()).unwrap();
+        let old = b.seal_for(a_id, b"", b"before restart").unwrap();
+        a.open_from(b_id, b"", &old).unwrap();
+
+        b.reset();
+        let stray_response = b.on_init(&recorded).unwrap();
+        assert_eq!(
+            a.on_resp(&stray_response),
+            Err(SessionManagerError::NoPendingHandshake)
+        );
+        let mismatched = b.seal_for(a_id, b"", b"after restart").unwrap();
+        assert_eq!(mismatched.counter, old.counter);
+        assert_eq!(
+            a.open_from(b_id, b"", &mismatched),
+            Err(SessionManagerError::Session(SessionError::AeadFailed))
+        );
+
+        // This is the transition the receive owner takes on authentication failure.
+        let fresh = a.begin_handshake(b_id, 2_000);
+        a.on_resp(&b.on_init(&fresh).unwrap()).unwrap();
+        let recovered = b.seal_for(a_id, b"", b"recovered").unwrap();
+        assert_eq!(a.open_from(b_id, b"", &recovered).unwrap(), b"recovered");
+        assert_eq!(
+            a.open_from(b_id, b"", &recovered),
+            Err(SessionManagerError::Session(SessionError::Replay))
+        );
+    }
+
+    #[test]
+    fn simultaneous_duplicate_inits_install_one_session() {
+        let reg = Arc::new(PeerKeyRegistry::new());
+        let (a, a_id) = mgr(&reg);
+        let (b, b_id) = mgr(&reg);
+        let init = a.begin_handshake(b_id, 1_000);
+        let barrier = std::sync::Barrier::new(8);
+        let responses = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        b.on_init(&init).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for response in &responses {
+            assert_eq!(response.eph_pub, responses[0].eph_pub);
+            assert_eq!(response.sig, responses[0].sig);
+        }
+        a.on_resp(&responses[0]).unwrap();
+        let sealed = a.seal_for(b_id, b"", b"one session").unwrap();
+        assert_eq!(b.open_from(a_id, b"", &sealed).unwrap(), b"one session");
+        assert!(b.on_init(&init).is_ok());
+        assert_eq!(
+            b.open_from(a_id, b"", &sealed),
+            Err(SessionManagerError::Session(SessionError::Replay))
+        );
+    }
+
+    #[test]
+    fn concurrent_waiters_share_one_pending_init() {
+        let reg = Arc::new(PeerKeyRegistry::new());
+        let (a, a_id) = mgr(&reg);
+        let (b, b_id) = mgr(&reg);
+        let barrier = std::sync::Barrier::new(8);
+        let inits = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|n| {
+                    scope.spawn({
+                        let a = &a;
+                        let barrier = &barrier;
+                        move || {
+                            barrier.wait();
+                            a.ensure_handshake(b_id, 1_000 + n)
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for init in &inits {
+            assert_eq!(init.eph_pub, inits[0].eph_pub);
+            assert_eq!(init.issued_at_ms, inits[0].issued_at_ms);
+        }
+        a.on_resp(&b.on_init(&inits[0]).unwrap()).unwrap();
+        let sealed = a.seal_for(b_id, b"", b"shared session").unwrap();
+        assert_eq!(b.open_from(a_id, b"", &sealed).unwrap(), b"shared session");
     }
 }

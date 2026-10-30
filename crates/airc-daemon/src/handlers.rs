@@ -42,6 +42,12 @@ const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as 
 /// wire protocol stays uniform.
 pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
     match request {
+        Request::Addressed(request) => {
+            crate::addressed_connection::route_request(&state, request).await
+        }
+        Request::AttachAddressed(_) | Request::ProveAddressed(_) => Response::Error {
+            message: "addressed proof requires its original challenged connection".into(),
+        },
         Request::Ping => Response::Pong,
         Request::Status => {
             let retained = state.router.retention_snapshot();
@@ -479,7 +485,10 @@ async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Respon
     }
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&bytes);
-    if let Err(error) = state.registry.enrol(add.peer_id, 0, pubkey) {
+    if let Err(error) =
+        crate::trust_refresh::refresh_peer(&state.registry, &state.home, add.peer_id, Some(pubkey))
+            .await
+    {
         return Response::Error {
             message: format!("add_peer: enrol: {error}"),
         };

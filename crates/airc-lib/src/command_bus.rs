@@ -1,143 +1,28 @@
-//! Command-bus primitive — typed request/reply with correlation +
-//! deadline + cancellation.
+//! Addressed command exchange over authenticated, sealed identity channels.
 //!
-//! Phase 4 of the GRID-SUBSTRATE-AUDIT. The same primitive serves:
-//!
-//! - **Tool integration for AI agent runtimes** — an agent's tool
-//!   call (Claude/Codex/OpenClaw/Hermes invoking a remote
-//!   capability) becomes `Airc::request(command_kind, body,
-//!   deadline)`; the agent's tool returns when `await_reply`
-//!   resolves. The shape maps cleanly onto each runtime's native
-//!   promise/future/await.
-//! - **Continuum's event + promise-based command bus** —
-//!   distributed compute / model serving / capability leasing.
-//!   Same correlation_id semantics, same deadline + cancellation
-//!   contract.
-//! - **Cross-runtime workflows** — OpenClaw thread emits a command
-//!   that Hermes orchestrator handles; sentinel-ai issues a
-//!   command an operator dashboard replies to; future AR command
-//!   planes route the same way.
-//!
-//! Deliberately named "command" rather than "tool" because the
-//! use cases go beyond agent tools. Consumers own the
-//! `airc.command_kind` vocabulary
-//! (`continuum.lora.invoke`, `forge.hermes.agent_command`,
-//! `openclaw.thread.create`, etc.); the substrate owns delivery +
-//! correlation matching + deadline enforcement.
-//!
-//! ## Conceptually
-//!
-//! A command is an **async task** — the requester emits it, the
-//! receiver eventually emits a reply (or a deadline elapses, or
-//! the requester cancels). The substrate carries both as plain
-//! events with paired `airc.correlation_id`.
-//!
-//! Forge-alloy contracts (the typed-payload layer above airc)
-//! ride alongside the substrate headers: a request event
-//! typically carries `forge.body_hint=continuum.lora.invoke`
-//! identifying the contract that decodes the body, plus
-//! `airc.command_kind=continuum.lora.invoke` for the substrate's
-//! routing/dispatch view. airc routes on the header; the
-//! consumer parses the body against the forge contract.
-//!
-//! Example (consumer-side; substrate sees only opaque events):
-//!
-//! ```ignore
-//! // Requesting machine — emits a LoRA-invoke command
-//! let mut headers = Headers::new();
-//! headers.insert("forge.body_hint".into(), "continuum.lora.invoke".into());
-//! headers.insert("airc.command_kind".into(), "continuum.lora.invoke".into());
-//! let pending = airc.request(
-//!     MentionTarget::All,
-//!     headers,
-//!     Body::Json(serde_json::json!({ "model": "foo", "prompt": "..." })),
-//!     Duration::from_secs(60),
-//! ).await?;
-//! let reply = airc.await_reply(pending).await?;
-//! // reply.body is the forge.continuum.lora.result payload
-//!
-//! // Receiving machine — handler dispatches on airc.command_kind
-//! for event in stream {
-//!     if event.headers.get("airc.command_kind") == Some(&"continuum.lora.invoke".into()) {
-//!         let correlation_id = parse_uuid(event.headers.get("airc.correlation_id")?)?;
-//!         let reply_to = parse_peer_id(event.headers.get("airc.reply_to")?)?;
-//!         let result = run_lora(event.body)?;
-//!         let mut reply_headers = Headers::new();
-//!         reply_headers.insert("forge.body_hint".into(), "continuum.lora.result".into());
-//!         airc.reply(reply_to, correlation_id, reply_headers, Body::Json(result)).await?;
-//!     }
-//! }
-//! ```
-//!
-//! Wire format (additive headers on a normal `Message` frame):
-//!
-//! - `airc.correlation_id` — UUIDv4 string; pairs ONE request with
-//!   ONE reply. Distinct from `airc.trace_id` (end-to-end
-//!   observability spanning many events).
-//! - `airc.reply_to` — sender's peer_id; the reply event's
-//!   `target` should match this.
-//! - `airc.deadline` — epoch-ms decimal string; receivers may drop
-//!   past-deadline requests; the requester uses it to time out.
-//! - `airc.command_kind` (optional) — consumer-namespace string,
-//!   e.g. `continuum.lora.invoke`. The substrate doesn't interpret
-//!   it; receivers dispatch on it without parsing the body.
-//!
-//! API:
-//!
-//! ```ignore
-//! let pending = airc.request(
-//!     headers,
-//!     Body::text("..."),
-//!     Duration::from_secs(30),
-//! ).await?;
-//! let reply = airc.await_reply(pending).await?;
-//! ```
-//!
-//! On the receiver side, handler code reads
-//! `event.headers["airc.correlation_id"]` + `["airc.reply_to"]`
-//! off the request event and calls
-//! `airc.reply(reply_to, correlation_id, headers, body)`.
-//!
-//! Cancellation: `airc.cancel(correlation_id)` aborts the pending
-//! receiver, but does NOT send a cancel signal to the remote
-//! receiver — that's a consumer-level concern (the consumer may
-//! emit a `consumer.cancel.<correlation_id>` event on the same
-//! correlation if their domain needs it).
+//! Requests and results never enter a conversational room. The inbox is armed
+//! before sending, and the reply must match the authenticated peer, recipient,
+//! kind and correlation. Consumers decode bodies only after that boundary.
 
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 
-use airc_core::{Body, Headers, MentionTarget, PeerId, TranscriptEvent};
+use airc_core::{Body, Headers, MentionTarget, PeerId};
 use airc_protocol::{HEADER_AIRC_CORRELATION_ID, HEADER_AIRC_DEADLINE, HEADER_AIRC_REPLY_TO};
-use futures::stream::StreamExt;
 use uuid::Uuid;
 
 use crate::error::AircError;
-use crate::stream::EventStream;
 use crate::time::now_ms;
-use crate::Airc;
+use crate::{AddressedInbox, AddressedKind, AddressedSend, Airc, VerifiedAddressed};
 
-/// One in-flight request awaiting a matching reply.
+/// An armed reply receiver with one monotonic end-to-end deadline.
 pub struct PendingCommand {
-    /// The correlation id stamped on the outgoing request event.
-    /// The reply event must carry the same value in
-    /// `airc.correlation_id`.
     pub correlation_id: Uuid,
-    /// Wall-clock deadline. `await_reply` returns
-    /// `AircError::CommandDeadline` past this point.
     pub deadline_at_ms: u64,
-    /// Live reply stream armed before the request is emitted.
-    ///
-    /// Without this, a fast same-process/LAN responder can reply
-    /// before `await_reply` subscribes, and the requester misses its
-    /// own command response. The stream is private so consumers use
-    /// the request/await contract rather than constructing half-armed
-    /// pending commands.
-    reply_stream: Option<EventStream>,
-    // Preserve the dispatch room across default-room changes and re-subscribe.
-    reply_room: airc_core::RoomId,
-    // Logical addressing captured at dispatch, independent of transport endpoints
-    // and of the Airc handle later used to await this pending request.
-    expected_target: MentionTarget,
+    deadline: Instant,
+    inbox: AddressedInbox,
+    expected_peer: PeerId,
     requester: PeerId,
 }
 
@@ -151,320 +36,214 @@ impl std::fmt::Debug for PendingCommand {
 }
 
 impl PendingCommand {
-    /// Returns the remaining time before the deadline, or `None`
-    /// if the deadline has already passed.
-    pub fn remaining(&self) -> Option<Duration> {
-        let now = now_ms().ok()?;
-        if now >= self.deadline_at_ms {
-            None
-        } else {
-            Some(Duration::from_millis(self.deadline_at_ms - now))
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        inbox: AddressedInbox,
+        expected_peer: PeerId,
+        requester: PeerId,
+        correlation_id: Uuid,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            inbox,
+            expected_peer,
+            requester,
+            correlation_id,
+            deadline,
+            deadline_at_ms: 0,
         }
     }
 
-    fn accepts_author(&self, author: PeerId) -> bool {
-        if author == self.requester {
-            return false;
-        }
-        match self.expected_target {
-            MentionTarget::Peer(expected) => author == expected,
-            // Neither a broadcast nor a room reference names one responder.
-            // Preserve first-reply semantics within the dispatch room.
-            MentionTarget::All | MentionTarget::Room(_) => true,
-        }
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline.checked_duration_since(Instant::now())
     }
 }
 
-/// Read the addressing a responder needs off an in-flight request:
-/// `(reply_to, correlation_id)`.
-///
-/// `None` when either header is missing or unparseable, which means the event
-/// is not an answerable request — a responder that guessed here would reply
-/// into the void or, worse, correlate its answer to someone else's question.
-/// Extracted because every responder needs exactly this pair, and each one
-/// re-deriving it from raw headers is how they drift apart.
-pub fn reply_addressing(event: &TranscriptEvent) -> Option<(PeerId, Uuid)> {
-    let reply_to = PeerId::from_uuid(event.headers.get(HEADER_AIRC_REPLY_TO)?.parse().ok()?);
-    let correlation_id = event
-        .headers
-        .get(HEADER_AIRC_CORRELATION_ID)?
-        .parse()
-        .ok()?;
-    Some((reply_to, correlation_id))
+/// Only authenticated command requests have a reply address. A caller-supplied
+/// reply_to header never overrides the session-authenticated sender.
+pub fn reply_addressing(event: &VerifiedAddressed) -> Option<(PeerId, Uuid)> {
+    (event.kind() == AddressedKind::Command).then(|| (event.from(), event.correlation()))
+}
+
+fn direct_peer(target: MentionTarget) -> Result<PeerId, AircError> {
+    match target {
+        MentionTarget::Peer(peer) => Ok(peer),
+        MentionTarget::All | MentionTarget::Room(_) => Err(AircError::Transport(
+            "commands require an explicit peer recipient".into(),
+        )),
+    }
+}
+
+fn matches_reply(
+    kind: AddressedKind,
+    actual: (PeerId, PeerId, Uuid),
+    expected: (PeerId, PeerId, Uuid),
+) -> bool {
+    kind == AddressedKind::CommandResult && actual == expected
 }
 
 impl Airc {
-    /// Issue a request and return a [`PendingCommand`] handle. The
-    /// reply is awaited via [`Airc::await_reply`]. The substrate
-    /// stamps `airc.correlation_id`, `airc.reply_to`, and
-    /// `airc.deadline` on the outgoing event; callers may inject
-    /// any consumer-namespace headers they want (e.g.
-    /// `continuum.lora.invoke`, `forge.body_hint`).
-    ///
-    /// `target` selects who is expected to handle the request.
-    /// `MentionTarget::All` broadcasts and the first reply wins;
-    /// `MentionTarget::Peer(id)` accepts a reply only from that logical peer.
-    /// A room reference does not select a unique responding peer. All replies
-    /// must be addressed to this requester in the original dispatch room.
+    /// Issue a sealed request to one peer. Broadcast and room targets refuse.
+    /// The deadline covers handshake, delivery and waiting for the response.
     pub async fn request(
         &self,
         target: MentionTarget,
-        headers: Headers,
-        body: Body,
-        deadline: Duration,
-    ) -> Result<PendingCommand, AircError> {
-        self.request_on(None, target, headers, body, deadline).await
-    }
-
-    /// Request in an explicit activity room without changing current-room state.
-    pub async fn request_in(
-        &self,
-        room: &crate::Room,
-        target: MentionTarget,
-        headers: Headers,
-        body: Body,
-        deadline: Duration,
-    ) -> Result<PendingCommand, AircError> {
-        self.request_on(Some(room), target, headers, body, deadline)
-            .await
-    }
-
-    async fn request_on(
-        &self,
-        room: Option<&crate::Room>,
-        target: MentionTarget,
-        headers: Headers,
-        body: Body,
-        deadline: Duration,
-    ) -> Result<PendingCommand, AircError> {
-        let room = match room {
-            Some(room) => {
-                self.room_by_name_or_channel(&room.channel.to_string(), "request in")
-                    .await?
-            }
-            None => self.current_room().await?,
-        };
-        self.request_in_resolved_room(&room, target, headers, body, deadline)
-            .await
-    }
-
-    /// Shared request preparation after the caller has resolved room authority.
-    /// Public requests use scope subscriptions; daemon recovery uses its hosted
-    /// room bindings. Neither path changes the current room or auto-joins.
-    pub(crate) async fn request_in_resolved_room(
-        &self,
-        room: &crate::Room,
-        target: MentionTarget,
         mut headers: Headers,
         body: Body,
-        deadline: Duration,
+        timeout: Duration,
     ) -> Result<PendingCommand, AircError> {
+        let peer = direct_peer(target)?;
         let correlation_id = Uuid::new_v4();
-        let deadline_at_ms = now_ms()? + deadline.as_millis() as u64;
-        let __sub = airc_diagnostics::timing::start();
-        let reply_stream = self
-            .command_reply_stream(room.channel, correlation_id)
-            .await?;
-        __sub.stop("airc.req.subscribe");
-
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            AircError::Transport("command duration exceeds monotonic clock range".into())
+        })?;
+        let millis = u64::try_from(timeout.as_millis())
+            .map_err(|_| AircError::Transport("command duration exceeds wire range".into()))?;
+        let deadline_at_ms = now_ms()?
+            .checked_add(millis)
+            .ok_or_else(|| AircError::Transport("command deadline exceeds wire range".into()))?;
+        let inbox = self
+            .addressed_inbox(deadline)
+            .await
+            .map_err(|error| AircError::Transport(error.to_string()))?;
         headers.insert(
             HEADER_AIRC_CORRELATION_ID.into(),
             correlation_id.to_string(),
         );
-        headers.insert(
-            HEADER_AIRC_REPLY_TO.into(),
-            self.inner.identity.peer_id.to_string(),
-        );
+        headers.insert(HEADER_AIRC_REPLY_TO.into(), self.peer_id().to_string());
         headers.insert(HEADER_AIRC_DEADLINE.into(), deadline_at_ms.to_string());
-
-        let __send = airc_diagnostics::timing::start();
-        self.send_frame_to_room(
-            airc_protocol::FrameKind::Message,
-            target.clone(),
-            body,
-            headers,
-            room,
+        self.send_addressed(
+            AddressedSend {
+                to: peer,
+                kind: AddressedKind::Command,
+                correlation: correlation_id,
+                headers,
+                body,
+            },
+            deadline,
         )
-        .await?;
-        __send.stop("airc.req.send_frame");
-
+        .await
+        .map_err(|error| AircError::Transport(error.to_string()))?;
         Ok(PendingCommand {
             correlation_id,
             deadline_at_ms,
-            reply_stream: Some(reply_stream),
-            reply_room: room.channel,
-            expected_target: target,
-            requester: self.inner.identity.peer_id,
+            deadline,
+            inbox,
+            expected_peer: peer,
+            requester: self.peer_id(),
         })
     }
 
-    async fn command_reply_stream(
-        &self,
-        room: airc_core::RoomId,
-        correlation_id: Uuid,
-    ) -> Result<EventStream, AircError> {
-        if self.is_daemon_attached() {
-            self.daemon_subscribe(
-                vec![room],
-                None,
-                airc_core::HeaderFilter::Exact {
-                    key: HEADER_AIRC_CORRELATION_ID.to_string(),
-                    value: correlation_id.to_string(),
-                },
-            )
-            .await
-        } else {
-            self.subscribe().await
-        }
-    }
-
-    /// Reply to an in-flight request INTO THE CHANNEL THE REQUEST ARRIVED ON.
-    ///
-    /// [`reply`](Self::reply) sends via the responder's CURRENT room — correct
-    /// only when both sides happen to share it. Two scopes on one machine can
-    /// be parked in different rooms (an operator CLI in `#general`, citizens
-    /// landed in `#academy`): the request crosses (responders subscribe every
-    /// room) but the answer leaves through the responder's room and the
-    /// requester — awaiting on the channel it asked in — never sees it. Every
-    /// dispatch then dies at the command deadline (2026-08-27 grid-smoke 0/3).
-    ///
-    /// `channel` is the request event's `room_id`, adopted verbatim;
-    /// `channel_name` is the request's stamped
-    /// [`airc_protocol::HEADER_AIRC_CHANNEL_NAME`] (for the blind-room heal
-    /// header on the reply), if present.
-    pub async fn reply_in(
-        &self,
-        channel: airc_core::RoomId,
-        channel_name: Option<&str>,
-        reply_to: PeerId,
-        correlation_id: Uuid,
-        mut headers: Headers,
-        body: Body,
-    ) -> Result<(), AircError> {
-        headers.insert(
-            HEADER_AIRC_CORRELATION_ID.into(),
-            correlation_id.to_string(),
-        );
-        headers.insert(HEADER_AIRC_REPLY_TO.into(), reply_to.to_string());
-        let room = crate::Room::at_channel(self.home(), channel_name.unwrap_or(""), channel)?;
-        self.send_frame_to_room(
-            airc_protocol::FrameKind::Message,
-            MentionTarget::Peer(reply_to),
-            body,
-            headers,
-            &room,
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Reply to an in-flight request. `reply_to` is the
-    /// `airc.reply_to` value read off the request event;
-    /// `correlation_id` is the request's `airc.correlation_id`.
-    ///
-    /// Sends via the responder's CURRENT room — prefer
-    /// [`reply_in`](Self::reply_in) with the request's own channel when the
-    /// requester may live in a different room than this scope.
+    /// Reply to an authenticated request within its original deadline.
     pub async fn reply(
         &self,
-        reply_to: PeerId,
-        correlation_id: Uuid,
+        request: &VerifiedAddressed,
         mut headers: Headers,
         body: Body,
     ) -> Result<(), AircError> {
+        if request.kind() != AddressedKind::Command || request.to() != self.peer_id() {
+            return Err(AircError::Transport(
+                "reply requires a verified request addressed to this identity".into(),
+            ));
+        }
+        let deadline_at_ms = request
+            .headers()
+            .get(HEADER_AIRC_DEADLINE)
+            .ok_or_else(|| AircError::Transport("request has no deadline".into()))?
+            .parse::<u64>()
+            .map_err(|_| AircError::Transport("request deadline is invalid".into()))?;
+        let remaining = deadline_at_ms
+            .checked_sub(now_ms()?)
+            .filter(|ms| *ms > 0)
+            .ok_or(AircError::CommandDeadline {
+                correlation_id: request.correlation(),
+            })?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(remaining))
+            .ok_or_else(|| {
+                AircError::Transport("reply deadline exceeds monotonic clock range".into())
+            })?
+            .min(request.deadline());
+        if Instant::now() >= deadline {
+            return Err(AircError::CommandDeadline {
+                correlation_id: request.correlation(),
+            });
+        }
         headers.insert(
             HEADER_AIRC_CORRELATION_ID.into(),
-            correlation_id.to_string(),
+            request.correlation().to_string(),
         );
-        headers.insert(HEADER_AIRC_REPLY_TO.into(), reply_to.to_string());
-        self.send_frame_to(
-            airc_protocol::FrameKind::Message,
-            MentionTarget::Peer(reply_to),
-            body,
-            headers,
+        headers.insert(HEADER_AIRC_REPLY_TO.into(), request.from().to_string());
+        self.send_addressed(
+            AddressedSend {
+                to: request.from(),
+                kind: AddressedKind::CommandResult,
+                correlation: request.correlation(),
+                headers,
+                body,
+            },
+            deadline,
         )
-        .await?;
-        Ok(())
+        .await
+        .map_err(|error| AircError::Transport(error.to_string()))
     }
 
-    /// Wait for the reply to a [`PendingCommand`]. Returns the
-    /// matching `TranscriptEvent` (the reply, with its body and
-    /// headers intact) or [`AircError::CommandDeadline`] if the
-    /// deadline elapses first.
-    ///
-    /// The substrate filters the reply stream armed by
-    /// [`request`](Self::request) before the request frame is sent.
-    /// That ordering is part of the contract: fast local/LAN
-    /// responders cannot win a race against the awaiter.
-    pub async fn await_reply(&self, pending: PendingCommand) -> Result<TranscriptEvent, AircError> {
-        let correlation = pending.correlation_id.to_string();
-        let correlation_id = pending.correlation_id;
-        let deadline = Instant::now()
-            + pending
-                .remaining()
-                .unwrap_or_else(|| Duration::from_secs(0));
-        let mut pending = pending;
-        let mut stream = match pending.reply_stream.take() {
-            Some(stream) => stream,
-            None => {
-                self.command_reply_stream(pending.reply_room, correlation_id)
-                    .await?
-            }
-        };
-        let mut reopened: u32 = 0;
-
+    /// Return only the result authenticated for this exact exchange.
+    pub async fn await_reply(
+        &self,
+        mut pending: PendingCommand,
+    ) -> Result<Arc<VerifiedAddressed>, AircError> {
         loop {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            if timeout.is_zero() {
-                return Err(AircError::CommandDeadline { correlation_id });
-            }
-            match tokio::time::timeout(timeout, stream.next()).await {
-                Ok(Some(Ok(event))) => {
-                    if event.headers.get(HEADER_AIRC_CORRELATION_ID) == Some(&correlation)
-                        && event.room_id == pending.reply_room
-                        && event.target == MentionTarget::Peer(pending.requester)
-                        && pending.accepts_author(event.peer_id)
-                    {
-                        return Ok(event.as_ref().clone());
+            let remaining = pending
+                .remaining()
+                .filter(|duration| !duration.is_zero())
+                .ok_or(AircError::CommandDeadline {
+                    correlation_id: pending.correlation_id,
+                })?;
+            let event = tokio::time::timeout(remaining, pending.inbox.next())
+                .await
+                .map_err(|_| AircError::CommandDeadline {
+                    correlation_id: pending.correlation_id,
+                })?;
+            let event = match event {
+                Ok(event) => event,
+                Err(crate::addressed::InboxError::Expired {
+                    from,
+                    to,
+                    kind,
+                    correlation,
+                }) => {
+                    if matches_reply(
+                        kind,
+                        (from, to, correlation),
+                        (
+                            pending.expected_peer,
+                            pending.requester,
+                            pending.correlation_id,
+                        ),
+                    ) {
+                        return Err(AircError::CommandDeadline {
+                            correlation_id: pending.correlation_id,
+                        });
                     }
-                    // Some other event flowed through; keep waiting.
+                    continue;
                 }
-                Ok(Some(Err(_))) => {
-                    // LiveLag — subscriber fell behind. Keep
-                    // looping; eventually we get caught up.
+                Err(error) => {
+                    return Err(AircError::Transport(format!(
+                        "addressed reply inbox: {error:?}"
+                    )))
                 }
-                Ok(None) => {
-                    // Stream closed before any reply arrived.
-                    // The per-request reply stream closed under us — the daemon
-                    // re-subscribed this handle (a room join, a restart) — and the reply,
-                    // if it comes, arrives on a NEW stream. Before 2026-09-07 this was
-                    // reported as the deadline: a sender under a 600 s budget saw nine
-                    // "timeouts" in 200 s while the peer's answers landed in its own
-                    // store. Re-open per closure and keep waiting until the real deadline;
-                    // only a re-subscribe that itself fails ends the wait early.
-                    reopened = reopened.saturating_add(1);
-                    tracing::warn!(
-                        correlation = %correlation,
-                        reopened,
-                        "await_reply: reply stream closed before the deadline; re-subscribing"
-                    );
-                    match self
-                        .command_reply_stream(pending.reply_room, correlation_id)
-                        .await
-                    {
-                        Ok(next) => {
-                            stream = next;
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(correlation = %correlation, error = %e, "await_reply: re-subscribe failed");
-                            return Err(AircError::CommandDeadline { correlation_id });
-                        }
-                    }
-                }
-                Err(_) => {
-                    return Err(AircError::CommandDeadline { correlation_id });
-                }
+            };
+            if matches_reply(
+                event.kind(),
+                (event.from(), event.to(), event.correlation()),
+                (
+                    pending.expected_peer,
+                    pending.requester,
+                    pending.correlation_id,
+                ),
+            ) {
+                return Ok(event);
             }
         }
     }
@@ -473,133 +252,35 @@ impl Airc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
-    // what this catches: a correlated event from a different logical peer or
-    // addressed to another requester must not complete a directed command.
-    #[tokio::test]
-    async fn await_reply_pins_dispatch_identity_and_preserves_broadcast_and_room_targets() {
-        let home = tempfile::TempDir::new().unwrap();
-        let airc = Airc::open(home.path()).await.unwrap();
-        let requester = PeerId::new();
-        let expected = PeerId::new();
-        let other = PeerId::new();
-        let room = airc_core::RoomId::new();
-        for target in [
-            MentionTarget::Peer(expected),
-            MentionTarget::All,
-            MentionTarget::Room(airc_core::RoomId::new()),
+    #[test]
+    fn result_requires_exact_authenticated_exchange() {
+        let expected = (PeerId::new(), PeerId::new(), Uuid::new_v4());
+        assert!(matches_reply(
+            AddressedKind::CommandResult,
+            expected,
+            expected
+        ));
+        assert!(!matches_reply(AddressedKind::Command, expected, expected));
+        for wrong in [
+            (PeerId::new(), expected.1, expected.2),
+            (expected.0, PeerId::new(), expected.2),
+            (expected.0, expected.1, Uuid::new_v4()),
+            (expected.1, expected.0, expected.2),
         ] {
-            let correlation = Uuid::new_v4();
-            let (tx, rx) = tokio::sync::mpsc::channel(16);
-            let pending = PendingCommand {
-                correlation_id: correlation,
-                deadline_at_ms: now_ms().unwrap() + 3000,
-                reply_stream: Some(EventStream::daemon(rx, Vec::new())),
-                reply_room: room,
-                expected_target: target.clone(),
-                requester,
-            };
-            let valid = TranscriptEvent {
-                event_id: airc_core::EventId::new(),
-                room_id: room,
-                peer_id: expected,
-                client_id: airc_core::ClientId::new(),
-                kind: airc_core::TranscriptKind::Message,
-                occurred_at_ms: 1,
-                lamport: 1,
-                target: MentionTarget::Peer(requester),
-                headers: Headers::from([(
-                    HEADER_AIRC_CORRELATION_ID.into(),
-                    correlation.to_string(),
-                )]),
-                body: Some(Body::text("accepted")),
-                attachment: None,
-                receipt: None,
-                metadata: serde_json::Value::Null,
-            };
-            let mut rejected = Vec::new();
-            for address in [
-                MentionTarget::All,
-                MentionTarget::Peer(other),
-                MentionTarget::Room(room),
-            ] {
-                let mut event = valid.clone();
-                event.target = address;
-                rejected.push(event);
-            }
-            let mut event = valid.clone();
-            event.peer_id = requester;
-            rejected.push(event);
-            let mut event = valid.clone();
-            event.room_id = airc_core::RoomId::new();
-            rejected.push(event);
-            let mut event = valid.clone();
-            event.headers.insert(
-                HEADER_AIRC_CORRELATION_ID.into(),
-                Uuid::new_v4().to_string(),
-            );
-            rejected.push(event);
-            if matches!(target, MentionTarget::Peer(_)) {
-                let mut event = valid.clone();
-                event.peer_id = other;
-                rejected.push(event);
-            }
-            for mut event in rejected {
-                event.body = Some(Body::text("must not complete request"));
-                tx.send(std::sync::Arc::new(event)).await.unwrap();
-            }
-            tx.send(std::sync::Arc::new(valid.clone())).await.unwrap();
-            assert_eq!(airc.await_reply(pending).await.unwrap(), valid);
+            assert!(!matches_reply(
+                AddressedKind::CommandResult,
+                wrong,
+                expected
+            ));
         }
     }
 
     #[test]
-    fn pending_command_remaining_returns_none_past_deadline() {
-        let pending = PendingCommand {
-            correlation_id: Uuid::new_v4(),
-            deadline_at_ms: 1,
-            reply_stream: None,
-            reply_room: airc_core::RoomId::new(),
-            expected_target: MentionTarget::All,
-            requester: PeerId::new(),
-        };
-        assert!(pending.remaining().is_none());
-    }
-
-    #[test]
-    fn pending_command_remaining_returns_some_before_deadline() {
-        // Far-future deadline; remaining should be non-zero.
-        let pending = PendingCommand {
-            correlation_id: Uuid::new_v4(),
-            deadline_at_ms: u64::MAX / 2,
-            reply_stream: None,
-            reply_room: airc_core::RoomId::new(),
-            expected_target: MentionTarget::All,
-            requester: PeerId::new(),
-        };
-        let remaining = pending.remaining().unwrap();
-        assert!(remaining.as_millis() > 0);
-    }
-
-    #[test]
-    fn header_constants_match_protocol_module() {
-        // The wire format pin: header names ride a stable schema
-        // because cross-version peers must agree. If protocol
-        // renames these, this test fails and we know to update both
-        // sides in lockstep.
-        let _ = HEADER_AIRC_CORRELATION_ID;
-        let _ = HEADER_AIRC_REPLY_TO;
-        let _ = HEADER_AIRC_DEADLINE;
-
-        // Sanity: a typical headers map carrying all three.
-        let mut headers: Headers = BTreeMap::new();
-        headers.insert(
-            HEADER_AIRC_CORRELATION_ID.into(),
-            Uuid::new_v4().to_string(),
-        );
-        headers.insert(HEADER_AIRC_REPLY_TO.into(), PeerId::new().to_string());
-        headers.insert(HEADER_AIRC_DEADLINE.into(), "1700000000000".to_string());
-        assert_eq!(headers.len(), 3);
+    fn command_recipient_requires_explicit_peer() {
+        let peer = PeerId::new();
+        assert_eq!(direct_peer(MentionTarget::Peer(peer)).unwrap(), peer);
+        assert!(direct_peer(MentionTarget::All).is_err());
+        assert!(direct_peer(MentionTarget::Room(airc_core::RoomId::new())).is_err());
     }
 }

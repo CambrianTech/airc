@@ -117,7 +117,15 @@ pub(super) async fn install_and_spawn_loops<R, W>(
     let id = inner
         .next_session_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let writer = tokio::spawn(write_loop(write_half, outbound_rx));
+    let (writer_ready, writer_installed) = oneshot::channel::<()>();
+    let writer_inner = Arc::clone(&inner);
+    let writer = tokio::spawn(async move {
+        if writer_installed.await.is_err() {
+            return;
+        }
+        write_loop(write_half, outbound_rx).await;
+        disconnect_session(&writer_inner, peer_id, id).await;
+    });
     // The reader starts only once its session is in the map, so a read that ends at once
     // cannot remove an entry that does not exist yet and leave a dead session installed.
     let (installed_tx, installed_rx) = oneshot::channel::<()>();
@@ -141,6 +149,7 @@ pub(super) async fn install_and_spawn_loops<R, W>(
         },
     );
     let _ = installed_tx.send(());
+    let _ = writer_ready.send(());
     if let Some(old) = replaced {
         old.end();
     }
@@ -150,7 +159,7 @@ pub(super) async fn install_and_spawn_loops<R, W>(
     }
 }
 
-/// A read loop ending on its own: remove this peer's entry only if it is still THIS session.
+/// Either I/O loop ending: remove this peer's entry only if it is still THIS session.
 /// A newer session for the same peer (a redial) is not this reader's to end.
 async fn disconnect_session(inner: &Arc<Inner>, peer_id: PeerId, id: u64) {
     let removed = {
@@ -161,9 +170,9 @@ async fn disconnect_session(inner: &Arc<Inner>, peer_id: PeerId, id: u64) {
         }
     };
     if let Some(session) = removed {
-        // The reader is this very task and is ending anyway; the writer may be blocked on
-        // a peer that stopped reading, so it is aborted rather than left holding its half.
-        session.writer.abort();
+        // Both split halves must end. Aborting this task takes effect at its
+        // next suspension; notification below is synchronous and remains visible.
+        session.end();
         notify_disconnect(inner, peer_id);
     }
 }
@@ -246,8 +255,8 @@ async fn read_loop<R>(
 /// The payload is pre-serialized and size-checked by
 /// `LanTcpAdapter::send` before it lands in the channel — by the
 /// time it reaches this loop the bytes are known-valid, so the
-/// only failure mode is a dead socket (which terminates the loop).
-/// No silent drops.
+/// write failures terminate the loop. Caller cancellation discards queued
+/// work, or closes the stream if writing may already have started.
 ///
 /// The `flushed` signal is fired ONLY after a successful `flush()`, so a
 /// caller awaiting it knows the bytes are in the kernel send buffer and
@@ -259,7 +268,14 @@ async fn write_loop<W>(mut write_half: W, mut outbound_rx: mpsc::Receiver<Outbou
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    while let Some(Outbound { payload, flushed }) = outbound_rx.recv().await {
+    while let Some(Outbound {
+        payload,
+        mut flushed,
+    }) = outbound_rx.recv().await
+    {
+        if flushed.is_closed() {
+            continue;
+        }
         // Defense-in-depth assertion: the sender already enforced
         // this, but if a future regression bypasses pre-validation
         // we'd rather fail loudly here than silently truncate.
@@ -270,17 +286,98 @@ where
             MAX_FRAME_BYTES
         );
         let len = (payload.len() as u32).to_be_bytes();
-        if write_half.write_all(&len).await.is_err() {
+        let written = tokio::select! {
+            biased;
+            // Cancellation may interrupt a partial frame. End this stream;
+            // never continue with another frame on a corrupted boundary.
+            _ = flushed.closed() => return,
+            result = async {
+                write_half.write_all(&len).await?;
+                write_half.write_all(&payload).await?;
+                write_half.flush().await
+            } => result,
+        };
+        if written.is_err() {
             return;
         }
-        if write_half.write_all(&payload).await.is_err() {
-            return;
-        }
-        if write_half.flush().await.is_err() {
-            return;
-        }
-        // Flushed to the wire — release the sender. A dropped receiver
-        // (caller no longer waiting) is fine: delivery still happened.
+        // Completion means bytes reached the kernel, not consumer execution.
         let _ = flushed.send(());
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn cancelled_queue_item_emits_nothing_and_next_item_survives() {
+        let (writer, mut reader) = tokio::io::duplex(64);
+        let (tx, rx) = mpsc::channel(2);
+        let (cancelled, wait) = tokio::sync::oneshot::channel();
+        drop(wait);
+        assert!(tx
+            .send(Outbound {
+                payload: vec![9; 10],
+                flushed: cancelled,
+            })
+            .await
+            .is_ok());
+        let (flushed, done) = tokio::sync::oneshot::channel();
+        assert!(tx
+            .send(Outbound {
+                payload: vec![7],
+                flushed,
+            })
+            .await
+            .is_ok());
+        drop(tx);
+        let task = tokio::spawn(write_loop(writer, rx));
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        task.await.unwrap();
+        done.await.unwrap();
+        assert_eq!(bytes, [0, 0, 0, 1, 7]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_blocked_write_closes_partial_stream() {
+        let (writer, mut reader) = tokio::io::duplex(1);
+        let (tx, rx) = mpsc::channel(1);
+        let (flushed, wait) = tokio::sync::oneshot::channel();
+        assert!(tx
+            .send(Outbound {
+                payload: vec![7; 64],
+                flushed,
+            })
+            .await
+            .is_ok());
+        let task = tokio::spawn(write_loop(writer, rx));
+        let mut byte = [0];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_exact(&mut byte),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(wait);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut remainder = Vec::new();
+        reader.read_to_end(&mut remainder).await.unwrap();
+        assert!(
+            remainder.len() < 67,
+            "cancelled frame must not finish writing"
+        );
+        assert!(tx.is_closed());
     }
 }

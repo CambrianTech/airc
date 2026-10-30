@@ -182,9 +182,11 @@ impl BackfillRequest {
     /// Recover a request from a received event, or `None` when the event is not
     /// a backfill ask. Total over arbitrary input: a malformed body from a peer
     /// is a non-request, never a panic.
-    pub fn from_event(event: &TranscriptEvent) -> Option<Self> {
-        event.headers.get(HEADER_AIRC_BACKFILL)?;
-        let Some(Body::Json(value)) = event.body.as_ref() else {
+    fn decode(headers: &Headers, body: &Body) -> Option<Self> {
+        if headers.get(HEADER_AIRC_BACKFILL)?.as_str() != "request" {
+            return None;
+        }
+        let Body::Json(value) = body else {
             return None;
         };
         Self::deserialize(value).ok()
@@ -296,6 +298,11 @@ impl Airc {
         request: BackfillRequest,
         deadline: Duration,
     ) -> Result<BackfillResponse, AircError> {
+        if room.channel != request.channel {
+            return Err(AircError::Route(
+                "backfill channel differs from validated room".into(),
+            ));
+        }
         let mut headers = exchange_headers();
         headers.insert(HEADER_AIRC_BACKFILL.into(), "request".into());
         let body = Body::Json(
@@ -303,15 +310,15 @@ impl Airc {
                 .map_err(|e| AircError::Crypto(format!("backfill request encode: {e}")))?,
         );
         let pending = self
-            .request_in_resolved_room(room, MentionTarget::Peer(peer), headers, body, deadline)
+            .request(MentionTarget::Peer(peer), headers, body, deadline)
             .await?;
         let reply = self.await_reply(pending).await?;
-        let Some(Body::Json(value)) = reply.body else {
+        let Body::Json(value) = reply.body() else {
             return Err(AircError::Crypto(
                 "backfill reply carried no JSON body".to_string(),
             ));
         };
-        decode_page(value, &request)
+        decode_page(value.clone(), &request)
     }
 
     /// Answer a backfill request from the daemon owner's durable transcript.
@@ -322,33 +329,25 @@ impl Airc {
     /// a failed read exhausted history.
     pub async fn serve_backfill(
         &self,
-        request_event: &TranscriptEvent,
+        request_event: &crate::VerifiedAddressed,
     ) -> Result<usize, AircError> {
-        let Some(request) = BackfillRequest::from_event(request_event) else {
-            return Ok(0);
-        };
-        let Some((reply_to, correlation_id)) = crate::command_bus::reply_addressing(request_event)
-        else {
-            return Ok(0);
-        };
+        if request_event.kind() != crate::AddressedKind::Command
+            || request_event.to() != self.peer_id()
+        {
+            return Err(AircError::Transport(
+                "backfill requires a verified request to this identity".into(),
+            ));
+        }
+        let request = BackfillRequest::decode(request_event.headers(), request_event.body())
+            .ok_or_else(|| AircError::Transport("invalid addressed backfill request".into()))?;
 
         let response = self.backfill_response(&request).await;
         let value = match &response {
             Ok(response) => serde_json::to_value(response)?,
             Err(error) => serde_json::json!({"error": error.to_string()}),
         };
-        self.reply_in(
-            request_event.room_id,
-            request_event
-                .headers
-                .get(airc_protocol::HEADER_AIRC_CHANNEL_NAME)
-                .map(String::as_str),
-            reply_to,
-            correlation_id,
-            exchange_headers(),
-            Body::Json(value),
-        )
-        .await?;
+        self.reply(request_event, exchange_headers(), Body::Json(value))
+            .await?;
         let response = response?;
         tracing::info!(
             target: "airc::backfill",
@@ -558,24 +557,6 @@ mod tests {
     use super::*;
     use airc_core::EventId;
 
-    fn request_event(headers: Headers, body: Option<Body>) -> TranscriptEvent {
-        TranscriptEvent {
-            event_id: EventId::new(),
-            room_id: RoomId::from_uuid(uuid::Uuid::from_u128(7)),
-            peer_id: PeerId::from_uuid(uuid::Uuid::from_u128(8)),
-            client_id: airc_core::ClientId::new(),
-            kind: airc_core::TranscriptKind::Message,
-            occurred_at_ms: 1_700_000_000_000,
-            lamport: 1,
-            target: MentionTarget::All,
-            headers,
-            body,
-            attachment: None,
-            receipt: None,
-            metadata: serde_json::Value::Null,
-        }
-    }
-
     fn a_request() -> BackfillRequest {
         BackfillRequest {
             channel: RoomId::from_uuid(uuid::Uuid::from_u128(0xB4CF111)),
@@ -596,37 +577,21 @@ mod tests {
     // parser that accepted junk would turn any garbage frame into a transcript
     // disclosure. Both the header AND a well-formed body are required.
     #[test]
-    fn only_a_well_formed_backfill_frame_parses_as_one() {
+    fn only_a_well_formed_backfill_request_parses() {
         let mut headers = Headers::new();
         headers.insert(HEADER_AIRC_BACKFILL.into(), "request".into());
         let good = Body::Json(serde_json::to_value(a_request()).unwrap());
-
-        assert!(
-            BackfillRequest::from_event(&request_event(headers.clone(), Some(good.clone())))
-                .is_some()
-        );
-        assert!(
-            BackfillRequest::from_event(&request_event(Headers::new(), Some(good))).is_none(),
-            "no header = not a backfill ask, even with a valid body"
-        );
-        assert!(
-            BackfillRequest::from_event(&request_event(
-                headers.clone(),
-                Some(Body::text("not json"))
-            ))
-            .is_none(),
-            "header without a JSON body must not parse"
-        );
-        assert!(
-            BackfillRequest::from_event(&request_event(
-                headers,
-                Some(Body::Json(serde_json::json!({"nonsense": true})))
-            ))
-            .is_none(),
-            "header with the WRONG json must not parse"
-        );
+        assert!(BackfillRequest::decode(&headers, &good).is_some());
+        assert!(BackfillRequest::decode(&Headers::new(), &good).is_none());
+        assert!(BackfillRequest::decode(&headers, &Body::text("not json")).is_none());
+        assert!(BackfillRequest::decode(
+            &headers,
+            &Body::Json(serde_json::json!({"nonsense": true}))
+        )
+        .is_none());
+        headers.insert(HEADER_AIRC_BACKFILL.into(), "response".into());
+        assert!(BackfillRequest::decode(&headers, &good).is_none());
     }
-
     // what this catches: the round-trip that carries the whole feature. If
     // `since` stops surviving encode/decode, backfill silently degrades to
     // "newest page" — it would still return events, still look like it worked,

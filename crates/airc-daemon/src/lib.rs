@@ -32,6 +32,9 @@
 
 #![deny(unsafe_code)]
 
+mod addressed_connection;
+pub use addressed_connection::AddressedAdmissionError;
+pub mod addressed_switch;
 pub mod auto_update;
 #[cfg(unix)]
 mod file_capacity;
