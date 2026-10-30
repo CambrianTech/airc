@@ -65,6 +65,52 @@ pub struct SqliteEventStore {
     custody: crate::custody::WriteGate,
 }
 
+/// The one connection configuration for a store at `db_url` (`"sqlite::memory:"`, or
+/// `"sqlite://<path>?mode=rwc"`): every open and the migration recovery use it.
+fn connect_options(db_url: &str) -> ConnectOptions {
+    let mut opts = ConnectOptions::new(db_url.to_owned());
+    // Keep timeouts predictable for tests — long enough to absorb
+    // a slow CI box, short enough to fail fast on a bad URL.
+    opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
+        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .max_connections(1);
+    // Card 127816bd Phase 1.C — chat throughput.
+    //
+    // Default SQLite mode is journal=DELETE + synchronous=FULL,
+    // which forces a rollback-journal fsync on EVERY append. On
+    // macOS APFS that's ~3-15ms per insert; for chat publish (one
+    // append per `.say()`) that single fsync IS the per-message
+    // hot path — measured at 3.5 ms/op against the empty-WAL
+    // baseline in `airc-lib/tests/chat_throughput.rs`.
+    //
+    // WAL + `synchronous=NORMAL` trades that per-commit fsync
+    // for an fsync at WAL checkpoint (every ~1000 pages). Crash
+    // semantics: only the un-checkpointed tail can be lost. For
+    // airc this is correct: events are content-addressed
+    // (event_id is the digest), the wire path replays gaps from
+    // peers on reconnect, and the daemon's recover-from-cursor
+    // protocol already handles short tails. Same trade `bus_sink`
+    // makes for the same reasons.
+    //
+    // Typed builder, not literal SQL — `SqliteConnectOptions`
+    // is sea-orm's ORM-level connection-config surface.
+    opts.sqlx_logging(false).map_sqlx_sqlite_opts(|so| {
+        use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
+        // A SECOND OPENER WAITS, IT DOES NOT FAIL (2026-09-14). Several processes
+        // open one events.sqlite on a machine: the daemon, every attached scope, a
+        // test's LAN-gateway handle. Opening runs migrations (DDL = a write lock);
+        // sqlx's default busy timeout is 5 s, and on Windows CI with a dozen
+        // daemons booting at once the lock outlives it — "database is locked" at
+        // attach (airc #1419/#1420; the two-pools-on-one-file flake). WAL was
+        // already set; the missing piece was telling SQLite to WAIT as long as
+        // the pool itself waits — one bound, one clock.
+        so.journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(POOL_ACQUIRE_TIMEOUT)
+    });
+    opts
+}
+
 impl SqliteEventStore {
     /// Open an existing SQLite database (or create one) at `db_url`
     /// under `admission`, and run any pending migrations (one admitted write).
@@ -74,48 +120,8 @@ impl SqliteEventStore {
     /// file if missing.
     async fn open(db_url: &str, admission: crate::custody::Admission) -> Result<Self, StoreError> {
         let custody = crate::custody::WriteGate::new(admission)?;
-        let mut opts = ConnectOptions::new(db_url.to_owned());
-        // Keep timeouts predictable for tests — long enough to absorb
-        // a slow CI box, short enough to fail fast on a bad URL.
-        opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .max_connections(1);
-        // Card 127816bd Phase 1.C — chat throughput.
-        //
-        // Default SQLite mode is journal=DELETE + synchronous=FULL,
-        // which forces a rollback-journal fsync on EVERY append. On
-        // macOS APFS that's ~3-15ms per insert; for chat publish (one
-        // append per `.say()`) that single fsync IS the per-message
-        // hot path — measured at 3.5 ms/op against the empty-WAL
-        // baseline in `airc-lib/tests/chat_throughput.rs`.
-        //
-        // WAL + `synchronous=NORMAL` trades that per-commit fsync
-        // for an fsync at WAL checkpoint (every ~1000 pages). Crash
-        // semantics: only the un-checkpointed tail can be lost. For
-        // airc this is correct: events are content-addressed
-        // (event_id is the digest), the wire path replays gaps from
-        // peers on reconnect, and the daemon's recover-from-cursor
-        // protocol already handles short tails. Same trade `bus_sink`
-        // makes for the same reasons.
-        //
-        // Typed builder, not literal SQL — `SqliteConnectOptions`
-        // is sea-orm's ORM-level connection-config surface.
-        opts.sqlx_logging(false).map_sqlx_sqlite_opts(|so| {
-            use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
-            // A SECOND OPENER WAITS, IT DOES NOT FAIL (2026-09-14). Several processes
-            // open one events.sqlite on a machine: the daemon, every attached scope, a
-            // test's LAN-gateway handle. Opening runs migrations (DDL = a write lock);
-            // sqlx's default busy timeout is 5 s, and on Windows CI with a dozen
-            // daemons booting at once the lock outlives it — "database is locked" at
-            // attach (airc #1419/#1420; the two-pools-on-one-file flake). WAL was
-            // already set; the missing piece was telling SQLite to WAIT as long as
-            // the pool itself waits — one bound, one clock.
-            so.journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
-        });
         let write = custody.admit()?;
-        let db = Database::connect(opts).await?;
+        let db = Database::connect(connect_options(db_url)).await?;
         // Migrate forward atomically, derive what rows owe, and refuse a DB
         // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db).await?;
@@ -137,6 +143,20 @@ impl SqliteEventStore {
         }
         let admission = crate::custody::resolve(path)?;
         Self::open(&sqlite_file_url(path), admission).await
+    }
+
+    /// Retire `version` (a migration this binary does not have, applied by a branch or
+    /// unpublished build) from the store at `path`, then migrate it forward and open it.
+    /// The recovery for a store refused [`StoreError::AheadOfBinary`] whose version no
+    /// published airc has (`airc store retire-migration`).
+    pub async fn retire_migration_at(path: &Path, version: &str) -> Result<Self, StoreError> {
+        let custody = crate::custody::WriteGate::new(crate::custody::resolve(path)?)?;
+        let write = custody.admit()?;
+        let db = Database::connect(connect_options(&sqlite_file_url(path))).await?;
+        crate::migration::retire(&db, version).await?;
+        crate::migration::apply_migrations(&db).await?;
+        drop(write);
+        Ok(Self { db, custody })
     }
 
     /// Open an ephemeral in-memory store. Convenience for tests.

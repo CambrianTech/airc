@@ -85,6 +85,8 @@ mod sos_commands;
 mod staleness;
 mod state_cli;
 mod state_commands;
+mod store_cli;
+mod store_commands;
 #[cfg(test)]
 mod test_env;
 mod transport_cli;
@@ -712,6 +714,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Doctor { fix, health } => doctor::run_doctor(&home, fix, health).await,
+
+        Command::Store(args) => store_commands::run(&home, args).await,
 
         Command::Gh(args) => match args.action {
             GhAction::Run { gh_args } => gh_commands::run_gh(gh_args),

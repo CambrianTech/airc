@@ -167,6 +167,8 @@ impl From<StoreError> for PeersStoreError {
             | StoreError::LockPoisoned
             | StoreError::Migration(_)
             | StoreError::AheadOfBinary { .. }
+            | StoreError::MigrationKnown { .. }
+            | StoreError::MigrationNotApplied { .. }
             | StoreError::NotAdmitted(_)
             | StoreError::DuplicateEventId(_)
             | StoreError::UnknownTranscriptKind(_)

@@ -114,13 +114,41 @@ pub(crate) async fn refuse_if_ahead(db: &impl ConnectionTrait) -> Result<(), Sto
     })
 }
 
+/// Retire `version`, a migration this binary does not have, from the store's version
+/// table, so the store opens and migrates forward under this binary. For a store a
+/// branch or unpublished build migrated (a version no published airc will ever know):
+/// the operator names the exact version; nothing is inferred from dates or names.
+/// The retired migration's tables stay; no airc reads them.
+pub(crate) async fn retire(db: &impl ConnectionTrait, version: &str) -> Result<(), StoreError> {
+    if known_versions().contains(version) {
+        return Err(StoreError::MigrationKnown {
+            version: version.to_owned(),
+        });
+    }
+    Migrator::install(db).await?;
+    let retired = seaql_migrations::Entity::delete_by_id(version.to_owned())
+        .exec(db)
+        .await?;
+    if retired.rows_affected == 0 {
+        return Err(StoreError::MigrationNotApplied {
+            version: version.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The migrations this binary has, by version.
+fn known_versions() -> std::collections::HashSet<String> {
+    Migrator::migrations()
+        .iter()
+        .map(|migration| migration.name().to_owned())
+        .collect()
+}
+
 /// Versions recorded as applied that this binary has no migration for.
 async fn unknown_applied(db: &impl ConnectionTrait) -> Result<Vec<String>, StoreError> {
     Migrator::install(db).await?;
-    let known: std::collections::HashSet<String> = Migrator::migrations()
-        .iter()
-        .map(|migration| migration.name().to_owned())
-        .collect();
+    let known = known_versions();
     Ok(seaql_migrations::Entity::find()
         .all(db)
         .await?
@@ -171,6 +199,37 @@ mod tests {
             }
             other => panic!("expected AheadOfBinary, got {other:?}"),
         }
+    }
+
+    // what this catches (the M5, 2026-10-30): a store a branch build migrated
+    // (m20260814_000021_create_room_directory, never on canary) locked every agent out:
+    // canary refused it AheadOfBinary and no published airc knows the version. Retiring
+    // the named version lets it open and migrate forward; a known or unapplied version is
+    // refused, typed.
+    #[tokio::test]
+    async fn a_branch_migration_is_retired_by_name_and_the_store_moves_forward() {
+        let db = memory_db().await;
+        apply_migrations(&db).await.expect("initial migrate");
+        record(&db, "m20260814_000021_create_room_directory").await;
+        assert!(matches!(
+            apply_migrations(&db).await,
+            Err(StoreError::AheadOfBinary { .. })
+        ));
+        retire(&db, "m20260814_000021_create_room_directory")
+            .await
+            .expect("retire the branch migration");
+        apply_migrations(&db)
+            .await
+            .expect("the store opens forward");
+        assert!(matches!(
+            retire(&db, "m20260814_000021_create_room_directory").await,
+            Err(StoreError::MigrationNotApplied { .. })
+        ));
+        let own = Migrator::migrations()[0].name().to_owned();
+        assert!(matches!(
+            retire(&db, &own).await,
+            Err(StoreError::MigrationKnown { .. })
+        ));
     }
 
     // what this catches (Codex on #1618): a database a NEWER binary migrated is refused

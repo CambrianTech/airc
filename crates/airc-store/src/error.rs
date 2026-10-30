@@ -33,10 +33,21 @@ pub enum StoreError {
     #[error(
         "this database was migrated by a newer airc (unknown migrations: {}); \
          refusing to open it for writing, since this binary would store rows without \
-         what the newer one derives. Update airc on this machine (`airc update`).",
+         what the newer one derives. Update airc on this machine (`airc update`); a \
+         version no published airc has (a branch build migrated this store) is retired \
+         with `airc store retire-migration <version>`.",
         versions.join(", ")
     )]
     AheadOfBinary { versions: Vec<String> },
+
+    /// `airc store retire-migration` named a migration this binary has: retiring it
+    /// would make this binary re-run it over its own tables.
+    #[error("migration {version} belongs to this airc; only a migration it does not know can be retired")]
+    MigrationKnown { version: String },
+
+    /// `airc store retire-migration` named a version the store never applied.
+    #[error("migration {version} is not applied in this store; nothing to retire")]
+    MigrationNotApplied { version: String },
 
     /// Tried to append an event whose `event_id` already exists.
     /// EventId is a UUIDv4 so honest senders won't collide; this
