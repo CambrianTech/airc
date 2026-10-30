@@ -95,7 +95,7 @@ async fn handle_three_consumer_requests(bob: Airc, ready: tokio::sync::oneshot::
     let _ = ready.send(());
     let mut handled = 0usize;
     while handled < 3 {
-        let Some(event) = stream.next().await else {
+        let Ok(event) = stream.next().await else {
             continue;
         };
         if event.from() == bob.peer_id() {

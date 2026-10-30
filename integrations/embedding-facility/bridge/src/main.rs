@@ -152,7 +152,7 @@ async fn run_bridge(
                 }
             }
             command = commands.next() => {
-                let Some(event) = command else {
+                let Ok(event) = command else {
                     return Err("addressed command inbox closed".into());
                 };
                 if is_embedding_request(&event, me) {

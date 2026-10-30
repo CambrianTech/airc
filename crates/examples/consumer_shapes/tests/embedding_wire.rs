@@ -202,7 +202,7 @@ async fn facility_answers_one_embedding(facility: Airc, ready: tokio::sync::ones
     let mut stream = facility.addressed_inbox();
     let _ = ready.send(());
     loop {
-        let Some(event) = stream.next().await else {
+        let Ok(event) = stream.next().await else {
             panic!("addressed inbox closed before request");
         };
         if event.kind() != AddressedKind::Command || event.to() != facility.peer_id() {

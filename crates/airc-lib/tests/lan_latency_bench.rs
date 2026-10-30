@@ -65,7 +65,8 @@ fn lan_request_reply_latency() {
         let mut inbox = bob.addressed_inbox();
         let bob_handle = bob.clone();
         tokio::spawn(async move {
-            while let Some(event) = inbox.next().await {
+            loop {
+                let event = inbox.next().await.expect("echo inbox failed");
                 assert_eq!(event.kind(), airc_lib::AddressedKind::Command);
                 let mut headers = Headers::new();
                 headers.insert(HEADER_FORGE_BODY_HINT.into(), "lat.pong".into());

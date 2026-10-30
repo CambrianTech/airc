@@ -217,7 +217,7 @@ fn spawn_reply_handler(
         let event = inbox
             .next()
             .await
-            .ok_or("addressed inbox closed before request")?;
+            .map_err(|error| format!("addressed inbox failed before request: {error:?}"))?;
         if event.kind() != airc_lib::AddressedKind::Command {
             return Err("route proof received a non-request".into());
         }

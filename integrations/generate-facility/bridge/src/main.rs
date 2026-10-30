@@ -161,7 +161,7 @@ async fn run_bridge(
                 }
             }
             item = stream.next() => {
-                let Some(event) = item else {
+                let Ok(event) = item else {
                     return Err("addressed command inbox closed".into());
                 };
                 if is_turn_request(&event, me) {

@@ -178,7 +178,9 @@ impl Airc {
                 .map_err(|_| AircError::CommandDeadline {
                     correlation_id: pending.correlation_id,
                 })?
-                .ok_or_else(|| AircError::Transport("addressed reply inbox closed".into()))?;
+                .map_err(|error| {
+                    AircError::Transport(format!("addressed reply inbox: {error:?}"))
+                })?;
             if matches_reply(
                 event.kind(),
                 (event.from(), event.to(), event.correlation()),

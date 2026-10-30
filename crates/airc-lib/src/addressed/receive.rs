@@ -101,6 +101,20 @@ impl Airc {
     /// consumer's dedup on (from, correlation).
     fn deliver_opened(&self, verified: VerifiedAddressed) {
         let from = verified.from();
+        if verified.kind() == super::AddressedKind::Command
+            && verified
+                .headers()
+                .get(crate::backfill::HEADER_AIRC_BACKFILL)
+                .is_some_and(|value| value == "request")
+        {
+            let owner = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = owner.serve_backfill(&verified).await {
+                    refuse(from, &format!("addressed backfill failed: {error}"));
+                }
+            });
+            return;
+        }
         // An opened payload with no consumer is lost: loud, never a quiet
         // delivery.
         if self

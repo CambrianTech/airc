@@ -113,7 +113,7 @@ async fn handle_one_turn_request(persona: Airc, ready: tokio::sync::oneshot::Sen
     let mut stream = persona.addressed_inbox();
     let _ = ready.send(());
     loop {
-        let Some(event) = stream.next().await else {
+        let Ok(event) = stream.next().await else {
             panic!("addressed inbox closed before request");
         };
         if event.kind() != AddressedKind::Command || event.to() != persona.peer_id() {

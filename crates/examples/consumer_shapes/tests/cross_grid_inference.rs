@@ -180,7 +180,7 @@ async fn stub_persona_answers_one_turn(server: Airc, ready: tokio::sync::oneshot
     let mut stream = server.addressed_inbox();
     let _ = ready.send(());
     loop {
-        let Some(event) = stream.next().await else {
+        let Ok(event) = stream.next().await else {
             panic!("addressed inbox closed before request");
         };
         if event.kind() != AddressedKind::Command || event.to() != server.peer_id() {
