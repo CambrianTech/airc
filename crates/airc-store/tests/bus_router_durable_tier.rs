@@ -201,14 +201,17 @@ fn durable(channel: RoomId, marker: u128, text: &str) -> Envelope {
 /// (a hang) rather than passing trivially.
 async fn take_n<S>(mut stream: S, n: usize) -> Vec<Arc<Envelope>>
 where
-    S: futures::Stream<Item = Arc<Envelope>> + Unpin,
+    S: futures::Stream<Item = Result<Arc<Envelope>, airc_bus::BusError>> + Unpin,
 {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("timed out waiting for an event — a gap/miss would hang here");
-        out.push(next.expect("stream ended early — missing events"));
+        out.push(
+            next.expect("stream ended early — missing events")
+                .expect("durable replay failed"),
+        );
     }
     out
 }
