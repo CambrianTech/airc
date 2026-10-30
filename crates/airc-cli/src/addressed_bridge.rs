@@ -142,3 +142,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "addressed_bridge_tests.rs"]
+mod transport_tests;
