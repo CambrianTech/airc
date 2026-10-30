@@ -543,7 +543,7 @@ where
     // filter, applied ROUTER-SIDE — the daemon never fans out an event a
     // consumer would discard (Hermes → Command/CommandResult; Continuum →
     // scoped `forge.*` headers; a media tap → StreamChunk only).
-    let mut filter = Filter::channel(channel).with_selection(parts.selection);
+    let mut filter = Filter::channel(channel).with_selection(parts.selection.clone());
     if let Some(kinds) = parts.kinds {
         match crate::kind_map::bus_kinds(kinds) {
             Ok(kinds) => filter = filter.with_kinds(kinds),
@@ -884,7 +884,7 @@ where
         .map(|d| d.into_iter().map(crate::kind_map::bus_delivery).collect());
     let headers = parts.headers;
     let filter_for = |room: airc_core::RoomId| {
-        let mut filter = Filter::channel(room).with_selection(parts.selection);
+        let mut filter = Filter::channel(room).with_selection(parts.selection.clone());
         if let Some(kinds) = kinds.clone() {
             filter = filter.with_kinds(kinds);
         }

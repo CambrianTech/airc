@@ -617,7 +617,7 @@ async fn handle_scan_inbox(
             after,
             through,
             airc_core::HistoryMatch {
-                selection: request.selection,
+                selection: request.selection.clone(),
                 kinds: &request.kinds,
                 self_echo: request.self_echo,
                 headers: &request.headers,
@@ -657,7 +657,7 @@ async fn handle_count_inbox(
             after,
             through,
             airc_core::HistoryMatch {
-                selection: request.selection,
+                selection: request.selection.clone(),
                 kinds: &request.kinds,
                 self_echo: request.self_echo,
                 headers: &request.headers,

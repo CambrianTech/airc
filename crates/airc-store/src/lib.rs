@@ -37,6 +37,7 @@
 // than scattering `#[allow(elided_lifetimes_in_paths)]` per impl.
 
 pub mod account_registry;
+pub mod audit;
 pub mod beacon;
 pub mod bus_epoch_store;
 pub mod bus_sink;

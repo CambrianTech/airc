@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 airc-core = { path = "../airc-core" }
+airc-bus = { path = "../airc-bus" }
 airc-protocol = { path = "../airc-protocol" }
 
 ciborium = "0.2"

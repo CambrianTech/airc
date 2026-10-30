@@ -332,6 +332,11 @@ impl<'buf> WireEnvelope<'buf> {
     }
 
     /// Delivery / retention class (§2, §3.3, §3.4).
+    pub fn class(&self) -> Result<EventClass, WireError> {
+        class_from_fb(self.inner.class()?)
+    }
+
+    /// Delivery and retention policy, independent of semantic classification.
     pub fn delivery(&self) -> Result<DeliveryClass, WireError> {
         Ok(delivery_from_fb(self.inner.delivery()?))
     }

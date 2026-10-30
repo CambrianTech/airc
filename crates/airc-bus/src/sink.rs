@@ -298,7 +298,7 @@ impl DurableSink for InMemoryDurableSink {
                 e.delivery.is_durable()
                     && e.cursor().is_after(&after)
                     && !e.cursor().is_after(&through)
-                    && e.matches_history(rule)
+                    && e.matches_history(&rule)
                     && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
             })
             .fold(airc_core::HistoryCount::default(), |count, e| {
@@ -326,7 +326,7 @@ impl DurableSink for InMemoryDurableSink {
                     e.delivery.is_durable()
                         && e.cursor().is_after(&after)
                         && !e.cursor().is_after(&through)
-                        && e.matches_history(rule)
+                        && e.matches_history(&rule)
                 }),
             |e| (e.seq, e.event_id.0),
             limit,

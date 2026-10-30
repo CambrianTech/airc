@@ -39,6 +39,7 @@ pub mod account_registry_fs;
 pub mod adapter;
 pub mod addressed;
 mod agent_feed;
+pub use agent_feed::agent_event_selection;
 pub mod agent_heartbeat;
 pub mod airc;
 pub mod backfill;

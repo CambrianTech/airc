@@ -421,3 +421,18 @@ fn attach_selection_roundtrips_and_reaches_serving_parts() {
         airc_core::EventSelection::Correspondence
     );
 }
+
+#[test]
+fn attach_union_selection_survives_ipc_and_owned_parts() {
+    let selection = airc_core::EventSelection::AnyOf(vec![
+        airc_core::EventSelection::Correspondence,
+        airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
+            airc_core::ActivityKind::WorkState,
+        )),
+    ]);
+    let request = AttachRequest::live(airc_core::RoomId::new()).with_selection(selection.clone());
+    let decoded: AttachRequest =
+        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    assert_eq!(decoded.selection(), selection);
+    assert_eq!(decoded.into_parts().selection, selection);
+}

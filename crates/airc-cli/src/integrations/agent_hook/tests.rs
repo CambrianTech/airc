@@ -136,6 +136,7 @@ async fn append(airc: &Airc, room: RoomId, n: u64, body: Body, self_event: bool,
     }
     if excluded {
         e.kind = TranscriptKind::Presence;
+        e.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Presence);
     }
     airc.append_event(e).await.unwrap();
 }
@@ -151,6 +152,7 @@ async fn lease_renewal_does_not_spend_delivery_budget_or_reset_the_cursor() {
         .unwrap();
     let mut renewal = event(Body::Json(json!({"kind":"claim_heartbeat"})));
     renewal.room_id = room;
+    renewal.class = airc_core::EventClass::Activity(airc_core::ActivityKind::Presence);
     renewal.lamport = 1;
     renewal.headers.insert(
         airc_lib::HEADER_FORGE_WORK_EVENT_KIND.into(),
@@ -163,7 +165,7 @@ async fn lease_renewal_does_not_spend_delivery_budget_or_reset_the_cursor() {
         .await
         .unwrap();
     let end = delivery_end(&turn, false, |_| true);
-    assert_eq!(end, 2);
+    assert_eq!(end, 1, "presence is excluded before the delivery budget");
     assert_eq!(delivery_end(&turn, true, |_| true), 1);
     let context = delivery_context(&turn, end, false, None, None, "codex-hook", |_| true).unwrap();
     assert!(context.contains("urgent review"));
@@ -361,7 +363,7 @@ async fn append_text(airc: &Airc, room: RoomId, n: u64, text: &str, target: Ment
 // the room. A pre-attach "@<my name> ..." with target All is shown whole; "@Fable
 // @Codex" is shown to each; a name mid-sentence is ambient and only counted.
 #[tokio::test]
-async fn leading_at_names_address_pre_attach_history_and_mid_sentence_names_do_not() {
+async fn names_in_body_do_not_address_pre_attach_history() {
     let (_dir, airc, room) = fixture().await;
     let mine = format!("@{} please rebase", airc.agent_name().to_uppercase());
     append_text(&airc, room, 1, &mine, MentionTarget::All).await;
@@ -381,29 +383,29 @@ async fn leading_at_names_address_pre_attach_history_and_mid_sentence_names_do_n
     let summary = summarize(&mut turn, &me, |_| true).await.unwrap();
     assert_eq!(
         lamports(&summary.addressed),
-        [1],
-        "only my leading name addresses me"
+        [],
+        "names in the body are not routing metadata"
     );
     assert_eq!(
         lamports(&summary.recent),
-        [2, 3],
+        [1, 2, 3],
         "the rest is room history, shown whole"
     );
     let text = super::render::history_section(&summary).unwrap();
     assert!(text.contains("please rebase"), "{text}");
     assert!(text.contains("AIRC: 3 earlier events"), "{text}");
-    for name in ["Fable", "codex"] {
-        let other = airc_lib::Addressee::new(PeerId::new(), [name.to_string()]);
+    for _ in 0..2 {
+        let other = airc_lib::Addressee::new(PeerId::new());
         let summary = summarize(&mut turn, &other, |_| true).await.unwrap();
         assert_eq!(
             lamports(&summary.addressed),
-            [2],
-            "{name}: both leading names address"
+            [],
+            "body names never direct delivery"
         );
         assert_eq!(
             lamports(&summary.recent),
-            [1, 3],
-            "{name}: mid-sentence is not addressed"
+            [1, 2, 3],
+            "all broadcast text remains room history"
         );
     }
 }

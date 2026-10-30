@@ -102,7 +102,7 @@ async fn addressee_scan_selects_candidates_by_indexed_columns() {
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
     let page = store
-        .matching_history(&origin, &through, &[room], rule, 10, true)
+        .matching_history(&origin, &through, &[room], rule.clone(), 10, true)
         .await
         .unwrap();
     assert_eq!(page, [typed]);
@@ -140,9 +140,11 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         headers: &airc_core::HeaderFilter::Any,
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
-    let branches = [
-        crate::event_query::matching(&origin, &through, &[room], rule, 10, true).expect("query"),
-    ];
+    let branches =
+        [
+            crate::event_query::matching(&origin, &through, &[room], rule.clone(), 10, true)
+                .expect("query"),
+        ];
     let indexes = ["idx_events_room_addressed_peer"];
     assert_eq!(branches.len(), indexes.len(), "one select per branch");
     for (query, index) in branches.into_iter().zip(indexes) {
@@ -162,7 +164,7 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
     }
     let started = std::time::Instant::now();
     let page = store
-        .matching_history(&origin, &through, &[room], rule, 10, true)
+        .matching_history(&origin, &through, &[room], rule.clone(), 10, true)
         .await
         .unwrap();
     let elapsed = started.elapsed();
@@ -704,6 +706,10 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
         activity.class = EventClass::Activity(ActivityKind::WorkReceipt);
         store.append(activity).await.expect("activity");
     }
+    let mut state = make_event(100, room, "work obligation");
+    state.class = EventClass::Activity(ActivityKind::WorkState);
+    state.kind = TranscriptKind::System;
+    store.append(state).await.expect("work state");
     let origin = TranscriptCursor {
         lamport: 0,
         event_id: EventId::from_u128(0),
@@ -721,13 +727,13 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
         addressed_to: None,
     };
     let page = store
-        .matching_history(&origin, &through, &[room], rule, 1, true)
+        .matching_history(&origin, &through, &[room], rule.clone(), 1, true)
         .await
         .expect("page");
     assert_eq!(page, [conversation]);
     assert_eq!(
         store
-            .count_history(&origin, &through, &[room], rule, None)
+            .count_history(&origin, &through, &[room], rule.clone(), None)
             .await
             .expect("count")
             .count,
@@ -737,7 +743,7 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
         kinds: &std::collections::BTreeSet::new(),
         self_echo: None,
         selection: EventSelection::Exact(EventClass::Activity(ActivityKind::WorkReceipt)),
-        ..rule
+        ..rule.clone()
     };
     assert_eq!(
         store
@@ -746,6 +752,43 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
             .expect("count")
             .count,
         98
+    );
+    let union = HistoryMatch {
+        selection: EventSelection::AnyOf(vec![
+            EventSelection::Correspondence,
+            EventSelection::AnyOf(vec![EventSelection::Exact(EventClass::Activity(
+                ActivityKind::WorkState,
+            ))]),
+        ]),
+        ..rule.clone()
+    };
+    let union_page = store
+        .matching_history(&origin, &through, &[room], union.clone(), 2, true)
+        .await
+        .expect("union");
+    assert_eq!(union_page.len(), 2);
+    assert!(union_page
+        .iter()
+        .all(|event| union.selection.matches(event.class)));
+    assert_eq!(
+        store
+            .count_history(&origin, &through, &[room], union, None)
+            .await
+            .expect("union count")
+            .count,
+        2
+    );
+    let empty = HistoryMatch {
+        selection: EventSelection::AnyOf(vec![]),
+        ..rule
+    };
+    assert_eq!(
+        store
+            .count_history(&origin, &through, &[room], empty, None)
+            .await
+            .expect("empty union")
+            .count,
+        0
     );
 }
 
@@ -818,13 +861,13 @@ async fn kind_and_self_echo_share_the_bounded_history_contract() {
         addressed_to: None,
     };
     let page = store
-        .matching_history(&origin, &through, &[room], rule, 1, true)
+        .matching_history(&origin, &through, &[room], rule.clone(), 1, true)
         .await
         .expect("page");
     assert_eq!(page, [remote]);
     assert_eq!(
         store
-            .count_history(&origin, &through, &[room], rule, None)
+            .count_history(&origin, &through, &[room], rule.clone(), None)
             .await
             .expect("count")
             .count,

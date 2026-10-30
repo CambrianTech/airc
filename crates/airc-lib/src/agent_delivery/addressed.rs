@@ -76,15 +76,17 @@ impl AgentDeliveryTurn {
             let limit = budget
                 .saturating_add(usize::from(range.top_exclusive))
                 .min(SCAN_CAP);
+            let kinds = std::collections::BTreeSet::new();
+            let rule = airc_core::HistoryMatch {
+                selection: airc_core::EventSelection::Correspondence,
+                headers: &airc_core::HeaderFilter::Any,
+                kinds: &kinds,
+                addressed_to: Some(me.filter()),
+                self_echo: None,
+            };
             let tail = self
                 .airc
-                .scan_agent_feed_in_channels(
-                    None,
-                    &range.top,
-                    limit,
-                    &self.channels,
-                    Some(me.filter()),
-                )
+                .scan_matching_channels(None, &range.top, limit, &self.channels, rule)
                 .await?;
             // Whether the range's start was reached is a fact about the candidate
             // scan (every candidate in the range is in hand):

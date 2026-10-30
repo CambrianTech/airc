@@ -577,16 +577,10 @@ pub(crate) fn bus_envelope_for_inbound(
         .as_ref()
         .map(airc_core::Body::to_payload)
         .unwrap_or_default();
-    let kind = match frame.kind {
-        FrameKind::Message => Kind::Message,
-        FrameKind::Event => Kind::Event,
-        FrameKind::Control => Kind::Control,
-        FrameKind::Command => Kind::Command,
-        FrameKind::CommandResult => Kind::CommandResult,
-        FrameKind::Addressed => {
-            return Err("an addressed frame never enters the bus".to_string());
-        }
-    };
+    if frame.kind != FrameKind::for_class(frame.envelope.class) {
+        return Err("frame kind conflicts with event class".into());
+    }
+    let kind = Kind::for_class(frame.envelope.class).map_err(|error| error.to_string())?;
     if frame.envelope.channel == airc_protocol::addressed::addressed_channel() {
         return Err("the addressed channel never enters the bus".to_string());
     }

@@ -360,7 +360,7 @@ impl Airc {
                 vec![channel],
                 None,
                 filter.headers_filter.clone(),
-                filter.selection,
+                filter.selection.clone(),
             )
             .await?
         } else {
@@ -415,7 +415,7 @@ impl Airc {
                         channels,
                         delivery,
                         filter.headers_filter.clone(),
-                        filter.selection,
+                        filter.selection.clone(),
                     )
                     .await?,
                 filter,
@@ -596,7 +596,7 @@ impl Airc {
             });
         };
         let rule = airc_core::HistoryMatch {
-            selection: filter.selection,
+            selection: filter.selection.clone(),
             headers: &filter.headers_filter,
             addressed_to: None,
             kinds: &filter.kinds,

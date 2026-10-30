@@ -213,6 +213,19 @@ impl SqliteDurableSink {
         })
     }
 
+    /// Retrieve original pre-classification records without migrations or
+    /// interpretation. Open with `open_read_only_path` to inspect a refused
+    /// store. Cursor is the last returned event ID; the requested limit is a
+    /// required nonzero bound. This never manufactures routable envelopes.
+    pub async fn audit_page(
+        &self,
+        table: crate::audit::AuditTable,
+        after: Option<uuid::Uuid>,
+        limit: std::num::NonZeroU32,
+    ) -> Result<Vec<crate::audit::AuditRecord>, crate::StoreError> {
+        crate::audit::page(&self.readers, table, after, limit).await
+    }
+
     /// Open an ephemeral in-memory durable tier. Convenience for tests.
     pub async fn in_memory() -> Result<Self, BusError> {
         Self::open("sqlite::memory:", crate::custody::Admission::Unmanaged).await
@@ -443,7 +456,7 @@ impl DurableSink for SqliteDurableSink {
             .filter(bus_event::Column::RoomId.eq(filter.channel.as_uuid()))
             .filter(
                 crate::class_query::selection::<bus_event::Entity>(
-                    filter.selection,
+                    &filter.selection,
                     &filter.headers,
                 )
                 .map_err(BusError::sink_source)?,

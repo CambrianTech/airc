@@ -78,7 +78,7 @@ impl Default for DeliverySelection {
     fn default() -> Self {
         Self {
             filter: EventFilter {
-                selection: airc_core::EventSelection::Correspondence,
+                selection: airc_lib::agent_event_selection(),
                 ..EventFilter::default()
             },
             include_self: false,
@@ -230,9 +230,11 @@ async fn compose(
         candidates: options.count.max(1),
         page: turn.budget,
     };
+    let mut correspondence = options.selection.filter.clone();
+    correspondence.selection = airc_core::EventSelection::Correspondence;
     let history = turn
         .history_summary(
-            options.selection.filter.clone(),
+            correspondence,
             options.selection.own_sends(&self_filter),
             |e| {
                 options.selection.filter.matches(e) && (options.raw || render::is_correspondence(e))

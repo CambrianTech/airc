@@ -7,9 +7,16 @@ use sea_orm::{sea_query::SimpleExpr, ColumnTrait};
 
 /// The common class/header predicate shared by live-filter replay and history.
 pub(crate) fn selection<T: EventTable>(
-    selection: EventSelection,
+    selection: &EventSelection,
     headers: &airc_core::HeaderFilter,
 ) -> Result<SimpleExpr, StoreError> {
+    if let EventSelection::AnyOf(selections) = selection {
+        let mut union = sea_orm::sea_query::Expr::value(false);
+        for child in selections {
+            union = union.or(self::selection::<T>(child, headers)?);
+        }
+        return Ok(union);
+    }
     let mut selected = T::CLASS.is_not_null().and(T::CLASS_FAMILY.is_not_null());
     if let Some(family) = selection.family() {
         selected = selected.and(T::CLASS_FAMILY.eq(family as i32));
@@ -21,7 +28,7 @@ pub(crate) fn selection<T: EventTable>(
 }
 
 pub(crate) fn matching<T: EventTable>(rule: HistoryMatch<'_>) -> Result<SimpleExpr, StoreError> {
-    let mut selected = selection::<T>(rule.selection, rule.headers)?;
+    let mut selected = selection::<T>(&rule.selection, rule.headers)?;
     if !rule.kinds.is_empty() {
         selected = selected.and(T::KIND.is_in(T::kinds(rule.kinds)));
     }

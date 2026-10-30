@@ -112,7 +112,7 @@ impl AgentDeliveryTurn {
         page: usize,
     ) -> Result<Vec<TranscriptEvent>, AircError> {
         let rule = airc_core::HistoryMatch {
-            selection: filter.selection,
+            selection: filter.selection.clone(),
             headers: &filter.headers_filter,
             addressed_to: None,
             kinds: &filter.kinds,

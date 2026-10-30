@@ -267,7 +267,7 @@ impl EventRouter {
                             e.delivery.is_durable()
                                 && e.cursor().is_after(&after)
                                 && !e.cursor().is_after(&through)
-                                && e.matches_history(rule)
+                                && e.matches_history(&rule)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -370,7 +370,7 @@ impl EventRouter {
         let durable = if durable_through.is_after(&after) {
             self.inner
                 .sink
-                .count_matching(channel, after, durable_through, rule, exclude)
+                .count_matching(channel, after, durable_through, rule.clone(), exclude)
                 .await?
         } else {
             airc_core::HistoryCount::default()
@@ -393,7 +393,7 @@ impl EventRouter {
                             e.delivery.is_durable()
                                 && e.cursor().is_after(&pending_after)
                                 && !e.cursor().is_after(&through)
-                                && e.matches_history(rule)
+                                && e.matches_history(&rule)
                                 && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
                         })
                         .fold(airc_core::HistoryCount::default(), |count, e| {
@@ -478,7 +478,7 @@ mod tests {
         );
         assert_eq!(
             router
-                .count_matching(room, after, through, routed, None)
+                .count_matching(room, after, through, routed.clone(), None)
                 .await
                 .unwrap(),
             expect(5)
@@ -523,7 +523,7 @@ mod tests {
         );
         assert_eq!(
             router
-                .count_matching(room, after, through, routed, None)
+                .count_matching(room, after, through, routed.clone(), None)
                 .await
                 .unwrap(),
             expect(5)

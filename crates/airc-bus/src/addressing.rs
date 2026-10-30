@@ -19,7 +19,7 @@ impl Envelope {
     }
 
     /// Whether this envelope matches a bounded history scan's predicate.
-    pub fn matches_history(&self, rule: airc_core::HistoryMatch<'_>) -> bool {
+    pub fn matches_history(&self, rule: &airc_core::HistoryMatch<'_>) -> bool {
         rule.matches_with(
             self.class,
             self.kind.transcript_kind(),

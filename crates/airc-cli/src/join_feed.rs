@@ -230,9 +230,10 @@ async fn print_delivery_turn(
                 && crate::event_render::render_feed_line(e).is_some()
         };
         // The feed renders no liveness beat, so the count routes them out by header.
-        let count_filter = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
-            key: airc_lib::agent_heartbeat::HEADER_HEARTBEAT_KIND.to_string(),
-        }));
+        let count_filter = airc_lib::EventFilter {
+            selection: airc_core::EventSelection::Correspondence,
+            ..airc_lib::EventFilter::default()
+        };
         // The feed's own self rule, the one print_event applies to live lines.
         turn.history_summary(count_filter, Some(self_filter), keep, &me, window)
             .await?

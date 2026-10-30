@@ -3,6 +3,17 @@ use crate::{Airc, AircError, EventFilter, EventScan, FilteredEventStream};
 use airc_core::{EventId, HeaderFilter, TranscriptCursor};
 use airc_ipc::{IpcCursor, COUNTER_BITS, COUNTER_MASK};
 
+/// Native agent subscriptions: speech and actionable work-state changes.
+/// Presence, work receipts and stream traffic do not enter this feed.
+pub fn agent_event_selection() -> airc_core::EventSelection {
+    airc_core::EventSelection::AnyOf(vec![
+        airc_core::EventSelection::Correspondence,
+        airc_core::EventSelection::Exact(airc_core::EventClass::Activity(
+            airc_core::ActivityKind::WorkState,
+        )),
+    ])
+}
+
 fn key(c: &TranscriptCursor) -> (u64, u128) {
     (c.lamport, c.event_id.0.as_u128())
 }
@@ -25,7 +36,7 @@ impl Airc {
     pub async fn subscribe_agent_feed(&self) -> Result<FilteredEventStream, AircError> {
         self.subscribe_subscribed_delivery(
             EventFilter {
-                selection: airc_core::EventSelection::Correspondence,
+                selection: agent_event_selection(),
                 ..EventFilter::default()
             },
             Some(vec![airc_ipc::IpcDelivery::Durable]),
@@ -63,7 +74,7 @@ impl Airc {
     ) -> Result<EventScan, AircError> {
         let kinds = std::collections::BTreeSet::new();
         let rule = airc_core::HistoryMatch {
-            selection: airc_core::EventSelection::Correspondence,
+            selection: agent_event_selection(),
             headers: &HeaderFilter::Any,
             addressed_to,
             kinds: &kinds,
@@ -106,7 +117,7 @@ impl Airc {
                         after: ipc(after),
                         through: ipc(through),
                         headers: rule.headers.clone(),
-                        selection: rule.selection,
+                        selection: rule.selection.clone(),
                         kinds: rule.kinds.clone(),
                         self_echo: rule.self_echo,
                         addressed_to: rule.addressed_to,
@@ -182,7 +193,7 @@ impl Airc {
         let predicate = filter.headers_filter;
         let kinds = filter.kinds;
         let rule = airc_core::HistoryMatch {
-            selection: filter.selection,
+            selection: filter.selection.clone(),
             headers: &predicate,
             addressed_to: None,
             kinds: &kinds,
@@ -200,7 +211,7 @@ impl Airc {
                         after: ipc(after),
                         through: ipc(through),
                         headers: predicate.clone(),
-                        selection: rule.selection,
+                        selection: rule.selection.clone(),
                         kinds: kinds.clone(),
                         addressed_to: None,
                         self_echo: rule.self_echo,

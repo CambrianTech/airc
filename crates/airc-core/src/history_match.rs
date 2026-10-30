@@ -7,7 +7,7 @@ use crate::{AddresseeFilter, Addressing, HeaderFilter, TranscriptEvent};
 static EMPTY_KINDS: std::collections::BTreeSet<crate::TranscriptKind> =
     std::collections::BTreeSet::new();
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HistoryMatch<'a> {
     pub kinds: &'a std::collections::BTreeSet<crate::TranscriptKind>,
     pub self_echo: Option<(crate::PeerId, crate::ClientId, crate::SelfFilter)>,

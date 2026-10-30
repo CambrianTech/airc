@@ -199,20 +199,16 @@ mod tests {
         assert_eq!(applied(&db).await, u64::from(BEFORE_DERIVED));
         drop(db);
         let db = connect(&path).await;
-        apply_migrations(&db).await.unwrap();
-        assert_eq!(applied(&db).await, Migrator::migrations().len() as u64);
-        let row = event::Entity::find_by_id(Uuid::from_u128(1))
-            .one(&db)
+        let error = apply_migrations(&db)
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (row.addressed_peer, row.leading_mention, row.derived_version),
-            (Some(me.as_uuid()), false, DERIVED_VERSION)
-        );
-        assert_eq!(row.class, None, "upgrade must not guess a historical class");
-        assert_eq!(row.class_family, None);
-        assert_eq!(event_header::Entity::find().count(&db).await.unwrap(), 1);
+            .expect_err("populated history refuses classification upgrade");
+        assert!(error.to_string().contains("classification upgrade refused"));
+        assert_eq!(applied(&db).await, u64::from(BEFORE_DERIVED));
+        assert!(!SchemaManager::new(&db)
+            .has_column("events", "class")
+            .await
+            .unwrap());
+        assert_eq!(event::Entity::find().count(&db).await.unwrap(), 1);
     }
 
     // what this catches (Codex on #1618): a derivation interrupted midway is never
@@ -224,7 +220,7 @@ mod tests {
         let path = dir.path().join("events.sqlite");
         let me = PeerId::from_u128(0x3e);
         let db = connect(&path).await;
-        Migrator::up(&db, Some(BEFORE_DERIVED)).await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
         let rows: Vec<_> = (1..=2500u128)
             .map(|n| {
                 if n % 2 == 0 {

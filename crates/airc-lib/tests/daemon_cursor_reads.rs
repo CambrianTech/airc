@@ -253,3 +253,31 @@ async fn attached_structured_send_keeps_its_declared_class_not_a_durable_pin() {
          pinning Durable again instead of honouring the frame's declared class"
     );
 }
+
+/// Signed semantic classes retain their distinct bus categories through IPC.
+#[tokio::test]
+async fn attached_signal_and_stream_classes_are_admitted_without_kind_conflicts() {
+    use airc_core::{Body, ControlKind, EventClass, Headers, MentionTarget};
+    use airc_protocol::FrameKind;
+    let machine = Machine::boot().await;
+    let (alice, bob) = machine.pair_in("typed-control-categories").await;
+    for class in [
+        EventClass::Control(ControlKind::Signal),
+        EventClass::Control(ControlKind::Stream),
+    ] {
+        let id = alice
+            .send_frame_to_for_test(
+                FrameKind::for_class(class),
+                class,
+                MentionTarget::All,
+                Body::Binary(vec![255, 0, 7]),
+                Headers::new(),
+            )
+            .await
+            .expect("typed control admitted");
+        let events = bob.page_recent(10).await.expect("history");
+        assert!(events
+            .iter()
+            .any(|event| event.event_id == id && event.class == class));
+    }
+}

@@ -480,7 +480,7 @@ impl AttachRequest {
     }
 
     pub fn selection(&self) -> airc_core::EventSelection {
-        self.selection
+        self.selection.clone()
     }
 
     /// Deliver only these event kinds.

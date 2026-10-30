@@ -132,12 +132,28 @@ async fn exercise(airc: &Airc) {
     airc.publish_stream_chunk(&StreamChunk::text_token("live", 0, "part"))
         .await
         .unwrap();
+    let work_change = airc
+        .send_frame_to_for_test(
+            FrameKind::Event,
+            airc_core::EventClass::Activity(airc_core::ActivityKind::WorkState),
+            MentionTarget::All,
+            Body::Binary(vec![255, 0]),
+            Headers::new(),
+        )
+        .await
+        .unwrap();
     let settled = airc.say("settled").await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
+        let mut observed_work = false;
         loop {
             let e = live.next().await.unwrap().unwrap();
             assert!(!e.headers.contains_key(HEADER_STREAM_ID));
+            observed_work |= e.event_id == work_change;
             if e.event_id == settled {
+                assert!(
+                    observed_work,
+                    "actionable work-state events share the agent subscription"
+                );
                 break;
             }
         }

@@ -163,6 +163,11 @@ impl Airc {
         body: Body,
         mut headers: airc_core::Headers,
     ) -> Result<crate::messaging::SendFrameResult, AircError> {
+        if kind != FrameKind::for_class(class) {
+            return Err(AircError::Route(
+                "frame kind conflicts with event class".into(),
+            ));
+        }
         room.stamp_name_header(&mut headers);
         // The FRAME's class, read from its own header — never a pin. This was
         // hardcoded `Durable` while `daemon_publish` beside it had already been
@@ -178,7 +183,9 @@ impl Airc {
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
-                kind: kind.into(),
+                kind: airc_bus::Kind::for_class(class)
+                    .map_err(|error| AircError::Route(error.to_string()))?
+                    .into(),
                 delivery: ipc_delivery(delivery),
                 target: target.into(),
                 correlation_id: None,
@@ -204,6 +211,11 @@ impl Airc {
         delivery: airc_bus::DeliveryClass,
         target: MentionTarget,
     ) -> Result<PublishReceipt, AircError> {
+        if kind != FrameKind::for_class(class) {
+            return Err(AircError::Route(
+                "frame kind conflicts with event class".into(),
+            ));
+        }
         room.stamp_name_header(&mut headers);
         let response = self
             .require_daemon_client()?
@@ -212,7 +224,9 @@ impl Airc {
                 channel: room.channel.as_uuid(),
                 from_peer: self.peer_id().as_uuid(),
                 from_client: self.client_id().as_uuid(),
-                kind: kind.into(),
+                kind: airc_bus::Kind::for_class(class)
+                    .map_err(|error| AircError::Route(error.to_string()))?
+                    .into(),
                 // The CALLER's class, not a pin. This was hardcoded
                 // `Durable`, which meant a citizen's presence line — a
                 // glyph, a pose, a thought marker — became an ORM row and
@@ -525,7 +539,7 @@ impl Airc {
                     None,
                     delivery.clone(),
                     headers.clone(),
-                    selection,
+                    selection.clone(),
                     tx.clone(),
                 )
                 .await?,
@@ -612,7 +626,13 @@ async fn spawn_channel_reader(
     // stored cursor — see `join_feed`).
     // `from` is the resume point a caller hands over (the set reader
     // falling back after a daemon rollback); `None` is the live edge.
-    let request = channel_request(channel, from, delivery.clone(), headers.clone(), selection);
+    let request = channel_request(
+        channel,
+        from,
+        delivery.clone(),
+        headers.clone(),
+        selection.clone(),
+    );
     let mut stream = client.attach(request).await?; // typed: see `attach_ack`
     attach_ack(read_response_frame(&mut stream).await, "daemon attach")?;
     Ok(tokio::spawn(async move {
@@ -715,7 +735,7 @@ async fn spawn_channel_reader(
                 }
                 request = request
                     .with_headers(headers.clone())
-                    .with_selection(selection);
+                    .with_selection(selection.clone());
                 let mut s = match client.attach(request).await {
                     Ok(s) => s,
                     Err(error) => {
@@ -777,13 +797,14 @@ impl Airc {
             let channels = channels.clone();
             let delivery = delivery.clone();
             let headers = headers.clone();
+            let selection = selection.clone();
             move |cursors: &std::collections::HashMap<RoomId, IpcCursor>| {
                 channel_set_request(
                     &channels,
                     cursors,
                     delivery.clone(),
                     headers.clone(),
-                    selection,
+                    selection.clone(),
                 )
             }
         };
@@ -870,7 +891,7 @@ impl Airc {
                                         cursors.get(&channel).copied(),
                                         delivery.clone(),
                                         headers.clone(),
-                                        selection,
+                                        selection.clone(),
                                         tx.clone(),
                                     )
                                     .await
@@ -1046,7 +1067,7 @@ mod tests {
             &cursors,
             delivery.clone(),
             headers.clone(),
-            selection,
+            selection.clone(),
         );
         let entries = set.channels().expect("a set attach");
         assert_eq!(entries[0].start(), AttachStart::After(cursor_a));
@@ -1062,7 +1083,7 @@ mod tests {
                 cursors.get(&room).copied(),
                 delivery.clone(),
                 headers.clone(),
-                selection,
+                selection.clone(),
             );
             let expected = if room == a {
                 AttachStart::After(cursor_a)

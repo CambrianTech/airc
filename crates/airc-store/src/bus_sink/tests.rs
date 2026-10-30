@@ -683,14 +683,14 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
     let page = sink
-        .page_matching(ch, origin, through, rule, 10, true)
+        .page_matching(ch, origin, through, rule.clone(), 10, true)
         .await
         .unwrap();
     let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
     assert_eq!(ids, [typed.event_id]);
     // Index evidence: each branch SEARCHes its own addressing index (rows
     // touched are candidates), never walks the room in cursor order.
-    let branches = [page_rows(ch, origin, through, rule, 10, true).expect("query")];
+    let branches = [page_rows(ch, origin, through, rule.clone(), 10, true).expect("query")];
     let indexes = ["idx_bus_events_room_addressed_peer"];
     assert_eq!(branches.len(), indexes.len(), "one select per branch");
     for (query, index) in branches.iter().zip(indexes) {
@@ -735,14 +735,14 @@ async fn typed_bus_history_selects_before_limit_without_decoding_payload() {
         addressed_to: None,
     };
     let page = sink
-        .page_matching(channel, origin, last, rule, 1, true)
+        .page_matching(channel, origin, last, rule.clone(), 1, true)
         .await
         .expect("page");
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].event_id, chat.event_id);
     assert_eq!(page[0].payload, chat.payload);
     assert_eq!(
-        sink.count_matching(channel, origin, last, rule, None)
+        sink.count_matching(channel, origin, last, rule.clone(), None)
             .await
             .expect("count")
             .count,
