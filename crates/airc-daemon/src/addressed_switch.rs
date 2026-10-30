@@ -18,6 +18,7 @@ pub enum RouteError {
     Backpressure,
     Closed,
     StatePoisoned,
+    DeadlineElapsed,
 }
 
 struct Entry {
@@ -28,6 +29,7 @@ struct Entry {
 
 pub(crate) struct QueuedFrame {
     pub frame: Frame,
+    pub deadline: tokio::time::Instant,
     // Held through the socket write, so draining the queue cannot evade admission.
     pub(crate) _permit: OwnedSemaphorePermit,
 }
@@ -90,8 +92,13 @@ impl AddressedSwitch {
     }
 
     /// The caller admits only authenticated addressed envelopes, never room data.
-    pub(crate) fn route(&self, peer: PeerId, frame: Frame) -> Result<(), RouteError> {
-        match self.route_if_owned(peer, frame)? {
+    pub(crate) fn route(
+        &self,
+        peer: PeerId,
+        frame: Frame,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), RouteError> {
+        match self.route_if_owned(peer, frame, deadline)? {
             LocalAdmission::Delivered => Ok(()),
             LocalAdmission::Unowned(frame) => {
                 drop(frame);
@@ -106,7 +113,11 @@ impl AddressedSwitch {
         &self,
         peer: PeerId,
         frame: Frame,
+        deadline: tokio::time::Instant,
     ) -> Result<LocalAdmission, RouteError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RouteError::DeadlineElapsed);
+        }
         let entries = self.entries.lock().map_err(|_| RouteError::StatePoisoned)?;
         let Some(entry) = entries.get(&peer) else {
             return Ok(LocalAdmission::Unowned(Box::new(frame)));
@@ -116,6 +127,7 @@ impl AddressedSwitch {
             .tx
             .try_send(QueuedFrame {
                 frame,
+                deadline,
                 _permit: permit,
             })
             .map(|()| LocalAdmission::Delivered)
@@ -198,9 +210,11 @@ mod tests {
     async fn only_absent_owner_returns_frame_and_budget_covers_inflight_write() {
         let switch = AddressedSwitch::new(NonZeroUsize::MIN, NonZeroUsize::MIN, NonZeroUsize::MIN);
         let peer = PeerId::new();
+        let deadline = tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT;
         let original = frame(peer);
-        let LocalAdmission::Unowned(returned) =
-            switch.route_if_owned(peer, original.clone()).unwrap()
+        let LocalAdmission::Unowned(returned) = switch
+            .route_if_owned(peer, original.clone(), deadline)
+            .unwrap()
         else {
             panic!("absent owner consumed the frame");
         };
@@ -208,12 +222,12 @@ mod tests {
         let mut owner = switch.register(peer).unwrap();
         let outbound = switch.reserve_frame().unwrap();
         assert!(matches!(
-            switch.route_if_owned(peer, frame(peer)),
+            switch.route_if_owned(peer, frame(peer), deadline),
             Err(RouteError::Backpressure)
         ));
         drop(outbound);
         assert!(matches!(
-            switch.route_if_owned(peer, frame(peer)),
+            switch.route_if_owned(peer, frame(peer), deadline),
             Ok(LocalAdmission::Delivered)
         ));
         let writing = owner.rx.recv().await.unwrap();
@@ -222,14 +236,14 @@ mod tests {
             Err(RouteError::Backpressure)
         ));
         assert!(matches!(
-            switch.route_if_owned(peer, frame(peer)),
+            switch.route_if_owned(peer, frame(peer), deadline),
             Err(RouteError::Backpressure)
         ));
         drop(writing);
         assert!(switch.reserve_frame().is_ok());
         owner.rx.close();
         assert!(matches!(
-            switch.route_if_owned(peer, frame(peer)),
+            switch.route_if_owned(peer, frame(peer), deadline),
             Err(RouteError::Closed)
         ));
     }

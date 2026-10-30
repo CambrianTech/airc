@@ -24,7 +24,12 @@ impl DaemonState {
         &self,
         frame: Frame,
     ) -> Result<(), AddressedAdmissionError> {
-        admit_local(self, frame).await
+        let deadline = tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT;
+        tokio::time::timeout_at(deadline, admit_local(self, frame, deadline))
+            .await
+            .unwrap_or(Err(AddressedAdmissionError::Queue(
+                crate::addressed_switch::RouteError::DeadlineElapsed,
+            )))
     }
 }
 
@@ -61,13 +66,14 @@ pub(crate) async fn route_request(
         return refusal("addressed deadline elapsed");
     }
     let remaining = remaining.min(airc_ipc::client::DEFAULT_RPC_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + remaining;
     let shutdown = state.shutdown.notified();
     tokio::pin!(shutdown);
     shutdown.as_mut().enable();
     tokio::select! {
         biased;
         _ = &mut shutdown => refusal("addressed daemon shutting down"),
-        result = tokio::time::timeout(remaining, admit_local(state, request.frame)) => match result {
+        result = tokio::time::timeout_at(deadline, admit_local(state, request.frame, deadline)) => match result {
             Ok(Ok(())) => Response::Ok,
             Ok(Err(error)) => refusal(error.to_string()),
             Err(_) => refusal("addressed deadline elapsed"),
@@ -75,7 +81,11 @@ pub(crate) async fn route_request(
     }
 }
 
-async fn admit_local(state: &DaemonState, frame: Frame) -> Result<(), AddressedAdmissionError> {
+async fn admit_local(
+    state: &DaemonState,
+    frame: Frame,
+    deadline: tokio::time::Instant,
+) -> Result<(), AddressedAdmissionError> {
     if frame.kind != FrameKind::Addressed || frame.envelope.channel != addressed_channel() {
         return Err(AddressedAdmissionError::WrongKindOrChannel);
     }
@@ -96,7 +106,7 @@ async fn admit_local(state: &DaemonState, frame: Frame) -> Result<(), AddressedA
     }
     state
         .addressed
-        .route(*peer, frame)
+        .route(*peer, frame, deadline)
         .map_err(AddressedAdmissionError::Queue)
 }
 
@@ -192,17 +202,42 @@ where
                 _ = reader.read(&mut unexpected) => return Ok(()),
             next = lease.rx.recv() => {
                 let Some(queued) = next else { return Ok(()); };
-                let crate::addressed_switch::QueuedFrame { frame, _permit: permit } = queued;
-                let response = Response::Addressed { frame };
+
                 tokio::select! {
                     biased;
                     _ = lease.superseded.changed() => return Ok(()),
-                                result = write_frame(&mut writer, &response) => result?,
+                                result = write_queued(&mut writer, queued) => result?,
                 }
-                drop(permit);
+
             }
         }
     }
+}
+
+// A timeout may leave a partial IPC frame: the caller must close the stream.
+async fn write_queued<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    queued: crate::addressed_switch::QueuedFrame,
+) -> std::io::Result<()> {
+    let crate::addressed_switch::QueuedFrame {
+        frame,
+        deadline,
+        _permit,
+    } = queued;
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    tokio::time::timeout_at(
+        deadline,
+        write_frame(writer, &Response::Addressed { frame }),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "addressed write deadline elapsed",
+        )
+    })?
 }
 
 #[cfg(test)]
@@ -235,11 +270,8 @@ mod tests {
         (home, Arc::new(state), peer, key)
     }
 
-    #[tokio::test]
-    async fn expired_ipc_frame_is_refused_before_admission() {
-        let (_home, state, peer, _key) = fixture().await;
-        let mut receiver = state.addressed.register(peer).unwrap();
-        let frame = Frame {
+    fn test_frame(peer: PeerId) -> Frame {
+        Frame {
             kind: FrameKind::Addressed,
             envelope: airc_protocol::Envelope {
                 event_id: airc_core::EventId::new(),
@@ -255,7 +287,118 @@ mod tests {
                 media: Vec::new(),
                 signature: Signature::Unsigned,
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_write_expiry_releases_budget_without_late_output() {
+        use crate::addressed_switch::{AddressedSwitch, QueuedFrame};
+        use std::num::NonZeroUsize;
+        let switch = AddressedSwitch::new(NonZeroUsize::MIN, NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let peer = PeerId::new();
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let expired = QueuedFrame {
+            frame: test_frame(peer),
+            deadline: tokio::time::Instant::now(),
+            _permit: switch.reserve_frame().unwrap(),
         };
+        write_queued(&mut writer, expired).await.unwrap();
+        let permit = switch
+            .reserve_frame()
+            .expect("expired frame released budget");
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), reader.read(&mut byte))
+                .await
+                .is_err()
+        );
+        let blocked = QueuedFrame {
+            frame: test_frame(peer),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            _permit: permit,
+        };
+        let writing = write_queued(&mut writer, blocked);
+        tokio::pin!(writing);
+        tokio::select! {
+            result = &mut writing => panic!("write finished before backpressure: {result:?}"),
+            result = reader.read_exact(&mut byte) => { result.unwrap(); }
+        }
+        assert!(matches!(
+            switch.reserve_frame(),
+            Err(crate::addressed_switch::RouteError::Backpressure)
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut writing)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            switch.reserve_frame().is_ok(),
+            "timed out write released budget"
+        );
+        // This stream has a partial frame and is dropped without reuse.
+    }
+
+    #[tokio::test]
+    async fn queued_write_timeout_closes_authenticated_stream() {
+        let (_home, state, peer, key) = fixture().await;
+        let (mut client, server) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(server);
+        let task = tokio::spawn(serve(reader, writer, state.clone(), peer));
+        let Some(Response::AddressedChallenge(challenge)) =
+            read_frame::<_, Response>(&mut client).await.unwrap()
+        else {
+            panic!("no challenge");
+        };
+        write_frame(
+            &mut client,
+            &Request::ProveAddressed(challenge.sign(&key, 0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_frame::<_, Response>(&mut client).await.unwrap(),
+            Some(Response::Ok)
+        );
+        let mut frame = test_frame(peer);
+        frame.envelope.body = Some("x".repeat(1024));
+        state
+            .addressed
+            .route(
+                peer,
+                frame,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            )
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "partial frame timeout must close the connection"
+        );
+        let mut partial = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_to_end(&mut partial),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!partial.is_empty(), "fixture must exercise a partial frame");
+        assert!(state
+            .addressed
+            .register(peer)
+            .unwrap()
+            .is_current()
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_ipc_frame_is_refused_before_admission() {
+        let (_home, state, peer, _key) = fixture().await;
+        let mut receiver = state.addressed.register(peer).unwrap();
+        let frame = test_frame(peer);
         let response = route_request(
             &state,
             airc_ipc::AddressedRequest {
