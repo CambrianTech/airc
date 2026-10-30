@@ -14,6 +14,21 @@ pub struct DaemonLifecycleGuard {
     owner: crate::MachineAccountHome,
 }
 
+/// Another admitted daemon owns initialization. Its endpoint need not be bound yet.
+#[derive(Debug, thiserror::Error)]
+#[error("daemon initialization is already in progress; no second initializer was admitted")]
+pub struct StartupInProgress;
+
+fn acquire_startup(file: &File) -> io::Result<()> {
+    FileExt::try_lock_exclusive(file).map_err(|error| {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            io::Error::new(io::ErrorKind::WouldBlock, StartupInProgress)
+        } else {
+            error
+        }
+    })
+}
+
 /// A child owns startup until its endpoint is bound, independently of the
 /// updater's parent-held maintenance lock. This is never a lifetime daemon lock.
 pub struct DaemonStartupGuard {
@@ -42,7 +57,7 @@ impl DaemonStartupGuard {
     pub fn acquire(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
         let active = DaemonLifecycleGuard::open(&owner, "daemon-startup.lock")?;
-        FileExt::try_lock_shared(&active)?;
+        acquire_startup(&active)?;
         require_running(&owner)?;
         Ok(Self { active, owner })
     }
@@ -81,6 +96,11 @@ impl DaemonLifecycleGuard {
             owner,
         };
         require_running(&guard.owner)?;
+        // Observe an admitted child before another caller attempts to spawn.
+        // The child takes this same lock exclusively before any store open.
+        let startup = Self::open(&guard.owner, "daemon-startup.lock")?;
+        acquire_startup(&startup)?;
+        FileExt::unlock(&startup)?;
         Ok(guard)
     }
 
@@ -243,6 +263,27 @@ mod tests {
         );
     }
 
+    // A slow initializer keeps ownership after its parent times out. Neither
+    // another child nor an autostart caller may launch competing store work.
+    #[test]
+    fn one_initializer_owns_startup_until_bound_or_dropped() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = DaemonStartupGuard::acquire(dir.path())?;
+        for error in [
+            DaemonStartupGuard::acquire(dir.path()).err(),
+            DaemonLifecycleGuard::autostart(dir.path()).err(),
+        ] {
+            assert!(error
+                .and_then(|error| error.into_inner())
+                .is_some_and(|source| source.is::<StartupInProgress>()));
+        }
+        first.bound()?;
+        let second = DaemonStartupGuard::acquire(dir.path())?;
+        drop(second);
+        DaemonLifecycleGuard::autostart(dir.path())?;
+        Ok(())
+    }
+
     // A reconnect must not respawn the old executable inside stop/install;
     // releasing the updater's OS lock must immediately restore autostart.
     #[test]
@@ -295,7 +336,13 @@ mod tests {
         });
         // Observe the real admission gate, not a sleep assumed to be long enough.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while DaemonLifecycleGuard::autostart(dir.path()).is_ok() {
+        loop {
+            if DaemonLifecycleGuard::autostart(dir.path())
+                .err()
+                .is_some_and(|error| is_maintenance_in_progress(&error))
+            {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
                 "maintenance never closed admission"
