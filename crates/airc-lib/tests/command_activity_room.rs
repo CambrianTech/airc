@@ -68,3 +68,38 @@ async fn command_rejects_broadcast_and_room_without_switching_rooms() {
     }
     assert_eq!(alice.current_room().await.unwrap().name, "home");
 }
+
+#[tokio::test]
+async fn ordinary_attach_does_not_steal_live_addressed_receiver() {
+    let machine = Machine::boot().await;
+    machine.pin_identity("command-custody-tests").await;
+    let alice = machine.attach("alice").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let first = alice.addressed_inbox(deadline).await.unwrap();
+    // Another ordinary facade is harmless until it explicitly requests custody.
+    let independent = machine.attach("alice").await;
+    let error = match independent.addressed_inbox(deadline).await {
+        Err(error) => error,
+        Ok(_) => panic!("independent facade stole receiver custody"),
+    };
+    assert!(error.to_string().contains("ReceiverBusy"), "{error}");
+    let shared = alice.addressed_inbox(deadline).await.unwrap();
+    drop(first);
+    // The second lease still keeps the original receiver alive.
+    assert!(independent.addressed_inbox(deadline).await.is_err());
+    drop(shared);
+}
+
+#[tokio::test]
+async fn concurrent_inboxes_on_one_handle_share_custody() {
+    let machine = Machine::boot().await;
+    machine.pin_identity("command-shared-custody-tests").await;
+    let alice = machine.attach("alice").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (left, right) = tokio::join!(
+        alice.addressed_inbox(deadline),
+        alice.addressed_inbox(deadline)
+    );
+    let _left = left.unwrap();
+    let _right = right.unwrap();
+}
