@@ -133,6 +133,13 @@ async fn unknown_applied(db: &impl ConnectionTrait) -> Result<Vec<String>, Store
         .collect())
 }
 
+/// Read-only classification admission shared with the schema migration itself.
+pub(crate) async fn check_classification_adoption(
+    db: &DatabaseConnection,
+) -> Result<(), StoreError> {
+    m20261030_000023_event_class::check_adoption(&SchemaManager::new(db)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,11 +198,4 @@ mod tests {
             other => panic!("expected AheadOfBinary, got {other:?}"),
         }
     }
-}
-
-/// Read-only classification admission shared with the schema migration itself.
-pub(crate) async fn check_classification_adoption(
-    db: &DatabaseConnection,
-) -> Result<(), StoreError> {
-    m20261030_000023_event_class::check_adoption(&SchemaManager::new(db)).await
 }

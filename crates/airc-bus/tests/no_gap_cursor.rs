@@ -29,7 +29,10 @@ where
         let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("timed out waiting for an event — a gap/miss would hang here");
-        out.push(next.expect("stream ended early — missing events"));
+        out.push(
+            next.expect("stream ended early — missing events")
+                .expect("durable replay failed"),
+        );
     }
     out
 }

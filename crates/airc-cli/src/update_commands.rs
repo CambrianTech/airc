@@ -1139,7 +1139,12 @@ mod tests {
             command
                 .args(["--exact", TEST, "--nocapture"])
                 .env(MODE, "daemon");
-            spawn_restarted_daemon(command, Path::new(&env::var(FIXTURE_HOME).unwrap())).unwrap();
+            // This fixture must exit before its daemon: the outer test owns
+            // its control socket and explicitly sends Q to terminate it.
+            #[allow(clippy::zombie_processes)]
+            let _detached_fixture =
+                spawn_restarted_daemon(command, Path::new(&env::var(FIXTURE_HOME).unwrap()))
+                    .unwrap();
             // Detachment changes only the runtime child's environment. The
             // installer retains its authority through publication/recovery.
             assert_eq!(

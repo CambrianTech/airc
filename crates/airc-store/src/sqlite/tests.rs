@@ -918,7 +918,7 @@ async fn sender_is_selected_before_limit_and_count_in_both_store_implementations
             .matching_history(&origin, &through, &[room], rule.clone(), 1, true)
             .await
             .expect("page");
-        assert_eq!(page, [wanted.clone()]);
+        assert_eq!(page.as_slice(), std::slice::from_ref(&wanted));
     }
     for store in [&sql as &dyn CountHistory, &memory as &dyn CountHistory] {
         assert_eq!(
