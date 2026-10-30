@@ -50,6 +50,8 @@ mod header_query;
 pub mod history_count;
 pub mod local_identity;
 pub mod memory;
+mod observation;
+pub use observation::StoreObservation;
 pub mod mesh_identity;
 pub mod migration;
 pub mod peer_trust;

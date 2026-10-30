@@ -11,7 +11,7 @@ use airc_identity::LocalIdentity;
 
 use super::{Check, CheckConfig, CheckContext, Finding};
 
-/// Identity pairing. Cheap (two `exists()` probes + one sqlite open), so it
+/// Identity pairing through read-only observation, so it
 /// inherits the default [`super::CheckTier::Always`].
 pub(super) struct IdentityCheck;
 
@@ -30,60 +30,87 @@ impl Check for IdentityCheck {
 /// does, but reports rather than fails.
 async fn check_identity(home: &Path) -> Vec<Finding> {
     let key_path = LocalIdentity::key_path(home);
-    let key_exists = key_path.exists();
-    // Probe legacy json so a half-migrated install is named for what
-    // it is, not just "row missing".
-    let legacy_json = home.join("identity.json").exists();
-
-    // Open the store to ask about the singleton row. If the store
-    // itself can't open, surface that instead — that's a different
-    // class of breakage (disk full, permissions, db corruption).
-    let store = match airc_store::SqliteEventStore::open_path(&home.join("events.sqlite")).await {
-        Ok(store) => store,
+    let key_exists = match key_path.try_exists() {
+        Ok(exists) => exists,
+        Err(error) => {
+            return vec![Finding::blocked(
+                "identity key",
+                format!("cannot inspect identity.key: {error}"),
+                "restore access to the existing key; preserve identity",
+            )]
+        }
+    };
+    let metadata_exists = match home.join("identity.json").try_exists() {
+        Ok(exists) => exists,
+        Err(error) => {
+            return vec![Finding::blocked(
+                "identity metadata",
+                format!("cannot inspect identity.json: {error}"),
+                "restore access to existing identity material",
+            )]
+        }
+    };
+    let path = home.join("events.sqlite");
+    let database_exists = match path.try_exists() {
+        Ok(exists) => exists,
         Err(error) => {
             return vec![Finding::blocked(
                 "identity store",
-                format!("can't open events.sqlite: {error}"),
-                "check disk/permissions; if corrupted, `airc stop` then `rm <home>/events.sqlite` and `airc join` to rebuild (loses scope state)",
-            )];
+                format!("cannot inspect events.sqlite: {error}"),
+                "restore access to the existing store; preserve identity and scope state",
+            )]
         }
     };
-    let row = match store.load_local_identity().await {
-        Ok(opt) => opt,
+    if !database_exists {
+        return if key_exists || metadata_exists {
+            vec![Finding::blocked("identity", "identity material exists without its database", "restore events.sqlite from backup; preserve the existing key and identity material")]
+        } else {
+            vec![Finding::info(
+                "identity",
+                "no identity material (fresh scope; `airc join` will generate)",
+            )]
+        };
+    }
+    let store = match airc_store::StoreObservation::open(&path).await {
+        Ok(store) => store,
+        Err(error) => {
+            return vec![Finding::blocked(
+            "identity store",
+            format!("cannot observe events.sqlite: {error}"),
+            "check disk and permissions; preserve the database and restore from backup if damaged",
+        )]
+        }
+    };
+    let present = match store.has_identity(airc_store::DEFAULT_AGENT_NAME).await {
+        Ok(present) => present,
         Err(error) => {
             return vec![Finding::blocked(
                 "identity row",
-                format!("can't query local_identity: {error}"),
-                "schema may be from an older binary; `airc update` or rebuild",
-            )];
+                format!("cannot query local_identity: {error}"),
+                "repair the store through its supported lifecycle; diagnostics never migrate it",
+            )]
         }
     };
-
-    match (key_exists, row.is_some(), legacy_json) {
-        (true, true, _) => vec![Finding::ok("identity", "key + ORM row both present")],
-        (false, false, false) => vec![Finding::info(
+    match (key_exists, present) {
+        (true, true) => vec![Finding::ok("identity", "key + ORM row both present")],
+        (false, false) if metadata_exists => vec![Finding::blocked(
+            "identity",
+            "identity metadata has no matching key or database identity",
+            "restore the matching identity state from backup; preserve existing material",
+        )],
+        (false, false) => vec![Finding::info(
             "identity",
             "no identity material (fresh scope; `airc join` will generate)",
         )],
-        (false, false, true) => vec![Finding::warn(
+        (true, false) => vec![Finding::blocked(
             "identity",
-            "legacy identity.json present without identity.key — orphan metadata",
-            "`rm <home>/identity.json` then `airc join` to regenerate identity cleanly",
+            "key present but identity row missing",
+            "restore the matching database from backup; preserve the key",
         )],
-        (true, false, true) => vec![Finding::warn(
+        (false, true) => vec![Finding::blocked(
             "identity",
-            "key present + legacy identity.json present, no ORM row — pre-#902 install",
-            "`airc join` will auto-migrate (post-#902 logic; identity.json gets consumed)",
-        )],
-        (true, false, false) => vec![Finding::blocked(
-            "identity",
-            "key present but no ORM row and no legacy json — orphan key, no recovery without backup",
-            "`airc stop` then `rm <home>/identity.key` (loses peer_id), then `airc join` to regenerate",
-        )],
-        (false, true, _) => vec![Finding::blocked(
-            "identity",
-            "ORM row present but key file missing — can't sign without the secret",
-            "restore <home>/identity.key from backup, OR `airc stop` + `rm -rf <home>` then `airc join` (loses peer_id)",
+            "identity row present but signing key missing",
+            "restore the matching identity.key from backup; preserve the database",
         )],
     }
 }
@@ -100,6 +127,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].status, Status::Info);
         assert!(findings[0].detail.contains("no identity material"));
+        assert!(!dir.path().join("events.sqlite").exists());
     }
 
     #[tokio::test]
@@ -110,30 +138,26 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].status, Status::Blocked);
         let fix = findings[0].fix.as_ref().unwrap();
-        // what this catches: the fix must name a REAL recovery path —
-        // wipe the orphan key, then regenerate — using verbs that exist
-        // in the rust rewrite. `teardown`/`--flush` were legacy Python
-        // verbs removed in the cutover; recommending them hands the user
-        // a broken command (regression guard for that dead-verb drift).
         assert!(
-            fix.contains("airc join"),
-            "fix must point at the regenerate step: {fix}"
+            fix.contains("restore"),
+            "recovery must preserve identity: {fix}"
         );
-        assert!(fix.contains("rm "), "fix must name the wipe step: {fix}");
         assert!(
-            !fix.contains("teardown"),
-            "must not recommend the removed teardown verb: {fix}"
+            !fix.contains("rm "),
+            "diagnosis must not recommend wiping identity: {fix}"
         );
+        assert!(!dir.path().join("events.sqlite").exists());
     }
 
     #[tokio::test]
-    async fn key_plus_legacy_json_reports_pre_902_install() {
+    async fn metadata_without_database_is_blocked_without_migration() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("identity.key"), [7u8; 32]).unwrap();
         std::fs::write(dir.path().join("identity.json"), "{}").unwrap();
         let findings = check_identity(dir.path()).await;
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].status, Status::Warn);
-        assert!(findings[0].detail.contains("pre-#902"));
+        assert_eq!(findings[0].status, Status::Blocked);
+        assert!(!dir.path().join("events.sqlite").exists());
+        assert!(dir.path().join("identity.json").exists());
     }
 }

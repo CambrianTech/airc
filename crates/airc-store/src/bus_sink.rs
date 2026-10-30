@@ -189,19 +189,7 @@ impl SqliteDurableSink {
     /// changing journal mode. Ordinary reads see the live WAL; this is not an
     /// immutable snapshot. Missing files/schema and read failures stay errors.
     pub async fn open_read_only_path(path: &Path) -> Result<Self, BusError> {
-        let path = path.to_owned();
-        let mut opts = Self::pool_options("sqlite::memory:");
-        opts.sqlx_logging(false);
-        // Supply the native filename through the typed driver, not a URI: `?`
-        // and `#` in a path must not become connection parameters.
-        opts.map_sqlx_sqlite_opts(move |_| {
-            sea_orm::sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&path)
-                .read_only(true)
-                .create_if_missing(false)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
-        });
-        let db = Database::connect(opts)
+        let db = crate::observation::connect(path)
             .await
             .map_err(BusError::sink_source)?;
         // Read-only: SQLite refuses its writes, so they need no admission.

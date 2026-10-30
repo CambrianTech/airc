@@ -310,6 +310,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(not_current(db).await, 1, "the old writer's row is owed");
+        let observer = crate::StoreObservation::open(&path).await.unwrap();
+        assert!(!observer
+            .has_identity(crate::DEFAULT_AGENT_NAME)
+            .await
+            .unwrap());
+        assert_eq!(
+            not_current(db).await,
+            1,
+            "observation must not derive pending rows"
+        );
+        drop(observer);
         drop(store);
         let store = SqliteEventStore::open_path(&path).await.unwrap();
         let db = store.connection();

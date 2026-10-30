@@ -56,7 +56,7 @@ use crate::subscriptions::StoredSubscription;
 /// should only fire when something is genuinely stuck, so it is sized
 /// for the slowest legitimate wait (loaded CI, cold Windows I/O),
 /// leaving real deadlocks still bounded.
-const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct SqliteEventStore {
     db: DatabaseConnection,
