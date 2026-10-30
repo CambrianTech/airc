@@ -112,9 +112,7 @@ async fn attached_filtered_page_pushes_kinds_down_to_the_daemon() {
     for _ in 0..200 {
         client
             .publish(PublishRequest {
-                class: airc_core::EventClass::Correspondence(
-                    airc_core::CorrespondenceKind::Message,
-                ),
+                class: airc_core::EventClass::Control(airc_core::ControlKind::Stream),
                 channel: channel.as_uuid(),
                 from_peer: alice.peer_id().as_uuid(),
                 from_client: alice.client_id().as_uuid(),
