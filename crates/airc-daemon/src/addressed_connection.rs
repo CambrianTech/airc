@@ -82,6 +82,9 @@ where
         let request = read_frame::<_, Request>(&mut reader).await?;
         Ok::<_, std::io::Error>(match request {
             Some(Request::ProveAddressed(proof)) => {
+                crate::trust_refresh::refresh_peer(&state.registry, &state.home, peer, None)
+                    .await
+                    .map_err(std::io::Error::other)?;
                 challenge.verify(&proof, &state.registry).is_ok()
             }
             _ => false,
@@ -151,7 +154,9 @@ mod tests {
         let peer = PeerId::new();
         let key = PeerKeypair::generate();
         let registry = Arc::new(PeerKeyRegistry::new());
-        registry.enrol(peer, 0, key.public_bytes()).unwrap();
+        airc_trust::add(home.path(), peer, key.public_bytes())
+            .await
+            .unwrap();
         let state = DaemonState::build(
             PeerId::new(),
             PeerKeypair::generate(),
@@ -165,6 +170,47 @@ mod tests {
         .await
         .unwrap();
         (home, Arc::new(state), peer, key)
+    }
+
+    #[tokio::test]
+    async fn add_peer_cannot_bootstrap_or_replace_durable_identity() {
+        use base64::Engine;
+        let (_home, state, peer, key) = fixture().await;
+        let impostor = PeerKeypair::generate();
+        let request = |peer_id, public_key| {
+            Request::AddPeer(airc_ipc::AddPeerRequest {
+                peer_id,
+                pubkey_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key),
+            })
+        };
+        assert_eq!(
+            crate::handlers::dispatch(state.clone(), request(peer, key.public_bytes())).await,
+            Response::Ok
+        );
+        assert!(matches!(
+            crate::handlers::dispatch(state.clone(), request(peer, impostor.public_bytes())).await,
+            Response::Error { .. }
+        ));
+        assert_eq!(
+            state.registry.lookup(peer, 0).unwrap().to_bytes(),
+            key.public_bytes()
+        );
+        let unknown = PeerId::new();
+        assert!(matches!(
+            crate::handlers::dispatch(state.clone(), request(unknown, impostor.public_bytes()))
+                .await,
+            Response::Error { .. }
+        ));
+        assert!(state.registry.lookup(unknown, 0).is_none());
+        // A fresh verifier (daemon restart) recovers admission from durable trust.
+        let restarted = PeerKeyRegistry::new();
+        crate::trust_refresh::refresh_peer(&restarted, &state.home, peer, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.lookup(peer, 0).unwrap().to_bytes(),
+            key.public_bytes()
+        );
     }
 
     #[tokio::test]

@@ -485,7 +485,10 @@ async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Respon
     }
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&bytes);
-    if let Err(error) = state.registry.enrol(add.peer_id, 0, pubkey) {
+    if let Err(error) =
+        crate::trust_refresh::refresh_peer(&state.registry, &state.home, add.peer_id, Some(pubkey))
+            .await
+    {
         return Response::Error {
             message: format!("add_peer: enrol: {error}"),
         };
