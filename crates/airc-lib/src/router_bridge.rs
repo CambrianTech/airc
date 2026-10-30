@@ -581,6 +581,8 @@ pub(crate) fn bus_envelope_for_inbound(
         FrameKind::Message => Kind::Message,
         FrameKind::Event => Kind::Event,
         FrameKind::Control => Kind::Control,
+        FrameKind::Command => Kind::Command,
+        FrameKind::CommandResult => Kind::CommandResult,
     };
     let mut env = airc_bus::envelope::Envelope::new(
         frame.envelope.channel,

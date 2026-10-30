@@ -43,6 +43,8 @@ impl Frame {
             FrameKind::Message => TranscriptKind::Message,
             FrameKind::Event => TranscriptKind::System,
             FrameKind::Control => TranscriptKind::SessionControl,
+            FrameKind::Command => TranscriptKind::Command,
+            FrameKind::CommandResult => TranscriptKind::CommandResult,
         };
 
         let mut metadata = serde_json::Map::new();
@@ -127,6 +129,16 @@ mod tests {
 
     #[test]
     fn frame_kind_maps_to_transcript_kind() {
+        for (wire_kind, event_kind) in [
+            (FrameKind::Command, TranscriptKind::Command),
+            (FrameKind::CommandResult, TranscriptKind::CommandResult),
+        ] {
+            let mut frame = message_frame();
+            frame.kind = wire_kind;
+            // Deliberately opaque bytes: classification cannot inspect JSON.
+            frame.envelope.body = None;
+            assert_eq!(frame.into_transcript_event().kind, event_kind);
+        }
         let mut frame = message_frame();
         frame.kind = FrameKind::Event;
         assert_eq!(

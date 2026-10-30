@@ -1,9 +1,10 @@
 //! The wire envelope — what a transport adapter carries across the mesh.
 //!
 //! An `Envelope` is the canonical "one event" record on the wire. Three
-//! frame kinds wrap it: `Message` (pull-driven, durable), `Event`
+//! chat/control frame kinds wrap it: `Message` (pull-driven, durable), `Event`
 //! (push-driven interrupt), `Control` (session lifecycle — JOIN / NICK /
 //! HEARTBEAT). The body and headers are opaque to the substrate;
+//! `Command` and `CommandResult` preserve addressed protocol categories;
 //! consumers (forge/alloy, Continuum, OpenClaw extensions, Hermes, ...)
 //! own meaning.
 //!
@@ -66,7 +67,7 @@ pub type ChannelId = RoomId;
 
 /// What kind of frame the wire is carrying.
 ///
-/// Three discrete delivery semantics, not a spectrum:
+/// Explicit categories; commands must not be classified by parsing bodies:
 ///   - `Message`  — pull-driven. Durable. Joins the transcript. Late
 ///     joiners see it on replay.
 ///   - `Event`    — push-driven. Interrupt-style. Receivers consume
@@ -81,6 +82,10 @@ pub enum FrameKind {
     Message,
     Event,
     Control,
+    /// Addressed protocol request. Never a conversational message.
+    Command,
+    /// Addressed protocol response to a correlated command.
+    CommandResult,
 }
 
 /// One wire-level frame. A transport adapter carries `Frame`s in either
