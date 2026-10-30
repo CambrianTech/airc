@@ -32,9 +32,19 @@ result was 850 MB of log and a node cut off from the grid while every part repor
 
 ## The contract
 
-1. **One authority per daemon.** `NetworkAuthority` owns all accounting and every decision about what
-   goes on a wire, for every transport (LAN/Tailscale TCP, relay, UDP, WebRTC, gh). An embedded `Airc`
-   with no daemon owns one too: airc stays separately capable. There is no second manager. `GhBudget`
+1. **One authority per machine.** `NetworkAuthority` owns all accounting and every decision about what
+   goes on a machine's wires, for every transport (LAN/Tailscale TCP, relay, UDP, WebRTC, gh).
+   Capacity belongs to the machine's links, not to a process, so there is never a second authority over
+   the same network interface.
+   - **A machine with a daemon:** the daemon owns the authority. Every handle on that machine (continuum's
+     core, CLI hooks, agents) is daemon-attached and claims through it.
+   - **An embedded handle while a daemon runs on its machine** may not own transports. It is refused,
+     typed, as daemon lifecycle already admits only one initializer (#1624).
+   - **A machine with no daemon:** the single embedded handle that owns its transports owns the
+     authority, so airc stays separately capable.
+   - **A relay** claims the traffic it relays against its own machine's authority.
+
+   There is no second manager. `GhBudget`
    becomes the authority's gh resource. It keeps its measured inputs (local count, `retry-after`,
    `x-ratelimit-*`) and loses its own constants.
 2. **Every consumer is a typed claim.** `Claim { class, link, bytes, deadline }` receives a `Grant`, a
@@ -58,9 +68,11 @@ result was 850 MB of log and a node cut off from the grid while every part repor
 4. **A shrinking grant is the backpressure** (contract 1). It is a request to the consumer, which
    releases. Nothing is dropped silently.
    - A claim that cannot be granted by its deadline gets `Refused { why }`, and its caller decides.
+     A refused durable frame stays in its outbox in that typed state; it is never discarded.
    - The three silent-drop queues become claims. Their bounds are grants, measured in bytes, not frames.
 5. **Classes share by priority, with aging.** `Interactive` and `Command` preempt `Bulk`, and `Bulk` is
-   never starved. This is the same aging rule as continuum goal 9.
+   never starved. Aging has no constant: a waiting claim's priority rises as its measured wait exceeds
+   the measured service time of its class on that link. This is the same rule as continuum goal 9.
    - gh pressure affects only the gh resource. It never degrades LAN or relay delivery, which is the
      rule from `INVITE-ROUTING-ARCHITECTURE.md` § GitHub Governor Semantics, now owned here.
 6. **Cancellation is per claim, never per link.** A caller's deadline withdraws its frame if the frame
@@ -97,7 +109,12 @@ Each count is driven to zero, not just held flat:
 - broadcast for a single-peer target (1 → 0);
 - cancellation that tears down a link (1 → 0).
 
-They follow the shape of continuum #5609's ratchet: sites counted from source, CI fails on a rise.
+They follow continuum #5609's ratchet:
+- sites are counted from source and CI fails on a rise;
+- a PR that touches a file must leave that file's count at zero ("a touched file ends clean"), not just
+  hold it flat;
+- protocol limits (frame-size maxima, wire versions) are exempt only by owner path: they live in
+  `airc-protocol`'s limits module, and nothing elsewhere may define one. A comment marker never exempts.
 
 ## Slices
 
@@ -107,7 +124,7 @@ two nodes before the next slice.
 | # | Slice | Owner | Done when |
 |---|---|---|---|
 | N0 | This contract agreed | Cormac, Codex, Fable | Codex and Fable approve |
-| N1 | `NetworkAuthority` core: claims, grants, `Unmeasured`, snapshot; ledger byte and RTT measurement on LAN and relay | Cormac | Grant-from-measurement unit tests; snapshot visible in `doctor` |
+| N1 | `NetworkAuthority` core: claims, grants, `Unmeasured`, snapshot; ledger byte and RTT measurement on LAN and relay | Cormac | Validator walks a link `Unmeasured` -> `Measured` -> `Stale` -> `Measured` and asserts no grant ever exceeds what was measured; snapshot visible in `doctor` |
 | N2 | LAN and relay writers take grants. Per-claim cancellation. Byte-bounded queues replace the 256-frame mpsc | Cormac | Cancel test: link survives; ratchet counts drop |
 | N3 | Directory + addressed unicast (item 1) as consumers | Cormac | Three-machine test: a third party receives no addressed frame |
 | N4 | Backfill as a per-peer `Bulk` claim. Its event replaces the per-connect, per-channel fan-out (item 3) | Codex | Reconnect storm test: one claim per peer |
