@@ -721,9 +721,32 @@ async fn submissions_survive_retry_conflict_settle_and_every_snapshot_boundary()
 }
 
 #[tokio::test]
-async fn malformed_submission_cannot_poison_board_or_hide_other_corruption() {
+async fn malformed_submission_is_an_explicit_replay_failure_regardless_of_hint() {
     let room = RoomId::from_u128(10);
     let id = WorkCardId::from_u128(20);
+    // Positive control: the same valid work before/after the corrupt row
+    // projects normally when it is genuinely a complete, valid history.
+    let valid = vec![
+        work_transcript(1, room, 1, &card_created(id)),
+        work_transcript(3, room, 3, &card_state_changed(id)),
+    ];
+    let expected = project_transcripts(valid.clone()).expect("valid history");
+    assert_eq!(expected.card(id).expect("card").state, CardState::Review);
+    assert_eq!(
+        airc_work::project_transcript_work_events(valid.clone()).expect("domain projection"),
+        expected
+    );
+    let valid_store = InMemoryEventStore::new();
+    for event in valid {
+        valid_store.append(event).await.expect("append");
+    }
+    assert_eq!(
+        WorkEventStore::new(&valid_store)
+            .project_complete(Some(room), 1)
+            .await
+            .expect("paged valid projection"),
+        expected
+    );
     for header in [None, Some("card_created"), Some("work_submitted")] {
         let mut malformed = work_transcript(2, room, 2, &WorkEvent::WorkSubmitted(submission(id)));
         malformed.body = Some(Body::Json(
@@ -743,22 +766,20 @@ async fn malformed_submission_cannot_poison_board_or_hide_other_corruption() {
             malformed,
             work_transcript(3, room, 3, &card_state_changed(id)),
         ];
-        let full = project_transcripts(transcripts.clone()).unwrap();
-        assert_eq!(full.card(id).unwrap().state, CardState::Review);
-        assert_eq!(
-            airc_work::project_transcript_work_events(transcripts.clone()).unwrap(),
-            full
+        let corrupt_id = transcripts[1].event_id;
+        assert!(matches!(project_transcripts(transcripts.clone()),
+            Err(WorkStoreError::Replay(airc_work::WorkReplayError::Codec { event_id, .. })) if event_id == corrupt_id));
+        assert!(
+            matches!(airc_work::project_transcript_work_events(transcripts.clone()),
+            Err(airc_work::WorkReplayError::Codec { event_id, .. }) if event_id == corrupt_id)
         );
         let store = InMemoryEventStore::new();
         for event in transcripts {
-            store.append(event).await.unwrap();
+            store.append(event).await.expect("append");
         }
-        assert_eq!(
-            WorkEventStore::new(&store)
-                .project_complete(Some(room), 1)
-                .await
-                .unwrap(),
-            full
+        assert!(
+            matches!(WorkEventStore::new(&store).project_complete(Some(room), 1).await,
+            Err(WorkStoreError::Replay(airc_work::WorkReplayError::Codec { event_id, .. })) if event_id == corrupt_id)
         );
     }
     let mut unrelated = work_transcript(4, room, 4, &card_created(id));
