@@ -492,7 +492,11 @@ pub enum Command {
 
     /// Validate existing stores without mutation before adopting this binary.
     #[command(hide = true)]
-    StorePreflight,
+    StorePreflight {
+        /// Refuse any existing store: direct installation cannot quiesce its writer.
+        #[arg(long)]
+        fresh_install: bool,
+    },
 
     /// Print the resolved daemon IPC socket path for this scope and exit.
     ///

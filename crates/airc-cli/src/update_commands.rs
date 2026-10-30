@@ -455,10 +455,11 @@ fn install_prepared_update(
         // Recheck after the writer stopped: a formerly empty old store may
         // have gained history while the candidate was being prepared.
         crate::update_preflight::candidate(prepared.artifact(), home)?;
-        swap = Some(crate::update_rollback::BinarySwap::displace(
-            airc_exe,
-            prepared.artifact(),
-        )?);
+        let transaction =
+            crate::update_rollback::BinarySwap::displace(airc_exe, prepared.artifact())?;
+        let published = transaction.publish(prepared.artifact());
+        swap = Some(transaction);
+        published?;
         Ok(())
     });
     let Some(swap) = swap else {

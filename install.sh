@@ -964,17 +964,24 @@ _install_airc_binary() {
     exit 0
   fi
   fi
-  # Candidate owns schema admission; never replace the working executable
-  # before it has inspected the durable stores without migrating them.
-  local preflight_home="${AIRC_HOME:-$HOME/.airc}"
-  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) preflight_home="$(_to_win_path "$preflight_home")" ;; esac
-  "$built" --home "$preflight_home" store-preflight || fail 'Candidate store preflight refused; installed binary retained'
-  mkdir -p "$BIN_DIR"
+  # Replacement is owned exclusively by the updater's stop/displace/publish
+  # transaction. Equal bytes here only verify publication, never adopt state.
+  local preflight_home="${AIRC_HOME:-$HOME/.airc}" destination="$BIN_DIR/airc"
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*)
+    preflight_home="$(_to_win_path "$preflight_home")"; destination="$destination.exe" ;;
+  esac
+  if [ -e "$destination" ]; then
+    cmp -s "$built" "$destination" || fail 'Direct replacement refused; use airc update for owned maintenance and publication'
+    "$built" --home "$preflight_home" store-preflight || fail 'Candidate store preflight refused; installed binary retained'
+  else
+    "$built" --home "$preflight_home" store-preflight --fresh-install || fail 'Direct installation refused existing state; use airc update'
+    mkdir -p "$BIN_DIR"
+    # noclobber keeps a concurrent publication from being overwritten.
+    (set -o noclobber; cat "$built" > "$destination") || fail 'Fresh binary destination is already owned'
+    chmod +x "$destination"
+  fi
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-      if ! cmp -s "$built" "$BIN_DIR/airc.exe"; then
-        cp -f "$built" "$BIN_DIR/airc.exe"
-      fi
       "$BIN_DIR/airc.exe" --version >/dev/null || fail 'Installed Windows binary cannot run'
       if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$BIN_DIR/airc.exe"; fi
       ok "Installed airc: $BIN_DIR/airc.exe"
@@ -986,10 +993,6 @@ _install_airc_binary() {
         -File "$(_to_win_path "$CLONE_DIR/windows/register-bin-path.ps1")" -BinDirectory "$(_to_win_path "$BIN_DIR")"
       ;;
     *)
-      local tmp="$BIN_DIR/.airc.tmp.$$"
-      cp -f "$built" "$tmp"
-      chmod +x "$tmp"
-      mv -f "$tmp" "$BIN_DIR/airc"
       # VERIFY THE DEPLOY. "Installed" is a claim about a file existing;
       # it is not evidence the binary RUNS. On macOS an invalidly-signed
       # executable is SIGKILLed before `main` — exit 137, no output, no

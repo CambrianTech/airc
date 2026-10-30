@@ -58,6 +58,27 @@ impl BinarySwap {
         })
     }
 
+    /// Publication belongs to the same transaction that displaced the original.
+    /// Stage privately, verify the pinned hash, then publish without replacing
+    /// any name another process created meanwhile.
+    pub(crate) fn publish(&self, candidate: &Path) -> Result<(), Error> {
+        let staged = self.previous.with_file_name("verified-candidate");
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        let mut input = std::fs::File::open(candidate)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::set_permissions(&staged, input.metadata()?.permissions())?;
+        if fingerprint(&staged)? != self.candidate_hash {
+            return Err("candidate changed before publication; original retained".into());
+        }
+        transaction_move("publish", &staged, &self.current)?;
+        Ok(())
+    }
+
     pub(crate) fn previous(&self) -> &Path {
         &self.previous
     }
@@ -177,6 +198,50 @@ mod tests {
         process::{Child, Command, Stdio},
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn publication_owns_verified_bytes_and_never_replaces_another_writer() {
+        for conflicting in [false, true] {
+            let dir = tempfile::tempdir().expect("directory");
+            let current = dir.path().join("airc");
+            let candidate = dir.path().join("candidate");
+            std::fs::write(&current, b"original").expect("original");
+            std::fs::write(&candidate, b"candidate").expect("candidate");
+            let swap = BinarySwap::displace(&current, &candidate).expect("displace");
+            if conflicting {
+                std::fs::write(&current, b"other owner").expect("conflict");
+                assert!(swap.publish(&candidate).is_err());
+                assert_eq!(
+                    std::fs::read(&current).expect("other preserved"),
+                    b"other owner"
+                );
+                assert_eq!(
+                    std::fs::read(swap.previous()).expect("original preserved"),
+                    b"original"
+                );
+            } else {
+                swap.publish(&candidate).expect("publish");
+                assert_eq!(std::fs::read(&current).expect("published"), b"candidate");
+                swap.rollback().expect("rollback");
+                assert_eq!(std::fs::read(&current).expect("restored"), b"original");
+            }
+        }
+    }
+
+    #[test]
+    fn changed_candidate_refuses_publication_and_original_can_be_restored() {
+        let dir = tempfile::tempdir().expect("directory");
+        let current = dir.path().join("airc");
+        let candidate = dir.path().join("candidate");
+        std::fs::write(&current, b"original").expect("original");
+        std::fs::write(&candidate, b"candidate").expect("candidate");
+        let swap = BinarySwap::displace(&current, &candidate).expect("displace");
+        std::fs::write(&candidate, b"changed").expect("tamper");
+        assert!(swap.publish(&candidate).is_err());
+        assert!(!current.exists());
+        swap.rollback().expect("rollback without candidate");
+        assert_eq!(std::fs::read(&current).expect("restored"), b"original");
+    }
 
     struct OwnedChild(Child);
     impl Drop for OwnedChild {

@@ -112,7 +112,7 @@ pub use airc_protocol::{
     HEADER_AIRC_REPLY_TO,
 };
 pub use airc_protocol::{
-    DeliveryAck, DeliveryOutcome, UndeliverableReason, DELIVERY_ACK_REQUEST, DELIVERY_ACK_RESPONSE,
+    DeliveryAck, DeliveryOutcome, UndeliverableReason, DELIVERY_ACK_REQUEST,
     HEADER_AIRC_DELIVERY_ACK,
 };
 pub use capability_registry::{

@@ -21,7 +21,7 @@ use airc_core::{Body, EventId, Headers, PeerId, RoomId, TranscriptCursor};
 use airc_diagnostics::{DiagnosticCode, DiagnosticComponent, DiagnosticEvent};
 use airc_protocol::{
     DeliveryAck, DeliveryOutcome, Envelope, Frame, FrameKind, Signature, UndeliverableReason,
-    DELIVERY_ACK_REQUEST, DELIVERY_ACK_RESPONSE, HEADER_AIRC_DELIVERY_ACK,
+    DELIVERY_ACK_REQUEST, HEADER_AIRC_DELIVERY_ACK,
 };
 
 use crate::error::AircError;
@@ -222,11 +222,7 @@ impl Airc {
                 return;
             }
         };
-        let mut headers = Headers::new();
-        headers.insert(
-            HEADER_AIRC_DELIVERY_ACK.to_string(),
-            DELIVERY_ACK_RESPONSE.to_string(),
-        );
+        let headers = Headers::new();
         let lamport = self.next_lamport(occurred_at_ms);
         let mut frame = Frame {
             kind: FrameKind::Control,

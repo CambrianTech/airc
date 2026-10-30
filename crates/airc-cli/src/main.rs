@@ -656,7 +656,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Version => commands::run_version(),
-        Command::StorePreflight => update_preflight::run(&home).await,
+        Command::StorePreflight { fresh_install } => {
+            update_preflight::run(&home, fresh_install).await
+        }
 
         #[cfg(windows)]
         Command::SetupRecoverElevatedOwner {
