@@ -310,11 +310,21 @@ async fn evicted_pending_durable_is_served_from_real_sqlite_not_skipped() {
     // an unrelated subscriber overflow from the flood.
     for i in 0..384u128 {
         let mut event = durable(ch, 1_000 + i, "non-durable during failed commit");
-        (event.kind, event.delivery) = match i % 3 {
-            0 => (Kind::CommandResult, DeliveryClass::RequestResponse),
-            1 => (Kind::StreamChunk, DeliveryClass::StreamChunk),
-            _ => (Kind::Event, DeliveryClass::EphemeralWindow),
+        (event.class, event.delivery) = match i % 3 {
+            0 => (
+                airc_core::EventClass::Control(airc_core::ControlKind::CommandResult),
+                DeliveryClass::RequestResponse,
+            ),
+            1 => (
+                airc_core::EventClass::Control(airc_core::ControlKind::Stream),
+                DeliveryClass::StreamChunk,
+            ),
+            _ => (
+                airc_core::EventClass::Activity(airc_core::ActivityKind::Presence),
+                DeliveryClass::EphemeralWindow,
+            ),
         };
+        event.kind = Kind::for_class(event.class).expect("fixture class");
         r.publish(event).await.expect("non-durable stays available");
         assert_eq!(r.pinned_in_ring(ch), 8);
         assert_eq!(r.ring_len(ch), 8, "only the accepted durable floor remains");

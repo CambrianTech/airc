@@ -266,7 +266,7 @@ mod tests {
             channel,
             (PeerId::from_u128(0xa1), ClientId::from_u128(0xc1)),
             Kind::Event,
-            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
+            airc_core::EventClass::Activity(airc_core::ActivityKind::WorkReceipt),
             DeliveryClass::Durable,
             bytes::Bytes::from_static(b"payload"),
         );
