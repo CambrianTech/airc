@@ -295,7 +295,7 @@ impl Airc {
         if frame.kind == airc_protocol::FrameKind::Addressed
             || frame.envelope.channel == airc_protocol::addressed::addressed_channel()
         {
-            self.receive_addressed(frame).await;
+            self.dispatch_addressed_frame(frame).await;
             return;
         }
         let ack_requested = airc_protocol::wants_delivery_ack(&frame);

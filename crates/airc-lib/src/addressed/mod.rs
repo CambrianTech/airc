@@ -17,6 +17,8 @@
 mod daemon;
 mod receive;
 mod send;
+mod sink;
+pub use sink::AddressedFrameSink;
 
 use std::sync::Arc;
 
@@ -171,6 +173,7 @@ impl AddressedInbox {
 
 /// Per-identity addressed state, shared by every handle on the identity.
 pub(crate) struct AddressedState {
+    sink: std::sync::OnceLock<Arc<dyn AddressedFrameSink>>,
     sessions: SessionManager,
     daemon_owner: tokio::sync::Mutex<std::sync::Weak<daemon::DaemonOwner>>,
     inbox_tx: broadcast::Sender<Arc<VerifiedAddressed>>,
@@ -187,6 +190,7 @@ impl AddressedState {
     ) -> Self {
         let (inbox_tx, _) = broadcast::channel(inbox_capacity);
         Self {
+            sink: std::sync::OnceLock::new(),
             daemon_owner: tokio::sync::Mutex::new(std::sync::Weak::new()),
             sessions: SessionManager::new(identity.keypair.clone(), identity.peer_id, registry),
             inbox_tx,

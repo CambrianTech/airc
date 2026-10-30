@@ -17,29 +17,64 @@ fn refusal(message: impl Into<String>) -> Response {
     }
 }
 
+impl DaemonState {
+    /// Receive an opaque transport frame through the same authenticated local
+    /// admission as IPC, without entering the durable room router.
+    pub async fn receive_addressed_frame(
+        &self,
+        frame: Frame,
+    ) -> Result<(), AddressedAdmissionError> {
+        admit_local(self, frame).await
+    }
+}
+
+#[derive(Debug)]
+pub enum AddressedAdmissionError {
+    WrongKindOrChannel,
+    WrongTarget,
+    SenderMustSign,
+    Trust(crate::trust_refresh::TrustRefreshError),
+    Signature(airc_protocol::VerificationError),
+    Queue(crate::addressed_switch::RouteError),
+}
+
+impl std::fmt::Display for AddressedAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "addressed admission refused: {self:?}")
+    }
+}
+impl std::error::Error for AddressedAdmissionError {}
+
 pub(crate) async fn route_local(state: &DaemonState, frame: Frame) -> Response {
+    match admit_local(state, frame).await {
+        Ok(()) => Response::Ok,
+        Err(error) => refusal(error.to_string()),
+    }
+}
+
+async fn admit_local(state: &DaemonState, frame: Frame) -> Result<(), AddressedAdmissionError> {
     if frame.kind != FrameKind::Addressed || frame.envelope.channel != addressed_channel() {
-        return refusal("addressed route refuses room or plaintext frames");
+        return Err(AddressedAdmissionError::WrongKindOrChannel);
     }
     let MentionTarget::Peer(peer) = &frame.envelope.target else {
-        return refusal("addressed route requires one peer");
+        return Err(AddressedAdmissionError::WrongTarget);
     };
     if !matches!(&frame.envelope.signature, Signature::Ed25519 { signer, .. } if *signer == frame.envelope.sender)
     {
-        return refusal("local addressed sender must sign its own envelope");
+        return Err(AddressedAdmissionError::SenderMustSign);
     }
     let registry =
         match crate::trust_refresh::admission_registry(&state.home, frame.envelope.sender).await {
             Ok(registry) => registry,
-            Err(error) => return refusal(format!("addressed trust refused: {error}")),
+            Err(error) => return Err(AddressedAdmissionError::Trust(error)),
         };
     if let Err(error) = airc_protocol::verify(&frame, VerificationPolicy::Strict, &registry) {
-        return refusal(format!("addressed signature refused: {error}"));
+        return Err(AddressedAdmissionError::Signature(error));
     }
-    match state.addressed.route(*peer, frame) {
-        Ok(()) => Response::Ok,
-        Err(error) => refusal(format!("addressed local admission refused: {error:?}")),
-    }
+    state
+        .addressed
+        .route(*peer, frame)
+        .map_err(AddressedAdmissionError::Queue)
 }
 
 pub(crate) async fn serve<R, W>(
