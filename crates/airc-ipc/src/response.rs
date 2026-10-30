@@ -21,6 +21,8 @@ use crate::request::IpcCursor;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    /// Fresh challenge consumed only on this IPC connection.
+    AddressedChallenge(airc_protocol::addressed_attach::AttachChallenge),
     /// Response to `Ping`.
     Pong,
     /// Response to `Status`.
@@ -60,6 +62,11 @@ pub enum Response {
     /// `airc_wire::decode`.
     Event {
         envelope: Vec<u8>,
+    },
+    /// One addressed frame for an `AttachAddressed` stream's peer, exactly as
+    /// its sender sealed and signed it. Never a bus event.
+    Addressed {
+        frame: airc_protocol::Frame,
     },
     /// **Card 7d5b6a65.** Emitted by an `Attach` stream when the
     /// client requested `coalesce_backlog: true` and the daemon had

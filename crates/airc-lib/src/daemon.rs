@@ -66,14 +66,10 @@ fn unpack_seq(lamport: u64) -> (u64, u64) {
 fn kind_to_transcript(kind: Kind) -> TranscriptKind {
     match kind {
         Kind::Message => TranscriptKind::Message,
-        // The fine-grained transcript kind for non-chat envelopes is
-        // carried in headers; project the coarse bus kind to System.
-        Kind::Event
-        | Kind::Command
-        | Kind::CommandResult
-        | Kind::Signal
-        | Kind::StreamChunk
-        | Kind::Control => TranscriptKind::System,
+        Kind::Command => TranscriptKind::Command,
+        Kind::CommandResult => TranscriptKind::CommandResult,
+        // Non-command event categories retain their coarse System projection.
+        Kind::Event | Kind::Signal | Kind::StreamChunk | Kind::Control => TranscriptKind::System,
     }
 }
 
@@ -83,20 +79,28 @@ fn kind_to_transcript(kind: Kind) -> TranscriptKind {
 ///
 /// The push-down must be a SUPERSET of the client-side `filter.matches`
 /// — never narrower, or the daemon would drop events the consumer asked
-/// for. `kind_to_transcript` is lossy (every non-chat bus kind projects
-/// to the coarse `System`), so `Message` maps exactly and ANY other
-/// transcript kind admits every non-`Message` bus kind; `filter.matches`
-/// still refines the decoded page afterwards.
+/// for. Message and command categories map exactly. Remaining transcript
+/// categories admit the remaining non-command bus categories, with
+/// `filter.matches` refining the decoded page afterwards.
 fn transcript_kinds_to_ipc(kinds: &std::collections::BTreeSet<TranscriptKind>) -> Vec<IpcKind> {
     let mut out = Vec::new();
     if kinds.contains(&TranscriptKind::Message) {
         out.push(IpcKind::Message);
     }
-    if kinds.iter().any(|kind| *kind != TranscriptKind::Message) {
+    if kinds.contains(&TranscriptKind::Command) {
+        out.push(IpcKind::Command);
+    }
+    if kinds.contains(&TranscriptKind::CommandResult) {
+        out.push(IpcKind::CommandResult);
+    }
+    if kinds.iter().any(|kind| {
+        !matches!(
+            kind,
+            TranscriptKind::Message | TranscriptKind::Command | TranscriptKind::CommandResult
+        )
+    }) {
         out.extend([
             IpcKind::Event,
-            IpcKind::Command,
-            IpcKind::CommandResult,
             IpcKind::Signal,
             IpcKind::StreamChunk,
             IpcKind::Control,
@@ -1063,6 +1067,26 @@ fn attach_ack(ack: std::io::Result<Option<Response>>, what: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_categories_survive_projection_and_filter_pushdown() {
+        for (bus, transcript, ipc) in [
+            (Kind::Command, TranscriptKind::Command, IpcKind::Command),
+            (
+                Kind::CommandResult,
+                TranscriptKind::CommandResult,
+                IpcKind::CommandResult,
+            ),
+        ] {
+            assert_eq!(kind_to_transcript(bus), transcript);
+            let requested = std::collections::BTreeSet::from([transcript]);
+            assert_eq!(transcript_kinds_to_ipc(&requested), vec![ipc]);
+        }
+        let system =
+            transcript_kinds_to_ipc(&std::collections::BTreeSet::from([TranscriptKind::System]));
+        assert!(!system.contains(&IpcKind::Command));
+        assert!(!system.contains(&IpcKind::CommandResult));
+    }
 
     // what this catches (Codex on #1603): a replacement daemon that closes the attach before
     // acknowledging it, read as a refusal, which ends a reattaching feed for good. Through

@@ -35,7 +35,7 @@ pub(super) async fn dispatch_to_subscribers(inner: &Arc<Inner>, frame: Frame) {
     // without this line nothing anywhere would record the loss (live
     // repro 2026-06-12 02:36Z: accepted frame in no store). Event-kind
     // frames are lossy by contract, so only Message/Control are loud.
-    if targets.is_empty() && matches!(frame.kind, FrameKind::Message | FrameKind::Control) {
+    if targets.is_empty() && frame.kind != FrameKind::Event {
         StderrJsonDiagnosticSink.emit(
             DiagnosticEvent::error(
                 DiagnosticComponent::Transport,
@@ -55,7 +55,11 @@ pub(super) async fn dispatch_to_subscribers(inner: &Arc<Inner>, frame: Frame) {
     let mut dead_ids: Vec<u64> = Vec::new();
     for (id, tx) in targets {
         let send_result = match frame.kind {
-            FrameKind::Message | FrameKind::Control => {
+            FrameKind::Message
+            | FrameKind::Control
+            | FrameKind::Command
+            | FrameKind::CommandResult
+            | FrameKind::Addressed => {
                 // Backpressure-bearing — block on slow consumer.
                 tx.send(Ok(frame.clone())).await.map_err(|_| ())
             }

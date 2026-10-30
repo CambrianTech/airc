@@ -28,7 +28,7 @@ use crate::response::{
     RouteEndpointsResponse, StatusResponse,
 };
 
-const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Completed boundaries of an RPC, for opt-in diagnostic observation.
 /// Failure or cancellation emits no boundary for the incomplete phase.
@@ -342,7 +342,7 @@ impl DaemonClient {
     }
 
     pub async fn attach(&self, request: AttachRequest) -> Result<IpcStream, ClientError> {
-        timeout(Duration::from_secs(5), self.attach_inner(request))
+        timeout(DEFAULT_RPC_TIMEOUT, self.attach_inner(request))
             .await
             .map_err(|_| ClientError::Timeout)?
     }
@@ -356,6 +356,93 @@ impl DaemonClient {
             .map_err(ClientError::Io)?;
         Ok(stream)
     }
+
+    /// Hand the daemon one addressed frame this scope sealed and signed.
+    pub async fn send_addressed(
+        &self,
+        frame: airc_protocol::Frame,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ClientError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(ClientError::Timeout)?;
+        let expires = std::time::SystemTime::now()
+            .checked_add(remaining)
+            .ok_or(ClientError::Timeout)?;
+        let deadline_unix_ms = u64::try_from(
+            expires
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| ClientError::Io(std::io::Error::other(error)))?
+                .as_millis(),
+        )
+        .map_err(|_| ClientError::Timeout)?;
+        match tokio::time::timeout_at(
+            deadline,
+            self.call(Request::Addressed(crate::request::AddressedRequest {
+                frame,
+                deadline_unix_ms,
+            })),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout)??
+        {
+            Response::Ok => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
+        }
+    }
+
+    /// Open this scope's addressed stream: the daemon answers `Response::Ok`,
+    /// then one `Response::Addressed` per frame for `peer`.
+    pub async fn attach_addressed(
+        &self,
+        peer: airc_core::PeerId,
+        daemon: airc_core::PeerId,
+        keypair: &airc_protocol::PeerKeypair,
+        key_id: u32,
+    ) -> Result<IpcStream, ClientError> {
+        timeout(DEFAULT_RPC_TIMEOUT, async {
+            let mut stream = IpcStream::connect(&self.socket_path)
+                .await
+                .map_err(ClientError::NotConnected)?;
+            write_frame(
+                &mut stream,
+                &Request::AttachAddressed(crate::request::AttachAddressedRequest { peer }),
+            )
+            .await
+            .map_err(ClientError::Io)?;
+            let challenge = match addressed_response(&mut stream).await? {
+                Response::AddressedChallenge(challenge)
+                    if challenge.peer == peer && challenge.daemon == daemon =>
+                {
+                    challenge
+                }
+                other => return Err(ClientError::UnexpectedResponse(Box::new(other))),
+            };
+            write_frame(
+                &mut stream,
+                &Request::ProveAddressed(challenge.sign(keypair, key_id)),
+            )
+            .await
+            .map_err(ClientError::Io)?;
+            match addressed_response(&mut stream).await? {
+                Response::Ok => Ok(stream),
+                other => Err(ClientError::UnexpectedResponse(Box::new(other))),
+            }
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+}
+
+async fn addressed_response(stream: &mut IpcStream) -> Result<Response, ClientError> {
+    match read_response_frame(stream).await.map_err(ClientError::Io)? {
+        Some(Response::Error { message }) => Err(ClientError::Daemon(message)),
+        Some(response) => Ok(response),
+        None => Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "daemon closed during addressed authentication",
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +450,51 @@ mod observation_tests {
     use super::*;
     use crate::transport::IpcListener;
 
+    #[tokio::test]
+    async fn addressed_send_uses_callers_deadline_when_daemon_stalls() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("addressed-timeout.sock");
+        let listener = IpcListener::bind(&socket).await.unwrap();
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_frame::<_, Request>(&mut stream).await.unwrap(),
+                Some(Request::Addressed(_))
+            ));
+            let _ = hold.await;
+            drop(stream);
+            listener.cleanup();
+        });
+        let peer = airc_core::PeerId::new();
+        let frame = airc_protocol::Frame {
+            kind: airc_protocol::FrameKind::Addressed,
+            envelope: airc_protocol::Envelope {
+                event_id: airc_core::EventId::new(),
+                sender: peer,
+                sender_client: airc_core::ClientId::new(),
+                channel: airc_protocol::addressed::addressed_channel(),
+                target: airc_core::MentionTarget::Peer(peer),
+                lamport: 1,
+                occurred_at_ms: 1,
+                reply_to: None,
+                headers: Default::default(),
+                body: None,
+                media: Vec::new(),
+                signature: airc_protocol::Signature::Unsigned,
+            },
+        };
+        let client = DaemonClient::new(socket);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let result = timeout(
+            Duration::from_secs(2),
+            client.send_addressed(frame, deadline),
+        )
+        .await;
+        let _ = release.send(());
+        server.await.unwrap();
+        assert!(matches!(result, Ok(Err(ClientError::Timeout))));
+    }
     // A server that holds the connection open must still hit the normal RPC
     // deadline, without reporting the unfinished response phase as complete.
     #[tokio::test]

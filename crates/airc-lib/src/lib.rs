@@ -37,6 +37,7 @@
 pub mod account_registry;
 pub mod account_registry_fs;
 pub mod adapter;
+pub mod addressed;
 mod agent_feed;
 pub mod agent_heartbeat;
 pub mod airc;
@@ -97,6 +98,9 @@ pub use account_registry::{
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 pub use account_registry_fs::FsAccountRegistryStore;
+pub use addressed::{
+    AddressedError, AddressedInbox, AddressedKind, AddressedSend, InboxError, VerifiedAddressed,
+};
 pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
     RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
@@ -113,7 +117,7 @@ pub use airc_protocol::{
 pub use capability_registry::{
     CapabilityCandidate, CapabilityEntry, CapabilityQuery, CapabilityRegistry, DEFAULT_OFFER_TTL_MS,
 };
-pub use command_bus::PendingCommand;
+pub use command_bus::{CommandEvent, PendingCommand};
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now,
     drain_stale_store as coordinator_drain_stale_store,

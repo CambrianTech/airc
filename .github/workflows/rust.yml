@@ -62,6 +62,7 @@ on:
       - ".github/workflows/ci.yml"
       - "test/rust_quality_guard.sh"
       - ".github/workflows/rust.yml"
+      - ".github/actions/rust-test-build/**"
 
 # A new push to the same PR/branch obsoletes the in-flight run —
 # cancel it instead of queueing behind it. Three moot runs were
@@ -76,6 +77,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # CI needs assertions and coverage, not debugger symbols or incremental
+  # compiler state. Keep binaries small for Windows linking/update-copy tests.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # Classify PRs and pushes without another checkout. Merge groups validate
@@ -123,7 +129,7 @@ jobs:
             printf 'rust=true\nruntime=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if printf '%s\n' "$files" | grep -E '^(crates/|integrations/(acp/|embedding-facility/bridge/|generate-facility/bridge/)|Cargo\.(toml|lock)$|test/rust_quality_guard\.sh$|\.github/workflows/rust\.yml$)' >/dev/null; then
+          if printf '%s\n' "$files" | grep -E '^(crates/|integrations/(acp/|embedding-facility/bridge/|generate-facility/bridge/)|Cargo\.(toml|lock)$|test/rust_quality_guard\.sh$|\.github/workflows/rust\.yml$|\.github/actions/rust-test-build/)' >/dev/null; then
             echo "rust=true"  >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
@@ -250,15 +256,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: rustup toolchain install stable --profile minimal
-      - name: cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
+      - uses: ./.github/actions/rust-test-build
       # #404 — THE GATE ITSELF WAS UNRELIABLE. Measured 2026-08-12:
       # three consecutive runs on two PRs (whose diffs were roster string
       # logic and one pool constant) failed FOUR DIFFERENT daemon tests
@@ -320,7 +318,7 @@ jobs:
     # self-hosted leg while 10+ runs starved behind it. The deadlock is
     # fixed, but the runner is a shared singleton, so a per-job ceiling
     # is the backstop: any future hang self-aborts and frees the leg
-    # instead of wedging the queue. 25 min is ~3x a healthy cold run.
+    # instead of wedging the queue. Track cold/warm timings against this ceiling.
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -377,15 +375,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: install rust toolchain
         run: rustup toolchain install stable --profile minimal
-      - name: cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
+      - uses: ./.github/actions/rust-test-build
       # #404 — THE GATE ITSELF WAS UNRELIABLE. Measured 2026-08-12:
       # three consecutive runs on two PRs (whose diffs were roster string
       # logic and one pool constant) failed FOUR DIFFERENT daemon tests
