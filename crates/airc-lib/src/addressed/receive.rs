@@ -138,7 +138,7 @@ impl Airc {
                 match tokio::time::timeout_at(verified.deadline, owner.serve_backfill(&verified))
                     .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(_served)) => {}
                     Ok(Err(error)) => refuse(from, &format!("addressed backfill failed: {error}")),
                     Err(_) => refuse(from, "addressed backfill expired"),
                 }
