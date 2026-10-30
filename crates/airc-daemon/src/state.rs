@@ -32,6 +32,7 @@ use airc_store::{EventStore, SqliteDurableSink};
 /// underlying handles (registry, router, store) do their own interior
 /// locking.
 pub struct DaemonState {
+    pub addressed: Arc<crate::addressed_switch::AddressedSwitch>,
     pub(crate) shared_frames: crate::shared_frames::SharedFrames,
     pub peer_id: PeerId,
     pub keypair: PeerKeypair,
@@ -152,6 +153,13 @@ impl DaemonState {
             Arc::new(StderrJsonDiagnosticSink),
         );
         Ok(Self {
+            // Explicit addressed admission: at most 64 recipients and 16 in-flight
+            // frames node-wide (IPC limits each frame to 16 MiB), four per peer.
+            addressed: crate::addressed_switch::AddressedSwitch::new(
+                std::num::NonZeroUsize::new(64).unwrap(),
+                std::num::NonZeroUsize::new(16).unwrap(),
+                std::num::NonZeroUsize::new(4).unwrap(),
+            ),
             shared_frames: crate::shared_frames::SharedFrames::default(),
             peer_id,
             keypair,

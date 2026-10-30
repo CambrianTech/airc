@@ -42,6 +42,12 @@ const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as 
 /// wire protocol stays uniform.
 pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
     match request {
+        Request::Addressed(request) => {
+            crate::addressed_connection::route_local(&state, request.frame)
+        }
+        Request::AttachAddressed(_) | Request::ProveAddressed(_) => Response::Error {
+            message: "addressed proof requires its original challenged connection".into(),
+        },
         Request::Ping => Response::Pong,
         Request::Status => {
             let retained = state.router.retention_snapshot();

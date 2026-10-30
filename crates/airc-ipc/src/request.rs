@@ -172,9 +172,33 @@ pub enum Request {
     /// frames (airc-wire bytes) until the client disconnects. Optionally
     /// resumes from `from` so replay→live has no gap and no dup.
     Attach(AttachRequest),
+    /// Hand the daemon one addressed frame (`airc_protocol::addressed`),
+    /// sealed and signed by the sending scope in its own process. The daemon
+    /// delivers it to a locally attached addressee or relays it over its
+    /// links; it never enters the bus or any store. Returns `Response::Ok`.
+    Addressed(AddressedRequest),
+    /// Request a connection-bound identity challenge. After proof and `Response::Ok` the daemon
+    /// streams `Response::Addressed` for every addressed frame whose target is
+    /// `peer`. One stream per peer; a newer attach for the peer replaces the
+    /// older (a reconnecting scope supersedes its stale stream).
+    AttachAddressed(AttachAddressedRequest),
+    /// Answer the challenge on the same connection; never a standalone RPC.
+    ProveAddressed(airc_protocol::addressed_attach::AttachProof),
     /// Graceful shutdown. Daemon completes in-flight requests, then
     /// stops accepting new connections + exits.
     Stop,
+}
+
+/// Parameters for `Addressed`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AddressedRequest {
+    pub frame: airc_protocol::Frame,
+}
+
+/// Parameters for `AttachAddressed`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachAddressedRequest {
+    pub peer: airc_core::PeerId,
 }
 
 /// Parameters for `Inbox`.

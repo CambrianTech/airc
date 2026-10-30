@@ -28,7 +28,7 @@ use crate::response::{
     RouteEndpointsResponse, StatusResponse,
 };
 
-const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Completed boundaries of an RPC, for opt-in diagnostic observation.
 /// Failure or cancellation emits no boundary for the incomplete phase.
@@ -342,7 +342,7 @@ impl DaemonClient {
     }
 
     pub async fn attach(&self, request: AttachRequest) -> Result<IpcStream, ClientError> {
-        timeout(Duration::from_secs(5), self.attach_inner(request))
+        timeout(DEFAULT_RPC_TIMEOUT, self.attach_inner(request))
             .await
             .map_err(|_| ClientError::Timeout)?
     }
@@ -355,6 +355,72 @@ impl DaemonClient {
             .await
             .map_err(ClientError::Io)?;
         Ok(stream)
+    }
+
+    /// Hand the daemon one addressed frame this scope sealed and signed.
+    pub async fn send_addressed(&self, frame: airc_protocol::Frame) -> Result<(), ClientError> {
+        match self
+            .call(Request::Addressed(crate::request::AddressedRequest {
+                frame,
+            }))
+            .await?
+        {
+            Response::Ok => Ok(()),
+            other => Err(ClientError::UnexpectedResponse(Box::new(other))),
+        }
+    }
+
+    /// Open this scope's addressed stream: the daemon answers `Response::Ok`,
+    /// then one `Response::Addressed` per frame for `peer`.
+    pub async fn attach_addressed(
+        &self,
+        peer: airc_core::PeerId,
+        daemon: airc_core::PeerId,
+        keypair: &airc_protocol::PeerKeypair,
+        key_id: u32,
+    ) -> Result<IpcStream, ClientError> {
+        timeout(DEFAULT_RPC_TIMEOUT, async {
+            let mut stream = IpcStream::connect(&self.socket_path)
+                .await
+                .map_err(ClientError::NotConnected)?;
+            write_frame(
+                &mut stream,
+                &Request::AttachAddressed(crate::request::AttachAddressedRequest { peer }),
+            )
+            .await
+            .map_err(ClientError::Io)?;
+            let challenge = match addressed_response(&mut stream).await? {
+                Response::AddressedChallenge(challenge)
+                    if challenge.peer == peer && challenge.daemon == daemon =>
+                {
+                    challenge
+                }
+                other => return Err(ClientError::UnexpectedResponse(Box::new(other))),
+            };
+            write_frame(
+                &mut stream,
+                &Request::ProveAddressed(challenge.sign(keypair, key_id)),
+            )
+            .await
+            .map_err(ClientError::Io)?;
+            match addressed_response(&mut stream).await? {
+                Response::Ok => Ok(stream),
+                other => Err(ClientError::UnexpectedResponse(Box::new(other))),
+            }
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+}
+
+async fn addressed_response(stream: &mut IpcStream) -> Result<Response, ClientError> {
+    match read_response_frame(stream).await.map_err(ClientError::Io)? {
+        Some(Response::Error { message }) => Err(ClientError::Daemon(message)),
+        Some(response) => Ok(response),
+        None => Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "daemon closed during addressed authentication",
+        ))),
     }
 }
 
