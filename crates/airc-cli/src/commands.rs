@@ -1939,6 +1939,16 @@ pub async fn run_daemon(
     daemon_airc.set_addressed_frame_sink(Arc::new(
         crate::addressed_bridge::DaemonAddressedSink(Arc::downgrade(&state)),
     ))?;
+    state
+        .addressed
+        .set_forwarder(Arc::new(
+            crate::addressed_bridge::DaemonAddressedForwarder {
+                airc: daemon_airc.clone(),
+                home: state.home.clone(),
+                daemon: state.peer_id,
+            },
+        ))
+        .map_err(|error| anyhow::anyhow!("addressed forwarder installation failed: {error:?}"))?;
     daemon_airc.set_inbound_frame_sink(Arc::new(
         airc_lib::RouterInboundBridge::new(state.router.clone(), state.coordinator_store.clone())
             // Self-healing join (the "blind room" heal): an inbound

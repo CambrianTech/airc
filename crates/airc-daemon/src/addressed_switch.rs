@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use airc_core::PeerId;
 use airc_protocol::Frame;
@@ -40,9 +40,33 @@ pub(crate) enum LocalAdmission {
     Unowned(Box<Frame>),
 }
 
+#[derive(Debug)]
+pub enum ForwardError {
+    NotInstalled,
+    AlreadyInstalled,
+    UnknownRecipient,
+    UnknownHost,
+    LocalOwnerAbsent,
+    InvalidEndpoints,
+    Trust(String),
+    Transport(String),
+    Admission(RouteError),
+}
+
+#[async_trait::async_trait]
+pub trait AddressedForwarder: Send + Sync {
+    async fn forward(
+        &self,
+        recipient: PeerId,
+        frame: Frame,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ForwardError>;
+}
+
 pub struct AddressedSwitch {
     entries: Mutex<HashMap<PeerId, Entry>>,
     frames: Arc<Semaphore>,
+    forwarder: OnceLock<Arc<dyn AddressedForwarder>>,
     receiver_limit: usize,
     queue_capacity: usize,
 }
@@ -58,9 +82,30 @@ impl AddressedSwitch {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             frames: Arc::new(Semaphore::new(frame_limit.get())),
+            forwarder: OnceLock::new(),
             receiver_limit: receiver_limit.get(),
             queue_capacity: queue_capacity.get(),
         })
+    }
+
+    pub fn set_forwarder(
+        &self,
+        forwarder: Arc<dyn AddressedForwarder>,
+    ) -> Result<(), ForwardError> {
+        self.forwarder
+            .set(forwarder)
+            .map_err(|_| ForwardError::AlreadyInstalled)
+    }
+
+    pub(crate) async fn forward(
+        &self,
+        recipient: PeerId,
+        frame: Frame,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ForwardError> {
+        let forwarder = self.forwarder.get().ok_or(ForwardError::NotInstalled)?;
+        let _permit = self.reserve_frame().map_err(ForwardError::Admission)?;
+        forwarder.forward(recipient, frame, deadline).await
     }
 
     pub(crate) fn register(self: &Arc<Self>, peer: PeerId) -> Result<ReceiverLease, RouteError> {
@@ -185,6 +230,47 @@ impl Drop for ReceiverLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BlockedForwarder(tokio::sync::Notify);
+
+    #[async_trait::async_trait]
+    impl AddressedForwarder for BlockedForwarder {
+        async fn forward(
+            &self,
+            _recipient: PeerId,
+            _frame: Frame,
+            _deadline: tokio::time::Instant,
+        ) -> Result<(), ForwardError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_holds_shared_budget_until_cancelled_and_owner_is_set_once() {
+        let switch = AddressedSwitch::new(NonZeroUsize::MIN, NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let forwarder = Arc::new(BlockedForwarder(tokio::sync::Notify::new()));
+        switch.set_forwarder(forwarder.clone()).unwrap();
+        assert!(matches!(
+            switch.set_forwarder(forwarder.clone()),
+            Err(ForwardError::AlreadyInstalled)
+        ));
+        let peer = PeerId::new();
+        let deadline = tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT;
+        {
+            let sending = switch.forward(peer, frame(peer), deadline);
+            tokio::pin!(sending);
+            tokio::select! {
+                result = &mut sending => panic!("forward unexpectedly ended: {result:?}"),
+                _ = forwarder.0.notified() => {}
+            }
+            assert!(matches!(
+                switch.reserve_frame(),
+                Err(RouteError::Backpressure)
+            ));
+        }
+        assert!(switch.reserve_frame().is_ok());
+    }
 
     fn frame(peer: PeerId) -> Frame {
         Frame {

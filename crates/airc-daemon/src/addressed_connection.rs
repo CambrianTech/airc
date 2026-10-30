@@ -41,6 +41,7 @@ pub enum AddressedAdmissionError {
     Trust(crate::trust_refresh::TrustRefreshError),
     Signature(airc_protocol::VerificationError),
     Queue(crate::addressed_switch::RouteError),
+    Forward(crate::addressed_switch::ForwardError),
 }
 
 impl std::fmt::Display for AddressedAdmissionError {
@@ -73,7 +74,7 @@ pub(crate) async fn route_request(
     tokio::select! {
         biased;
         _ = &mut shutdown => refusal("addressed daemon shutting down"),
-        result = tokio::time::timeout_at(deadline, admit_local(state, request.frame, deadline)) => match result {
+        result = tokio::time::timeout_at(deadline, admit_ipc(state, request.frame, deadline)) => match result {
             Ok(Ok(())) => Response::Ok,
             Ok(Err(error)) => refusal(error.to_string()),
             Err(_) => refusal("addressed deadline elapsed"),
@@ -86,6 +87,37 @@ async fn admit_local(
     frame: Frame,
     deadline: tokio::time::Instant,
 ) -> Result<(), AddressedAdmissionError> {
+    let peer = verify_addressed(state, &frame).await?;
+    state
+        .addressed
+        .route(peer, frame, deadline)
+        .map_err(AddressedAdmissionError::Queue)
+}
+
+async fn admit_ipc(
+    state: &DaemonState,
+    frame: Frame,
+    deadline: tokio::time::Instant,
+) -> Result<(), AddressedAdmissionError> {
+    let peer = verify_addressed(state, &frame).await?;
+    match state
+        .addressed
+        .route_if_owned(peer, frame, deadline)
+        .map_err(AddressedAdmissionError::Queue)?
+    {
+        crate::addressed_switch::LocalAdmission::Delivered => Ok(()),
+        crate::addressed_switch::LocalAdmission::Unowned(frame) => state
+            .addressed
+            .forward(peer, *frame, deadline)
+            .await
+            .map_err(AddressedAdmissionError::Forward),
+    }
+}
+
+async fn verify_addressed(
+    state: &DaemonState,
+    frame: &Frame,
+) -> Result<PeerId, AddressedAdmissionError> {
     if frame.kind != FrameKind::Addressed || frame.envelope.channel != addressed_channel() {
         return Err(AddressedAdmissionError::WrongKindOrChannel);
     }
@@ -101,13 +133,10 @@ async fn admit_local(
             Ok(registry) => registry,
             Err(error) => return Err(AddressedAdmissionError::Trust(error)),
         };
-    if let Err(error) = airc_protocol::verify(&frame, VerificationPolicy::Strict, &registry) {
+    if let Err(error) = airc_protocol::verify(frame, VerificationPolicy::Strict, &registry) {
         return Err(AddressedAdmissionError::Signature(error));
     }
-    state
-        .addressed
-        .route(*peer, frame, deadline)
-        .map_err(AddressedAdmissionError::Queue)
+    Ok(*peer)
 }
 
 pub(crate) async fn serve<R, W>(
@@ -246,6 +275,58 @@ mod tests {
     use airc_protocol::{PeerKeyRegistry, PeerKeypair};
     use airc_store::InMemoryEventStore;
     use tokio::io::AsyncWriteExt;
+
+    #[derive(Default)]
+    struct RecordingForwarder(std::sync::Mutex<Vec<Frame>>);
+
+    #[async_trait::async_trait]
+    impl crate::addressed_switch::AddressedForwarder for RecordingForwarder {
+        async fn forward(
+            &self,
+            recipient: PeerId,
+            frame: Frame,
+            _deadline: tokio::time::Instant,
+        ) -> Result<(), crate::addressed_switch::ForwardError> {
+            assert_eq!(frame.envelope.target, MentionTarget::Peer(recipient));
+            self.0.lock().unwrap().push(frame);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_prefers_local_owner_and_never_forwards_pressure_or_transport_ingress() {
+        let (_home, state, peer, key) = fixture().await;
+        let forwarder = Arc::new(RecordingForwarder::default());
+        state.addressed.set_forwarder(forwarder.clone()).unwrap();
+        let mut frame = test_frame(peer);
+        frame.envelope.signature = key.sign_envelope(&frame.envelope, peer, 0).unwrap();
+        let deadline = tokio::time::Instant::now() + airc_ipc::client::DEFAULT_RPC_TIMEOUT;
+        let mut owner = state.addressed.register(peer).unwrap();
+        admit_ipc(&state, frame.clone(), deadline).await.unwrap();
+        assert_eq!(owner.rx.recv().await.unwrap().frame, frame);
+        let mut permits = Vec::new();
+        while let Ok(permit) = state.addressed.reserve_frame() {
+            permits.push(permit);
+        }
+        assert!(matches!(
+            admit_ipc(&state, frame.clone(), deadline).await,
+            Err(AddressedAdmissionError::Queue(
+                crate::addressed_switch::RouteError::Backpressure
+            ))
+        ));
+        assert!(forwarder.0.lock().unwrap().is_empty());
+        drop(permits);
+        drop(owner);
+        assert!(matches!(
+            state.receive_addressed_frame(frame.clone()).await,
+            Err(AddressedAdmissionError::Queue(
+                crate::addressed_switch::RouteError::NoReceiver
+            ))
+        ));
+        assert!(forwarder.0.lock().unwrap().is_empty());
+        admit_ipc(&state, frame.clone(), deadline).await.unwrap();
+        assert_eq!(*forwarder.0.lock().unwrap(), vec![frame]);
+    }
 
     async fn fixture() -> (tempfile::TempDir, Arc<DaemonState>, PeerId, PeerKeypair) {
         let home = tempfile::tempdir().unwrap();
