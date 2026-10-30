@@ -92,6 +92,7 @@ mod transport_commands;
 mod update_artifact;
 mod update_commands;
 mod update_legacy;
+mod update_preflight;
 mod update_rollback;
 #[cfg(windows)]
 mod update_session;
@@ -655,6 +656,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Version => commands::run_version(),
+        Command::StorePreflight => update_preflight::run(&home).await,
 
         #[cfg(windows)]
         Command::SetupRecoverElevatedOwner {

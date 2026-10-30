@@ -283,9 +283,16 @@ impl Airc {
         // and hand them to in-process `send_with_delivery_ack`
         // waiters. Old peers never request acks, so they never see
         // these frames at all.
-        if let Some(ack) = airc_protocol::decode_delivery_ack(&frame) {
-            let _ = self.inner.ack_tx.send(ack);
-            return;
+        match airc_protocol::decode_delivery_ack(&frame) {
+            Ok(Some(ack)) => {
+                let _ = self.inner.ack_tx.send(ack);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(event_id = %frame.envelope.event_id, %error, "rejected malformed delivery receipt");
+                return;
+            }
         }
         // Addressed traffic is readable by its two ends only: it goes to its
         // owner before anything below could store or fan it out, on every

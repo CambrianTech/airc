@@ -434,6 +434,7 @@ fn install_prepared_update(
     socket: &Path,
     expected: &str,
 ) -> Result<InstalledUpdate, Box<dyn std::error::Error>> {
+    crate::update_preflight::candidate(prepared.artifact(), home)?;
     let maintenance = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
     // Preparation can outlive an operator stop or resume. Decide from current
     // owner state only after acquiring maintenance, and retain that guard
@@ -451,6 +452,9 @@ fn install_prepared_update(
             stop_daemon(socket)?;
             stopped = true;
         }
+        // Recheck after the writer stopped: a formerly empty old store may
+        // have gained history while the candidate was being prepared.
+        crate::update_preflight::candidate(prepared.artifact(), home)?;
         swap = Some(crate::update_rollback::BinarySwap::displace(
             airc_exe,
             prepared.artifact(),

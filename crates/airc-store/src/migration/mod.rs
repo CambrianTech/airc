@@ -192,3 +192,10 @@ mod tests {
         }
     }
 }
+
+/// Read-only classification admission shared with the schema migration itself.
+pub(crate) async fn check_classification_adoption(
+    db: &DatabaseConnection,
+) -> Result<(), StoreError> {
+    m20261030_000023_event_class::check_adoption(&SchemaManager::new(db)).await
+}

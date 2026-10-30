@@ -490,6 +490,10 @@ pub enum Command {
     /// package version.)
     Version,
 
+    /// Validate existing stores without mutation before adopting this binary.
+    #[command(hide = true)]
+    StorePreflight,
+
     /// Print the resolved daemon IPC socket path for this scope and exit.
     ///
     /// The canonical answer to "where does my daemon bind?". Consumers
@@ -759,8 +763,7 @@ mod tests {
     }
 }
 
-/// Frame kind selector for `airc publish`. Maps 1:1 onto
-/// `airc_protocol::FrameKind`.
+/// Explicit semantic class for `airc publish`; transport kind is derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum PublishClass {

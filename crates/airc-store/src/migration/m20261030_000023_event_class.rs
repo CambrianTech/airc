@@ -8,23 +8,9 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        for table in ["events", "bus_events"] {
-            let query = Query::select()
-                .column(Alias::new("event_id"))
-                .from(Alias::new(table))
-                .limit(1)
-                .to_owned();
-            if connection
-                .query_one(connection.get_database_backend().build(&query))
-                .await?
-                .is_some()
-            {
-                return Err(DbErr::Migration(format!(
-                    "classification upgrade refused: {table} contains pre-classification history; preserve this store and running binary; export audit records and resolve durable work obligations before adoption"
-                )));
-            }
-        }
+        check_adoption(manager)
+            .await
+            .map_err(|error| DbErr::Migration(error.to_string()))?;
         for table in ["events", "bus_events"] {
             for column in [
                 ColumnDef::new(Alias::new("class"))
@@ -69,6 +55,41 @@ impl MigrationTrait for Migration {
             "authenticated classification cannot be downgraded".into(),
         ))
     }
+}
+
+/// Shared candidate/migration admission. This inspects schema and row existence
+/// only; it never creates a table, advances versions, or interprets content.
+pub(super) async fn check_adoption(manager: &SchemaManager<'_>) -> Result<(), crate::StoreError> {
+    use crate::audit::AuditTable;
+    let connection = manager.get_connection();
+    for table in [AuditTable::Transcript, AuditTable::Bus] {
+        let name = table.name();
+        if !manager.has_table(name).await? {
+            continue;
+        }
+        let mut query = Query::select();
+        query
+            .column(Alias::new("event_id"))
+            .from(Alias::new(name))
+            .limit(1);
+        if manager.has_column(name, "class").await?
+            && manager.has_column(name, "class_family").await?
+        {
+            query.cond_where(
+                Condition::any()
+                    .add(Expr::col(Alias::new("class")).is_null())
+                    .add(Expr::col(Alias::new("class_family")).is_null()),
+            );
+        }
+        if connection
+            .query_one(connection.get_database_backend().build(&query))
+            .await?
+            .is_some()
+        {
+            return Err(crate::StoreError::PreclassificationHistory { table });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -140,6 +161,10 @@ mod tests {
             let observer = crate::SqliteDurableSink::open_read_only_path(&path)
                 .await
                 .expect("observer");
+            assert!(matches!(
+                observer.check_classification_adoption().await,
+                Err(crate::StoreError::PreclassificationHistory { .. })
+            ));
             let limit = std::num::NonZeroU32::new(1).expect("bound");
             let before = observer
                 .audit_page(table, None, limit)
@@ -194,7 +219,13 @@ mod tests {
             .await
             .expect("database");
         Migrator::up(&db, Some(22)).await.expect("old schema");
+        check_adoption(&SchemaManager::new(&db))
+            .await
+            .expect("empty preflight");
         apply_migrations(&db).await.expect("empty adoption");
+        check_adoption(&SchemaManager::new(&db))
+            .await
+            .expect("adopted preflight");
         assert!(SchemaManager::new(&db)
             .has_column("events", "class")
             .await

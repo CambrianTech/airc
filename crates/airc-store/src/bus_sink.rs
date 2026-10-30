@@ -213,6 +213,12 @@ impl SqliteDurableSink {
         })
     }
 
+    /// Read-only candidate admission. An incompatible populated store is a
+    /// typed refusal before the installer displaces the currently running build.
+    pub async fn check_classification_adoption(&self) -> Result<(), crate::StoreError> {
+        crate::migration::check_classification_adoption(&self.readers).await
+    }
+
     /// Retrieve original pre-classification records without migrations or
     /// interpretation. Open with `open_read_only_path` to inspect a refused
     /// store. Cursor is the last returned event ID; the requested limit is a

@@ -964,6 +964,11 @@ _install_airc_binary() {
     exit 0
   fi
   fi
+  # Candidate owns schema admission; never replace the working executable
+  # before it has inspected the durable stores without migrating them.
+  local preflight_home="${AIRC_HOME:-$HOME/.airc}"
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) preflight_home="$(_to_win_path "$preflight_home")" ;; esac
+  "$built" --home "$preflight_home" store-preflight || fail 'Candidate store preflight refused; installed binary retained'
   mkdir -p "$BIN_DIR"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)

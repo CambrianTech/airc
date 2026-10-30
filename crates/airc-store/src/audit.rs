@@ -14,7 +14,7 @@ pub enum AuditTable {
     Bus,
 }
 impl AuditTable {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Transcript => "events",
             Self::Bus => "bus_events",
