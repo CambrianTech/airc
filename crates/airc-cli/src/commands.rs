@@ -1948,7 +1948,7 @@ pub async fn run_daemon(
                 daemon: state.peer_id,
             },
         ))
-        .map_err(|error| anyhow::anyhow!("addressed forwarder installation failed: {error:?}"))?;
+        .map_err(|error| format!("addressed forwarder installation failed: {error:?}"))?;
     daemon_airc.set_inbound_frame_sink(Arc::new(
         airc_lib::RouterInboundBridge::new(state.router.clone(), state.coordinator_store.clone())
             // Self-healing join (the "blind room" heal): an inbound
