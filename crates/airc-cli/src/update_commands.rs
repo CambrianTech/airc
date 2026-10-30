@@ -447,7 +447,7 @@ fn install_prepared_update(
         .ok_or("cannot verify current binary before update; nothing displaced")?;
     let mut swap = None;
     let mut stopped = false;
-    let installed = prepared.install_after(|| {
+    let installed = prepared.install_after(home, || {
         if daemon_was_running {
             stop_daemon(socket)?;
             stopped = true;

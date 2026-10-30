@@ -49,7 +49,7 @@ impl PreparedInstall {
             bin_directory,
         };
         println!("Preparing and verifying the update while the daemon stays up…");
-        prepared.run("--prepare-artifact")?;
+        prepared.run("--prepare-artifact", None)?;
         if !prepared.artifact.is_file() {
             return Err("installer succeeded without producing the prepared artifact".into());
         }
@@ -60,17 +60,18 @@ impl PreparedInstall {
     /// installer work here consumes the snapshot, never the shared Cargo cache.
     pub fn install_after(
         &self,
+        home: &Path,
         before_install: impl FnOnce() -> Result<(), Error>,
     ) -> Result<(), Error> {
         before_install()?;
-        self.run("--prebuilt")
+        self.run("--prebuilt", Some(home))
     }
 
     pub(crate) fn artifact(&self) -> &Path {
         &self.artifact
     }
 
-    fn run(&self, mode: &str) -> Result<(), Error> {
+    fn run(&self, mode: &str, home: Option<&Path>) -> Result<(), Error> {
         #[cfg(windows)]
         let mut command = {
             let powershell = std::env::var_os("SystemRoot")
@@ -102,6 +103,9 @@ impl PreparedInstall {
                 .arg(&self.expected);
             command
         };
+        if let Some(home) = home {
+            command.env("AIRC_HOME", home);
+        }
         command
             .env("AIRC_DIR", &self.source)
             .env("AIRC_INSTALL_NO_PULL", "1")

@@ -583,7 +583,8 @@ impl Airc {
         for channel in &channels {
             if let Some(cursor) = self.channel_latest_cursor(*channel).await? {
                 if through.as_ref().is_none_or(|old: &TranscriptCursor| {
-                    (cursor.lamport, cursor.event_id) > (old.lamport, old.event_id)
+                    (cursor.lamport, cursor.event_id.as_uuid())
+                        > (old.lamport, old.event_id.as_uuid())
                 }) {
                     through = Some(cursor);
                 }
