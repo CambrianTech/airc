@@ -101,12 +101,20 @@ mod tests {
         for (k, v) in headers {
             h.insert(k.to_string(), v.to_string());
         }
+        // Test fixture semantics are explicit for every transport category.
+        use airc_core::{ActivityKind, ControlKind, CorrespondenceKind, EventClass};
+        let class = match kind {
+            FrameKind::Message => EventClass::Correspondence(CorrespondenceKind::Message),
+            FrameKind::Event => EventClass::Activity(ActivityKind::WorkState),
+            FrameKind::Control => EventClass::Control(ControlKind::Session),
+            FrameKind::Command => EventClass::Control(ControlKind::Command),
+            FrameKind::CommandResult => EventClass::Control(ControlKind::CommandResult),
+            FrameKind::Addressed => EventClass::Control(ControlKind::Addressed),
+        };
         Frame {
             kind,
             envelope: Envelope {
-                class: airc_core::EventClass::Correspondence(
-                    airc_core::CorrespondenceKind::Message,
-                ),
+                class,
                 event_id: EventId::from_u128(0x01),
                 sender: PeerId::from_u128(0xa1),
                 sender_client: ClientId::from_u128(0xc1),

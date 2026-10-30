@@ -268,14 +268,14 @@ mod tests {
 
     use super::*;
 
-    fn event(room_id: RoomId, kind: TranscriptKind) -> TranscriptEvent {
+    fn event(room_id: RoomId) -> TranscriptEvent {
         TranscriptEvent {
             class: airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             event_id: EventId::new(),
             room_id,
             peer_id: PeerId::from_u128(0xa1),
             client_id: ClientId::from_u128(0xc1),
-            kind,
+            kind: TranscriptKind::Message,
             occurred_at_ms: 1,
             lamport: 1,
             target: MentionTarget::All,
@@ -293,7 +293,7 @@ mod tests {
             selection: airc_core::EventSelection::Correspondence,
             ..EventFilter::default()
         };
-        let mut value = event(RoomId::new(), TranscriptKind::Message);
+        let mut value = event(RoomId::new());
         for body in [
             Body::text("Codex: @Fable 🛠️ {\"kind\":\"alive\"}"),
             Body::Binary(vec![255, 0, 7]),
@@ -308,7 +308,7 @@ mod tests {
     }
 
     fn event_from(room_id: RoomId, peer: PeerId, client: ClientId) -> TranscriptEvent {
-        let mut ev = event(room_id, TranscriptKind::Message);
+        let mut ev = event(room_id);
         ev.peer_id = peer;
         ev.client_id = client;
         ev
@@ -323,8 +323,8 @@ mod tests {
             ..EventFilter::default()
         };
 
-        assert!(filter.matches(&event(admitted, TranscriptKind::Message)));
-        assert!(!filter.matches(&event(other, TranscriptKind::Message)));
+        assert!(filter.matches(&event(admitted)));
+        assert!(!filter.matches(&event(other)));
     }
 
     // what this catches: the DISPLAY-only self-echo suppression. An agent's
@@ -372,7 +372,7 @@ mod tests {
             message: "durable replay unavailable".into(),
         };
         tx.send(Err(failure.clone())).await.expect("failure");
-        tx.send(Ok(Arc::new(event(RoomId::new(), TranscriptKind::Message))))
+        tx.send(Ok(Arc::new(event(RoomId::new()))))
             .await
             .expect("queued sibling event");
         let task = tokio::spawn(std::future::pending::<()>());
@@ -396,10 +396,8 @@ mod tests {
         use futures::StreamExt;
         let (tx, rx) = broadcast::channel(1);
         let mut stream = EventStream::from_broadcast(rx);
-        tx.send(Arc::new(event(RoomId::new(), TranscriptKind::Message)))
-            .expect("first");
-        tx.send(Arc::new(event(RoomId::new(), TranscriptKind::Message)))
-            .expect("second");
+        tx.send(Arc::new(event(RoomId::new()))).expect("first");
+        tx.send(Arc::new(event(RoomId::new()))).expect("second");
         assert!(matches!(
             stream.next().await,
             Some(Err(StreamError::Lag(LiveLag { skipped: 1 })))

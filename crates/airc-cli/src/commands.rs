@@ -1281,6 +1281,7 @@ pub async fn run_send(
         .publish(
             target,
             airc_protocol::FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             airc_core::Body::text(text),
             runtime_headers()?,
         )
@@ -2669,6 +2670,7 @@ pub async fn run_msg(
         .publish(
             target,
             airc_protocol::FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             airc_core::Body::text(text),
             runtime_headers()?,
         )

@@ -481,7 +481,6 @@ fn kind_and_delivery_text_round_trip_every_variant() {
         assert_eq!(kind_from_text(kind_to_text(kind)).unwrap(), kind);
     }
     for delivery in [
-        airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
         DeliveryClass::Durable,
         DeliveryClass::EphemeralLatest,
         DeliveryClass::EphemeralWindow,

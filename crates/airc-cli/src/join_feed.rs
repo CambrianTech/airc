@@ -342,6 +342,7 @@ mod tests {
         airc.publish(
             airc_lib::PublishTarget::RoomByName(other.to_string()).to_peer(airc.peer_id()),
             airc_protocol::FrameKind::Message,
+            airc_core::EventClass::Correspondence(airc_core::CorrespondenceKind::Message),
             Body::text("direct-challenge"),
             Headers::from([(HEADER_AIRC_CLIENT.to_string(), "claude:peer".to_string())]),
         )

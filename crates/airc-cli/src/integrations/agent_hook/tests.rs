@@ -383,7 +383,7 @@ async fn names_in_body_do_not_address_pre_attach_history() {
     let summary = summarize(&mut turn, &me, |_| true).await.unwrap();
     assert_eq!(
         lamports(&summary.addressed),
-        [],
+        Vec::<u64>::new(),
         "names in the body are not routing metadata"
     );
     assert_eq!(
@@ -399,7 +399,7 @@ async fn names_in_body_do_not_address_pre_attach_history() {
         let summary = summarize(&mut turn, &other, |_| true).await.unwrap();
         assert_eq!(
             lamports(&summary.addressed),
-            [],
+            Vec::<u64>::new(),
             "body names never direct delivery"
         );
         assert_eq!(

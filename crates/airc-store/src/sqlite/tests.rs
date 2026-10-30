@@ -706,6 +706,7 @@ async fn typed_history_survives_activity_flood_and_agrees_with_count() {
     for n in 2..100 {
         let mut activity = make_event(n, room, "please answer this ordinary-looking prose");
         activity.class = EventClass::Activity(ActivityKind::WorkReceipt);
+        activity.kind = activity.class.transcript_kind();
         store.append(activity).await.expect("activity");
     }
     let mut state = make_event(100, room, "work obligation");
