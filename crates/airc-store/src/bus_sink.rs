@@ -86,8 +86,7 @@ impl SqliteDurableSink {
         db_url: &str,
         admission: crate::custody::Admission,
     ) -> Result<Self, BusError> {
-        let custody =
-            crate::custody::WriteGate::new(admission).map_err(|e| BusError::Sink(e.to_string()))?;
+        let custody = crate::custody::WriteGate::new(admission).map_err(BusError::sink_source)?;
         let mut opts = Self::pool_options(db_url);
         // WAL + the busy timeout ride the connection options so the journal switch
         // never needs a separate exclusive statement racing another opener — see
@@ -101,17 +100,15 @@ impl SqliteDurableSink {
                 .synchronous(SqliteSynchronous::Normal)
                 .busy_timeout(POOL_ACQUIRE_TIMEOUT)
         });
+        let write = custody.admit().map_err(BusError::sink_source)?;
         let db = Database::connect(opts)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         // Migrate forward atomically, derive what rows owe, and refuse a DB
         // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
-        {
-            let _write = custody.admit().map_err(|e| BusError::Sink(e.to_string()))?;
-            crate::migration::apply_migrations(&db)
-                .await
-                .map_err(|e| BusError::Sink(e.to_string()))?;
-        }
+        crate::migration::apply_migrations(&db)
+            .await
+            .map_err(BusError::sink_source)?;
         // Inspect the driver's resolved mode rather than guessing from the
         // input URL. Reopening a memory URL can create a different database;
         // shared-cache memory also lacks file-WAL reader/writer isolation.
@@ -156,8 +153,9 @@ impl SqliteDurableSink {
             opts.map_sqlx_sqlite_opts(move |_| read_options.clone());
             Database::connect(opts)
                 .await
-                .map_err(|e| BusError::Sink(e.to_string()))?
+                .map_err(BusError::sink_source)?
         };
+        drop(write);
         Ok(Self {
             db,
             readers,
@@ -168,13 +166,10 @@ impl SqliteDurableSink {
     /// Admit one write: custody, then no migration past this binary since
     /// open ([`crate::SqliteEventStore::admit_write`] is the same rule).
     async fn admit_write(&self) -> Result<crate::custody::WriteTicket<'_>, BusError> {
-        let ticket = self
-            .custody
-            .admit()
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+        let ticket = self.custody.admit().map_err(BusError::sink_source)?;
         crate::migration::refuse_if_ahead(&self.db)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         Ok(ticket)
     }
 
@@ -183,10 +178,10 @@ impl SqliteDurableSink {
     pub async fn open_path(path: &Path) -> Result<Self, BusError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| BusError::Sink(e.to_string()))?;
+                std::fs::create_dir_all(parent).map_err(BusError::sink_source)?;
             }
         }
-        let admission = crate::custody::resolve(path).map_err(|e| BusError::Sink(e.to_string()))?;
+        let admission = crate::custody::resolve(path).map_err(BusError::sink_source)?;
         Self::open(&sqlite_file_url(path), admission).await
     }
 
@@ -208,13 +203,13 @@ impl SqliteDurableSink {
         });
         let db = Database::connect(opts)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         // Read-only: SQLite refuses its writes, so they need no admission.
         Ok(Self {
             readers: db.clone(),
             db,
             custody: crate::custody::WriteGate::new(crate::custody::Admission::Unmanaged)
-                .map_err(|e| BusError::Sink(e.to_string()))?,
+                .map_err(BusError::sink_source)?,
         })
     }
 
@@ -309,7 +304,7 @@ impl DurableSink for SqliteDurableSink {
                 query
                     .all(&self.readers)
                     .await
-                    .map_err(|e| BusError::Sink(e.to_string()))?,
+                    .map_err(BusError::sink_source)?,
             );
         }
         crate::event_table::merge_branches(
@@ -346,7 +341,7 @@ impl DurableSink for SqliteDurableSink {
             .into_tuple()
             .one(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         let Some((count, oldest, newest)) = row else {
             return Ok(airc_core::HistoryCount::default());
         };
@@ -410,7 +405,7 @@ impl DurableSink for SqliteDurableSink {
             .limit(bounded)
             .all(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
 
         rows.into_iter().map(from_model).collect()
     }
@@ -448,7 +443,7 @@ impl DurableSink for SqliteDurableSink {
             .limit(bounded)
             .all(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
 
         // DESC off the index, ascending to the caller.
         rows.into_iter().rev().map(from_model).collect()
@@ -486,7 +481,7 @@ impl DurableSink for SqliteDurableSink {
             .limit(bounded)
             .all(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
 
         rows.into_iter().rev().map(from_model).collect()
     }
@@ -504,7 +499,7 @@ impl DurableSink for SqliteDurableSink {
             .order_by_desc(bus_event::Column::EventId)
             .one(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         Ok(row.map(|r| {
             Cursor::new(
                 airc_bus::Seq::new(r.epoch as u64, r.counter as u64),
@@ -519,7 +514,7 @@ impl DurableSink for SqliteDurableSink {
         let row = bus_event::Entity::find_by_id(event_id.as_uuid())
             .one(&self.readers)
             .await
-            .map_err(|e| BusError::Sink(e.to_string()))?;
+            .map_err(BusError::sink_source)?;
         Ok(row.is_some())
     }
 }

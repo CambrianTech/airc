@@ -17,6 +17,10 @@ pub enum BusError {
     #[error("durable sink error: {0}")]
     Sink(String),
 
+    /// An underlying sink failure whose typed cause remains inspectable.
+    #[error("durable sink error: {0}")]
+    SinkSource(#[source] Box<dyn std::error::Error + Send + Sync>),
+
     /// A subscriber's bounded live channel filled and the subscriber was
     /// marked lagged (§3.5). Not fatal — the subscriber resumes from the sink.
     #[error("subscriber lagged behind the live stream")]
@@ -25,3 +29,9 @@ pub enum BusError {
 
 /// Crate result alias.
 pub type Result<T> = std::result::Result<T, BusError>;
+
+impl BusError {
+    pub fn sink_source(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::SinkSource(Box::new(error))
+    }
+}
