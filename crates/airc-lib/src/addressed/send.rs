@@ -18,12 +18,10 @@ impl Airc {
         msg: AddressedSend,
         deadline: Instant,
     ) -> Result<(), AddressedError> {
-        if self.is_daemon_attached() {
-            return Err(AddressedError::DaemonPathNotBuilt);
-        }
         if Instant::now() >= deadline {
             return Err(AddressedError::DeadlineExceeded);
         }
+        let _owner = self.addressed_daemon_owner(deadline).await?;
         tokio::time::timeout_at(deadline, self.send_addressed_by(msg, deadline))
             .await
             .unwrap_or(Err(AddressedError::DeadlineExceeded))
@@ -115,6 +113,12 @@ impl Airc {
             .keypair
             .sign_envelope(&frame.envelope, self.inner.identity.peer_id, 0)
             .map_err(|error| AddressedError::Codec(error.to_string()))?;
+        if let Some(client) = &self.inner.daemon_client {
+            return client
+                .send_addressed(frame)
+                .await
+                .map_err(|error| AddressedError::Transport(error.to_string()));
+        }
         let route = self
             .resolve_send_route(FrameKind::Addressed, &target)
             .await

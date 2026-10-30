@@ -75,9 +75,18 @@ fn an_addressed_request_and_its_result_reach_only_their_two_ends() {
             .await
             .expect("bob-carol");
 
-        let mut alice_inbox = alice.addressed_inbox();
-        let mut bob_inbox = bob.addressed_inbox();
-        let mut carol_inbox = carol.addressed_inbox();
+        let mut alice_inbox = alice
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut bob_inbox = bob
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut carol_inbox = carol
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         let correlation = Uuid::new_v4();
         let deadline = Instant::now() + Duration::from_secs(10);
 
@@ -219,7 +228,10 @@ fn a_lost_first_init_ends_in_its_deadline_and_the_next_send_completes() {
             .connect_lan(addr, bob.peer_id())
             .await
             .expect("connect");
-        let mut inbox = bob.addressed_inbox();
+        let mut inbox = bob
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         alice
             .send_addressed(
                 command(bob.peer_id(), "once linked"),
@@ -250,7 +262,10 @@ fn a_restarted_addressee_rekeys_and_the_next_send_opens() {
             .connect_lan(addr, bob.peer_id())
             .await
             .expect("connect");
-        let mut inbox = bob.addressed_inbox();
+        let mut inbox = bob
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         alice
             .send_addressed(command(bob.peer_id(), "before restart"), deadline)

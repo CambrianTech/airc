@@ -199,7 +199,10 @@ async fn embedding_request_reply_resolves_before_deadline() {
 /// the model slug rode as a header (the routing/space identity), and reply
 /// `EmbeddingEmitted` correlating the command bus.
 async fn facility_answers_one_embedding(facility: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = facility.addressed_inbox();
+    let mut stream = facility
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let _ = ready.send(());
     loop {
         let Ok(event) = stream.next().await else {

@@ -91,7 +91,10 @@ async fn consumer_contracts_round_trip_over_lan_command_bus() {
 }
 
 async fn handle_three_consumer_requests(bob: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = bob.addressed_inbox();
+    let mut stream = bob
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let _ = ready.send(());
     let mut handled = 0usize;
     while handled < 3 {

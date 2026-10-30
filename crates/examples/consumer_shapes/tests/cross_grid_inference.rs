@@ -177,7 +177,10 @@ async fn remote_inference_resolves_and_round_trips_end_to_end() {
 /// `TurnRequested`, reply with the canned `TurnEmitted` echoing the
 /// command-bus correlation via `reply_turn_emitted`.
 async fn stub_persona_answers_one_turn(server: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = server.addressed_inbox();
+    let mut stream = server
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let _ = ready.send(());
     loop {
         let Ok(event) = stream.next().await else {

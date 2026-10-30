@@ -149,7 +149,9 @@ async fn run_bridge(
     base_url: &str,
     cfg: &GenConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = airc.addressed_inbox();
+    let mut stream = airc
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await?;
     let mut readvertise = tokio::time::interval(READVERTISE_EVERY);
     readvertise.tick().await; // first tick is immediate; already advertised at startup
 
@@ -296,7 +298,10 @@ mod tests {
             .await
             .unwrap();
         sender.connect_lan(addr, receiver.peer_id()).await.unwrap();
-        let mut inbox = receiver.addressed_inbox();
+        let mut inbox = receiver
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         for (wire_kind, admitted) in [("turn_requested", true), ("turn_emitted", false)] {
             let mut headers = airc_lib::Headers::new();
             headers.insert(HEADER_FORGE_PERSONA_KIND.to_string(), wire_kind.to_string());

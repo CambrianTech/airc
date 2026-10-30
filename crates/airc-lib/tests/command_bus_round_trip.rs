@@ -215,7 +215,10 @@ async fn wait_for_relay_peers(relay: &RelayServer, expected: &[PeerId]) {
 
 // Arm before spawning: no timing sleep can stand in for subscription readiness.
 fn respond_once(bob: &Airc, text: &'static str) -> tokio::task::JoinHandle<()> {
-    let mut inbox = bob.addressed_inbox();
+    let mut inbox = bob
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let bob = bob.clone();
     tokio::spawn(async move {
         let event = tokio::time::timeout(Duration::from_secs(3), inbox.next())

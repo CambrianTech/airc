@@ -14,6 +14,7 @@
 //! authenticated by the session (the handshake pins `from` to its enrolled
 //! identity key; the AEAD covers the rest), never read from a header.
 
+mod daemon;
 mod receive;
 mod send;
 
@@ -100,9 +101,6 @@ pub enum AddressedError {
     Codec(String),
     /// No session formed before the caller's deadline.
     DeadlineExceeded,
-    /// This handle is attached to a machine daemon, whose routing of addressed
-    /// frames is not built yet. Refused rather than sent any other way.
-    DaemonPathNotBuilt,
 }
 
 impl std::fmt::Display for AddressedError {
@@ -114,10 +112,6 @@ impl std::fmt::Display for AddressedError {
             AddressedError::DeadlineExceeded => {
                 write!(f, "addressed: no session with the peer before the deadline")
             }
-            AddressedError::DaemonPathNotBuilt => write!(
-                f,
-                "addressed: a daemon-attached handle cannot send addressed traffic yet"
-            ),
         }
     }
 }
@@ -127,6 +121,7 @@ impl std::error::Error for AddressedError {}
 /// Every [`VerifiedAddressed`] for this identity, from any peer.
 pub struct AddressedInbox {
     rx: broadcast::Receiver<Arc<VerifiedAddressed>>,
+    owner: Option<Arc<daemon::DaemonOwner>>,
 }
 
 /// Why [`AddressedInbox::next`] returned no payload.
@@ -143,7 +138,20 @@ pub enum InboxError {
 impl AddressedInbox {
     /// The next payload, or why there is none.
     pub async fn next(&mut self) -> Result<Arc<VerifiedAddressed>, InboxError> {
-        match self.rx.recv().await {
+        let received = if let Some(owner) = &self.owner {
+            let mut closed = owner.closed.clone();
+            if *closed.borrow() {
+                return Err(InboxError::Closed);
+            }
+            tokio::select! {
+                biased;
+                _ = closed.changed() => return Err(InboxError::Closed),
+                result = self.rx.recv() => result,
+            }
+        } else {
+            self.rx.recv().await
+        };
+        match received {
             Ok(item) => Ok(item),
             Err(broadcast::error::RecvError::Lagged(lost)) => Err(InboxError::Lagged { lost }),
             Err(broadcast::error::RecvError::Closed) => Err(InboxError::Closed),
@@ -154,6 +162,7 @@ impl AddressedInbox {
 /// Per-identity addressed state, shared by every handle on the identity.
 pub(crate) struct AddressedState {
     sessions: SessionManager,
+    daemon_owner: tokio::sync::Mutex<std::sync::Weak<daemon::DaemonOwner>>,
     inbox_tx: broadcast::Sender<Arc<VerifiedAddressed>>,
     /// Bumped whenever a session is installed, so senders waiting on a
     /// handshake wake and re-check.
@@ -168,6 +177,7 @@ impl AddressedState {
     ) -> Self {
         let (inbox_tx, _) = broadcast::channel(inbox_capacity);
         Self {
+            daemon_owner: tokio::sync::Mutex::new(std::sync::Weak::new()),
             sessions: SessionManager::new(identity.keypair.clone(), identity.peer_id, registry),
             inbox_tx,
             established: watch::Sender::new(0),
@@ -189,10 +199,13 @@ impl crate::Airc {
     }
 
     /// Every payload addressed to this identity, from any peer, in any room.
-    pub fn addressed_inbox(&self) -> AddressedInbox {
-        AddressedInbox {
-            rx: self.inner.addressed.inbox_tx.subscribe(),
-        }
+    pub async fn addressed_inbox(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<AddressedInbox, AddressedError> {
+        let rx = self.inner.addressed.inbox_tx.subscribe();
+        let owner = self.addressed_daemon_owner(deadline).await?;
+        Ok(AddressedInbox { rx, owner })
     }
 }
 
@@ -206,7 +219,7 @@ mod tests {
     #[tokio::test]
     async fn a_lagging_inbox_reports_its_loss_then_continues() {
         let (tx, rx) = broadcast::channel(1);
-        let mut inbox = AddressedInbox { rx };
+        let mut inbox = AddressedInbox { rx, owner: None };
         let item = |n: u128| {
             Arc::new(VerifiedAddressed {
                 from: PeerId::from_u128(n),

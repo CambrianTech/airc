@@ -62,7 +62,10 @@ fn lan_request_reply_latency() {
         alice.connect_lan(bob_addr, bob.peer_id()).await.unwrap();
 
         // Persistent echo responder.
-        let mut inbox = bob.addressed_inbox();
+        let mut inbox = bob
+            .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         let bob_handle = bob.clone();
         tokio::spawn(async move {
             loop {

@@ -58,7 +58,7 @@ async fn proof_lan_loopback(
         .listen_lan(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await?;
     alice.connect_lan(bob_addr, bob.peer_id()).await?;
-    let handler = spawn_reply_handler(bob.clone(), "route.proof.lan.result");
+    let handler = spawn_reply_handler(bob.clone(), "route.proof.lan.result", timeout).await?;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let start = Instant::now();
@@ -135,7 +135,7 @@ async fn proof_relay_loopback(
     alice.replace_transport_health(relay_only)?;
     bob.replace_transport_health(relay_only)?;
 
-    let handler = spawn_reply_handler(bob.clone(), "route.proof.relay.result");
+    let handler = spawn_reply_handler(bob.clone(), "route.proof.relay.result", timeout).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let start = Instant::now();
@@ -208,12 +208,18 @@ async fn enrol_pair(
     Ok((alice_spec, bob_spec))
 }
 
-fn spawn_reply_handler(
+async fn spawn_reply_handler(
     responder: Airc,
     result_hint: &'static str,
-) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-    let mut inbox = responder.addressed_inbox();
-    tokio::spawn(async move {
+    timeout: Duration,
+) -> Result<
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    Box<dyn std::error::Error>,
+> {
+    let mut inbox = responder
+        .addressed_inbox(tokio::time::Instant::now() + timeout)
+        .await?;
+    Ok(tokio::spawn(async move {
         let event = inbox
             .next()
             .await
@@ -227,7 +233,7 @@ fn spawn_reply_handler(
             .reply(&event, headers, Body::text("route-proof-pong"))
             .await?;
         Ok(())
-    })
+    }))
 }
 async fn join_reply_handler(
     handler: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,

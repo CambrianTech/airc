@@ -13,6 +13,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteError {
     ReceiverLimit,
+    ReceiverBusy,
     NoReceiver,
     Backpressure,
     Closed,
@@ -56,7 +57,10 @@ impl AddressedSwitch {
 
     pub(crate) fn register(self: &Arc<Self>, peer: PeerId) -> Result<ReceiverLease, RouteError> {
         let mut entries = self.entries.lock().map_err(|_| RouteError::StatePoisoned)?;
-        if !entries.contains_key(&peer) && entries.len() >= self.receiver_limit {
+        if entries.contains_key(&peer) {
+            return Err(RouteError::ReceiverBusy);
+        }
+        if entries.len() >= self.receiver_limit {
             return Err(RouteError::ReceiverLimit);
         }
         let generation = Uuid::new_v4();
@@ -142,20 +146,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_connection_cannot_unregister_replacement_and_receiver_limit_is_hard() {
+    fn live_receiver_cannot_be_replaced_and_receiver_limit_is_hard() {
         let one = NonZeroUsize::new(1).unwrap();
         let switch = AddressedSwitch::new(one, one, one);
         let peer = PeerId::new();
         let old = switch.register(peer).unwrap();
-        let replacement = switch.register(peer).unwrap();
-        assert!(!old.is_current().unwrap());
-        drop(old);
-        assert!(replacement.is_current().unwrap());
+        assert!(matches!(
+            switch.register(peer),
+            Err(RouteError::ReceiverBusy)
+        ));
+        assert!(old.is_current().unwrap());
         assert!(matches!(
             switch.register(PeerId::new()),
             Err(RouteError::ReceiverLimit)
         ));
-        drop(replacement);
+        drop(old);
         assert!(switch.register(PeerId::new()).is_ok());
     }
 }

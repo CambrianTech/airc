@@ -84,7 +84,10 @@ impl Airc {
         let deadline_at_ms = now_ms()?
             .checked_add(millis)
             .ok_or_else(|| AircError::Transport("command deadline exceeds wire range".into()))?;
-        let inbox = self.addressed_inbox();
+        let inbox = self
+            .addressed_inbox(deadline)
+            .await
+            .map_err(|error| AircError::Transport(error.to_string()))?;
         headers.insert(
             HEADER_AIRC_CORRELATION_ID.into(),
             correlation_id.to_string(),

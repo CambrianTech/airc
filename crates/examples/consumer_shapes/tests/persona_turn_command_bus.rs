@@ -110,7 +110,10 @@ async fn turn_request_reply_resolves_await_reply_before_deadline() {
 }
 
 async fn handle_one_turn_request(persona: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = persona.addressed_inbox();
+    let mut stream = persona
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let _ = ready.send(());
     loop {
         let Ok(event) = stream.next().await else {

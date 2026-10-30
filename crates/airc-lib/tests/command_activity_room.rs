@@ -14,7 +14,10 @@ async fn addressed_request_survives_default_room_changes() {
     alice.join("alice-activity").await.unwrap();
     bob.join("bob-activity").await.unwrap();
     let recipient = bob.peer_id();
-    let mut inbox = bob.addressed_inbox();
+    let mut inbox = bob
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let responder = tokio::spawn(async move {
         let event = tokio::time::timeout(Duration::from_secs(5), inbox.next())
             .await
