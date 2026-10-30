@@ -156,9 +156,9 @@ impl DaemonState {
             // Explicit addressed admission: at most 64 recipients and 16 in-flight
             // frames node-wide (IPC limits each frame to 16 MiB), four per peer.
             addressed: crate::addressed_switch::AddressedSwitch::new(
-                std::num::NonZeroUsize::new(64).unwrap(),
-                std::num::NonZeroUsize::new(16).unwrap(),
-                std::num::NonZeroUsize::new(4).unwrap(),
+                std::num::NonZeroUsize::MIN.saturating_add(63),
+                std::num::NonZeroUsize::MIN.saturating_add(15),
+                std::num::NonZeroUsize::MIN.saturating_add(3),
             ),
             shared_frames: crate::shared_frames::SharedFrames::default(),
             peer_id,
