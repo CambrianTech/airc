@@ -116,7 +116,7 @@ pub use airc_protocol::{
 pub use capability_registry::{
     CapabilityCandidate, CapabilityEntry, CapabilityQuery, CapabilityRegistry, DEFAULT_OFFER_TTL_MS,
 };
-pub use command_bus::PendingCommand;
+pub use command_bus::{CommandEvent, PendingCommand};
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now,
     drain_stale_store as coordinator_drain_stale_store,

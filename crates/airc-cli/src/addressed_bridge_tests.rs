@@ -326,6 +326,44 @@ async fn attached_sdk_scopes_exchange_encrypted_command_and_result() {
         assert_eq!(received.correlation(), correlation);
         assert_eq!(received.body().as_text(), Some(body));
     }
+    let mut pending = alice
+        .request(
+            airc_core::MentionTarget::Peer(bob.peer_id()),
+            Default::default(),
+            airc_core::Body::text("progress request"),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    let request = tokio::time::timeout_at(deadline, bob_inbox.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.correlation(), pending.correlation_id);
+    let mut headers = airc_core::Headers::new();
+    headers.insert(airc_lib::HEADER_STREAM_FINAL.into(), "true".into());
+    bob.reply_progress(&request, headers, airc_core::Body::text("last progress"))
+        .await
+        .unwrap();
+    bob.reply(
+        &request,
+        Default::default(),
+        airc_core::Body::text("settled result"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(alice.next_command_event(&mut pending).await.unwrap(),
+        airc_lib::CommandEvent::Progress(frame) if frame.body().as_text() == Some("last progress"))
+    );
+    assert!(
+        matches!(alice.next_command_event(&mut pending).await.unwrap(),
+        airc_lib::CommandEvent::Completed(frame) if frame.body().as_text() == Some("settled result"))
+    );
+    assert!(matches!(
+        alice.next_command_event(&mut pending).await,
+        Err(airc_lib::AircError::CommandFinished { .. })
+    ));
     for (machine, baseline) in [&a, &b].into_iter().zip(before) {
         let store =
             airc_store::SqliteEventStore::open_path(&machine.home.path().join("events.sqlite"))
