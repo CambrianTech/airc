@@ -578,11 +578,20 @@ fn every_custody_change_moves_the_fence_and_an_idempotent_report_does_not() {
     let cleared = tier.fence();
     assert_eq!(tier.report_held(release(&second, 1, 10)), Ok(amount(30)));
     let released = tier.fence();
-    assert_eq!(released.generation, cleared.generation, "a release is not a clearing");
+    assert_eq!(
+        released.generation, cleared.generation,
+        "a release is not a clearing"
+    );
     assert_ne!(released, cleared, "a release changes what is free");
     assert_eq!(tier.report_held(release(&second, 1, 10)), Ok(amount(0)));
-    assert_eq!(tier.fence(), released, "the same report again changes nothing");
-    let lease = grant(&second, 2).map(|g| g.lease).expect("test: B holds a lease");
+    assert_eq!(
+        tier.fence(),
+        released,
+        "the same report again changes nothing"
+    );
+    let lease = grant(&second, 2)
+        .map(|g| g.lease)
+        .expect("test: B holds a lease");
     assert_eq!(tier.withdraw(ClaimId(2), lease), Ok(amount(10)));
     assert_ne!(tier.fence(), released, "a withdrawal changes what is free");
 }
