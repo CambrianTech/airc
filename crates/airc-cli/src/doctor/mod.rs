@@ -454,6 +454,54 @@ mod tests {
             .contains("IPC unavailable"));
     }
 
+    // A successful daemon observation must not open, create, or migrate stores.
+    #[tokio::test]
+    async fn fresh_delivery_observation_does_not_touch_scope_files(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let home = directory.path().join("scope");
+        let now = health::now_ms().ok_or("clock unavailable")?;
+        let context = CheckContext {
+            home: &home,
+            delivery_stats: tokio::sync::OnceCell::new(),
+        };
+        context
+            .delivery_stats
+            .set(Ok(airc_ipc::DeliveryStatsResponse {
+                peers: vec![airc_ipc::IpcPeerDeliveryStats {
+                    peer_id: airc_core::PeerId::from_u128(42),
+                    attempts: 1,
+                    acked: 1,
+                    attempts_since_ack: 0,
+                    last_attempt_ms: Some(now),
+                    last_ack_ms: Some(now),
+                    rtt_ema_ms: Some(1),
+                    suspect: false,
+                }],
+                sampled_at_ms: Some(now),
+                connected_lan_peers: Some(1),
+            }))
+            .map_err(|_| "snapshot already set")?;
+        for existing in [false, true] {
+            if existing {
+                std::fs::create_dir(&home)?;
+                std::fs::write(home.join("events.db"), b"older store sentinel")?;
+            }
+            let findings = delivery::DeliveryTruthCheck.run(&context).await;
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].status, Status::Ok);
+            if existing {
+                assert_eq!(
+                    std::fs::read(home.join("events.db"))?,
+                    b"older store sentinel"
+                );
+                assert_eq!(std::fs::read_dir(&home)?.count(), 1);
+            } else {
+                assert!(!home.exists());
+            }
+        }
+        Ok(())
+    }
     // Both registered checks must retain a failed shared read as unavailable;
     // neither may open another handle or replace it with an empty success.
     #[tokio::test]

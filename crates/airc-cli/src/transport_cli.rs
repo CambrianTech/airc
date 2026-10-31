@@ -8,13 +8,13 @@ pub struct TransportArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TransportAction {
-    /// Inspect substrate route health.
+    /// Inspect daemon route and delivery observations without refreshing discovery.
     Health {
         /// Suppress output; exit code still reports degraded health.
         #[arg(long)]
         quiet: bool,
 
-        /// Print only degraded route rows.
+        /// Print only warnings, including missing or stale observations.
         #[arg(long)]
         degraded_only: bool,
 
@@ -23,8 +23,8 @@ pub enum TransportAction {
         fail: bool,
 
         /// Emit a single line of structured JSON instead of prose.
-        /// Shape: `{"verdict": {"kind": "ok|degraded|no-routes", ...},
-        /// "endpoints": N, "lan_peers": N, "samples": [...]}`.
+        /// Shape: `{"requires_attention": bool, "findings": [{"status": ...,
+        /// "check": ..., "detail": ..., "fix": ...}]}`.
         #[arg(long)]
         json: bool,
     },
