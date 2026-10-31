@@ -9,11 +9,21 @@ use crate::claim::{Claim, ClaimId, Floor, Increment};
 use crate::value::{NonFinite, Price, Value};
 
 /// Each claim's target (its reservation plus what it was granted past it), in the order the claims
-/// were given, the price, and what no claim wanted.
+/// were given; the scarcity price; what no claim wanted; and the value achieved past the
+/// reservations.
 pub(crate) struct Solution<U: Unit> {
     pub targets: Vec<Amount<U>>,
     pub price: Price<U>,
     pub unallocated: Amount<U>,
+    pub achieved: Value,
+}
+
+/// Whether indivisible blocks keep their shape (the clearing) or are relaxed to divisible (the upper
+/// bound on the optimum that the clearing's achieved value is reported against).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape {
+    AsClaimed,
+    Relaxed,
 }
 
 /// One candidate: a claim's next block, ordered by value per unit, then by the LOWER claim id
@@ -51,7 +61,7 @@ impl<U: Unit> Ord for Candidate<U> {
 /// A claim's blocks past its reservation: an optional floor joins its leading increments into one
 /// indivisible block (below the floor the claim takes nothing), priced at their average, which is
 /// never below the next increment's value per unit because the increments are concave.
-fn blocks<U: Unit>(claim: &Claim<U>) -> Result<Vec<Increment<U>>, NonFinite> {
+pub(crate) fn blocks<U: Unit>(claim: &Claim<U>) -> Result<Vec<Increment<U>>, NonFinite> {
     let Floor::Optional(floor) = claim.floor else {
         return Ok(claim.increments.clone());
     };
@@ -94,13 +104,25 @@ fn blocks<U: Unit>(claim: &Claim<U>) -> Result<Vec<Increment<U>>, NonFinite> {
 pub(crate) fn solve<U: Unit>(
     capacity: Amount<U>,
     claims: &[&Claim<U>],
+    shape: Shape,
 ) -> Result<Solution<U>, NonFinite> {
     let reserved: Amount<U> = claims.iter().map(|c| c.reservation()).sum();
     let mut free = capacity.saturating_sub(reserved);
     let mut targets: Vec<Amount<U>> = claims.iter().map(|c| c.reservation()).collect();
     let all_blocks = claims
         .iter()
-        .map(|&c| blocks(c))
+        .map(|&c| {
+            blocks(c).map(|blocks| match shape {
+                Shape::AsClaimed => blocks,
+                Shape::Relaxed => blocks
+                    .into_iter()
+                    .map(|b| Increment {
+                        divisible: true,
+                        ..b
+                    })
+                    .collect(),
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut heap = BinaryHeap::new();
     for (slot, (claim, blocks)) in claims.iter().zip(&all_blocks).enumerate() {
@@ -114,9 +136,21 @@ pub(crate) fn solve<U: Unit>(
             });
         }
     }
-    let mut last_price = None;
+    let mut achieved = Value::ZERO;
+    // The most valuable demand left unmet: what one more unit of capacity would buy. Zero when
+    // every claim's demand is met.
+    let mut unmet = Value::ZERO;
+    let note_unmet = |unmet: &mut Value, per_unit: Value| {
+        if per_unit.total_cmp(unmet).is_gt() {
+            *unmet = per_unit;
+        }
+    };
     while let Some(next) = heap.pop() {
-        if free == Amount::ZERO || next.per_unit.raw() <= 0.0 {
+        if next.per_unit.raw() <= 0.0 {
+            break;
+        }
+        if free == Amount::ZERO {
+            note_unmet(&mut unmet, next.per_unit);
             break;
         }
         let take = if next.block.width <= free {
@@ -124,36 +158,98 @@ pub(crate) fn solve<U: Unit>(
         } else if next.block.divisible {
             free
         } else {
-            // An indivisible block that does not fit ends this claim (its blocks are a prefix).
+            // An indivisible block that does not fit ends this claim (its blocks are a prefix), and
+            // is demand left unmet.
+            note_unmet(&mut unmet, next.per_unit);
             continue;
         };
         free = free.saturating_sub(take);
-        last_price = Some(next.per_unit);
+        achieved = Value::new(achieved.raw() + next.per_unit.times(take.raw())?.raw())?;
         if let Some(target) = targets.get_mut(next.slot) {
             *target = target.saturating_add(take);
         }
-        if take == next.block.width {
-            if let Some(block) = all_blocks
-                .get(next.slot)
-                .and_then(|b| b.get(next.index + 1))
-            {
-                heap.push(Candidate {
-                    index: next.index + 1,
-                    per_unit: block.per_unit,
-                    block: *block,
-                    ..next
-                });
-            }
+        if take < next.block.width {
+            note_unmet(&mut unmet, next.per_unit);
+        } else if let Some(block) = all_blocks
+            .get(next.slot)
+            .and_then(|b| b.get(next.index + 1))
+        {
+            heap.push(Candidate {
+                index: next.index + 1,
+                per_unit: block.per_unit,
+                block: *block,
+                ..next
+            });
         }
     }
-    // Slack capacity is worth nothing at the margin: the price is zero unless capacity ran out.
-    let price = match (free == Amount::ZERO, last_price) {
-        (true, Some(per_unit)) => Price::per_unit(per_unit),
-        _ => Price::per_unit(Value::ZERO),
-    };
     Ok(Solution {
         targets,
-        price,
+        price: Price::per_unit(unmet),
         unallocated: free,
+        achieved,
     })
+}
+
+/// How much of the way from `owned` toward `target` can be committed from `free` without splitting
+/// an indivisible block: a required floor, an optional floor and every indivisible level are
+/// acquired whole or not at all; a divisible block may be taken in part.
+pub(crate) fn committable<U: Unit>(
+    claim: &Claim<U>,
+    owned: Amount<U>,
+    target: Amount<U>,
+    free: Amount<U>,
+) -> Result<Amount<U>, NonFinite> {
+    let reservation = claim.reservation();
+    let mut segments = Vec::new();
+    if reservation > Amount::ZERO {
+        segments.push(Increment {
+            width: reservation,
+            per_unit: Value::ZERO,
+            divisible: false,
+        });
+    }
+    segments.extend(blocks(claim)?);
+    let mut start = Amount::ZERO;
+    let mut reach = owned;
+    let mut left = free;
+    for segment in segments {
+        let end = start.saturating_add(segment.width);
+        if end <= owned {
+            start = end;
+            continue;
+        }
+        if reach >= target || left == Amount::ZERO {
+            break;
+        }
+        let stop = end.min(target);
+        let need = stop.saturating_sub(reach);
+        if need <= left {
+            left = left.saturating_sub(need);
+            reach = stop;
+        } else if segment.divisible {
+            reach = reach.saturating_add(left);
+            left = Amount::ZERO;
+        } else {
+            break;
+        }
+        start = end;
+    }
+    Ok(reach.saturating_sub(owned))
+}
+
+/// The value per unit of the block a claim holding `owned` would acquire next; zero when it wants
+/// nothing more.
+pub(crate) fn next_value<U: Unit>(claim: &Claim<U>, owned: Amount<U>) -> Result<Value, NonFinite> {
+    let mut start = claim.reservation();
+    if owned < start {
+        return Ok(Value::ZERO);
+    }
+    for block in blocks(claim)? {
+        let end = start.saturating_add(block.width);
+        if owned < end {
+            return Ok(block.per_unit);
+        }
+        start = end;
+    }
+    Ok(Value::ZERO)
 }

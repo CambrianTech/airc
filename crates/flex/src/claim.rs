@@ -97,6 +97,12 @@ impl<U: Unit> Claim<U> {
         }
     }
 
+    /// The value of holding `total` (reservation included): what its units past the reservation
+    /// are worth.
+    pub fn value_at(&self, total: Amount<U>) -> Result<Value, NonFinite> {
+        self.value_of(total.saturating_sub(self.reservation()))
+    }
+
     /// The value of holding `amount` past the reservation: the sum over the increments it covers.
     /// `NonFinite` only if that sum overflows, which the caller refuses rather than rounds.
     pub fn value_of(&self, amount: Amount<U>) -> Result<Value, NonFinite> {
