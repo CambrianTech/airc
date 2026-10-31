@@ -1631,6 +1631,31 @@ pub async fn run_submit(
     submit_patch(&airc, home, &room, card_id, &bytes, base_sha, instance).await
 }
 
+/// The card on `board`, or a refusal that says WHERE it looked (card 8ffcf055). The bare
+/// "not visible in board projection" sent an agent through three retries on 2026-10-18:
+/// the scope's current room was #general and the card lived in #continuum-dev, under
+/// another `.airc` home. `searched` is the room the board came from, or `None` for every
+/// subscribed room. Opening and relinking a card's PR (`work_commands_gh.rs`) and spawning
+/// its claim worktree (`work_commands_git.rs`) look cards up through it.
+pub(crate) fn board_card<'b>(
+    board: &'b airc_work::WorkBoardProjection,
+    card_id: airc_lib::WorkCardId,
+    searched: Option<&airc_lib::Room>,
+    scope_home: &Path,
+) -> Result<&'b airc_work::WorkCard, String> {
+    board.card(card_id).ok_or_else(|| {
+        let place = searched.map_or_else(
+            || "any subscribed room".to_string(),
+            |room| format!("room #{}", room.name),
+        );
+        format!(
+            "card {card_id} is not on the board of {place} (scope {}); if it lives \
+             elsewhere, pass --room <name> or --home <scope dir>",
+            scope_home.display()
+        )
+    })
+}
+
 /// Publish `bytes` as a submission on `card_id`, under the caller as its holder: the
 /// one path behind `airc work submit` and the review transition's PR (BigMama,
 /// 2026-10-06: a PR opened with no submission left the reviewer's verdict nothing to
@@ -2726,6 +2751,29 @@ impl From<CliCardState> for CardState {
 
 #[cfg(test)]
 mod tests {
+    // what this catches (card 8ffcf055): a card missing from a board refused without saying
+    // WHERE it looked. An agent took three retries on 2026-10-18 to learn the scope's room
+    // was #general and the card lived in #continuum-dev under another `.airc` home.
+    #[test]
+    fn a_missing_card_names_the_room_and_scope_it_searched() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let room = airc_lib::Room::from_name(home.path(), "general").expect("room");
+        let board = airc_work::WorkBoardProjection::default();
+        let card = airc_lib::WorkCardId::from_u128(0x8ffc_f055);
+        let in_room = super::board_card(&board, card, Some(&room), home.path()).unwrap_err();
+        assert!(in_room.contains("room #general"), "{in_room}");
+        assert!(
+            in_room.contains(&home.path().display().to_string()),
+            "{in_room}"
+        );
+        assert!(
+            in_room.contains("--room") && in_room.contains("--home"),
+            "{in_room}"
+        );
+        let anywhere = super::board_card(&board, card, None, home.path()).unwrap_err();
+        assert!(anywhere.contains("any subscribed room"), "{anywhere}");
+    }
+
     // what this catches (card 9c3ab08d; BigMama on #1548): a submission naming a hash that
     // nothing holds, or an empty patch accepted as reviewable. The patch is retained first,
     // the published hash reads its exact bytes back, and empty is refused.
