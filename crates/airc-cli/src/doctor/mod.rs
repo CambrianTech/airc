@@ -54,7 +54,8 @@ mod store;
 
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Status {
     Ok,
     Info,
@@ -63,7 +64,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Status::Ok => "[ok]",
             Status::Info => "[info]",
@@ -73,6 +74,7 @@ impl Status {
     }
 }
 
+#[derive(serde::Serialize)]
 pub struct Finding {
     pub status: Status,
     pub check: &'static str,
@@ -229,6 +231,17 @@ fn registry() -> Vec<Box<dyn Check>> {
     ]
 }
 
+/// Transport consumers share the same timestamped daemon observation and
+/// delivery interpretation as doctor. No local discovery or redial is performed.
+pub(crate) async fn transport_findings(home: &Path) -> Vec<Finding> {
+    let ctx = CheckContext {
+        home,
+        delivery_stats: tokio::sync::OnceCell::new(),
+    };
+    let mut findings = health::RouteHealthCheck.run(&ctx).await;
+    findings.extend(delivery::DeliveryTruthCheck.run(&ctx).await);
+    findings
+}
 pub async fn run(home: &Path, fix: bool, health: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("airc doctor — scope: {}", home.display());
     println!();

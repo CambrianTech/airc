@@ -162,7 +162,7 @@ fn delivery_findings(
                     peer.attempts_since_ack,
                     last.map(age).unwrap_or_else(|| "never confirmed".into()),
                 ),
-                "watch `airc transport health` for the suspect-drop + re-dial",
+                "watch daemon route-refresh diagnostics for the suspect-drop and re-dial",
             )),
             // OUTSTANDING-UNCONFIRMED is the real question, not "how old is
             // the last ack". An old ack on an IDLE route is fine — nothing was
@@ -207,7 +207,7 @@ fn delivery_findings(
                             ack_detail,
                         ),
                         "treat anything sent since as NOT received; \
-                             `airc transport health` for the row, then re-dial",
+                             inspect daemon route-refresh diagnostics for recovery",
                     )),
                     _ => findings.push(Finding::ok(
                         "delivery truth",
@@ -241,7 +241,7 @@ fn delivery_findings(
                 ),
                 "a new route clears this on its first ack; if it does not, check you are in \
                  the scope the peer is enrolled in (`airc peers`) and that the daemon serves \
-                 THAT scope, then `airc transport health` for the dial errors",
+                 THAT scope, then inspect daemon route-refresh diagnostics for dial errors",
             )),
         }
     }
