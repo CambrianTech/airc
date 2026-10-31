@@ -222,7 +222,10 @@ impl<U: Unit> Tier<U> {
 
     /// The value a quote is fenced on: generation and custody revision together.
     pub fn fence(&self) -> Fence {
-        Fence { generation: self.generation, custody: self.custody }
+        Fence {
+            generation: self.generation,
+            custody: self.custody,
+        }
     }
 
     /// Clear `claims` against `capacity` and move the grants. A holder that presents no claim is
