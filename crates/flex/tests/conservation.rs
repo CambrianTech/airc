@@ -200,6 +200,9 @@ fn the_tier_never_charges_a_holder_less_than_it_physically_holds() {
         let mut rng = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
         let mut tier: Tier<B> = Tier::new();
         let mut physical: std::collections::HashMap<u128, u64> = Default::default();
+        // The custody (lease, epoch) each holder last acted on: it grows only when the tier commits
+        // growth, which starts a new epoch; within an epoch it only releases.
+        let mut acted: std::collections::HashMap<u128, (LeaseId, u64)> = Default::default();
         let mut mailbox: Vec<Release<B>> = Vec::new();
         let mut sent: Vec<Release<B>> = Vec::new();
         for step in 0..100 {
@@ -235,17 +238,22 @@ fn the_tier_never_charges_a_holder_less_than_it_physically_holds() {
                     held,
                     g.owned.raw()
                 );
-                // The holder takes what it was granted, and releases when asked.
-                if g.owned.raw() > *held {
+                // The holder takes growth only when the tier committed it (a new lease or epoch), and
+                // releases when asked.
+                let custody = (g.lease, g.epoch);
+                if acted.get(&g.claim.0) != Some(&custody) && g.owned.raw() > *held {
                     *held = g.owned.raw();
                 }
+                acted.insert(g.claim.0, custody);
                 if let GrantState::ShrinkRequested { to } = g.state {
-                    *held = to.raw();
+                    // Releasing never raises what it holds: asked to shrink to more than it holds, it
+                    // stays where it is, and it reports what it physically holds.
+                    *held = (*held).min(to.raw());
                     let report = Release {
                         claim: g.claim,
                         lease: g.lease,
                         epoch: g.epoch,
-                        holds: to,
+                        holds: Amount::new(*held),
                     };
                     mailbox.push(report);
                     sent.push(report);
