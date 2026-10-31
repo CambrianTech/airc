@@ -485,14 +485,14 @@ mod tests {
         for existing in [false, true] {
             if existing {
                 std::fs::create_dir(&home)?;
-                std::fs::write(home.join("events.db"), b"older store sentinel")?;
+                std::fs::write(home.join("events.sqlite"), b"older store sentinel")?;
             }
             let findings = delivery::DeliveryTruthCheck.run(&context).await;
-            assert_eq!(findings.len(), 1);
+            assert_eq!(findings.len(), 2);
             assert_eq!(findings[0].status, Status::Ok);
             if existing {
                 assert_eq!(
-                    std::fs::read(home.join("events.db"))?,
+                    std::fs::read(home.join("events.sqlite"))?,
                     b"older store sentinel"
                 );
                 assert_eq!(std::fs::read_dir(&home)?.count(), 1);

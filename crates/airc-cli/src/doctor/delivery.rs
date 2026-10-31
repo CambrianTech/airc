@@ -217,6 +217,10 @@ fn delivery_findings(stats: &[IpcPeerDeliveryStats], now_ms: u64) -> Vec<Finding
             )),
         }
     }
+    findings.push(Finding::info(
+        "delivery evidence",
+        "A daemon ACK confirms transport only; it does not prove the intended agent received or consumed a message",
+    ));
     findings
 }
 
