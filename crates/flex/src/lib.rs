@@ -17,6 +17,7 @@
 
 mod amount;
 mod claim;
+mod interval;
 mod pool;
 mod provenance;
 mod solve;
@@ -25,6 +26,7 @@ mod value;
 
 pub use amount::{Amount, Unit};
 pub use claim::{Claim, ClaimError, ClaimId, Floor, Increment, OwnerId};
+pub use interval::{IntervalClock, IntervalError, LaneCapacity, LaneDemand, LaneInterval, Lanes};
 pub use pool::{
     PoolAmounts, PoolCapacity, PoolError, PoolFitError, PoolId, PoolTopology, PoolViewId,
     TopologyRevision,
