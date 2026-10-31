@@ -1631,17 +1631,12 @@ pub async fn run_submit(
     submit_patch(&airc, home, &room, card_id, &bytes, base_sha, instance).await
 }
 
-/// Publish `bytes` as a submission on `card_id`, under the caller as its holder: the
-/// one path behind `airc work submit` and the review transition's PR (BigMama,
-/// 2026-10-06: a PR opened with no submission left the reviewer's verdict nothing to
-/// attach to). Only the holder submits. The bytes are retained in the scope's blob store
-/// BEFORE their hash is published (BigMama on #1548): a reviewer, grader or lift reads a
-/// submission by hash, and the patch file can change after this call.
 /// The card on `board`, or a refusal that says WHERE it looked (card 8ffcf055). The bare
 /// "not visible in board projection" sent an agent through three retries on 2026-10-18:
 /// the scope's current room was #general and the card lived in #continuum-dev, under
 /// another `.airc` home. `searched` is the room the board came from, or `None` for every
-/// subscribed room. One lookup for every verb that needs a card from a board.
+/// subscribed room. Opening and relinking a card's PR (`work_commands_gh.rs`) and spawning
+/// its claim worktree (`work_commands_git.rs`) look cards up through it.
 pub(crate) fn board_card<'b>(
     board: &'b airc_work::WorkBoardProjection,
     card_id: airc_lib::WorkCardId,
@@ -1661,6 +1656,12 @@ pub(crate) fn board_card<'b>(
     })
 }
 
+/// Publish `bytes` as a submission on `card_id`, under the caller as its holder: the
+/// one path behind `airc work submit` and the review transition's PR (BigMama,
+/// 2026-10-06: a PR opened with no submission left the reviewer's verdict nothing to
+/// attach to). Only the holder submits. The bytes are retained in the scope's blob store
+/// BEFORE their hash is published (BigMama on #1548): a reviewer, grader or lift reads a
+/// submission by hash, and the patch file can change after this call.
 pub(crate) async fn submit_patch(
     airc: &airc_lib::Airc,
     home: &Path,
