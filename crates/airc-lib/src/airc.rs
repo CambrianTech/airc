@@ -686,8 +686,7 @@ impl Airc {
         let home: PathBuf = home.into();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let wire_root = machine_account_home(&home).into_path_buf();
-        Self::open_initialize_inner(home, wire_root, VerificationPolicy::Strict, None)
-            .await
+        Self::open_initialize_inner(home, wire_root, VerificationPolicy::Strict, None).await
     }
 
     /// Explicit initialisation verb behind `airc init --as <name>`: same as

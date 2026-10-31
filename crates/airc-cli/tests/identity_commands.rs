@@ -84,14 +84,21 @@ fn init_as_adds_a_named_citizen_beside_the_default() {
 
     let default_out = run_ok(home, &["init"], "");
     let default_peer = peer_id_from(&default_out);
-    assert!(default_peer.is_some(), "init must print a peer_id: {default_out}");
+    assert!(
+        default_peer.is_some(),
+        "init must print a peer_id: {default_out}"
+    );
 
     // The regression itself: a populated home is exactly what `open_as`
     // refuses. Success here proves the CLI took the explicit init path.
     let codex = run_ok(home, &["init", "--as", "codex"], "");
     assert!(codex.contains("agent_name:  codex\n"));
     let codex_peer = peer_id_from(&codex).expect("init --as must print a peer_id");
-    assert_ne!(default_peer.as_deref(), Some(codex_peer.as_str()), "a named citizen is a distinct principal from the default");
+    assert_ne!(
+        default_peer.as_deref(),
+        Some(codex_peer.as_str()),
+        "a named citizen is a distinct principal from the default"
+    );
 
     // Idempotent resume: re-init loads the existing row and key — no re-mint.
     let again = run_ok(home, &["init", "--as", "codex"], "");
@@ -118,11 +125,25 @@ fn init_as_refuses_orphan_key_material_and_leaves_it_untouched() {
         .output()
         .expect("airc-core must spawn");
 
-    assert!(!output.status.success(), "init over orphan key material must fail: {}",
-        String::from_utf8_lossy(&output.stdout));
-    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-    assert!(combined.contains("key material"), "the refusal must name the orphan key: {combined}");
-    assert_eq!(std::fs::read(&key_path).unwrap(), bytes, "a refused init must leave the orphan key untouched");
+    assert!(
+        !output.status.success(),
+        "init over orphan key material must fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("key material"),
+        "the refusal must name the orphan key: {combined}"
+    );
+    assert_eq!(
+        std::fs::read(&key_path).unwrap(),
+        bytes,
+        "a refused init must leave the orphan key untouched"
+    );
 }
 
 #[test]
