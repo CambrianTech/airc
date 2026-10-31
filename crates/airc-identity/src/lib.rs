@@ -426,14 +426,12 @@ impl LocalIdentity {
                 }
                 match peer_id {
                     Some(peer_id) => {
-                        Self::generate_and_save_as_with_peer_id(
-                            home, &store, &agent_name, peer_id,
-                        )
-                        .await
+                        Self::generate_and_save_as_with_peer_id(home, &store, &agent_name, peer_id)
+                            .await
                     }
                     None => Self::generate_and_save_as(home, &store, &agent_name).await,
                 }
-            },
+            }
             // A row exists for THIS agent but no shared key file: under the
             // #402 layout a named citizen's secret lives in its own per-agent
             // key file, so if that one is present we can load her exactly as
@@ -450,7 +448,7 @@ impl LocalIdentity {
                         state_exists: true,
                     })
                 }
-            },
+            }
         }
     }
 
@@ -715,7 +713,7 @@ impl LocalIdentity {
                     found: airc_store::DEFAULT_AGENT_NAME.to_string(),
                 }),
                 None => unreachable!("legacy identity.json existence checked above"),
-            }
+            };
         }
 
         // Nothing of this agent's survives in the home: explicit mint with
@@ -1179,7 +1177,7 @@ mod tests {
             LocalIdentity::load_or_generate_as(home.path(), "beta").await,
             Err(IdentityError::IdentityNotInitialised { .. })
         ));
-        let second = LocalIdentity::generate_and_save_as(&home.path(), &store, "beta")
+        let second = LocalIdentity::generate_and_save_as(home.path(), &store, "beta")
             .await
             .unwrap();
 
@@ -1235,8 +1233,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LocalIdentity::generate_and_save_as(home.path(), &store, "codex")
-            .await;
+        let result = LocalIdentity::generate_and_save_as(home.path(), &store, "codex").await;
         assert!(matches!(
             result,
             Err(IdentityError::IdentityAlreadyInitialised {
@@ -1262,8 +1259,7 @@ mod tests {
         let bytes_before = std::fs::read(&key_path).unwrap();
 
         let store = open_store(home.path()).await.unwrap();
-        let result = LocalIdentity::generate_and_save_as(home.path(), &store, "codex")
-            .await;
+        let result = LocalIdentity::generate_and_save_as(home.path(), &store, "codex").await;
         assert!(matches!(
             result,
             Err(IdentityError::KeyMaterialWithoutState {
@@ -1292,12 +1288,9 @@ mod tests {
 
         // Two citizens in one home: the default (shared identity.key) and a
         // named agent with her own key file.
-        let first = LocalIdentity::load_or_generate_as(
-            home.path(),
-            airc_store::DEFAULT_AGENT_NAME,
-        )
-        .await
-        .unwrap();
+        let first = LocalIdentity::load_or_generate_as(home.path(), airc_store::DEFAULT_AGENT_NAME)
+            .await
+            .unwrap();
         let store = open_store(home.path()).await.unwrap();
         let second = LocalIdentity::generate_and_save_as(home.path(), &store, "codex")
             .await
@@ -1305,8 +1298,7 @@ mod tests {
 
         // The named citizen's secret half is lost (deleted, moved, corrupted
         // away). Her row survives.
-        std::fs::remove_file(LocalIdentity::agent_key_path(home.path(), "codex"))
-            .unwrap();
+        std::fs::remove_file(LocalIdentity::agent_key_path(home.path(), "codex")).unwrap();
 
         // Opening as codex must refuse — with the shared identity.key sitting
         // right there on disk. Loading her peer_id under someone else's secret
@@ -1320,12 +1312,10 @@ mod tests {
         ));
 
         // The default citizen is untouched: same peer_id, same key material.
-        let reloaded_default = LocalIdentity::load_or_generate_as(
-            home.path(),
-            airc_store::DEFAULT_AGENT_NAME,
-        )
-        .await
-        .unwrap();
+        let reloaded_default =
+            LocalIdentity::load_or_generate_as(home.path(), airc_store::DEFAULT_AGENT_NAME)
+                .await
+                .unwrap();
         assert_eq!(reloaded_default.peer_id, first.peer_id);
         assert_eq!(
             reloaded_default.keypair.public_bytes(),
@@ -1353,14 +1343,14 @@ mod tests {
         std::fs::create_dir_all(home.path()).unwrap();
         // Orphan per-agent key, no rows, no shared identity.key — the residue
         // of an interrupted or pre-fix mint.
-        std::fs::write(LocalIdentity::agent_key_path(home.path(), "codex"), [9u8; 32])
-            .unwrap();
-
-        let result = LocalIdentity::load_or_generate_as(
-            home.path(),
-            airc_store::DEFAULT_AGENT_NAME,
+        std::fs::write(
+            LocalIdentity::agent_key_path(home.path(), "codex"),
+            [9u8; 32],
         )
-        .await;
+        .unwrap();
+
+        let result =
+            LocalIdentity::load_or_generate_as(home.path(), airc_store::DEFAULT_AGENT_NAME).await;
         assert!(matches!(
             result,
             Err(IdentityError::PartialState {
