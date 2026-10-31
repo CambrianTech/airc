@@ -550,3 +550,16 @@ fn a_hold_is_applied_only_on_a_block_boundary() {
         "it grows to the whole block rather than holding inside it"
     );
 }
+
+// what this catches: a hold below the required floor when the block after the reservation is
+// divisible (the reservation itself is never split, so a holding inside it is never a boundary).
+#[test]
+fn a_hold_never_sits_inside_the_reservation_even_before_a_divisible_block() {
+    let mut tier = Tier::new();
+    tier.clear(capacity(20), &[claim(1, Floor::None, &[(5, 1.0, true)])]);
+    let mut required = claim(1, Floor::Required(amount(10)), &[(5, 1.0, true)]);
+    required.switch_cost = value(100.0);
+    let clearing = tier.clear(capacity(20), &[required]);
+    assert_ne!(state(&clearing, 1), Some(GrantState::Held));
+    assert_eq!(owned(&clearing, 1), amount(15));
+}

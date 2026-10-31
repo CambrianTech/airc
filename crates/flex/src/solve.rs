@@ -268,6 +268,10 @@ pub(crate) fn on_boundary<U: Unit>(claim: &Claim<U>, owned: Amount<U>) -> Result
     if owned == at {
         return Ok(true);
     }
+    if owned < at {
+        // Inside the reservation, which is never split.
+        return Ok(false);
+    }
     for block in blocks(claim)? {
         at = at.saturating_add(block.width);
         if owned == at {

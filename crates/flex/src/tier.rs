@@ -516,13 +516,9 @@ impl<U: Unit> Tier<U> {
                 .holdings
                 .get(&claim.id)
                 .map_or(Amount::ZERO, |h| h.owned);
-            // A hold never keeps a holder below its own required floor, nor partway into a block
-            // that may not be split (Codex on airc#1630).
-            if owned == Amount::ZERO
-                || owned == *target
-                || owned < claim.reservation()
-                || !on_boundary(claim, owned)?
-            {
+            // A hold never keeps a holder partway into a block that may not be split, the
+            // reservation included, so never below its own required floor (Codex on airc#1630).
+            if owned == Amount::ZERO || owned == *target || !on_boundary(claim, owned)? {
                 continue;
             }
             let gain = (claim.value_at(*target)?.raw() - claim.value_at(owned)?.raw()).abs();
