@@ -150,6 +150,24 @@ pub struct PoolAmounts<U: Unit> {
 }
 
 impl<U: Unit> PoolAmounts<U> {
+    /// Combine complete demands without changing either input on refusal.
+    pub fn checked_add(&self, other: &Self) -> Result<Self, PoolError> {
+        if self.revision != other.revision {
+            return Err(PoolError::WrongTopology);
+        }
+        let mut result = self.clone();
+        for (pool, amount) in other.components() {
+            let previous = result.amounts.entry(pool).or_insert(Amount::ZERO);
+            *previous = Amount::new(
+                previous
+                    .raw()
+                    .checked_add(amount.raw())
+                    .ok_or(PoolError::Overflow(pool))?,
+            );
+        }
+        Ok(result)
+    }
+
     pub fn revision(&self) -> TopologyRevision {
         self.revision
     }
