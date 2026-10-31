@@ -73,7 +73,14 @@ pub(crate) fn blocks<U: Unit>(claim: &Claim<U>) -> Result<Vec<Increment<U>>, Non
     let mut rest = Vec::new();
     for increment in &claim.increments {
         if joined < floor {
-            let take = increment.width.min(floor.saturating_sub(joined));
+            // A divisible increment gives only what the floor still needs; an indivisible one is
+            // taken whole, so the joined block may pass the floor (Codex on airc#1630: an optional
+            // floor of 3 over an indivisible 10 must never split it).
+            let take = if increment.divisible {
+                increment.width.min(floor.saturating_sub(joined))
+            } else {
+                increment.width
+            };
             joined = joined.saturating_add(take);
             if take < increment.width {
                 rest.push(Increment {
@@ -252,4 +259,24 @@ pub(crate) fn next_value<U: Unit>(claim: &Claim<U>, owned: Amount<U>) -> Result<
         start = end;
     }
     Ok(Value::ZERO)
+}
+
+/// Whether a holding of `owned` ends on one of the claim's block boundaries (its reservation, or the
+/// reservation plus whole blocks): only there can it be held without splitting a block.
+pub(crate) fn on_boundary<U: Unit>(claim: &Claim<U>, owned: Amount<U>) -> Result<bool, NonFinite> {
+    let mut at = claim.reservation();
+    if owned == at {
+        return Ok(true);
+    }
+    for block in blocks(claim)? {
+        at = at.saturating_add(block.width);
+        if owned == at {
+            return Ok(true);
+        }
+        if owned < at {
+            // Inside this block: a boundary only if the block may be split.
+            return Ok(block.divisible);
+        }
+    }
+    Ok(false)
 }

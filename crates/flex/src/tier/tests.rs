@@ -481,3 +481,72 @@ fn a_holder_that_no_longer_claims_is_asked_to_release_everything() {
     assert_eq!(tier.report_held(release(&clearing, 1, 0)), Ok(amount(40)));
     assert!(tier.clear(capacity(50), &[]).grants.is_empty());
 }
+
+// what this catches: a hold keeping a holder below its own required floor (Codex on airc#1630: A
+// holds 5, its claim now requires 10 and fits; a zero switch cost must not hold it at 5).
+#[test]
+fn a_hold_never_keeps_a_holder_below_its_required_floor() {
+    let mut tier = Tier::new();
+    tier.clear(capacity(10), &[claim(1, Floor::None, &[(5, 1.0, true)])]);
+    let required = claim(1, Floor::Required(amount(10)), &[]);
+    let clearing = tier.clear(capacity(10), &[required]);
+    assert_eq!(
+        (owned(&clearing, 1), state(&clearing, 1)),
+        (amount(10), Some(GrantState::Granted))
+    );
+}
+
+// what this catches: an optional floor splitting an indivisible level (Codex on airc#1630: an
+// optional floor of 3 over an indivisible 10 at capacity 3 must grant nothing; at 10, all 10).
+#[test]
+fn an_optional_floor_never_splits_an_indivisible_level() {
+    let shaped = claim(1, Floor::Optional(amount(3)), &[(10, 2.0, false)]);
+    let small = Tier::new().clear(capacity(3), std::slice::from_ref(&shaped));
+    assert_eq!(owned(&small, 1), Amount::ZERO);
+    let whole = Tier::new().clear(capacity(10), &[shaped]);
+    assert_eq!(owned(&whole, 1), amount(10));
+}
+
+// what this catches: two claims under one id in one clearing overwriting each other's custody,
+// including two fresh claims with different owners (Codex on airc#1630).
+#[test]
+fn duplicate_claim_ids_in_one_clearing_are_all_refused() {
+    let mut other = claim(7, Floor::None, &[(5, 1.0, true)]);
+    other.owner = OwnerId(8);
+    let clearing = Tier::new().clear(
+        capacity(20),
+        &[
+            claim(7, Floor::None, &[(5, 2.0, true)]),
+            other,
+            claim(9, Floor::None, &[(5, 1.0, true)]),
+        ],
+    );
+    assert_eq!(
+        clearing.refused,
+        vec![
+            (ClaimId(7), ClaimError::DuplicateId),
+            (ClaimId(7), ClaimError::DuplicateId)
+        ]
+    );
+    assert_eq!(owned(&clearing, 9), amount(5));
+    assert!(grant(&clearing, 7).is_none());
+}
+
+// what this catches: holding an amount that sits partway into a block the claim no longer lets be
+// split (the claim was reshaped between clearings).
+#[test]
+fn a_hold_is_applied_only_on_a_block_boundary() {
+    let mut tier = Tier::new();
+    let mut divisible = claim(1, Floor::None, &[(6, 1.0, true)]);
+    divisible.switch_cost = value(100.0);
+    tier.clear(capacity(10), std::slice::from_ref(&divisible));
+    let mut whole = claim(1, Floor::None, &[(10, 1.0, false)]);
+    whole.switch_cost = value(100.0);
+    let clearing = tier.clear(capacity(10), &[whole]);
+    assert_ne!(state(&clearing, 1), Some(GrantState::Held));
+    assert_eq!(
+        owned(&clearing, 1),
+        amount(10),
+        "it grows to the whole block rather than holding inside it"
+    );
+}

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::amount::{Amount, Unit};
 use crate::claim::{Claim, ClaimError, ClaimId, Floor, OwnerId};
 use crate::provenance::Provenance;
-use crate::solve::{committable, next_value, solve, Shape};
+use crate::solve::{committable, next_value, on_boundary, solve, Shape};
 use crate::value::{NonFinite, Price, Value};
 
 /// What a tier can grant, as measured. `Unavailable` clears nothing: an unknown capacity is never a
@@ -212,7 +212,16 @@ impl<U: Unit> Tier<U> {
     pub fn clear(&mut self, capacity: Capacity<U>, claims: &[Claim<U>]) -> Clearing<U> {
         let mut refused = Vec::new();
         let mut valid: Vec<&Claim<U>> = Vec::new();
+        let mut seen: BTreeMap<ClaimId, usize> = BTreeMap::new();
         for claim in claims {
+            *seen.entry(claim.id).or_insert(0) += 1;
+        }
+        for claim in claims {
+            if seen.get(&claim.id).is_some_and(|&n| n > 1) {
+                // Two claims under one id would overwrite each other's custody: neither is cleared.
+                refused.push((claim.id, ClaimError::DuplicateId));
+                continue;
+            }
             let held_by = self.holdings.get(&claim.id).and_then(|h| h.owner);
             let custody = match held_by {
                 Some(holder) if holder != claim.owner => Err(ClaimError::OwnerChanged { holder }),
@@ -507,7 +516,13 @@ impl<U: Unit> Tier<U> {
                 .holdings
                 .get(&claim.id)
                 .map_or(Amount::ZERO, |h| h.owned);
-            if owned == Amount::ZERO || owned == *target {
+            // A hold never keeps a holder below its own required floor, nor partway into a block
+            // that may not be split (Codex on airc#1630).
+            if owned == Amount::ZERO
+                || owned == *target
+                || owned < claim.reservation()
+                || !on_boundary(claim, owned)?
+            {
                 continue;
             }
             let gain = (claim.value_at(*target)?.raw() - claim.value_at(owned)?.raw()).abs();
