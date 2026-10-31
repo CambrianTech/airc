@@ -673,6 +673,89 @@ impl Airc {
             }
             None => LocalIdentity::load_or_generate(&home).await?,
         };
+        Self::finish_open(identity, home, wire_root, policy).await
+    }
+
+    /// Explicit initialisation verb behind `airc init` (no `--as`): open the
+    /// substrate at `<home>` with an EXPLICIT default-agent identity — load
+    /// what exists (idempotent), or mint custody-safe only when nothing of
+    /// this agent's survives. Unlike [`Self::open`], which must never add a
+    /// citizen beside existing ones, `init` may create the default citizen
+    /// even in a home that holds other material — an operator asked for it.
+    pub async fn initialize(home: impl Into<PathBuf>) -> Result<Self, AircError> {
+        let home: PathBuf = home.into();
+        std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
+        let wire_root = machine_account_home(&home).into_path_buf();
+        Self::open_initialize_inner(home, wire_root, VerificationPolicy::Strict, None)
+            .await
+    }
+
+    /// Explicit initialisation verb behind `airc init --as <name>`: same as
+    /// [`Self::initialize`], for a named agent. This is the one Airc-level
+    /// path that adds a citizen beside existing ones (card 32f7dd97, review
+    /// blocker P1 #3): `open_as` refuses populated homes by design, so an
+    /// explicit init goes through `LocalIdentity::initialize_as`, which fails
+    /// closed on every half-state instead of minting over one.
+    pub async fn initialize_as(
+        home: impl Into<PathBuf>,
+        agent_name: impl AsRef<str>,
+    ) -> Result<Self, AircError> {
+        let home: PathBuf = home.into();
+        std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
+        let wire_root = machine_account_home(&home).into_path_buf();
+        Self::open_initialize_inner(
+            home,
+            wire_root,
+            VerificationPolicy::Strict,
+            Some(agent_name.as_ref().to_string()),
+        )
+        .await
+    }
+
+    /// Shared body of [`Self::initialize`] / [`Self::initialize_as`].
+    /// Resolves the identity through the explicit INIT path (which needs a
+    /// store for row-first custody checks), then runs the common open tail.
+    async fn open_initialize_inner(
+        home: PathBuf,
+        wire_root: PathBuf,
+        policy: VerificationPolicy,
+        agent_name: Option<String>,
+    ) -> Result<Self, AircError> {
+        std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
+        let store_path = home.join(EVENTS_DB_FILENAME);
+        // Scope the identity-resolution connection; `finish_open` opens its
+        // own (the same file) for the substrate's lifetime. Identity is fully
+        // materialised in memory by then, so dropping this connection is safe:
+        // a mint committed row + key file before returning, and a load read
+        // both halves from disk.
+        let identity = {
+            let store = SqliteEventStore::open_path(&store_path).await?;
+            match agent_name {
+                Some(agent_name) => LocalIdentity::initialize_as(&home, &store, agent_name).await?,
+                // A bare `init` still honours $AIRC_AGENT_NAME — the same resolution
+                // as the OPEN path (`requested_agent_name`), which is why a plain
+                // `open` mints under the env name. Unset, it resolves to the default
+                // citizen, so this changes nothing for an operator who names nobody.
+                None => {
+                    let agent_name = airc_identity::requested_agent_name(None)?;
+                    LocalIdentity::initialize_as(&home, &store, agent_name).await?
+                }
+            }
+        };
+        Self::finish_open(identity, home, wire_root, policy).await
+    }
+
+    /// Common tail of every successful substrate construction: registry
+    /// priming from `home` and `wire_root`, event-store wiring, and the
+    /// `Airc` value itself. Identity is already resolved by the caller —
+    /// via the OPEN path (`LocalIdentity::load_or_generate*`) or the
+    /// explicit INIT path (`LocalIdentity::initialize*`).
+    async fn finish_open(
+        identity: LocalIdentity,
+        home: PathBuf,
+        wire_root: PathBuf,
+        policy: VerificationPolicy,
+    ) -> Result<Self, AircError> {
         std::fs::create_dir_all(&wire_root).map_err(IdentityError::Io)?;
         peers_store::add(
             &wire_root,
