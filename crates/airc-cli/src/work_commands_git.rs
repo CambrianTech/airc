@@ -313,7 +313,7 @@ pub(crate) fn validate_review_workspace(
 pub(crate) fn pr_patch(
     worktree: &str,
     base_branch: &str,
-) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+) -> Result<(String, String, Vec<u8>), Box<dyn std::error::Error>> {
     let git = |args: &[&str]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let out = airc_core::process::background("git")
             .arg("-C")
@@ -334,8 +334,11 @@ pub(crate) fn pr_patch(
     let base = String::from_utf8(git(&["merge-base", "HEAD", "FETCH_HEAD"])?)?
         .trim()
         .to_string();
-    let patch = git(&["diff", "--binary", &base, "HEAD"])?;
-    Ok((base, patch))
+    let head = String::from_utf8(git(&["rev-parse", "HEAD"])?)?
+        .trim()
+        .to_string();
+    let patch = git(&["diff", "--binary", &base, &head])?;
+    Ok((base, head, patch))
 }
 
 /// `git show -s --format=<format> HEAD` from inside `worktree`. Used
@@ -487,9 +490,14 @@ mod tests {
         run(&origin, &["add", "."]);
         run(&origin, &["commit", "--quiet", "-m", "unrelated"]);
 
-        let (got_base, patch) =
+        let (got_base, got_head, patch) =
             pr_patch(clone.to_str().expect("utf8"), "canary").expect("pr_patch");
         let patch = String::from_utf8(patch).expect("utf8 patch");
+        assert_eq!(
+            got_head,
+            run(&clone, &["rev-parse", "HEAD"]),
+            "the head is the commit the patch produces, which a merge must equal to credit it"
+        );
         assert_eq!(
             got_base, base,
             "the base is the merge-base, not origin's moved tip"

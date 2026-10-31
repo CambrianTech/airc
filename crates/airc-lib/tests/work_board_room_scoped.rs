@@ -78,6 +78,7 @@ async fn review_and_merge_keep_the_selected_room_without_changing_default() {
             head: airc_work::BranchName::new("feature").unwrap(),
             base: airc_work::BranchName::new("canary").unwrap(),
         },
+        head: None,
         merged_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

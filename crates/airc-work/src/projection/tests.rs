@@ -684,6 +684,7 @@ fn lane_card_and_pr_merge_projection_is_deterministic() {
         WorkEvent::PullRequestMerged(PullRequestMerged {
             card_id,
             pull_request: pr.clone(),
+            head: None,
             merged_by: owner,
             merged_at_ms: 4,
         }),
@@ -2015,6 +2016,7 @@ fn relink_racing_terminal_state_is_dropped_without_poisoning_projection() {
         .apply(&WorkEvent::PullRequestMerged(PullRequestMerged {
             card_id,
             pull_request: old.clone(),
+            head: None,
             merged_by: owner,
             merged_at_ms: 3,
         }))

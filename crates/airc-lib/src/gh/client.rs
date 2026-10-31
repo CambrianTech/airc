@@ -278,6 +278,10 @@ pub struct PrView {
     /// Target revision observed in the same PR response.
     #[serde(default, rename = "baseRefOid")]
     pub base_ref_oid: Option<String>,
+    /// The PR branch's tip in the same response: at a merge, the exact commit that merged,
+    /// which a work submission's `head` must equal for the merge to credit it.
+    #[serde(default, rename = "headRefOid")]
+    pub head_ref_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -381,6 +385,10 @@ impl PrView {
                 .map(str::to_string),
             base_ref_oid: pr_json
                 .pointer("/base/sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            head_ref_oid: pr_json
+                .pointer("/head/sha")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         };
@@ -810,7 +818,8 @@ mod tests {
             "state": "closed",
             "mergeable": true,
             "merged_at": "2026-09-04T18:01:58Z",
-            "base": {"ref": "release/topic", "sha": "0123456789abcdef0123456789abcdef01234567"}
+            "base": {"ref": "release/topic", "sha": "0123456789abcdef0123456789abcdef01234567"},
+            "head": {"sha": "89abcdef0123456789abcdef0123456789abcdef"}
         });
         let rest_checks = parse_check_runs(
             br#"{"total_count":1,"check_runs":[{"id":1,"name":"cargo test","status":"completed","conclusion":"success"}]}"#,
@@ -821,6 +830,7 @@ mod tests {
         let from_graphql = PrView::from_graphql(
             br#"{"state":"MERGED","mergeable":"MERGEABLE","mergedAt":"2026-09-04T18:01:58Z",
                  "baseRefName":"release/topic","baseRefOid":"0123456789abcdef0123456789abcdef01234567",
+                 "headRefOid":"89abcdef0123456789abcdef0123456789abcdef",
                  "statusCheckRollup":[{"name":"cargo test","status":"COMPLETED","conclusion":"SUCCESS"}]}"#,
         )
         .expect("graphql parses");
@@ -832,6 +842,10 @@ mod tests {
         assert_eq!(
             from_rest.base_ref_oid.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            from_rest.head_ref_oid.as_deref(),
+            Some("89abcdef0123456789abcdef0123456789abcdef")
         );
         let check = &from_rest.status_check_rollup.as_ref().unwrap()[0];
         assert_eq!(check.status.as_deref(), Some("COMPLETED"));
@@ -1158,6 +1172,7 @@ pub mod mock {
                 merged_at: None,
                 base_ref_name: None,
                 base_ref_oid: None,
+                head_ref_oid: None,
             }
         }
 

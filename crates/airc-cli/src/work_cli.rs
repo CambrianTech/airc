@@ -430,6 +430,10 @@ pub enum WorkAction {
         /// The FULL commit sha the patch applies to (`git merge-base HEAD origin/<base>`).
         #[arg(long)]
         base: String,
+        /// The FULL commit sha the patch produces (`git rev-parse HEAD`): a merge of that
+        /// commit credits this submission. Omit it for a patch with no commit.
+        #[arg(long)]
+        head: Option<String>,
         /// What the patch is for (default: the card's repo).
         #[arg(long)]
         instance: Option<String>,
@@ -662,9 +666,10 @@ impl WorkArgs {
                 card_id,
                 patch,
                 base,
+                head,
                 instance,
                 room,
-            } => work_commands::run_submit(&home, room, card_id, patch, base, instance).await,
+            } => work_commands::run_submit(&home, room, card_id, patch, base, head, instance).await,
             WorkAction::SubmissionReview {
                 review_card_id,
                 outcome,

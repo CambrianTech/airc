@@ -161,16 +161,22 @@ pub(crate) async fn open_pr_and_link(
     // Errors become text before the await, so no `dyn Error` is held across it.
     let submitted = crate::work_commands_git::pr_patch(&worktree_str, &base_branch)
         .map_err(|e| e.to_string())
-        .and_then(|(base, patch)| {
-            airc_work::GitObjectId::new(base.as_str())
-                .map(|base| (base, patch))
-                .map_err(|e| format!("merge-base `{base}`: {e}"))
+        .and_then(|(base, head, patch)| {
+            let base = airc_work::GitObjectId::new(base.as_str())
+                .map_err(|e| format!("merge-base `{base}`: {e}"))?;
+            let head = airc_work::GitObjectId::new(head.as_str())
+                .map_err(|e| format!("HEAD `{head}`: {e}"))?;
+            Ok((base, head, patch))
         });
     match submitted {
-        Ok((base, patch)) => {
+        Ok((base, head, patch)) => {
+            let candidate = crate::work_commands::PatchCandidate {
+                bytes: &patch,
+                base,
+                head: Some(head),
+            };
             if let Err(error) =
-                crate::work_commands::submit_patch(airc, home, room, card_id, &patch, base, None)
-                    .await
+                crate::work_commands::submit_patch(airc, home, room, card_id, candidate, None).await
             {
                 eprintln!("airc: submission skipped — {error}");
             }

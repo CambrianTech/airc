@@ -124,6 +124,12 @@ pub struct WorkSubmission {
     pub claim_id: ClaimId,
     pub instance: String,
     pub base_sha: GitObjectId,
+    /// The commit the submitted patch produces (the submitter's branch tip), so a merge whose
+    /// head is this commit credits exactly this candidate. `None` for a patch submitted without
+    /// a commit, and for every submission published before this was recorded: such a
+    /// submission is never matched to a merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<GitObjectId>,
     pub artifact: airc_blobs::MediaRef,
     pub publisher: PeerId,
     pub submitted_at_ms: u64,
@@ -833,6 +839,11 @@ pub struct PullRequestRelinked {
 pub struct PullRequestMerged {
     pub card_id: WorkCardId,
     pub pull_request: PullRequestRef,
+    /// The PR branch's tip GitHub reported at the merge: the exact commit that merged, typed
+    /// from the PR read, never parsed from a body. `None` when the read did not carry it, and
+    /// for every merge recorded before this was: such a merge credits no submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<GitObjectId>,
     pub merged_by: PeerId,
     pub merged_at_ms: u64,
 }
@@ -908,6 +919,7 @@ mod tests {
             claim_id,
             instance: "card".into(),
             base_sha: GitObjectId::new("a".repeat(40)).unwrap(),
+            head: None,
             artifact: airc_blobs::MediaRef {
                 hash: airc_blobs::ContentHash::from_bytes(b"corrected submission fixture"),
                 size_bytes: 100,
@@ -1031,6 +1043,76 @@ mod tests {
         assert_eq!(
             serde_json::to_value(WorkEvent::ClaimReleased(decoded)).unwrap(),
             old
+        );
+    }
+
+    // what this catches: a submission or a merge recorded before `head` existed must still
+    // decode (the projection replays every past event; a required field would refuse the whole
+    // history, the outage shape of continuum's Event.level on 2026-10-31), and a recorded head
+    // must survive the round trip a merged-PR credit binds on (card 90367042).
+    #[test]
+    fn a_submission_and_a_merge_without_head_decode_and_a_head_round_trips() {
+        let commit = GitObjectId::new("b".repeat(40)).unwrap();
+        let submission = WorkSubmission {
+            submission_id: crate::SubmissionId::from_u128(1),
+            card_id: WorkCardId::from_u128(2),
+            claim_id: ClaimId::from_u128(3),
+            instance: "repo".into(),
+            base_sha: GitObjectId::new("a".repeat(40)).unwrap(),
+            head: Some(commit.clone()),
+            artifact: airc_blobs::MediaRef {
+                hash: airc_blobs::ContentHash::from_bytes(b"head fixture"),
+                size_bytes: 12,
+                mime: Some("text/x-patch".into()),
+            },
+            publisher: PeerId::from_u128(4),
+            submitted_at_ms: 5,
+        };
+        let whole = serde_json::to_value(&submission).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkSubmission>(whole.clone()).unwrap(),
+            submission
+        );
+
+        let mut older = whole;
+        older.as_object_mut().unwrap().remove("head");
+        let read: WorkSubmission = serde_json::from_value(older).unwrap();
+        assert_eq!(
+            read.head, None,
+            "a submission from before heads were recorded matches no merge"
+        );
+        assert_eq!(
+            WorkSubmission {
+                head: Some(commit.clone()),
+                ..read
+            },
+            submission
+        );
+
+        let merged = PullRequestMerged {
+            card_id: WorkCardId::from_u128(2),
+            pull_request: PullRequestRef {
+                repo: RepoId::new("CambrianTech/airc").unwrap(),
+                number: 7,
+                head: crate::model::BranchName::new("topic").unwrap(),
+                base: crate::model::BranchName::new("canary").unwrap(),
+            },
+            head: Some(commit),
+            merged_by: PeerId::from_u128(4),
+            merged_at_ms: 6,
+        };
+        let whole = serde_json::to_value(&merged).unwrap();
+        assert_eq!(
+            serde_json::from_value::<PullRequestMerged>(whole.clone()).unwrap(),
+            merged
+        );
+        let mut older = whole;
+        older.as_object_mut().unwrap().remove("head");
+        assert_eq!(
+            serde_json::from_value::<PullRequestMerged>(older)
+                .unwrap()
+                .head,
+            None
         );
     }
 }

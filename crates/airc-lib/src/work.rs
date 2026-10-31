@@ -30,6 +30,8 @@ pub struct SubmitWork {
     pub claim_id: ClaimId,
     pub instance: String,
     pub base_sha: airc_work::GitObjectId,
+    /// The commit the patch produces, when the submitter has one (`WorkSubmission::head`).
+    pub head: Option<airc_work::GitObjectId>,
     pub artifact: airc_work::SubmissionArtifact,
 }
 
@@ -215,6 +217,8 @@ pub struct RelinkCardPullRequest {
 pub struct MarkPullRequestMerged {
     pub card_id: WorkCardId,
     pub pull_request: airc_work::model::PullRequestRef,
+    /// The PR branch's tip at the merge, from the PR read (`PullRequestMerged::head`).
+    pub head: Option<airc_work::GitObjectId>,
     pub merged_at_ms: u64,
 }
 
@@ -532,6 +536,7 @@ impl Airc {
             claim_id: request.claim_id,
             instance: request.instance,
             base_sha: request.base_sha,
+            head: request.head,
             artifact: request.artifact,
             publisher: self.peer_id(),
             submitted_at_ms: now_ms()?,
@@ -923,6 +928,7 @@ impl Airc {
         let event = WorkEvent::PullRequestMerged(airc_work::event::PullRequestMerged {
             card_id: request.card_id,
             pull_request: request.pull_request,
+            head: request.head,
             merged_by: self.peer_id(),
             merged_at_ms: request.merged_at_ms,
         });
@@ -1986,6 +1992,7 @@ mod tests {
                     claim_id: claim,
                     instance: "ordinary-task".into(),
                     base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+                    head: None,
                     artifact: artifact.clone(),
                 },
             )
@@ -2061,6 +2068,7 @@ mod tests {
                     claim_id: claim,
                     instance: "ordinary-task".into(),
                     base_sha: airc_work::GitObjectId::new("c".repeat(40)).unwrap(),
+                    head: None,
                     artifact: artifact.clone(),
                 },
             )

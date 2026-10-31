@@ -725,7 +725,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .result;
         assert!(
             matches!(result, crate::merger::GateResult::Green),
             "{result:?}"
@@ -774,7 +775,8 @@ mod tests {
                 now_ms: 0,
             },
         )
-        .await;
+        .await
+        .map(|read| read.result);
         (result, join_server(server).await)
     }
 

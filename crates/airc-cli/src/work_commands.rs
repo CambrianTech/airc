@@ -644,6 +644,7 @@ pub(crate) async fn mark_merged_and_reclaim(
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
     pull_request: airc_work::model::PullRequestRef,
+    head: Option<airc_work::model::GitObjectId>,
     merged_at_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_lib::MarkPullRequestMerged;
@@ -652,6 +653,7 @@ pub(crate) async fn mark_merged_and_reclaim(
         MarkPullRequestMerged {
             card_id,
             pull_request,
+            head,
             merged_at_ms,
         },
     )
@@ -1617,18 +1619,38 @@ pub async fn run_submit(
     card_id: String,
     patch: std::path::PathBuf,
     base: String,
+    head: Option<String>,
     instance: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes =
         std::fs::read(&patch).map_err(|e| format!("patch file {}: {e}", patch.display()))?;
     let base_sha = airc_work::GitObjectId::new(base.trim())
         .map_err(|e| format!("--base `{base}`: {e} (give the FULL commit sha)"))?;
+    let head = head
+        .map(|head| {
+            airc_work::GitObjectId::new(head.trim())
+                .map_err(|e| format!("--head `{head}`: {e} (give the FULL commit sha)"))
+        })
+        .transpose()?;
     let airc = crate::commands::attached_airc(home).await?;
     let shown = Shown::try_from(card_id.as_str())?;
     let room = room_or_current(&airc, room.as_deref(), "submit work in").await?;
     let board = airc.work_board_in(&room).await?;
     let card_id = card_on_board(&board, &shown)?;
-    submit_patch(&airc, home, &room, card_id, &bytes, base_sha, instance).await
+    let candidate = PatchCandidate {
+        bytes: &bytes,
+        base: base_sha,
+        head,
+    };
+    submit_patch(&airc, home, &room, card_id, candidate, instance).await
+}
+
+/// What a submission says about its patch: the bytes, the commit they apply to, and the
+/// commit they produce when there is one (`WorkSubmission::head`).
+pub(crate) struct PatchCandidate<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) base: airc_work::GitObjectId,
+    pub(crate) head: Option<airc_work::GitObjectId>,
 }
 
 /// Publish `bytes` as a submission on `card_id`, under the caller as its holder: the
@@ -1642,10 +1664,14 @@ pub(crate) async fn submit_patch(
     home: &Path,
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
-    bytes: &[u8],
-    base_sha: airc_work::GitObjectId,
+    candidate: PatchCandidate<'_>,
     instance: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let PatchCandidate {
+        bytes,
+        base: base_sha,
+        head,
+    } = candidate;
     let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
@@ -1675,6 +1701,7 @@ pub(crate) async fn submit_patch(
                 claim_id,
                 instance,
                 base_sha,
+                head,
                 artifact,
             },
         )
@@ -1897,7 +1924,10 @@ pub async fn run_merge(
     };
 
     match crate::merger::check_pr_gate(gh.as_ref(), &pr, &mut baselines, policy).await {
-        Ok(crate::merger::GateResult::Green) => {
+        Ok(crate::merger::GateRead {
+            result: crate::merger::GateResult::Green,
+            head,
+        }) => {
             if dry_run {
                 println!(
                     "merge_gate: GREEN — card={card_uuid} pr=#{n} repo={r} (would merge)",
@@ -1915,7 +1945,7 @@ pub async fn run_merge(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), now_ms).await?;
+            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), head, now_ms).await?;
             println!(
                 "merged: card={card_uuid} pr=#{n} repo={r}",
                 n = pr.number,
@@ -1923,7 +1953,10 @@ pub async fn run_merge(
             );
             Ok(())
         }
-        Ok(crate::merger::GateResult::AlreadyMerged { merged_at_ms }) => {
+        Ok(crate::merger::GateRead {
+            result: crate::merger::GateResult::AlreadyMerged { merged_at_ms },
+            head,
+        }) => {
             // Card acd72c81 follow-up: PR is already merged on
             // GitHub. The manual `airc work merge` path reconciles
             // by emitting `PullRequestMerged` — no `gh pr merge`
@@ -1937,7 +1970,8 @@ pub async fn run_merge(
                 );
                 return Ok(());
             }
-            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), merged_at_ms).await?;
+            mark_merged_and_reclaim(&airc, &room, card_uuid, pr.clone(), head, merged_at_ms)
+                .await?;
             println!(
                 "reconciled: card={card_uuid} pr=#{n} repo={r} (PR was already merged on GitHub)",
                 n = pr.number,
@@ -1945,7 +1979,10 @@ pub async fn run_merge(
             );
             Ok(())
         }
-        Ok(crate::merger::GateResult::NotReady(reason)) => Err(format!(
+        Ok(crate::merger::GateRead {
+            result: crate::merger::GateResult::NotReady(reason),
+            ..
+        }) => Err(format!(
             "refusing to merge card {card_uuid} pr=#{n}: {reason}.\n\n\
              The strictly-less-red doctrine (card d5b7b07d) already lets you through \
              when only base-inherited failures remain. If you BELIEVE this gate is \

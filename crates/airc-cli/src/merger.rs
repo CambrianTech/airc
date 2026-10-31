@@ -144,7 +144,7 @@ async fn tick_once(
             continue;
         };
         match decision {
-            MergeDecision::Merge(pr) => {
+            MergeDecision::Merge(pr, head) => {
                 if dry_run {
                     eprintln!(
                         "airc-merger: [DRY-RUN] would merge card={} pr=#{} ({})",
@@ -152,7 +152,7 @@ async fn tick_once(
                     );
                     continue;
                 }
-                match perform_merge(gh, card, &pr, airc, &room).await {
+                match perform_merge(gh, card, &pr, head, airc, &room).await {
                     Ok(()) => eprintln!(
                         "airc-merger: merged card={} pr=#{} ({})",
                         card.card_id, pr.number, pr.repo
@@ -163,7 +163,7 @@ async fn tick_once(
                     ),
                 }
             }
-            MergeDecision::Reconcile(pr, merged_at_ms) => {
+            MergeDecision::Reconcile(pr, merged_at_ms, head) => {
                 if dry_run {
                     eprintln!(
                         "airc-merger: [DRY-RUN] would reconcile already-merged card={} pr=#{} ({})",
@@ -171,7 +171,7 @@ async fn tick_once(
                     );
                     continue;
                 }
-                match perform_reconcile(card, &pr, merged_at_ms, airc, &room).await {
+                match perform_reconcile(card, &pr, merged_at_ms, head, airc, &room).await {
                     Ok(()) => eprintln!(
                         "airc-merger: reconciled already-merged card={} pr=#{} ({})",
                         card.card_id, pr.number, pr.repo
@@ -199,6 +199,7 @@ async fn perform_reconcile(
     card: &WorkCard,
     pr: &airc_work::model::PullRequestRef,
     merged_at_ms: u64,
+    head: Option<airc_work::model::GitObjectId>,
     airc: &Airc,
     room: &airc_lib::Room,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -211,13 +212,18 @@ async fn perform_reconcile(
         room,
         card.card_id,
         pr.clone(),
+        head,
         merged_at_ms,
     )
     .await
 }
 
 enum MergeDecision {
-    Merge(airc_work::model::PullRequestRef),
+    /// The PR to merge and its head at the gate's read.
+    Merge(
+        airc_work::model::PullRequestRef,
+        Option<airc_work::model::GitObjectId>,
+    ),
     /// Card acd72c81 follow-up: PR is ALREADY merged on GitHub but the
     /// kanban projection hasn't observed it (no `PullRequestMerged`
     /// event for this card). The merger reconciles by emitting one
@@ -225,7 +231,12 @@ enum MergeDecision {
     /// `merged_at_ms` comes from gh's `mergedAt` ISO-8601 timestamp
     /// when available, falls back to wall-clock-now if gh didn't
     /// supply it (older gh schema or transient).
-    Reconcile(airc_work::model::PullRequestRef, u64),
+    /// The merged PR, its merge time and its head at the read.
+    Reconcile(
+        airc_work::model::PullRequestRef,
+        u64,
+        Option<airc_work::model::GitObjectId>,
+    ),
     Skip(String),
 }
 
@@ -248,11 +259,18 @@ async fn evaluate(
     };
 
     match check_pr_gate(gh, &pr, baselines, policy).await {
-        Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
-        Ok(GateResult::AlreadyMerged { merged_at_ms }) => {
-            Ok(Some(MergeDecision::Reconcile(pr, merged_at_ms)))
-        }
-        Ok(GateResult::NotReady(reason)) => Ok(Some(MergeDecision::Skip(reason))),
+        Ok(GateRead {
+            result: GateResult::Green,
+            head,
+        }) => Ok(Some(MergeDecision::Merge(pr, head))),
+        Ok(GateRead {
+            result: GateResult::AlreadyMerged { merged_at_ms },
+            head,
+        }) => Ok(Some(MergeDecision::Reconcile(pr, merged_at_ms, head))),
+        Ok(GateRead {
+            result: GateResult::NotReady(reason),
+            ..
+        }) => Ok(Some(MergeDecision::Skip(reason))),
         Err(error) => Ok(Some(MergeDecision::Skip(format!(
             "gh status query failed: {error}"
         )))),
@@ -342,7 +360,7 @@ pub(crate) async fn check_pr_gate(
     pr: &airc_work::model::PullRequestRef,
     baselines: &mut BaselineCache,
     policy: GatePolicy,
-) -> Result<GateResult, crate::gh_client::GhError> {
+) -> Result<GateRead, crate::gh_client::GhError> {
     let view = gh
         .pr_view(crate::gh_client::PrViewArgs {
             repo: pr.repo.as_str().to_string(),
@@ -350,20 +368,46 @@ pub(crate) async fn check_pr_gate(
             cwd: None,
         })
         .await?;
+    let head = view_head(&view);
+    let result = gate_from_view(gh, pr, &view, baselines, policy).await;
+    Ok(GateRead { result, head })
+}
+
+/// The gate's decision and the PR branch's tip from the same read: a merge records the
+/// commit that merged (`PullRequestMerged::head`) without asking GitHub twice.
+pub(crate) struct GateRead {
+    pub(crate) result: GateResult,
+    pub(crate) head: Option<airc_work::model::GitObjectId>,
+}
+
+/// The PR's head commit, only when GitHub gave a complete object id: a short or malformed
+/// value never stands for the commit that merged.
+fn view_head(view: &crate::gh_client::PrView) -> Option<airc_work::model::GitObjectId> {
+    let head = airc_work::model::GitObjectId::new(view.head_ref_oid.as_deref()?).ok()?;
+    matches!(head.as_str().len(), 40 | 64).then_some(head)
+}
+
+async fn gate_from_view(
+    gh: &dyn crate::gh_client::GhClient,
+    pr: &airc_work::model::PullRequestRef,
+    view: &crate::gh_client::PrView,
+    baselines: &mut BaselineCache,
+    policy: GatePolicy,
+) -> GateResult {
     let no_allowance = HashSet::new();
-    let without_baseline = evaluate_gh_view(&view, &no_allowance, policy);
+    let without_baseline = evaluate_gh_view(view, &no_allowance, policy);
     if !matches!(without_baseline, GateResult::NotReady(_)) {
         // A decision needing no base allowance (including the configured
         // pending-timeout policy) does not depend on another lookup succeeding.
-        return Ok(without_baseline);
+        return without_baseline;
     }
-    let Some(target) = BaselineTarget::from_view(&pr.repo, &view) else {
+    let Some(target) = BaselineTarget::from_view(&pr.repo, view) else {
         eprintln!(
             "airc-merger: PR #{} in {} has no verified target branch/revision \
              (degrading to no-allowance gate)",
             pr.number, pr.repo
         );
-        return Ok(without_baseline);
+        return without_baseline;
     };
     let failures = match baselines.failures.entry(target) {
         Entry::Occupied(entry) => entry.into_mut(),
@@ -372,7 +416,7 @@ pub(crate) async fn check_pr_gate(
             entry.insert(failures)
         }
     };
-    Ok(evaluate_gh_view(&view, failures, policy))
+    evaluate_gh_view(view, failures, policy)
 }
 
 /// Short-lived baseline observations for one merger tick or manual command.
@@ -660,6 +704,7 @@ async fn perform_merge(
     gh: &dyn crate::gh_client::GhClient,
     card: &WorkCard,
     pr: &airc_work::model::PullRequestRef,
+    head: Option<airc_work::model::GitObjectId>,
     airc: &Airc,
     room: &airc_lib::Room,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -678,8 +723,15 @@ async fn perform_merge(
     // CLI's two terminal paths all agree. Before extraction, four
     // sites duplicated this pair and the CLI half forgot the cleanup
     // wire — recurring disk-full crash.
-    crate::work_commands::mark_merged_and_reclaim(airc, room, card.card_id, pr.clone(), now_ms)
-        .await
+    crate::work_commands::mark_merged_and_reclaim(
+        airc,
+        room,
+        card.card_id,
+        pr.clone(),
+        head,
+        now_ms,
+    )
+    .await
 }
 
 /// Acquire a non-blocking exclusive lock at `<home>/merger.lock`.
@@ -794,7 +846,8 @@ mod tests {
                 empty_policy(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .result;
             assert_eq!(
                 matches!(result, GateResult::Green),
                 should_merge,
@@ -848,7 +901,8 @@ mod tests {
             assert!(matches!(
                 check_pr_gate(&gh, &pr, &mut baselines, empty_policy())
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .result,
                 GateResult::NotReady(_)
             ));
         }
@@ -862,7 +916,8 @@ mod tests {
             assert!(matches!(
                 check_pr_gate(&gh, &pr, &mut baselines, empty_policy())
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .result,
                 GateResult::NotReady(_)
             ));
         }
@@ -879,7 +934,8 @@ mod tests {
         assert!(matches!(
             check_pr_gate(&gh, &pr, &mut baselines, empty_policy())
                 .await
-                .unwrap(),
+                .unwrap()
+                .result,
             GateResult::Green
         ));
         assert_eq!(
@@ -897,7 +953,8 @@ mod tests {
         assert!(matches!(
             check_pr_gate(&gh, &pr, &mut BaselineCache::default(), empty_policy())
                 .await
-                .unwrap(),
+                .unwrap()
+                .result,
             GateResult::Green
         ));
         assert_eq!(gh.branch_check_rollup_call_count(), 2);
@@ -1380,6 +1437,7 @@ mod tests {
             merged_at: Some("2026-06-01T07:04:07Z".to_string()),
             base_ref_name: None,
             base_ref_oid: None,
+            head_ref_oid: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);
@@ -1406,6 +1464,7 @@ mod tests {
             merged_at: Some("2026-09-04T16:46:08Z".to_string()),
             base_ref_name: None,
             base_ref_oid: None,
+            head_ref_oid: None,
         };
         match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
             GateResult::AlreadyMerged { merged_at_ms } => {
@@ -1429,6 +1488,7 @@ mod tests {
             merged_at: None,
             base_ref_name: None,
             base_ref_oid: None,
+            head_ref_oid: None,
         };
         match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
             GateResult::NotReady(reason) => assert!(reason.contains("CLOSED"), "{reason}"),
@@ -1449,6 +1509,7 @@ mod tests {
             merged_at: None,
             base_ref_name: None,
             base_ref_oid: None,
+            head_ref_oid: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);
@@ -1470,6 +1531,7 @@ mod tests {
             merged_at: None,
             base_ref_name: None,
             base_ref_oid: None,
+            head_ref_oid: None,
         };
         let baseline = std::collections::HashSet::new();
         let policy = GatePolicy::default_for_merger(0);
