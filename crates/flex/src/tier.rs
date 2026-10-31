@@ -180,10 +180,22 @@ struct Targets<U: Unit> {
     unallocated: Amount<U>,
 }
 
+/// What a quote or plan was made against: the clearing generation and the custody revision.
+/// A child quote is current only while both are unchanged, because a release or a withdrawal
+/// changes what is free without a new clearing (Codex on #5632's integration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Fence {
+    pub generation: u64,
+    pub custody: u64,
+}
+
 /// One resource's grants across clearings.
 #[derive(Debug)]
 pub struct Tier<U: Unit> {
     generation: u64,
+    /// Advances on every change to what holders own or are asked for: a clearing, a report that
+    /// changes a holding, a withdrawal. An idempotent report leaves it.
+    custody: u64,
     holdings: BTreeMap<ClaimId, Holding<U>>,
     next_lease: u64,
 }
@@ -192,6 +204,7 @@ impl<U: Unit> Default for Tier<U> {
     fn default() -> Self {
         Self {
             generation: 0,
+            custody: 0,
             holdings: BTreeMap::new(),
             next_lease: 0,
         }
@@ -205,6 +218,14 @@ impl<U: Unit> Tier<U> {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The value a quote is fenced on: generation and custody revision together.
+    pub fn fence(&self) -> Fence {
+        Fence {
+            generation: self.generation,
+            custody: self.custody,
+        }
     }
 
     /// Clear `claims` against `capacity` and move the grants. A holder that presents no claim is
@@ -262,6 +283,7 @@ impl<U: Unit> Tier<U> {
             return self.unmoved(capacity, Outcome::NonFinite, refused);
         };
         self.generation += 1;
+        self.custody += 1;
         let generation = self.generation;
         for holding in self.holdings.values_mut() {
             // A holder that no longer claims anything is asked to release everything; a claimant is
@@ -342,14 +364,19 @@ impl<U: Unit> Tier<U> {
             });
         }
         let released = holding.owned.saturating_sub(holds);
+        let before = (holding.owned, holding.state);
         holding.owned = holds;
         if holds == holding.target && matches!(holding.state, GrantState::ShrinkRequested { .. }) {
             holding.state = GrantState::Granted;
         } else if holds < holding.target {
             holding.state = GrantState::Waiting;
         }
+        let changed = before != (holding.owned, holding.state);
         if holds == Amount::ZERO && holding.target == Amount::ZERO {
             self.holdings.remove(&claim);
+            self.custody += 1;
+        } else if changed {
+            self.custody += 1;
         }
         Ok(released)
     }
@@ -372,6 +399,7 @@ impl<U: Unit> Tier<U> {
         }
         let owned = holding.owned;
         self.holdings.remove(&claim);
+        self.custody += 1;
         Ok(owned)
     }
 

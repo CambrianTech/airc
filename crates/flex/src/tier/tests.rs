@@ -563,3 +563,35 @@ fn a_hold_never_sits_inside_the_reservation_even_before_a_divisible_block() {
     assert_ne!(state(&clearing, 1), Some(GrantState::Held));
     assert_eq!(owned(&clearing, 1), amount(15));
 }
+
+// what this catches: a child quote fenced on the clearing generation alone staying "current"
+// after a release or a withdrawal changed what is free (Codex: report_held/withdraw mutate
+// custody without advancing the generation). Every custody change moves the fence; an
+// idempotent report does not.
+#[test]
+fn every_custody_change_moves_the_fence_and_an_idempotent_report_does_not() {
+    let mut tier = Tier::new();
+    let a = claim(1, Floor::None, &[(40, 1.0, true)]);
+    tier.clear(capacity(50), std::slice::from_ref(&a));
+    let b = claim(2, Floor::None, &[(40, 5.0, true)]);
+    let second = tier.clear(capacity(50), &[a, b]);
+    let cleared = tier.fence();
+    assert_eq!(tier.report_held(release(&second, 1, 10)), Ok(amount(30)));
+    let released = tier.fence();
+    assert_eq!(
+        released.generation, cleared.generation,
+        "a release is not a clearing"
+    );
+    assert_ne!(released, cleared, "a release changes what is free");
+    assert_eq!(tier.report_held(release(&second, 1, 10)), Ok(amount(0)));
+    assert_eq!(
+        tier.fence(),
+        released,
+        "the same report again changes nothing"
+    );
+    let lease = grant(&second, 2)
+        .map(|g| g.lease)
+        .expect("test: B holds a lease");
+    assert_eq!(tier.withdraw(ClaimId(2), lease), Ok(amount(10)));
+    assert_ne!(tier.fence(), released, "a withdrawal changes what is free");
+}
