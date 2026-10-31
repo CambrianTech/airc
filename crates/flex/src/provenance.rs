@@ -10,9 +10,17 @@ pub struct SourceId(pub u128);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provenance {
     /// Measured by `source` at `at_ms` (the caller's clock), as revision `version` of its method.
-    Measured { source: SourceId, at_ms: u64, version: u64 },
+    Measured {
+        source: SourceId,
+        at_ms: u64,
+        version: u64,
+    },
     /// Measured once, at `last_ms`, and `age_ms` old when this clearing ran.
-    Stale { source: SourceId, last_ms: u64, age_ms: u64 },
+    Stale {
+        source: SourceId,
+        last_ms: u64,
+        age_ms: u64,
+    },
     /// Never measured.
     Unmeasured,
 }

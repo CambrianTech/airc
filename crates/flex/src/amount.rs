@@ -22,7 +22,10 @@ impl<U: Unit> Amount<U> {
     pub const ZERO: Self = Self::new(0);
 
     pub const fn new(raw: u64) -> Self {
-        Self { raw, unit: PhantomData }
+        Self {
+            raw,
+            unit: PhantomData,
+        }
     }
 
     pub const fn raw(self) -> u64 {

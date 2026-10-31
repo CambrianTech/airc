@@ -17,7 +17,10 @@ use crate::value::{NonFinite, Price};
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub enum Capacity<U: Unit> {
-    Measured { amount: Amount<U>, provenance: Provenance },
+    Measured {
+        amount: Amount<U>,
+        provenance: Provenance,
+    },
     Unavailable,
 }
 
@@ -58,7 +61,11 @@ pub enum Outcome<U: Unit> {
     Cleared,
     /// The required floors alone exceed capacity. Nothing moved; the named claims need
     /// scheduling, placement or a smaller footprint, never an oversubscription.
-    Infeasible { required: Amount<U>, capacity: Amount<U>, claims: Vec<ClaimId> },
+    Infeasible {
+        required: Amount<U>,
+        capacity: Amount<U>,
+        claims: Vec<ClaimId>,
+    },
     /// Capacity is not measured. Nothing moved.
     CapacityUnavailable,
     /// A value overflowed past what a finite number holds. Nothing moved.
@@ -89,7 +96,10 @@ pub enum ReleaseError {
     /// Nothing was asked of it.
     NothingRequested,
     /// The acknowledgement names an older generation than the request it answers.
-    Stale { requested_at: u64, acknowledged: u64 },
+    Stale {
+        requested_at: u64,
+        acknowledged: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,7 +127,10 @@ pub struct Tier<U: Unit> {
 
 impl<U: Unit> Default for Tier<U> {
     fn default() -> Self {
-        Self { generation: 0, holdings: BTreeMap::new() }
+        Self {
+            generation: 0,
+            holdings: BTreeMap::new(),
+        }
     }
 }
 
@@ -143,15 +156,37 @@ impl<U: Unit> Tier<U> {
         }
         valid.sort_by_key(|c| c.id);
         refused.sort_by_key(|(id, _)| *id);
-        let Capacity::Measured { amount: capacity_amount, .. } = capacity else {
+        let Capacity::Measured {
+            amount: capacity_amount,
+            ..
+        } = capacity
+        else {
             return self.unmoved(capacity, Outcome::CapacityUnavailable, refused);
         };
         let required: Amount<U> = valid.iter().map(|c| c.reservation()).sum();
         if required > capacity_amount {
-            let claims = valid.iter().filter(|c| matches!(c.floor, Floor::Required(_))).map(|c| c.id).collect();
-            return self.unmoved(capacity, Outcome::Infeasible { required, capacity: capacity_amount, claims }, refused);
+            let claims = valid
+                .iter()
+                .filter(|c| matches!(c.floor, Floor::Required(_)))
+                .map(|c| c.id)
+                .collect();
+            return self.unmoved(
+                capacity,
+                Outcome::Infeasible {
+                    required,
+                    capacity: capacity_amount,
+                    claims,
+                },
+                refused,
+            );
         }
-        let Ok(Targets { amounts, held, price, unallocated }) = self.targets(capacity_amount, &valid) else {
+        let Ok(Targets {
+            amounts,
+            held,
+            price,
+            unallocated,
+        }) = self.targets(capacity_amount, &valid)
+        else {
             return self.unmoved(capacity, Outcome::NonFinite, refused);
         };
         self.generation += 1;
@@ -200,15 +235,30 @@ impl<U: Unit> Tier<U> {
             states.insert(claim.id, state);
         }
         let grants = self.grants(&states);
-        Clearing { generation, capacity, outcome: Outcome::Cleared, grants, price, unallocated, refused }
+        Clearing {
+            generation,
+            capacity,
+            outcome: Outcome::Cleared,
+            grants,
+            price,
+            unallocated,
+            refused,
+        }
     }
 
     /// The holder of `claim` released down to what the request at `generation` asked.
-    pub fn acknowledge_release(&mut self, claim: ClaimId, generation: u64) -> Result<Amount<U>, ReleaseError> {
+    pub fn acknowledge_release(
+        &mut self,
+        claim: ClaimId,
+        generation: u64,
+    ) -> Result<Amount<U>, ReleaseError> {
         let holding = self.holdings.get_mut(&claim).ok_or(ReleaseError::Unknown)?;
         let to = holding.shrink_to.ok_or(ReleaseError::NothingRequested)?;
         if generation < holding.generation {
-            return Err(ReleaseError::Stale { requested_at: holding.generation, acknowledged: generation });
+            return Err(ReleaseError::Stale {
+                requested_at: holding.generation,
+                acknowledged: generation,
+            });
         }
         let freed = holding.owned.saturating_sub(to);
         holding.owned = to;
@@ -221,7 +271,9 @@ impl<U: Unit> Tier<U> {
 
     /// Whether a grant presented at `generation` for `claim` is current.
     pub fn is_current(&self, claim: ClaimId, generation: u64) -> bool {
-        self.holdings.get(&claim).is_some_and(|h| h.generation == generation)
+        self.holdings
+            .get(&claim)
+            .is_some_and(|h| h.generation == generation)
     }
 
     /// Targets with hysteresis, aligned with `claims`: a claim whose target differs from what it
@@ -231,16 +283,24 @@ impl<U: Unit> Tier<U> {
         // Unmeasured claims get their reservation and nothing traded; every other amount starts
         // from its reservation too, and the clearing fills it in.
         let mut amounts: Vec<Amount<U>> = claims.iter().map(|c| c.reservation()).collect();
-        let tradeable: Vec<usize> = (0..claims.len()).filter(|&i| claims[i].provenance.is_measured()).collect();
-        let unmeasured_reserved: Amount<U> =
-            claims.iter().filter(|c| !c.provenance.is_measured()).map(|c| c.reservation()).sum();
+        let tradeable: Vec<usize> = (0..claims.len())
+            .filter(|&i| claims[i].provenance.is_measured())
+            .collect();
+        let unmeasured_reserved: Amount<U> = claims
+            .iter()
+            .filter(|c| !c.provenance.is_measured())
+            .map(|c| c.reservation())
+            .sum();
         let room = capacity.saturating_sub(unmeasured_reserved);
         let pick = |slots: &[usize]| slots.iter().map(|&i| claims[i]).collect::<Vec<_>>();
         let first = solve(room, &pick(&tradeable))?;
         let mut held: Vec<(usize, Amount<U>)> = Vec::new();
         for (&i, target) in tradeable.iter().zip(&first.targets) {
             let claim = claims[i];
-            let owned = self.holdings.get(&claim.id).map_or(Amount::ZERO, |h| h.owned);
+            let owned = self
+                .holdings
+                .get(&claim.id)
+                .map_or(Amount::ZERO, |h| h.owned);
             if owned == Amount::ZERO || owned == *target {
                 continue;
             }
@@ -250,14 +310,22 @@ impl<U: Unit> Tier<U> {
             }
         }
         let held_amount: Amount<U> = held.iter().map(|(_, owned)| *owned).sum();
-        let others: Vec<usize> = tradeable.iter().copied().filter(|i| !held.iter().any(|(h, _)| h == i)).collect();
+        let others: Vec<usize> = tradeable
+            .iter()
+            .copied()
+            .filter(|i| !held.iter().any(|(h, _)| h == i))
+            .collect();
         let others_reserved: Amount<U> = others.iter().map(|&i| claims[i].reservation()).sum();
         // A hold that would overcommit the capacity is not applied this time.
         let holds_fit = held_amount.saturating_add(others_reserved) <= room;
         let (solution, cleared, held) = if held.is_empty() || !holds_fit {
             (first, tradeable, Vec::new())
         } else {
-            (solve(room.saturating_sub(held_amount), &pick(&others))?, others, held)
+            (
+                solve(room.saturating_sub(held_amount), &pick(&others))?,
+                others,
+                held,
+            )
         };
         for (&i, target) in cleared.iter().zip(&solution.targets) {
             amounts[i] = *target;
@@ -273,7 +341,12 @@ impl<U: Unit> Tier<U> {
         })
     }
 
-    fn unmoved(&self, capacity: Capacity<U>, outcome: Outcome<U>, refused: Vec<(ClaimId, ClaimError)>) -> Clearing<U> {
+    fn unmoved(
+        &self,
+        capacity: Capacity<U>,
+        outcome: Outcome<U>,
+        refused: Vec<(ClaimId, ClaimError)>,
+    ) -> Clearing<U> {
         let states = BTreeMap::new();
         Clearing {
             generation: self.generation,
@@ -324,11 +397,18 @@ mod tests {
     }
 
     fn measured() -> Provenance {
-        Provenance::Measured { source: SourceId(1), at_ms: 0, version: 1 }
+        Provenance::Measured {
+            source: SourceId(1),
+            at_ms: 0,
+            version: 1,
+        }
     }
 
     fn capacity(n: u64) -> Capacity<Tok> {
-        Capacity::Measured { amount: amount(n), provenance: measured() }
+        Capacity::Measured {
+            amount: amount(n),
+            provenance: measured(),
+        }
     }
 
     fn claim(id: u128, floor: Floor<Tok>, increments: &[(u64, f64, bool)]) -> Claim<Tok> {
@@ -338,7 +418,11 @@ mod tests {
             floor,
             increments: increments
                 .iter()
-                .map(|&(width, per_unit, divisible)| Increment { width: amount(width), per_unit: value(per_unit), divisible })
+                .map(|&(width, per_unit, divisible)| Increment {
+                    width: amount(width),
+                    per_unit: value(per_unit),
+                    divisible,
+                })
                 .collect(),
             provenance: measured(),
             switch_cost: Value::ZERO,
@@ -346,11 +430,19 @@ mod tests {
     }
 
     fn owned(clearing: &Clearing<Tok>, id: u128) -> Amount<Tok> {
-        clearing.grants.iter().find(|g| g.claim == ClaimId(id)).map_or(Amount::ZERO, |g| g.owned)
+        clearing
+            .grants
+            .iter()
+            .find(|g| g.claim == ClaimId(id))
+            .map_or(Amount::ZERO, |g| g.owned)
     }
 
     fn state(clearing: &Clearing<Tok>, id: u128) -> Option<GrantState<Tok>> {
-        clearing.grants.iter().find(|g| g.claim == ClaimId(id)).map(|g| g.state)
+        clearing
+            .grants
+            .iter()
+            .find(|g| g.claim == ClaimId(id))
+            .map(|g| g.state)
     }
 
     // what this catches: a solver that splits by share instead of value. Reservations come first,
@@ -362,7 +454,10 @@ mod tests {
         let b = claim(2, Floor::None, &[(30, 3.0, true)]);
         let clearing = tier.clear(capacity(50), &[a, b]);
         assert_eq!(clearing.outcome, Outcome::Cleared);
-        assert_eq!((owned(&clearing, 1), owned(&clearing, 2)), (amount(20), amount(30)));
+        assert_eq!(
+            (owned(&clearing, 1), owned(&clearing, 2)),
+            (amount(20), amount(30))
+        );
         assert_eq!(clearing.price.value(), value(2.0));
         assert_eq!(clearing.unallocated, Amount::ZERO);
     }
@@ -377,10 +472,18 @@ mod tests {
         let clearing = tier.clear(capacity(50), &[a, b]);
         assert_eq!(
             clearing.outcome,
-            Outcome::Infeasible { required: amount(60), capacity: amount(50), claims: vec![ClaimId(1), ClaimId(2)] }
+            Outcome::Infeasible {
+                required: amount(60),
+                capacity: amount(50),
+                claims: vec![ClaimId(1), ClaimId(2)]
+            }
         );
         assert!(clearing.grants.is_empty());
-        assert_eq!(tier.generation(), 0, "an infeasible clearing is not a generation");
+        assert_eq!(
+            tier.generation(),
+            0,
+            "an infeasible clearing is not a generation"
+        );
     }
 
     // what this catches: trading on a value nobody measured. It gets its reservation only.
@@ -403,14 +506,21 @@ mod tests {
         let claims = [
             claim(3, Floor::None, &[(20, 2.0, true)]),
             claim(1, Floor::None, &[(20, 2.0, true)]),
-            claim(2, Floor::Optional(amount(10)), &[(10, 4.0, false), (10, 1.0, true)]),
+            claim(
+                2,
+                Floor::Optional(amount(10)),
+                &[(10, 4.0, false), (10, 1.0, true)],
+            ),
         ];
         let forward = Tier::new().clear(capacity(35), &claims);
         let mut reversed = claims.to_vec();
         reversed.reverse();
         let backward = Tier::new().clear(capacity(35), &reversed);
         assert_eq!(forward, backward);
-        assert_eq!((owned(&forward, 1), owned(&forward, 2), owned(&forward, 3)), (amount(20), amount(10), amount(5)));
+        assert_eq!(
+            (owned(&forward, 1), owned(&forward, 2), owned(&forward, 3)),
+            (amount(20), amount(10), amount(5))
+        );
     }
 
     // what this catches: two holders owning the same unit. A shrink is a request; what it frees is
@@ -423,13 +533,33 @@ mod tests {
         assert_eq!(owned(&first, 1), amount(40));
         let b = claim(2, Floor::None, &[(40, 5.0, true)]);
         let second = tier.clear(capacity(50), &[a.clone(), b.clone()]);
-        assert_eq!(state(&second, 1), Some(GrantState::ShrinkRequested { to: amount(10) }));
-        assert_eq!(owned(&second, 1), amount(40), "it still owns what it has not released");
-        assert_eq!(owned(&second, 2), amount(10), "only the free capacity is granted");
-        assert_eq!(state(&second, 2), Some(GrantState::Waiting { target: amount(40) }));
-        assert_eq!(tier.acknowledge_release(ClaimId(1), second.generation), Ok(amount(30)));
+        assert_eq!(
+            state(&second, 1),
+            Some(GrantState::ShrinkRequested { to: amount(10) })
+        );
+        assert_eq!(
+            owned(&second, 1),
+            amount(40),
+            "it still owns what it has not released"
+        );
+        assert_eq!(
+            owned(&second, 2),
+            amount(10),
+            "only the free capacity is granted"
+        );
+        assert_eq!(
+            state(&second, 2),
+            Some(GrantState::Waiting { target: amount(40) })
+        );
+        assert_eq!(
+            tier.acknowledge_release(ClaimId(1), second.generation),
+            Ok(amount(30))
+        );
         let third = tier.clear(capacity(50), &[a, b]);
-        assert_eq!((owned(&third, 1), owned(&third, 2)), (amount(10), amount(40)));
+        assert_eq!(
+            (owned(&third, 1), owned(&third, 2)),
+            (amount(10), amount(40))
+        );
         assert_eq!(state(&third, 2), Some(GrantState::Granted));
     }
 
@@ -443,7 +573,10 @@ mod tests {
         let second = tier.clear(capacity(50), &[a, b]);
         assert_eq!(
             tier.acknowledge_release(ClaimId(1), first.generation),
-            Err(ReleaseError::Stale { requested_at: second.generation, acknowledged: first.generation })
+            Err(ReleaseError::Stale {
+                requested_at: second.generation,
+                acknowledged: first.generation
+            })
         );
         assert!(tier.is_current(ClaimId(1), second.generation));
         assert!(!tier.is_current(ClaimId(1), first.generation));
@@ -461,7 +594,10 @@ mod tests {
         let b = claim(2, Floor::None, &[(2, 3.0, true)]);
         let held = tier.clear(capacity(40), &[a, b]);
         assert_eq!(state(&held, 1), Some(GrantState::Held));
-        assert_eq!((owned(&held, 1), owned(&held, 2)), (amount(40), Amount::ZERO));
+        assert_eq!(
+            (owned(&held, 1), owned(&held, 2)),
+            (amount(40), Amount::ZERO)
+        );
     }
 
     // what this catches: holding a change that would overcommit the capacity.
@@ -473,7 +609,10 @@ mod tests {
         tier.clear(capacity(40), &[a.clone()]);
         let b = claim(2, Floor::Required(amount(20)), &[]);
         let clearing = tier.clear(capacity(40), &[a, b]);
-        assert_eq!(state(&clearing, 1), Some(GrantState::ShrinkRequested { to: amount(20) }));
+        assert_eq!(
+            state(&clearing, 1),
+            Some(GrantState::ShrinkRequested { to: amount(20) })
+        );
     }
 
     // what this catches: a level granted in part. An item's next level is whole or not at all, and
@@ -484,14 +623,20 @@ mod tests {
         let a = claim(1, Floor::None, &[(30, 5.0, false)]);
         let b = claim(2, Floor::None, &[(30, 1.0, true)]);
         let clearing = tier.clear(capacity(20), &[a, b]);
-        assert_eq!((owned(&clearing, 1), owned(&clearing, 2)), (Amount::ZERO, amount(20)));
+        assert_eq!(
+            (owned(&clearing, 1), owned(&clearing, 2)),
+            (Amount::ZERO, amount(20))
+        );
     }
 
     // what this catches: clearing against a guessed capacity.
     #[test]
     fn an_unmeasured_capacity_moves_nothing() {
         let mut tier = Tier::new();
-        let clearing = tier.clear(Capacity::Unavailable, &[claim(1, Floor::None, &[(10, 1.0, true)])]);
+        let clearing = tier.clear(
+            Capacity::Unavailable,
+            &[claim(1, Floor::None, &[(10, 1.0, true)])],
+        );
         assert_eq!(clearing.outcome, Outcome::CapacityUnavailable);
         assert!(clearing.grants.is_empty());
     }
@@ -503,7 +648,10 @@ mod tests {
         assert!(Value::new(f64::INFINITY).is_err());
         let rising = claim(1, Floor::None, &[(10, 1.0, true), (10, 2.0, true)]);
         let clearing = Tier::new().clear(capacity(50), &[rising]);
-        assert_eq!(clearing.refused, vec![(ClaimId(1), ClaimError::NotConcave { at: 1 })]);
+        assert_eq!(
+            clearing.refused,
+            vec![(ClaimId(1), ClaimError::NotConcave { at: 1 })]
+        );
     }
 
     // what this catches: a holder that stops claiming keeping its grant forever.
@@ -512,8 +660,14 @@ mod tests {
         let mut tier = Tier::new();
         tier.clear(capacity(50), &[claim(1, Floor::None, &[(40, 1.0, true)])]);
         let clearing = tier.clear(capacity(50), &[]);
-        assert_eq!(state(&clearing, 1), Some(GrantState::ShrinkRequested { to: Amount::ZERO }));
-        assert_eq!(tier.acknowledge_release(ClaimId(1), clearing.generation), Ok(amount(40)));
+        assert_eq!(
+            state(&clearing, 1),
+            Some(GrantState::ShrinkRequested { to: Amount::ZERO })
+        );
+        assert_eq!(
+            tier.acknowledge_release(ClaimId(1), clearing.generation),
+            Ok(amount(40))
+        );
         assert!(tier.clear(capacity(50), &[]).grants.is_empty());
     }
 }

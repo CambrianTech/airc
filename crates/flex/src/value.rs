@@ -76,7 +76,10 @@ pub struct Price<U: Unit> {
 
 impl<U: Unit> Price<U> {
     pub const fn per_unit(per_unit: Value) -> Self {
-        Self { per_unit, unit: PhantomData }
+        Self {
+            per_unit,
+            unit: PhantomData,
+        }
     }
 
     pub const fn value(self) -> Value {

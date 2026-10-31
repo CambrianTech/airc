@@ -66,7 +66,10 @@ fn blocks<U: Unit>(claim: &Claim<U>) -> Result<Vec<Increment<U>>, NonFinite> {
             let take = increment.width.min(floor.saturating_sub(joined));
             joined = joined.saturating_add(take);
             if take < increment.width {
-                rest.push(Increment { width: increment.width.saturating_sub(take), ..*increment });
+                rest.push(Increment {
+                    width: increment.width.saturating_sub(take),
+                    ..*increment
+                });
             }
         } else {
             rest.push(*increment);
@@ -78,21 +81,37 @@ fn blocks<U: Unit>(claim: &Claim<U>) -> Result<Vec<Increment<U>>, NonFinite> {
     }
     let value = claim.value_of(joined)?;
     let per_unit = Value::new(value.raw() / joined.raw() as f64)?;
-    out.push(Increment { width: joined, per_unit, divisible: false });
+    out.push(Increment {
+        width: joined,
+        per_unit,
+        divisible: false,
+    });
     out.extend(rest);
     Ok(out)
 }
 
 /// Clear `claims` against `capacity`, the reservations already known to fit.
-pub(crate) fn solve<U: Unit>(capacity: Amount<U>, claims: &[&Claim<U>]) -> Result<Solution<U>, NonFinite> {
+pub(crate) fn solve<U: Unit>(
+    capacity: Amount<U>,
+    claims: &[&Claim<U>],
+) -> Result<Solution<U>, NonFinite> {
     let reserved: Amount<U> = claims.iter().map(|c| c.reservation()).sum();
     let mut free = capacity.saturating_sub(reserved);
     let mut targets: Vec<Amount<U>> = claims.iter().map(|c| c.reservation()).collect();
-    let all_blocks = claims.iter().map(|&c| blocks(c)).collect::<Result<Vec<_>, _>>()?;
+    let all_blocks = claims
+        .iter()
+        .map(|&c| blocks(c))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut heap = BinaryHeap::new();
     for (slot, (claim, blocks)) in claims.iter().zip(&all_blocks).enumerate() {
         if let Some(first) = blocks.first() {
-            heap.push(Candidate { per_unit: first.per_unit, claim: claim.id, slot, index: 0, block: *first });
+            heap.push(Candidate {
+                per_unit: first.per_unit,
+                claim: claim.id,
+                slot,
+                index: 0,
+                block: *first,
+            });
         }
     }
     let mut last_price = None;
@@ -114,8 +133,16 @@ pub(crate) fn solve<U: Unit>(capacity: Amount<U>, claims: &[&Claim<U>]) -> Resul
             *target = target.saturating_add(take);
         }
         if take == next.block.width {
-            if let Some(block) = all_blocks.get(next.slot).and_then(|b| b.get(next.index + 1)) {
-                heap.push(Candidate { index: next.index + 1, per_unit: block.per_unit, block: *block, ..next });
+            if let Some(block) = all_blocks
+                .get(next.slot)
+                .and_then(|b| b.get(next.index + 1))
+            {
+                heap.push(Candidate {
+                    index: next.index + 1,
+                    per_unit: block.per_unit,
+                    block: *block,
+                    ..next
+                });
             }
         }
     }
@@ -124,5 +151,9 @@ pub(crate) fn solve<U: Unit>(capacity: Amount<U>, claims: &[&Claim<U>]) -> Resul
         (true, Some(per_unit)) => Price::per_unit(per_unit),
         _ => Price::per_unit(Value::ZERO),
     };
-    Ok(Solution { targets, price, unallocated: free })
+    Ok(Solution {
+        targets,
+        price,
+        unallocated: free,
+    })
 }
