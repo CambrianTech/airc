@@ -678,7 +678,7 @@ mod tests {
     fn physical_ownership_is_charged_until_the_holder_reports_its_release() {
         let mut tier = Tier::new();
         let a = claim(1, Floor::None, &[(40, 1.0, true)]);
-        tier.clear(capacity(50), &[a.clone()]);
+        tier.clear(capacity(50), std::slice::from_ref(&a));
         let b = claim(2, Floor::None, &[(40, 5.0, true)]);
         let second = tier.clear(capacity(50), &[a.clone(), b.clone()]);
         assert_eq!(
@@ -710,7 +710,7 @@ mod tests {
     fn a_release_reported_after_a_later_clearing_is_still_credited() {
         let mut tier = Tier::new();
         let a = claim(1, Floor::None, &[(40, 1.0, true)]);
-        tier.clear(capacity(50), &[a.clone()]);
+        tier.clear(capacity(50), std::slice::from_ref(&a));
         let b = claim(2, Floor::None, &[(40, 5.0, true)]);
         let second = tier.clear(capacity(50), &[a.clone(), b.clone()]);
         let third = tier.clear(capacity(50), &[a, b]);
@@ -740,7 +740,7 @@ mod tests {
     fn growth_never_commits_part_of_an_optional_floor_or_an_indivisible_level() {
         let mut tier = Tier::new();
         let a = claim(1, Floor::None, &[(6, 1.0, true)]);
-        tier.clear(capacity(10), &[a.clone()]);
+        tier.clear(capacity(10), std::slice::from_ref(&a));
         let b = claim(2, Floor::Optional(amount(10)), &[(10, 5.0, true)]);
         let second = tier.clear(capacity(10), &[a.clone(), b.clone()]);
         assert_eq!(
@@ -765,7 +765,7 @@ mod tests {
         let mut tier = Tier::new();
         let mut a = claim(1, Floor::None, &[(40, 1.0, true)]);
         a.switch_cost = value(100.0);
-        tier.clear(capacity(40), &[a.clone()]);
+        tier.clear(capacity(40), std::slice::from_ref(&a));
         let b = claim(2, Floor::None, &[(2, 3.0, true)]);
         let held = tier.clear(capacity(40), &[a, b]);
         assert_eq!(state(&held, 1), Some(GrantState::Held));
@@ -781,7 +781,7 @@ mod tests {
         let mut tier = Tier::new();
         let mut a = claim(1, Floor::None, &[(40, 1.0, true)]);
         a.switch_cost = value(100.0);
-        tier.clear(capacity(40), &[a.clone()]);
+        tier.clear(capacity(40), std::slice::from_ref(&a));
         let b = claim(2, Floor::Required(amount(20)), &[]);
         let clearing = tier.clear(capacity(40), &[a, b]);
         assert_eq!(
@@ -847,7 +847,7 @@ mod tests {
     fn a_withdrawn_holder_frees_everything_it_owned() {
         let mut tier = Tier::new();
         let a = claim(1, Floor::None, &[(40, 1.0, true)]);
-        tier.clear(capacity(50), &[a.clone()]);
+        tier.clear(capacity(50), std::slice::from_ref(&a));
         let b = claim(2, Floor::None, &[(40, 5.0, true)]);
         tier.clear(capacity(50), &[a, b.clone()]);
         assert_eq!(tier.withdraw(ClaimId(1)), Ok(amount(40)));
@@ -865,7 +865,7 @@ mod tests {
     fn capacity_below_what_is_owned_is_overcommitted_and_nothing_grows() {
         let mut tier = Tier::new();
         let a = claim(1, Floor::None, &[(40, 1.0, true)]);
-        tier.clear(capacity(50), &[a.clone()]);
+        tier.clear(capacity(50), std::slice::from_ref(&a));
         let b = claim(2, Floor::None, &[(10, 5.0, true)]);
         let clearing = tier.clear(capacity(30), &[a, b]);
         assert_eq!(clearing.overcommitted, Some(amount(10)));
