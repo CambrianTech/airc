@@ -20,13 +20,15 @@ pub struct DaemonLifecycleGuard {
 pub struct StartupInProgress;
 
 fn acquire_startup(file: &File) -> io::Result<()> {
-    FileExt::try_lock_exclusive(file).map_err(|error| {
-        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
-            io::Error::new(io::ErrorKind::WouldBlock, StartupInProgress)
-        } else {
-            error
-        }
-    })
+    FileExt::try_lock_exclusive(file).map_err(startup_lock_error)
+}
+
+fn startup_lock_error(error: io::Error) -> io::Error {
+    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+        io::Error::new(io::ErrorKind::WouldBlock, StartupInProgress)
+    } else {
+        error
+    }
 }
 
 /// A child owns startup until its endpoint is bound, independently of the
@@ -96,10 +98,11 @@ impl DaemonLifecycleGuard {
             owner,
         };
         require_running(&guard.owner)?;
-        // Observe an admitted child before another caller attempts to spawn.
-        // The child takes this same lock exclusively before any store open.
+        // Observers share the check; only the initializing child is exclusive.
+        // Taking an exclusive probe here makes concurrent ordinary callers
+        // misidentify each other as an initializing daemon.
         let startup = Self::open(&guard.owner, "daemon-startup.lock")?;
-        acquire_startup(&startup)?;
+        FileExt::try_lock_shared(&startup).map_err(startup_lock_error)?;
         FileExt::unlock(&startup)?;
         Ok(guard)
     }
@@ -281,6 +284,32 @@ mod tests {
         let second = DaemonStartupGuard::acquire(dir.path())?;
         drop(second);
         DaemonLifecycleGuard::autostart(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_observers_coexist_but_exclude_an_initializer() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = crate::machine_account_home(dir.path());
+        // Hold an observer at the exact overlap point deterministically, rather
+        // than depend on thread timing to reproduce the eight-tab CI failure.
+        let observer = DaemonLifecycleGuard::open(&owner, "daemon-startup.lock")?;
+        FileExt::try_lock_shared(&observer)?;
+        let ordinary = DaemonLifecycleGuard::autostart(dir.path())?;
+        let another = DaemonLifecycleGuard::autostart(dir.path())?;
+        assert!(DaemonStartupGuard::acquire(dir.path())
+            .err()
+            .and_then(|error| error.into_inner())
+            .is_some_and(|source| source.is::<StartupInProgress>()));
+        FileExt::unlock(&observer)?;
+        let initializer = DaemonStartupGuard::acquire(dir.path())?;
+        assert!(DaemonLifecycleGuard::autostart(dir.path())
+            .err()
+            .and_then(|error| error.into_inner())
+            .is_some_and(|source| source.is::<StartupInProgress>()));
+        initializer.bound()?;
+        DaemonLifecycleGuard::autostart(dir.path())?;
+        drop((ordinary, another));
         Ok(())
     }
 
