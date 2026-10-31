@@ -25,5 +25,7 @@ mod value;
 pub use amount::{Amount, Unit};
 pub use claim::{Claim, ClaimError, ClaimId, Floor, Increment, OwnerId};
 pub use provenance::{Provenance, SourceId};
-pub use tier::{Capacity, Clearing, Grant, GrantState, Outcome, ReleaseError, Tier};
+pub use tier::{
+    Capacity, Clearing, Grant, GrantState, LeaseId, Outcome, Release, ReleaseError, Tier,
+};
 pub use value::{NonFinite, Price, Value};

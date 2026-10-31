@@ -162,12 +162,20 @@ fn conservation_holds_under_random_clearings_releases_and_withdrawals() {
                 let mut now = g.owned.raw();
                 match rng.below(5) {
                     0 => {
-                        let _ = tier.withdraw(g.claim);
+                        let _ = tier.withdraw(g.claim, g.lease);
                         now = 0;
                     }
                     1 | 2 => {
                         let to = if now == 0 { 0 } else { rng.below(now + 1) };
-                        if tier.report_held(g.claim, Amount::new(to)).is_ok() {
+                        if tier
+                            .report_held(Release {
+                                claim: g.claim,
+                                lease: g.lease,
+                                epoch: g.epoch,
+                                holds: Amount::new(to),
+                            })
+                            .is_ok()
+                        {
                             now = to;
                         }
                     }
@@ -175,6 +183,72 @@ fn conservation_holds_under_random_clearings_releases_and_withdrawals() {
                 }
                 if now > 0 {
                     owned_before.insert(g.claim.0, now);
+                }
+            }
+        }
+    }
+}
+
+// what this catches: the tier believing a holder has less than it physically holds, which grants
+// those units twice. What the tier is told can lag, repeat or arrive out of order; what a holder
+// physically holds is the truth. Holders here take every growth they are granted, release when
+// asked, and their reports are delivered late and replayed (Cormac's driver for Codex's P0 on
+// airc#1630; it failed at seed 1 step 8 before custody epochs).
+#[test]
+fn the_tier_never_charges_a_holder_less_than_it_physically_holds() {
+    for seed in 1..=200u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
+        let mut tier: Tier<B> = Tier::new();
+        let mut physical: std::collections::HashMap<u128, u64> = Default::default();
+        let mut mailbox: Vec<Release<B>> = Vec::new();
+        let mut sent: Vec<Release<B>> = Vec::new();
+        for step in 0..100 {
+            // Deliver some queued reports, and sometimes replay an old one.
+            let mut keep = Vec::new();
+            for report in mailbox.drain(..) {
+                if rng.coin() {
+                    let _ = tier.report_held(report);
+                } else {
+                    keep.push(report);
+                }
+            }
+            mailbox = keep;
+            if !sent.is_empty() && rng.below(3) == 0 {
+                let report = sent[rng.below(sent.len() as u64) as usize];
+                let _ = tier.report_held(report);
+            }
+            let capacity = Capacity::Measured {
+                amount: Amount::new(5 + rng.below(30)),
+                provenance: measured(),
+            };
+            let n = 1 + rng.below(4);
+            let claims: Vec<Claim<B>> = (1..=n)
+                .map(|id| random_claim(&mut rng, id as u128))
+                .collect();
+            let c = tier.clear(capacity, &claims);
+            for g in &c.grants {
+                let held = physical.entry(g.claim.0).or_insert(0);
+                assert!(
+                    *held <= g.owned.raw(),
+                    "seed {seed} step {step}: {:?} physically holds {} but the tier charges {}",
+                    g.claim,
+                    held,
+                    g.owned.raw()
+                );
+                // The holder takes what it was granted, and releases when asked.
+                if g.owned.raw() > *held {
+                    *held = g.owned.raw();
+                }
+                if let GrantState::ShrinkRequested { to } = g.state {
+                    *held = to.raw();
+                    let report = Release {
+                        claim: g.claim,
+                        lease: g.lease,
+                        epoch: g.epoch,
+                        holds: to,
+                    };
+                    mailbox.push(report);
+                    sent.push(report);
                 }
             }
         }

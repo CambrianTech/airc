@@ -65,6 +65,9 @@ pub enum ClaimError {
     EmptyIncrement { at: usize },
     /// A value per unit or the switch cost was negative.
     Negative,
+    /// The claim id is held by another owner. Custody never changes hands inside a clearing: the
+    /// holder is withdrawn first (Codex on airc#1630).
+    OwnerChanged { holder: OwnerId },
 }
 
 impl<U: Unit> Claim<U> {
