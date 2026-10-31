@@ -90,6 +90,10 @@ pub struct Clearing<U: Unit> {
     pub price: Price<U>,
     /// Capacity no target asked for.
     pub unallocated: Amount<U>,
+    /// How far what holders physically own exceeds the measured capacity (capacity fell below what
+    /// was committed: the person's game took memory). Nothing grows while this is set; shrinks are
+    /// issued; free capacity is never negative.
+    pub overcommitted: Option<Amount<U>>,
     /// The value the targets achieve past the reservations: a feasible lower bound on the optimum.
     pub achieved: Value,
     /// The value with every indivisible block relaxed to divisible: an upper bound on the optimum.
@@ -133,6 +137,7 @@ struct Plan<U: Unit> {
     steps: Vec<Step<U>>,
     price: Price<U>,
     unallocated: Amount<U>,
+    overcommitted: Option<Amount<U>>,
     achieved: Value,
     upper_bound: Value,
 }
@@ -236,14 +241,16 @@ impl<U: Unit> Tier<U> {
             grants: self.grants(),
             price: plan.price,
             unallocated: plan.unallocated,
+            overcommitted: plan.overcommitted,
             achieved: plan.achieved,
             upper_bound: plan.upper_bound,
             refused,
         }
     }
 
-    /// The holder of `claim` reports what it physically holds now. A report only ever lowers what is
-    /// charged, is idempotent, and is not fenced by the clearing generation: a release can never
+    /// The holder of `claim` reports what it physically holds now, at or below its target as it
+    /// likes. A report only ever lowers what is charged, is idempotent, and is not fenced by the
+    /// clearing generation: a release can never
     /// overcommit, and a later clearing must not refuse a real release made earlier.
     pub fn report_held(
         &mut self,
@@ -268,6 +275,24 @@ impl<U: Unit> Tier<U> {
             self.holdings.remove(&claim);
         }
         Ok(released)
+    }
+
+    /// A holder known to be gone (its process exited or crashed) is withdrawn: everything it owned is
+    /// free, whatever it was asked to release. Without this, a holder that disappears after a shrink
+    /// request strands its units forever (Cormac on #5620).
+    pub fn withdraw(&mut self, claim: ClaimId) -> Result<Amount<U>, ReleaseError<U>> {
+        let holding = self.holdings.remove(&claim).ok_or(ReleaseError::Unknown)?;
+        Ok(holding.owned)
+    }
+
+    fn owned_now(&self) -> Amount<U> {
+        self.holdings.values().map(|h| h.owned).sum()
+    }
+
+    /// How far physical ownership exceeds `capacity`, when it does.
+    fn overcommitted(&self, capacity: Amount<U>) -> Option<Amount<U>> {
+        let owned = self.owned_now();
+        (owned > capacity).then(|| owned.saturating_sub(capacity))
     }
 
     /// Whether a commitment presented at `generation` for `claim` is current: growth on an older
@@ -301,8 +326,10 @@ impl<U: Unit> Tier<U> {
             Shape::Relaxed,
         )?
         .achieved;
-        let owned_now: Amount<U> = self.holdings.values().map(|h| h.owned).sum();
-        // Physical ownership is charged first: growth comes only from what no one holds.
+        let owned_now = self.owned_now();
+        let overcommitted = self.overcommitted(capacity);
+        // Physical ownership is charged first: growth comes only from what no one holds, and when
+        // holders own more than the capacity there is nothing free (never a negative free).
         let mut free = capacity.saturating_sub(owned_now);
         let mut achieved = Value::ZERO;
         let mut steps: Vec<Step<U>> = Vec::with_capacity(claims.len());
@@ -368,6 +395,7 @@ impl<U: Unit> Tier<U> {
             steps,
             price,
             unallocated,
+            overcommitted,
             achieved,
             upper_bound,
         })
@@ -455,6 +483,10 @@ impl<U: Unit> Tier<U> {
             grants: self.grants(),
             price: Price::per_unit(Value::ZERO),
             unallocated: Amount::ZERO,
+            overcommitted: match capacity {
+                Capacity::Measured { amount, .. } => self.overcommitted(amount),
+                Capacity::Unavailable => None,
+            },
             achieved: Value::ZERO,
             upper_bound: Value::ZERO,
             refused,
@@ -806,6 +838,57 @@ mod tests {
         assert_eq!(
             clearing.refused,
             vec![(ClaimId(1), ClaimError::NotConcave { at: 1 })]
+        );
+    }
+
+    // what this catches: a holder that exits or crashes after a shrink request stranding its units
+    // forever (Cormac on #5620). Withdrawn, everything it owned is free at once.
+    #[test]
+    fn a_withdrawn_holder_frees_everything_it_owned() {
+        let mut tier = Tier::new();
+        let a = claim(1, Floor::None, &[(40, 1.0, true)]);
+        tier.clear(capacity(50), &[a.clone()]);
+        let b = claim(2, Floor::None, &[(40, 5.0, true)]);
+        tier.clear(capacity(50), &[a, b.clone()]);
+        assert_eq!(tier.withdraw(ClaimId(1)), Ok(amount(40)));
+        assert_eq!(tier.withdraw(ClaimId(1)), Err(ReleaseError::Unknown));
+        let after = tier.clear(capacity(50), &[b]);
+        assert_eq!(
+            (owned(&after, 2), state(&after, 2)),
+            (amount(40), Some(GrantState::Granted))
+        );
+    }
+
+    // what this catches: measured capacity falling below what holders own (S4: the person's game
+    // took memory) read as a negative free, or as room to grow.
+    #[test]
+    fn capacity_below_what_is_owned_is_overcommitted_and_nothing_grows() {
+        let mut tier = Tier::new();
+        let a = claim(1, Floor::None, &[(40, 1.0, true)]);
+        tier.clear(capacity(50), &[a.clone()]);
+        let b = claim(2, Floor::None, &[(10, 5.0, true)]);
+        let clearing = tier.clear(capacity(30), &[a, b]);
+        assert_eq!(clearing.overcommitted, Some(amount(10)));
+        assert_eq!(
+            state(&clearing, 1),
+            Some(GrantState::ShrinkRequested { to: amount(20) })
+        );
+        assert_eq!(
+            (owned(&clearing, 2), state(&clearing, 2)),
+            (Amount::ZERO, Some(GrantState::Waiting))
+        );
+        assert_eq!(tier.report_held(ClaimId(1), amount(20)), Ok(amount(20)));
+        let settled = tier.clear(
+            capacity(30),
+            &[
+                claim(1, Floor::None, &[(40, 1.0, true)]),
+                claim(2, Floor::None, &[(10, 5.0, true)]),
+            ],
+        );
+        assert_eq!(settled.overcommitted, None);
+        assert_eq!(
+            (owned(&settled, 1), owned(&settled, 2)),
+            (amount(20), amount(10))
         );
     }
 
