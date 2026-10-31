@@ -991,11 +991,46 @@ mod tests {
             late.validate_for_card(renewed.card(card_id).unwrap()),
             Ok(())
         );
+        // A takeover (Codex on #1587): another peer releases her claim and
+        // claims the card. Her heartbeat and late submission afterwards must renew nothing
+        // of the new owner's and be refused as no longer hers.
+        let taker = PeerId::from_u128(7);
+        let taker_claim = ClaimId::from_u128(9);
         let mut taken = board.clone();
-        taken.apply(&heartbeat(ClaimId::from_u128(9))).unwrap();
+        taken
+            .apply(&WorkEvent::ClaimReleased(ClaimReleased {
+                card_id,
+                claim_id,
+                owner: taker,
+                reason: None,
+                released_at_ms: lapsed_at - 20,
+                taken_over_from: Some(owner),
+            }))
+            .unwrap();
+        taken
+            .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+                card_id,
+                claim_id: taker_claim,
+                owner: taker,
+                ttl_ms: 1000,
+                claimed_at_ms: lapsed_at - 10,
+                origin: ClaimOrigin::Automatic,
+                selected_at_ms: None,
+            }))
+            .unwrap();
+        let takers_expiry = taken.card(card_id).unwrap().claim_expires_at_ms;
+        assert_eq!(takers_expiry, Some(lapsed_at - 10 + 1000));
+        taken.apply(&heartbeat(claim_id)).unwrap();
+        let after = taken.card(card_id).unwrap();
+        assert_eq!(after.owner, Some(taker));
+        assert_eq!(after.claim_id, Some(taker_claim));
         assert_eq!(
-            late.validate_for_card(taken.card(card_id).unwrap()),
-            Err(SubmissionRejectionReason::ExpiredClaim)
+            after.claim_expires_at_ms, takers_expiry,
+            "her stale heartbeat renews nothing of the new owner's"
+        );
+        assert_eq!(
+            late.validate_for_card(after),
+            Err(SubmissionRejectionReason::WrongClaim)
         );
         let foreign = WorkSubmission {
             publisher: PeerId::from_u128(9),
