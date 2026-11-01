@@ -65,7 +65,7 @@ pub use model::{
 pub use projection::{
     AgentAvailabilityRecord, BoardSnapshot, BranchTrackingRecord, LaneRecord, ManagerHat,
     ProjectionError, PullRequestRecord, RepoTrackingRecord, StaleClaim, WorkBoardProjection,
-    WorkspaceRecord, TAKEOVER_ON_RECORD_SINCE_MS,
+    WorkCardConflict, WorkspaceRecord, TAKEOVER_ON_RECORD_SINCE_MS,
 };
 pub use pull_requests::gh::{
     CommandGhRunner, GhCommandRunner, GhPullRequestSource, GhRunnerError, GH_JSON_FIELDS,

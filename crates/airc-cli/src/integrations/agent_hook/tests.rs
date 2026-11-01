@@ -566,8 +566,8 @@ fn card(n: u128, title: &str) -> airc_work::WorkEvent {
 
 // what this catches (Codex on #1638): a work event in the turn made the hook read the board,
 // and a board projection error aborted the whole hook, addressed chat included, before its
-// delivery ACK. A duplicate create is quarantined, so its board still renders; any board
-// error left is stated in the turn, and the chat delivers either way.
+// delivery ACK. A conflicting create is named as a conflict, never offered as claimable; any
+// board error left is stated in the turn, and the chat delivers either way.
 #[tokio::test]
 async fn a_board_that_cannot_project_never_withholds_addressed_chat() {
     let (_dir, airc, room) = fixture().await;
@@ -596,8 +596,16 @@ async fn a_board_that_cannot_project_never_withholds_addressed_chat() {
         .unwrap();
     let context = context.unwrap();
     assert!(context.contains("first ask"), "{context}");
-    assert!(context.contains("the original card"), "{context}");
-    assert!(!context.contains("a clobber attempt"), "{context}");
+    // a conflicted card is named, never offered: neither creation's title is a claim line
+    let card_id = airc_work::WorkCardId::from_u128(7);
+    assert!(
+        context.contains(&format!("CONFLICT {card_id}")),
+        "{context}"
+    );
+    assert!(
+        !context.contains(&format!("airc work claim {card_id}")),
+        "{context}"
+    );
     turn.acknowledge(end, true).await.unwrap();
 
     let lane = |n: u64| {

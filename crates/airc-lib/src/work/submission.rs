@@ -123,6 +123,7 @@ impl Airc {
         let card = board
             .card(request.card_id)
             .ok_or(airc_work::ProjectionError::UnknownCard(request.card_id))?;
+        super::refuse_conflicted(&board, request.card_id, super::CardMutation::Act)?;
         let mut submission = airc_work::WorkSubmission {
             submission_id: request.submission_id,
             card_id: request.card_id,

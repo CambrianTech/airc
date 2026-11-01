@@ -123,7 +123,10 @@ fn replay_keeps_the_first_creation_and_counts_a_duplicate() {
     .unwrap();
 
     assert_eq!(projection.card(card_id).unwrap().created_at_ms, 1000);
-    assert_eq!(projection.quarantined_duplicates(), &[card_id]);
+    let conflicts = projection.card_conflicts(card_id);
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].original_event, EventId::from_u128(10));
+    assert_eq!(conflicts[0].conflicting_event, EventId::from_u128(20));
 }
 
 #[test]

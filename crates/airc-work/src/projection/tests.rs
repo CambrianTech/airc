@@ -1868,19 +1868,22 @@ fn bench_projection_snapshot_clone_cost() {
 // `replay_window` and incremental resume from a cached snapshot —
 // missing-anchor events are skipped, structural errors stay loud.
 #[test]
-fn apply_windowed_skips_missing_anchors_and_quarantines_duplicates() {
+fn apply_at_skips_missing_anchors_and_records_a_conflicting_creation() {
+    use airc_core::EventId;
     let card_id = WorkCardId::from_u128(1);
     let mut projection = WorkBoardProjection::new();
 
-    // Anchor missing: the card was created before this window /
-    // snapshot — skip, exactly like replay_window.
+    // Anchor missing: the card was created before this window / snapshot: skipped.
     projection
-        .apply_windowed(&WorkEvent::CardStateChanged(CardStateChanged {
-            card_id,
-            state: CardState::Review,
-            changed_by: peer(3),
-            changed_at_ms: 100,
-        }))
+        .apply_at(
+            EventId::from_u128(10),
+            &WorkEvent::CardStateChanged(CardStateChanged {
+                card_id,
+                state: CardState::Review,
+                changed_by: peer(3),
+                changed_at_ms: 100,
+            }),
+        )
         .unwrap();
     assert!(projection.card(card_id).is_none());
 
@@ -1896,22 +1899,118 @@ fn apply_windowed_skips_missing_anchors_and_quarantines_duplicates() {
         reviews: None,
         origin: None,
     });
-    projection.apply_windowed(&created).unwrap();
-    assert!(projection.card(card_id).is_some());
+    projection
+        .apply_at(EventId::from_u128(11), &created)
+        .unwrap();
 
-    // what this catches: a duplicate create failing every replay and
-    // resume of the room (card a3fa88ae). It is not window tolerance:
-    // the original stands and the duplicate is counted for the board.
+    // what this catches (Codex on #1638): a redelivery of the card's own creating event
+    // mistaken for a second creation. The same event id is a no-op.
+    projection
+        .apply_at(EventId::from_u128(11), &created)
+        .unwrap();
+    assert!(projection.card_conflicts(card_id).is_empty());
+
+    // what this catches: a different creation of the id failing every replay of the room
+    // (card a3fa88ae), or silently picking a winner. It is recorded with both events, and
+    // the original card stands, conflicted; a repeat of the conflicting event records once.
     let clobber = WorkEvent::CardCreated(CardCreated {
         title: "clobber attempt".to_string(),
+        created_by: peer(4),
+        created_at_ms: 200,
         ..match &created {
             WorkEvent::CardCreated(e) => e.clone(),
             _ => unreachable!(),
         }
     });
-    projection.apply_windowed(&clobber).unwrap();
+    projection
+        .apply_at(EventId::from_u128(12), &clobber)
+        .unwrap();
+    projection
+        .apply_at(EventId::from_u128(12), &clobber)
+        .unwrap();
     assert_eq!(projection.card(card_id).unwrap().title, "windowed apply");
-    assert_eq!(projection.quarantined_duplicates(), &[card_id]);
+    assert_eq!(
+        projection.card_conflicts(card_id),
+        &[WorkCardConflict {
+            card_id,
+            original_event: EventId::from_u128(11),
+            conflicting_event: EventId::from_u128(12),
+            conflicting_created_by: peer(4),
+            at_ms: 200,
+        }]
+    );
+    assert_eq!(projection.snapshot().card_conflicts.len(), 1);
+}
+
+#[test]
+fn a_conflict_keeps_earlier_and_later_events_and_survives_a_cached_resume() {
+    // what this catches (Codex on #1638): an update before the conflict lost, a claim after it
+    // refused at replay (replay stays a function of the transcript; actions refuse at publish),
+    // and a cached projection resuming without the conflict it had recorded.
+    use airc_core::EventId;
+    let card_id = WorkCardId::from_u128(2);
+    let create = |by: u128, at: u64| {
+        WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: format!("by {by}"),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: peer(by),
+            created_at_ms: at,
+            reviews: None,
+            origin: None,
+        })
+    };
+    let events = vec![
+        (EventId::from_u128(1), create(5, 10)),
+        (
+            EventId::from_u128(2),
+            WorkEvent::CardUpdated(CardUpdated {
+                claim_selection: None,
+                card_id,
+                title: Some("updated before".to_string()),
+                body: None,
+                priority: None,
+                updated_by: peer(5),
+                updated_at_ms: 20,
+            }),
+        ),
+        (EventId::from_u128(3), create(6, 30)),
+        (
+            EventId::from_u128(4),
+            WorkEvent::CardClaimed(WorkCardClaimed {
+                selected_at_ms: None,
+                card_id,
+                claim_id: ClaimId::from_u128(9),
+                owner: peer(6),
+                ttl_ms: 1_000_000,
+                claimed_at_ms: 40,
+                origin: ClaimOrigin::default(),
+            }),
+        ),
+    ];
+    let mut full = WorkBoardProjection::new();
+    for (id, event) in &events {
+        full.apply_at(*id, event).unwrap();
+    }
+    let card = full.card(card_id).unwrap();
+    assert_eq!(card.title, "updated before");
+    assert_eq!(card.owner, Some(peer(6)));
+    assert_eq!(full.card_conflicts(card_id).len(), 1);
+
+    // cached resume: the first two events, serialized and read back, then the rest
+    let mut head = WorkBoardProjection::new();
+    for (id, event) in &events[..2] {
+        head.apply_at(*id, event).unwrap();
+    }
+    let mut resumed: WorkBoardProjection =
+        serde_json::from_str(&serde_json::to_string(&head).unwrap()).unwrap();
+    for (id, event) in &events[2..] {
+        resumed.apply_at(*id, event).unwrap();
+    }
+    assert_eq!(resumed, full);
 }
 
 // Card 09fddedd — `PullRequestRelinked` projection semantics. The
@@ -2094,7 +2193,7 @@ fn relink_racing_terminal_state_is_dropped_without_poisoning_projection() {
 fn relink_for_unknown_card_errors_strict_and_skips_windowed() {
     // what this catches: drift in the missing-window-anchor contract.
     // Strict apply must surface UnknownCard (loud failure for full
-    // replays); apply_windowed must skip it (bounded windows and
+    // replays); apply_at must skip it (bounded windows and
     // cache resume legally start after the card's creation event).
     let owner = peer(2);
     let event = WorkEvent::PullRequestRelinked(PullRequestRelinked {
@@ -2110,7 +2209,10 @@ fn relink_for_unknown_card_errors_strict_and_skips_windowed() {
         projection.apply(&event),
         Err(ProjectionError::UnknownCard(WorkCardId::from_u128(404)))
     );
-    assert_eq!(projection.apply_windowed(&event), Ok(()));
+    assert_eq!(
+        projection.apply_at(airc_core::EventId::from_u128(1), &event),
+        Ok(())
+    );
 }
 
 fn durable_fixture(at: u64) -> (WorkBoardProjection, WorkCardId, ClaimId, PeerId) {

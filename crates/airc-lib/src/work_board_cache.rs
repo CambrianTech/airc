@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 /// Bump when the persisted shape (or projection semantics feeding it)
 /// changes; old snapshots are then discarded and rebuilt.
 // v6 replays review-request extensions skipped by earlier readers, materializing their cards.
-pub(crate) const WORK_BOARD_CACHE_FORMAT_VERSION: u32 = 6;
+// v7 records each card's creating event and the conflicting creations (card a3fa88ae).
+pub(crate) const WORK_BOARD_CACHE_FORMAT_VERSION: u32 = 7;
 
 /// Subdirectory of the scope home holding one snapshot per room.
 const CACHE_DIR: &str = "work-board-cache";

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use airc_core::PeerId;
+use airc_core::{EventId, PeerId};
 
 use crate::event::{
     AgentAvailabilityReported, GitCommitObserved, GitDirtyStateChanged,
@@ -55,17 +55,36 @@ pub struct WorkBoardProjection {
     pub(super) review_requests: BTreeMap<WorkCardId, crate::SubmissionReviewRequested>,
     #[serde(default)]
     pub(super) review_request_rejections: BTreeMap<WorkCardId, crate::WorkReviewRejectionReason>,
-    /// Cards whose id a later `CardCreated` reused. The first creation
-    /// stands; each later one is counted here so the board can say so,
-    /// instead of one bad event failing every replay of the room.
-    #[serde(default)]
-    pub(super) quarantined_duplicates: Vec<WorkCardId>,
+    /// The transcript event that created each card: its identity, so a
+    /// redelivery of that same event is recognized, never mistaken for a
+    /// second creation.
+    pub(super) card_origins: BTreeMap<WorkCardId, EventId>,
+    /// Cards a different `CardCreated` event claimed again. A conflicted
+    /// card stays on the board, but no action is accepted on it until the
+    /// room resolves it (closes it and re-files the work under a fresh id).
+    pub(super) card_conflicts: BTreeMap<WorkCardId, Vec<WorkCardConflict>>,
+}
+
+/// A second, different creation of a card id: both events, so the conflict
+/// is evidenced from the transcript, never inferred from card contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkCardConflict {
+    pub card_id: WorkCardId,
+    pub original_event: EventId,
+    pub conflicting_event: EventId,
+    pub conflicting_created_by: PeerId,
+    pub at_ms: u64,
 }
 
 impl WorkBoardProjection {
-    /// Ids reused by a later `CardCreated`, one entry per skipped event.
-    pub fn quarantined_duplicates(&self) -> &[WorkCardId] {
-        &self.quarantined_duplicates
+    /// The conflicting creations recorded for `card_id` (empty when it has none).
+    pub fn card_conflicts(&self, card_id: WorkCardId) -> &[WorkCardConflict] {
+        self.card_conflicts.get(&card_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every conflict on the board.
+    pub fn conflicts(&self) -> impl Iterator<Item = &WorkCardConflict> + '_ {
+        self.card_conflicts.values().flatten()
     }
 
     pub fn review_request(
@@ -190,6 +209,8 @@ pub struct BoardSnapshot {
     pub manager_hats: Vec<ManagerHat>,
     pub agent_availability: Vec<AgentAvailabilityRecord>,
     pub hygiene_reports: Vec<HygieneReport>,
+    /// Cards a second, different creation claimed: on the board, never actionable.
+    pub card_conflicts: Vec<WorkCardConflict>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

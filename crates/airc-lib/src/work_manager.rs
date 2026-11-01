@@ -435,6 +435,7 @@ mod tests {
             claimable,
             agent_availability: Vec::new(),
             active_claims_for_peer: Vec::new(),
+            conflicts: Vec::new(),
         }
     }
 
