@@ -163,7 +163,15 @@ async fn backlog_is_counted_once_and_settles_when_searched() {
         .unwrap();
     assert!(initial.live_events().is_empty());
     let found = summary(&mut initial, &airc).await.unwrap();
-    assert_eq!(found.counted.unwrap(), counted(5000, 1, 5000));
+    // 5,000 events: the count stops at the cap, says "more", and its times are the newest it read.
+    let cap = airc_core::HISTORY_COUNT_CAP;
+    assert_eq!(
+        found.counted.unwrap(),
+        airc_core::HistoryCount {
+            more: true,
+            ..counted(cap, 5000 - cap + 1, 5000)
+        }
+    );
     assert!(found.addressed.is_empty());
     let routed = initial
         .history_summary(
@@ -178,9 +186,11 @@ async fn backlog_is_counted_once_and_settles_when_searched() {
         .await
         .unwrap()
         .unwrap();
+    // The hidden event (5000) is routed out by its header: the newest counted is 4999.
+    let routed = routed.counted.unwrap();
     assert_eq!(
-        routed.counted.unwrap().count,
-        5000 - 1,
+        (routed.count, routed.more, routed.newest_ms),
+        (cap, true, Some(4999)),
         "header-routed out of the count"
     );
     drop(initial); // output failed: the summary stays due
@@ -1055,11 +1065,12 @@ async fn new_addressed_traffic_never_starves_an_older_pending_request() {
     assert_eq!(emitted, requests, "every request exactly once: {shown:?}");
 }
 
-// what this catches: a new session owing the whole history (Joel, 2026-11-01: "who the
-// fuck is gonna want four year old messages as default behavior"). An agent that has
-// never read starts at the present: nothing before it is owed, and new events deliver.
+// what this catches: a new agent owing the whole history (Joel, 2026-11-01: "who the fuck is
+// gonna want four year old messages as default behavior"), and the opposite failure, a DM sent
+// before its first read never reaching it. It gets ONE newest-first page (a capped count of the
+// rest), shown once; then only new events deliver.
 #[tokio::test]
-async fn an_agent_that_never_read_starts_at_the_present() {
+async fn an_agent_that_never_read_gets_one_page_then_the_present() {
     let (_dir, airc, room) = fresh_agent().await;
     for n in 1..=50 {
         append(&airc, room, n).await;
@@ -1069,11 +1080,20 @@ async fn an_agent_that_never_read_starts_at_the_present() {
         .await
         .unwrap();
     assert!(first.live_events().is_empty());
-    assert!(
-        summary(&mut first, &airc).await.is_none(),
-        "nothing before the first read is owed"
-    );
+    let shown = summary(&mut first, &airc)
+        .await
+        .expect("one page of history");
+    assert_eq!(shown.counted.unwrap().count, 50);
     first.acknowledge(0, true).await.unwrap();
+    let mut again = airc
+        .prepare_agent_delivery("session-a", 64, 8)
+        .await
+        .unwrap();
+    assert!(
+        summary(&mut again, &airc).await.is_none(),
+        "the page is shown once, the backlog never walked"
+    );
+    again.acknowledge(0, true).await.unwrap();
     append(&airc, room, 51).await;
     let next = airc
         .prepare_agent_delivery("session-a", 64, 8)
@@ -1125,10 +1145,10 @@ async fn a_new_session_continues_from_the_agents_read_marker() {
 
 // what this catches: an upgrade leaving existing sessions owing their whole history. A row
 // from before read markers (history reaching back to the start of time, its delivery
-// positions stale because a hook killed at its timeout never acknowledged) starts over at
-// the present.
+// positions stale because a hook killed at its timeout never acknowledged) gets one
+// newest-first page, then the present.
 #[tokio::test]
-async fn a_legacy_session_owes_nothing_older_than_what_the_agent_read() {
+async fn a_legacy_session_gets_one_page_then_the_present() {
     let (_dir, airc, room) = fresh_agent().await;
     for n in 1..=25 {
         append(&airc, room, n).await;
@@ -1170,20 +1190,23 @@ async fn a_legacy_session_owes_nothing_older_than_what_the_agent_read() {
             history_counted: false,
             unsearched: Vec::new(),
             starts_at_marker: false,
+            one_page: false,
         };
         persist(&airc, name, &state).await.unwrap();
     }
+    // one newest-first page, then nothing old is owed
+    let mut once = airc
+        .prepare_agent_delivery("legacy-owing", 64, 8)
+        .await
+        .unwrap();
+    assert!(summary(&mut once, &airc).await.is_some(), "one page");
+    once.acknowledge(0, true).await.unwrap();
     let mut again = airc
         .prepare_agent_delivery("legacy-owing", 64, 8)
         .await
         .unwrap();
     assert!(
-        key(&again.state.summarized) >= key(&tip),
-        "owed history starts at what the agent read"
-    );
-    let owed = summary(&mut again, &airc).await;
-    assert!(
-        owed.as_ref().and_then(|h| h.counted.as_ref()).is_none(),
-        "nothing old is owed"
+        summary(&mut again, &airc).await.is_none(),
+        "the backlog is never walked"
     );
 }

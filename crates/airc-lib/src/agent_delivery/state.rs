@@ -42,6 +42,11 @@ pub(super) struct State {
     /// start of time and is clamped to the marker once.
     #[serde(default)]
     pub(super) starts_at_marker: bool,
+    /// Its history is shown as ONE page, newest first (what was addressed to it, and a capped
+    /// count of the rest), then settled: an agent that never read, or a row from before read
+    /// markers. A DM sent before an agent's first read reaches it; a backlog is never walked.
+    #[serde(default)]
+    pub(super) one_page: bool,
 }
 
 /// Pre-attachment history whose addressed requests are not all emitted yet:

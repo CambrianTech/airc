@@ -202,11 +202,19 @@ impl AgentDeliveryTurn {
             advance_read_marker(&turn.airc, &turn.state.live).await?;
             if let (true, Some(progress)) = (settle_history, turn.progress.take()) {
                 turn.state.history_counted |= progress.counted_shown;
-                if progress.unsearched.is_empty() {
+                if turn.state.one_page {
+                    // One page shown: the rest of the backlog is settled, never walked.
+                    turn.state.one_page = false;
                     turn.state.summarized = turn.state.boundary.clone();
                     turn.state.history_counted = false;
+                    turn.state.unsearched.clear();
+                } else {
+                    if progress.unsearched.is_empty() {
+                        turn.state.summarized = turn.state.boundary.clone();
+                        turn.state.history_counted = false;
+                    }
+                    turn.state.unsearched = progress.unsearched;
                 }
-                turn.state.unsearched = progress.unsearched;
             }
             persist(&turn.airc, &turn.consumer, &turn.state).await
         })
@@ -356,15 +364,12 @@ impl Airc {
                 // history reached back to the start of time, and its delivery positions are
                 // as stale (a hook killed at its timeout never acknowledged), so neither is a
                 // read position worth keeping; older history is a pull (`airc inbox`).
+                // A row from before read markers: its history reached back to the start of
+                // time. It gets one newest-first page (what was addressed to it, a capped count
+                // of the rest), then live from the present; the backlog is never walked.
                 if !state.starts_at_marker {
                     state.starts_at_marker = true;
-                    if key(&state.summarized) < key(&tip) {
-                        state.summarized = tip.clone();
-                        state.boundary = tip.clone();
-                        state.history_counted = false;
-                        state.unsearched.clear();
-                    }
-                    advance_read_marker(self, &tip).await?;
+                    state.one_page = true;
                     persist(self, &consumer, &state).await?;
                 }
                 state.ensure_unsearched();
@@ -382,9 +387,11 @@ impl Airc {
                 // at the present: older history is a pull (`airc inbox`), never a debt.
                 // A legacy runtime cursor is not a read position: an old build's may be
                 // months old, and starting there is the June backlog again.
-                let summarized = match read_marker(self).await? {
-                    Some(marker) => marker,
-                    None => tip.clone(),
+                // An agent that never read gets one newest-first page of history (a DM sent
+                // before its first read must reach it), then live from the present.
+                let (summarized, one_page) = match read_marker(self).await? {
+                    Some(marker) => (marker, false),
+                    None => (zero(), true),
                 };
                 let boundary = if key(&summarized) > key(&tip) {
                     summarized.clone()
@@ -401,6 +408,7 @@ impl Airc {
                     history_counted: false,
                     unsearched: Vec::new(),
                     starts_at_marker: true,
+                    one_page,
                 };
                 state.ensure_unsearched();
                 persist(self, &consumer, &state).await?;
