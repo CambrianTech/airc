@@ -57,8 +57,14 @@ impl crate::Airc {
 
     pub(crate) async fn dispatch_addressed_frame(&self, frame: Frame) {
         if let Some(sink) = self.inner.addressed.sink.get() {
+            // These are envelope claims until the sink verifies admission. Do
+            // not log the sealed body or imply that a refused sender is trusted.
+            let event_id = frame.envelope.event_id;
+            let claimed_sender = frame.envelope.sender;
+            let claimed_target = frame.envelope.target.clone();
             if let Err(error) = sink.deliver(frame).await {
-                tracing::error!(target: "airc::addressed", %error, "opaque addressed admission refused");
+                tracing::error!(target: "airc::addressed", %error, %event_id,
+                    %claimed_sender, ?claimed_target, "opaque addressed admission refused");
             }
         } else {
             self.receive_addressed(frame).await;
