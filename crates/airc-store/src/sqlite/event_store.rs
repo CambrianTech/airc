@@ -345,6 +345,40 @@ impl EventStore for SqliteEventStore {
         Ok(())
     }
 
+    async fn advance_scoped_state(&self, entry: StoredScopedState) -> Result<bool, StoreError> {
+        use sea_orm::sea_query::{Alias, Expr};
+        let _write = self.admit_write().await?;
+        let active = scoped_state::ActiveModel {
+            scope_key: ActiveValue::Set(entry.scope_key),
+            key: ActiveValue::Set(entry.key),
+            value_json: ActiveValue::Set(entry.value_json),
+            version: ActiveValue::Set(entry.version),
+            updated_at_ms: ActiveValue::Set(entry.updated_at_ms),
+            updated_by: ActiveValue::Set(entry.updated_by),
+        };
+        // One statement: insert, or update only when the incoming value orders after the stored
+        // one. SQLite applies it atomically, so a delayed lower write never lands over a higher.
+        let advanced = scoped_state::Entity::insert(active)
+            .on_conflict(
+                OnConflict::columns([scoped_state::Column::ScopeKey, scoped_state::Column::Key])
+                    .update_columns([
+                        scoped_state::Column::ValueJson,
+                        scoped_state::Column::Version,
+                        scoped_state::Column::UpdatedAtMs,
+                        scoped_state::Column::UpdatedBy,
+                    ])
+                    .action_and_where(
+                        Expr::col((Alias::new("excluded"), scoped_state::Column::ValueJson)).gt(
+                            Expr::col((scoped_state::Entity, scoped_state::Column::ValueJson)),
+                        ),
+                    )
+                    .to_owned(),
+            )
+            .exec_without_returning(&self.db)
+            .await?;
+        Ok(advanced > 0)
+    }
+
     async fn list_scoped_state(
         &self,
         scope_key: &str,

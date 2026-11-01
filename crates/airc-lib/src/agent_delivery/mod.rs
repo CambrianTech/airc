@@ -92,6 +92,64 @@ async fn rooms(airc: &Airc) -> Result<Vec<RoomId>, AircError> {
     rooms.dedup();
     Ok(rooms)
 }
+/// The agent's read marker: the furthest live position any of its sessions delivered.
+/// One per agent home (its identity), so a new session continues where the agent left off.
+const READ_MARKER: &str = "read-marker";
+
+/// The marker's stored form orders as the cursor does (lamport, then event id), as zero-padded
+/// hex, so the store's atomic `advance_scoped_state` keeps it monotonic across sessions and
+/// processes (Codex on #1640: a get-then-set let a delayed lower write land over a higher).
+fn encode_marker(cursor: &TranscriptCursor) -> String {
+    format!(
+        "\"{:016x}:{:032x}\"",
+        cursor.lamport,
+        cursor.event_id.0.as_u128()
+    )
+}
+
+fn decode_marker(stored: &str) -> Result<TranscriptCursor, AircError> {
+    let inner = stored
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| fail("read marker is not a quoted cursor"))?;
+    let (lamport, event) = inner
+        .split_once(':')
+        .ok_or_else(|| fail("read marker has no separator"))?;
+    Ok(TranscriptCursor {
+        lamport: u64::from_str_radix(lamport, 16).map_err(fail)?,
+        event_id: EventId::from_u128(u128::from_str_radix(event, 16).map_err(fail)?),
+    })
+}
+
+async fn read_marker(airc: &Airc) -> Result<Option<TranscriptCursor>, AircError> {
+    match airc
+        .inner
+        .store
+        .get_scoped_state(SCOPE, READ_MARKER)
+        .await?
+    {
+        Some(row) => Ok(Some(decode_marker(&row.value_json)?)),
+        None => Ok(None),
+    }
+}
+
+/// Moves only forward, atomically in the store: whatever order sessions write in, the marker
+/// is the furthest any of them delivered.
+async fn advance_read_marker(airc: &Airc, delivered: &TranscriptCursor) -> Result<(), AircError> {
+    airc.inner
+        .store
+        .advance_scoped_state(StoredScopedState {
+            scope_key: SCOPE.into(),
+            key: READ_MARKER.into(),
+            value_json: encode_marker(delivered),
+            version: 1,
+            updated_at_ms: 0,
+            updated_by: None,
+        })
+        .await?;
+    Ok(())
+}
+
 async fn persist(airc: &Airc, consumer: &str, state: &State) -> Result<(), AircError> {
     airc.inner
         .store
@@ -162,13 +220,22 @@ impl AgentDeliveryTurn {
                 return Err(fail("acknowledgment outside prepared range"));
             }
             turn.state.live = delivered;
+            advance_read_marker(&turn.airc, &turn.state.live).await?;
             if let (true, Some(progress)) = (settle_history, turn.progress.take()) {
                 turn.state.history_counted |= progress.counted_shown;
-                if progress.unsearched.is_empty() {
+                if turn.state.one_page {
+                    // One page shown: the rest of the backlog is settled, never walked.
+                    turn.state.one_page = false;
                     turn.state.summarized = turn.state.boundary.clone();
                     turn.state.history_counted = false;
+                    turn.state.unsearched.clear();
+                } else {
+                    if progress.unsearched.is_empty() {
+                        turn.state.summarized = turn.state.boundary.clone();
+                        turn.state.history_counted = false;
+                    }
+                    turn.state.unsearched = progress.unsearched;
                 }
-                turn.state.unsearched = progress.unsearched;
             }
             persist(&turn.airc, &turn.consumer, &turn.state).await
         })
@@ -204,6 +271,24 @@ impl Airc {
     /// before the first attachment is left for [`AgentDeliveryTurn::history_summary`].
     /// Scope changes fail explicitly: a global cursor cannot safely cover newly
     /// joined rooms' older events. Legacy checkpoints and general history are untouched.
+    /// Test fixture: the agent last read before every event (its read marker at the start),
+    /// the condition history tests model. Production markers only move forward.
+    #[doc(hidden)]
+    pub async fn read_from_start_for_test(&self) -> Result<(), AircError> {
+        self.inner
+            .store
+            .set_scoped_state(StoredScopedState {
+                scope_key: SCOPE.into(),
+                key: READ_MARKER.into(),
+                value_json: encode_marker(&zero()),
+                version: 1,
+                updated_at_ms: 0,
+                updated_by: None,
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn prepare_agent_delivery(
         &self,
         consumer: &str,
@@ -292,15 +377,43 @@ impl Airc {
                     ));
                 }
                 let mut state = state;
+                // A session seeded at the start of time (before read markers) owes nothing
+                // older than what this agent already read. Only that seed is clamped: a
+                // request that arrived during a later outage stays owed, as a chat client
+                // keeps an unread mention.
+                // A row from before read markers starts over at the present. Its owed
+                // history reached back to the start of time, and its delivery positions are
+                // as stale (a hook killed at its timeout never acknowledged), so neither is a
+                // read position worth keeping; older history is a pull (`airc inbox`).
+                // A row from before read markers: its history reached back to the start of
+                // time. It gets one newest-first page (what was addressed to it, a capped count
+                // of the rest), then live from the present; the backlog is never walked.
+                if !state.starts_at_marker {
+                    state.starts_at_marker = true;
+                    state.one_page = true;
+                    persist(self, &consumer, &state).await?;
+                }
                 state.ensure_unsearched();
                 state
             } else {
-                // A legacy checkpoint seeds the summary watermark: what it already
-                // covered needs no summary.
-                let summarized = self
-                    .load_runtime_cursor(&consumer)
-                    .await?
-                    .unwrap_or_else(zero);
+                // WHERE A NEW READER STARTS, the way every chat system does it (a Matrix
+                // read marker, a Slack last-read): a new session continues from where
+                // THIS AGENT last read, never from the start of time. A new session per
+                // Claude Code or Codex task used to seed zero here, so every session owed
+                // the whole history: each hook call searched every addressed request
+                // since June across every subscribed room (12-17 s against a 5 s hook
+                // timeout, so nothing was ever delivered) and paged months-old requests
+                // ahead of today's (Joel, 2026-11-01: "who the fuck is gonna want four
+                // year old messages as default behavior"). No read marker at all starts
+                // at the present: older history is a pull (`airc inbox`), never a debt.
+                // A legacy runtime cursor is not a read position: an old build's may be
+                // months old, and starting there is the June backlog again.
+                // An agent that never read gets one newest-first page of history (a DM sent
+                // before its first read must reach it), then live from the present.
+                let (summarized, one_page) = match read_marker(self).await? {
+                    Some(marker) => (marker, false),
+                    None => (zero(), true),
+                };
                 let boundary = if key(&summarized) > key(&tip) {
                     summarized.clone()
                 } else {
@@ -315,6 +428,8 @@ impl Airc {
                     source,
                     history_counted: false,
                     unsearched: Vec::new(),
+                    starts_at_marker: true,
+                    one_page,
                 };
                 state.ensure_unsearched();
                 persist(self, &consumer, &state).await?;

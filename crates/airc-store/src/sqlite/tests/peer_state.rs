@@ -724,3 +724,59 @@ fn trust_tier_wire_str_round_trips_every_variant() {
     assert_eq!(TrustTier::from_wire_str("verified"), None);
     assert_eq!(TrustTier::from_wire_str("OwnMachine"), None);
 }
+
+// what this catches (Codex on airc #1640): a shared marker written by get-then-set from two
+// processes moves backwards when a delayed lower write lands after a higher one. Two stores
+// opened independently on one real SQLite file: the lower write never lands over the higher,
+// and many concurrent writers leave the maximum.
+#[tokio::test]
+async fn advance_scoped_state_never_moves_back_across_independent_stores() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("events.sqlite");
+    let a = SqliteEventStore::open_path(&path).await.unwrap();
+    let b = SqliteEventStore::open_path(&path).await.unwrap();
+    let entry = |value: u32| StoredScopedState {
+        scope_key: "runtime:agent-delivery".into(),
+        key: "read-marker".into(),
+        value_json: format!("\"{value:08x}\""),
+        version: 1,
+        updated_at_ms: 0,
+        updated_by: None,
+    };
+    assert!(
+        b.advance_scoped_state(entry(30)).await.unwrap(),
+        "first write inserts"
+    );
+    assert!(
+        !a.advance_scoped_state(entry(20)).await.unwrap(),
+        "the delayed lower write is refused"
+    );
+    assert_eq!(
+        a.get_scoped_state("runtime:agent-delivery", "read-marker")
+            .await
+            .unwrap()
+            .unwrap()
+            .value_json,
+        "\"0000001e\""
+    );
+    // Concurrent writers from both stores, in shuffled order: the maximum survives.
+    let mut writers = Vec::new();
+    for value in [41u32, 7, 99, 63, 12, 98, 50, 3] {
+        // each writer is its own independently opened store on the same file
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        writers.push(tokio::spawn(async move {
+            store.advance_scoped_state(entry(value)).await.unwrap()
+        }));
+    }
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    assert_eq!(
+        b.get_scoped_state("runtime:agent-delivery", "read-marker")
+            .await
+            .unwrap()
+            .unwrap()
+            .value_json,
+        "\"00000063\""
+    );
+}

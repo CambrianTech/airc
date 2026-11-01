@@ -47,8 +47,9 @@ pub(crate) fn history_line(summary: &HistorySummary) -> Option<String> {
     };
     (counted.count > 0).then(|| {
         format!(
-            "AIRC: {} earlier events from before this session attached ({} to {}){shown} not replayed; read them with `airc inbox --all --json`.",
+            "AIRC: {}{} earlier events from before this session attached ({} to {}){shown} not replayed; read them with `airc inbox --all --json`.",
             counted.count,
+            if counted.more { "+" } else { "" },
             original_time(oldest),
             original_time(newest),
         )

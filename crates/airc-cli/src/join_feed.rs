@@ -643,6 +643,8 @@ mod tests {
         subscriptions::save(airc.coordinator_store_for_test(), &set)
             .await
             .unwrap();
+        // The feed tests model an agent whose last read was before the events they append.
+        airc.read_from_start_for_test().await.unwrap();
         (dir, airc, room)
     }
 

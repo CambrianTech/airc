@@ -447,6 +447,7 @@ mod tests {
             count,
             oldest_ms: Some(7),
             newest_ms: Some(7),
+            more: false,
         };
         let any = airc_core::HeaderFilter::Any;
         assert_eq!(

@@ -279,21 +279,23 @@ impl DurableSink for InMemoryDurableSink {
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(guard
-            .events
-            .get(&channel.0.as_u128())
-            .into_iter()
-            .flatten()
-            .filter(|e| {
-                e.delivery.is_durable()
-                    && e.cursor().is_after(&after)
-                    && !e.cursor().is_after(&through)
-                    && headers.matches(&e.headers)
-                    && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
-            })
-            .fold(airc_core::HistoryCount::default(), |count, e| {
-                count.with_event(e.occurred_at_ms)
-            }))
+        Ok(airc_core::HistoryCount::of_newest(
+            guard
+                .events
+                .get(&channel.0.as_u128())
+                .into_iter()
+                .flatten()
+                .rev()
+                .filter(|e| {
+                    e.delivery.is_durable()
+                        && e.cursor().is_after(&after)
+                        && !e.cursor().is_after(&through)
+                        && headers.matches(&e.headers)
+                        && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
+                })
+                .map(|e| e.occurred_at_ms)
+                .take(airc_core::HISTORY_COUNT_CAP as usize + 1),
+        ))
     }
 
     async fn page_matching(
