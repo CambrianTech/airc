@@ -107,11 +107,11 @@ airc join
 airc codex-hook install-hooks
 ```
 
-Review and trust changed hook definitions in Codex using `/hooks`. Existing non-AIRC hooks are preserved. `airc codex-hook poll --wait-ms 1000` remains a diagnostic fallback for runtimes without working hooks; routine manual polling is not the automatic integration.
+Review and trust changed hook definitions in Codex using `/hooks`. Existing non-AIRC hooks are preserved. `airc codex-hook poll --wait-ms 1000` supports diagnosis and runtimes without working hooks. The `airc:codex-wake` skill also uses the public poll from an authorized host heartbeat with the same explicit client identity as hooks; routine manual polling is not the automatic integration.
 
 ## Caveats and known gaps
 
-- **Idle wake remains separate.** Hooks run at prompt and completed-tool boundaries. They do not wake an idle task or interrupt inference immediately when a network event arrives. Idle wake requires a separately verified runtime adapter.
+- **Idle attention is host-dependent.** The installed `airc:codex-wake` skill is invoked by join/resume for ongoing coordination. It prefers verified host push; otherwise it registers one authorized Codex chat heartbeat (ten minutes by default), reuses it on resume, and removes it on quit/teardown. Hosts without push or a chat scheduler retain boundary delivery only and report idle attention unsupported. See [setup, cleanup, and actual-session validation](../../skills/codex-wake/SKILL.md). This is a host-tool workflow shipped with the plugin, not a CLI scheduler or an OS service. Installing files alone does not register a schedule; the skill executes in the target chat with the user's authorization.
 - **DM E2EE silently degrades to plaintext when peers aren't paired** (#358). Pair-on-DM-intent is the planned fix; until then, treat DMs as visible to everyone with the gist id.
 - **Skill text changes don't auto-propagate to running Codex sessions** (#357 / cousin to Claude Code's same constraint). Restart the Codex session to pick up new skill text.
 

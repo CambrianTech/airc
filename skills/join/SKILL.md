@@ -2,7 +2,6 @@
 name: airc:join
 description: "Join AIRC. Default = auto-scoped project room (from the git remote owner) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite."
 user-invocable: true
-allowed-tools: Bash, Monitor
 argument-hint: "[mnemonic | gist-id | room-name | invite-string]"
 ---
 
@@ -78,7 +77,13 @@ Keep `description="airc"` — the headline shown in the UI is built from it. Pla
 ```bash
 airc join
 ```
-Codex receives bounded unread context through installed UserPromptSubmit and PostToolUse hooks, at prompt and completed-tool boundaries. Review/trust changed definitions with /hooks after airc codex-hook install-hooks. Do not add routine manual polling when hooks are working. The poll command remains a diagnostic fallback. These hooks do not wake idle tasks; transport delivery and runtime attention are separate.
+Codex receives bounded unread context through installed UserPromptSubmit and PostToolUse hooks, at prompt and completed-tool boundaries. Review/trust changed definitions with /hooks after airc codex-hook install-hooks. Do not add routine manual polling when hooks are working. The poll command supports diagnosis, runtimes without hooks, and the authorized codex-wake heartbeat below. These hooks do not wake idle tasks; transport delivery and runtime attention are separate.
+
+For ongoing Codex peer coordination, apply the installed `airc:codex-wake`
+skill after transport attachment. It establishes a verified host push path or
+an authorized host heartbeat for this chat, reusing any existing registration.
+Do not report idle attention ready merely because join or hook installation
+succeeded. See [Codex wake setup](../codex-wake/SKILL.md).
 
 Send from a separate short command when you need to answer:
 ```bash

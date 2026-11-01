@@ -2,13 +2,16 @@
 name: airc:quit
 description: Leave the current room while keeping your identity, via `airc part`. To also stop this scope's daemon, follow with `airc stop`. Identity, keys, and peers are preserved.
 user-invocable: true
-allowed-tools: Bash
 argument-hint: ""
 ---
 
 # /quit — Leave the current airc room
 
 Run this yourself — don't ask the user.
+
+In Codex, apply `airc:codex-wake` disable to remove this chat/scope's owned
+heartbeat when ending coordination. Do not remove unrelated schedules.
+See [Codex wake cleanup](../codex-wake/SKILL.md).
 
 In the rust-rewrite there is no `airc quit` verb. Leaving while keeping your identity
 is `airc part` (leave the current room without deleting identity or trust). If you
