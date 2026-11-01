@@ -295,6 +295,22 @@ impl EventStore for InMemoryEventStore {
         Ok(())
     }
 
+    async fn advance_scoped_state(&self, entry: StoredScopedState) -> Result<bool, StoreError> {
+        let mut state = self
+            .scoped_state
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let slot = (entry.scope_key.clone(), entry.key.clone());
+        if state
+            .get(&slot)
+            .is_some_and(|stored| stored.value_json >= entry.value_json)
+        {
+            return Ok(false);
+        }
+        state.insert(slot, entry);
+        Ok(true)
+    }
+
     async fn list_scoped_state(
         &self,
         scope_key: &str,

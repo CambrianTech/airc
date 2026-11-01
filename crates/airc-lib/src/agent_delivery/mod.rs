@@ -96,6 +96,31 @@ async fn rooms(airc: &Airc) -> Result<Vec<RoomId>, AircError> {
 /// One per agent home (its identity), so a new session continues where the agent left off.
 const READ_MARKER: &str = "read-marker";
 
+/// The marker's stored form orders as the cursor does (lamport, then event id), as zero-padded
+/// hex, so the store's atomic `advance_scoped_state` keeps it monotonic across sessions and
+/// processes (Codex on #1640: a get-then-set let a delayed lower write land over a higher).
+fn encode_marker(cursor: &TranscriptCursor) -> String {
+    format!(
+        "\"{:016x}:{:032x}\"",
+        cursor.lamport,
+        cursor.event_id.0.as_u128()
+    )
+}
+
+fn decode_marker(stored: &str) -> Result<TranscriptCursor, AircError> {
+    let inner = stored
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| fail("read marker is not a quoted cursor"))?;
+    let (lamport, event) = inner
+        .split_once(':')
+        .ok_or_else(|| fail("read marker has no separator"))?;
+    Ok(TranscriptCursor {
+        lamport: u64::from_str_radix(lamport, 16).map_err(fail)?,
+        event_id: EventId::from_u128(u128::from_str_radix(event, 16).map_err(fail)?),
+    })
+}
+
 async fn read_marker(airc: &Airc) -> Result<Option<TranscriptCursor>, AircError> {
     match airc
         .inner
@@ -103,24 +128,20 @@ async fn read_marker(airc: &Airc) -> Result<Option<TranscriptCursor>, AircError>
         .get_scoped_state(SCOPE, READ_MARKER)
         .await?
     {
-        Some(row) => Ok(Some(serde_json::from_str(&row.value_json).map_err(fail)?)),
+        Some(row) => Ok(Some(decode_marker(&row.value_json)?)),
         None => Ok(None),
     }
 }
 
-/// Moves only forward: a session that delivered less never pulls the marker back.
+/// Moves only forward, atomically in the store: whatever order sessions write in, the marker
+/// is the furthest any of them delivered.
 async fn advance_read_marker(airc: &Airc, delivered: &TranscriptCursor) -> Result<(), AircError> {
-    if let Some(marker) = read_marker(airc).await? {
-        if key(&marker) >= key(delivered) {
-            return Ok(());
-        }
-    }
     airc.inner
         .store
-        .set_scoped_state(StoredScopedState {
+        .advance_scoped_state(StoredScopedState {
             scope_key: SCOPE.into(),
             key: READ_MARKER.into(),
-            value_json: serde_json::to_string(delivered).map_err(fail)?,
+            value_json: encode_marker(delivered),
             version: 1,
             updated_at_ms: 0,
             updated_by: None,
@@ -259,7 +280,7 @@ impl Airc {
             .set_scoped_state(StoredScopedState {
                 scope_key: SCOPE.into(),
                 key: READ_MARKER.into(),
-                value_json: serde_json::to_string(&zero()).map_err(fail)?,
+                value_json: encode_marker(&zero()),
                 version: 1,
                 updated_at_ms: 0,
                 updated_by: None,

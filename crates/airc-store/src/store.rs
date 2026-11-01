@@ -177,6 +177,12 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// those semantics.
     async fn set_scoped_state(&self, entry: StoredScopedState) -> Result<(), StoreError>;
 
+    /// Write `entry` only if its `value_json` orders after the stored one (byte order), in one
+    /// atomic statement: a monotonic register shared across processes. A consumer that encodes
+    /// its value order-preservingly gets a value that never moves back, however writers
+    /// interleave. Returns whether this write advanced it.
+    async fn advance_scoped_state(&self, entry: StoredScopedState) -> Result<bool, StoreError>;
+
     /// List every scoped-state row under `scope_key`, `key` ascending.
     /// Backs dashboard / RAG enumeration of a scope's walls.
     async fn list_scoped_state(
