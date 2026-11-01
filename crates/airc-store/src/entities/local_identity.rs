@@ -61,6 +61,12 @@ pub struct Model {
     /// `load_local_identity_by_agent_name` so the lookup is by
     /// agent rather than by the singleton id.
     pub agent_name: String,
+    /// Custody binding (card 0f3b3126): the public key this row's secret must
+    /// derive at load time. Written by mint and legacy-json migration; NULL on
+    /// rows created before the column existed — there is no auto-bind of an
+    /// unverified file, so such a row loads without binding until re-minted or
+    /// explicitly re-bound.
+    pub expected_public_key: Option<Vec<u8>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
