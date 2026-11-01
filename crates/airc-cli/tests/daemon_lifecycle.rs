@@ -267,6 +267,9 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     // completed receipt while that child's startup lease remains held.
     let starting =
         airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(&acct.join(".airc")).unwrap();
+    // Endpoint inspection must precede treating startup custody as a refusal.
+    // A current endpoint is attachable even while initialization custody is held.
+    ok(acct, "claude", "claude:main", &["inbox", "--limit", "1"]);
     let incomplete = tab(acct, "new-stop-scope", "claude:main", &["stop"]);
     assert!(!incomplete.status.success());
     assert!(String::from_utf8_lossy(&incomplete.stderr).contains("shutdown not confirmed"));

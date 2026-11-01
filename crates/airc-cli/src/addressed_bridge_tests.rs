@@ -517,3 +517,29 @@ async fn attached_sdk_scopes_exchange_encrypted_command_and_result() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+#[tokio::test]
+async fn cli_attaches_when_existing_initializer_binds_later() {
+    let home = Arc::new(tempfile::tempdir().expect("home"));
+    let socket_home = Arc::new(tempfile::tempdir().expect("socket home"));
+    let socket = socket_home.path().join("a.sock");
+    let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home.path())
+        .expect("initializer custody");
+    let attach = crate::commands::ensure_daemon_running(home.path(), socket.clone(), Vec::new());
+    tokio::pin!(attach);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), &mut attach)
+            .await
+            .is_err(),
+        "observer waits rather than refusing startup"
+    );
+    let machine = Machine::boot_in(home.clone(), socket_home).await;
+    startup.bound().expect("bound initializer");
+    let attached = tokio::time::timeout(std::time::Duration::from_secs(5), &mut attach)
+        .await
+        .expect("attach deadline")
+        .expect("attach existing owner");
+    assert_eq!(attached, socket);
+    machine.client.ping().await.expect("subsequent owner work");
+    machine.shutdown().await;
+}

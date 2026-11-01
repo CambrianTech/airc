@@ -619,7 +619,7 @@ pub async fn ensure_daemon_running(
     socket: PathBuf,
     _peers: Vec<PeerSpec>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let _lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::autostart(home)?;
+    let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::attach(home)?;
     // 1. Fast path: home-resolved socket already has a current daemon.
     let client = DaemonClient::new(socket.clone());
     if let Ok(status) = client.status_with_timeout(Duration::from_millis(250)).await {
@@ -653,6 +653,12 @@ pub async fn ensure_daemon_running(
                 }
             }
         }
+    }
+
+    // An admitted child owns initialization even before its endpoint exists.
+    // Join the same readiness contract; never spawn a competing initializer.
+    if lifecycle.startup_in_progress()? {
+        return await_daemon_ready(home, socket, project_root.as_deref(), None, &lifecycle).await;
     }
 
     // 3. Spawn a fresh daemon at the home-resolved socket.
@@ -702,7 +708,31 @@ pub async fn ensure_daemon_running(
         .stderr(Stdio::from(stderr));
     let child = spawn_daemon(command)?;
     let daemon_pid = child.id();
+    await_daemon_ready(
+        home,
+        socket,
+        project_root.as_deref(),
+        Some(daemon_pid),
+        &lifecycle,
+    )
+    .await
+}
 
+#[derive(Debug, thiserror::Error)]
+enum DaemonReadinessError {
+    #[error("daemon initializer is still active but its endpoint did not become ready")]
+    Initializing,
+    #[error("daemon initializer released custody without a ready current endpoint")]
+    InitializerGone,
+}
+
+async fn await_daemon_ready(
+    home: &Path,
+    socket: PathBuf,
+    project_root: Option<&Path>,
+    daemon_pid: Option<u32>,
+    lifecycle: &airc_lib::daemon_lifecycle::DaemonLifecycleGuard,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let client = DaemonClient::new(socket.clone());
     // Card 7e3c9a1f / #1210: a freshly-spawned daemon must BIND its IPC
     // socket within this window or the CLI gives up, returns an error, and
@@ -718,15 +748,17 @@ pub async fn ensure_daemon_running(
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if client
-            .ping_with_timeout(Duration::from_millis(250))
+            .status_with_timeout(Duration::from_millis(250))
             .await
-            .is_ok()
+            .is_ok_and(|status| daemon_status_is_current(&status))
         {
             // 4. Card 282850c2: announce so a sandboxed agent
             // attaching later finds this daemon instead of orphaning
             // a new one. Best-effort — if the announcement fails,
             // the normal singleton-per-home model still works.
-            announce_running_daemon(home, &socket, project_root.as_deref(), daemon_pid).await;
+            if let Some(pid) = daemon_pid {
+                announce_running_daemon(home, &socket, project_root, pid).await;
+            }
             return Ok(socket);
         }
         if Instant::now() >= deadline {
@@ -734,7 +766,12 @@ pub async fn ensure_daemon_running(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("daemon did not become ready; see {}", log.display()).into())
+    Err(if lifecycle.startup_in_progress()? {
+        DaemonReadinessError::Initializing
+    } else {
+        DaemonReadinessError::InitializerGone
+    }
+    .into())
 }
 
 /// Read `peer_id`/`build` from the freshly-ready daemon and write a
