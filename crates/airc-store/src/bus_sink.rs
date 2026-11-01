@@ -332,28 +332,24 @@ impl DurableSink for SqliteDurableSink {
                 rule,
             ));
         }
-        // COUNT/MIN/MAX in the store: no row, header JSON or payload leaves SQLite.
-        let row: Option<(i64, Option<i64>, Option<i64>)> = rows
+        // Newest first, at most one past the cap: the count never walks the whole range, and
+        // no header JSON or payload leaves SQLite.
+        let times: Vec<i64> = rows
             .select_only()
-            .column_as(Expr::col(bus_event::Column::EventId).count(), "count")
-            .column_as(Expr::col(bus_event::Column::OccurredAtMs).min(), "oldest")
-            .column_as(Expr::col(bus_event::Column::OccurredAtMs).max(), "newest")
+            .column(bus_event::Column::OccurredAtMs)
+            .order_by_desc(bus_event::Column::Epoch)
+            .order_by_desc(bus_event::Column::Counter)
+            .order_by_desc(bus_event::Column::EventId)
+            .limit(airc_core::HISTORY_COUNT_CAP + 1)
             .into_tuple()
-            .one(&self.readers)
+            .all(&self.readers)
             .await
             .map_err(BusError::sink_source)?;
-        let Some((count, oldest, newest)) = row else {
-            return Ok(airc_core::HistoryCount::default());
-        };
-        Ok(airc_core::HistoryCount {
-            count: i64_to_u64("count", count)?,
-            oldest_ms: oldest
-                .map(|ms| i64_to_u64("occurred_at_ms", ms))
-                .transpose()?,
-            newest_ms: newest
-                .map(|ms| i64_to_u64("occurred_at_ms", ms))
-                .transpose()?,
-        })
+        let times = times
+            .into_iter()
+            .map(|ms| i64_to_u64("occurred_at_ms", ms))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(airc_core::HistoryCount::of_newest(times))
     }
 
     async fn page(

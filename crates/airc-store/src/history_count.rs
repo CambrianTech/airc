@@ -1,15 +1,14 @@
 //! Counting matching history in the store, never by paging events out of it.
 //!
 //! [`CountHistory`] is the narrow capability every [`crate::EventStore`] backing
-//! carries: `COUNT`, `MIN(occurred_at_ms)` and `MAX(occurred_at_ms)` over the
-//! rows in `(after, through]` of the given channels whose headers match a
-//! [`HeaderFilter`]. The header predicate is the store's own query layer
+//! carries: how many rows in `(after, through]` of the given channels match a
+//! [`HeaderFilter`], read newest first and stopping past `HISTORY_COUNT_CAP`. The header predicate is the store's own query layer
 //! ([`crate::header_query`], typed subqueries on the header entity); no event
 //! body is read or allocated.
 
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, SimpleExpr};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 
 use airc_core::{HeaderFilter, HistoryCount, RoomId, RuntimeSelf, TranscriptCursor};
 
@@ -71,21 +70,20 @@ impl CountHistory for SqliteEventStore {
         if let Some(rule) = exclude {
             query = query.filter(crate::header_query::not_runtime_self::<event::Entity>(rule));
         }
-        let row: Option<(i64, Option<i64>, Option<i64>)> = query
+        // Newest first, at most one past the cap: the count never walks the whole range.
+        let times: Vec<i64> = query
             .select_only()
-            .column_as(Expr::col(event::Column::EventId).count(), "count")
-            .column_as(Expr::col(event::Column::OccurredAtMs).min(), "oldest")
-            .column_as(Expr::col(event::Column::OccurredAtMs).max(), "newest")
+            .column(event::Column::OccurredAtMs)
+            .order_by_desc(event::Column::Lamport)
+            .order_by_desc(event::Column::EventId)
+            .limit(airc_core::HISTORY_COUNT_CAP + 1)
             .into_tuple()
-            .one(self.connection())
+            .all(self.connection())
             .await?;
-        let Some((count, oldest, newest)) = row else {
-            return Ok(HistoryCount::default());
-        };
-        Ok(HistoryCount {
-            count: to_u64("count", count)?,
-            oldest_ms: oldest.map(|ms| to_u64("occurred_at_ms", ms)).transpose()?,
-            newest_ms: newest.map(|ms| to_u64("occurred_at_ms", ms)).transpose()?,
-        })
+        let times = times
+            .into_iter()
+            .map(|ms| to_u64("occurred_at_ms", ms))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(HistoryCount::of_newest(times))
     }
 }

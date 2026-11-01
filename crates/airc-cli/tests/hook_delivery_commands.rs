@@ -238,7 +238,7 @@ fn hook_reads_current_message_after_typed_legacy_chunk_backlog() {
 // summary line (count, original times) on the first call, never the old messages;
 // every later call carries only what arrived after it, and the summary never repeats.
 #[test]
-fn backlog_is_summarized_once_then_only_new_messages_deliver() {
+fn a_new_agent_starts_at_the_present_then_only_new_messages_deliver() {
     let workspace = common::daemon_tempdir();
     let home = workspace.path().join("agent");
     run_ok(&home, &["init"]);
@@ -254,26 +254,12 @@ fn backlog_is_summarized_once_then_only_new_messages_deliver() {
         "--max-items",
         "2",
     ];
-    let first = additional_context(&run_hook(&home, args, "{}"));
+    // what this catches (Joel, 2026-11-01: "recency is the common path"): an agent that has
+    // never read owes nothing from before it attached; older history is a pull (`airc inbox`).
+    let first = run_hook(&home, args, "{}");
     assert!(
-        first.contains("earlier events from before this session attached"),
+        !first.contains("retained-old-") && !first.contains("earlier events"),
         "{first}"
-    );
-    // The newest page (--max-items 2) opens the session whole; the older ten are
-    // counted, never replayed.
-    let shows = |body: &str| {
-        first
-            .lines()
-            .any(|line| line.ends_with(&format!(": {body}")))
-    };
-    assert!(
-        shows("retained-old-11") && shows("retained-old-10"),
-        "{first}"
-    );
-    assert!(!shows("retained-old-9"), "{first}");
-    assert!(
-        run_hook(&home, args, "{}").trim().is_empty(),
-        "the summary is shown once"
     );
     run_ok(&home, &["send", "new-directed-request"]);
     let next = additional_context(&run_hook(&home, args, "{}"));

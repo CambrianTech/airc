@@ -63,7 +63,7 @@ pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use datetime::{iso_to_epoch, DateTimeError};
 pub use filter::{filter_self_echoes, RuntimeSelf, SelfFilter};
 pub use headers::{HeaderFilter, Headers};
-pub use history_count::HistoryCount;
+pub use history_count::{HistoryCount, HISTORY_COUNT_CAP};
 pub use history_match::HistoryMatch;
 pub use humanhash::{humanhash, HumanhashError};
 pub use identity::Identity;

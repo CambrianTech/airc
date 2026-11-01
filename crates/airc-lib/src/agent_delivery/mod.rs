@@ -380,12 +380,11 @@ impl Airc {
                 // ahead of today's (Joel, 2026-11-01: "who the fuck is gonna want four
                 // year old messages as default behavior"). No read marker at all starts
                 // at the present: older history is a pull (`airc inbox`), never a debt.
-                let summarized = match self.load_runtime_cursor(&consumer).await? {
-                    Some(cursor) => cursor,
-                    None => match read_marker(self).await? {
-                        Some(marker) => marker,
-                        None => tip.clone(),
-                    },
+                // A legacy runtime cursor is not a read position: an old build's may be
+                // months old, and starting there is the June backlog again.
+                let summarized = match read_marker(self).await? {
+                    Some(marker) => marker,
+                    None => tip.clone(),
                 };
                 let boundary = if key(&summarized) > key(&tip) {
                     summarized.clone()

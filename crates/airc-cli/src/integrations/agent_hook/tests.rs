@@ -227,7 +227,8 @@ async fn backlog_is_one_summary_then_only_new_events() {
         Some(airc_core::HistoryCount {
             count: 44,
             oldest_ms: Some(1),
-            newest_ms: Some(44)
+            newest_ms: Some(44),
+            more: false,
         })
     );
     let context = delivery_context(
@@ -498,6 +499,7 @@ async fn burst_larger_than_a_turn_becomes_bounded_history_and_keeps_its_requests
             count: 9,
             oldest_ms: Some(1),
             newest_ms: Some(9),
+            more: false,
         },
         "the represented range, exactly"
     );

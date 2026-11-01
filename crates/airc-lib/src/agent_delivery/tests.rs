@@ -68,6 +68,7 @@ fn counted(count: u64, oldest: u64, newest: u64) -> airc_core::HistoryCount {
         count,
         oldest_ms: Some(oldest),
         newest_ms: Some(newest),
+        more: false,
     }
 }
 // what this catches: a native reattach counts only what arrived while detached,

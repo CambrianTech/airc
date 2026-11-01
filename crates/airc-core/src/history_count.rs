@@ -7,12 +7,22 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Matching events in a range, and the original times of the oldest and newest.
+/// The most events a count reads before it stops and says "more": a count is shown to a
+/// reader as a number, and past this one "999+" tells it as much as the exact figure, so no
+/// store walks a range longer than this to answer (Joel, 2026-11-01: every read is bounded;
+/// recency is the common path).
+pub const HISTORY_COUNT_CAP: u64 = 999;
+
+/// Matching events in a range, and the original times of the oldest and newest counted.
+/// `more`: the range holds more than `count`; the store stopped at [`HISTORY_COUNT_CAP`] and
+/// counted the newest ones, so `oldest_ms` is the oldest of those, not of the range.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryCount {
     pub count: u64,
     pub oldest_ms: Option<u64>,
     pub newest_ms: Option<u64>,
+    #[serde(default)]
+    pub more: bool,
 }
 
 impl HistoryCount {
@@ -27,7 +37,22 @@ impl HistoryCount {
             count: self.count + other.count,
             oldest_ms: pick(self.oldest_ms, other.oldest_ms, u64::min),
             newest_ms: pick(self.newest_ms, other.newest_ms, u64::max),
+            more: self.more || other.more,
         }
+    }
+
+    /// The count of the newest matching events' times, read newest first and at most
+    /// `HISTORY_COUNT_CAP + 1` of them: the one fold every store uses.
+    pub fn of_newest(times_newest_first: impl IntoIterator<Item = u64>) -> HistoryCount {
+        let mut count = HistoryCount::default();
+        for (i, ms) in times_newest_first.into_iter().enumerate() {
+            if i as u64 == HISTORY_COUNT_CAP {
+                count.more = true;
+                break;
+            }
+            count = count.with_event(ms);
+        }
+        count
     }
 
     /// Count one event at `occurred_at_ms` into this range.
@@ -36,6 +61,7 @@ impl HistoryCount {
             count: 1,
             oldest_ms: Some(occurred_at_ms),
             newest_ms: Some(occurred_at_ms),
+            more: false,
         })
     }
 }
@@ -54,8 +80,25 @@ mod tests {
             HistoryCount {
                 count: 3,
                 oldest_ms: Some(2),
-                newest_ms: Some(9)
+                newest_ms: Some(9),
+                more: false,
             }
+        );
+    }
+
+    // what this catches: a count that walks a whole range to answer. Past the cap it stops,
+    // says "more", and its times are those of the newest it counted.
+    #[test]
+    fn a_count_stops_at_the_cap_and_says_more() {
+        use super::HISTORY_COUNT_CAP;
+        let past = HistoryCount::of_newest((0..HISTORY_COUNT_CAP + 5).rev());
+        assert_eq!(past.count, HISTORY_COUNT_CAP);
+        assert!(past.more);
+        assert_eq!(past.newest_ms, Some(HISTORY_COUNT_CAP + 4));
+        let under = HistoryCount::of_newest([7, 3]);
+        assert_eq!(
+            (under.count, under.more, under.oldest_ms),
+            (2, false, Some(3))
         );
     }
 }
