@@ -84,6 +84,16 @@ impl Drop for DaemonStartupGuard {
 impl DaemonLifecycleGuard {
     /// Hold through status inspection and any resulting daemon spawn.
     pub fn autostart(home: &Path) -> io::Result<Self> {
+        let guard = Self::attach(home)?;
+        if guard.startup_in_progress()? {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, StartupInProgress));
+        }
+        Ok(guard)
+    }
+
+    /// Admit an endpoint observer even while the existing child initializes.
+    /// The retained lifecycle lease still excludes maintenance and stop.
+    pub fn attach(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
         // Hold the admission gate only while acquiring the active read lock.
         // A waiting updater closes this gate before draining existing readers,
@@ -98,13 +108,23 @@ impl DaemonLifecycleGuard {
             owner,
         };
         require_running(&guard.owner)?;
+        Ok(guard)
+    }
+
+    /// Observe startup custody without granting permission for a second child.
+    pub fn startup_in_progress(&self) -> io::Result<bool> {
         // Observers share the check; only the initializing child is exclusive.
         // Taking an exclusive probe here makes concurrent ordinary callers
         // misidentify each other as an initializing daemon.
-        let startup = Self::open(&guard.owner, "daemon-startup.lock")?;
-        FileExt::try_lock_shared(&startup).map_err(startup_lock_error)?;
+        let startup = Self::open(&self.owner, "daemon-startup.lock")?;
+        if let Err(error) = FileExt::try_lock_shared(&startup) {
+            if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+                return Ok(true);
+            }
+            return Err(error);
+        }
         FileExt::unlock(&startup)?;
-        Ok(guard)
+        Ok(false)
     }
 
     /// Serialize operator intent or maintenance; updaters acquire after building
@@ -272,6 +292,8 @@ mod tests {
     fn one_initializer_owns_startup_until_bound_or_dropped() -> io::Result<()> {
         let dir = tempfile::tempdir()?;
         let first = DaemonStartupGuard::acquire(dir.path())?;
+        let observer = DaemonLifecycleGuard::attach(dir.path())?;
+        assert!(observer.startup_in_progress()?);
         for error in [
             DaemonStartupGuard::acquire(dir.path()).err(),
             DaemonLifecycleGuard::autostart(dir.path()).err(),
@@ -281,6 +303,7 @@ mod tests {
                 .is_some_and(|source| source.is::<StartupInProgress>()));
         }
         first.bound()?;
+        assert!(!observer.startup_in_progress()?);
         let second = DaemonStartupGuard::acquire(dir.path())?;
         drop(second);
         DaemonLifecycleGuard::autostart(dir.path())?;

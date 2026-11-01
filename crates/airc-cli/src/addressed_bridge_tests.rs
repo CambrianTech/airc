@@ -62,7 +62,12 @@ impl Machine {
                 home.path().to_owned(),
                 &home.path().join("events.sqlite"),
                 store,
-                airc_daemon::DaemonRuntimeInfo::unknown(),
+                airc_daemon::DaemonRuntimeInfo {
+                    ipc_protocol_version: Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION)),
+                    build_commit: (!crate::build_info::is_unknown())
+                        .then(|| crate::build_info::COMMIT.into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap(),
@@ -516,4 +521,55 @@ async fn attached_sdk_scopes_exchange_encrypted_command_and_result() {
     drop(bob);
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test]
+async fn cli_attaches_when_existing_initializer_binds_later() {
+    let home = Arc::new(tempfile::tempdir().expect("home"));
+    let socket_home = Arc::new(tempfile::tempdir().expect("socket home"));
+    let socket = socket_home.path().join("a.sock");
+    let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home.path())
+        .expect("initializer custody");
+    let attach = crate::commands::ensure_daemon_running(home.path(), socket.clone(), Vec::new());
+    tokio::pin!(attach);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), &mut attach)
+            .await
+            .is_err(),
+        "observer waits rather than refusing startup"
+    );
+    let machine = Machine::boot_in(home.clone(), socket_home).await;
+    startup.bound().expect("bound initializer");
+    let attached = tokio::time::timeout(std::time::Duration::from_secs(5), &mut attach)
+        .await
+        .expect("attach deadline")
+        .expect("attach existing owner");
+    assert_eq!(attached, socket);
+    machine.client.ping().await.expect("subsequent owner work");
+    machine.shutdown().await;
+}
+
+#[tokio::test]
+async fn cli_reports_initializer_exit_without_spawning_a_replacement() {
+    let home = tempfile::tempdir().expect("home");
+    let socket_home = tempfile::tempdir().expect("socket home");
+    let socket = socket_home.path().join("a.sock");
+    let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home.path())
+        .expect("initializer custody");
+    let attach = crate::commands::ensure_daemon_running(home.path(), socket, Vec::new());
+    tokio::pin!(attach);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), &mut attach)
+            .await
+            .is_err()
+    );
+    drop(startup);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(25), &mut attach)
+        .await
+        .expect("bounded readiness")
+        .expect_err("dead initializer cannot satisfy readiness");
+    assert_eq!(
+        error.to_string(),
+        "daemon initializer released custody without a ready current endpoint"
+    );
 }
