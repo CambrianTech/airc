@@ -543,3 +543,28 @@ async fn cli_attaches_when_existing_initializer_binds_later() {
     machine.client.ping().await.expect("subsequent owner work");
     machine.shutdown().await;
 }
+
+#[tokio::test]
+async fn cli_reports_initializer_exit_without_spawning_a_replacement() {
+    let home = tempfile::tempdir().expect("home");
+    let socket_home = tempfile::tempdir().expect("socket home");
+    let socket = socket_home.path().join("a.sock");
+    let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home.path())
+        .expect("initializer custody");
+    let attach = crate::commands::ensure_daemon_running(home.path(), socket, Vec::new());
+    tokio::pin!(attach);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), &mut attach)
+            .await
+            .is_err()
+    );
+    drop(startup);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(25), &mut attach)
+        .await
+        .expect("bounded readiness")
+        .expect_err("dead initializer cannot satisfy readiness");
+    assert_eq!(
+        error.to_string(),
+        "daemon initializer released custody without a ready current endpoint"
+    );
+}
