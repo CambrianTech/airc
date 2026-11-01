@@ -1987,6 +1987,9 @@ fn print_board(
     aliases: &std::collections::HashMap<airc_lib::PeerId, String>,
     limit: usize,
 ) {
+    for card_id in board.quarantined_duplicates() {
+        println!("warning: a later CardCreated reused card {card_id}; the first creation stands");
+    }
     let snapshot = board.snapshot();
     if snapshot.cards.is_empty() && snapshot.agent_availability.is_empty() {
         println!("(no work cards)");

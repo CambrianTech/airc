@@ -55,9 +55,19 @@ pub struct WorkBoardProjection {
     pub(super) review_requests: BTreeMap<WorkCardId, crate::SubmissionReviewRequested>,
     #[serde(default)]
     pub(super) review_request_rejections: BTreeMap<WorkCardId, crate::WorkReviewRejectionReason>,
+    /// Cards whose id a later `CardCreated` reused. The first creation
+    /// stands; each later one is counted here so the board can say so,
+    /// instead of one bad event failing every replay of the room.
+    #[serde(default)]
+    pub(super) quarantined_duplicates: Vec<WorkCardId>,
 }
 
 impl WorkBoardProjection {
+    /// Ids reused by a later `CardCreated`, one entry per skipped event.
+    pub fn quarantined_duplicates(&self) -> &[WorkCardId] {
+        &self.quarantined_duplicates
+    }
+
     pub fn review_request(
         &self,
         review_card: WorkCardId,

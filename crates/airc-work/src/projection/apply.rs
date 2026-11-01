@@ -166,10 +166,26 @@ impl WorkBoardProjection {
     /// cached projection (card 1291173d) — the two paths stay
     /// semantically identical by construction.
     pub fn apply_windowed(&mut self, event: &WorkEvent) -> Result<(), ProjectionError> {
-        match self.apply(event) {
+        match self.apply_or_quarantine(event) {
             Ok(()) => Ok(()),
             Err(error) if error.is_missing_window_anchor() => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Apply one event; a `CardCreated` reusing an existing card id
+    /// leaves the original card standing and is recorded in
+    /// [`Self::quarantined_duplicates`]. Every board-building replay
+    /// uses this, so one duplicate in a room's transcript is a counted
+    /// warning, never a board nobody can read. [`Self::apply`] stays
+    /// strict for callers that must refuse it.
+    pub fn apply_or_quarantine(&mut self, event: &WorkEvent) -> Result<(), ProjectionError> {
+        match self.apply(event) {
+            Err(ProjectionError::DuplicateCard(card_id)) => {
+                self.quarantined_duplicates.push(card_id);
+                Ok(())
+            }
+            other => other,
         }
     }
 

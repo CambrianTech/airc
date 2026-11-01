@@ -1868,7 +1868,7 @@ fn bench_projection_snapshot_clone_cost() {
 // `replay_window` and incremental resume from a cached snapshot —
 // missing-anchor events are skipped, structural errors stay loud.
 #[test]
-fn apply_windowed_skips_missing_anchor_and_fails_structural_errors() {
+fn apply_windowed_skips_missing_anchors_and_quarantines_duplicates() {
     let card_id = WorkCardId::from_u128(1);
     let mut projection = WorkBoardProjection::new();
 
@@ -1899,12 +1899,19 @@ fn apply_windowed_skips_missing_anchor_and_fails_structural_errors() {
     projection.apply_windowed(&created).unwrap();
     assert!(projection.card(card_id).is_some());
 
-    // Structural error (duplicate create) is NOT window tolerance —
-    // it must stay loud on both the replay and the resume paths.
-    assert_eq!(
-        projection.apply_windowed(&created),
-        Err(ProjectionError::DuplicateCard(card_id))
-    );
+    // what this catches: a duplicate create failing every replay and
+    // resume of the room (card a3fa88ae). It is not window tolerance:
+    // the original stands and the duplicate is counted for the board.
+    let clobber = WorkEvent::CardCreated(CardCreated {
+        title: "clobber attempt".to_string(),
+        ..match &created {
+            WorkEvent::CardCreated(e) => e.clone(),
+            _ => unreachable!(),
+        }
+    });
+    projection.apply_windowed(&clobber).unwrap();
+    assert_eq!(projection.card(card_id).unwrap().title, "windowed apply");
+    assert_eq!(projection.quarantined_duplicates(), &[card_id]);
 }
 
 // Card 09fddedd — `PullRequestRelinked` projection semantics. The

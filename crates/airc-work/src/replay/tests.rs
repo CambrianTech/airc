@@ -111,6 +111,21 @@ fn replay_sorts_by_lamport_then_event_id_before_projection() {
     assert_eq!(card.updated_at_ms, 2000);
 }
 
+// what this catches: one duplicate CardCreated in a room's transcript
+// failing the whole board (card a3fa88ae); the first creation stands.
+#[test]
+fn replay_keeps_the_first_creation_and_counts_a_duplicate() {
+    let card_id = WorkCardId::from_u128(11);
+    let projection = project_transcript_work_events(vec![
+        transcript(10, 1, &card_created(card_id, 1000)),
+        transcript(20, 2, &card_created(card_id, 5000)),
+    ])
+    .unwrap();
+
+    assert_eq!(projection.card(card_id).unwrap().created_at_ms, 1000);
+    assert_eq!(projection.quarantined_duplicates(), &[card_id]);
+}
+
 #[test]
 fn replay_rejects_non_work_transcript_explicitly() {
     let mut transcript = transcript(10, 1, &card_created(WorkCardId::from_u128(10), 1000));

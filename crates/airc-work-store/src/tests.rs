@@ -1004,7 +1004,7 @@ fn apply_transcripts_advances_cursor_past_non_work_events() {
 }
 
 #[test]
-fn apply_transcripts_skips_missing_anchor_but_fails_structural_errors() {
+fn apply_transcripts_skips_missing_anchors_and_quarantines_duplicates() {
     let room = RoomId::from_u128(10);
     let card_a = WorkCardId::from_u128(20);
     let mut projection =
@@ -1020,12 +1020,16 @@ fn apply_transcripts_skips_missing_anchor_but_fails_structural_errors() {
     .unwrap();
     assert!(projection.card(unknown).is_none());
 
-    // Structural error (duplicate create): loud failure, not a skip.
-    let result = apply_transcripts(
+    // what this catches: a duplicate create failing every resume of the
+    // room's board (card a3fa88ae). Not a skip: the original stands and
+    // the duplicate is counted for the board to report.
+    apply_transcripts(
         &mut projection,
         vec![work_transcript(3, room, 3, &card_created(card_a))],
-    );
-    assert!(matches!(result, Err(WorkStoreError::Projection(_))));
+    )
+    .unwrap();
+    assert!(projection.card(card_a).is_some());
+    assert_eq!(projection.quarantined_duplicates(), &[card_a]);
 }
 
 #[test]
