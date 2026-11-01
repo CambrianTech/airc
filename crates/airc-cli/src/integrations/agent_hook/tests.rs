@@ -536,6 +536,77 @@ async fn burst_larger_than_a_turn_becomes_bounded_history_and_keeps_its_requests
     );
 }
 
+async fn append_work(airc: &Airc, room: RoomId, n: u64, work: &airc_work::WorkEvent) {
+    let (headers, body) = airc_work::encode_work_event(work).unwrap();
+    let mut e = event(body);
+    e.room_id = room;
+    e.lamport = n;
+    e.occurred_at_ms = n;
+    e.event_id = EventId::from_u128(n as u128);
+    e.headers = headers;
+    airc.append_event(e).await.unwrap();
+}
+
+fn card(n: u128, title: &str) -> airc_work::WorkEvent {
+    airc_work::WorkEvent::CardCreated(airc_work::CardCreated {
+        card_id: airc_work::WorkCardId::from_u128(n),
+        repo: airc_work::RepoId::new("CambrianTech/airc").unwrap(),
+        title: title.to_string(),
+        body: None,
+        priority: airc_work::Priority::P1,
+        lane_id: None,
+        created_by: PeerId::from_u128(101),
+        created_at_ms: n as u64,
+        reviews: None,
+        origin: None,
+    })
+}
+
+// what this catches (Codex on #1638): a work event in the turn made the hook read the board,
+// and a board projection error (here a second creation of one card id) aborted the whole
+// hook, addressed chat included, before its delivery ACK. The turn states the board's error
+// and delivers the chat.
+#[tokio::test]
+async fn a_board_that_cannot_project_never_withholds_addressed_chat() {
+    let (_dir, airc, room) = fixture().await;
+    let options = super::HookOptions {
+        count: 50,
+        max_items: 8,
+        raw: false,
+        selection: DeliverySelection::default(),
+    };
+    // attach: what lands after this is live (the board is read only for live work events)
+    drop(
+        super::prepare(&airc, "claude-hook:board", &options)
+            .await
+            .unwrap(),
+    );
+
+    append_text(
+        &airc,
+        room,
+        1,
+        "an addressed ask",
+        MentionTarget::Peer(airc.peer_id()),
+    )
+    .await;
+    append_work(&airc, room, 2, &card(7, "the original card")).await;
+    append_work(&airc, room, 3, &card(7, "a second creation of the same id")).await;
+    let mut turn = super::prepare(&airc, "claude-hook:board", &options)
+        .await
+        .unwrap();
+    let (context, _) = super::compose(&CLAUDE, &airc, &mut turn, None, &options, None)
+        .await
+        .unwrap();
+    let context = context.unwrap();
+    assert!(context.contains("an addressed ask"), "{context}");
+    assert!(
+        context.contains("AIRC: the work board could not be read")
+            && context.contains("duplicate card"),
+        "{context}"
+    );
+}
+
 fn event(body: Body) -> TranscriptEvent {
     TranscriptEvent {
         event_id: EventId::new(),
