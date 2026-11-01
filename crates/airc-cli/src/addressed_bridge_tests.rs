@@ -12,8 +12,8 @@ struct Machine {
     client: DaemonClient,
     task: tokio::task::JoinHandle<Result<(), airc_daemon::DaemonError>>,
     // Drop resources before directories, including on panic.
-    _socket_home: tempfile::TempDir,
-    home: tempfile::TempDir,
+    _socket_home: Arc<tempfile::TempDir>,
+    home: Arc<tempfile::TempDir>,
 }
 
 impl Drop for Machine {
@@ -36,7 +36,14 @@ impl Machine {
     }
 
     async fn boot() -> Self {
-        let home = tempfile::tempdir().unwrap();
+        Self::boot_in(
+            Arc::new(tempfile::tempdir().unwrap()),
+            Arc::new(tempfile::tempdir().unwrap()),
+        )
+        .await
+    }
+
+    async fn boot_in(home: Arc<tempfile::TempDir>, socket_home: Arc<tempfile::TempDir>) -> Self {
         let gateway = airc_lib::Airc::open(home.path()).await.unwrap();
         let identity = airc_identity::LocalIdentity::load(home.path())
             .await
@@ -71,7 +78,6 @@ impl Machine {
                 daemon: state.peer_id,
             }))
             .unwrap();
-        let socket_home = tempfile::tempdir().unwrap();
         let socket = socket_home.path().join("a.sock");
         let client = DaemonClient::new(socket.clone());
         let (ready, bound) = tokio::sync::oneshot::channel();
@@ -98,6 +104,134 @@ impl Machine {
             _socket_home: socket_home,
         }
     }
+}
+
+#[tokio::test]
+async fn surviving_sdk_scopes_release_closed_inboxes_and_reacquire_after_daemon_restart() {
+    use airc_lib::addressed::{AddressedKind, AddressedSend, InboxError};
+    use std::time::Duration;
+
+    let machine = Machine::boot().await;
+    let home = machine.home.clone();
+    let socket_home = machine._socket_home.clone();
+    let daemon_peer = machine.state.peer_id;
+    let alice = airc_lib::Airc::attach_as(home.path(), "alice", socket_home.path().join("a.sock"))
+        .await
+        .expect("attach Alice");
+    let bob = airc_lib::Airc::attach_as(home.path(), "bob", socket_home.path().join("a.sock"))
+        .await
+        .expect("attach Bob");
+    for scope in [&alice, &bob] {
+        for peer in [&alice, &bob] {
+            scope
+                .add_peer(peer.peer_spec().parse().expect("peer spec"))
+                .await
+                .expect("enroll peer");
+        }
+    }
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut alice_inbox = alice
+        .addressed_inbox(deadline())
+        .await
+        .expect("Alice inbox");
+    let mut bob_inbox = bob.addressed_inbox(deadline()).await.expect("Bob inbox");
+
+    // Establish useful encrypted work before destroying the actual IPC server.
+    let pending = alice
+        .request(
+            MentionTarget::Peer(bob.peer_id()),
+            Default::default(),
+            airc_core::Body::text("before restart"),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("request before restart");
+    let request = tokio::time::timeout_at(deadline(), bob_inbox.next())
+        .await
+        .expect("request deadline")
+        .expect("request delivery");
+    bob.reply(
+        &request,
+        Default::default(),
+        airc_core::Body::text("settled before restart"),
+    )
+    .await
+    .expect("reply before restart");
+    assert_eq!(
+        alice
+            .await_reply(pending)
+            .await
+            .expect("settled command")
+            .body()
+            .as_text(),
+        Some("settled before restart")
+    );
+    // Alice's explicit inbox also observed that reply; drain it before closure.
+    tokio::time::timeout_at(deadline(), alice_inbox.next())
+        .await
+        .expect("broadcast reply deadline")
+        .expect("broadcast reply copy");
+
+    machine.shutdown().await;
+    for inbox in [&mut alice_inbox, &mut bob_inbox] {
+        assert_eq!(
+            tokio::time::timeout_at(deadline(), inbox.next())
+                .await
+                .expect("closed owner must wake its consumer")
+                .err(),
+            Some(InboxError::Closed)
+        );
+    }
+    // Rebuild state and listener from the same durable homes. SDK scopes and
+    // crypto sessions survive; no reset hook, new identity, or cursor reset.
+    let restarted = Machine::boot_in(home, socket_home).await;
+    assert_eq!(restarted.state.peer_id, daemon_peer);
+    assert!(
+        alice.addressed_inbox(deadline()).await.is_err(),
+        "a closed old lease cannot silently join a new incarnation"
+    );
+    drop(alice_inbox);
+    drop(bob_inbox);
+    let mut alice_inbox = alice
+        .addressed_inbox(deadline())
+        .await
+        .expect("reacquire Alice");
+    let mut bob_inbox = bob
+        .addressed_inbox(deadline())
+        .await
+        .expect("reacquire Bob");
+    for (sender, recipient, inbox) in [
+        (&alice, &bob, &mut bob_inbox),
+        (&bob, &alice, &mut alice_inbox),
+    ] {
+        let correlation = uuid::Uuid::new_v4();
+        sender
+            .send_addressed(
+                AddressedSend {
+                    to: recipient.peer_id(),
+                    kind: AddressedKind::Command,
+                    correlation,
+                    headers: Default::default(),
+                    body: airc_core::Body::text("useful work after restart"),
+                },
+                deadline(),
+            )
+            .await
+            .expect("send after restart");
+        let received = tokio::time::timeout_at(deadline(), inbox.next())
+            .await
+            .expect("delivery deadline")
+            .expect("delivery after restart");
+        assert_eq!(received.correlation(), correlation);
+        assert_eq!(received.from(), sender.peer_id());
+        assert_eq!(received.to(), recipient.peer_id());
+        assert_eq!(received.body().as_text(), Some("useful work after restart"));
+    }
+    drop(alice_inbox);
+    drop(bob_inbox);
+    drop(alice);
+    drop(bob);
+    restarted.shutdown().await;
 }
 
 #[tokio::test]

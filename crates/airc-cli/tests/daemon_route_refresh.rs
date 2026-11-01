@@ -82,12 +82,19 @@ fn spawn_daemon(home: &std::path::Path, socket: &std::path::Path) -> DaemonGuard
 async fn daemon_dials_stored_endpoint_without_transport_health() {
     // Outer bound: this entire test must finish or fail loudly —
     // never hang (card d2ba719c).
-    tokio::time::timeout(Duration::from_secs(120), scenario())
+    tokio::time::timeout(Duration::from_secs(120), scenario(false))
         .await
         .expect("daemon route-refresh scenario must finish inside 120s");
 }
 
-async fn scenario() {
+#[tokio::test(flavor = "multi_thread")]
+async fn addressed_remote_scope_recovers_after_its_daemon_process_restarts() {
+    tokio::time::timeout(Duration::from_secs(120), scenario(true))
+        .await
+        .expect("addressed process restart scenario deadline");
+}
+
+async fn scenario(restart_addressed: bool) {
     let tmp_alice = common::daemon_tempdir();
     let tmp_bob = common::daemon_tempdir();
     let alice_home = tmp_alice.path().join(".airc");
@@ -133,7 +140,7 @@ async fn scenario() {
     // Bob's daemon comes up. Nothing else runs against it — no
     // `transport health`, no `doctor`, no IPC client at all.
     let socket = bob_home.join("daemon.sock");
-    let _daemon = spawn_daemon(&bob_home, &socket);
+    let daemon = spawn_daemon(&bob_home, &socket);
 
     // The daemon's first refresh fires FIRST_REFRESH_DELAY (5s) after
     // start; give it generous-but-bounded room. Observe from alice's
@@ -160,4 +167,126 @@ async fn scenario() {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    if restart_addressed {
+        use airc_lib::addressed::InboxError;
+        let bob = Airc::attach_as(&bob_home, "restart-bob", socket.clone())
+            .await
+            .expect("attach surviving Bob scope");
+        alice
+            .add_peer(bob.peer_spec().parse().expect("Bob scope spec"))
+            .await
+            .expect("Alice enrolls Bob scope");
+        bob.add_peer(alice.peer_spec().parse().expect("Alice spec"))
+            .await
+            .expect("Bob enrolls Alice");
+        airc_trust::set_endpoints_json(alice.home(), bob.peer_id(), None, 1, Some(bob_peer_id))
+            .await
+            .expect("route Bob scope through its host")
+            .expect("Bob enrolled");
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut alice_inbox = alice
+            .addressed_inbox(deadline())
+            .await
+            .expect("Alice inbox");
+        let mut bob_inbox = bob.addressed_inbox(deadline()).await.expect("Bob inbox");
+        exchange(&alice, &bob, &mut bob_inbox, "before crash").await;
+        exchange(&bob, &alice, &mut alice_inbox, "before crash reply").await;
+
+        // Terminate and reap the real daemon process, including its TLS and
+        // IPC sockets. Both SDK objects, Alice's inbox and crypto state survive.
+        drop(daemon);
+        assert_eq!(
+            tokio::time::timeout_at(deadline(), bob_inbox.next())
+                .await
+                .expect("Bob must observe dead daemon")
+                .err(),
+            Some(InboxError::Closed)
+        );
+        drop(bob_inbox);
+        tokio::time::timeout_at(deadline(), async {
+            loop {
+                if !alice
+                    .route_discovery_snapshot()
+                    .await
+                    .expect("observe old TLS connection closure")
+                    .connected_lan_peers
+                    .contains(&bob_peer_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("old daemon TLS session must close before restart");
+        let _restarted = spawn_daemon(&bob_home, &socket);
+        let client = airc_ipc::DaemonClient::new(socket);
+        tokio::time::timeout_at(deadline(), async {
+            loop {
+                if let Ok(status) = client.status().await {
+                    assert_eq!(status.peer_id, bob_peer_id.to_string());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("restarted daemon readiness");
+        let mut bob_inbox = bob
+            .addressed_inbox(deadline())
+            .await
+            .expect("Bob reacquires IPC owner");
+        // Let the daemon's existing discovery owner re-establish TLS. Do not
+        // call transport health, connect_lan, or a crypto-session reset hook.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if alice
+                    .route_discovery_snapshot()
+                    .await
+                    .expect("route observation")
+                    .connected_lan_peers
+                    .contains(&bob_peer_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("daemon reconnects stored endpoint");
+        exchange(&bob, &alice, &mut alice_inbox, "after crash").await;
+        exchange(&alice, &bob, &mut bob_inbox, "after crash reply").await;
+    }
+}
+
+async fn exchange(
+    sender: &Airc,
+    recipient: &Airc,
+    inbox: &mut airc_lib::addressed::AddressedInbox,
+    body: &str,
+) {
+    use airc_lib::addressed::{AddressedKind, AddressedSend};
+    let correlation = uuid::Uuid::new_v4();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    sender
+        .send_addressed(
+            AddressedSend {
+                to: recipient.peer_id(),
+                kind: AddressedKind::Command,
+                correlation,
+                headers: Default::default(),
+                body: airc_core::Body::text(body),
+            },
+            deadline,
+        )
+        .await
+        .expect("addressed send");
+    let received = tokio::time::timeout_at(deadline, inbox.next())
+        .await
+        .expect("addressed receive deadline")
+        .expect("addressed receive");
+    assert_eq!(received.correlation(), correlation);
+    assert_eq!(received.from(), sender.peer_id());
+    assert_eq!(received.to(), recipient.peer_id());
+    assert_eq!(received.body().as_text(), Some(body));
 }

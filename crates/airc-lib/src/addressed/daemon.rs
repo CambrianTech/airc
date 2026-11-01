@@ -38,10 +38,30 @@ impl Airc {
             let (closed_tx, closed) = watch::channel(false);
             let airc = self.clone();
             let task = tokio::spawn(async move {
-                while let Ok(Some(airc_ipc::Response::Addressed { frame })) =
-                    airc_ipc::codec::read_response_frame(&mut stream).await
-                {
-                    airc.receive_addressed(frame).await;
+                loop {
+                    match airc_ipc::codec::read_response_frame(&mut stream).await {
+                        Ok(Some(airc_ipc::Response::Addressed { frame })) => {
+                            airc.receive_addressed(frame).await;
+                        }
+                        Ok(None) => {
+                            tracing::warn!(target: "airc::addressed", %daemon,
+                                peer = %airc.peer_id(), "addressed IPC owner reached EOF");
+                            break;
+                        }
+                        Ok(Some(_)) => {
+                            // Never render an unexpected response: it may carry
+                            // private application data.
+                            tracing::error!(target: "airc::addressed", %daemon,
+                                peer = %airc.peer_id(), "addressed IPC owner received a non-addressed response");
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "airc::addressed", %daemon,
+                                peer = %airc.peer_id(), error_kind = ?error.kind(),
+                                "addressed IPC owner read failed");
+                            break;
+                        }
+                    }
                 }
                 closed_tx.send_replace(true);
             });
