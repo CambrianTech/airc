@@ -69,6 +69,9 @@ impl Airc {
             recorded.validate_for_board(&board)?;
             return Ok(card_id);
         }
+        // a new handoff is a new action on both identities: neither may be conflicted
+        super::refuse_conflicted(&board, parent, super::CardMutation::Act)?;
+        super::refuse_conflicted(&board, card_id, super::CardMutation::Act)?;
         request.reviews = Some(parent);
         let handoff = airc_work::SubmissionReviewRequested {
             card: build_operator_card_created(card_id, self.peer_id(), now_ms()?, request),
@@ -106,6 +109,9 @@ impl Airc {
         if let Some(prior) = board.submission_review(review.review_id) {
             return Ok(prior.clone());
         }
+        // a new judgement is a new action on the parent and on its review card
+        super::refuse_conflicted(&board, review.card_id, super::CardMutation::Act)?;
+        super::refuse_conflicted(&board, review.review_card_id, super::CardMutation::Act)?;
         self.publish_work_event_in(room, &WorkEvent::WorkSubmissionReviewed(review.clone()))
             .await?;
         Ok(review)

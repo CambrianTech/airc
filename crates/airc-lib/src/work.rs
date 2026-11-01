@@ -1789,6 +1789,156 @@ mod tests {
         .expect("closing a conflicted card resolves it");
     }
 
+    // what this catches (Codex round 2 on #1638): review handoff and judgement skipped the
+    // conflict guard, so a submitted parent whose id a second creation claimed could still
+    // materialize a review, and a claimed review card in conflict could still take a fresh
+    // judgement. Both now refuse with the typed conflict and publish nothing; a retry that
+    // only reads (the recorded handoff) still answers.
+    #[tokio::test]
+    async fn review_handoff_and_judgement_refuse_a_conflicted_parent_or_review_card() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room = airc.join("conflict-review").await.unwrap();
+        let repo = RepoId::new("fixture/conflict-review").unwrap();
+        let artifact: airc_work::SubmissionArtifact = serde_json::from_value(serde_json::json!({
+            "hash": "d".repeat(64), "size_bytes": 5, "mime": "text/x-diff"
+        }))
+        .unwrap();
+        let collide = |card_id: WorkCardId| {
+            WorkEvent::CardCreated(airc_work::CardCreated {
+                card_id,
+                repo: repo.clone(),
+                title: "a second creation of the same id".to_string(),
+                body: None,
+                priority: Priority::P1,
+                lane_id: None,
+                created_by: airc.peer_id(),
+                created_at_ms: now_ms().unwrap(),
+                reviews: None,
+                origin: None,
+            })
+        };
+        let submitted = |title: &'static str| {
+            let airc = &airc;
+            let room = &room;
+            let repo = repo.clone();
+            let artifact = artifact.clone();
+            async move {
+                let card = airc
+                    .create_work_card(CreateWorkCard::new(repo, title, Priority::P1))
+                    .await
+                    .unwrap();
+                let claim = airc
+                    .claim_work_card_with_provenance_in(
+                        room,
+                        ClaimWorkCard {
+                            card_id: card,
+                            ttl_ms: 600_000,
+                        },
+                        airc_work::ClaimOrigin::Explicit,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let submission = airc
+                    .submit_work_in(
+                        room,
+                        SubmitWork {
+                            submission_id: airc_work::SubmissionId::new(),
+                            card_id: card,
+                            claim_id: claim,
+                            instance: title.into(),
+                            base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+                            artifact,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                (card, submission)
+            }
+        };
+
+        // A: the parent collides after its submission: no new review handoff
+        let (parent, submission) = submitted("parent that collides").await;
+        airc.publish_work_event_in(&room, &collide(parent))
+            .await
+            .unwrap();
+        let handoff = CreateWorkCard::new(repo.clone(), "review it", Priority::P1);
+        let refused = airc
+            .ensure_submission_review_in(&room, parent, submission.submission_id, handoff.clone())
+            .await;
+        assert!(
+            matches!(refused, Err(AircError::WorkCardConflicted { card_id, .. }) if card_id == parent),
+            "{refused:?}"
+        );
+        assert_eq!(
+            airc.work_board_in(&room)
+                .await
+                .unwrap()
+                .review_cards_for(parent)
+                .count(),
+            0
+        );
+
+        // B: a claimed review card collides: no fresh judgement
+        let (healthy, submission) = submitted("healthy parent").await;
+        let review_card = airc
+            .ensure_submission_review_in(&room, healthy, submission.submission_id, handoff.clone())
+            .await
+            .expect("a healthy parent hands off its review");
+        let review_claim = airc
+            .claim_work_card_with_provenance_in(
+                &room,
+                ClaimWorkCard {
+                    card_id: review_card,
+                    ttl_ms: 600_000,
+                },
+                airc_work::ClaimOrigin::Explicit,
+                None,
+            )
+            .await
+            .unwrap();
+        airc.publish_work_event_in(&room, &collide(review_card))
+            .await
+            .unwrap();
+        // the recorded handoff is a read: a retry still answers it
+        assert_eq!(
+            airc.ensure_submission_review_in(&room, healthy, submission.submission_id, handoff)
+                .await
+                .unwrap(),
+            review_card
+        );
+        let judgement = ReviewWorkSubmission {
+            review_id: airc_work::WorkReviewId::new(),
+            card_id: healthy,
+            submission_id: submission.submission_id,
+            artifact: artifact.clone(),
+            review_card_id: review_card,
+            review_claim_id: review_claim,
+            outcome: airc_work::WorkReviewOutcome::Unknown,
+            evidence: artifact,
+            evidence_text: None,
+        };
+        let refused = airc
+            .review_work_submission_in(&room, judgement.clone())
+            .await;
+        assert!(
+            matches!(refused, Err(AircError::WorkCardConflicted { card_id, .. }) if card_id == review_card),
+            "{refused:?}"
+        );
+        assert!(airc
+            .work_board_in(&room)
+            .await
+            .unwrap()
+            .submission_review(judgement.review_id)
+            .is_none());
+    }
+
     // what this catches: card 4fee35cf. Kimi's lease on her own Review card lapsed and
     // her re-claim was refused WorkCardNotClaimable (29 of 42 board calls failed on
     // 2026-10-04). The owner's re-claim renews HER claim and leaves the card in Review:
