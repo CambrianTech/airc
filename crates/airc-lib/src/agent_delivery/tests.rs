@@ -1,7 +1,19 @@
 use super::*;
 use crate::subscriptions::{self, ChannelName, MeshIdentity, SubscriptionSet};
 use airc_core::{Body, Headers, MentionTarget, TranscriptKind};
+/// An agent whose last read was before every event a test appends: the scenario the
+/// history tests model (an outage, a backlog, paging), stated as its read marker.
 async fn fixture() -> (tempfile::TempDir, Airc, RoomId) {
+    let (dir, airc, room) = fresh_agent().await;
+    reset_read_marker(&airc).await;
+    (dir, airc, room)
+}
+/// Put the agent's read marker back at the start (the marker itself only moves forward).
+async fn reset_read_marker(airc: &Airc) {
+    airc.read_from_start_for_test().await.unwrap();
+}
+/// An agent that has never read on this scope: no read marker.
+async fn fresh_agent() -> (tempfile::TempDir, Airc, RoomId) {
     let dir = tempfile::TempDir::new().unwrap();
     let airc = Airc::open_with_wire_root_for_test(dir.path(), dir.path())
         .await
@@ -495,6 +507,8 @@ async fn at_the_scan_cap_the_oldest_request_is_still_emitted() {
     let me = airc.addressee().await.unwrap();
     // At the cap, and (Codex) far above it: both clamp to one 4096-event scan.
     for (consumer, candidates) in [("capped", 4096), ("over-cap", 10_000)] {
+        // Each consumer models the same condition: the agent last read before event 1.
+        reset_read_marker(&airc).await;
         let window = AddressedWindow {
             candidates,
             page: 8,
@@ -1038,4 +1052,137 @@ async fn new_addressed_traffic_never_starves_an_older_pending_request() {
     let mut emitted: Vec<u64> = shown.iter().map(|(_, lamport)| *lamport).collect();
     emitted.sort_unstable();
     assert_eq!(emitted, requests, "every request exactly once: {shown:?}");
+}
+
+// what this catches: a new session owing the whole history (Joel, 2026-11-01: "who the
+// fuck is gonna want four year old messages as default behavior"). An agent that has
+// never read starts at the present: nothing before it is owed, and new events deliver.
+#[tokio::test]
+async fn an_agent_that_never_read_starts_at_the_present() {
+    let (_dir, airc, room) = fresh_agent().await;
+    for n in 1..=50 {
+        append(&airc, room, n).await;
+    }
+    let mut first = airc
+        .prepare_agent_delivery("session-a", 64, 8)
+        .await
+        .unwrap();
+    assert!(first.live_events().is_empty());
+    assert!(
+        summary(&mut first, &airc).await.is_none(),
+        "nothing before the first read is owed"
+    );
+    first.acknowledge(0, true).await.unwrap();
+    append(&airc, room, 51).await;
+    let next = airc
+        .prepare_agent_delivery("session-a", 64, 8)
+        .await
+        .unwrap();
+    assert_eq!(next.live_events()[0].lamport, 51);
+}
+
+// what this catches: every new Claude Code or Codex session reading as a stranger. A new
+// session of the same agent continues from where the agent last read, like a chat client
+// reopening at its read marker: what it already saw is neither replayed nor owed.
+#[tokio::test]
+async fn a_new_session_continues_from_the_agents_read_marker() {
+    let (_dir, airc, room) = fresh_agent().await;
+    let first = airc
+        .prepare_agent_delivery("session-a", 64, 8)
+        .await
+        .unwrap();
+    first.acknowledge(0, true).await.unwrap();
+    append(&airc, room, 1).await;
+    append(&airc, room, 2).await;
+    let seen = airc
+        .prepare_agent_delivery("session-a", 64, 8)
+        .await
+        .unwrap();
+    assert_eq!(seen.live_events().len(), 2);
+    seen.acknowledge(2, true).await.unwrap();
+    append(&airc, room, 3).await;
+    let mut other = airc
+        .prepare_agent_delivery("session-b", 64, 8)
+        .await
+        .unwrap();
+    let history = summary(&mut other, &airc).await;
+    assert!(
+        history
+            .as_ref()
+            .and_then(|h| h.counted.as_ref())
+            .is_none_or(|c| c.count <= 1),
+        "session b owes at most what arrived after the agent's marker"
+    );
+    other.acknowledge(0, true).await.unwrap();
+    append(&airc, room, 4).await;
+    let live = airc
+        .prepare_agent_delivery("session-b", 64, 8)
+        .await
+        .unwrap();
+    assert_eq!(live.live_events()[0].lamport, 4);
+}
+
+// what this catches: an upgrade leaving existing sessions owing their whole history. A row
+// from before read markers (history reaching back to the start of time, its delivery
+// positions stale because a hook killed at its timeout never acknowledged) starts over at
+// the present.
+#[tokio::test]
+async fn a_legacy_session_owes_nothing_older_than_what_the_agent_read() {
+    let (_dir, airc, room) = fresh_agent().await;
+    for n in 1..=25 {
+        append(&airc, room, n).await;
+    }
+    let tip = airc.channel_latest_cursor(room).await.unwrap().unwrap();
+    let channels = rooms(&airc).await.unwrap();
+    let source = {
+        let probe = airc.prepare_agent_delivery("probe", 64, 8).await.unwrap();
+        let source = probe.state.source.clone();
+        drop(probe);
+        airc.inner
+            .store
+            .delete_scoped_state(SCOPE, "probe")
+            .await
+            .unwrap();
+        airc.inner
+            .store
+            .delete_scoped_state(SCOPE, READ_MARKER)
+            .await
+            .unwrap();
+        source
+    };
+    let at = |n: u64| TranscriptCursor {
+        lamport: n,
+        event_id: EventId::from_u128(n as u128),
+    };
+    // the legacy reader delivered through 20; the legacy owing session reaches back to zero
+    for (name, live, summarized) in [
+        ("legacy-reader", at(20), at(20)),
+        ("legacy-owing", tip.clone(), zero()),
+    ] {
+        let state = State {
+            version: 1,
+            boundary: tip.clone(),
+            summarized,
+            live,
+            rooms: channels.clone(),
+            source: source.clone(),
+            history_counted: false,
+            unsearched: Vec::new(),
+            starts_at_marker: false,
+        };
+        persist(&airc, name, &state).await.unwrap();
+    }
+    let mut again = airc
+        .prepare_agent_delivery("legacy-owing", 64, 8)
+        .await
+        .unwrap();
+    assert!(
+        key(&again.state.summarized) >= key(&tip),
+        "owed history starts at what the agent read"
+    );
+    let owed = summary(&mut again, &airc).await;
+    assert!(
+        owed.as_ref().and_then(|h| h.counted.as_ref()).is_none(),
+        "nothing old is owed"
+    );
 }

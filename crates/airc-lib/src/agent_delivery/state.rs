@@ -37,6 +37,11 @@ pub(super) struct State {
     pub(super) history_counted: bool,
     #[serde(default)]
     pub(super) unsearched: Vec<Unsearched>,
+    /// Created under read markers: its history starts at the agent's marker or the
+    /// present. `false` = a row from before them, whose history may reach back to the
+    /// start of time and is clamped to the marker once.
+    #[serde(default)]
+    pub(super) starts_at_marker: bool,
 }
 
 /// Pre-attachment history whose addressed requests are not all emitted yet:
