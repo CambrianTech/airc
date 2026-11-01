@@ -137,6 +137,48 @@ pub enum IdentityError {
         agent_name: String,
         source: std::io::Error,
     },
+    /// An explicit mint lost a key-path race and removed exactly its own
+    /// just-inserted row — the conditional delete verified by peer/client/key
+    /// binding that it still WAS that very row — after another writer won the
+    /// case-insensitive `identity-{agent_name}.key` path race. The winner's
+    /// row and key are untouched; the loser leaves no orphan row behind.
+    KeyPathContended {
+        agent_name: String,
+        source: std::io::Error,
+    },
+    /// An explicit mint lost a key-path race, but removing its own just-
+    /// inserted row FAILED (a store error during custody cleanup). The home
+    /// now holds at least the loser's orphan row without its secret — every
+    /// open path refuses that half-state fail-closed. Both failures are kept
+    /// as typed fields: the key-write context and the actual cleanup failure,
+    /// so an operator can repair with full evidence (card 0f3b3126). A clean
+    /// contention is never reported over a failed cleanup.
+    KeyPathContendedCleanupFailed {
+        agent_name: String,
+        write_source: std::io::Error,
+        cleanup_error: StoreError,
+    },
+    /// A row for the requested agent exists but its custody binding
+    /// (`expected_public_key`) is NULL: it predates verified custody, so there
+    /// is no independently verified evidence of which public key its secret
+    /// must derive. Loading it would let any file content at the key path
+    /// become this agent's signing identity — a different principal than the
+    /// row describes — so load and signing are refused with this typed,
+    /// migration-required error. The row and key file are preserved as-is;
+    /// establishing a binding requires independently verified evidence, never
+    /// an auto-bind of whatever file happens to sit at the path (card
+    /// 0f3b3126).
+    KeyBindingMissing {
+        agent_name: String,
+    },
+    /// A row for the requested agent carries a custody binding, but the secret
+    /// file at its key path does not derive the bound public key. The file is
+    /// different signing material than what the row describes — swapped or
+    /// drifted — so load and signing are refused rather than serving it (card
+    /// 0f3b3126).
+    KeyBindingMismatch {
+        agent_name: String,
+    },
 }
 
 impl std::fmt::Display for IdentityError {
@@ -203,7 +245,34 @@ impl std::fmt::Display for IdentityError {
             IdentityError::KeyWriteFailedAfterRowInserted { agent_name, source } => write!(
                 f,
                 "identity row for agent {agent_name:?} was inserted but its key file could not be written ({source}) — \
-                 the home now holds half a citizen: restore the missing key or remove the orphan row before opening"
+                  the home now holds half a citizen: restore the missing key or remove the orphan row before opening"
+            ),
+            IdentityError::KeyPathContended { agent_name, source } => write!(
+                f,
+                "the key path for identity-{agent_name}.key was already occupied by another mint's winning write ({source}) — \
+                  this mint lost the race and removed exactly its own row; the winner's identity is untouched"
+            ),
+            IdentityError::KeyPathContendedCleanupFailed {
+                agent_name,
+                write_source,
+                cleanup_error,
+            } => write!(
+                f,
+                "the key path for identity-{agent_name}.key was already occupied by another mint's winning write ({write_source}), \
+                  and removing this mint's own orphan row FAILED ({cleanup_error}) — the half-state survives and demands operator repair; \
+                  no clean contention is reported over a failed cleanup"
+            ),
+            IdentityError::KeyBindingMissing { agent_name } => write!(
+                f,
+                "identity row for agent {agent_name:?} has no custody binding (expected_public_key is NULL) — \
+                 migration required: establish a binding from independently verified evidence before this home can open as that agent; \
+                 the row and key file are preserved, and load refuses to sign with an unbound secret"
+            ),
+            IdentityError::KeyBindingMismatch { agent_name } => write!(
+                f,
+                "the secret at identity-{agent_name}.key does not derive the public key bound by the row for agent {agent_name:?} — \
+                 restore the correct key or repair the binding from independently verified evidence before this home can open; \
+                 load refuses to serve a swapped or drifted signing identity"
             ),
         }
     }
@@ -224,8 +293,17 @@ impl std::error::Error for IdentityError {
             | IdentityError::IdentityNotInitialised { .. }
             | IdentityError::KeyMissingForAgent { .. }
             | IdentityError::IdentityAlreadyInitialised { .. }
-            | IdentityError::KeyMaterialWithoutState { .. } => None,
-            IdentityError::KeyWriteFailedAfterRowInserted { source, .. } => Some(source),
+            | IdentityError::KeyMaterialWithoutState { .. }
+            | IdentityError::KeyBindingMissing { .. }
+            | IdentityError::KeyBindingMismatch { .. } => None,
+            IdentityError::KeyWriteFailedAfterRowInserted { source, .. }
+            | IdentityError::KeyPathContended { source, .. } => Some(source),
+            // The distinguishing failure of this variant is the failed custody
+            // cleanup (the orphan row survives); chain that typed store error,
+            // not the write context already printed in Display.
+            IdentityError::KeyPathContendedCleanupFailed { cleanup_error, .. } => {
+                Some(cleanup_error)
+            }
         }
     }
 }
@@ -507,6 +585,31 @@ impl LocalIdentity {
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&key_bytes);
         let keypair = PeerKeypair::from_secret_bytes(&secret);
+        // Custody binding (card 0f3b3126): the row's expected_public_key is a
+        // MANDATORY check — no fingerprint or other field may gate it, and a
+        // missing binding is not an old-load contract. A NULL binding means this
+        // row predates verified custody: there is no independently verified
+        // evidence of which public key its secret must derive, so loading it
+        // would let any file content at the key path become this agent's
+        // signing identity. Refuse with the typed migration-required error; the
+        // row and key are preserved as-is — establishing a binding requires
+        // independently verified evidence, never an auto-bind of whatever file
+        // happens to sit at the path (recording what a file currently is would
+        // launder drift into trust).
+        match &stored.expected_public_key {
+            Some(expected) => {
+                if keypair.public_bytes().to_vec() != *expected {
+                    return Err(IdentityError::KeyBindingMismatch {
+                        agent_name: stored.agent_name.clone(),
+                    });
+                }
+            }
+            None => {
+                return Err(IdentityError::KeyBindingMissing {
+                    agent_name: stored.agent_name.clone(),
+                })
+            }
+        }
         Ok(Self {
             keypair,
             peer_id: stored.peer_id,
@@ -597,6 +700,11 @@ impl LocalIdentity {
         let client_id = ClientId::new();
         let created_at_ms = now_ms()?;
 
+        // The custody binding, computed ONCE and used for both the row insert
+        // and — if the key write loses a path race — verifying we remove exactly
+        // this inserted row (card 0f3b3126).
+        let expected_public_key: Vec<u8> = keypair.public_bytes().to_vec();
+
         // Row FIRST, then key — the reverse order is the custody bug this card
         // fixes. Writing the named key before the row insert meant a duplicate
         // (a pre-existing legacy row for the same name) failed the insert while
@@ -616,6 +724,11 @@ impl LocalIdentity {
                 created_at_ms,
                 identity: Identity::default(),
                 agent_name: agent_name.clone(),
+                // Mandatory binding (card 0f3b3126): the row records the public
+                // key this very keypair derives. From now on every load of this
+                // row verifies file -> key against it, so a swapped or drifted
+                // secret can never silently become this agent's signing identity.
+                expected_public_key: Some(keypair.public_bytes().to_vec()),
             })
             .await?;
 
@@ -627,15 +740,61 @@ impl LocalIdentity {
         // name gets `identity-<name>.key`. create_new still refuses to
         // overwrite whatever file already exists at that path — rekeying is a
         // named operation, not a side effect of this mint.
-        write_owner_only(&key_path, &keypair.secret_bytes()).map_err(|e| {
-            // The row now exists without its secret half; say so explicitly so
-            // the operator knows exactly what to repair (restore or remove the
-            // orphan row) — a bare io error would hide that.
-            IdentityError::KeyWriteFailedAfterRowInserted {
-                agent_name: agent_name.to_string(),
-                source: e,
-            }
-        })?;
+        if let Err(e) = write_owner_only(&key_path, &keypair.secret_bytes()) {
+            return if e.kind() == std::io::ErrorKind::AlreadyExists {
+                // Lost the key-path race: between our absence check and this
+                // write another mint's material landed at the same path (on a
+                // case-insensitive filesystem, `Alice`/`alice` collide). Our
+                // row is now an orphan whose secret half belongs to no one we
+                // can name — remove EXACTLY the row we just inserted. The
+                // conditional delete verifies by peer/client/key binding that
+                // it still IS our row; a replaced or vanished row deletes
+                // nothing, in which case the surviving half-state demands
+                // operator attention (card 0f3b3126).
+                match airc_store::EventStore::delete_local_identity_if_matching(
+                    store,
+                    &agent_name,
+                    peer_id,
+                    client_id,
+                    Some(expected_public_key.clone()),
+                )
+                .await
+                {
+                    // Clean contention: our own row is gone, the winner's row
+                    // and key are untouched — report it as such.
+                    Ok(true) => Err(IdentityError::KeyPathContended {
+                        agent_name: agent_name.to_string(),
+                        source: e,
+                    }),
+                    // Our row no longer matched (replaced or gone): do NOT
+                    // report a clean contention — whatever state survives is
+                    // not ours to explain, so hand the operator the half-state
+                    // error instead.
+                    Ok(false) => Err(IdentityError::KeyWriteFailedAfterRowInserted {
+                        agent_name: agent_name.to_string(),
+                        source: e,
+                    }),
+                    // Custody cleanup itself failed: an orphan row survives
+                    // without its secret. Keep BOTH typed failures — the key-
+                    // write context and the actual cleanup failure — so the
+                    // operator can repair with full evidence; a clean
+                    // contention is never reported over a failed cleanup.
+                    Err(cleanup_error) => Err(IdentityError::KeyPathContendedCleanupFailed {
+                        agent_name: agent_name.to_string(),
+                        write_source: e,
+                        cleanup_error,
+                    }),
+                }
+            } else {
+                // The row now exists without its secret half; say so explicitly
+                // so the operator knows exactly what to repair (restore or
+                // remove the orphan row) — a bare io error would hide that.
+                Err(IdentityError::KeyWriteFailedAfterRowInserted {
+                    agent_name: agent_name.to_string(),
+                    source: e,
+                })
+            };
+        }
 
         Ok(Self {
             keypair,
@@ -747,6 +906,31 @@ async fn migrate_legacy_identity_json(
             expected: IDENTITY_STATE_VERSION,
         });
     }
+    // Custody binding established from the very secret material this migration
+    // moves (card 0f3b3126). Pre-ORM, identity.json and its key file jointly
+    // constituted this citizen's identity: the legacy load path signed with
+    // whatever secret sat at that path. Both halves pre-exist in this same home
+    // and NO row exists yet — there is no prior state to drift against, so
+    // recording what this material derives is a faithful transcription of trust
+    // the legacy system already placed here, not an auto-bind of an unverified
+    // file (that laundering risk arises only when binding an EXISTING row from
+    // current file contents that may have been swapped since insertion). Every
+    // subsequent load verifies file -> key against this binding; a migrated
+    // citizen stays loadable — existing persistent identities are preserved,
+    // never reminted or reset.
+    let key_bytes = std::fs::read(LocalIdentity::key_path(home)).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            IdentityError::PartialState {
+                key_exists: false,
+                state_exists: true,
+            }
+        } else {
+            IdentityError::Io(error)
+        }
+    })?;
+    let secret = <[u8; 32]>::try_from(key_bytes.as_slice())
+        .map_err(|_| IdentityError::BadKeyLength(key_bytes.len()))?;
+    let keypair = PeerKeypair::from_secret_bytes(&secret);
     let stored = StoredLocalIdentity {
         peer_id: parsed.peer_id,
         client_id: parsed.client_id,
@@ -754,6 +938,7 @@ async fn migrate_legacy_identity_json(
         created_at_ms: parsed.created_at_ms,
         identity: Identity::default(),
         agent_name: airc_store::DEFAULT_AGENT_NAME.to_string(),
+        expected_public_key: Some(keypair.public_bytes().to_vec()),
     };
     store.insert_local_identity(stored.clone()).await?;
     let _ = std::fs::remove_file(path);
@@ -1116,6 +1301,7 @@ mod tests {
                 created_at_ms: 1,
                 identity: Identity::default(),
                 agent_name: airc_store::DEFAULT_AGENT_NAME.to_string(),
+                expected_public_key: None,
             })
             .await
             .unwrap();
@@ -1229,6 +1415,7 @@ mod tests {
                 created_at_ms: 1,
                 identity: Identity::default(),
                 agent_name: "codex".to_string(),
+                expected_public_key: None,
             })
             .await
             .unwrap();

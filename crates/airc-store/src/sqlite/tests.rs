@@ -195,6 +195,7 @@ async fn local_identity_card_round_trips_through_store_trait() {
             created_at_ms: 42,
             identity,
             agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
+            expected_public_key: None,
         })
         .await
         .unwrap();
@@ -247,6 +248,7 @@ async fn explicit_agent_name_round_trips_through_local_identity() {
             created_at_ms: 100,
             identity: Identity::new("bob"),
             agent_name: "claude-tab-2".to_string(),
+            expected_public_key: None,
         })
         .await
         .unwrap();
@@ -301,6 +303,7 @@ async fn local_identity_api_inserts_a_second_agent_row() {
             created_at_ms: 100,
             identity: Identity::new("default-agent"),
             agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
+            expected_public_key: None,
         })
         .await
         .unwrap();
@@ -313,6 +316,7 @@ async fn local_identity_api_inserts_a_second_agent_row() {
             created_at_ms: 101,
             identity: Identity::new("codex"),
             agent_name: "codex".to_string(),
+            expected_public_key: None,
         })
         .await
         .expect("Sub-D write path inserts a non-singleton local_identity row");
@@ -351,6 +355,7 @@ async fn load_local_identity_by_agent_name_disambiguates_rows() {
             created_at_ms: 200,
             identity: Identity::new("primary"),
             agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
+            expected_public_key: None,
         })
         .await
         .unwrap();
@@ -363,6 +368,7 @@ async fn load_local_identity_by_agent_name_disambiguates_rows() {
             created_at_ms: 201,
             identity: Identity::new("codex"),
             agent_name: "codex".to_string(),
+            expected_public_key: None,
         })
         .await
         .unwrap();
@@ -417,6 +423,7 @@ async fn local_identity_schema_accepts_a_second_agent_row() {
             created_at_ms: 100,
             identity: Identity::new("default-agent"),
             agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
+            expected_public_key: None,
         })
         .await
         .unwrap();
@@ -435,6 +442,7 @@ async fn local_identity_schema_accepts_a_second_agent_row() {
         fingerprint: Set("".to_string()),
         integrations_json: Set(json!({})),
         agent_name: Set("codex".to_string()),
+        expected_public_key: Set(None),
     })
     .exec(&store.db)
     .await

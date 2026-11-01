@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use airc_core::{PeerId, RoomId, TranscriptCursor, TranscriptEvent};
+use airc_core::{ClientId, PeerId, RoomId, TranscriptCursor, TranscriptEvent};
 use uuid::Uuid;
 
 use crate::beacon::StoredBeacon;
@@ -105,6 +105,30 @@ impl EventStore for InMemoryEventStore {
         }
         stored.insert(identity.agent_name.clone(), identity);
         Ok(())
+    }
+
+    async fn delete_local_identity_if_matching(
+        &self,
+        agent_name: &str,
+        peer_id: PeerId,
+        client_id: ClientId,
+        expected_public_key: Option<Vec<u8>>,
+    ) -> Result<bool, StoreError> {
+        let mut stored = self
+            .local_identities
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        match stored.get(agent_name) {
+            Some(row)
+                if row.peer_id == peer_id
+                    && row.client_id == client_id
+                    && row.expected_public_key.as_deref() == expected_public_key.as_deref() =>
+            {
+                stored.remove(agent_name);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn save_local_identity_card(
@@ -483,6 +507,7 @@ mod tests {
                 created_at_ms: 42,
                 identity,
                 agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
+                expected_public_key: None,
             })
             .await
             .unwrap();
@@ -511,6 +536,7 @@ mod tests {
                 created_at_ms: 43,
                 identity: airc_core::identity::Identity::new("codex"),
                 agent_name: "codex".to_string(),
+                expected_public_key: None,
             })
             .await
             .unwrap();
