@@ -62,7 +62,12 @@ impl Machine {
                 home.path().to_owned(),
                 &home.path().join("events.sqlite"),
                 store,
-                airc_daemon::DaemonRuntimeInfo::unknown(),
+                airc_daemon::DaemonRuntimeInfo {
+                    ipc_protocol_version: Some(u32::from(airc_ipc::IPC_PROTOCOL_VERSION)),
+                    build_commit: (!crate::build_info::is_unknown())
+                        .then(|| crate::build_info::COMMIT.into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap(),

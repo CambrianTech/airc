@@ -656,7 +656,9 @@ pub async fn ensure_daemon_running(
     }
 
     // An admitted child owns initialization even before its endpoint exists.
-    // Join the same readiness contract; never spawn a competing initializer.
+    // If observed, join the same readiness contract without spawning.
+    // This snapshot is not an atomic spawn reservation: the pre-existing
+    // bind-between-probe-and-spawn race still needs child/endpoint custody.
     if lifecycle.startup_in_progress()? {
         return await_daemon_ready(home, socket, project_root.as_deref(), None, &lifecycle).await;
     }
