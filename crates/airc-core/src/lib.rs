@@ -34,6 +34,7 @@ pub mod attachment;
 pub mod body;
 pub mod channel_purpose;
 pub mod cursor;
+pub mod daemon_log;
 pub mod datetime;
 pub mod doctrine;
 pub mod filter;

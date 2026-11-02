@@ -16,6 +16,7 @@
 
 mod daemon;
 mod receive;
+mod refusals;
 mod send;
 mod sink;
 pub use sink::AddressedFrameSink;
@@ -220,6 +221,8 @@ pub(crate) struct AddressedState {
     /// Bumped whenever a session is installed, so senders waiting on a
     /// handshake wake and re-check.
     established: watch::Sender<u64>,
+    /// Refused admissions counted by kind, said at powers of two (card 92cd55d2).
+    refusals: std::sync::Mutex<refusals::Refusals>,
 }
 
 impl AddressedState {
@@ -236,6 +239,7 @@ impl AddressedState {
             sessions: SessionManager::new(identity.keypair.clone(), identity.peer_id, registry),
             inbox_tx,
             established: watch::Sender::new(0),
+            refusals: Default::default(),
         }
     }
 
