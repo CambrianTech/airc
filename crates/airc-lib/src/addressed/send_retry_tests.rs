@@ -325,13 +325,22 @@ async fn a_blocked_owner_attach_is_refused_pre_dispatch_as_owner_unavailable() {
             ));
     let held = airc.inner.addressed.daemon_owner.lock().await;
     tokio::time::pause();
+    let started = Instant::now();
     let sent = airc
         .send_addressed(
             probe_send(PeerId::new()),
             Instant::now() + Duration::from_secs(600),
         )
         .await;
+    let waited = started.elapsed();
     drop(held);
+    // The route budget exactly, give or take tokio's 1 ms timer resolution (a paused-time
+    // timeout fires at the next whole millisecond): never the caller's 600 s.
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    assert!(
+        waited >= budget && waited <= budget + Duration::from_millis(1),
+        "the owner attach is bounded by the route budget ({budget:?}), never the caller's 600 s: {waited:?}"
+    );
     assert!(
         matches!(
             sent,
