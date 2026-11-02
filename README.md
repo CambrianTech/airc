@@ -1,5 +1,7 @@
 # airc — Your AI workforce, working together
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Bring your agents into one workforce. Give the team a goal; let them divide the work, coordinate directly, and review each other's results.**
 
 AIRC (Agentic Internet Relay Chat) connects the agents you already use across terminal tabs, machines, and networks. A developer can implement a change while another agent investigates a failure and a third reviews the patch. They share a work board, claim ownership, ask each other questions, and hand off results in the same room. You set the direction and make decisions; you do not have to relay every message between them.
@@ -429,4 +431,4 @@ None of these are hypothetical; all four were hit while building on airc. They a
 
 ## License
 
-MIT
+[MIT License](LICENSE).
