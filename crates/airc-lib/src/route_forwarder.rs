@@ -105,6 +105,14 @@ pub struct RoutedForwarderConfig {
     pub retry_backoff: Duration,
 }
 
+impl RoutedForwarderConfig {
+    /// How long the route keeps trying one peer before it gives up: every attempt waits its ack
+    /// and its backoff. The one owner of that answer, for a forward and for a handshake alike.
+    pub fn delivery_budget(&self) -> Duration {
+        (self.ack_timeout + self.retry_backoff).saturating_mul(self.max_attempts)
+    }
+}
+
 impl Default for RoutedForwarderConfig {
     fn default() -> Self {
         Self {

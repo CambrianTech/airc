@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio::time::Instant;
 
-use super::{AddressedError, AddressedSend};
+use super::{AddressedError, AddressedSend, SessionUnavailableReason};
 use crate::time::now_ms;
 use crate::Airc;
 
@@ -79,44 +79,62 @@ impl Airc {
     }
 
     /// One request owns retransmission for this peer, using the existing route
-    /// retry cadence. Re-send the same pending init until a session arrives or
-    /// this caller expires. Followers share ownership, not their deadlines.
+    /// retry cadence. Re-send the same pending init until a session arrives, the
+    /// route's delivery budget passes, or this caller expires. Followers share
+    /// ownership, not their deadlines. Every way out short of a session is
+    /// `SessionUnavailable`: nothing has been sealed or sent yet, so the caller may
+    /// take the work elsewhere. Before this the wait was the caller's whole deadline
+    /// (a remote inference request's, ~630 s) and its failure read as a deadline:
+    /// IntelMac 2026-11-02, three residents waited that long per act on a seat that
+    /// answered no handshake while the route delivered every other frame.
     async fn await_session(
         &self,
         peer: airc_core::PeerId,
         deadline: Instant,
     ) -> Result<(), AddressedError> {
         let state = &self.inner.addressed;
-        tokio::time::timeout_at(deadline, async {
+        let route = crate::route_forwarder::RoutedForwarderConfig::default();
+        let budget = Instant::now() + route.delivery_budget();
+        let give_up = budget.min(deadline);
+        // Whether the last init went out: an attempt that cannot be sent (no live route yet) is
+        // retried on the same cadence, since a link may appear within the budget, and decides
+        // the reason if none does.
+        let mut last_init_sent = true;
+        let waited = tokio::time::timeout_at(give_up, async {
             let lease = state.handshake_waiters.lease(peer).await;
             let mut next_attempt = lease.lock().await;
             let mut established = state.established.subscribe();
-            let retry_delay =
-                crate::route_forwarder::RoutedForwarderConfig::default().retry_backoff;
             while !state.sessions.has_session(peer) {
                 tokio::select! {
                     biased;
-                    _ = tokio::time::sleep_until(deadline) => {
-                        return Err(AddressedError::DeadlineExceeded);
-                    }
                     changed = established.changed() => {
                         if changed.is_err() {
-                            return Err(AddressedError::DeadlineExceeded);
+                            return Err(AddressedError::Transport("addressed session state closed".into()));
                         }
                     }
                     _ = tokio::time::sleep_until(*next_attempt) => {
                         // Set before awaiting the write: cancellation must not
                         // let a live follower immediately repeat the attempt.
-                        *next_attempt = Instant::now() + retry_delay;
-                        self.rekey(peer, deadline).await?;
-                        *next_attempt = Instant::now() + retry_delay;
+                        *next_attempt = Instant::now() + route.retry_backoff;
+                        last_init_sent = self.rekey(peer, give_up).await.is_ok();
+                        *next_attempt = Instant::now() + route.retry_backoff;
                     }
                 }
             }
             Ok(())
         })
-        .await
-        .unwrap_or(Err(AddressedError::DeadlineExceeded))
+        .await;
+        let reason = if give_up == deadline {
+            SessionUnavailableReason::CallerDeadline
+        } else if last_init_sent {
+            SessionUnavailableReason::NoHandshakeReply
+        } else {
+            SessionUnavailableReason::NoRoute
+        };
+        match waited {
+            Ok(result) => result,
+            Err(_) => Err(AddressedError::SessionUnavailable { peer, reason }),
+        }
     }
 
     /// Put one addressed frame on the wire to `to`. Never appended anywhere.

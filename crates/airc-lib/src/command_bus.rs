@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::error::AircError;
 use crate::time::now_ms;
-use crate::{AddressedInbox, AddressedKind, AddressedSend, Airc, VerifiedAddressed};
+use crate::{
+    AddressedError, AddressedInbox, AddressedKind, AddressedSend, Airc, VerifiedAddressed,
+};
 
 /// Authenticated progress cannot settle a command. Only Completed is its result.
 #[derive(Debug)]
@@ -133,7 +135,12 @@ impl Airc {
             deadline,
         )
         .await
-        .map_err(|error| AircError::Transport(error.to_string()))?;
+        .map_err(|error| match error {
+            AddressedError::SessionUnavailable { peer, reason } => {
+                AircError::SessionUnavailable { peer, reason }
+            }
+            other => AircError::Transport(other.to_string()),
+        })?;
         Ok(PendingCommand {
             correlation_id,
             deadline_at_ms,

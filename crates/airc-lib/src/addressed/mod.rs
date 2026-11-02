@@ -113,8 +113,29 @@ pub enum AddressedError {
     Handshake(SessionManagerError),
     /// The payload did not encode.
     Codec(String),
-    /// No session formed before the caller's deadline.
+    /// The deadline passed after a session existed: the sealed frame may already be on the
+    /// wire, so whether the peer received it is unknown (ambiguous custody: never resend it
+    /// elsewhere as if it had not gone).
     DeadlineExceeded,
+    /// No session with `peer` formed, so nothing was sealed or sent: provably pre-dispatch.
+    /// The caller may take the work elsewhere without any risk of running it twice.
+    SessionUnavailable {
+        peer: airc_core::PeerId,
+        reason: SessionUnavailableReason,
+    },
+}
+
+/// Why no session with the peer formed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionUnavailableReason {
+    /// The route's own delivery budget ([`crate::route_forwarder::RoutedForwarderConfig::delivery_budget`])
+    /// passed with handshake attempts sent and unanswered: the peer is routable but forms no session.
+    NoHandshakeReply,
+    /// The route's delivery budget passed and the last handshake attempt could not even be sent:
+    /// no live route to the peer.
+    NoRoute,
+    /// The caller's deadline passed first, still before anything was sealed or sent.
+    CallerDeadline,
 }
 
 impl std::fmt::Display for AddressedError {
@@ -124,7 +145,16 @@ impl std::fmt::Display for AddressedError {
             AddressedError::Handshake(error) => write!(f, "addressed handshake: {error}"),
             AddressedError::Codec(error) => write!(f, "addressed codec: {error}"),
             AddressedError::DeadlineExceeded => {
-                write!(f, "addressed: no session with the peer before the deadline")
+                write!(
+                    f,
+                    "addressed: deadline passed after the session formed; delivery unknown"
+                )
+            }
+            AddressedError::SessionUnavailable { peer, reason } => {
+                write!(
+                    f,
+                    "addressed: no session with {peer} formed ({reason:?}); nothing was sent"
+                )
             }
         }
     }

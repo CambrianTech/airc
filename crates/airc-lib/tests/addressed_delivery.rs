@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use airc_core::{Body, Headers, TranscriptEvent};
-use airc_lib::addressed::{AddressedKind, AddressedSend};
+use airc_lib::addressed::{AddressedError, AddressedKind, AddressedSend, SessionUnavailableReason};
 use airc_lib::Airc;
 use airc_protocol::addressed::addressed_channel;
 use airc_store::{EventStore, SqliteEventStore};
@@ -214,7 +214,16 @@ fn a_lost_first_init_ends_in_its_deadline_and_the_next_send_completes() {
                     Instant::now() + Duration::from_millis(300),
                 )
                 .await;
-            assert!(sent.is_err(), "a send with no session must be refused");
+            assert!(
+                matches!(
+                    sent,
+                    Err(AddressedError::SessionUnavailable {
+                        reason: SessionUnavailableReason::CallerDeadline,
+                        ..
+                    })
+                ),
+                "a send with no session is refused as pre-dispatch, nothing sent: {sent:?}"
+            );
         }
         for text in texts(&stored(homes[0].path()).await) {
             assert!(!text.contains(REQUEST_SECRET));
@@ -244,6 +253,50 @@ fn a_lost_first_init_ends_in_its_deadline_and_the_next_send_completes() {
             .expect("bob receives in time")
             .expect("bob's inbox yields");
         assert_eq!(opened.body().as_text(), Some("once linked"));
+    });
+}
+
+#[test]
+fn a_peer_that_forms_no_session_is_given_up_at_the_route_budget_not_the_callers_deadline() {
+    // what this catches: the handshake waiting out the caller's whole deadline. A remote
+    // inference request carries ~630 s; on IntelMac 2026-11-02 three residents waited that
+    // long per act on a seat that answered no handshake. With a ten-minute deadline and no
+    // link, the send gives up once the route's own delivery budget passes, typed as
+    // pre-dispatch (no route, here), so the caller can take the work elsewhere.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let homes: Vec<TempDir> = (0..2).map(|_| TempDir::new().expect("home")).collect();
+        let (alice, bob) = trusted_pair(&homes).await;
+        let budget = airc_lib::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+        let started = Instant::now();
+        let sent = alice
+            .send_addressed(
+                command(bob.peer_id(), REQUEST_SECRET),
+                Instant::now() + Duration::from_secs(600),
+            )
+            .await;
+        let waited = started.elapsed();
+        assert!(
+            matches!(
+                sent,
+                Err(AddressedError::SessionUnavailable {
+                    reason: SessionUnavailableReason::NoRoute
+                        | SessionUnavailableReason::NoHandshakeReply,
+                    ..
+                })
+            ),
+            "no session within the route budget is pre-dispatch, typed by the route's budget: {sent:?}"
+        );
+        assert!(
+            waited < budget + Duration::from_secs(5),
+            "given up at the route budget ({budget:?}), not the caller's 600 s: waited {waited:?}"
+        );
+        for text in texts(&stored(homes[0].path()).await) {
+            assert!(!text.contains(REQUEST_SECRET), "nothing was sent");
+        }
     });
 }
 
