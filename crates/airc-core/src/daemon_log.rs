@@ -249,14 +249,24 @@ mod tests {
             std::fs::rename(&path, dir.path().join("probe")).is_err(),
             "test: the reader denies the rename"
         );
-        for _ in 0..20 {
-            log.write_all(&vec![b'b'; 100]).unwrap();
+        // One refused rotation: the first `b` crosses the bound.
+        for _ in 0..5 {
+            log.write_all(&[b'b'; 100]).unwrap();
         }
         assert_eq!(
-            std::fs::read(dir.path().join(format!("{FILE}.1"))).unwrap()[..1000],
-            vec![b'a'; 1000][..],
-            "nothing lost"
+            std::fs::read(dir.path().join(format!("{FILE}.1"))).unwrap(),
+            vec![b'a'; 1000],
+            "the refused rotation moved every record to .1"
         );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            vec![b'b'; 500],
+            "the live file was cut in place"
+        );
+        // Still refused on every later rotation, and still bounded.
+        for _ in 0..50 {
+            log.write_all(&[b'b'; 100]).unwrap();
+        }
         assert!(on_disk(dir.path()) <= 2 * 1024, "{}", on_disk(dir.path()));
     }
 }
