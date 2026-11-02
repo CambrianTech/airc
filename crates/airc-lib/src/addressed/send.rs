@@ -95,7 +95,7 @@ impl Airc {
             .sessions
             .seal_for(msg.to, &aad(me, msg.to), &plaintext)
             .map_err(AddressedError::Handshake)?;
-        self.send_addressed_wire(msg.to, &AddressedWire::Sealed(sealed), deadline)
+        self.write_addressed_wire(msg.to, &AddressedWire::Sealed(sealed), deadline)
             .await
     }
 
