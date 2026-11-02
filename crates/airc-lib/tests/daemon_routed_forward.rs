@@ -336,9 +336,15 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
     let second_page_before = first_page.first().expect("nonempty source page").cursor();
     let source_forwarder =
         RoutedForwarder::install(&source.daemon.router(), RoutedForwarderConfig::default());
+    let source_recovery = MemoryDiagnosticSink::default();
+    source_forwarder.set_diagnostic_sink(Arc::new(source_recovery.clone()));
     source_forwarder.add_link(source_gateway.clone()).await;
 
     let receiving = boot_linked(RoutedForwarderConfig::default()).await;
+    let receiver_recovery = MemoryDiagnosticSink::default();
+    receiving
+        .forwarder
+        .set_diagnostic_sink(Arc::new(receiver_recovery.clone()));
     receiving
         .machine
         .pin_identity("fixture:owner-backfill")
@@ -531,6 +537,27 @@ async fn owner_backfill_recovers_history_and_quiet_reconnect_exactly_once() {
             1
         );
     }
+
+    // Importing the forward history does not settle the reverse recovery.
+    // Cutting that initial exchange can strand its reply behind the existing
+    // request deadline and contaminate the reconnect assertion below. Observe
+    // both owners, rather than sleeping or increasing the delivery timeout.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (diagnostics, peer) in [
+            (&source_recovery, receiving.gateway.peer_id()),
+            (&receiver_recovery, source_gateway.peer_id()),
+        ] {
+            let peer = peer.to_string();
+            while !diagnostics.events().iter().any(|event| {
+                event.code == DiagnosticCode::RoutedBackfillSettled
+                    && event.fields.get("peer") == Some(&peer)
+            }) {
+                tokio::task::yield_now().await;
+            }
+        }
+    })
+    .await
+    .expect("both initial recovery owners settle before the first disconnect");
 
     let (source_gone, mut source_disconnects) = tokio::sync::mpsc::channel(2);
     source_gateway.set_disconnect_observer(Arc::new(move |peer| {
