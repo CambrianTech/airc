@@ -352,3 +352,77 @@ async fn a_blocked_owner_attach_is_refused_pre_dispatch_as_owner_unavailable() {
         "a blocked owner attach is pre-dispatch OwnerUnavailable at the route budget: {sent:?}"
     );
 }
+
+// what this catches: a send whose session is already formed but whose wire write cannot complete
+// being reported as pre-dispatch (SessionUnavailable) or bounded by the route budget instead of
+// the caller's deadline. Past the session the frame is sealed: the outcome is DeadlineExceeded
+// (delivery unknown) at the caller's deadline. The wire is blocked by holding the LAN adapter
+// slot the send path takes; time is paused after the session forms (Codex on #1649).
+#[tokio::test]
+async fn a_blocked_wire_after_a_formed_session_is_deadline_exceeded_at_the_callers_deadline() {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join("blocked-wire").await.unwrap();
+    bob.join("blocked-wire").await.unwrap();
+    let (tx, mut frames) = mpsc::channel(32);
+    bob.set_addressed_frame_sink(Arc::new(Capture(tx))).unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    let formed = Instant::now() + Duration::from_secs(10);
+    let _inbox = bob.addressed_inbox(formed).await.unwrap();
+    let first = alice.send_addressed(probe_send(bob.peer_id()), formed);
+    let pump = async {
+        loop {
+            let frame = frames.recv().await.unwrap();
+            let sealed = matches!(
+                AddressedWire::from_body(frame.envelope.body.as_ref().unwrap()).unwrap(),
+                AddressedWire::Sealed(_)
+            );
+            bob.receive_addressed(frame).await;
+            if sealed {
+                break;
+            }
+        }
+    };
+    let (first, ()) = tokio::join!(first, pump);
+    first.unwrap();
+    assert!(
+        alice.inner.addressed.sessions.has_session(bob.peer_id()),
+        "the session formed"
+    );
+
+    let held = alice.inner.lan_tcp.lock().await;
+    tokio::time::pause();
+    let started = Instant::now();
+    let caller = Duration::from_secs(5);
+    let sent = alice
+        .send_addressed(probe_send(bob.peer_id()), started + caller)
+        .await;
+    let waited = started.elapsed();
+    drop(held);
+    assert!(
+        matches!(sent, Err(AddressedError::DeadlineExceeded)),
+        "past a formed session a blocked wire is delivery-unknown: {sent:?}"
+    );
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    assert!(
+        waited >= caller && waited <= caller + Duration::from_millis(1) && caller < budget,
+        "bounded by the caller's {caller:?}, not the route budget {budget:?}: {waited:?}"
+    );
+    assert!(
+        frames.try_recv().is_err(),
+        "nothing reached the peer's wire"
+    );
+}
