@@ -153,10 +153,7 @@ impl std::fmt::Display for AddressedError {
             AddressedError::Codec(error) => write!(f, "addressed codec: {error}"),
             AddressedError::NoLiveRoute(error) => write!(f, "addressed: no live route: {error}"),
             AddressedError::DeadlineExceeded => {
-                write!(
-                    f,
-                    "addressed: deadline passed after the session formed; delivery unknown"
-                )
+                write!(f, "addressed: deadline passed; delivery unknown")
             }
             AddressedError::SessionUnavailable { peer, reason } => {
                 write!(

@@ -253,3 +253,93 @@ fn only_a_typed_absent_route_is_retried_as_no_route() {
         CallerDeadline
     );
 }
+
+fn probe_send(to: PeerId) -> AddressedSend {
+    AddressedSend {
+        to,
+        kind: AddressedKind::Command,
+        correlation: uuid::Uuid::new_v4(),
+        headers: Headers::new(),
+        body: Body::text("must not leave"),
+    }
+}
+
+// what this catches: an already-expired send reported as a post-seal DeadlineExceeded (delivery
+// unknown) when nothing was attempted. It is refused pre-dispatch as CallerDeadline, and the
+// peer's wire sink sees nothing at all (Codex on #1649).
+#[tokio::test]
+async fn an_already_expired_send_is_refused_pre_dispatch_and_nothing_leaves() {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join("expired-send").await.unwrap();
+    bob.join("expired-send").await.unwrap();
+    let (tx, mut frames) = mpsc::channel(8);
+    bob.set_addressed_frame_sink(Arc::new(Capture(tx))).unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    let sent = alice
+        .send_addressed(probe_send(bob.peer_id()), Instant::now())
+        .await;
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::CallerDeadline,
+                ..
+            })
+        ),
+        "an expired send is pre-dispatch CallerDeadline: {sent:?}"
+    );
+    assert!(
+        frames.try_recv().is_err(),
+        "nothing reached the peer's wire"
+    );
+}
+
+// what this catches: a daemon-owner attach that cannot complete keeping the caller's whole
+// deadline (the 630 s failure one layer down) or reading as delivery-unknown. With the owner slot
+// held, a send under a ten-minute deadline gives up at the route budget as pre-dispatch
+// OwnerUnavailable. Time is paused after setup: the held lock leaves the runtime idle, so the
+// budget elapses at once (Codex on #1649: hold the existing owner mutex, daemon-client mode).
+#[tokio::test]
+async fn a_blocked_owner_attach_is_refused_pre_dispatch_as_owner_unavailable() {
+    let home = tempfile::TempDir::new().unwrap();
+    let airc =
+        Airc::open(home.path())
+            .await
+            .unwrap()
+            .with_daemon_client(airc_ipc::DaemonClient::new(
+                home.path().join("no-daemon.sock"),
+            ));
+    let held = airc.inner.addressed.daemon_owner.lock().await;
+    tokio::time::pause();
+    let sent = airc
+        .send_addressed(
+            probe_send(PeerId::new()),
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    drop(held);
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::OwnerUnavailable,
+                ..
+            })
+        ),
+        "a blocked owner attach is pre-dispatch OwnerUnavailable at the route budget: {sent:?}"
+    );
+}
