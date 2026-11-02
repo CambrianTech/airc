@@ -113,10 +113,14 @@ pub enum AddressedError {
     Handshake(SessionManagerError),
     /// The payload did not encode.
     Codec(String),
-    /// The deadline passed after a session existed: the sealed frame may already be on the
-    /// wire, so whether the peer received it is unknown (ambiguous custody: never resend it
-    /// elsewhere as if it had not gone).
+    /// A deadline passed. From [`crate::Airc::send_addressed`] this means the seal/wire phase
+    /// (a session existed when it began): whether the sealed frame left is unknown, so it is
+    /// ambiguous custody, never resent elsewhere as if it had not gone. A send's pre-dispatch
+    /// phases return [`AddressedError::SessionUnavailable`] instead.
     DeadlineExceeded,
+    /// No live route to the peer for this frame (the route resolver's typed refusal). Distinct
+    /// from a transport failure on a route that exists.
+    NoLiveRoute(String),
     /// No session with `peer` formed, so nothing was sealed or sent: provably pre-dispatch.
     /// The caller may take the work elsewhere without any risk of running it twice.
     SessionUnavailable {
@@ -132,9 +136,12 @@ pub enum SessionUnavailableReason {
     /// passed with handshake attempts sent and unanswered: the peer is routable but forms no session.
     NoHandshakeReply,
     /// The route's delivery budget passed and the last handshake attempt could not even be sent:
-    /// no live route to the peer.
+    /// the route resolver reported no live route to the peer.
     NoRoute,
-    /// The caller's deadline passed first, still before anything was sealed or sent.
+    /// This process could not attach its addressed owner to the local daemon within the bound.
+    OwnerUnavailable,
+    /// The caller's deadline passed first (or had already passed), still before anything was
+    /// sealed or sent.
     CallerDeadline,
 }
 
@@ -144,6 +151,7 @@ impl std::fmt::Display for AddressedError {
             AddressedError::Transport(error) => write!(f, "addressed transport: {error}"),
             AddressedError::Handshake(error) => write!(f, "addressed handshake: {error}"),
             AddressedError::Codec(error) => write!(f, "addressed codec: {error}"),
+            AddressedError::NoLiveRoute(error) => write!(f, "addressed: no live route: {error}"),
             AddressedError::DeadlineExceeded => {
                 write!(
                     f,

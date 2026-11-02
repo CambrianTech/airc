@@ -283,12 +283,11 @@ fn a_peer_that_forms_no_session_is_given_up_at_the_route_budget_not_the_callers_
             matches!(
                 sent,
                 Err(AddressedError::SessionUnavailable {
-                    reason: SessionUnavailableReason::NoRoute
-                        | SessionUnavailableReason::NoHandshakeReply,
+                    reason: SessionUnavailableReason::NoRoute,
                     ..
                 })
             ),
-            "no session within the route budget is pre-dispatch, typed by the route's budget: {sent:?}"
+            "no link: the route resolver's typed refusal, retried to the budget, then NoRoute: {sent:?}"
         );
         assert!(
             waited < budget + Duration::from_secs(5),

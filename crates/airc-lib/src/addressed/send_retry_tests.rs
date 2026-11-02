@@ -1,6 +1,7 @@
 use super::*;
-use crate::addressed::{AddressedFrameSink, AddressedKind};
+use crate::addressed::{AddressedFrameSink, AddressedKind, SessionUnavailableReason};
 use airc_core::{Body, Headers, PeerId};
+use airc_protocol::addressed::AddressedWire;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -124,4 +125,131 @@ async fn cancelled_owner_hands_off_same_retry_schedule_and_dead_peers_are_pruned
     let peers = waiters.peers.lock().await;
     assert_eq!(peers.len(), 1);
     assert!(!peers.contains_key(&peer));
+}
+
+// what this catches: the IntelMac 2026-11-02 shape at the wire. The route is healthy but the peer
+// forms no session: its frame sink takes every init and answers none. A send with a ten-minute
+// deadline gives up at the route's delivery budget as pre-dispatch NoHandshakeReply, and the
+// peer's wire sink saw inits only, never a sealed request, so the caller may take the work
+// elsewhere without running it twice (Codex on #1649: prove it at the sink, not the store).
+#[tokio::test]
+async fn a_peer_that_answers_no_handshake_is_given_up_at_the_budget_and_nothing_sealed_leaves() {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join("silent-seat").await.unwrap();
+    bob.join("silent-seat").await.unwrap();
+    let (tx, mut frames) = mpsc::channel(256);
+    bob.set_addressed_frame_sink(Arc::new(Capture(tx))).unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    let started = Instant::now();
+    let sent = alice
+        .send_addressed(
+            AddressedSend {
+                to: bob.peer_id(),
+                kind: AddressedKind::Command,
+                correlation: uuid::Uuid::new_v4(),
+                headers: Headers::new(),
+                body: Body::text("a request the seat must never see"),
+            },
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    let waited = started.elapsed();
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::NoHandshakeReply,
+                ..
+            })
+        ),
+        "a routable peer that forms no session is pre-dispatch NoHandshakeReply: {sent:?}"
+    );
+    assert!(
+        waited < budget + Duration::from_secs(5),
+        "given up at the route budget ({budget:?}), not the caller's 600 s: {waited:?}"
+    );
+    let (mut inits, mut sealed) = (0, 0);
+    while let Ok(frame) = frames.try_recv() {
+        match AddressedWire::from_body(frame.envelope.body.as_ref().unwrap()).unwrap() {
+            AddressedWire::Init(_) => inits += 1,
+            AddressedWire::Sealed(_) => sealed += 1,
+            AddressedWire::Resp(_) => {}
+        }
+    }
+    assert!(inits >= 1, "the handshake was attempted on the live route");
+    assert_eq!(
+        sealed, 0,
+        "nothing sealed left: the request was never dispatched"
+    );
+}
+
+// what this catches: the bound of the pre-dispatch phases. The route's delivery budget bounds
+// them when it is the earlier, typed NoHandshakeReply; the caller's deadline when it is,
+// typed CallerDeadline. Never the caller's deadline alone (the 630 s wait).
+#[test]
+fn the_pre_dispatch_bound_is_the_earlier_of_the_route_budget_and_the_caller() {
+    let now = Instant::now();
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    let (bound, reason) = pre_dispatch_bound(now, now + Duration::from_secs(600));
+    assert_eq!(
+        (bound, reason),
+        (now + budget, SessionUnavailableReason::NoHandshakeReply)
+    );
+    let short = now + Duration::from_millis(300);
+    assert_eq!(
+        pre_dispatch_bound(now, short),
+        (short, SessionUnavailableReason::CallerDeadline)
+    );
+}
+
+// what this catches: relabeling a failed init as an absent route (Codex on #1649). Only the route
+// resolver's typed refusal is NoRoute and retried; a codec, signing, clock or IPC failure returns
+// at once, typed; the bound cutting a write short ends on the session wait's own timer.
+#[test]
+fn only_a_typed_absent_route_is_retried_as_no_route() {
+    assert_eq!(InitOutcome::of(Ok(())).unwrap(), InitOutcome::Sent);
+    assert_eq!(
+        InitOutcome::of(Err(AddressedError::NoLiveRoute("none".into()))).unwrap(),
+        InitOutcome::NoRoute
+    );
+    assert_eq!(
+        InitOutcome::of(Err(AddressedError::DeadlineExceeded)).unwrap(),
+        InitOutcome::Sent
+    );
+    assert!(matches!(
+        InitOutcome::of(Err(AddressedError::Codec("bad".into()))),
+        Err(AddressedError::Codec(_))
+    ));
+    assert!(matches!(
+        InitOutcome::of(Err(AddressedError::Transport("ipc".into()))),
+        Err(AddressedError::Transport(_))
+    ));
+    use SessionUnavailableReason::*;
+    assert_eq!(
+        InitOutcome::NoRoute.give_up_reason(NoHandshakeReply),
+        NoRoute
+    );
+    assert_eq!(
+        InitOutcome::Sent.give_up_reason(NoHandshakeReply),
+        NoHandshakeReply
+    );
+    assert_eq!(
+        InitOutcome::NoRoute.give_up_reason(CallerDeadline),
+        CallerDeadline
+    );
 }
