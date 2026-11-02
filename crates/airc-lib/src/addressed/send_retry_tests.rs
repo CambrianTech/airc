@@ -490,32 +490,13 @@ async fn a_burst_to_a_silent_recipient_probes_once_and_then_nothing_leaves() {
     );
 }
 
-// what this catches: backoff keyed by the wrong identity, or a stale failure overwriting a recovery.
-// A session installed with another peer (a host, another recipient) leaves the recipient backing
-// off; a session with the recipient itself clears it; a failure recorded while a session with the
-// peer exists is fenced out.
+// what this catches: a stale failure overwriting a recovery on a real pair (the unit fence is in
+// reachability.rs). A probe generation taken before a live session forms is fenced out after it.
 #[tokio::test]
-async fn backoff_is_per_recipient_cleared_by_its_own_session_and_fenced_after_recovery() {
-    let home = tempfile::TempDir::new().unwrap();
-    let airc = Airc::open(home.path()).await.unwrap();
-    let state = &airc.inner.addressed;
-    let (recipient, host) = (PeerId::new(), PeerId::new());
-    let now = crate::time::now_ms().unwrap();
-    state.record_unanswered(recipient, now);
-    assert!(state.backing_off(recipient, now).is_some());
-    state.session_installed(host);
-    assert!(
-        state.backing_off(recipient, now).is_some(),
-        "another peer's session does not clear it"
-    );
-    state.session_installed(recipient);
-    assert_eq!(
-        state.backing_off(recipient, now),
-        None,
-        "its own session clears it"
-    );
-
+async fn a_failure_from_before_a_live_session_is_fenced_out() {
     let (alice, bob, _a, _b) = linked_pair("fence").await;
+    let state = &alice.inner.addressed;
+    let started = state.reachability_mut().generation(bob.peer_id());
     alice
         .send_addressed(
             probe_send(bob.peer_id()),
@@ -523,14 +504,51 @@ async fn backoff_is_per_recipient_cleared_by_its_own_session_and_fenced_after_re
         )
         .await
         .expect("a live pair forms a session");
-    let state = &alice.inner.addressed;
     let now = crate::time::now_ms().unwrap();
-    state.record_unanswered(bob.peer_id(), now);
-    assert_eq!(
-        state.backing_off(bob.peer_id(), now),
-        None,
-        "a late failure never overwrites a session that exists"
+    assert!(
+        !state
+            .reachability_mut()
+            .record_unanswered(bob.peer_id(), started, now),
+        "a failure from a probe that started before the session is fenced"
     );
+    assert_eq!(state.backing_off(bob.peer_id(), now), None);
+}
+
+// what this catches: a follower recording a failure it never probed (Codex on #1650). With the
+// probe lease held (another owner probing), a send whose bound passes while waiting for it sends
+// nothing and records nothing.
+#[tokio::test]
+async fn a_caller_that_never_owned_the_probe_records_nothing() {
+    let (alice, bob, mut frames, _a, _b) = silent_pair("follower").await;
+    let state = &alice.inner.addressed;
+    let held = state
+        .handshake_waiters
+        .lease(bob.peer_id())
+        .await
+        .lock_owned()
+        .await;
+    let sent = alice
+        .send_addressed(
+            probe_send(bob.peer_id()),
+            Instant::now() + Duration::from_millis(300),
+        )
+        .await;
+    drop(held);
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::CallerDeadline,
+                ..
+            })
+        ),
+        "{sent:?}"
+    );
+    assert!(
+        state.reachability_mut().is_empty(),
+        "the follower recorded nothing"
+    );
+    assert_eq!(inits_in(&mut frames), 0, "and probed nothing");
 }
 
 // what this catches: a probe owner dropped mid-wait recording a failure it never reached. A

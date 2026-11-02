@@ -121,13 +121,28 @@ impl Airc {
     ) -> Result<(), AddressedError> {
         let state = &self.inner.addressed;
         let retry_backoff = crate::route_forwarder::RoutedForwarderConfig::default().retry_backoff;
+        // Own the probe of `peer`. A caller whose bound passes while another owns it never
+        // probed, so it records nothing (Codex on #1650); it backs off if the owner recorded.
+        let owned = tokio::time::timeout_at(bound, async {
+            state.handshake_waiters.lease(peer).await.lock_owned().await
+        })
+        .await;
+        let Ok(mut next_attempt) = owned else {
+            self.refuse_if_backing_off(peer)?;
+            return Err(AddressedError::SessionUnavailable {
+                peer,
+                reason: bound_reason,
+            });
+        };
+        // The probe owner from here until this function returns: its outcome is published
+        // while it still holds `next_attempt`, so no follower can slip in before the record.
+        if state.sessions.has_session(peer) {
+            return Ok(());
+        }
+        self.refuse_if_backing_off(peer)?;
+        let started = state.reachability_mut().generation(peer);
         let mut last_init = InitOutcome::Sent;
-        let waited = tokio::time::timeout_at(bound, async {
-            let lease = state.handshake_waiters.lease(peer).await;
-            let mut next_attempt = lease.lock().await;
-            if !state.sessions.has_session(peer) {
-                self.refuse_if_backing_off(peer)?;
-            }
+        let probed = tokio::time::timeout_at(bound, async {
             let mut established = state.established.subscribe();
             while !state.sessions.has_session(peer) {
                 tokio::select! {
@@ -149,23 +164,28 @@ impl Airc {
             Ok(())
         })
         .await;
-        match waited {
+        let outcome = match probed {
             Ok(result) => result,
             Err(_) => {
                 let reason = last_init.give_up_reason(bound_reason);
-                // Only the recipient's own silence backs it off: never the caller's deadline
-                // or this process's owner attach (Codex on #1649).
+                // Only the recipient's own silence backs it off: never the caller's deadline or
+                // this process's owner attach. Fenced by the generation this probe started
+                // under, atomically with the record.
                 if matches!(
                     reason,
                     SessionUnavailableReason::NoHandshakeReply | SessionUnavailableReason::NoRoute
                 ) {
                     let now =
                         now_ms().map_err(|error| AddressedError::Transport(error.to_string()))?;
-                    state.record_unanswered(peer, now);
+                    state
+                        .reachability_mut()
+                        .record_unanswered(peer, started, now);
                 }
                 Err(AddressedError::SessionUnavailable { peer, reason })
             }
-        }
+        };
+        drop(next_attempt);
+        outcome
     }
 
     /// `SessionUnavailable { BackingOff }` while `peer` is on the bounded backoff.

@@ -15,6 +15,7 @@
 //! identity key; the AEAD covers the rest), never read from a header.
 
 mod daemon;
+mod reachability;
 mod receive;
 mod send;
 mod sink;
@@ -264,7 +265,7 @@ pub(crate) struct AddressedState {
     /// every handle (commands and backfill alike) is refused locally, with nothing on the
     /// wire. A session installed with it clears it. One owner, so no caller can storm a
     /// peer that does not answer: the 0121d959 storm, about 2/s per sender on every node.
-    reachability: std::sync::Mutex<crate::route::Quarantine<airc_core::PeerId>>,
+    reachability: std::sync::Mutex<reachability::Reachability>,
 }
 
 impl AddressedState {
@@ -281,38 +282,25 @@ impl AddressedState {
             sessions: SessionManager::new(identity.keypair.clone(), identity.peer_id, registry),
             inbox_tx,
             established: watch::Sender::new(0),
-            reachability: std::sync::Mutex::new(crate::route::Quarantine::backoff_only()),
+            reachability: std::sync::Mutex::new(reachability::Reachability::default()),
         }
     }
 
-    /// A session with `peer` is installed: wake handshake waiters, and clear any backoff
-    /// on `peer` (it answered).
+    /// A session with `peer` is installed: a new session generation and no backoff for it (under
+    /// the memo's one lock), then wake handshake waiters.
     fn session_installed(&self, peer: airc_core::PeerId) {
-        self.reachability_mut().record_success(&peer);
+        self.reachability_mut().session_installed(peer);
         self.established.send_modify(|generation| *generation += 1);
     }
 
     /// Whether sends to `peer` are backing off now: `Some(remaining_ms)` while they are.
     pub(super) fn backing_off(&self, peer: airc_core::PeerId, now_ms: u64) -> Option<u64> {
-        match self.reachability_mut().gate(&peer, now_ms, 0, 0) {
-            crate::route::DialGate::Backoff { remaining_ms } => Some(remaining_ms),
-            crate::route::DialGate::Dial | crate::route::DialGate::Dead { .. } => None,
-        }
+        self.reachability_mut().backing_off(peer, now_ms)
     }
 
-    /// `peer` formed no session for a remote reason: back off, unless a session with it
-    /// exists by now (a late failure never overwrites a newer success).
-    pub(super) fn record_unanswered(&self, peer: airc_core::PeerId, now_ms: u64) {
-        if !self.sessions.has_session(peer) {
-            self.reachability_mut().record_failure(peer, now_ms, 0);
-        }
-    }
-
-    fn reachability_mut(
-        &self,
-    ) -> std::sync::MutexGuard<'_, crate::route::Quarantine<airc_core::PeerId>> {
-        // A poisoned lock still holds the memo: the policy is bookkeeping over plain
-        // timestamps, consistent at every step.
+    pub(super) fn reachability_mut(&self) -> std::sync::MutexGuard<'_, reachability::Reachability> {
+        // A poisoned lock still holds the memo: plain timestamps and counters, consistent at
+        // every step.
         self.reachability
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
