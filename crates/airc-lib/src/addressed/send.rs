@@ -62,7 +62,11 @@ impl Airc {
                     peer,
                     reason: match bound_reason {
                         SessionUnavailableReason::CallerDeadline => bound_reason,
-                        _ => SessionUnavailableReason::OwnerUnavailable,
+                        SessionUnavailableReason::NoHandshakeReply
+                        | SessionUnavailableReason::NoRoute
+                        | SessionUnavailableReason::OwnerUnavailable => {
+                            SessionUnavailableReason::OwnerUnavailable
+                        }
                     },
                 })
             }
@@ -219,9 +223,12 @@ impl Airc {
         let route = self
             .resolve_send_route(FrameKind::Addressed, &target)
             .await
-            .map_err(|error| match error {
-                crate::error::AircError::Route(why) => AddressedError::NoLiveRoute(why),
-                other => AddressedError::Transport(other.to_string()),
+            .map_err(|error| {
+                if let crate::error::AircError::Route(why) = error {
+                    AddressedError::NoLiveRoute(why)
+                } else {
+                    AddressedError::Transport(error.to_string())
+                }
             })?;
         self.execute_send_route(route.kind, frame)
             .await

@@ -135,11 +135,12 @@ impl Airc {
             deadline,
         )
         .await
-        .map_err(|error| match error {
-            AddressedError::SessionUnavailable { peer, reason } => {
+        .map_err(|error| {
+            if let AddressedError::SessionUnavailable { peer, reason } = error {
                 AircError::SessionUnavailable { peer, reason }
+            } else {
+                AircError::Transport(error.to_string())
             }
-            other => AircError::Transport(other.to_string()),
         })?;
         Ok(PendingCommand {
             correlation_id,
