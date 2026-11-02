@@ -67,7 +67,7 @@ impl Airc {
                 }
                 match state.sessions.on_init(&init) {
                     Ok(resp) => {
-                        state.session_installed();
+                        state.session_installed(from);
                         if let Err(error) = self
                             .send_addressed_wire(
                                 from,
@@ -89,7 +89,7 @@ impl Airc {
                     return refuse(from, "handshake response names a different responder");
                 }
                 match state.sessions.on_resp(&resp) {
-                    Ok(()) => state.session_installed(),
+                    Ok(()) => state.session_installed(from),
                     Err(error) => refuse(from, &error.to_string()),
                 }
             }

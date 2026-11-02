@@ -16,7 +16,8 @@ pub mod resolver;
 pub(crate) mod execution;
 
 pub use dial_quarantine::{
-    DialGate, DialQuarantine, DEAD_AFTER_CONSECUTIVE_FAILURES, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS,
+    DialGate, DialQuarantine, Quarantine, DEAD_AFTER_CONSECUTIVE_FAILURES, INITIAL_BACKOFF_MS,
+    MAX_BACKOFF_MS,
 };
 pub use discovery::{PeerDialFailure, PeerDialSkip, RouteDiscoverySnapshot};
 pub use health::{TransportHealthSample, TransportHealthState, TransportHealthTable};

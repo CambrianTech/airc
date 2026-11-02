@@ -167,17 +167,47 @@ impl QuarantineEntry {
 }
 
 /// In-memory, per-handle quarantine of recently-failed dial endpoints.
-#[derive(Debug, Default)]
-pub struct DialQuarantine {
-    entries: HashMap<QuarantineKey, QuarantineEntry>,
+/// One backoff policy for any key that can fail to answer: an endpoint dial
+/// (`(peer, addr)`, [`DialQuarantine`]) or an addressed recipient that formed no
+/// session (`PeerId`). One set of constants and one revival rule, so the two never
+/// drift. `dead_after` is the consecutive-failure count that makes an entry Dead (only
+/// a fresher advertisement or proof of life revives it); `None` makes the policy
+/// backoff-only: an uncertain failure is retried on the bounded timed backoff and is
+/// never Dead (Codex on airc #1649: uncertainty must not become a blackhole).
+#[derive(Debug)]
+pub struct Quarantine<K> {
+    entries: HashMap<K, QuarantineEntry>,
+    dead_after: Option<u32>,
 }
 
-impl DialQuarantine {
+/// The endpoint dial gate: Dead after [`DEAD_AFTER_CONSECUTIVE_FAILURES`].
+pub type DialQuarantine = Quarantine<QuarantineKey>;
+
+impl Default for DialQuarantine {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            dead_after: Some(DEAD_AFTER_CONSECUTIVE_FAILURES),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Quarantine<K> {
+    /// The bounded backoff alone: never Dead, whatever the failure count.
+    pub fn backoff_only() -> Self {
+        Self {
+            entries: HashMap::new(),
+            dead_after: None,
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Quarantine<K> {
     /// Milliseconds of backoff remaining for `key` at `now_ms`, or `None`
     /// when the endpoint is not quarantined (never failed, or its window
     /// has elapsed). The dialer surfaces the `Some(remaining)` value on
     /// the discovery snapshot so the skip is visible, not silent.
-    pub fn remaining_ms(&self, key: &QuarantineKey, now_ms: u64) -> Option<u64> {
+    pub fn remaining_ms(&self, key: &K, now_ms: u64) -> Option<u64> {
         self.entries.get(key).and_then(|e| e.remaining_ms(now_ms))
     }
 
@@ -217,7 +247,7 @@ impl DialQuarantine {
     /// dial per fresh beacon, never one per tick.
     pub fn gate(
         &self,
-        key: &QuarantineKey,
+        key: &K,
         now_ms: u64,
         current_advert_stamp_ms: u64,
         proof_of_life_ms: u64,
@@ -232,7 +262,9 @@ impl DialQuarantine {
         // presence beacon is exactly the route-flap. Only a fresher endpoint
         // ADVERTISEMENT (a genuinely different addr/port/cert) can clear it.
         let alive_since_failure = !entry.terminal && proof_of_life_ms > entry.failed_at_ms;
-        if entry.consecutive_failures >= DEAD_AFTER_CONSECUTIVE_FAILURES
+        if self
+            .dead_after
+            .is_some_and(|dead| entry.consecutive_failures >= dead)
             && !advert_fresher
             && !alive_since_failure
         {
@@ -254,7 +286,7 @@ impl DialQuarantine {
     /// (`advert_stamp_ms`, monotonic). Also sweeps entries whose window
     /// has fully elapsed, so the map can't grow unbounded as a
     /// long-lived daemon churns through ephemeral container addresses.
-    pub fn record_failure(&mut self, key: QuarantineKey, now_ms: u64, advert_stamp_ms: u64) {
+    pub fn record_failure(&mut self, key: K, now_ms: u64, advert_stamp_ms: u64) {
         // Sweep entries not re-failed within the retention horizon. This
         // is INTENTIONALLY keyed off `QUARANTINE_RETENTION_MS`, NOT the
         // (shorter) backoff window — sweeping at window expiry would drop
@@ -309,12 +341,7 @@ impl DialQuarantine {
     /// re-advertises its new endpoint (or that endpoint proves live), the dead
     /// orphan is released exactly as a failure-counted one would be — the peer
     /// reconnects on its own, no manual `airc join`.
-    pub fn record_terminal_failure(
-        &mut self,
-        key: QuarantineKey,
-        now_ms: u64,
-        advert_stamp_ms: u64,
-    ) {
+    pub fn record_terminal_failure(&mut self, key: K, now_ms: u64, advert_stamp_ms: u64) {
         // Same unbounded-growth sweep as record_failure.
         self.entries.retain(|_, entry| {
             now_ms.saturating_sub(entry.failed_at_ms) <= QUARANTINE_RETENTION_MS
@@ -346,14 +373,48 @@ impl DialQuarantine {
     /// A successful dial clears any quarantine for `key` so the endpoint
     /// is immediately eligible again — a peer that flapped and came back
     /// must not stay shadow-banned behind a stale backoff.
-    pub fn record_success(&mut self, key: &QuarantineKey) {
+    pub fn record_success(&mut self, key: &K) {
         self.entries.remove(key);
+    }
+
+    /// No key is backing off or dead.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // what this catches: an uncertain failure becoming a blackhole. A backoff-only quarantine (the
+    // addressed recipient memo) stays on the bounded timed backoff however many failures it takes,
+    // never Dead, and the backoff caps at MAX_BACKOFF_MS; the dial gate keeps its Dead.
+    #[test]
+    fn a_backoff_only_quarantine_is_never_dead_and_its_backoff_caps() {
+        let mut memo: Quarantine<u8> = Quarantine::backoff_only();
+        for n in 0..(DEAD_AFTER_CONSECUTIVE_FAILURES * 3) {
+            memo.record_failure(7, u64::from(n), 0);
+        }
+        let now = u64::from(DEAD_AFTER_CONSECUTIVE_FAILURES * 3);
+        assert!(matches!(
+            memo.gate(&7, now, 0, 0),
+            DialGate::Backoff { remaining_ms } if remaining_ms <= MAX_BACKOFF_MS
+        ));
+        assert_eq!(
+            memo.gate(&7, now + MAX_BACKOFF_MS, 0, 0),
+            DialGate::Dial,
+            "the backoff passes"
+        );
+        let mut dial = DialQuarantine::default();
+        for n in 0..DEAD_AFTER_CONSECUTIVE_FAILURES {
+            dial.record_failure(key(1), u64::from(n), 0);
+        }
+        assert!(
+            matches!(dial.gate(&key(1), 10, 0, 0), DialGate::Dead { .. }),
+            "the dial gate keeps Dead"
+        );
+    }
 
     fn key(port: u16) -> QuarantineKey {
         (

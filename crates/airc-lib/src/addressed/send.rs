@@ -69,6 +69,10 @@ impl Airc {
             Err(other) => return Err(other),
         };
         if !self.inner.addressed.sessions.has_session(peer) {
+            // A recipient on backoff is refused here, before any handshake: nothing on the
+            // wire. The session wait rechecks under the per-peer lease, so callers queued
+            // behind a probe that failed do not each probe again.
+            self.refuse_if_backing_off(peer)?;
             self.await_session(peer, bound, bound_reason).await?;
         }
         tokio::time::timeout_at(deadline, self.seal_and_send(msg, deadline))
@@ -121,6 +125,9 @@ impl Airc {
         let waited = tokio::time::timeout_at(bound, async {
             let lease = state.handshake_waiters.lease(peer).await;
             let mut next_attempt = lease.lock().await;
+            if !state.sessions.has_session(peer) {
+                self.refuse_if_backing_off(peer)?;
+            }
             let mut established = state.established.subscribe();
             while !state.sessions.has_session(peer) {
                 tokio::select! {
@@ -144,10 +151,32 @@ impl Airc {
         .await;
         match waited {
             Ok(result) => result,
-            Err(_) => Err(AddressedError::SessionUnavailable {
+            Err(_) => {
+                let reason = last_init.give_up_reason(bound_reason);
+                // Only the recipient's own silence backs it off: never the caller's deadline
+                // or this process's owner attach (Codex on #1649).
+                if matches!(
+                    reason,
+                    SessionUnavailableReason::NoHandshakeReply | SessionUnavailableReason::NoRoute
+                ) {
+                    let now =
+                        now_ms().map_err(|error| AddressedError::Transport(error.to_string()))?;
+                    state.record_unanswered(peer, now);
+                }
+                Err(AddressedError::SessionUnavailable { peer, reason })
+            }
+        }
+    }
+
+    /// `SessionUnavailable { BackingOff }` while `peer` is on the bounded backoff.
+    fn refuse_if_backing_off(&self, peer: airc_core::PeerId) -> Result<(), AddressedError> {
+        let now = now_ms().map_err(|error| AddressedError::Transport(error.to_string()))?;
+        match self.inner.addressed.backing_off(peer, now) {
+            Some(_) => Err(AddressedError::SessionUnavailable {
                 peer,
-                reason: last_init.give_up_reason(bound_reason),
+                reason: SessionUnavailableReason::BackingOff,
             }),
+            None => Ok(()),
         }
     }
 
