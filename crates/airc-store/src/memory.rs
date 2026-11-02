@@ -11,12 +11,39 @@ use uuid::Uuid;
 
 use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
+use crate::history_count::CountHistory;
 use crate::local_identity::StoredLocalIdentity;
 use crate::mesh_identity::StoredMeshIdentity;
 use crate::refresh_lock::{StoredRefreshLock, StoredRefreshLockOutcome};
 use crate::scoped_state::StoredScopedState;
 use crate::store::EventStore;
 use crate::subscriptions::StoredSubscription;
+
+#[async_trait]
+impl CountHistory for InMemoryEventStore {
+    async fn count_history(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
+    ) -> Result<airc_core::HistoryCount, StoreError> {
+        let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(events
+            .iter()
+            .filter(|e| {
+                channels.contains(&e.room_id)
+                    && strictly_after(e, after)
+                    && !strictly_after(e, through)
+                    && headers.matches(&e.headers)
+                    && !exclude.is_some_and(|rule| rule.is_self_event(e))
+            })
+            .fold(airc_core::HistoryCount::default(), |count, e| {
+                count.with_event(e.occurred_at_ms)
+            }))
+    }
+}
 
 pub struct InMemoryEventStore {
     local_identities: Mutex<BTreeMap<String, StoredLocalIdentity>>,
@@ -121,6 +148,29 @@ impl EventStore for InMemoryEventStore {
             filtered.drain(..drop_count);
         }
         Ok(filtered)
+    }
+
+    async fn matching_history(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        rule: airc_core::HistoryMatch<'_>,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<TranscriptEvent>, StoreError> {
+        let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(airc_core::bounded_selection::select(
+            events.iter().filter(|e| {
+                channels.contains(&e.room_id)
+                    && strictly_after(e, after)
+                    && !strictly_after(e, through)
+                    && rule.matches_event(e)
+            }),
+            |e| (e.lamport, e.event_id.0),
+            limit,
+            tail,
+        ))
     }
 
     async fn resume_from(
@@ -243,6 +293,22 @@ impl EventStore for InMemoryEventStore {
             .map_err(|_| StoreError::LockPoisoned)?;
         state.insert((entry.scope_key.clone(), entry.key.clone()), entry);
         Ok(())
+    }
+
+    async fn advance_scoped_state(&self, entry: StoredScopedState) -> Result<bool, StoreError> {
+        let mut state = self
+            .scoped_state
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let slot = (entry.scope_key.clone(), entry.key.clone());
+        if state
+            .get(&slot)
+            .is_some_and(|stored| stored.value_json >= entry.value_json)
+        {
+            return Ok(false);
+        }
+        state.insert(slot, entry);
+        Ok(true)
     }
 
     async fn list_scoped_state(

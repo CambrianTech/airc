@@ -346,7 +346,7 @@ pub async fn run_join(
         // feed, never spawned: the feed ends the join, and the keeper ends with it.
         let watched = airc.current_room().await?.channel;
         tokio::select! {
-            fed = crate::join_feed::run(&airc) => fed?,
+            fed = crate::join_feed::run(&airc, watched, home) => fed?,
             () = keep_daemon(home, socket, watched) => {}
         }
     }
@@ -565,6 +565,16 @@ fn ensure_runtime_integrations() {
             eprintln!("airc: Codex hook setup skipped: {error}");
         }
     }
+    match crate::integrations::claude::install_hooks_for_default_config_if_present() {
+        Ok(None) => {}
+        Ok(Some(path)) => println!(
+            "runtime: installed AIRC UserPromptSubmit and PostToolUse hooks in {}",
+            path.display()
+        ),
+        Err(error) => {
+            eprintln!("airc: Claude Code hook setup skipped: {error}");
+        }
+    }
 }
 
 /// `version` — print package version + install dir. Distinct from
@@ -609,7 +619,7 @@ pub async fn ensure_daemon_running(
     socket: PathBuf,
     _peers: Vec<PeerSpec>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let _lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::autostart(home)?;
+    let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::attach(home)?;
     // 1. Fast path: home-resolved socket already has a current daemon.
     let client = DaemonClient::new(socket.clone());
     if let Ok(status) = client.status_with_timeout(Duration::from_millis(250)).await {
@@ -643,6 +653,14 @@ pub async fn ensure_daemon_running(
                 }
             }
         }
+    }
+
+    // An admitted child owns initialization even before its endpoint exists.
+    // If observed, join the same readiness contract without spawning.
+    // This snapshot is not an atomic spawn reservation: the pre-existing
+    // bind-between-probe-and-spawn race still needs child/endpoint custody.
+    if lifecycle.startup_in_progress()? {
+        return await_daemon_ready(home, socket, project_root.as_deref(), None, &lifecycle).await;
     }
 
     // 3. Spawn a fresh daemon at the home-resolved socket.
@@ -690,11 +708,33 @@ pub async fn ensure_daemon_running(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    inject_gh_token(&mut command);
-    detach_daemon(&mut command);
-    let child = command.spawn()?;
+    let child = spawn_daemon(command)?;
     let daemon_pid = child.id();
+    await_daemon_ready(
+        home,
+        socket,
+        project_root.as_deref(),
+        Some(daemon_pid),
+        &lifecycle,
+    )
+    .await
+}
 
+#[derive(Debug, thiserror::Error)]
+enum DaemonReadinessError {
+    #[error("daemon initializer is still active but its endpoint did not become ready")]
+    Initializing,
+    #[error("daemon initializer released custody without a ready current endpoint")]
+    InitializerGone,
+}
+
+async fn await_daemon_ready(
+    home: &Path,
+    socket: PathBuf,
+    project_root: Option<&Path>,
+    daemon_pid: Option<u32>,
+    lifecycle: &airc_lib::daemon_lifecycle::DaemonLifecycleGuard,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let client = DaemonClient::new(socket.clone());
     // Card 7e3c9a1f / #1210: a freshly-spawned daemon must BIND its IPC
     // socket within this window or the CLI gives up, returns an error, and
@@ -710,15 +750,17 @@ pub async fn ensure_daemon_running(
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if client
-            .ping_with_timeout(Duration::from_millis(250))
+            .status_with_timeout(Duration::from_millis(250))
             .await
-            .is_ok()
+            .is_ok_and(|status| daemon_status_is_current(&status))
         {
             // 4. Card 282850c2: announce so a sandboxed agent
             // attaching later finds this daemon instead of orphaning
             // a new one. Best-effort — if the announcement fails,
             // the normal singleton-per-home model still works.
-            announce_running_daemon(home, &socket, project_root.as_deref(), daemon_pid).await;
+            if let Some(pid) = daemon_pid {
+                announce_running_daemon(home, &socket, project_root, pid).await;
+            }
             return Ok(socket);
         }
         if Instant::now() >= deadline {
@@ -726,7 +768,12 @@ pub async fn ensure_daemon_running(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("daemon did not become ready; see {}", log.display()).into())
+    Err(if lifecycle.startup_in_progress()? {
+        DaemonReadinessError::Initializing
+    } else {
+        DaemonReadinessError::InitializerGone
+    }
+    .into())
 }
 
 /// Read `peer_id`/`build` from the freshly-ready daemon and write a
@@ -775,6 +822,17 @@ async fn wait_for_daemon_exit(client: &DaemonClient, max_wait: Duration) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Shared daemon spawn boundary for normal startup and verified update adoption.
+/// Callers own scope, lifecycle guards and log streams; this boundary owns the
+/// credential handoff and platform detachment before creating the process.
+pub(crate) fn spawn_daemon(mut command: Command) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    crate::update_session::detach_runtime(&mut command);
+    inject_gh_token(&mut command);
+    detach_daemon(&mut command);
+    command.spawn()
 }
 
 /// Hand the spawned daemon a `GH_TOKEN` so its account-registry loop can
@@ -943,7 +1001,7 @@ fn resolve_gh_bin_with(override_bin: Option<std::path::PathBuf>) -> Option<std::
 }
 
 #[cfg(unix)]
-pub(crate) fn detach_daemon(command: &mut Command) {
+fn detach_daemon(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: this closure runs in the child just before exec and
     // only calls setsid, which is async-signal-safe.
@@ -958,7 +1016,7 @@ pub(crate) fn detach_daemon(command: &mut Command) {
 }
 
 #[cfg(windows)]
-pub(crate) fn detach_daemon(command: &mut Command) {
+fn detach_daemon(command: &mut Command) {
     airc_core::process::configure_detached(command);
 
     // Stop the detached daemon from inheriting THIS process's standard
@@ -1778,7 +1836,6 @@ pub async fn run_lan_listen(
 /// `daemon` — run the long-lived daemon process on the given socket.
 pub async fn run_daemon(
     home: &Path,
-    identity: LocalIdentity,
     peers: Vec<PeerSpec>,
     socket: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1847,6 +1904,12 @@ pub async fn run_daemon(
     // A parent may time out or die before this child binds. Keep startup
     // observable to stop even after that parent's admission lock is gone.
     let startup = airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(home)?;
+    // From here this process's store writes are the daemon's: no lifecycle lock.
+    airc_lib::store_admission::declare_daemon(&startup.custody());
+    // Loaded only now: during an `airc update` the updater holds maintenance
+    // while this child starts, and a store write before the declaration above
+    // would be refused as a CLI writer's.
+    let identity = LocalIdentity::load_or_generate(home).await?;
     // Card 800ce5bd: install a tracing subscriber so the existing
     // `tracing::warn!` / `tracing::info!` calls in airc-bus, airc-lib,
     // airc-relay, etc. actually emit. Before this, every tracing call
@@ -1927,6 +1990,19 @@ pub async fn run_daemon(
     // installed ONCE here; the listener bind stays in the registry task
     // (gated), the dial happens in route refresh — all on this one handle.
     let daemon_airc = Airc::open(&state.home).await?;
+    daemon_airc.set_addressed_frame_sink(Arc::new(
+        crate::addressed_bridge::DaemonAddressedSink(Arc::downgrade(&state)),
+    ))?;
+    state
+        .addressed
+        .set_forwarder(Arc::new(
+            crate::addressed_bridge::DaemonAddressedForwarder {
+                airc: daemon_airc.clone(),
+                home: state.home.clone(),
+                daemon: state.peer_id,
+            },
+        ))
+        .map_err(|error| format!("addressed forwarder installation failed: {error:?}"))?;
     daemon_airc.set_inbound_frame_sink(Arc::new(
         airc_lib::RouterInboundBridge::new(state.router.clone(), state.coordinator_store.clone())
             // Self-healing join (the "blind room" heal): an inbound
@@ -1946,24 +2022,10 @@ pub async fn run_daemon(
     // health (rtt/success_ppm) instead of `healthy (not measured)`.
     daemon_airc.set_delivery_ledger(routed_forwarder.delivery_ledger());
 
-    // Self-healing join (refresh-on-failure): the ONE resolved rendezvous
-    // store + gate, shared between the registry-refresh loop (its owner,
-    // which fills this slot once resolution succeeds) and the
-    // route-refresh loop (which re-reads the rendezvous when dials fail,
-    // instead of blindly retrying dead endpoints). Empty until the
-    // registry task resolves — and stays empty when the rendezvous is
-    // disabled (hermetic gate / no store), in which case there is
-    // nothing to re-read and the heal path correctly stays off.
-    let rendezvous_for_heal: Arc<SharedRendezvousSlot> = Arc::new(std::sync::OnceLock::new());
-
     // Card 625abe6d slice 2: the daemon, not the operator, keeps
     // routes alive. Spawn the periodic route-discovery refresh before
     // the accept loop blocks; it exits on the same shutdown notifier.
-    let route_refresh_task = spawn_route_refresh(
-        state.clone(),
-        daemon_airc.clone(),
-        rendezvous_for_heal.clone(),
-    );
+    let route_refresh_task = spawn_route_refresh(state.clone(), daemon_airc.clone());
 
     // #240 event-driven heal (peer-DROPPED mirror of the registry-import
     // nudge): when a live LAN session terminates, nudge the route-refresh loop
@@ -2064,9 +2126,10 @@ pub async fn run_daemon(
     // daemon handle (one adapter for accept + dial + forward) rather than
     // opening its own — that split was the reverse-broadcast bug.
     let registry_airc = daemon_airc.clone();
-    // Self-healing join: the registry task fills this once the
-    // rendezvous store is resolved (see `rendezvous_for_heal` above).
-    let heal_slot = rendezvous_for_heal.clone();
+    // Capture before spawning or accepting IPC: Stop may arrive while registry
+    // initialization awaits LAN/store setup. notify_waiters does not retain a
+    // permit for a future created after that Stop.
+    let registry_shutdown = state.shutdown.clone().notified_owned();
     let registry_handle = tokio::spawn(async move {
         // HERMETIC GATE (card d793c242): test/temp daemons inherit the
         // operator's working gh auth, so without this gate they publish
@@ -2275,13 +2338,7 @@ pub async fn run_daemon(
                 token_override: airc_lib::GhTokenOverride::new(),
             },
         );
-        // Self-healing join: share the resolved store + gate with the
-        // route-refresh loop so a failed dial can re-read the rendezvous
-        // (refresh-on-failure) instead of blindly retrying a dead
-        // endpoint. `Arc<dyn>` because both loops consume the SAME
-        // resolved door — resolving twice would race gh token recovery.
         let store: Arc<dyn airc_lib::AccountRegistryStore> = Arc::from(store);
-        let _ = heal_slot.set((store.clone(), gate.clone()));
         airc_lib::run_registry_refresh_loop(
             airc,
             store,
@@ -2292,7 +2349,7 @@ pub async fn run_daemon(
             // instant an import lands fresh endpoints so they are dialed
             // NOW, not up to a full route-refresh interval later.
             &registry_state.route_wake,
-            registry_state.shutdown.notified(),
+            registry_shutdown,
         )
         .await;
     });
@@ -2342,24 +2399,11 @@ pub async fn run_daemon(
 /// connections live on its adapter, so re-opening per tick would sever
 /// them. Inbound sink + forwarder link are installed once in
 /// `run_daemon` before this spawns.
-/// Self-healing join: the daemon's ONE resolved rendezvous (store +
-/// gate), filled by the registry task, read by the route-refresh loop's
-/// refresh-on-failure heal. `OnceLock` because resolution happens
-/// exactly once and the readers only ever need "the resolved door or
-/// nothing yet".
-type SharedRendezvousSlot = std::sync::OnceLock<(
-    Arc<dyn airc_lib::AccountRegistryStore>,
-    airc_lib::RegistryRefreshGate,
-)>;
-
-fn spawn_route_refresh(
-    state: Arc<DaemonState>,
-    airc: Airc,
-    rendezvous: Arc<SharedRendezvousSlot>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_route_refresh(state: Arc<DaemonState>, airc: Airc) -> tokio::task::JoinHandle<()> {
     let connected = state.connected_lan_peers.clone();
     let delivery_stats = state.delivery_stats.clone();
     let endpoint_resync = state.endpoint_resync.clone();
+    let failed_routes = tokio::sync::Mutex::new(Vec::new());
     tokio::spawn(async move {
         // The registry task applies this same isolation policy before starting
         // automatic listeners. Keep the refresh clock and stored peer dials
@@ -2375,7 +2419,7 @@ fn spawn_route_refresh(
                     &connected,
                     &delivery_stats,
                     &endpoint_resync,
-                    &rendezvous,
+                    &failed_routes,
                     allow_advertising,
                 )
             },
@@ -2401,6 +2445,28 @@ async fn run_route_refresh_with_advertising_policy<F, Fut>(
         .await;
 }
 
+// Keep failure observations across dial backoff; success retires them.
+fn observe_failed_routes(
+    observed: &mut Vec<(airc_lib::PeerId, airc_lib::RouteEndpoint)>,
+    snapshot: &airc_lib::RouteDiscoverySnapshot,
+) -> bool {
+    let current: Vec<_> = snapshot
+        .peer_dial_failures
+        .iter()
+        .map(|failure| (failure.peer_id, failure.endpoint.clone()))
+        .chain(
+            snapshot
+                .peer_dial_skips
+                .iter()
+                .map(|skip| (skip.peer_id, skip.endpoint.clone())),
+        )
+        .filter(|(peer, _)| !snapshot.connected_lan_peers.contains(peer))
+        .collect();
+    let changed = current.iter().any(|route| !observed.contains(route));
+    *observed = current;
+    changed
+}
+
 /// One periodic route refresh: run discovery on the shared daemon handle
 /// (which dials stored peer endpoints outbound, 3s-bounded each), and
 /// surface every failure through the diagnostic sink — loud, never
@@ -2411,7 +2477,7 @@ async fn refresh_routes_once(
     connected_lan_peers: &std::sync::atomic::AtomicUsize,
     delivery_stats: &tokio::sync::RwLock<airc_ipc::DeliveryStatsResponse>,
     endpoint_resync: &tokio::sync::Notify,
-    rendezvous: &SharedRendezvousSlot,
+    failed_routes: &tokio::sync::Mutex<Vec<(airc_lib::PeerId, airc_lib::RouteEndpoint)>>,
     allow_advertising: bool,
 ) {
     // Adaptable-router reflex: re-detect this node's own routable LAN +
@@ -2463,7 +2529,7 @@ async fn refresh_routes_once(
         }
     }
     match airc.refresh_route_discovery().await {
-        Ok(mut snapshot) => {
+        Ok(snapshot) => {
             for failure in &snapshot.peer_dial_failures {
                 StderrJsonDiagnosticSink.emit(
                     DiagnosticEvent::warn(
@@ -2477,46 +2543,11 @@ async fn refresh_routes_once(
                 );
             }
 
-            // Self-healing join — refresh-on-failure: dials failed, so
-            // re-read the rendezvous for FRESHER endpoints for those
-            // peers before their next blind retry (the M5↔bigmama
-            // stale-port decay: the old port stays dead forever unless
-            // someone re-reads the advertisement). Gated exactly like
-            // the registry loop's own ticks; when a fresher endpoint
-            // arrived, the heal already re-dialed it and the healed
-            // snapshot replaces this tick's (so the connected count and
-            // relay self-election below see the post-heal truth).
-            if !snapshot.peer_dial_failures.is_empty() {
-                if let Some((store, gate)) = rendezvous.get() {
-                    if gate.block().await.is_none() {
-                        match airc
-                            .heal_failed_dials(store.as_ref(), &snapshot.peer_dial_failures)
-                            .await
-                        {
-                            Ok(Some(healed)) => {
-                                eprintln!(
-                                    "airc daemon: dial failure(s) triggered a rendezvous re-read; \
-                                     fresher endpoint(s) found and re-dialed — connected LAN \
-                                     peers now: {}",
-                                    healed.connected_lan_peers.len()
-                                );
-                                snapshot = healed;
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                StderrJsonDiagnosticSink.emit(
-                                    DiagnosticEvent::warn(
-                                        DiagnosticComponent::Daemon,
-                                        DiagnosticCode::RouteRefreshFailed,
-                                        "refresh-on-failure rendezvous re-read failed; dead \
-                                         endpoints stay in backoff until the next cycle",
-                                    )
-                                    .with_field("error", error),
-                                );
-                            }
-                        }
-                    }
-                }
+            // Remote discovery has one owner. Repeated failures (including
+            // quarantined endpoints) must not feed each imported snapshot
+            // back into another remote sweep.
+            if observe_failed_routes(&mut *failed_routes.lock().await, &snapshot) {
+                endpoint_resync.notify_one();
             }
 
             // Publish the live LAN-peer count for `Status` to report —
@@ -2611,18 +2642,27 @@ async fn refresh_routes_once(
                     // Re-binding the persisted port keeps every stale card
                     // valid; OS-assigned is only the first-election / port-
                     // stolen fallback, and whatever binds gets persisted.
+                    // Publish-on-bind only when the bind CHANGED what this node advertises.
+                    // Holding the relay role re-runs this election every tick; nudging the
+                    // registry on every run woke its loop the instant it finished sleeping
+                    // out a gh-governor denial, so the Registry budget never refilled, the
+                    // card never published and peers never found this node (the M5,
+                    // 2026-10-18: ~2 gh calls/s from the daemon, 15,423 Registry refusals,
+                    // 181,309 elections logged, 0 route candidates).
+                    let advertised_before = airc.route_endpoints().ok();
                     match become_relay_with_stable_port(airc, lan_ip, tailscale_ip).await {
                         Ok(addr) => {
-                            eprintln!(
-                                "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
-                                 self-elected as a relay (listening {addr}) and advertised it on \
-                                 this node's routable IP(s) (#1247)"
-                            );
-                            // Self-healing join — publish-on-bind: the relay
-                            // listener just bound; propagate the new relay
-                            // endpoint to the rendezvous now instead of
-                            // waiting up to a full registry cadence.
-                            endpoint_resync.notify_one();
+                            if airc.route_endpoints().ok() != advertised_before {
+                                eprintln!(
+                                    "airc daemon: no reachable peer or relay (enrolled={enrolled}) — \
+                                     self-elected as a relay (listening {addr}) and advertised it on \
+                                     this node's routable IP(s) (#1247)"
+                                );
+                                // Self-healing join — publish-on-bind: the relay listener
+                                // bound a NEW endpoint; propagate it to the rendezvous now
+                                // instead of waiting up to a full registry cadence.
+                                endpoint_resync.notify_one();
+                            }
                         }
                         Err(error) => eprintln!(
                             "airc daemon: relay self-election failed ({error}); \
@@ -2804,6 +2844,7 @@ pub async fn run_msg(
     socket: PathBuf,
     room: Option<&str>,
     text: &str,
+    to: Option<airc_core::PeerId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     reject_recovery_room(room)?;
     let socket = ensure_daemon_running(home, socket, Vec::new()).await?;
@@ -2815,6 +2856,10 @@ pub async fn run_msg(
     // Without `--room`, the historical "current room" path runs
     // unchanged.
     let target = mesh_publish_target(&airc, room).await?;
+    let target = match to {
+        Some(peer) => target.to_peer(peer),
+        None => target,
+    };
     let receipt = airc
         .publish(
             target,
@@ -2839,6 +2884,9 @@ pub async fn run_msg(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
+    if let Some(peer) = to {
+        println!("addressed to peer {peer}; recipient presence and agent-visible delivery are unconfirmed until the peer replies");
+    }
     if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
         println!("{warning}");
     }
@@ -3676,6 +3724,46 @@ fn runtime_headers() -> Result<Headers, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_route_observations_do_not_feed_registry_imports_back() {
+        let peer = airc_lib::PeerId::new();
+        let endpoint = airc_lib::RouteEndpoint::LanTcp {
+            addr: "127.0.0.1:9000".parse().unwrap(),
+        };
+        let mut snapshot = airc_lib::RouteDiscoverySnapshot {
+            health: vec![],
+            endpoints: vec![],
+            connected_lan_peers: vec![],
+            peer_dial_failures: vec![airc_lib::PeerDialFailure {
+                peer_id: peer,
+                endpoint: endpoint.clone(),
+                error: "offline".into(),
+            }],
+            peer_dial_skips: vec![],
+            ghost_peers_skipped: 0,
+            suspect_connections_dropped: vec![],
+        };
+        let mut observed = vec![];
+        assert!(super::observe_failed_routes(&mut observed, &snapshot));
+        assert!(!super::observe_failed_routes(&mut observed, &snapshot));
+        snapshot.peer_dial_failures.clear();
+        snapshot.peer_dial_skips.push(airc_lib::PeerDialSkip {
+            peer_id: peer,
+            endpoint,
+            remaining_ms: 500,
+            dead: false,
+        });
+        assert!(!super::observe_failed_routes(&mut observed, &snapshot));
+        snapshot.peer_dial_skips[0].endpoint = airc_lib::RouteEndpoint::LanTcp {
+            addr: "127.0.0.1:9001".parse().unwrap(),
+        };
+        assert!(super::observe_failed_routes(&mut observed, &snapshot));
+        snapshot.connected_lan_peers.push(peer);
+        assert!(!super::observe_failed_routes(&mut observed, &snapshot));
+        assert!(observed.is_empty());
+        snapshot.connected_lan_peers.clear();
+        assert!(super::observe_failed_routes(&mut observed, &snapshot));
+    }
     use super::*;
 
     // what this catches (card a32f8ac0): a supervising join that never restarts its dead
@@ -3843,6 +3931,7 @@ mod tests {
                     home.join("missing.sock"),
                     Some(name),
                     "must not publish",
+                    None,
                 )
                 .await,
                 crate::publish_commands::run_publish(

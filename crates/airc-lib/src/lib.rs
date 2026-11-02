@@ -37,6 +37,8 @@
 pub mod account_registry;
 pub mod account_registry_fs;
 pub mod adapter;
+pub mod addressed;
+mod agent_feed;
 pub mod agent_heartbeat;
 pub mod airc;
 pub mod backfill;
@@ -71,6 +73,7 @@ pub mod route_forwarder;
 pub mod router_bridge;
 pub mod runtime_dir;
 pub mod socket_path;
+pub mod store_admission;
 mod stream;
 pub mod stream_chunk;
 pub mod subscriptions;
@@ -84,6 +87,7 @@ pub mod webrtc_signaling;
 pub mod work;
 pub(crate) mod work_board_cache;
 pub mod work_manager;
+pub mod work_repository;
 pub mod work_roster;
 pub mod work_subscription;
 pub mod work_worktree;
@@ -94,6 +98,9 @@ pub use account_registry::{
     SqliteAccountRegistryStore, ACCOUNT_REGISTRY_SCHEMA_VERSION, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 pub use account_registry_fs::FsAccountRegistryStore;
+pub use addressed::{
+    AddressedError, AddressedInbox, AddressedKind, AddressedSend, InboxError, VerifiedAddressed,
+};
 pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,
     RoomMemberCard, DEFAULT_HEARTBEAT_INTERVAL, HEADER_HEARTBEAT_KIND, HEADER_HEARTBEAT_RUNTIME,
@@ -110,7 +117,7 @@ pub use airc_protocol::{
 pub use capability_registry::{
     CapabilityCandidate, CapabilityEntry, CapabilityQuery, CapabilityRegistry, DEFAULT_OFFER_TTL_MS,
 };
-pub use command_bus::PendingCommand;
+pub use command_bus::{CommandEvent, PendingCommand};
 pub use coordinator::{
     account_root as coordinator_account_root, beacon_now,
     drain_stale_store as coordinator_drain_stale_store,
@@ -245,3 +252,8 @@ pub use airc_work::{
     WorkCardId, WorkEvent, WorkspaceId, WorkspaceStatus, BODY_HINT_FORGE_WORK_EVENT,
     HEADER_FORGE_WORK_EVENT_KIND, HEADER_FORGE_WORK_REPO,
 };
+
+mod addressing;
+mod agent_delivery;
+pub use addressing::Addressee;
+pub use agent_delivery::{AddressedWindow, AgentDeliveryTurn, HistorySummary};

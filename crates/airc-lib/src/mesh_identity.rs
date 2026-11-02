@@ -318,9 +318,8 @@ const RESOLVER_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// (command missing, non-zero exit, non-UTF-8 output, timeout) —
 /// caller decides what to do.
 ///
-/// Synchronous wait_with_timeout pattern: spawn the child, poll
-/// `try_wait` until the deadline. On timeout, kill the child and
-/// return None so the caller falls through to the next resolver.
+/// Bounded by [`airc_core::process::run_bounded`]: on timeout the command's whole process
+/// group is killed and this returns None, so the caller falls through to the next resolver.
 fn run_command(argv: &[&str]) -> Option<String> {
     let (program, args) = argv.split_first()?;
     let program = if *program == "gh" {
@@ -328,33 +327,12 @@ fn run_command(argv: &[&str]) -> Option<String> {
     } else {
         std::path::PathBuf::from(program)
     };
-    let mut child = airc_core::process::background(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + RESOLVER_COMMAND_TIMEOUT;
-    let output = loop {
-        match child.try_wait().ok()? {
-            Some(status) => {
-                let out = child.wait_with_output().ok()?;
-                if !status.success() {
-                    return None;
-                }
-                break out;
-            }
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-    };
+    let mut command = airc_core::process::background(program);
+    command.args(args);
+    let output = airc_core::process::run_bounded(command, RESOLVER_COMMAND_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 

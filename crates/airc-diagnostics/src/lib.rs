@@ -46,6 +46,8 @@ pub enum DiagnosticCode {
     ConnectionError,
     /// IPC listener failure with its accept stage and original OS error.
     IpcAcceptFailed,
+    /// Startup descriptor capacity, including restricted hard limits.
+    DaemonFileCapacity,
     FrameVerificationFailed,
     StoreAppendFailed,
     /// The owner writer retains this batch and retries; its durable ring
@@ -138,6 +140,9 @@ pub enum DiagnosticCode {
     /// remote reports the channel unbound). The local transcript is
     /// intact; the remote machine did not confirm visibility.
     RoutedForwardFailed,
+    /// The recovery owner has settled its active pass and all queued reruns.
+    /// This is a lifetime boundary, not proof that every history read succeeded.
+    RoutedBackfillSettled,
     /// #1306: a live LAN session was force-dropped by route refresh
     /// because frames flushed to it went unacked past the suspect
     /// threshold — the half-open-socket purge. The peer is re-dialed

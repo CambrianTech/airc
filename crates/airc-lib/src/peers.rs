@@ -32,6 +32,7 @@ async fn peer_trust_snapshot_for_agent(
     wire_root: &std::path::Path,
     agent_name: &str,
 ) -> Result<Vec<peers_store::StoredPeer>, AircError> {
+    crate::store_admission::install();
     let mut peers = crate::airc::load_peer_registries(home, wire_root).await?;
     for (root, name) in [
         (home, agent_name),

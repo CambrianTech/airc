@@ -22,7 +22,7 @@ use airc_core::{
 use airc_ipc::codec::read_response_frame;
 use airc_ipc::{
     AttachRequest, AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind,
-    IpcTarget, PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
+    PeerIdentityCardRequest, PublishRequest, Response, RoomTipRequest, SendRequest,
 };
 use airc_protocol::FrameKind;
 use tokio::sync::mpsc;
@@ -66,14 +66,10 @@ fn unpack_seq(lamport: u64) -> (u64, u64) {
 fn kind_to_transcript(kind: Kind) -> TranscriptKind {
     match kind {
         Kind::Message => TranscriptKind::Message,
-        // The fine-grained transcript kind for non-chat envelopes is
-        // carried in headers; project the coarse bus kind to System.
-        Kind::Event
-        | Kind::Command
-        | Kind::CommandResult
-        | Kind::Signal
-        | Kind::StreamChunk
-        | Kind::Control => TranscriptKind::System,
+        Kind::Command => TranscriptKind::Command,
+        Kind::CommandResult => TranscriptKind::CommandResult,
+        // Non-command event categories retain their coarse System projection.
+        Kind::Event | Kind::Signal | Kind::StreamChunk | Kind::Control => TranscriptKind::System,
     }
 }
 
@@ -83,20 +79,28 @@ fn kind_to_transcript(kind: Kind) -> TranscriptKind {
 ///
 /// The push-down must be a SUPERSET of the client-side `filter.matches`
 /// — never narrower, or the daemon would drop events the consumer asked
-/// for. `kind_to_transcript` is lossy (every non-chat bus kind projects
-/// to the coarse `System`), so `Message` maps exactly and ANY other
-/// transcript kind admits every non-`Message` bus kind; `filter.matches`
-/// still refines the decoded page afterwards.
+/// for. Message and command categories map exactly. Remaining transcript
+/// categories admit the remaining non-command bus categories, with
+/// `filter.matches` refining the decoded page afterwards.
 fn transcript_kinds_to_ipc(kinds: &std::collections::BTreeSet<TranscriptKind>) -> Vec<IpcKind> {
     let mut out = Vec::new();
     if kinds.contains(&TranscriptKind::Message) {
         out.push(IpcKind::Message);
     }
-    if kinds.iter().any(|kind| *kind != TranscriptKind::Message) {
+    if kinds.contains(&TranscriptKind::Command) {
+        out.push(IpcKind::Command);
+    }
+    if kinds.contains(&TranscriptKind::CommandResult) {
+        out.push(IpcKind::CommandResult);
+    }
+    if kinds.iter().any(|kind| {
+        !matches!(
+            kind,
+            TranscriptKind::Message | TranscriptKind::Command | TranscriptKind::CommandResult
+        )
+    }) {
         out.extend([
             IpcKind::Event,
-            IpcKind::Command,
-            IpcKind::CommandResult,
             IpcKind::Signal,
             IpcKind::StreamChunk,
             IpcKind::Control,
@@ -129,7 +133,14 @@ pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
         occurred_at_ms: env.occurred_at_ms,
         lamport: pack_seq(env.seq.epoch, env.seq.counter),
         target: target_to_mention(&env.target),
-        headers: env.headers.clone(),
+        headers: {
+            let mut headers = env.headers.clone();
+            headers.insert(
+                airc_protocol::headers_keys::HEADER_AIRC_DELIVERY_CLASS.into(),
+                crate::publish::delivery_class_header_value(env.delivery).into(),
+            );
+            headers
+        },
         // Durable chat payloads are `Body`-encoded; a non-`Body` payload
         // (raw stream chunk) has no transcript body.
         body: Body::from_payload(&env.payload).ok(),
@@ -232,6 +243,7 @@ impl Airc {
         body: Body,
         mut headers: airc_core::Headers,
         delivery: airc_bus::DeliveryClass,
+        target: MentionTarget,
     ) -> Result<PublishReceipt, AircError> {
         room.stamp_name_header(&mut headers);
         let response = self
@@ -248,7 +260,7 @@ impl Airc {
                 // digest forever. Presence is state, not an event (#1341).
                 // `publish` still passes Durable, so chat is unchanged.
                 delivery: ipc_delivery(delivery),
-                target: IpcTarget::All,
+                target: target.into(),
                 correlation_id: None,
                 coalesce_key: coalesce_key_of(&headers),
                 // The consumer's `Body` is encoded to opaque payload
@@ -586,8 +598,7 @@ impl Airc {
         // unchanged — no error text is ever interpreted to decide this.
         let daemon_serves_sets = client
             .status()
-            .await
-            .map_err(|e| AircError::Route(format!("daemon status: {e}")))?
+            .await? // typed: a reader tells a daemon between processes from a refused request
             .attach_channel_sets;
         if daemon_serves_sets && channels.len() > 1 {
             let handle =
@@ -687,20 +698,8 @@ async fn spawn_channel_reader(
     // `from` is the resume point a caller hands over (the set reader
     // falling back after a daemon rollback); `None` is the live edge.
     let request = channel_request(channel, from, delivery.clone(), headers.clone());
-    let mut stream = client
-        .attach(request)
-        .await
-        .map_err(|e| AircError::Route(format!("daemon attach: {e}")))?;
-    match read_response_frame(&mut stream).await {
-        Ok(Some(Response::Ok)) => {}
-        Ok(Some(Response::Error { message })) => {
-            return Err(AircError::Route(format!("daemon attach: {message}")))
-        }
-        Ok(Some(_)) | Ok(None) => {
-            return Err(AircError::Route("daemon attach: no ack".to_string()))
-        }
-        Err(e) => return Err(AircError::Route(format!("daemon attach ack: {e}"))),
-    }
+    let mut stream = client.attach(request).await?; // typed: see `attach_ack`
+    attach_ack(read_response_frame(&mut stream).await, "daemon attach")?;
     Ok(tokio::spawn(async move {
         // Drain the live stream; when it drops (daemon restart /
         // transient loss) re-attach and RESUME strictly after the
@@ -865,20 +864,11 @@ impl Airc {
             }
         };
         let mut cursors: std::collections::HashMap<RoomId, IpcCursor> = Default::default();
-        let mut stream = client
-            .attach(request_for(&cursors))
-            .await
-            .map_err(|e| AircError::Route(format!("daemon attach (set): {e}")))?;
-        match read_response_frame(&mut stream).await {
-            Ok(Some(Response::Ok)) => {}
-            Ok(Some(Response::Error { message })) => {
-                return Err(AircError::Route(format!("daemon attach (set): {message}")))
-            }
-            Ok(Some(_)) | Ok(None) => {
-                return Err(AircError::Route("daemon attach (set): no ack".to_string()))
-            }
-            Err(e) => return Err(AircError::Route(format!("daemon attach (set) ack: {e}"))),
-        }
+        let mut stream = client.attach(request_for(&cursors)).await?; // typed, as above
+        attach_ack(
+            read_response_frame(&mut stream).await,
+            "daemon attach (set)",
+        )?;
         let rooms = channels.len();
         Ok(tokio::spawn(async move {
             let mut backoff_ms = RECONNECT_BACKOFF_START_MS;
@@ -1047,9 +1037,79 @@ fn ipc_delivery(delivery: airc_bus::DeliveryClass) -> IpcDelivery {
     }
 }
 
+/// An attach's acknowledgment, typed by cause (Codex on #1603). A daemon that refuses the
+/// attach, or answers with a frame that is not an acknowledgment or not a frame at all, is a
+/// real error (`Route`). A connection that closes or fails before the acknowledgment is the
+/// daemon going away, which happens in an update's handoff: it is `DaemonClient(Io)`, which
+/// `AircError::is_daemon_absent` reads, so a waiting reader attaches again instead of ending.
+fn attach_ack(ack: std::io::Result<Option<Response>>, what: &str) -> Result<(), AircError> {
+    match ack {
+        Ok(Some(Response::Ok)) => Ok(()),
+        Ok(Some(Response::Error { message })) => {
+            Err(AircError::Route(format!("{what}: {message}")))
+        }
+        Ok(Some(other)) => Err(AircError::Route(format!(
+            "{what}: not an acknowledgment: {other:?}"
+        ))),
+        Ok(None) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{what}: closed before acknowledging"),
+            ),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Err(AircError::Route(
+            format!("{what}: malformed acknowledgment: {error}"),
+        )),
+        Err(error) => Err(AircError::DaemonClient(airc_ipc::ClientError::Io(error))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_categories_survive_projection_and_filter_pushdown() {
+        for (bus, transcript, ipc) in [
+            (Kind::Command, TranscriptKind::Command, IpcKind::Command),
+            (
+                Kind::CommandResult,
+                TranscriptKind::CommandResult,
+                IpcKind::CommandResult,
+            ),
+        ] {
+            assert_eq!(kind_to_transcript(bus), transcript);
+            let requested = std::collections::BTreeSet::from([transcript]);
+            assert_eq!(transcript_kinds_to_ipc(&requested), vec![ipc]);
+        }
+        let system =
+            transcript_kinds_to_ipc(&std::collections::BTreeSet::from([TranscriptKind::System]));
+        assert!(!system.contains(&IpcKind::Command));
+        assert!(!system.contains(&IpcKind::CommandResult));
+    }
+
+    // what this catches (Codex on #1603): a replacement daemon that closes the attach before
+    // acknowledging it, read as a refusal, which ends a reattaching feed for good. Through
+    // the real frame reader: a close (before or inside the frame) is the daemon gone; a
+    // refusal or a frame that does not decode is a real error.
+    #[tokio::test]
+    async fn an_attach_closed_before_its_ack_is_the_daemon_gone_and_a_refusal_is_not() {
+        let closed = attach_ack(read_response_frame(&mut tokio::io::empty()).await, "attach");
+        assert!(closed.unwrap_err().is_daemon_absent());
+        let mut cut: &[u8] = &[0, 0, 0, 9, 1];
+        let cut = attach_ack(read_response_frame(&mut cut).await, "attach");
+        assert!(cut.unwrap_err().is_daemon_absent());
+        let refused = attach_ack(
+            Ok(Some(Response::Error {
+                message: "no such room".into(),
+            })),
+            "attach",
+        );
+        assert!(!refused.unwrap_err().is_daemon_absent());
+        let mut garbage: &[u8] = &[0, 0, 0, 1, 0xff];
+        let garbage = attach_ack(read_response_frame(&mut garbage).await, "attach");
+        assert!(!garbage.unwrap_err().is_daemon_absent());
+    }
 
     // what this catches (Astra's re-review of airc #1523): a daemon rolled back
     // under a live set subscription stops serving channel sets, and the set

@@ -6,10 +6,29 @@ use std::path::Path;
 
 use fs2::FileExt;
 
+use airc_store::custody::{try_shared, LIFECYCLE_LOCK, MAINTENANCE_LOCK};
+
 pub struct DaemonLifecycleGuard {
     active: File,
     _maintenance_intent: Option<File>,
     owner: crate::MachineAccountHome,
+}
+
+/// Another admitted daemon owns initialization. Its endpoint need not be bound yet.
+#[derive(Debug, thiserror::Error)]
+#[error("daemon initialization is already in progress; no second initializer was admitted")]
+pub struct StartupInProgress;
+
+fn acquire_startup(file: &File) -> io::Result<()> {
+    FileExt::try_lock_exclusive(file).map_err(startup_lock_error)
+}
+
+fn startup_lock_error(error: io::Error) -> io::Error {
+    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+        io::Error::new(io::ErrorKind::WouldBlock, StartupInProgress)
+    } else {
+        error
+    }
 }
 
 /// A child owns startup until its endpoint is bound, independently of the
@@ -19,11 +38,28 @@ pub struct DaemonStartupGuard {
     owner: crate::MachineAccountHome,
 }
 
+/// Proof that this process is the daemon admitted through
+/// [`DaemonStartupGuard::acquire`]. Presented once to
+/// [`crate::store_admission::declare_daemon`], it makes this process's store
+/// writes take no lifecycle lock (an `airc update` excludes the daemon by
+/// stopping it), so they never contend with the startup guard.
+/// Constructed only by [`DaemonStartupGuard::custody`].
+#[derive(Clone, Debug)]
+pub struct DaemonCustody {
+    _admitted: (),
+}
+
 impl DaemonStartupGuard {
+    /// This daemon's custody proof, minted while startup is held; it stays
+    /// valid after [`Self::bound`] for the process's lifetime.
+    pub fn custody(&self) -> DaemonCustody {
+        DaemonCustody { _admitted: () }
+    }
+
     pub fn acquire(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
         let active = DaemonLifecycleGuard::open(&owner, "daemon-startup.lock")?;
-        FileExt::try_lock_shared(&active)?;
+        acquire_startup(&active)?;
         require_running(&owner)?;
         Ok(Self { active, owner })
     }
@@ -48,24 +84,24 @@ impl Drop for DaemonStartupGuard {
 impl DaemonLifecycleGuard {
     /// Hold through status inspection and any resulting daemon spawn.
     pub fn autostart(home: &Path) -> io::Result<Self> {
+        let guard = Self::attach(home)?;
+        if guard.startup_in_progress()? {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, StartupInProgress));
+        }
+        Ok(guard)
+    }
+
+    /// Admit an endpoint observer even while the existing child initializes.
+    /// The retained lifecycle lease still excludes maintenance and stop.
+    pub fn attach(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
         // Hold the admission gate only while acquiring the active read lock.
         // A waiting updater closes this gate before draining existing readers,
         // so continuous new CLI calls cannot starve installation.
-        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
-        FileExt::try_lock_shared(&intent).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("daemon maintenance requested; autostart refused: {error}"),
-            )
-        })?;
-        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
-        FileExt::try_lock_shared(&file).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("daemon maintenance in progress; autostart refused: {error}"),
-            )
-        })?;
+        let intent = Self::open(&owner, MAINTENANCE_LOCK)?;
+        try_shared(&intent)?;
+        let file = Self::open(&owner, LIFECYCLE_LOCK)?;
+        try_shared(&file)?;
         let guard = Self {
             active: file,
             _maintenance_intent: None,
@@ -75,6 +111,22 @@ impl DaemonLifecycleGuard {
         Ok(guard)
     }
 
+    /// Observe startup custody without granting permission for a second child.
+    pub fn startup_in_progress(&self) -> io::Result<bool> {
+        // Observers share the check; only the initializing child is exclusive.
+        // Taking an exclusive probe here makes concurrent ordinary callers
+        // misidentify each other as an initializing daemon.
+        let startup = Self::open(&self.owner, "daemon-startup.lock")?;
+        if let Err(error) = FileExt::try_lock_shared(&startup) {
+            if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+                return Ok(true);
+            }
+            return Err(error);
+        }
+        FileExt::unlock(&startup)?;
+        Ok(false)
+    }
+
     /// Serialize operator intent or maintenance; updaters acquire after building
     /// and hold through installation and verified restart.
     /// This synchronous updater boundary waits in the OS, without polling. It
@@ -82,9 +134,9 @@ impl DaemonLifecycleGuard {
     /// Process cancellation releases both locks, including a pending acquisition.
     pub fn maintenance(home: &Path) -> io::Result<Self> {
         let owner = crate::machine_account_home(home);
-        let intent = Self::open(&owner, "daemon-maintenance.lock")?;
+        let intent = Self::open(&owner, MAINTENANCE_LOCK)?;
         FileExt::lock_exclusive(&intent)?;
-        let file = Self::open(&owner, "daemon-lifecycle.lock")?;
+        let file = Self::open(&owner, LIFECYCLE_LOCK)?;
         FileExt::lock_exclusive(&file).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -163,14 +215,16 @@ impl DaemonLifecycleGuard {
     }
 
     fn open(owner: &crate::MachineAccountHome, name: &str) -> io::Result<File> {
-        std::fs::create_dir_all(owner)?;
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(owner.join(name))
+        airc_store::custody::lock_file(owner.as_path(), name)
     }
+}
+
+/// Whether an operator stop is recorded for `home`'s machine account. Unserialized: for a
+/// reader deciding whether to keep waiting for the daemon (a live feed across an update), where
+/// a stop recorded a moment later is seen on its next look. Admission still reads it under
+/// the lifecycle gate.
+pub fn operator_stop_recorded(home: &Path) -> io::Result<bool> {
+    operator_stopped(&crate::machine_account_home(home))
 }
 
 fn operator_stopped(owner: &crate::MachineAccountHome) -> io::Result<bool> {
@@ -200,6 +254,87 @@ impl Drop for DaemonLifecycleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use airc_store::custody::is_maintenance_in_progress;
+
+    // what this catches (Codex on #1618): a CLI auto-start attempted in the update's
+    // stop/swap window, from another thread as a hook would from another process, is
+    // refused with the typed maintenance error (never a spawn); and an update that FAILS
+    // while holding maintenance releases it, so the next auto-start is admitted.
+    #[test]
+    fn an_update_window_refuses_autostart_typed_and_a_failed_update_releases_it() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_owned();
+        let (held, window) = mpsc::channel();
+        let (finish, finished) = mpsc::channel::<()>();
+        let updater = std::thread::spawn(move || -> Result<(), io::Error> {
+            let _custody = DaemonLifecycleGuard::maintenance(&home)?;
+            held.send(()).map_err(io::Error::other)?;
+            finished.recv().map_err(io::Error::other)?;
+            Err(io::Error::other("injected update failure after the stop"))
+        });
+        window.recv().unwrap();
+        let refused = DaemonLifecycleGuard::autostart(dir.path()).err().unwrap();
+        assert!(is_maintenance_in_progress(&refused), "{refused}");
+        assert!(refused.to_string().contains("update"), "{refused}");
+        finish.send(()).unwrap();
+        assert!(updater.join().unwrap().is_err(), "the update failed");
+        assert!(
+            DaemonLifecycleGuard::autostart(dir.path()).is_ok(),
+            "custody released on the failure path"
+        );
+    }
+
+    // A slow initializer keeps ownership after its parent times out. Neither
+    // another child nor an autostart caller may launch competing store work.
+    #[test]
+    fn one_initializer_owns_startup_until_bound_or_dropped() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = DaemonStartupGuard::acquire(dir.path())?;
+        let observer = DaemonLifecycleGuard::attach(dir.path())?;
+        assert!(observer.startup_in_progress()?);
+        for error in [
+            DaemonStartupGuard::acquire(dir.path()).err(),
+            DaemonLifecycleGuard::autostart(dir.path()).err(),
+        ] {
+            assert!(error
+                .and_then(|error| error.into_inner())
+                .is_some_and(|source| source.is::<StartupInProgress>()));
+        }
+        first.bound()?;
+        assert!(!observer.startup_in_progress()?);
+        let second = DaemonStartupGuard::acquire(dir.path())?;
+        drop(second);
+        DaemonLifecycleGuard::autostart(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_observers_coexist_but_exclude_an_initializer() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = crate::machine_account_home(dir.path());
+        // Hold an observer at the exact overlap point deterministically, rather
+        // than depend on thread timing to reproduce the eight-tab CI failure.
+        let observer = DaemonLifecycleGuard::open(&owner, "daemon-startup.lock")?;
+        FileExt::try_lock_shared(&observer)?;
+        let ordinary = DaemonLifecycleGuard::autostart(dir.path())?;
+        let another = DaemonLifecycleGuard::autostart(dir.path())?;
+        assert!(DaemonStartupGuard::acquire(dir.path())
+            .err()
+            .and_then(|error| error.into_inner())
+            .is_some_and(|source| source.is::<StartupInProgress>()));
+        FileExt::unlock(&observer)?;
+        let initializer = DaemonStartupGuard::acquire(dir.path())?;
+        assert!(DaemonLifecycleGuard::autostart(dir.path())
+            .err()
+            .and_then(|error| error.into_inner())
+            .is_some_and(|source| source.is::<StartupInProgress>()));
+        initializer.bound()?;
+        DaemonLifecycleGuard::autostart(dir.path())?;
+        drop((ordinary, another));
+        Ok(())
+    }
 
     // A reconnect must not respawn the old executable inside stop/install;
     // releasing the updater's OS lock must immediately restore autostart.
@@ -253,7 +388,13 @@ mod tests {
         });
         // Observe the real admission gate, not a sleep assumed to be long enough.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while DaemonLifecycleGuard::autostart(dir.path()).is_ok() {
+        loop {
+            if DaemonLifecycleGuard::autostart(dir.path())
+                .err()
+                .is_some_and(|error| is_maintenance_in_progress(&error))
+            {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
                 "maintenance never closed admission"

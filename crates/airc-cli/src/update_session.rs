@@ -4,6 +4,15 @@ use std::path::Path;
 type Error = Box<dyn std::error::Error>;
 const RESTORED: u8 = 200;
 
+/// Installer authority belongs to the temporary update process tree. A daemon
+/// survives that owner and must establish a fresh session for its next update;
+/// inheriting these markers would instead borrow an already-exited owner.
+pub(crate) fn detach_runtime(command: &mut std::process::Command) {
+    command
+        .env_remove("CAMBRIAN_INSTALL_ELEVATION")
+        .env_remove("AIRC_UPDATE_SESSION_OWNER");
+}
+
 #[derive(Debug)]
 struct SessionExit(u8);
 impl std::fmt::Display for SessionExit {
@@ -17,7 +26,7 @@ pub(crate) fn exit_code(error: &(dyn std::error::Error + 'static)) -> Option<u8>
     error.downcast_ref::<SessionExit>().map(|error| error.0)
 }
 
-pub(crate) fn run(home: &Path, auto: bool) -> Result<(), Error> {
+pub(crate) fn run(home: &Path, auto: bool, revision: Option<&str>) -> Result<(), Error> {
     let source = crate::update_commands::install_source_dir()?;
     let wrapper = source.join("windows/install-session.ps1");
     if !wrapper.is_file() {
@@ -46,9 +55,9 @@ pub(crate) fn run(home: &Path, auto: bool) -> Result<(), Error> {
         }
         let socket = crate::cli::default_socket_path_in(home);
         let result = if auto {
-            crate::update_commands::run_update_auto(home, socket)
+            crate::update_commands::run_update_auto(home, socket, revision)
         } else {
-            crate::update_commands::run_update(home, socket)
+            crate::update_commands::run_update(home, socket, revision)
         };
         return result.map_err(|error| {
             if std::env::var_os("AIRC_UPDATE_SESSION_OWNER").is_some_and(|v| !v.is_empty())
@@ -71,6 +80,9 @@ pub(crate) fn run(home: &Path, auto: bool) -> Result<(), Error> {
         .arg(home);
     if auto {
         command.arg("-AutoUpdate");
+    }
+    if let Some(revision) = revision {
+        command.arg("-Revision").arg(revision);
     }
     let status = command.status()?;
     if status.success() {

@@ -129,6 +129,14 @@ pub fn decode_transcript_work_event(
             work_event = WorkEvent::ReviewRejected(rejected);
         }
     }
+    if let WorkEvent::SubmissionReviewRequested(request) = &work_event {
+        if request.card.created_by != event.peer_id {
+            return Err(WorkReplayError::RejectedReview {
+                event_id: event.event_id,
+                source: crate::WorkEventCodecError::ReviewRequestAuthorMismatch,
+            });
+        }
+    }
     Ok(WorkReplayItem {
         cursor: event.cursor(),
         event: work_event,

@@ -1,0 +1,32 @@
+name: Cached Rust test build
+description: Build every test and save reusable compiler output before tests run.
+runs:
+  using: composite
+  steps:
+    - name: Rust compiler identity
+      id: compiler
+      shell: bash
+      run: echo "identity=$(rustc -Vv | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
+    - name: Restore test build
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/debug
+        key: ${{ runner.os }}-${{ runner.arch }}-test-v2-${{ steps.compiler.outputs.identity }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-test-v2-${{ steps.compiler.outputs.identity }}-${{ hashFiles('Cargo.lock') }}-
+    - name: Compile all tests
+      shell: bash
+      run: cargo test --locked --workspace --all-features --no-run
+    - name: Save completed build before tests
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/debug
+        key: ${{ steps.cache.outputs.cache-primary-key }}

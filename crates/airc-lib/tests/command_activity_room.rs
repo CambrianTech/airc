@@ -1,92 +1,105 @@
-//! Activity requests retain their dispatch room despite other active rooms.
+//! Addressed exchanges are independent of conversational room selection.
 mod common;
 
 use airc_core::{Body, Headers, MentionTarget};
-use airc_lib::command_bus::reply_addressing;
-use airc_lib::EventFilter;
+use airc_lib::AddressedKind;
 use common::Machine;
-use futures::StreamExt;
 use std::time::Duration;
 
 #[tokio::test]
-async fn activity_request_receives_reply_when_both_default_rooms_differ() {
+async fn addressed_request_survives_default_room_changes() {
     let machine = Machine::boot().await;
     machine.pin_identity("command-activity-tests").await;
     let (alice, bob) = machine.pair_in("team-benchmark").await;
-    let activity = alice.current_room().await.unwrap();
-    let other = alice.join("other-activity").await.unwrap();
-    bob.join("other-activity").await.unwrap();
-    let mut stream = bob
-        .subscribe_subscribed_filtered(EventFilter::default())
+    alice.join("alice-activity").await.unwrap();
+    bob.join("bob-activity").await.unwrap();
+    let recipient = bob.peer_id();
+    let mut inbox = bob
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
         .await
         .unwrap();
     let responder = tokio::spawn(async move {
-        while let Some(Ok(event)) = stream.next().await {
-            let Some((peer, correlation)) = reply_addressing(&event) else {
-                continue;
-            };
-            if event.peer_id == bob.peer_id() {
-                continue;
-            }
-            // Same correlation in a different room is not this command's reply.
-            bob.reply_in(
-                other.channel,
-                Some(&other.name),
-                peer,
-                correlation,
-                Headers::new(),
-                Body::text("wrong-room"),
-            )
+        let event = tokio::time::timeout(Duration::from_secs(5), inbox.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind(), AddressedKind::Command);
+        assert_eq!(event.to(), bob.peer_id());
+        bob.reply(&event, Headers::new(), Body::text("graded"))
             .await
             .unwrap();
-            bob.reply_in(
-                event.room_id,
-                Some("team-benchmark"),
-                peer,
-                correlation,
-                Headers::new(),
-                Body::text("graded"),
-            )
-            .await
-            .unwrap();
-            return;
-        }
     });
     let pending = alice
-        .request_in(
-            &activity,
-            MentionTarget::All,
+        .request(
+            MentionTarget::Peer(recipient),
             Headers::new(),
             Body::text("grade candidate"),
             Duration::from_secs(5),
         )
         .await
         .unwrap();
-    // A switch after dispatch must not redirect the reply subscription either.
     alice.join("third-activity").await.unwrap();
     let reply = alice.await_reply(pending).await.unwrap();
-    assert_eq!(reply.room_id, activity.channel);
-    assert_eq!(reply.body, Some(Body::text("graded")));
+    assert_eq!(reply.from(), recipient);
+    assert_eq!(reply.to(), alice.peer_id());
+    assert_eq!(reply.body(), &Body::text("graded"));
     assert_eq!(alice.current_room().await.unwrap().name, "third-activity");
     responder.await.unwrap();
 }
 
 #[tokio::test]
-async fn explicit_request_does_not_auto_join_an_unknown_activity() {
+async fn command_rejects_broadcast_and_room_without_switching_rooms() {
     let machine = Machine::boot().await;
     machine.pin_identity("command-activity-tests").await;
     let alice = machine.solo("home").await;
-    let unknown =
-        airc_lib::Room::at_channel(alice.home(), "unknown", airc_core::RoomId::new()).unwrap();
-    assert!(alice
-        .request_in(
-            &unknown,
-            MentionTarget::All,
-            Headers::new(),
-            Body::text("must refuse"),
-            Duration::from_secs(1)
-        )
-        .await
-        .is_err());
+    for target in [
+        MentionTarget::All,
+        MentionTarget::Room(airc_core::RoomId::new()),
+    ] {
+        assert!(alice
+            .request(
+                target,
+                Headers::new(),
+                Body::text("must refuse"),
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err());
+    }
     assert_eq!(alice.current_room().await.unwrap().name, "home");
+}
+
+#[tokio::test]
+async fn ordinary_attach_does_not_steal_live_addressed_receiver() {
+    let machine = Machine::boot().await;
+    machine.pin_identity("command-custody-tests").await;
+    let alice = machine.attach("alice").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let first = alice.addressed_inbox(deadline).await.unwrap();
+    // Another ordinary facade is harmless until it explicitly requests custody.
+    let independent = machine.attach("alice").await;
+    let error = match independent.addressed_inbox(deadline).await {
+        Err(error) => error,
+        Ok(_) => panic!("independent facade stole receiver custody"),
+    };
+    assert!(error.to_string().contains("ReceiverBusy"), "{error}");
+    let shared = alice.addressed_inbox(deadline).await.unwrap();
+    drop(first);
+    // The second lease still keeps the original receiver alive.
+    assert!(independent.addressed_inbox(deadline).await.is_err());
+    drop(shared);
+}
+
+#[tokio::test]
+async fn concurrent_inboxes_on_one_handle_share_custody() {
+    let machine = Machine::boot().await;
+    machine.pin_identity("command-shared-custody-tests").await;
+    let alice = machine.attach("alice").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (left, right) = tokio::join!(
+        alice.addressed_inbox(deadline),
+        alice.addressed_inbox(deadline)
+    );
+    let _left = left.unwrap();
+    let _right = right.unwrap();
 }

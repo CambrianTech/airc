@@ -94,6 +94,17 @@ uuid_newtype! {
     PeerId
 }
 
+/// A peer is named back by its shown form too (`@7711fe60`).
+impl crate::shown_id::ShownKind for PeerId {
+    const LABEL: &'static str = "peer";
+    fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+    fn to_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
 uuid_newtype! {
     /// A per-process / per-tab session identifier under a peer. The pair
     /// `(PeerId, ClientId)` uniquely identifies one running airc consumer

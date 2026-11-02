@@ -228,6 +228,32 @@ pub enum AircError {
     /// correlation id rather than reusing the timed-out one.
     #[error("command deadline elapsed (correlation_id={correlation_id})")]
     CommandDeadline { correlation_id: uuid::Uuid },
+
+    #[error("command {correlation_id} has already finished")]
+    CommandFinished { correlation_id: uuid::Uuid },
+
+    #[error("command {correlation_id} inbox: {source}")]
+    CommandInbox {
+        correlation_id: uuid::Uuid,
+        #[source]
+        source: crate::addressed::InboxError,
+    },
+}
+
+impl AircError {
+    /// The daemon is not there to answer: not connected, the connection dropped mid-call, or
+    /// it did not answer in time. That is the shape of a daemon between processes (an
+    /// update's handoff, a restart). Every other error is about the request itself.
+    pub fn is_daemon_absent(&self) -> bool {
+        matches!(
+            self,
+            AircError::DaemonClient(
+                airc_ipc::ClientError::NotConnected(_)
+                    | airc_ipc::ClientError::Io(_)
+                    | airc_ipc::ClientError::Timeout
+            )
+        )
+    }
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ airc-blobs = { path = "../airc-blobs" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "signal", "net", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 toml_edit = "0.22"
 base64 = "0.22"
 futures = "0.3"
@@ -60,6 +60,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 libc = "0.2"
 
 [dev-dependencies]
+# Test binaries may open stores without installing a write admission.
+airc-store = { path = "../airc-store", features = ["test-fixtures"] }
 airc-lib = { path = "../airc-lib", features = ["mock"] }
 tempfile = "3"
 temp-env = "0.3"

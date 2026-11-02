@@ -20,6 +20,8 @@
 //! auto-generate missing identity material. `VerificationPolicy::Strict`
 //! is the only policy used in CLI paths — no `AllowUnsigned` opt-in.
 
+mod addressed_bridge;
+mod agent_resume;
 mod build_info;
 mod channel_gist_cli;
 mod channel_gist_commands;
@@ -103,6 +105,7 @@ mod workspace_cli;
 mod workspace_commands;
 mod worktree_lane_cli;
 mod worktree_lane_commands;
+mod worktree_retirement;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -113,7 +116,6 @@ use uuid::Uuid;
 
 use airc_core::PeerId;
 
-use airc_identity::LocalIdentity;
 use channel_gist_cli::ChannelGistAction;
 use cli::{Cli, Command, PeerAction, SosAction};
 use collaboration_cli::CollaborationAction;
@@ -123,16 +125,13 @@ use gh_cli::GhAction;
 use gist_cli::GistAction;
 use handshake_cli::HandshakeAction;
 use identity_cli::IdentityAction;
-use integrations::codex::CodexHookAction;
 use knock_cli::KnockAction;
 use lane_cli::{LaneAction, LaneManagerAction};
 use monitor::MonitorAction;
 use pending_cli::PendingAction;
-use queue_card_cli::QueueCardAction;
 use route_cli::RouteAction;
 use state_cli::StateAction;
 use transport_cli::TransportAction;
-use work_cli::WorkAction;
 use workspace_cli::WorkspaceAction;
 use worktree_lane_cli::WorktreeLaneAction;
 
@@ -197,6 +196,8 @@ async fn async_main() -> ExitCode {
     // never blocks. The single highest-friction onboarding issue.
     staleness::warn_if_stale();
 
+    // One rule for every store this process opens (airc_lib::store_admission).
+    airc_lib::store_admission::install();
     let parsed = Cli::parse();
     match dispatch(parsed).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -417,9 +418,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Daemon { socket } => {
-            let identity = LocalIdentity::load_or_generate(&home).await?;
             let socket = default_or(socket, &home);
-            commands::run_daemon(&home, identity, parsed.peers, socket).await
+            commands::run_daemon(&home, parsed.peers, socket).await
         }
 
         Command::Ping { socket } => commands::run_ping(default_or(socket, &home)).await,
@@ -434,6 +434,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Stop { socket } => commands::run_stop(&home, default_or(socket, &home)).await,
 
         Command::Msg {
+            to,
             socket,
             room,
             text,
@@ -491,7 +492,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .into())
                 }
             };
-            commands::run_msg(&home, default_or(socket, &home), room.named(), &body).await
+            commands::run_msg(
+                &home,
+                default_or(socket, &home),
+                room.named(),
+                &body,
+                to.map(airc_core::PeerId::from_uuid),
+            )
+            .await
         }
         Command::Publish {
             room,
@@ -681,6 +689,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Update {
             auto,
+            revision,
             adopt_installed,
         } => {
             let socket = cli::default_socket_path_in(&home);
@@ -689,14 +698,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 #[cfg(windows)]
                 {
-                    update_session::run(&home, auto)
+                    update_session::run(&home, auto, revision.as_deref())
                 }
                 #[cfg(not(windows))]
                 {
                     if auto {
-                        update_commands::run_update_auto(&home, socket)
+                        update_commands::run_update_auto(&home, socket, revision.as_deref())
                     } else {
-                        update_commands::run_update(&home, socket)
+                        update_commands::run_update(&home, socket, revision.as_deref())
                     }
                 }
             }
@@ -804,249 +813,14 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => pending_commands::run_host_broadcast_route(&snapshot, &config, &fallback_gist),
         },
 
-        Command::CodexHook(args) => match args.action {
-            CodexHookAction::ConfigureInstaller {
-                codex_home,
-                token_stdin,
-                command_rules,
-            } => integrations::codex::install::configure_installer(
-                codex_home,
-                token_stdin,
-                command_rules,
-            ),
-            CodexHookAction::InstallHooks { codex_home } => {
-                integrations::codex::install::run_install_hooks(codex_home).await
-            }
-            CodexHookAction::UninstallHooks { codex_home } => {
-                integrations::codex::install::run_uninstall_hooks(codex_home).await
-            }
-            CodexHookAction::UserPromptSubmit {
-                count,
-                max_items,
-                raw,
-                include_self,
-            } => {
-                integrations::codex::hook::run_user_prompt_submit(
-                    &home,
-                    count,
-                    max_items,
-                    raw,
-                    include_self,
-                )
-                .await
-            }
-            CodexHookAction::PostToolUse {
-                count,
-                max_items,
-                raw,
-                include_self,
-            } => {
-                integrations::codex::hook::run_post_tool_use(
-                    &home,
-                    count,
-                    max_items,
-                    raw,
-                    include_self,
-                )
-                .await
-            }
-            CodexHookAction::Poll {
-                count,
-                max_items,
-                raw,
-                include_self,
-                wait_ms,
-            } => {
-                integrations::codex::hook::run_poll(
-                    &home,
-                    count,
-                    max_items,
-                    raw,
-                    include_self,
-                    wait_ms,
-                )
-                .await
-            }
-        },
+        Command::CodexHook(args) => args.run(&home).await,
+        Command::ClaudeHook(args) => args.run(&home).await,
 
         Command::CodexStart(args) => {
             integrations::codex::start::run(&args.airc, &args.home, &args.log, args.join_args).await
         }
 
-        Command::Work(args) => match args.action {
-            WorkAction::Create {
-                room,
-                repo,
-                title,
-                body,
-                lane_id,
-                priority,
-            } => work_commands::run_create(&home, room, repo, title, body, lane_id, priority).await,
-            WorkAction::Seed {
-                repo,
-                title,
-                body,
-                lane_id,
-                priority,
-                evidence_key,
-            } => {
-                work_commands::run_seed(&home, repo, title, body, lane_id, priority, evidence_key)
-                    .await
-            }
-            WorkAction::Claim {
-                room,
-                card_id,
-                ttl_ms,
-                no_lease_required,
-            } => work_commands::run_claim(&home, room, card_id, ttl_ms, no_lease_required).await,
-            WorkAction::Heartbeat {
-                room,
-                card_id,
-                claim_id,
-                ttl_ms,
-            } => work_commands::run_heartbeat(&home, room, card_id, claim_id, ttl_ms).await,
-            WorkAction::Release {
-                room,
-                card_id,
-                claim_id,
-                reason,
-            } => work_commands::run_release(&home, room, card_id, claim_id, reason).await,
-            WorkAction::Update {
-                room,
-                card_id,
-                title,
-                body,
-                priority,
-            } => work_commands::run_update(&home, room, card_id, title, body, priority).await,
-            WorkAction::State {
-                room,
-                card_id,
-                state,
-            } => work_commands::run_state(&home, room, card_id, state).await,
-            WorkAction::Close { room, card_id } => {
-                work_commands::run_close(&home, room, card_id).await
-            }
-            WorkAction::Cleanup { dry_run, force } => {
-                work_commands::run_cleanup(&home, dry_run, force).await
-            }
-            WorkAction::Board {
-                room,
-                limit,
-                available,
-                mine,
-                others,
-            } => {
-                let filter = work_commands::BoardFilter::from_flags(available, mine, others);
-                work_commands::run_board(&home, room, limit, filter).await
-            }
-            WorkAction::Next {
-                repo,
-                max_priority,
-                exclude_stale,
-                limit,
-                event_limit,
-                check_idle,
-            } => {
-                work_commands::run_next(
-                    &home,
-                    repo,
-                    max_priority,
-                    !exclude_stale,
-                    limit,
-                    event_limit,
-                    check_idle,
-                )
-                .await
-            }
-            WorkAction::Roster {
-                repo,
-                event_limit,
-                active_within_ms,
-            } => work_commands::run_roster(&home, repo, event_limit, active_within_ms).await,
-            WorkAction::Manage {
-                repo,
-                max_priority,
-                exclude_stale,
-                limit,
-                event_limit,
-                active_within_ms,
-            } => {
-                work_commands::run_manage(
-                    &home,
-                    repo,
-                    max_priority,
-                    !exclude_stale,
-                    limit,
-                    event_limit,
-                    active_within_ms,
-                )
-                .await
-            }
-            WorkAction::Review {
-                room,
-                parent_id,
-                pr,
-                priority,
-                body,
-            } => work_commands::run_review(&home, room, parent_id, pr, priority, body).await,
-            WorkAction::Availability {
-                repo,
-                state,
-                note,
-                ttl_ms,
-            } => work_commands::run_availability(&home, repo, state, note, ttl_ms).await,
-            WorkAction::Merger { action } => match action {
-                work_cli::MergerAction::Run {
-                    interval_secs,
-                    dry_run,
-                } => {
-                    merger::run(
-                        &home,
-                        std::time::Duration::from_secs(interval_secs),
-                        dry_run,
-                    )
-                    .await
-                }
-            },
-            WorkAction::Merge {
-                room,
-                card_id,
-                dry_run,
-                pending_timeout_secs,
-            } => {
-                work_commands::run_merge(&home, room, card_id, dry_run, pending_timeout_secs).await
-            }
-            WorkAction::Link { room, card_id, pr } => {
-                work_commands::run_link(&home, room, card_id, pr).await
-            }
-            WorkAction::Relink { card_id, pr } => {
-                work_commands::run_relink(&home, card_id, pr).await
-            }
-            WorkAction::Submit {
-                card_id,
-                patch,
-                base,
-                instance,
-                room,
-            } => work_commands::run_submit(&home, room, card_id, patch, base, instance).await,
-            WorkAction::SubmissionReview {
-                review_card_id,
-                outcome,
-                evidence_file,
-                submission,
-                room,
-            } => {
-                work_commands::run_submission_review(
-                    &home,
-                    room,
-                    review_card_id,
-                    outcome,
-                    evidence_file,
-                    submission,
-                )
-                .await
-            }
-        },
+        Command::Work(args) => args.run(&home).await,
 
         Command::Lane(args) => match args.action {
             LaneAction::Create { repo, title, state } => {
@@ -1095,6 +869,8 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 field,
             } => worktree_lane_commands::run_find(&registry, &target, &field),
         },
+
+        Command::AgentResume(args) => agent_resume::run(&home, args).await,
 
         Command::Monitor(args) => match args.action {
             MonitorAction::Format { peers_dir, my_name } => {
@@ -1148,184 +924,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             WorkspaceAction::List { limit: _ } => workspace_commands::run_list(&home).await,
         },
 
-        Command::QueueCard(args) => match args.action {
-            QueueCardAction::Body {
-                id,
-                branch,
-                owner,
-                status,
-                blockers,
-                environment,
-                evidence,
-                next_action,
-                last_heartbeat,
-            } => queue_card_commands::run_body(queue_card_commands::QueueCardInput {
-                id,
-                branch,
-                owner,
-                status,
-                blockers,
-                environment,
-                evidence,
-                next_action,
-                last_heartbeat,
-            }),
-            QueueCardAction::MutateBody {
-                body_file,
-                mutations_file,
-                log_msg,
-                timestamp,
-            } => queue_card_commands::run_mutate_body(
-                &body_file,
-                &mutations_file,
-                &log_msg,
-                &timestamp,
-            ),
-            QueueCardAction::ClaimFields { body_file } => {
-                queue_card_commands::run_claim_fields(&body_file)
-            }
-            QueueCardAction::DispatchMessage {
-                target_agent,
-                extra_message,
-                next_json_file,
-            } => queue_card_commands::run_dispatch_message(
-                &target_agent,
-                &extra_message,
-                &next_json_file,
-            ),
-            QueueCardAction::AdoptBody {
-                issue_json_file,
-                queue_body_file,
-                force,
-            } => queue_card_commands::run_adopt_body(&issue_json_file, &queue_body_file, force),
-            QueueCardAction::NudgeSummary { raw_json_file } => {
-                queue_card_commands::run_nudge_summary(&raw_json_file)
-            }
-            QueueCardAction::NudgeCardMeta { issue_file } => {
-                queue_card_commands::run_nudge_card_meta(&issue_file)
-            }
-            QueueCardAction::List {
-                repo,
-                owner,
-                status,
-                json,
-                raw_json_file,
-            } => queue_card_projection::run_list(&repo, &owner, &status, json, &raw_json_file),
-            QueueCardAction::Stale {
-                repo,
-                stale_after,
-                json,
-                raw_json_file,
-            } => queue_card_projection::run_stale(&repo, &stale_after, json, &raw_json_file),
-            QueueCardAction::Next {
-                repo,
-                owner,
-                base,
-                repo_root,
-                json,
-                raw_json_file,
-            } => queue_card_projection::run_next(
-                &repo,
-                &owner,
-                &base,
-                &repo_root,
-                json,
-                &raw_json_file,
-            ),
-            QueueCardAction::Pongs {
-                repo,
-                sweep_id,
-                since,
-                json,
-                cards_file,
-                messages_file,
-            } => queue_card_runtime::run_pongs(
-                &repo,
-                &sweep_id,
-                &since,
-                json,
-                &cards_file,
-                &messages_file,
-            ),
-            QueueCardAction::Availability {
-                repo,
-                sweep_id,
-                since,
-                stale_after,
-                json,
-                cards_file,
-                messages_file,
-            } => queue_card_runtime::run_availability(
-                &repo,
-                &sweep_id,
-                &since,
-                &stale_after,
-                json,
-                &cards_file,
-                &messages_file,
-            ),
-            QueueCardAction::ReviewRefs {
-                repo,
-                raw_json_file,
-            } => queue_card_staleness::run_review_refs(&repo, &raw_json_file),
-            QueueCardAction::PrMeta { pr_file } => queue_card_staleness::run_pr_meta(&pr_file),
-            QueueCardAction::StalenessAnalyze {
-                repo_root,
-                pr_repo,
-                pr_num,
-                base_ref,
-                head_ref,
-                base_git_ref,
-                head_git_ref,
-                merge_base,
-                pr_url,
-                limit_lines,
-                json,
-                files_file,
-                diff_file,
-                base_new_file,
-            } => queue_card_staleness::run_staleness_analyze(
-                queue_card_staleness::StalenessAnalyzeInput {
-                    repo_root: &repo_root,
-                    pr_repo: &pr_repo,
-                    pr_num: &pr_num,
-                    base_ref: &base_ref,
-                    head_ref: &head_ref,
-                    base_git_ref: &base_git_ref,
-                    head_git_ref: &head_git_ref,
-                    merge_base: &merge_base,
-                    pr_url: &pr_url,
-                    limit: limit_lines,
-                    output_json: json,
-                    files_file: &files_file,
-                    diff_file: &diff_file,
-                    base_new_file: &base_new_file,
-                },
-            ),
-            QueueCardAction::CloseMergedMeta { pr_file } => {
-                queue_card_commands::run_close_merged_meta(&pr_file)
-            }
-            QueueCardAction::CloseMergedRefs { pr_file, repo } => {
-                queue_card_commands::run_close_merged_refs(&pr_file, &repo)
-            }
-            QueueCardAction::CardStatus { body_file } => {
-                queue_card_commands::run_card_status(&body_file)
-            }
-            QueueCardAction::Plan {
-                repo,
-                owner,
-                stale_after,
-                json,
-                raw_json_file,
-            } => queue_card_plan::run_plan(&repo, &owner, &stale_after, json, &raw_json_file),
-            QueueCardAction::Steward {
-                repo,
-                owner,
-                stale_after,
-                json,
-                raw_json_file,
-            } => queue_card_plan::run_steward(&repo, &owner, &stale_after, json, &raw_json_file),
-        },
+        Command::QueueCard(args) => args.run(),
 
         Command::Humanhash { hex_input, words } => {
             println!("{}", airc_core::humanhash(&hex_input, words)?);

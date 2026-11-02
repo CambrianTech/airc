@@ -44,10 +44,7 @@ async fn the_wall_snapshots_and_resumes_across_its_cursor_without_gap_or_dup() {
         vec!["A".to_string(), "B".to_string()]
     );
 
-    let snapshot = alice
-        .home()
-        .join("wall-cache")
-        .join(format!("{}.json", room.channel));
+    let snapshot = common::projection_cache::only_snapshot(&alice.home().join("wall-cache"));
     assert!(
         snapshot.is_file(),
         "the first read snapshots the wall at {}",

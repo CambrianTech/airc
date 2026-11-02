@@ -54,7 +54,8 @@ mod store;
 
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Status {
     Ok,
     Info,
@@ -63,7 +64,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Status::Ok => "[ok]",
             Status::Info => "[info]",
@@ -73,6 +74,7 @@ impl Status {
     }
 }
 
+#[derive(serde::Serialize)]
 pub struct Finding {
     pub status: Status,
     pub check: &'static str,
@@ -229,6 +231,17 @@ fn registry() -> Vec<Box<dyn Check>> {
     ]
 }
 
+/// Transport consumers share the same timestamped daemon observation and
+/// delivery interpretation as doctor. No local discovery or redial is performed.
+pub(crate) async fn transport_findings(home: &Path) -> Vec<Finding> {
+    let ctx = CheckContext {
+        home,
+        delivery_stats: tokio::sync::OnceCell::new(),
+    };
+    let mut findings = health::RouteHealthCheck.run(&ctx).await;
+    findings.extend(delivery::DeliveryTruthCheck.run(&ctx).await);
+    findings
+}
 pub async fn run(home: &Path, fix: bool, health: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("airc doctor — scope: {}", home.display());
     println!();
@@ -441,6 +454,54 @@ mod tests {
             .contains("IPC unavailable"));
     }
 
+    // A successful daemon observation must not open, create, or migrate stores.
+    #[tokio::test]
+    async fn fresh_delivery_observation_does_not_touch_scope_files(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let home = directory.path().join("scope");
+        let now = health::now_ms().ok_or("clock unavailable")?;
+        let context = CheckContext {
+            home: &home,
+            delivery_stats: tokio::sync::OnceCell::new(),
+        };
+        context
+            .delivery_stats
+            .set(Ok(airc_ipc::DeliveryStatsResponse {
+                peers: vec![airc_ipc::IpcPeerDeliveryStats {
+                    peer_id: airc_core::PeerId::from_u128(42),
+                    attempts: 1,
+                    acked: 1,
+                    attempts_since_ack: 0,
+                    last_attempt_ms: Some(now),
+                    last_ack_ms: Some(now),
+                    rtt_ema_ms: Some(1),
+                    suspect: false,
+                }],
+                sampled_at_ms: Some(now),
+                connected_lan_peers: Some(1),
+            }))
+            .map_err(|_| "snapshot already set")?;
+        for existing in [false, true] {
+            if existing {
+                std::fs::create_dir(&home)?;
+                std::fs::write(home.join("events.sqlite"), b"older store sentinel")?;
+            }
+            let findings = delivery::DeliveryTruthCheck.run(&context).await;
+            assert_eq!(findings.len(), 2);
+            assert_eq!(findings[0].status, Status::Ok);
+            if existing {
+                assert_eq!(
+                    std::fs::read(home.join("events.sqlite"))?,
+                    b"older store sentinel"
+                );
+                assert_eq!(std::fs::read_dir(&home)?.count(), 1);
+            } else {
+                assert!(!home.exists());
+            }
+        }
+        Ok(())
+    }
     // Both registered checks must retain a failed shared read as unavailable;
     // neither may open another handle or replace it with an empty success.
     #[tokio::test]

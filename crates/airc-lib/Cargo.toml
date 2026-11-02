@@ -67,6 +67,8 @@ webrtc = { version = "0.20.0-alpha.1", default-features = false, features = ["ru
 mock = []
 
 [dev-dependencies]
+# Test binaries may open stores without installing a write admission.
+airc-store = { path = "../airc-store", features = ["test-fixtures"] }
 airc-daemon = { path = "../airc-daemon" }
 airc-protocol = { path = "../airc-protocol" }
 # Stub AccountRegistryStore rendezvous in integration tests

@@ -57,3 +57,28 @@ Explicit `airc join` also resumes operator-stop intent. Automatic consumers use
 Aliases `airc upgrade` and `airc pull` dispatch to the same updater. Installed
 skill changes are separate from binary adoption; read the updated skill when
 its instructions are needed.
+
+## Verified prebuilt preparation
+
+For an already downloaded and checksum-verified CI/release artifact, set
+`AIRC_PREBUILT_ARTIFACT` to the extracted executable and
+`AIRC_PREBUILT_SHA256` to its 64-digit SHA-256, then run ordinary `airc update`.
+Verify the archive's published checksum before extraction; the binary checksum
+pins the extracted bytes supplied to the updater. The artifact must report the
+current update channel revision. Scope these variables to this invocation and
+clear them afterward.
+
+The current installer copies the input into the updater-owned preparation
+snapshot, verifies its digest before executing it, and checks its build revision.
+Invalid/missing input refuses before maintenance; explicit prebuilt input never
+falls back to compilation. Existing installed updater versions can use this
+path because they invoke the newly fetched installer with their environment.
+Maintenance, rollback, operator-stop intent and daemon revision verification
+remain owned by the existing updater. Do not call installer `--prebuilt` directly
+against a running installation: that phase assumes updater-owned maintenance.
+
+Without explicit artifact input, preparation downloads the checkout's published
+stable-tag or immutable canary-revision artifact and verifies its checksum and
+build identity through the shared installer. An unpublished revision refuses
+before maintenance; it never falls back to compilation. Contributors may opt
+into source preparation with invocation-scoped `AIRC_DEVELOPER_BUILD=1`.

@@ -299,7 +299,7 @@ send_general_from_continuum "$MONITOR_MESSAGE" "$ROOT/monitor-msg.out" "$ROOT/mo
 
 # Cross-daemon live delivery — re-enabled when card e51ab14e closed
 # the per-project daemon socket gap. `default_socket_path_in`
-# (crates/airc-cli/src/cli.rs:183) now consolidates every project
+# (crates/airc-lib/src/socket_path.rs) now consolidates every project
 # scope under $HOME onto the same machine-singular daemon socket,
 # so openclaw's monitor and continuum's msg-sender share the same
 # daemon → live events propagate without a shared-store tail.

@@ -91,11 +91,12 @@ public static class FakeUpdater {
 '@ | Set-Content (Join-Path $scratch 'fake-updater.cs')
     Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe" @('/nologo','/target:exe',('/out:'+(Join-Path $scratch 'fake-updater.exe')),(Join-Path $scratch 'fake-updater.cs'))
     if ($LASTEXITCODE -ne 0) { throw 'Synthetic updater compile failed.' }
-    foreach($case in @(@{Auto=$false;Code=0},@{Auto=$true;Code=200},@{Auto=$false;Code=23})) {
+    foreach($case in @(@{Auto=$false;Code=0;Revision=''},@{Auto=$true;Code=200;Revision='1234567890123456789012345678901234567890'},@{Auto=$false;Code=23;Revision='abcdefabcdefabcdefabcdefabcdefabcdefabcd'})) {
         $env:AIRC_SESSION_TEST_LOG=Join-Path $scratch ([guid]::NewGuid().ToString('N')+'.log')
         $env:AIRC_SESSION_TEST_CODE=[string]$case.Code
         $arguments=@('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',(Join-Path $windows 'install-session.ps1'),'-SourceDirectory',$scratch,'-UpdaterPath',(Join-Path $scratch 'fake-updater.exe'),'-HomePath',(Join-Path $scratch 'home with spaces'))
         if($case.Auto) { $arguments+='-AutoUpdate' }
+        if($case.Revision) { $arguments+=@('-Revision',$case.Revision) }
         $output=@(Invoke-InstallerProcess -OwnProcessTree "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" $arguments 2>&1)
         $expected=if($case.Code -eq 200){1}else{$case.Code}
         if($LASTEXITCODE -ne $expected) {throw "Public status changed: $LASTEXITCODE expected $expected; $output"}
@@ -107,6 +108,7 @@ public static class FakeUpdater {
         if($owners.Count -ne 1 -or ($off[0] -split ' ')[3] -ne $owners[0]) {throw "Elevation owner changed: $lines"}
         $wanted='args:--home|'+(Join-Path $scratch 'home with spaces')+'|update'
         if($case.Auto){$wanted+='|--auto'}
+        if($case.Revision){$wanted+='|--revision|'+$case.Revision}
         if($lines -notcontains $wanted){throw "Update arguments changed: $lines"}
     }
     Write-Host 'PASS: public update session shares one owner across two phases, cleans once, preserves args and maps verified recovery to public failure.'

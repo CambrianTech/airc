@@ -26,7 +26,7 @@ pub async fn run_request(
     // ([[no-fallbacks-ever]]).
     let base = match base {
         Some(explicit) => explicit,
-        None => crate::work_commands_gh::configured_base_branch(&repo).ok_or_else(|| {
+        None => airc_lib::work_repository::configured_base_branch(&repo).ok_or_else(|| {
             format!(
                 "no integration branch configured for {} — pass --base explicitly \
                  (or add the repo to configured_base_branch)",

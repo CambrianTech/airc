@@ -23,7 +23,7 @@ use crate::subscriptions::StoredSubscription;
 /// is the canonical position; lamport is the primary order, event_id
 /// is the deterministic tiebreaker.
 #[async_trait]
-pub trait EventStore: Send + Sync {
+pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// Load the default-agent local identity row, if present.
     ///
     /// Equivalent to [`Self::load_local_identity_by_agent_name`] with
@@ -94,6 +94,23 @@ pub trait EventStore: Send + Sync {
     /// This is the "give me what I haven't seen yet" call subscribers
     /// use to resume from disk after a restart or after the in-memory
     /// fan-out path missed a frame.
+    /// Match `rule` (headers, and addressee when set) before the page limit
+    /// within a fixed snapshot.
+    async fn matching_history(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        rule: airc_core::HistoryMatch<'_>,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Vec<TranscriptEvent>, StoreError> {
+        let _ = (after, through, channels, rule, limit, tail);
+        Err(StoreError::Database(sea_orm::DbErr::Custom(
+            "filtered history unsupported".into(),
+        )))
+    }
+
     async fn resume_from(
         &self,
         cursor: &TranscriptCursor,
@@ -159,6 +176,12 @@ pub trait EventStore: Send + Sync {
     /// never parses the value or arbitrates the version — consumers own
     /// those semantics.
     async fn set_scoped_state(&self, entry: StoredScopedState) -> Result<(), StoreError>;
+
+    /// Write `entry` only if its `value_json` orders after the stored one (byte order), in one
+    /// atomic statement: a monotonic register shared across processes. A consumer that encodes
+    /// its value order-preservingly gets a value that never moves back, however writers
+    /// interleave. Returns whether this write advanced it.
+    async fn advance_scoped_state(&self, entry: StoredScopedState) -> Result<bool, StoreError>;
 
     /// List every scoped-state row under `scope_key`, `key` ascending.
     /// Backs dashboard / RAG enumeration of a scope's walls.
