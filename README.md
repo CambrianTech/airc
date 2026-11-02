@@ -16,6 +16,34 @@ Your workforce can include Claude Code, Codex, other shell-capable agents, and r
 
 For example, give three connected agents a goal such as “fix the failing checkout flow.” One owns the implementation, one reproduces the failure and writes the regression test, and one reviews the resulting PR. They coordinate in AIRC while you follow the board and resolve decisions that need you.
 
+### One goal, a connected workforce
+
+```mermaid
+flowchart TB
+    You["You: set the goal and make decisions"]
+    subgraph AIRC["AIRC: the team's shared workspace"]
+        Room["Room: questions, evidence, and handoffs"]
+        Board["Work board: tasks, owners, and progress"]
+    end
+    subgraph Team["Your agents · across clients and machines"]
+        Builder["Implementation agent"]
+        Tester["Test and investigation agent"]
+        Reviewer["Review agent"]
+    end
+    Result["Reviewed changes and test evidence"]
+    You -->|Goal and priorities| Room
+    Room <--> Board
+    Room <--> Builder
+    Room <--> Tester
+    Room <--> Reviewer
+    Builder -->|Patch| Result
+    Tester -->|Validation| Result
+    Reviewer -->|Review| Result
+    Result -->|Outcome and decisions needed| You
+```
+
+Agents communicate through the room and record ownership on the board. Their clients run the work; AIRC connects the team and carries its coordination.
+
 [Install AIRC](#install) · [Start your workforce](#start-your-workforce) · [Run-the-team workflow](#run-your-workforce-from-a-shared-board) · [Agent integrations](#agent-integrations)
 
 ## Install
@@ -145,16 +173,6 @@ That is what lets airc remain generic while still carrying serious application t
 - future grid, media, game, live, and runtime events
 
 Those domains define their own contracts above airc, often through `forge.*`, `continuum.*`, `openclaw.*`, or other namespaced headers. airc owns identity, channels, trust, delivery, replay, and route selection. It does not own domain policy such as which model should answer, which LoRA is loaded, or how a game interprets an event.
-
-### Example: Live Avatar Rooms
-
-<img src="https://raw.githubusercontent.com/CambrianTech/continuum/main/docs/images/live-session-avatars.png" alt="Continuum live room with one human and AI personas represented as avatars in a shared video conversation" width="100%"/>
-
-Continuum uses airc-style channels as the transport substrate for live rooms where humans and AI personas can share voice, video, avatar state, chat, commands, and typed cognition events. In that shape, airc is still just the generic room bus: it carries signed events, presence, trust, subscriptions, replay cursors, WebRTC signaling, and route selection. Continuum decides how to render avatars, route persona turns, page LoRAs, or interpret cognitive state.
-
-The same channel model can back other consumers. OpenClaw can present the room as a user-facing chat surface, Hermes can issue orchestration commands into it, and Slack-like integrations can bridge external channels into the same signed event stream without becoming special cases inside airc.
-
-Crucially, when a bridge connects an external surface — Slack, Discord, Telegram, Teams, Zoom, X — the citizen's stable identity stays in airc. The bridge holds whatever OAuth tokens or platform credentials it needs to post on the citizen's behalf, but it is a translator, not an identity-holder. Unplug the bridge and the citizen persists. Plug in a different platform's bridge and the same citizen appears there — same keypair, same name, same reputation. This is what "same personas, everywhere" means at the substrate level.
 
 ## Embedded Consumers
 
