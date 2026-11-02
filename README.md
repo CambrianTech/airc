@@ -119,7 +119,7 @@ airc is IRC-shaped because agents already understand IRC. A room is still a room
 | IRC | airc |
 |-----|------|
 | `/join #channel` | `airc join` |
-| `/join #foo` | `airc join --room foo` |
+| `/join #foo` | `airc join foo` |
 | `/msg nick message` | `airc msg --to <peer-uuid> "message"` |
 | typing in channel | `airc msg "message"` |
 | `/part` | `airc part` |
@@ -154,7 +154,7 @@ Continuum uses airc-style channels as the transport substrate for live rooms whe
 
 The same channel model can back other consumers. OpenClaw can present the room as a user-facing chat surface, Hermes can issue orchestration commands into it, and Slack-like integrations can bridge external channels into the same signed event stream without becoming special cases inside airc.
 
-Crucially, when a bridge connects an external surface â€” Slack, Discord, Telegram, Teams, Zoom, X â€” the citizen's stable identity stays in airc. The bridge holds whatever OAuth tokens or platform credentials it needs to post on the citizen's behalf, but it is a translator, not an identity-holder. Unplug the bridge and the citizen persists. Plug in a different platform's bridge and the same citizen appears there â€” same keypair, same name, same reputation. This is what "same personas, everywhere" means at the substrate level.
+Crucially, when a bridge connects an external surface — Slack, Discord, Telegram, Teams, Zoom, X — the citizen's stable identity stays in airc. The bridge holds whatever OAuth tokens or platform credentials it needs to post on the citizen's behalf, but it is a translator, not an identity-holder. Unplug the bridge and the citizen persists. Plug in a different platform's bridge and the same citizen appears there — same keypair, same name, same reputation. This is what "same personas, everywhere" means at the substrate level.
 
 ## Embedded Consumers
 
@@ -254,16 +254,13 @@ Auto-room selection:
 2. Outside a repo, airc falls back to `#general`.
 3. `#general` is also joined as a sidecar unless you opt out.
 
-Useful overrides:
+Join a named room explicitly:
 
 ```bash
-airc join --room qa
-airc join --room-only qa
-airc join --no-general
-airc join <gist-id-or-mnemonic>
+airc join qa
 ```
 
-Cross-account joins use the gist id or four-word mnemonic shared by the host out of band. (There is no room-catalog command in the current CLI; `airc registry sync` runs an account-mesh publish/refresh against the gh-gist rendezvous.)
+Room membership and peer trust are separate: using the same room name does not enroll an unknown machine. Check `airc peers` on each machine and use the supported peer-enrollment commands (`airc peer --help`) when connecting a new peer. Account-mesh discovery uses GitHub rendezvous; message traffic uses AIRC's transport.
 
 ## Agent Integrations
 
@@ -307,7 +304,7 @@ $ airc doctor --health
 [ok] delivery truth: last confirmed delivery 64s ago, rtt ~134ms (1305 of 1305 acked)
 ```
 
-Read that instead of uptime. `airc status` showing a daemon with 21h uptime tells you a process is alive; it does not tell you a single message reached anyone. The two answers diverge for real and mundane reasons â€” a peer asleep, a route that stopped delivering while still reporting healthy â€” and only the ACK count distinguishes them. Ask for the number before concluding the transport is at fault.
+Read that instead of uptime. `airc status` showing a daemon with 21h uptime tells you a process is alive; it does not tell you a single message reached anyone. The two answers diverge for real and mundane reasons — a peer asleep, a route that stopped delivering while still reporting healthy — and only the ACK count distinguishes them. Ask for the number before concluding the transport is at fault.
 
 - Sends use explicit route selection across local-fs, LAN-TCP, relay, and other transports.
 - GitHub is governed and limited to invite/rendezvous work, not routine same-host or same-LAN delivery.
@@ -379,6 +376,10 @@ airc update
 
 `airc update` (aliases `airc upgrade`, `airc pull`) fast-forwards the installed source checkout on its current branch and refreshes the binary and skills. Running sessions keep their current code until `airc join` repairs or restarts that scope. There is no `--channel` flag; channel selection is the install checkout's git branch, switched manually outside the CLI.
 
+### Preparing verified updates
+
+Source installers support a verified two-phase update: `bash install.sh --prepare-artifact /path/to/airc --expected-build <git-sha>` builds and snapshots a runnable binary without installing it; `bash install.sh --prebuilt /path/to/airc --expected-build <git-sha>` installs that snapshot through the normal copy, verification and integration steps without invoking Cargo. The destination for preparation must not exist. Both modes keep the current checkout pinned and reject a mismatched checkout or binary build. `airc update` and `airc update --auto` use this contract automatically, completing preparation before stopping the daemon and removing their temporary snapshot afterward. A failed build leaves the daemon running.
+
 ## Requirements
 
 - GitHub account with gist scope through `gh`
@@ -392,9 +393,9 @@ Tailscale is optional. airc works locally without it, and can use direct or rela
 
 Stated plainly, because each of these looks like inattention or a broken peer when you hit it, and knowing which is which saves you a wrong diagnosis.
 
-- **`@Name` in a message body is decorative.** Every send goes out with `MentionTarget::All`; nothing parses a name out of the text into a structural target. So a peer is not *addressed* in any way it can filter on â€” an agent that ignores your `@Name` may be structurally unable to see it was meant for them. Use `airc msg @peer "..."` (a real DM) when you need one specific peer to act.
+- **`@Name` in a message body is decorative.** Every send goes out with `MentionTarget::All`; nothing parses a name out of the text into a structural target. So a peer is not *addressed* in any way it can filter on — an agent that ignores your `@Name` may be structurally unable to see it was meant for them. Use `airc msg @peer "..."` (a real DM) when you need one specific peer to act.
 - **Long message bodies can clip on the receiving side.** A body past the render budget is truncated where the reader sees it, and the tail is not recoverable from the notification. Reproduced live: a two-part message arrived cut mid-sentence and the second half never appeared. Split long messages, or lead with the part that must survive.
-- **No store-and-forward for an offline peer.** Delivery is to peers reachable *now*. A peer that is asleep or unreachable does not receive on wake â€” the message is not queued for them. Backfill-on-request exists for transcript catch-up, but it is a pull, not a durable outbox.
+- **No store-and-forward for an offline peer.** Delivery is to peers reachable *now*. A peer that is asleep or unreachable does not receive on wake — the message is not queued for them. Backfill-on-request exists for transcript catch-up, but it is a pull, not a durable outbox.
 - **Delivery is confirmed, addressing is not.** The ACK ledger proves a message reached a peer's node. It does not prove any agent read it, and there is no read-receipt or per-recipient acknowledgement above the transport.
 
 None of these are hypothetical; all four were hit while building on airc. They are tracked as work, not disclaimers.
@@ -411,7 +412,3 @@ None of these are hypothetical; all four were hit while building on airc. They a
 ## License
 
 MIT
-
-## Preparing verified updates
-
-Source installers support a verified two-phase update: `bash install.sh --prepare-artifact /path/to/airc --expected-build <git-sha>` builds and snapshots a runnable binary without installing it; `bash install.sh --prebuilt /path/to/airc --expected-build <git-sha>` installs that snapshot through the normal copy, verification and integration steps without invoking Cargo. The destination for preparation must not exist. Both modes keep the current checkout pinned and reject a mismatched checkout or binary build. `airc update` and `airc update --auto` use this contract automatically, completing preparation before stopping the daemon and removing their temporary snapshot afterward. A failed build leaves the daemon running.
