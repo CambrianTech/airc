@@ -38,16 +38,16 @@ mod windows_pipe_security;
 /// that an already-running daemon cannot parse. The default CLI socket
 /// includes this value so `airc join` starts a current daemon instead of
 /// connecting to a stale daemon that speaks the previous protocol.
-// v5: owner-core contract — no `wire`/`Subscribe`/`ResolveWire`; live +
-// inbox events cross as airc-wire bytes; cursor is `(epoch, counter)`.
-// Bumped from 4 so a v4 daemon and a v5 client never share a socket.
-pub const IPC_PROTOCOL_VERSION: u16 = 5;
+// v6: authenticated addressed attach/challenge/proof and opaque addressed
+// frames. A v5 daemon cannot serve this contract; use a distinct endpoint.
+pub const IPC_PROTOCOL_VERSION: u16 = 6;
 
 pub use client::{ClientError, DaemonClient};
 pub use request::{
-    AddPeerRequest, AttachParts, AttachRequest, AttachStart, ChannelAttach, InboxRequest,
-    IpcCursor, IpcDelivery, IpcKind, IpcTarget, PeerIdentityCardRequest, PresenceRequest,
-    PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
+    AddPeerRequest, AddressedRequest, AttachAddressedRequest, AttachParts, AttachRequest,
+    AttachStart, ChannelAttach, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
+    PeerIdentityCardRequest, PresenceRequest, PublishRequest, RemovePeerRequest, Request,
+    RoomTipRequest, SendRequest,
 };
 pub use response::{
     DeliveryStatsResponse, InboxResponse, IpcIdentityCard, IpcPeerDeliveryStats, IpcRoomInfo,

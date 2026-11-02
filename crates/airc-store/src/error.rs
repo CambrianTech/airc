@@ -18,9 +18,25 @@ pub enum StoreError {
     #[error("store lock poisoned")]
     LockPoisoned,
 
+    /// A file store opened in a process that installed no write admission.
+    #[error(transparent)]
+    NotAdmitted(#[from] crate::custody::NotAdmitted),
+
     /// Migration error during `open`.
     #[error("store migration error: {0}")]
     Migration(String),
+
+    /// The database was migrated by a newer airc: it records migrations this
+    /// binary does not have. Opening it for writing is refused, because this
+    /// binary would store rows without the data the newer one derives at every
+    /// write (addressing columns, header rows).
+    #[error(
+        "this database was migrated by a newer airc (unknown migrations: {}); \
+         refusing to open it for writing, since this binary would store rows without \
+         what the newer one derives. Update airc on this machine (`airc update`).",
+        versions.join(", ")
+    )]
+    AheadOfBinary { versions: Vec<String> },
 
     /// Tried to append an event whose `event_id` already exists.
     /// EventId is a UUIDv4 so honest senders won't collide; this

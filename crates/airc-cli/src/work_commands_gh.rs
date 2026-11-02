@@ -5,7 +5,7 @@
 //!
 //! Card c0bd865c phase 4 (c7bdf2df). The extracted handlers:
 //!
-//!   - `open_pr_and_link` — best-effort: from a card's worktree,
+//!   - `open_pr_and_link` — from a card's worktree,
 //!     run `gh pr create` against the configured base, parse the
 //!     created PR's URL/number, and emit `PullRequestLinked` so the
 //!     projection picks it up.
@@ -18,16 +18,16 @@
 //!     opens PRs against (rust-rewrite). Hardcoded per card 28f1440c.
 
 use crate::lease;
+use airc_lib::work_repository::configured_base_branch;
 
-/// Best-effort: open a GitHub PR for the work card's worktree branch
-/// and link it via `WorkEvent::PullRequestLinked`. Returns Err so
-/// run_state can surface as a warning without aborting the state
-/// transition.
+/// Open and link a PR before the caller advertises Review. Prerequisite failures
+/// leave the card in its current state and are returned to the caller.
 pub(crate) async fn open_pr_and_link(
     airc: &airc_lib::Airc,
     home: &std::path::Path,
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
+    workspace: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use airc_work::model::{BranchName, PullRequestRef};
 
@@ -37,17 +37,33 @@ pub(crate) async fn open_pr_and_link(
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
-    if card.pull_request.is_some() {
-        // Already linked; nothing to do. Re-running `state review` on
-        // a card that's already been reviewed is a no-op for the PR
-        // side.
+    if card.reviews.is_some() || card.pull_request.is_some() {
+        // Review-only verdicts and already-linked PRs keep their existing path.
         return Ok(());
     }
 
     let short = card.card_id.shown();
     let lease_root = lease::lease_root()
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
-    let worktree_path = lease_root.join(&short);
+    let canonical = lease_root.join(&short);
+    // Card 52bf7370: the canonical `<lease_root>/<short>` path is the default, unchanged.
+    // An explicit --workspace replaces it only after it is proven to be THIS card's: the
+    // caller holds the card's claim, and the checkout is a governed worktree on the card's
+    // branch and repo. The PR metadata, the patch submission and the pushed-head gate below
+    // all read this one path; there is no cwd fallback.
+    let worktree_path = match workspace {
+        None => canonical,
+        Some(candidate) => {
+            crate::work_commands::resolve_my_active_claim(airc, room, card_id).await?;
+            crate::work_commands_git::validate_review_workspace(
+                candidate,
+                &lease_root,
+                &short,
+                card.repo.as_str(),
+                &canonical,
+            )?
+        }
+    };
     if !worktree_path.exists() {
         return Err(format!(
             "no worktree at {} — claim was made before card d1b2798d shipped, or with --no-lease-required (re-claim from a worktree to get auto-PR on review)",
@@ -56,6 +72,7 @@ pub(crate) async fn open_pr_and_link(
         .into());
     }
     let worktree_str = worktree_path.to_string_lossy().to_string();
+    let head_branch = crate::work_commands_git::require_pushed_head(&worktree_str)?;
 
     // gh pr create — pass --title + --body explicitly from the HEAD
     // commit's metadata. `--fill` SOUNDS right but its heuristic
@@ -101,6 +118,8 @@ pub(crate) async fn open_pr_and_link(
             body.trim(),
             "--base",
             base_branch.as_str(),
+            "--head",
+            head_branch.as_str(),
         ])
         .output()?;
     if !create_out.status.success() {
@@ -118,8 +137,6 @@ pub(crate) async fn open_pr_and_link(
     // Resolve head from the worktree's git state. Base is the same
     // pinned value we passed to gh — the projection must record what
     // we actually opened the PR against, not gh's repo default.
-    let head_branch = crate::work_commands_git::git_rev_parse_branch(&worktree_str)?;
-
     let pull_request = PullRequestRef {
         repo: card.repo.clone(),
         number: pr_number,
@@ -183,46 +200,6 @@ pub(crate) fn extract_pr_number(url: &str) -> Option<u64> {
     let tail = trimmed.rsplit('/').next()?;
     tail.parse::<u64>().ok()
 }
-/// Card 70e87d33 — resolve the integration branch a card's PR opens
-/// against, PER REPO. Returns `Some(branch)` for repos whose
-/// integration branch is pinned (and is NOT their GitHub default), or
-/// `None` to signal "use the repo's GitHub default branch".
-///
-/// History: card 28f1440c hardcoded a single global `rust-rewrite`
-/// base because airc's substrate work lived on rust-rewrite, not its
-/// GitHub default (`main`). Correct for airc then, wrong for every other
-/// repo — continuum has no `rust-rewrite` branch, so `gh pr create
-/// --base rust-rewrite` failed, `PullRequestLinked` never fired, and
-/// the merger never saw the PR. The fix is per-repo, NOT a blanket
-/// default-branch switch (which would land PRs on main — the exact
-/// fallback 28f1440c set out to refuse).
-///
-/// Card 5e04ab56: airc's integration branch is now `canary`, and
-/// `rust-rewrite` no longer exists on the remote — so the airc pin
-/// itself had gone stale and `airc work state <card> review` could not
-/// open a PR for the airc repo at all ("No commits between rust-rewrite
-/// and <branch>, Base ref must be a branch"), i.e. the substrate's own
-/// disciplined review path was broken for its own repo. The invariant
-/// 28f1440c protects is unchanged: airc pins its integration branch and
-/// never falls through to `main`; only the branch's name moved.
-///
-/// `AIRC_PR_BASE` overrides everything (tests / one-offs). The carded
-/// end state surfaces this as `.airc/work.toml` per-repo config; for
-/// now the two known consumer repos are pinned inline.
-pub(crate) fn configured_base_branch(repo: &airc_work::RepoId) -> Option<String> {
-    if let Ok(base) = std::env::var("AIRC_PR_BASE") {
-        let base = base.trim();
-        if !base.is_empty() {
-            return Some(base.to_string());
-        }
-    }
-    match repo.as_str() {
-        "CambrianTech/airc" => Some("canary".to_string()),
-        "CambrianTech/continuum" => Some("canary".to_string()),
-        _ => None,
-    }
-}
-
 /// Card 70e87d33 (part b) — retroactively link an ALREADY-OPEN PR to a
 /// card by emitting `PullRequestLinked`. The auto-link in
 /// `open_pr_and_link` only fires when `airc work state review` itself
@@ -444,64 +421,4 @@ pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::e
         .into());
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use airc_work::RepoId;
-
-    fn repo(key: &str) -> RepoId {
-        RepoId::new(key).expect("test repo key valid")
-    }
-
-    /// Card 70e87d33: the per-repo base resolver. Kept in ONE test so
-    /// the process-global `AIRC_PR_BASE` env var can't race a sibling
-    /// test running in parallel in the same binary.
-    #[test]
-    fn configured_base_branch_is_per_repo_with_env_override_and_default_fallback() {
-        // No override env: pinned repos resolve to their integration
-        // branch (NOT their GitHub default of `main`).
-        std::env::remove_var("AIRC_PR_BASE");
-        assert_eq!(
-            configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
-            Some("canary"),
-            "airc must pin its integration branch (canary — card 5e04ab56 \
-             retired rust-rewrite), never fall through to main"
-        );
-        assert_eq!(
-            configured_base_branch(&repo("CambrianTech/continuum")).as_deref(),
-            Some("canary"),
-            "continuum must pin canary — the bug this card fixes"
-        );
-
-        // Unknown repo: None signals the caller to use the repo's real
-        // GitHub default branch (the safe, correct generic fallback).
-        assert_eq!(
-            configured_base_branch(&repo("SomeOrg/unknown-repo")),
-            None,
-            "unknown repos defer to their GitHub default, not a hardcoded base"
-        );
-
-        // Env override wins for every repo (tests / one-off retarget).
-        std::env::set_var("AIRC_PR_BASE", "release/x");
-        assert_eq!(
-            configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
-            Some("release/x"),
-            "AIRC_PR_BASE must override even a pinned repo"
-        );
-        assert_eq!(
-            configured_base_branch(&repo("SomeOrg/unknown-repo")).as_deref(),
-            Some("release/x"),
-            "AIRC_PR_BASE must override the default-branch fallback too"
-        );
-        // Blank/whitespace env is ignored (not treated as a real base).
-        std::env::set_var("AIRC_PR_BASE", "   ");
-        assert_eq!(
-            configured_base_branch(&repo("CambrianTech/airc")).as_deref(),
-            Some("canary"),
-            "blank AIRC_PR_BASE must not shadow the pinned base"
-        );
-        std::env::remove_var("AIRC_PR_BASE");
-    }
 }

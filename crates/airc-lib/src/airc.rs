@@ -411,6 +411,9 @@ pub(crate) struct AircInner {
     /// attached scope reads — not in this handle's private scope store.
     pub(crate) inbound_sink:
         std::sync::RwLock<Option<Arc<dyn crate::router_bridge::InboundFrameSink>>>,
+    /// Sessions and inbox for addressed traffic (`crate::addressed`), shared
+    /// by every handle on this identity.
+    pub(crate) addressed: Arc<crate::addressed::AddressedState>,
     /// #1306: the daemon's per-peer delivery ledger, set once at daemon
     /// boot ([`Airc::set_delivery_ledger`]) from the routed forwarder's
     /// accounting. Route refresh consults it to distrust "connected"
@@ -660,6 +663,9 @@ impl Airc {
         // an `agent_name` (the anonymous default-scope path never pins ids).
         peer_id: Option<PeerId>,
     ) -> Result<Self, AircError> {
+        // Every store this opens (identity, trust, the scope and coordinator
+        // stores) is admitted by this process's rule (`store_admission`).
+        crate::store_admission::install();
         std::fs::create_dir_all(&home).map_err(IdentityError::Io)?;
         let identity = match agent_name {
             Some(agent_name) => {
@@ -701,6 +707,11 @@ impl Airc {
                 .map_err(|e| AircError::Crypto(e.to_string()))?;
         }
         let (live_tx, _) = broadcast::channel(LIVE_BROADCAST_CAPACITY);
+        let addressed = Arc::new(crate::addressed::AddressedState::new(
+            &identity,
+            registry.clone(),
+            LIVE_BROADCAST_CAPACITY,
+        ));
 
         Ok(Self {
             inner: Arc::new(AircInner {
@@ -747,6 +758,7 @@ impl Airc {
                     airc_diagnostics::StderrJsonDiagnosticSink,
                 )),
                 inbound_sink: std::sync::RwLock::new(None),
+                addressed,
                 delivery_ledger: Arc::new(std::sync::OnceLock::new()),
             }),
         })
@@ -1291,6 +1303,7 @@ impl Airc {
                 // A wall post is history: durable, unchanged by the
                 // presence-plane work.
                 airc_bus::DeliveryClass::Durable,
+                airc_core::MentionTarget::All,
             )
             .await?;
         } else {
@@ -1688,6 +1701,7 @@ impl Airc {
             ack_tx: self.inner.ack_tx.clone(),
             diag_sink: std::sync::RwLock::new(self.diag_sink()),
             inbound_sink: std::sync::RwLock::new(self.inbound_frame_sink()),
+            addressed: self.inner.addressed.clone(),
             // #1306: share the ledger slot so any daemon-derived handle's
             // route refresh sees the forwarder's delivery accounting.
             delivery_ledger: self.inner.delivery_ledger.clone(),
@@ -2408,6 +2422,21 @@ impl Airc {
             .save_runtime_cursor(consumer_id, cursor, time::now_ms()?)
             .await?;
         self.emit_subscription_advanced(consumer_id, cursor, room.channel)
+            .await?;
+        Ok(())
+    }
+
+    /// Checkpoint a bounded transcript scan without publishing a lifecycle event.
+    /// The caller must stop before any visible event it has not delivered. Emitting
+    /// SubscriptionAdvanced for an excluded-only scan would create its own backlog.
+    pub async fn save_runtime_scan_cursor(
+        &self,
+        consumer_id: &str,
+        cursor: &airc_core::TranscriptCursor,
+    ) -> Result<(), AircError> {
+        self.inner
+            .store
+            .save_runtime_cursor(consumer_id, cursor, time::now_ms()?)
             .await?;
         Ok(())
     }

@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 #
-# AIRC installer — DEV PATH ONLY (zero-friction doctrine,
-# docs/ZERO-FRICTION-PATH.md): users get prebuilt signed binaries and
-# never see this script or a compiler. This source-build path serves
-# contributors, grid operators on unreleased branches, and CI; it moves
-# behind --dev once the release pipeline lands.
+# AIRC installer: verified published artifacts by default. Contributors may
+# explicitly choose --developer-build; absent artifacts never imply compilation.
+# Platform signing remains conditional on the publisher's configured identity.
 #
 # curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 #
@@ -46,8 +44,10 @@ fail()  { printf '  \033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 PREPARE_ARTIFACT=""
 PREBUILT_ARTIFACT=""
 EXPECTED_BUILD=""
+export AIRC_DEVELOPER_BUILD="${AIRC_DEVELOPER_BUILD:-0}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --developer-build) export AIRC_DEVELOPER_BUILD=1; shift ;;
     --prepare-artifact|--prebuilt|--expected-build)
       [ "$#" -ge 2 ] && [ -n "$2" ] || fail "Missing value for $1"
       case "$1" in
@@ -58,7 +58,7 @@ while [ "$#" -gt 0 ]; do
       shift 2 ;;
     --help)
       printf '%s\n' 'Usage: bash install.sh [--prepare-artifact PATH | --prebuilt PATH] --expected-build GIT_SHA' \
-        'Without arguments, build and install normally. Handoff modes use the current checkout without pulling.'
+        'Default: verified published artifact; --developer-build explicitly compiles source. Handoff modes never pull.'
       exit 0 ;;
     *) fail "Unknown installer argument: $1" ;;
   esac
@@ -68,6 +68,15 @@ if [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT$EXPECTED_BUILD" ]; then
   [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT" ] || fail '--expected-build requires a handoff mode'
   [[ "$EXPECTED_BUILD" =~ ^[0-9a-fA-F]{7,40}$ ]] || fail 'Handoff requires --expected-build with a Git SHA'
   [ "${AIRC_SKIP_RUST_BUILD:-0}" != 1 ] || fail 'Handoff cannot skip artifact validation'
+fi
+
+# Explicit prebuilt input is consumed only by the updater's prepare phase.
+# The old updater passes its environment to the current installer, so adoption
+# still uses its existing maintenance, rollback and native session owner.
+if [ -n "${AIRC_PREBUILT_ARTIFACT:-}${AIRC_PREBUILT_SHA256:-}" ]; then
+  [ -n "$PREPARE_ARTIFACT$PREBUILT_ARTIFACT" ] || fail 'Prebuilt input requires the guarded update handoff'
+  [ -n "${AIRC_PREBUILT_ARTIFACT:-}" ] || fail 'AIRC_PREBUILT_ARTIFACT is required'
+  [[ "${AIRC_PREBUILT_SHA256:-}" =~ ^[0-9a-fA-F]{64}$ ]] || fail 'AIRC_PREBUILT_SHA256 must be the binary SHA-256'
 fi
 
 # BEGIN GENERATED WINDOWS TOKEN CHECK
@@ -171,6 +180,7 @@ SKILLS_TARGET="$(_to_bash_path "$SKILLS_TARGET")"
 _compatible_setup_layout() {
   local directory="$1" relative
   [ -f "$directory/setup/github-auth.sh" ] || return 1
+  [ -f "$directory/scripts/release-artifact.sh" ] || return 1
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
       for relative in install-prereqs.ps1 run-powershell.sh register-bin-path.ps1 configure-firewall.ps1 shared-setup.ps1 setup-artifacts.lock.json install-session.ps1 adopt-installed.ps1 sync-bootstrap.ps1 setup-entrypoint.ps1; do
@@ -418,7 +428,9 @@ ensure_prereqs() {
   local missing=() pkgs=() unmappable=()
   # The full prereq set is exactly these four. JSON handling, Ed25519
   # identity/signing, hooks, and config mutation are all Rust-owned.
-  for cmd in git gh ssh-keygen cargo; do
+  local required=(git gh ssh-keygen)
+  [ "$AIRC_DEVELOPER_BUILD" != 1 ] || required+=(cargo)
+  for cmd in "${required[@]}"; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # git/gh/cargo support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
@@ -482,7 +494,7 @@ ensure_prereqs() {
     fi
   fi
 
-  _ensure_macos_build_toolchain
+  [ "$AIRC_DEVELOPER_BUILD" != 1 ] || _ensure_macos_build_toolchain
 
   # Identity gen + signing live in Rust — there is no crypto bootstrap to
   # do here; system package state is irrelevant to airc install correctness.
@@ -502,7 +514,7 @@ ensure_prereqs() {
 # applying Windows packages; other platforms retain their package-manager path.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) ;;
-  *) if [ -z "$PREBUILT_ARTIFACT" ]; then ensure_prereqs; fi ;;
+  *) if [ -z "$PREBUILT_ARTIFACT${AIRC_PREBUILT_ARTIFACT:-}" ]; then ensure_prereqs; fi ;;
 esac
 
 # ── Clone or update ─────────────────────────────────────────────────────
@@ -623,7 +635,7 @@ case "$(uname -s)" in
       ( source "$CLONE_DIR/windows/run-powershell.sh" "${session_args[@]}" ) || result=$?
       exit "$result"
     fi
-    if [ -z "$PREBUILT_ARTIFACT" ] && [ "${AIRC_SKIP_PREREQS:-0}" != 1 ]; then
+    if [ -z "$PREBUILT_ARTIFACT${AIRC_PREBUILT_ARTIFACT:-}" ] && [ "${AIRC_SKIP_PREREQS:-0}" != 1 ]; then
       environment_file="$(mktemp)"
       if ! ( source "$CLONE_DIR/windows/run-powershell.sh" -NoProfile -ExecutionPolicy RemoteSigned \
           -File "$(_to_win_path "$CLONE_DIR/windows/install-prereqs.ps1")" \
@@ -875,10 +887,54 @@ _setup_windows_autostart() {
 _install_airc_binary() {
   [ "${AIRC_SKIP_RUST_BUILD:-0}" = "1" ] && { info "AIRC_SKIP_RUST_BUILD=1 -- skipping airc build"; return 0; }
   local built target_dir
+  if [ "$AIRC_DEVELOPER_BUILD" != 1 ] && [ -z "$PREBUILT_ARTIFACT${AIRC_PREBUILT_ARTIFACT:-}" ]; then
+    # Fresh install and the updater's prepare phase share this artifact owner.
+    # Preserve the original handoff marker: fresh installation still adopts via
+    # the existing guarded lifecycle at the end of this coordinator.
+    local revision original_expected="$EXPECTED_BUILD"
+    revision="$(git -C "$CLONE_DIR" rev-parse HEAD)" || fail 'Cannot resolve published revision'
+    source "$CLONE_DIR/scripts/release-artifact.sh"
+    AIRC_PUBLISHED_TEMP="$(mktemp -d)"
+    trap 'rm -rf "$AIRC_PUBLISHED_TEMP"' EXIT
+    built="$AIRC_PUBLISHED_TEMP/airc"
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) built="$built.exe" ;; esac
+    airc_release_artifact "$built" "$revision" "$CLONE_DIR" || fail 'Published artifact preparation failed'
+    EXPECTED_BUILD="${EXPECTED_BUILD:-$revision}"
+    _verify_artifact "$built"
+    EXPECTED_BUILD="$original_expected"
+    if [ -n "$PREPARE_ARTIFACT" ]; then
+      local prepared; prepared="$(_to_bash_path "$PREPARE_ARTIFACT")"
+      [ ! -e "$prepared" ] || fail 'Artifact destination already exists'
+      cp "$built" "$prepared"
+      chmod +x "$prepared"
+      _verify_artifact "$prepared"
+      exit 0
+    fi
+    PREBUILT_ARTIFACT="$built"
+  fi
   if [ -n "$PREBUILT_ARTIFACT" ]; then
     built="$(_to_bash_path "$PREBUILT_ARTIFACT")"
-    _verify_artifact "$built"
+    if [ -n "$EXPECTED_BUILD" ]; then _verify_artifact "$built"; fi
     info "Installing verified prebuilt artifact: $built"
+  elif [ -n "${AIRC_PREBUILT_ARTIFACT:-}" ]; then
+    local prepared digest
+    prepared="$(_to_bash_path "$PREPARE_ARTIFACT")"
+    [ ! -e "$prepared" ] || fail 'Artifact destination already exists'
+    # Hash the owned copy, not the mutable input; nothing executes before this.
+    cp "$(_to_bash_path "$AIRC_PREBUILT_ARTIFACT")" "$prepared" || fail 'Cannot snapshot prebuilt artifact'
+    if command -v sha256sum >/dev/null 2>&1; then
+      digest="$(sha256sum "$prepared")" || fail 'Cannot checksum prebuilt artifact'
+    elif command -v shasum >/dev/null 2>&1; then
+      digest="$(shasum -a 256 "$prepared")" || fail 'Cannot checksum prebuilt artifact'
+    else
+      fail 'SHA-256 verifier required; refusing compilation fallback'
+    fi
+    digest="${digest%% *}"
+    [ "$(printf '%s' "$digest" | tr 'A-F' 'a-f')" = "$(printf '%s' "$AIRC_PREBUILT_SHA256" | tr 'A-F' 'a-f')" ] || fail 'Prebuilt checksum mismatch'
+    chmod +x "$prepared"
+    _verify_artifact "$prepared"
+    ok "Prepared verified prebuilt artifact: $prepared"
+    exit 0
   else
   # Belt-and-suspenders: even when prereq install was skipped (AIRC_SKIP_PREREQS)
   # the build still needs cargo on PATH. On macOS that means sourcing brew env.
@@ -1105,22 +1161,24 @@ fi
 # no GitHub calls, no log-tail polling in the model, and no dependence
 # on the agent remembering the turn contract.
 
+# Integration setup consumes the verified installation, never an unrelated
+# Cargo output or PATH binary. Source and prebuilt installs share this owner.
+_installed_airc_binary() {
+  local binary="$BIN_DIR/airc"
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) binary="$BIN_DIR/airc.exe" ;; esac
+  [ -x "$binary" ] || return 1
+  printf '%s\n' "$binary"
+}
+
 _install_airc_codex_hooks() {
   [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
   [ -f "$HOME/.codex/config.toml" ] || return 0
 
-  local _airc=""
-  local _tdir; _tdir="$(_airc_target_dir)" || fail 'Cannot resolve Cargo output for bridge installation.'
-  if [ -x "$_tdir/release/airc" ]; then
-    _airc="$_tdir/release/airc"
-  elif [ -x "$_tdir/debug/airc" ]; then
-    _airc="$_tdir/debug/airc"
-  elif command -v airc >/dev/null 2>&1; then
-    _airc=$(command -v airc)
-  else
-    warn "Could not install Codex AIRC hook: airc binary not found"
+  local _airc
+  _airc="$(_installed_airc_binary)" || {
+    warn "Could not install Codex AIRC hook: installed airc binary not found"
     return 0
-  fi
+  }
 
   local out
   if out=$("$_airc" codex-hook install-hooks --codex-home "$HOME/.codex" 2>&1); then
@@ -1261,15 +1319,11 @@ _install_airc_codex_gh_token() {
   local token; token=$(gh auth token 2>/dev/null) || return 0
   [ -z "$token" ] && return 0
 
-  local _airc=""
-  if [ -x "$BIN_DIR/airc.exe" ]; then
-    _airc="$BIN_DIR/airc.exe"
-  elif [ -x "$BIN_DIR/airc" ]; then
-    _airc="$BIN_DIR/airc"
-  else
+  local _airc
+  _airc="$(_installed_airc_binary)" || {
     warn "Cannot update Codex token: parser-capable airc binary unavailable"
     return 0
-  fi
+  }
   if printf '%s' "$token" | "$_airc" codex-hook configure-installer --codex-home "$HOME/.codex" --token-stdin; then
     ok "Codex token configuration updated through the TOML parser"
   else
@@ -1304,15 +1358,11 @@ _install_airc_codex_command_rules() {
   local config="$HOME/.codex/config.toml"
   [ "${AIRC_SKIP_CODEX_RULES:-0}" = "1" ] && return 0
   [ -f "$config" ] || return 0
-  local _airc=""
-  if [ -x "$BIN_DIR/airc.exe" ]; then
-    _airc="$BIN_DIR/airc.exe"
-  elif [ -x "$BIN_DIR/airc" ]; then
-    _airc="$BIN_DIR/airc"
-  else
+  local _airc
+  _airc="$(_installed_airc_binary)" || {
     warn "Cannot configure Codex rules: parser-capable airc binary unavailable"
     return 0
-  fi
+  }
   if "$_airc" codex-hook configure-installer --codex-home "$HOME/.codex" --command-rules; then
     ok "Codex rules configuration checked; existing user rules preserved"
   else

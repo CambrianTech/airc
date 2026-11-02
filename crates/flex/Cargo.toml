@@ -1,0 +1,13 @@
+[package]
+name = "cambrian-flex"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The one solver for every grant: claims cleared by price against measured capacity"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

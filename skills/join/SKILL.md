@@ -21,7 +21,7 @@ If you are Claude Code and this skill was invoked by `/join` or `/airc:join`, yo
 Monitor(persistent=true, description="airc", command="airc join")
 ```
 
-Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `airc join` starts or verifies the scope's transport owner and streams events from all subscribed channels until interrupted. The user should see a Monitor task.
+Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `airc join` starts or verifies the scope's transport owner and monitors all subscribed channels until interrupted. It prints the attached room and direct peer-addressed events from every subscribed room; other-room ambient activity is summarized with counts and remains readable through inbox. Pre-attachment events are retained history, announced once rather than replayed live. The user should see a Monitor task.
 
 ## Substrate facts
 

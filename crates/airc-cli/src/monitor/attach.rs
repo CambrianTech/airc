@@ -8,7 +8,7 @@ use airc_lib::{decode_wire_event, Airc};
 use airc_protocol::HEADER_AIRC_CLIENT;
 
 use super::render::{normalize_channel, xml_escape, Sandbox};
-use crate::client_id::{current_client_id, RuntimeSelfFilter};
+use crate::client_id::current_client_id;
 use crate::work_suggestions::render_claimable_work_for_event;
 
 /// One frame to surface on stdout — either a decoded transcript event
@@ -55,7 +55,7 @@ pub(crate) async fn run(
 ) -> Result<(), Box<dyn Error>> {
     let airc = Airc::open(home).await?;
     let client_id = current_client_id().ok().flatten();
-    let self_filter = RuntimeSelfFilter::new(airc.client_id(), client_id.as_deref());
+    let self_filter = airc_core::RuntimeSelf::new(airc.client_id(), client_id.as_deref());
     let socket = crate::cli::default_socket_path_in(home);
     let set = airc.subscription_set().await?;
     let channels: Vec<RoomId> = set.all().map(|sub| sub.as_room().channel).collect();
@@ -171,7 +171,33 @@ pub(crate) async fn run(
     println!("airc: attached to Rust event stream for subscribed channels");
     std::io::stdout().flush()?;
 
-    while let Some(frame) = rx.recv().await {
+    // Reuse this already-running runtime monitor; no independent timer daemon.
+    // Its first tick supplies resume context, later ticks obey the saved cadence.
+    let resume_consumer = format!(
+        "claude-monitor:{}",
+        client_id.as_deref().unwrap_or("default")
+    );
+    let mut resume_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let frame = tokio::select! {
+            frame = rx.recv() => match frame { Some(frame) => frame, None => break },
+            _ = resume_tick.tick() => {
+                match crate::agent_resume::prepare(&airc, &resume_consumer, false).await {
+                    Ok(Some(delivery)) => {
+                        sandbox.emit_contract_once();
+                        println!("{}", resume_frame(&delivery.text, &sandbox));
+                        std::io::stdout().flush()?;
+                        if let Err(error) = crate::agent_resume::acknowledge(&airc, delivery).await {
+                            eprintln!("airc: resume acknowledgment failed; context remains due: {error}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("airc: resume context unavailable: {error}"),
+                }
+                continue;
+            }
+        };
         match frame {
             MonitorFrame::Event(event) => {
                 let event = *event;
@@ -200,9 +226,18 @@ pub(crate) async fn run(
     Ok(())
 }
 
+fn resume_frame(text: &str, sandbox: &Sandbox) -> String {
+    format!(
+        "<resume-{}>{}</resume-{}>",
+        sandbox.nonce,
+        xml_escape(text),
+        sandbox.nonce
+    )
+}
+
 fn render_event(
     event: &TranscriptEvent,
-    self_filter: &RuntimeSelfFilter<'_>,
+    self_filter: &airc_core::RuntimeSelf,
     sandbox: &mut Sandbox,
 ) {
     if self_filter.is_self_event(event) {
@@ -266,6 +301,14 @@ mod tests {
     /// never exceed the cap (which would let a dead daemon go un-retried
     /// for an unbounded time, the exact "permanent dark" this card ends).
     #[test]
+    fn resume_frame_escapes_board_data_in_monitor_envelope() {
+        let sandbox = Sandbox::new();
+        let frame = resume_frame("saved brief & <untrusted card title>", &sandbox);
+        assert!(frame.contains("&amp; &lt;untrusted card title&gt;"));
+        assert!(frame.starts_with(&format!("<resume-{}>", sandbox.nonce)));
+    }
+
+    #[test]
     fn reconnect_backoff_doubles_then_caps() {
         assert_eq!(next_reconnect_backoff_ms(RECONNECT_INITIAL_BACKOFF_MS), 500);
         assert_eq!(next_reconnect_backoff_ms(500), 1_000);
@@ -294,7 +337,7 @@ mod tests {
     #[test]
     fn render_event_filters_same_client() {
         let event = event("hello");
-        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);
@@ -308,7 +351,7 @@ mod tests {
         event
             .headers
             .insert(HEADER_AIRC_CLIENT.to_string(), "codex:thread-1".to_string());
-        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);
@@ -324,7 +367,7 @@ mod tests {
             "claude:session-1".to_string(),
         );
         // Shared HOME: both durable IDs may match, but the runtime differs.
-        let self_filter = RuntimeSelfFilter::new(event.client_id, Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(event.client_id, Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);
@@ -337,7 +380,7 @@ mod tests {
     #[test]
     fn render_event_keeps_unstamped_different_client() {
         let event = event("another client on this peer");
-        let self_filter = RuntimeSelfFilter::new(ClientId::new(), Some("codex:thread-1"));
+        let self_filter = airc_core::RuntimeSelf::new(ClientId::new(), Some("codex:thread-1"));
         let mut sandbox = Sandbox::new();
 
         render_event(&event, &self_filter, &mut sandbox);

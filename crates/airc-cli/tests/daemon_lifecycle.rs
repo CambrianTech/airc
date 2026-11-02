@@ -53,12 +53,7 @@ fn tab_command(account: &Path, scope: &str, client: &str, args: &[&str]) -> Comm
 /// Run a tab and require success, returning stdout.
 fn ok(account: &Path, scope: &str, client: &str, args: &[&str]) -> String {
     let out = tab(account, scope, client, args);
-    assert!(
-        out.status.success(),
-        "airc {args:?} (scope={scope}) failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
+    common::assert_success(&out, &format!("airc {args:?} (scope={scope})"));
     String::from_utf8(out.stdout).expect("utf-8 stdout")
 }
 
@@ -272,6 +267,9 @@ fn daemon_survives_shutdown_and_restart_with_durable_history_intact() {
     // completed receipt while that child's startup lease remains held.
     let starting =
         airc_lib::daemon_lifecycle::DaemonStartupGuard::acquire(&acct.join(".airc")).unwrap();
+    // Endpoint inspection must precede treating startup custody as a refusal.
+    // A current endpoint is attachable even while initialization custody is held.
+    ok(acct, "claude", "claude:main", &["inbox", "--limit", "1"]);
     let incomplete = tab(acct, "new-stop-scope", "claude:main", &["stop"]);
     assert!(!incomplete.status.success());
     assert!(String::from_utf8_lossy(&incomplete.stderr).contains("shutdown not confirmed"));
@@ -413,4 +411,22 @@ fn status_does_not_start_an_absent_daemon() {
         assert!(common::find_daemon_pid_under(acct).is_none());
         assert!(!tab(acct, scope, "codex:probe", &["ping"]).status.success());
     }
+}
+
+// what this catches (card 81d11df6): a failed child described without HOW it ended. The
+// Windows flake printed empty stdout and stderr and nothing else, so a crash and a silent
+// error path looked the same. A signal death and an exit code must each be named.
+#[cfg(unix)]
+#[test]
+fn a_failed_child_says_how_it_ended() {
+    let killed = Command::new("/bin/sh")
+        .args(["-c", "kill -9 $$"])
+        .status()
+        .expect("sh spawns");
+    assert_eq!(common::describe_exit(&killed), "killed by signal 9");
+    let exited = Command::new("/bin/sh")
+        .args(["-c", "exit 3"])
+        .status()
+        .expect("sh spawns");
+    assert_eq!(common::describe_exit(&exited), "exit code 3");
 }

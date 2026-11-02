@@ -252,3 +252,191 @@ pub enum QueueCardAction {
         raw_json_file: PathBuf,
     },
 }
+
+impl QueueCardArgs {
+    /// Dispatch `airc queue-card ...` (moved from `main.rs`, unchanged).
+    pub fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            queue_card_commands, queue_card_plan, queue_card_projection, queue_card_runtime,
+            queue_card_staleness,
+        };
+        match self.action {
+            QueueCardAction::Body {
+                id,
+                branch,
+                owner,
+                status,
+                blockers,
+                environment,
+                evidence,
+                next_action,
+                last_heartbeat,
+            } => queue_card_commands::run_body(queue_card_commands::QueueCardInput {
+                id,
+                branch,
+                owner,
+                status,
+                blockers,
+                environment,
+                evidence,
+                next_action,
+                last_heartbeat,
+            }),
+            QueueCardAction::MutateBody {
+                body_file,
+                mutations_file,
+                log_msg,
+                timestamp,
+            } => queue_card_commands::run_mutate_body(
+                &body_file,
+                &mutations_file,
+                &log_msg,
+                &timestamp,
+            ),
+            QueueCardAction::ClaimFields { body_file } => {
+                queue_card_commands::run_claim_fields(&body_file)
+            }
+            QueueCardAction::DispatchMessage {
+                target_agent,
+                extra_message,
+                next_json_file,
+            } => queue_card_commands::run_dispatch_message(
+                &target_agent,
+                &extra_message,
+                &next_json_file,
+            ),
+            QueueCardAction::AdoptBody {
+                issue_json_file,
+                queue_body_file,
+                force,
+            } => queue_card_commands::run_adopt_body(&issue_json_file, &queue_body_file, force),
+            QueueCardAction::NudgeSummary { raw_json_file } => {
+                queue_card_commands::run_nudge_summary(&raw_json_file)
+            }
+            QueueCardAction::NudgeCardMeta { issue_file } => {
+                queue_card_commands::run_nudge_card_meta(&issue_file)
+            }
+            QueueCardAction::List {
+                repo,
+                owner,
+                status,
+                json,
+                raw_json_file,
+            } => queue_card_projection::run_list(&repo, &owner, &status, json, &raw_json_file),
+            QueueCardAction::Stale {
+                repo,
+                stale_after,
+                json,
+                raw_json_file,
+            } => queue_card_projection::run_stale(&repo, &stale_after, json, &raw_json_file),
+            QueueCardAction::Next {
+                repo,
+                owner,
+                base,
+                repo_root,
+                json,
+                raw_json_file,
+            } => queue_card_projection::run_next(
+                &repo,
+                &owner,
+                &base,
+                &repo_root,
+                json,
+                &raw_json_file,
+            ),
+            QueueCardAction::Pongs {
+                repo,
+                sweep_id,
+                since,
+                json,
+                cards_file,
+                messages_file,
+            } => queue_card_runtime::run_pongs(
+                &repo,
+                &sweep_id,
+                &since,
+                json,
+                &cards_file,
+                &messages_file,
+            ),
+            QueueCardAction::Availability {
+                repo,
+                sweep_id,
+                since,
+                stale_after,
+                json,
+                cards_file,
+                messages_file,
+            } => queue_card_runtime::run_availability(
+                &repo,
+                &sweep_id,
+                &since,
+                &stale_after,
+                json,
+                &cards_file,
+                &messages_file,
+            ),
+            QueueCardAction::ReviewRefs {
+                repo,
+                raw_json_file,
+            } => queue_card_staleness::run_review_refs(&repo, &raw_json_file),
+            QueueCardAction::PrMeta { pr_file } => queue_card_staleness::run_pr_meta(&pr_file),
+            QueueCardAction::StalenessAnalyze {
+                repo_root,
+                pr_repo,
+                pr_num,
+                base_ref,
+                head_ref,
+                base_git_ref,
+                head_git_ref,
+                merge_base,
+                pr_url,
+                limit_lines,
+                json,
+                files_file,
+                diff_file,
+                base_new_file,
+            } => queue_card_staleness::run_staleness_analyze(
+                queue_card_staleness::StalenessAnalyzeInput {
+                    repo_root: &repo_root,
+                    pr_repo: &pr_repo,
+                    pr_num: &pr_num,
+                    base_ref: &base_ref,
+                    head_ref: &head_ref,
+                    base_git_ref: &base_git_ref,
+                    head_git_ref: &head_git_ref,
+                    merge_base: &merge_base,
+                    pr_url: &pr_url,
+                    limit: limit_lines,
+                    output_json: json,
+                    files_file: &files_file,
+                    diff_file: &diff_file,
+                    base_new_file: &base_new_file,
+                },
+            ),
+            QueueCardAction::CloseMergedMeta { pr_file } => {
+                queue_card_commands::run_close_merged_meta(&pr_file)
+            }
+            QueueCardAction::CloseMergedRefs { pr_file, repo } => {
+                queue_card_commands::run_close_merged_refs(&pr_file, &repo)
+            }
+            QueueCardAction::CardStatus { body_file } => {
+                queue_card_commands::run_card_status(&body_file)
+            }
+            QueueCardAction::Plan {
+                repo,
+                owner,
+                stale_after,
+                json,
+                raw_json_file,
+            } => queue_card_plan::run_plan(&repo, &owner, &stale_after, json, &raw_json_file),
+            QueueCardAction::Steward {
+                repo,
+                owner,
+                stale_after,
+                json,
+                raw_json_file,
+            } => queue_card_plan::run_steward(&repo, &owner, &stale_after, json, &raw_json_file),
+        }
+    }
+}

@@ -288,6 +288,7 @@ dependencies = [
  "bytes",
  "fs2",
  "futures",
+ "rustix",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -315,6 +316,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -329,6 +331,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -416,6 +419,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "uuid",
  "x25519-dalek",
 ]
 
@@ -443,9 +447,11 @@ dependencies = [
  "airc-bus",
  "airc-core",
  "airc-diagnostics",
+ "airc-store",
  "async-trait",
  "base64",
  "bytes",
+ "fs2",
  "futures",
  "sea-orm",
  "sea-orm-migration",
@@ -524,6 +530,7 @@ dependencies = [
 name = "airc-work-store"
 version = "0.1.0"
 dependencies = [
+ "airc-blobs",
  "airc-core",
  "airc-protocol",
  "airc-store",
@@ -962,6 +969,13 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "cambrian-flex"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cbc"

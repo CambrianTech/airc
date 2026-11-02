@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
+fs2 = "0.4"
 
 sea-orm = { version = "1", default-features = false, features = [
     "sqlx-sqlite",
@@ -40,7 +41,14 @@ sea-orm-migration = { version = "1", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["rt", "macros"] }
 
+[features]
+# Lets a test binary open file stores without installing a write
+# admission resolver (custody::resolve). Never enabled by a production build.
+test-fixtures = []
+
 [dev-dependencies]
+# Integration tests (tests/*.rs) open stores without installing a write admission.
+airc-store = { path = ".", features = ["test-fixtures"] }
 airc-diagnostics = { path = "../airc-diagnostics" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tempfile = "3"

@@ -120,3 +120,14 @@ Review and trust changed hook definitions in Codex using `/hooks`. Existing non-
 - `README.md` — this file.
 
 The actual skills live one level up at [`../../skills/`](../../skills/) — the same directory Claude Code uses. install.sh copies them into both agent skill dirs with an `.airc-skill` marker so uninstall can remove only AIRC-owned skills.
+
+## Saved resume brief
+
+`airc agent-resume set --brief "..." --manual "AGENTS.md"` opts this agent into
+compact saved context (1024 characters including the reference), with separate
+AIRC-derived work and maintenance issues. UserPromptSubmit delivers it when due;
+PostToolUse suppresses it during active work. This does not wake an idle Codex
+task. A separately authorized runtime schedule can invoke
+`airc agent-resume poll --consumer <task-id>`. See
+[agent resume context](../../docs/agent-resume-context.md) for cadence, scope,
+consumer state, and explicit busy/away behavior.

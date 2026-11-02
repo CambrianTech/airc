@@ -65,6 +65,15 @@ pub struct Model {
     pub client_id: Uuid,
     /// Owner-stamped wall clock (ms).
     pub occurred_at_ms: i64,
+    /// The peer a `Target::Peer` target names, else NULL: derived at append
+    /// ([`airc_bus::Envelope::addressing`]) so an addressee scan is indexed.
+    /// The stored envelope itself is untouched.
+    pub addressed_peer: Option<Uuid>,
+    /// The payload is a `Body` whose text opens with an `@name`.
+    pub leading_mention: bool,
+    /// The version of this row's derived data (addressing, header rows);
+    /// below `crate::derive::DERIVED_VERSION` it is derived on the next open.
+    pub derived_version: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

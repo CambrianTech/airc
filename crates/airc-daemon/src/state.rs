@@ -32,6 +32,7 @@ use airc_store::{EventStore, SqliteDurableSink};
 /// underlying handles (registry, router, store) do their own interior
 /// locking.
 pub struct DaemonState {
+    pub addressed: Arc<crate::addressed_switch::AddressedSwitch>,
     pub(crate) shared_frames: crate::shared_frames::SharedFrames,
     pub peer_id: PeerId,
     pub keypair: PeerKeypair,
@@ -54,7 +55,7 @@ pub struct DaemonState {
     /// trust; same-machine publishers are in-process trusted).
     pub trusted_roots: Mutex<HashMap<PathBuf, ()>>,
     /// Notified when the daemon should stop accepting + exit cleanly.
-    pub shutdown: Notify,
+    pub shutdown: Arc<Notify>,
     /// Runtime metadata reported through IPC status so clients can
     /// replace stale daemons after updates.
     pub runtime: DaemonRuntimeInfo,
@@ -138,6 +139,8 @@ impl DaemonState {
         coordinator_store: Arc<dyn EventStore>,
         runtime: DaemonRuntimeInfo,
     ) -> Result<Self, BusError> {
+        #[cfg(unix)]
+        crate::file_capacity::prepare();
         let sink = Arc::new(SqliteDurableSink::open_path(db_path).await?);
         let epoch_store = sink.bump_epoch().await?;
         let seq = Arc::new(SeqSource::start(&epoch_store));
@@ -150,6 +153,13 @@ impl DaemonState {
             Arc::new(StderrJsonDiagnosticSink),
         );
         Ok(Self {
+            // Explicit addressed admission: at most 64 recipients and 16 in-flight
+            // frames node-wide (IPC limits each frame to 16 MiB), four per peer.
+            addressed: crate::addressed_switch::AddressedSwitch::new(
+                std::num::NonZeroUsize::MIN.saturating_add(63),
+                std::num::NonZeroUsize::MIN.saturating_add(15),
+                std::num::NonZeroUsize::MIN.saturating_add(3),
+            ),
             shared_frames: crate::shared_frames::SharedFrames::default(),
             peer_id,
             keypair,
@@ -160,7 +170,7 @@ impl DaemonState {
             router,
             coordinator_store,
             trusted_roots: Mutex::new(HashMap::new()),
-            shutdown: Notify::new(),
+            shutdown: Arc::new(Notify::new()),
             runtime,
             route_endpoints: RwLock::new(Vec::new()),
             connected_lan_peers: Arc::new(AtomicUsize::new(0)),

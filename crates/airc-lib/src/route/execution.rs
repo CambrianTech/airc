@@ -10,13 +10,12 @@ use airc_transport::Transport;
 
 use crate::error::AircError;
 use crate::route::policy::TransportKind;
-use crate::{Airc, Room};
+use crate::Airc;
 
 impl Airc {
     pub(crate) async fn execute_send_route(
         &self,
         route: TransportKind,
-        _room: &Room,
         frame: Frame,
     ) -> Result<(), AircError> {
         match route {

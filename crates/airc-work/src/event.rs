@@ -25,6 +25,8 @@ pub enum WorkEvent {
     CardStateChanged(CardStateChanged),
     WorkSubmitted(WorkSubmission),
     WorkSubmissionReviewed(WorkSubmissionReview),
+    /// Idempotent handoff in the review extension, never a repeated CardCreated.
+    SubmissionReviewRequested(SubmissionReviewRequested),
     /// Derived during authenticated transcript replay, never accepted from wire.
     #[serde(skip)]
     SubmissionRejected(RejectedSubmission),
@@ -80,6 +82,7 @@ impl WorkEvent {
             WorkEvent::CardStateChanged(e) => e.changed_at_ms,
             WorkEvent::WorkSubmitted(e) => e.submitted_at_ms,
             WorkEvent::WorkSubmissionReviewed(e) => e.reviewed_at_ms,
+            WorkEvent::SubmissionReviewRequested(e) => e.card.created_at_ms,
             WorkEvent::SubmissionRejected(e) => e.submitted_at_ms,
             WorkEvent::ReviewRejected(e) => e.reviewed_at_ms,
             WorkEvent::LaneCreated(e) => e.created_at_ms,
@@ -150,6 +153,9 @@ pub struct WorkSubmissionReview {
     pub reviewer: PeerId,
     pub outcome: WorkReviewOutcome,
     pub evidence: airc_blobs::MediaRef,
+    /// Signed, bounded reviewer words; absent on legacy hash-only receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_text: Option<String>,
     /// Signed author's clock, like WorkSubmission::submitted_at_ms. This is
     /// checked against the historical claim; it is not trusted global time.
     pub reviewed_at_ms: u64,
@@ -158,6 +164,8 @@ pub struct WorkSubmissionReview {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkReviewRejectionReason {
+    #[error("review handoff is not requested by the accepted submission's publisher")]
+    RequestorMismatch,
     #[error("reviewer differs from signed transcript author")]
     ReviewerMismatch,
     #[error("review refers to no accepted submission on the parent card")]
@@ -172,7 +180,7 @@ pub enum WorkReviewRejectionReason {
     ExpiredClaim,
     #[error("review card is already settled")]
     SettledReviewCard,
-    #[error("review evidence is empty or has an oversized MIME hint")]
+    #[error("review evidence is empty, has an oversized MIME hint, or inline text exceeds 32 KiB or differs from its hash/size")]
     InvalidEvidence,
     #[error("review id was already used for different immutable content")]
     ConflictingId,
@@ -198,6 +206,7 @@ impl WorkSubmissionReview {
             && self.reviewer == other.reviewer
             && self.outcome == other.outcome
             && self.evidence == other.evidence
+            && self.evidence_text == other.evidence_text
     }
 
     pub fn validate(&self) -> Result<(), WorkReviewRejectionReason> {
@@ -209,6 +218,15 @@ impl WorkSubmissionReview {
                 .is_some_and(|mime| mime.len() > 128)
         {
             return Err(WorkReviewRejectionReason::InvalidEvidence);
+        }
+        if let Some(text) = &self.evidence_text {
+            if text.trim().is_empty()
+                || text.len() > 32 * 1024
+                || text.len() as u64 != self.evidence.size_bytes
+                || airc_blobs::ContentHash::from_bytes(text.as_bytes()) != self.evidence.hash
+            {
+                return Err(WorkReviewRejectionReason::InvalidEvidence);
+            }
         }
         Ok(())
     }
@@ -242,6 +260,12 @@ impl WorkSubmissionReview {
             .card(self.review_card_id)
             .ok_or(Reason::WrongReviewCard)?;
         if review_card.reviews != Some(self.card_id) || review_card.repo != parent.repo {
+            return Err(Reason::WrongReviewCard);
+        }
+        if board
+            .review_request(self.review_card_id)
+            .is_some_and(|r| r.submission_id != self.submission_id)
+        {
             return Err(Reason::WrongReviewCard);
         }
         if review_card.owner != Some(self.reviewer)
@@ -418,6 +442,60 @@ pub struct CardCreated {
     /// shape as the `reviews` field on this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<CardOrigin>,
+}
+
+/// A peer-review handoff names the exact accepted candidate. Repeated requests
+/// materialize the same review card without resetting its claim or lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionReviewRequested {
+    pub card: CardCreated,
+    pub submission_id: crate::SubmissionId,
+}
+
+/// Stable domain identity; callers still resolve and publish in the parent's room.
+pub fn submission_review_card_id(
+    parent: WorkCardId,
+    submission: crate::SubmissionId,
+) -> WorkCardId {
+    WorkCardId::from_uuid(uuid::Uuid::new_v5(
+        &parent.as_uuid(),
+        format!("submission-review:{submission}").as_bytes(),
+    ))
+}
+
+impl SubmissionReviewRequested {
+    pub fn validate_for_board(
+        &self,
+        board: &crate::WorkBoardProjection,
+    ) -> Result<(), WorkReviewRejectionReason> {
+        use WorkReviewRejectionReason as Reason;
+        let parent_id = self.card.reviews.ok_or(Reason::WrongReviewCard)?;
+        let parent = board.card(parent_id).ok_or(Reason::UnknownSubmission)?;
+        let submitted = parent
+            .submissions
+            .iter()
+            .find(|s| s.submission_id == self.submission_id)
+            .ok_or(Reason::UnknownSubmission)?;
+        if self.card.created_by != submitted.publisher {
+            return Err(Reason::RequestorMismatch);
+        }
+        if self.card.repo != parent.repo
+            || self.card.card_id != submission_review_card_id(parent_id, self.submission_id)
+        {
+            return Err(Reason::WrongReviewCard);
+        }
+        if let Some(existing) = board.card(self.card.card_id) {
+            if existing.reviews != Some(parent_id)
+                || existing.repo != self.card.repo
+                || board
+                    .review_request(self.card.card_id)
+                    .is_none_or(|r| r.submission_id != self.submission_id)
+            {
+                return Err(Reason::ConflictingId);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Amend a card's editable fields after creation. Card 5ac0a359 —

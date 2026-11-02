@@ -110,7 +110,7 @@ fn stream_plane_handshake_and_sealed_frames_over_real_lan() {
         tokio::time::sleep(Duration::from_millis(100)).await; // connection + subs arm
 
         // 1. A → Init (over the wire)
-        send_msg(&alice, &SessionMsg::Init(sm_a.begin_handshake(id_b))).await;
+        send_msg(&alice, &SessionMsg::Init(sm_a.begin_handshake(id_b, 1_000))).await;
         // 2. B receives Init → installs its session → Resp (over the wire)
         let SessionMsg::Init(init) = next_msg(&mut sub_b, bob.peer_id()).await else {
             panic!("expected Init");

@@ -895,13 +895,13 @@ async fn owner_backfill_read_failure_and_legacy_request_are_explicit_errors() {
         .await_reply(pending)
         .await
         .expect("legacy explicit reply");
-    let Some(Body::Json(value)) = reply.body else {
+    let Body::Json(value) = reply.body() else {
         panic!("JSON failure reply required");
     };
     assert!(value["error"]
         .as_str()
         .is_some_and(|error| error.contains("legacy")));
-    assert!(serde_json::from_value::<BackfillResponse>(value).is_err());
+    assert!(serde_json::from_value::<BackfillResponse>(value.clone()).is_err());
 
     // An unshared dispatch room still gets an explicit owner-read refusal;
     // malformed bodies and missing reply addressing retain ordinary loud ingress.

@@ -81,6 +81,13 @@ if($Child){
             if(Test-Path -LiteralPath $installed){Invoke-InstallerProcess -OwnProcessTree $installed ($installedScope+@('stop'));if($LASTEXITCODE -ne 0){throw 'Owned installed test daemon cleanup failed'}}
             if($daemonOwner -and -not $daemonOwner.WaitForExit(10000)){throw 'Captured installed daemon remained alive after Stop'}
         } catch {
+            # Preserve the real Stop/process-exit failure and expose the daemon's
+            # last observed phase from this disposable user's scope only.
+            $daemonLog=Join-Path (Get-AircInstallerHome) 'airc-daemon.log'
+            if(Test-Path -LiteralPath $daemonLog){
+                Write-Warning ('Installed fixture daemon shutdown log: '+$daemonLog)
+                Get-Content -LiteralPath $daemonLog -Tail 80 -ErrorAction Continue | Out-Host
+            }
             if($installFailure){Write-Warning ('Cleanup after failed installation: '+$_.Exception.Message)}else{throw}
         } finally {if($daemonOwner){$daemonOwner.Dispose()}}
     }

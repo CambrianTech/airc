@@ -2,7 +2,25 @@
 
 use std::path::PathBuf;
 
-use super::{config, hooks_json};
+use super::config;
+use crate::integrations::agent_hook::settings::{self, ManagedHook, ManagedHooks};
+
+/// Codex's hooks in `hooks.json`.
+const CODEX_HOOKS: ManagedHooks = ManagedHooks {
+    hooks: &[
+        ManagedHook {
+            event: "UserPromptSubmit",
+            args: "codex-hook user-prompt-submit",
+            matcher: None,
+        },
+        ManagedHook {
+            event: "PostToolUse",
+            args: "codex-hook post-tool-use",
+            matcher: None,
+        },
+    ],
+    status_message: Some("Checking AIRC inbox"),
+};
 
 pub fn configure_installer(
     codex_home: Option<PathBuf>,
@@ -70,7 +88,7 @@ pub fn install_hooks_at(
             config.display()
         ));
     }
-    if hooks_json::install(&hooks_json)? {
+    if settings::install(&hooks_json, &CODEX_HOOKS)? {
         report.push(format!(
             "installed AIRC UserPromptSubmit and PostToolUse hooks in {}",
             hooks_json.display()
@@ -114,7 +132,7 @@ pub async fn run_uninstall_hooks(
             config.display()
         );
     }
-    if hooks_json::uninstall(&hooks_json)? {
+    if settings::uninstall(&hooks_json, &CODEX_HOOKS)? {
         println!(
             "removed AIRC UserPromptSubmit and PostToolUse hooks from {}",
             hooks_json.display()

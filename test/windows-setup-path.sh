@@ -7,8 +7,9 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 source_dir="$fixture/source with spaces"
-mkdir -p "$source_dir/windows" "$source_dir/setup" "$source_dir/.git" "$fixture/home" "$fixture/wsl-first"
+mkdir -p "$source_dir/scripts" "$source_dir/windows" "$source_dir/setup" "$source_dir/.git" "$fixture/home" "$fixture/wsl-first"
 cp "$repo/install.sh" "$source_dir/install.sh"
+cp "$repo/scripts/release-artifact.sh" "$source_dir/scripts/release-artifact.sh"
 # This isolated PATH unit fixture mocks token policy. Full installation CI uses
 # windows-normal-install.ps1 with a real medium token and no predicate override.
 guard="$(sed -n '/^# BEGIN GENERATED WINDOWS TOKEN CHECK$/,/^# END GENERATED WINDOWS TOKEN CHECK$/p' "$source_dir/install.sh")"

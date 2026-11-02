@@ -372,7 +372,7 @@ airc doctor --fix                  # safe auto-recovery
 airc update
 ```
 
-`airc update` (aliases `airc upgrade`, `airc pull`) fast-forwards the installed source checkout on its current branch and refreshes the binary and skills. Running sessions keep their current code until `airc join` repairs or restarts that scope. There is no `--channel` flag; channel selection is the install checkout's git branch, switched manually outside the CLI.
+`airc update` (aliases `airc upgrade`, `airc pull`) selects the configured release channel and prepares its verified published binary before the guarded daemon handoff. If the channel tip is still publishing, `airc update --revision <full-40-character-commit-sha>` selects an already-published ancestor of that channel; it also works with `--auto`. The pin uses the updater-owned worktree and leaves developer branches and work untouched. Missing artifacts, checksum failures, unsupported platforms and mismatched executable builds still refuse before stopping the daemon. This explicit pin does not automatically search for the newest published ancestor. Channel selection comes from `AIRC_UPDATE_CHANNEL`, then `~/.airc/update-channel`, then `canary`; there is no `--channel` flag.
 
 ## Requirements
 

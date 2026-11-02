@@ -96,6 +96,154 @@ fn work_create_claim_release_projects_on_board() {
     assert!(released_board.contains("claim=-"));
 }
 
+// what this catches: `release --room R` without a CLAIM_ID resolved the
+// holder's claim on the CURRENT room's board, so a card claimed in a room
+// the scope was not standing in was unreleasable ("not present in the board
+// projection") and therefore unclosable by its own claimant.
+#[test]
+fn work_release_defaults_to_my_claim_in_the_named_room_not_the_current_one() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(&home, &["room", "review"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "claimed in review",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+    run_ok(
+        &home,
+        &[
+            "work",
+            "claim",
+            card_id,
+            "--ttl-ms",
+            "60000",
+            "--no-lease-required",
+        ],
+    );
+    run_ok(&home, &["room", "general"]);
+
+    let released = run_ok(&home, &["work", "release", card_id, "--room", "review"]);
+    assert!(released.contains("released:"), "{released}");
+    let board = run_ok(&home, &["work", "board", "--room", "review"]);
+    assert!(
+        board.contains(card_id) && board.contains("claim=-"),
+        "{board}"
+    );
+}
+
+// what this catches: `work cleanup` classified worktrees against the CURRENT
+// room's board only, so the worktree of a card that closed in another room
+// read as "unknown card" (an orphan, never removed) and ~/.airc/worktrees grew
+// without a drain (card 3ed41b1b).
+#[test]
+fn work_cleanup_classifies_worktrees_of_cards_in_every_subscribed_room() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+
+    run_ok(&home, &["init"]);
+    run_ok(&home, &["room", "review"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "closed in review",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+    run_ok(&home, &["work", "close", card_id]);
+    run_ok(&home, &["room", "general"]);
+
+    let short = &card_id[..8];
+    std::fs::create_dir_all(workspace.path().join(".airc/worktrees").join(short))
+        .expect("worktree dir");
+    let cleanup = run_ok(&home, &["work", "cleanup"]);
+    let line = cleanup
+        .lines()
+        .find(|line| line.trim_start().starts_with(short))
+        .unwrap_or_else(|| panic!("cleanup lists {short}: {cleanup}"));
+    assert!(line.contains("Closed"), "{cleanup}");
+}
+
+// what this catches (card bac19e3c, Codex b1fe8f13): `work close` holds the card's
+// lifecycle lock across the state change, and its automatic worktree retirement tried to take
+// the same lock again, saw itself as the holder, and refused, so every close kept its
+// worktree. The held guard is now passed through: a clean, merged checkout is retired on close.
+#[test]
+fn work_close_retires_the_cards_clean_worktree_through_its_own_lifecycle_lock() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "close retires",
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+
+    let git = |dir: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=F", "-c", "user.email=f@e.t"])
+            .args(args)
+            .output()
+            .expect("git spawns");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let repo = workspace.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "base"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/canary", "HEAD"]);
+    let tree = workspace.path().join(".airc/worktrees").join(&card_id[..8]);
+    let branch = format!("{}/fix", &card_id[..8]);
+    git(
+        &repo,
+        &["worktree", "add", "-b", &branch, tree.to_str().unwrap()],
+    );
+    assert!(tree.exists());
+
+    let output = Command::new(airc_core())
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env("USERPROFILE", workspace.path())
+        .arg("--home")
+        .arg(&home)
+        .args(["work", "close", card_id])
+        .output()
+        .expect("airc spawns");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "close failed: {stderr}");
+    assert!(!stderr.contains("worktree cleanup skipped"), "{stderr}");
+    assert!(
+        !tree.exists(),
+        "the clean checkout retires on close: {stderr}"
+    );
+}
+
 #[test]
 fn work_seed_is_idempotent_for_manager_candidates() {
     let workspace = common::daemon_tempdir();
@@ -605,6 +753,68 @@ fn work_board_empty_state_is_explicit() {
     assert!(
         board.contains("(no work cards)"),
         "empty board should be explicit, got: {board}"
+    );
+}
+
+// adbe0177: review used to mutate the board before gh refused an unpushed branch.
+#[test]
+fn unpushed_review_preserves_in_progress_card() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "unpushed review regression",
+        ],
+    );
+    let card = extract_field(&create, "card_id:").unwrap();
+    run_ok(&home, &["work", "claim", card, "--no-lease-required"]);
+    run_ok(&home, &["work", "state", card, "in-progress"]);
+    let origin = workspace.path().join("origin.git");
+    let tree = workspace.path().join(".airc/worktrees").join(&card[..8]);
+    std::fs::create_dir_all(&tree).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&tree)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "--bare", origin.to_str().unwrap()]);
+    git(&["init", "--initial-branch=card-work"]);
+    git(&["config", "user.name", "Regression"]);
+    git(&["config", "user.email", "regression@example.invalid"]);
+    git(&["commit", "--allow-empty", "-m", "unpublished work"]);
+    git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+    let before = run_ok(&home, &["work", "board"]);
+    let error = run_expect_failure(&home, &["work", "state", card, "review"]);
+    assert!(error.contains("git push -u origin HEAD"), "{error}");
+    let after = run_ok(&home, &["work", "board"]);
+    let card_line = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with(card))
+            .unwrap()
+            .split("lease=")
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(card_line(&before), card_line(&after));
+    assert!(after.contains("InProgress"), "{after}");
+    assert!(
+        !after.contains("review: unpushed review regression"),
+        "{after}"
     );
 }
 

@@ -3,12 +3,17 @@
 //! Run automatically by `SqliteEventStore::open` so consumers don't
 //! need a separate "init" step. Migrations preserve user data; most are
 //! additive, and the few SQLite table-recreate migrations copy rows
-//! before dropping their legacy tables. The store treats older
-//! databases as forward-compatible.
+//! before dropping their legacy tables. An older database is migrated
+//! forward; a NEWER one (migrations this binary does not know) is refused for
+//! writing ([`crate::StoreError::AheadOfBinary`]).
 
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, TransactionTrait};
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::seaql_migrations;
+
+use crate::error::StoreError;
+
+pub(crate) mod fault;
 
 mod m20260519_000001_create_events;
 mod m20260522_000002_create_runtime_cursors;
@@ -30,6 +35,8 @@ mod m20260614_000017_add_peer_trust_last_seen;
 mod m20260629_000018_create_scoped_state;
 mod m20260723_000019_add_peer_trust_endpoints_stamp;
 mod m20260723_000020_add_peer_trust_endpoints_peer;
+mod m20261029_000021_add_event_addressing;
+mod m20261029_000022_create_event_headers;
 
 pub struct Migrator;
 
@@ -57,60 +64,87 @@ impl MigratorTrait for Migrator {
             Box::new(m20260629_000018_create_scoped_state::Migration),
             Box::new(m20260723_000019_add_peer_trust_endpoints_stamp::Migration),
             Box::new(m20260723_000020_add_peer_trust_endpoints_peer::Migration),
+            Box::new(m20261029_000021_add_event_addressing::Migration),
+            Box::new(m20261029_000022_create_event_headers::Migration),
         ]
     }
 }
 
-/// Apply pending migrations, tolerating a database that is AHEAD of this
-/// binary.
+/// Bring the database to this binary's schema and derived data, for writing.
 ///
-/// `Migrator::up` hard-fails when the DB has applied migrations this
-/// binary has no file for (SeaORM: "migration file is missing"). That
-/// happens under version skew — a newer build migrates the DB forward,
-/// then an older binary opens it (e.g. a stale `~/.local/bin/airc`
-/// against a DB a dev build already migrated). Our migrations preserve
-/// existing data and older binaries simply ignore schema they do not
-/// understand, so a DB ahead of us is harmless: the extra tables/columns
-/// are unused. If `up` fails ONLY because the DB is ahead — every
-/// migration WE define is already applied — we proceed. A genuine
-/// divergence (we still have unapplied migrations of our own) surfaces
-/// the error instead of silently skipping schema we actually need.
-pub async fn apply_migrations(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
-    match Migrator::up(db, None).await {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            if all_defined_migrations_applied(db).await? {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        }
+/// 1. Refuse a database migrated AHEAD of this binary: a newer build added
+///    columns or tables it keeps current at every write (the addressing
+///    columns, the header rows), and an older writer would insert rows without
+///    them. The refusal names the unknown versions.
+/// 2. Apply the pending migrations and their version rows in ONE transaction.
+///    sea-orm-migration 1.1 runs SQLite migrations on the connection it is
+///    given without a transaction of its own (`exec_with_connection`), so a
+///    crash between a migration's DDL and its version row left a half-applied
+///    schema that the retry could not re-apply (duplicate column). Given our
+///    transaction, the DDL and the version rows commit together or not at all
+///    (SQLite DDL is transactional).
+/// 3. Derive what rows still owe ([`crate::derive::derive_pending`]): resumable,
+///    so an interrupted derivation or rows an older writer inserted are healed
+///    on this and every later open.
+pub async fn apply_migrations(db: &DatabaseConnection) -> Result<(), StoreError> {
+    let ahead = unknown_applied(db).await?;
+    if !ahead.is_empty() {
+        return Err(StoreError::AheadOfBinary { versions: ahead });
     }
+    if !Migrator::get_pending_migrations(db).await?.is_empty() {
+        let txn = db.begin().await?;
+        Migrator::up(&txn, None).await?;
+        txn.commit().await?;
+    }
+    crate::derive::derive_pending(db).await
 }
 
-/// True when every migration this binary defines is already recorded in
-/// the DB's `seaql_migrations` table — i.e. the DB is at or ahead of us,
-/// never behind on one of ours.
-async fn all_defined_migrations_applied(db: &DatabaseConnection) -> Result<bool, sea_orm::DbErr> {
-    // Read the applied set through SeaORM's own `seaql_migrations`
-    // entity — not raw SQL (the migration table is a first-class entity;
-    // hand-written SQL here would be a "bad ORM" smell + violate the
-    // no-raw-SQL rule).
-    let applied: std::collections::HashSet<String> = seaql_migrations::Entity::find()
+/// Refuse a write when the database was migrated past this binary after it was
+/// opened (an `airc update` ran while this process held the store open): the
+/// write would store rows without what the newer binary derives. Cheap: one
+/// COUNT of the version table, which at open held exactly this binary's
+/// migrations; only a mismatch reads the versions to name them.
+pub(crate) async fn refuse_if_ahead(db: &impl ConnectionTrait) -> Result<(), StoreError> {
+    let applied = seaql_migrations::Entity::find().count(db).await?;
+    if applied <= Migrator::migrations().len() as u64 {
+        return Ok(());
+    }
+    Err(StoreError::AheadOfBinary {
+        versions: unknown_applied(db).await?,
+    })
+}
+
+/// Versions recorded as applied that this binary has no migration for.
+async fn unknown_applied(db: &impl ConnectionTrait) -> Result<Vec<String>, StoreError> {
+    Migrator::install(db).await?;
+    let known: std::collections::HashSet<String> = Migrator::migrations()
+        .iter()
+        .map(|migration| migration.name().to_owned())
+        .collect();
+    Ok(seaql_migrations::Entity::find()
         .all(db)
         .await?
         .into_iter()
         .map(|row| row.version)
-        .collect();
-    Ok(Migrator::migrations()
-        .iter()
-        .all(|migration| applied.contains(migration.name())))
+        .filter(|version| !known.contains(version))
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use sea_orm::{ActiveModelTrait, Database, Set};
+
+    /// Record `version` as applied, through SeaORM's own migrations entity.
+    async fn record(db: &DatabaseConnection, version: &str) {
+        seaql_migrations::ActiveModel {
+            version: Set(version.to_owned()),
+            applied_at: Set(0),
+        }
+        .insert(db)
+        .await
+        .expect("record migration");
+    }
 
     async fn memory_db() -> DatabaseConnection {
         Database::connect("sqlite::memory:")
@@ -118,51 +152,40 @@ mod tests {
             .expect("connect in-memory")
     }
 
+    // what this catches (Codex on #1618): a store this binary opened stays open
+    // across an `airc update` that migrates the database forward; its next write
+    // is refused AheadOfBinary, never a row without the newer derived data.
     #[tokio::test]
-    async fn tolerates_a_db_migrated_ahead_of_this_binary() {
-        let db = memory_db().await;
-        apply_migrations(&db).await.expect("initial migrate");
-        // Simulate a newer build recording a migration we have no file for.
-        db.execute(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "INSERT INTO seaql_migrations (version, applied_at) \
-             VALUES ('m99999999_999999_future', 0)"
-                .to_owned(),
-        ))
-        .await
-        .expect("insert future migration");
-        // Re-opening must NOT hard-fail on the unknown-applied migration —
-        // the DB is merely ahead of us, and our schema is all present.
-        apply_migrations(&db)
-            .await
-            .expect("must tolerate a DB ahead of this binary");
+    async fn a_stale_writer_is_refused_after_the_database_moves_ahead() {
+        use crate::store::EventStore;
+        let store = crate::SqliteEventStore::in_memory().await.unwrap();
+        let cursor = |n: u128| airc_core::TranscriptCursor {
+            lamport: n as u64,
+            event_id: airc_core::EventId::from_u128(n),
+        };
+        store.save_runtime_cursor("c", &cursor(1), 1).await.unwrap();
+        record(store.connection(), "m99999999_999999_newer_binary").await;
+        match store.save_runtime_cursor("c", &cursor(2), 2).await {
+            Err(StoreError::AheadOfBinary { versions }) => {
+                assert_eq!(versions, ["m99999999_999999_newer_binary"]);
+            }
+            other => panic!("expected AheadOfBinary, got {other:?}"),
+        }
     }
 
+    // what this catches (Codex on #1618): a database a NEWER binary migrated is refused
+    // for writing, naming the versions, instead of tolerated: this binary would write rows
+    // without the data the newer one derives at every write.
     #[tokio::test]
-    async fn surfaces_error_when_our_own_migrations_are_unapplied() {
-        // A DB whose ONLY recorded migration is foreign (none of ours) —
-        // we genuinely have pending schema, so we must NOT silently skip
-        // it; the error surfaces instead.
+    async fn a_database_ahead_of_this_binary_is_refused_for_writing() {
         let db = memory_db().await;
-        db.execute(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "CREATE TABLE seaql_migrations \
-             (version varchar PRIMARY KEY, applied_at bigint NOT NULL)"
-                .to_owned(),
-        ))
-        .await
-        .expect("create migrations table");
-        db.execute(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "INSERT INTO seaql_migrations (version, applied_at) \
-             VALUES ('m99999999_999999_foreign', 0)"
-                .to_owned(),
-        ))
-        .await
-        .expect("insert foreign migration");
-        assert!(
-            apply_migrations(&db).await.is_err(),
-            "divergence (our migrations unapplied) must surface, not silently skip"
-        );
+        apply_migrations(&db).await.expect("initial migrate");
+        record(&db, "m99999999_999999_future").await;
+        match apply_migrations(&db).await {
+            Err(StoreError::AheadOfBinary { versions }) => {
+                assert_eq!(versions, ["m99999999_999999_future"]);
+            }
+            other => panic!("expected AheadOfBinary, got {other:?}"),
+        }
     }
 }

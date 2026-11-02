@@ -29,12 +29,7 @@ fn run(account: &Path, scope: &str, client: &str, args: &[&str]) -> String {
         .env("AIRC_CLIENT_ID", client)
         .output()
         .expect("airc command must spawn");
-    assert!(
-        output.status.success(),
-        "airc {args:?} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    common::assert_success(&output, &format!("airc {args:?}"));
     String::from_utf8(output.stdout).expect("stdout utf-8")
 }
 

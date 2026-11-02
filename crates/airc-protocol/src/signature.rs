@@ -321,23 +321,44 @@ fn check_reply_to_consistency(envelope: &Envelope) -> Result<(), VerificationErr
 
 /// serde adapter for `[u8; 64]` — serde doesn't derive for arrays > 32.
 pub(crate) mod serde_bytes_64 {
-    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    use serde::{
+        de::{Error, SeqAccess, Visitor},
+        Deserializer, Serializer,
+    };
 
     pub fn serialize<S: Serializer>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(value)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
-        let bytes = <Vec<u8> as Deserialize>::deserialize(deserializer)?;
-        if bytes.len() != 64 {
-            return Err(D::Error::custom(format!(
-                "Ed25519 signature must be 64 bytes, got {}",
-                bytes.len()
-            )));
+        struct SignatureBytes;
+        impl<'de> Visitor<'de> for SignatureBytes {
+            type Value = [u8; 64];
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("exactly 64 Ed25519 signature bytes")
+            }
+            fn visit_bytes<E: Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+                bytes
+                    .try_into()
+                    .map_err(|_| E::invalid_length(bytes.len(), &self))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut bytes = [0; 64];
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = sequence
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(index, &self))?;
+                }
+                if sequence.next_element::<u8>()?.is_some() {
+                    return Err(A::Error::invalid_length(65, &self));
+                }
+                Ok(bytes)
+            }
         }
-        let mut out = [0u8; 64];
-        out.copy_from_slice(&bytes);
-        Ok(out)
+        deserializer.deserialize_bytes(SignatureBytes)
     }
 }
 
@@ -371,6 +392,19 @@ mod tests {
             kind: FrameKind::Message,
             envelope: envelope_with(sig),
         }
+    }
+
+    #[test]
+    fn signed_frame_round_trips_cbor_signature_bytes() {
+        let frame = frame_with(Signature::Ed25519 {
+            signer: PeerId::from_u128(0xa1),
+            key_id: 0,
+            sig: [42; 64],
+        });
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&frame, &mut encoded).unwrap();
+        let decoded: Frame = ciborium::from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, frame);
     }
 
     #[test]

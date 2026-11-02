@@ -49,9 +49,55 @@ pub struct WorkBoardProjection {
     /// Latest refusal per parent; invalid reviews never replace accepted evidence.
     #[serde(default)]
     pub(super) review_rejections: BTreeMap<WorkCardId, crate::RejectedWorkReview>,
+    /// Exact candidate bindings for materialized review handoffs. Legacy review
+    /// cards are parent-scoped and have no entry here.
+    #[serde(default)]
+    pub(super) review_requests: BTreeMap<WorkCardId, crate::SubmissionReviewRequested>,
+    #[serde(default)]
+    pub(super) review_request_rejections: BTreeMap<WorkCardId, crate::WorkReviewRejectionReason>,
 }
 
 impl WorkBoardProjection {
+    pub fn review_request(
+        &self,
+        review_card: WorkCardId,
+    ) -> Option<&crate::SubmissionReviewRequested> {
+        self.review_requests.get(&review_card)
+    }
+
+    pub fn review_request_rejection(
+        &self,
+        review_card: WorkCardId,
+    ) -> Option<crate::WorkReviewRejectionReason> {
+        self.review_request_rejections.get(&review_card).copied()
+    }
+
+    /// Resolve the candidate under the review's typed binding. Legacy unbound
+    /// reviews retain their explicit-or-latest behavior, using transcript order.
+    pub fn candidate_for_review(
+        &self,
+        review_card: WorkCardId,
+        requested: Option<crate::SubmissionId>,
+    ) -> Result<&crate::WorkSubmission, crate::WorkReviewRejectionReason> {
+        use crate::WorkReviewRejectionReason as Reason;
+        let review = self.card(review_card).ok_or(Reason::WrongReviewCard)?;
+        let parent = self
+            .card(review.reviews.ok_or(Reason::WrongReviewCard)?)
+            .ok_or(Reason::UnknownSubmission)?;
+        let bound = self.review_request(review_card).map(|r| r.submission_id);
+        if requested
+            .zip(bound)
+            .is_some_and(|(asked, actual)| asked != actual)
+        {
+            return Err(Reason::WrongReviewCard);
+        }
+        match requested.or(bound) {
+            Some(id) => parent.submissions.iter().find(|s| s.submission_id == id),
+            None => parent.submissions.first(),
+        }
+        .ok_or(Reason::UnknownSubmission)
+    }
+
     pub fn submission_review(
         &self,
         id: crate::WorkReviewId,
@@ -123,6 +169,10 @@ impl WorkBoardProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardSnapshot {
     pub cards: Vec<WorkCard>,
+    /// Accepted signed verdicts, from the same room projection as the cards.
+    /// Missing on older snapshots; never infer a verdict from card state.
+    #[serde(default)]
+    pub submission_reviews: Vec<crate::WorkSubmissionReview>,
     pub lanes: Vec<LaneRecord>,
     pub workspaces: Vec<WorkspaceRecord>,
     pub repo_tracking: Vec<RepoTrackingRecord>,
