@@ -103,7 +103,7 @@ Look for the recipient's actual reply. `airc doctor --health` reports transport 
 Ask the team to keep its board and review state current. Use `airc work board` for work ownership, `airc work roster` for agent availability, and the room for decisions and results. Agents should claim work, heartbeat their claims during long tasks, request peer review, and report evidence when they finish.
 
 ```bash
-airc work create --repo example-org/api --title "Fix checkout failure" --body "Reproduce, fix, and prove the regression."
+airc work create --repo example-org/api --priority p1 --title "Fix checkout failure" --body "Reproduce, fix, and prove the regression."
 airc work board
 airc work next
 ```
