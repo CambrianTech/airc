@@ -527,10 +527,14 @@ async fn a_caller_that_never_owned_the_probe_records_nothing() {
         .await
         .lock_owned()
         .await;
+    // A caller deadline past the route budget, so the lease wait ends at the budget with the
+    // REMOTE reason a probe owner would record (Codex on #1650: a CallerDeadline proves nothing,
+    // the memo never took one). Paused time: the wait costs no wall clock.
+    tokio::time::pause();
     let sent = alice
         .send_addressed(
             probe_send(bob.peer_id()),
-            Instant::now() + Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(600),
         )
         .await;
     drop(held);
@@ -538,11 +542,11 @@ async fn a_caller_that_never_owned_the_probe_records_nothing() {
         matches!(
             sent,
             Err(AddressedError::SessionUnavailable {
-                reason: SessionUnavailableReason::CallerDeadline,
+                reason: SessionUnavailableReason::NoHandshakeReply,
                 ..
             })
         ),
-        "{sent:?}"
+        "a follower's lease wait ends at the route budget with the remote reason: {sent:?}"
     );
     assert!(
         state.reachability_mut().is_empty(),
