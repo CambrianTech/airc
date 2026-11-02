@@ -293,6 +293,17 @@ fn request_backfill(inner: &Arc<ForwarderInner>, peer: PeerId) {
                 }
             }
             active.remove(&peer);
+            drop(active);
+            emit(
+                &inner,
+                DiagnosticEvent::new(
+                    airc_diagnostics::DiagnosticSeverity::Debug,
+                    DiagnosticComponent::Daemon,
+                    DiagnosticCode::RoutedBackfillSettled,
+                    "recovery owner settled its active pass and queued reruns",
+                )
+                .with_field("peer", peer),
+            );
             return;
         }
     });

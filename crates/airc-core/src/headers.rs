@@ -7,6 +7,12 @@
 //! `openclaw.*`, `hermes.*`, `continuum.*`, `x-*`).
 
 use serde::{Deserialize, Serialize};
+
+/// Runtime consumer identity. This is the human/agent process label
+/// (`codex:<thread>`, `claude:<session>`, etc.) used by hooks and
+/// monitors to filter their own sends without conflating every process
+/// that shares the same persisted substrate `ClientId`.
+pub const HEADER_AIRC_CLIENT: &str = "airc.client";
 use std::collections::{BTreeMap, HashMap};
 
 /// Deterministically ordered string headers.

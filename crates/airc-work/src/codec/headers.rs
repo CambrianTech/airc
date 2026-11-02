@@ -44,6 +44,10 @@ fn project_domain_headers(event: &WorkEvent, headers: &mut Headers) {
             insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);
             insert_display_header(headers, HEADER_FORGE_WORK_CLAIM_ID, e.review_claim_id);
         }
+        WorkEvent::SubmissionReviewRequested(e) => {
+            insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card.card_id);
+            headers.insert(HEADER_FORGE_WORK_REPO.to_string(), e.card.repo.to_string());
+        }
         WorkEvent::SubmissionRejected(_) | WorkEvent::ReviewRejected(_) => {}
         WorkEvent::CardCreated(e) => {
             insert_display_header(headers, HEADER_FORGE_WORK_CARD_ID, e.card_id);

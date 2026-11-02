@@ -72,3 +72,68 @@ async fn publish_to_room_by_name_does_not_change_current_room() {
         "BUG: --room publish silently changed the channel id (regression of seam #5)"
     );
 }
+
+// Real daemon IPC must preserve the recipient, not silently broadcast it.
+#[tokio::test]
+async fn directed_publish_preserves_peer_and_room_through_daemon() {
+    let machine = Machine::boot().await;
+    let alice = machine.attach("alice").await;
+    let bob = machine.attach("bob").await;
+    let other = alice.join("directed-other").await.expect("join other");
+    bob.join("directed-other").await.expect("recipient joins");
+    let home = alice.join("directed-home").await.expect("join home");
+    let receipt = alice
+        .publish(
+            PublishTarget::RoomByName(other.name.clone()).to_peer(bob.peer_id()),
+            FrameKind::Message,
+            Body::text("cross-room directed challenge"),
+            airc_core::Headers::new(),
+        )
+        .await
+        .expect("directed publish");
+    let events = bob.page_recent_in(&other, 20).await.expect("read receipt");
+    let event = events
+        .iter()
+        .find(|event| event.event_id == receipt.event_id)
+        .expect("persisted event");
+    assert_eq!(event.target, airc_core::MentionTarget::Peer(bob.peer_id()));
+    assert_eq!(event.room_id, other.channel);
+    assert_eq!(
+        alice.current_room().await.expect("current").channel,
+        home.channel
+    );
+    assert!(alice
+        .publish(
+            PublishTarget::RoomByName("not-subscribed".into()).to_peer(bob.peer_id()),
+            FrameKind::Message,
+            Body::text("must refuse"),
+            airc_core::Headers::new(),
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn directed_publish_preserves_recipient_without_daemon() {
+    let dir = tempfile::tempdir().expect("home");
+    let alice = airc_lib::Airc::open(dir.path()).await.expect("open");
+    let room = alice.join("direct-self").await.expect("join");
+    let receipt = alice
+        .publish(
+            PublishTarget::CurrentRoom.to_peer(alice.peer_id()),
+            FrameKind::Message,
+            Body::text("typed self message"),
+            airc_core::Headers::new(),
+        )
+        .await
+        .expect("publish");
+    let events = alice.page_recent_in(&room, 20).await.expect("history");
+    let event = events
+        .iter()
+        .find(|event| event.event_id == receipt.event_id)
+        .expect("persisted event");
+    assert_eq!(
+        event.target,
+        airc_core::MentionTarget::Peer(alice.peer_id())
+    );
+}

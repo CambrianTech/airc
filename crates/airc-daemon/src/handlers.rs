@@ -18,9 +18,8 @@ use airc_bus::{Clock, Seq, SystemClock};
 use airc_core::scoped_state::{ScopeRef, PEER_IDENTITY_STATE_KEY};
 use airc_core::{Body, ClientId, PeerId, RoomId};
 use airc_ipc::request::{
-    AddPeerRequest, InboxRequest, IpcCursor, IpcDelivery, IpcKind, IpcTarget,
-    PeerIdentityCardRequest, PresenceRequest, PublishRequest, RemovePeerRequest, Request,
-    RoomTipRequest, SendRequest,
+    AddPeerRequest, InboxRequest, IpcCursor, IpcTarget, PeerIdentityCardRequest, PresenceRequest,
+    PublishRequest, RemovePeerRequest, Request, RoomTipRequest, SendRequest,
 };
 use airc_ipc::response::{
     InboxResponse, IpcIdentityCard, IpcRoomInfo, PeerEntry, PeerIdentityCardResponse,
@@ -43,6 +42,12 @@ const INBOX_PAGE_BYTE_BUDGET: usize = (airc_ipc::codec::MAX_FRAME_BYTES / 2) as 
 /// wire protocol stays uniform.
 pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
     match request {
+        Request::Addressed(request) => {
+            crate::addressed_connection::route_request(&state, request).await
+        }
+        Request::AttachAddressed(_) | Request::ProveAddressed(_) => Response::Error {
+            message: "addressed proof requires its original challenged connection".into(),
+        },
         Request::Ping => Response::Pong,
         Request::Status => {
             let retained = state.router.retention_snapshot();
@@ -71,6 +76,8 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
         Request::Send(send) => handle_send(state, send).await,
         Request::Publish(publish) => handle_publish(state, publish).await,
         Request::Inbox(inbox) => handle_inbox(state, inbox).await,
+        Request::ScanInbox(scan) => handle_scan_inbox(state, scan).await,
+        Request::CountInbox(count) => handle_count_inbox(state, count).await,
         Request::RoomTip(tip) => handle_room_tip(state, tip).await,
         Request::Presence(request) => handle_presence(&state, request),
         Request::PeerIdentityCard(req) => handle_peer_identity_card(state, req).await,
@@ -100,28 +107,6 @@ pub async fn dispatch(state: Arc<DaemonState>, request: Request) -> Response {
             state.shutdown.notify_waiters();
             Response::Ok
         }
-    }
-}
-
-fn map_kind(kind: IpcKind) -> Kind {
-    match kind {
-        IpcKind::Message => Kind::Message,
-        IpcKind::Event => Kind::Event,
-        IpcKind::Command => Kind::Command,
-        IpcKind::CommandResult => Kind::CommandResult,
-        IpcKind::Signal => Kind::Signal,
-        IpcKind::StreamChunk => Kind::StreamChunk,
-        IpcKind::Control => Kind::Control,
-    }
-}
-
-fn map_delivery(delivery: IpcDelivery) -> DeliveryClass {
-    match delivery {
-        IpcDelivery::Durable => DeliveryClass::Durable,
-        IpcDelivery::EphemeralLatest => DeliveryClass::EphemeralLatest,
-        IpcDelivery::EphemeralWindow => DeliveryClass::EphemeralWindow,
-        IpcDelivery::RequestResponse => DeliveryClass::RequestResponse,
-        IpcDelivery::StreamChunk => DeliveryClass::StreamChunk,
     }
 }
 
@@ -208,6 +193,14 @@ async fn handle_send(state: Arc<DaemonState>, send: SendRequest) -> Response {
 }
 
 async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Response {
+    let kind = match crate::kind_map::bus_kind(publish.kind) {
+        Ok(kind) => kind,
+        Err(refusal) => {
+            return Response::Error {
+                message: format!("publish: {refusal}"),
+            }
+        }
+    };
     publish_envelope(
         &state,
         publish.channel,
@@ -215,8 +208,8 @@ async fn handle_publish(state: Arc<DaemonState>, publish: PublishRequest) -> Res
             PeerId::from_uuid(publish.from_peer),
             ClientId::from_uuid(publish.from_client),
         ),
-        map_kind(publish.kind),
-        map_delivery(publish.delivery),
+        kind,
+        crate::kind_map::bus_delivery(publish.delivery),
         map_target(publish.target),
         publish.correlation_id,
         publish.coalesce_key,
@@ -247,11 +240,20 @@ async fn handle_inbox(state: Arc<DaemonState>, request: InboxRequest) -> Respons
     // unfiltered: filtering to nothing is never what a caller means,
     // so an empty list is treated as absent rather than answered with
     // a vacuously empty page.
-    let kinds: Option<Vec<Kind>> = request
+    let kinds: Option<Vec<Kind>> = match request
         .kinds
         .as_ref()
         .filter(|kinds| !kinds.is_empty())
-        .map(|kinds| kinds.iter().map(|k| map_kind(*k)).collect());
+        .map(|kinds| crate::kind_map::bus_kinds(kinds.iter().copied()))
+        .transpose()
+    {
+        Ok(kinds) => kinds,
+        Err(refusal) => {
+            return Response::Error {
+                message: format!("inbox: {refusal}"),
+            }
+        }
+    };
     if request.since.is_some() && request.before.is_some() {
         return Response::Error {
             message: "inbox: `since` pages forward and `before` pages back; pass one".to_string(),
@@ -483,7 +485,10 @@ async fn handle_add_peer(state: Arc<DaemonState>, add: AddPeerRequest) -> Respon
     }
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&bytes);
-    if let Err(error) = state.registry.enrol(add.peer_id, 0, pubkey) {
+    if let Err(error) =
+        crate::trust_refresh::refresh_peer(&state.registry, &state.home, add.peer_id, Some(pubkey))
+            .await
+    {
         return Response::Error {
             message: format!("add_peer: enrol: {error}"),
         };
@@ -585,5 +590,264 @@ mod tests {
             (1, false),
             "one oversize event is still delivered so the cursor moves"
         );
+    }
+}
+
+async fn handle_scan_inbox(
+    state: Arc<DaemonState>,
+    request: airc_ipc::request::ScanInboxRequest,
+) -> Response {
+    let cursor = |c: IpcCursor| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id);
+    let after = cursor(request.after);
+    let through = cursor(request.through);
+    if request.limit == 0 || request.limit > 4096 || after.is_after(&through) {
+        return Response::Error {
+            message: "scan inbox: invalid bounds or limit (1..4096)".into(),
+        };
+    }
+    let events = match state
+        .router
+        .matching_history(
+            request.channel,
+            after,
+            through,
+            airc_core::HistoryMatch {
+                headers: &request.headers,
+                addressed_to: request.addressed_to,
+            },
+            request.limit + 1,
+            request.tail,
+        )
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            return Response::Error {
+                message: format!("scan inbox: {error}"),
+            }
+        }
+    };
+    scan_page_response(events, request, airc_ipc::codec::MAX_FRAME_BYTES as usize)
+}
+
+async fn handle_count_inbox(
+    state: Arc<DaemonState>,
+    request: airc_ipc::request::CountInboxRequest,
+) -> Response {
+    let cursor = |c: IpcCursor| Cursor::new(Seq::new(c.epoch, c.counter), c.event_id);
+    let after = cursor(request.after);
+    let through = cursor(request.through);
+    if after.is_after(&through) {
+        return Response::Error {
+            message: "count inbox: `after` is past `through`".into(),
+        };
+    }
+    match state
+        .router
+        .count_matching(
+            request.channel,
+            after,
+            through,
+            &request.headers,
+            request.exclude_self.as_ref(),
+        )
+        .await
+    {
+        Ok(count) => Response::CountInbox(count),
+        Err(error) => Response::Error {
+            message: format!("count inbox: {error}"),
+        },
+    }
+}
+
+fn scan_page_response(
+    mut events: Vec<Arc<Envelope>>,
+    request: airc_ipc::request::ScanInboxRequest,
+    budget: usize,
+) -> Response {
+    let mut more = events.len() > request.limit;
+    if request.tail && more {
+        events.remove(0);
+    } else {
+        events.truncate(request.limit);
+    }
+    if request.tail {
+        more = false;
+    }
+    let mut envelopes = Vec::new();
+    let mut bytes = 0;
+    let mut last = request.after;
+    for event in events {
+        let encoded = airc_wire::encode(&event);
+        let next = IpcCursor {
+            epoch: event.seq.epoch,
+            counter: event.seq.counter,
+            event_id: event.event_id,
+        };
+        let array_bytes = airc_ipc::codec::byte_array_payload_len(&encoded);
+        // Reserve the larger of complete and truncated cursor metadata: either
+        // outcome must fit without reserializing all earlier envelope bodies.
+        let overhead = [next, request.through]
+            .into_iter()
+            .map(|cursor| {
+                airc_ipc::codec::scan_inbox_payload_overhead(cursor, true, envelopes.len() + 1)
+            })
+            .collect::<std::io::Result<Vec<_>>>();
+        let overhead = match overhead {
+            Ok(sizes) => sizes.into_iter().max().unwrap_or(0),
+            Err(error) => {
+                return Response::Error {
+                    message: format!("scan inbox framing: {error}"),
+                }
+            }
+        };
+        if bytes + array_bytes + overhead > budget.min(airc_ipc::codec::MAX_FRAME_BYTES as usize) {
+            if envelopes.is_empty() || request.tail {
+                return Response::Error {
+                    message: "scan inbox: event exceeds response budget".into(),
+                };
+            }
+            more = true;
+            break;
+        }
+        bytes += array_bytes;
+        envelopes.push(encoded.to_vec());
+        last = IpcCursor {
+            epoch: event.seq.epoch,
+            counter: event.seq.counter,
+            event_id: event.event_id,
+        };
+    }
+    // Tail intentionally omits earlier history, but must never acknowledge a byte-cut later match.
+    let scanned_through = if more { last } else { request.through };
+    Response::ScanInbox(airc_ipc::response::ScanInboxResponse {
+        envelopes,
+        scanned_through,
+        has_more: more,
+    })
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    #[test]
+    fn maximum_cursor_and_high_bytes_fit_real_codec_or_fail_without_progress() {
+        let room = RoomId::from_u128(1);
+        let make = |counter, size| {
+            let mut event = Envelope::new(
+                room,
+                (PeerId::from_u128(2), ClientId::from_u128(3)),
+                Kind::Message,
+                DeliveryClass::Durable,
+                Bytes::from(vec![255; size]),
+            );
+            event.seq = Seq::new(u64::MAX, counter);
+            Arc::new(event)
+        };
+        let cap = airc_ipc::codec::MAX_FRAME_BYTES as usize;
+        let request = airc_ipc::request::ScanInboxRequest {
+            channel: room,
+            after: IpcCursor {
+                epoch: u64::MAX,
+                counter: 0,
+                event_id: airc_core::EventId::from_u128(0),
+            },
+            through: IpcCursor {
+                epoch: u64::MAX,
+                counter: u64::MAX,
+                event_id: airc_core::EventId::from_u128(u128::MAX),
+            },
+            headers: airc_core::HeaderFilter::Any,
+            addressed_to: None,
+            limit: 2,
+            tail: false,
+        };
+        let response = scan_page_response(
+            vec![make(1, cap / 4), make(2, cap / 4)],
+            request.clone(),
+            cap,
+        );
+        let Response::ScanInbox(page) = &response else {
+            panic!("bounded page expected")
+        };
+        assert_eq!(page.envelopes.len(), 1);
+        assert!(page.has_more);
+        assert_eq!(page.scanned_through.counter, 1);
+        assert!(airc_ipc::codec::encode_frame_payload(&response).is_ok());
+        let oversized = scan_page_response(vec![make(1, cap / 2)], request.clone(), cap);
+        assert!(matches!(oversized, Response::Error { .. }));
+        let mut tail = request;
+        tail.tail = true;
+        assert!(matches!(
+            scan_page_response(vec![make(1, cap / 4), make(2, cap / 4)], tail, cap),
+            Response::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn byte_cut_acknowledges_only_the_delivered_prefix_and_empty_scan_reaches_bound() {
+        let room = RoomId::from_u128(1);
+        let events: Vec<_> = (1..=3)
+            .map(|n| {
+                let mut e = Envelope::new(
+                    room,
+                    (PeerId::from_u128(2), ClientId::from_u128(3)),
+                    Kind::Message,
+                    DeliveryClass::Durable,
+                    Bytes::from(vec![0; 1024]),
+                );
+                e.seq = Seq::new(1, n);
+                Arc::new(e)
+            })
+            .collect();
+        let request = airc_ipc::request::ScanInboxRequest {
+            channel: room,
+            after: IpcCursor {
+                epoch: 1,
+                counter: 0,
+                event_id: airc_core::EventId::from_u128(0),
+            },
+            through: IpcCursor {
+                epoch: 1,
+                counter: 9,
+                event_id: airc_core::EventId::from_u128(9),
+            },
+            headers: airc_core::HeaderFilter::Any,
+            addressed_to: None,
+            limit: 3,
+            tail: false,
+        };
+        let budget = airc_ipc::codec::byte_array_payload_len(&airc_wire::encode(&events[0]))
+            + airc_ipc::codec::scan_inbox_payload_overhead(request.through, true, 1).unwrap();
+        let Response::ScanInbox(page) = scan_page_response(events, request.clone(), budget) else {
+            panic!("scan response expected")
+        };
+        assert_eq!(page.envelopes.len(), 1);
+        assert!(page.has_more);
+        assert_eq!(page.scanned_through.counter, 1);
+        let Response::ScanInbox(empty) = scan_page_response(vec![], request.clone(), budget) else {
+            panic!("scan response expected")
+        };
+        assert_eq!(empty.scanned_through, request.through);
+        assert!(!empty.has_more);
+        // An ordinary Inbox reply cannot be mistaken for the positive ScanInbox contract.
+        let mut encoded = Vec::new();
+        airc_ipc::codec::write_frame(
+            &mut encoded,
+            &Response::Inbox(InboxResponse {
+                envelopes: vec![],
+                newest: None,
+                has_more: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!matches!(
+            airc_ipc::codec::read_frame::<_, Response>(&mut encoded.as_slice())
+                .await
+                .unwrap()
+                .unwrap(),
+            Response::ScanInbox(_)
+        ));
     }
 }

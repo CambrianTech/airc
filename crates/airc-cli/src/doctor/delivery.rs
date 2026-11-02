@@ -7,8 +7,6 @@
 //! ledger is reported as a warning, never vacuously ok: neither
 //! establishes that anything was delivered.
 
-use std::path::Path;
-
 use airc_ipc::IpcPeerDeliveryStats;
 
 use super::{Check, CheckConfig, CheckContext, Finding};
@@ -53,27 +51,6 @@ const NO_RTT_GRACE_MS: u64 = 2_000 * RTT_GRACE_MULTIPLE;
 const _: () = assert!(NO_RTT_GRACE_MS >= 50 * RTT_GRACE_MULTIPLE);
 const _: () = assert!(NO_RTT_GRACE_MS <= 2_000 * RTT_GRACE_MULTIPLE);
 
-/// Which peers are THIS operator's own machines.
-///
-/// `OwnAccount` describes account ownership, not physical placement. Another
-/// machine on the same account can acknowledge delivery; do not call it loopback.
-async fn own_account_peers(
-    home: &Path,
-) -> Result<std::collections::HashSet<airc_core::PeerId>, String> {
-    // Match `airc peers`: account enrollment can live in the machine store,
-    // and this scope's own identity must not count as a remote acknowledgement.
-    airc_lib::peer_trust_snapshot(home)
-        .await
-        .map(|peers| {
-            peers
-                .into_iter()
-                .filter(|peer| peer.tier == airc_store::TrustTier::OwnAccount)
-                .map(|peer| peer.peer_id)
-                .collect()
-        })
-        .map_err(|error| error.to_string())
-}
-
 async fn check_delivery_truth(ctx: &CheckContext<'_>) -> Vec<Finding> {
     let snapshot = match ctx.delivery_stats().await {
         Ok(response) => response,
@@ -111,15 +88,10 @@ async fn check_delivery_truth(ctx: &CheckContext<'_>) -> Vec<Finding> {
             "check daemon build and route-refresh diagnostics; historical acknowledgements cannot establish current delivery",
         )];
     }
-    let own = own_account_peers(ctx.home).await;
-    delivery_findings(&snapshot.peers, own.as_ref().map_err(String::as_str), now)
+    delivery_findings(&snapshot.peers, now)
 }
 
-fn delivery_findings(
-    stats: &[IpcPeerDeliveryStats],
-    own: Result<&std::collections::HashSet<airc_core::PeerId>, &str>,
-    now_ms: u64,
-) -> Vec<Finding> {
+fn delivery_findings(stats: &[IpcPeerDeliveryStats], now_ms: u64) -> Vec<Finding> {
     if stats.is_empty() {
         // NOT `ok`, and NOT "no deliveries attempted yet" — the ledger being
         // empty is not evidence that nothing was sent. Entries are only created
@@ -162,7 +134,7 @@ fn delivery_findings(
                     peer.attempts_since_ack,
                     last.map(age).unwrap_or_else(|| "never confirmed".into()),
                 ),
-                "watch `airc transport health` for the suspect-drop + re-dial",
+                "watch daemon route-refresh diagnostics for the suspect-drop and re-dial",
             )),
             // OUTSTANDING-UNCONFIRMED is the real question, not "how old is
             // the last ack". An old ack on an IDLE route is fine — nothing was
@@ -207,7 +179,7 @@ fn delivery_findings(
                             ack_detail,
                         ),
                         "treat anything sent since as NOT received; \
-                             `airc transport health` for the row, then re-dial",
+                             inspect daemon route-refresh diagnostics for recovery",
                     )),
                     _ => findings.push(Finding::ok(
                         "delivery truth",
@@ -241,72 +213,20 @@ fn delivery_findings(
                 ),
                 "a new route clears this on its first ack; if it does not, check you are in \
                  the scope the peer is enrolled in (`airc peers`) and that the daemon serves \
-                 THAT scope, then `airc transport health` for the dial errors",
+                 THAT scope, then inspect daemon route-refresh diagnostics for dial errors",
             )),
         }
     }
-    // Account ownership is not a physical topology test. Keep every peer's
-    // receipt above, and describe the trust partition without inventing locality.
-    match own {
-        Ok(own) => {
-            let (same_account, not_tagged) = stats.iter().filter(|peer| peer.acked > 0).fold(
-                (0, 0),
-                |(same, other), peer| {
-                    if own.contains(&peer.peer_id) {
-                        (same + 1, other)
-                    } else {
-                        (same, other + 1)
-                    }
-                },
-            );
-            findings.push(Finding::info(
-                "delivery account scope",
-                format!(
-                    "{same_account} OwnAccount peer(s) and {not_tagged} peer(s) not tagged OwnAccount in this scope have acknowledged; OwnAccount does not imply physical loopback, and a daemon ACK does not prove the intended reader consumed a message"
-                ),
-            ));
-        }
-        Err(error) => findings.push(Finding::warn(
-            "delivery account scope",
-            format!("UNKNOWN — trust store could not classify peer acknowledgements ({error})"),
-            "inspect the trust-store read error; peer receipts remain valid but their account scope is unknown",
-        )),
-    }
-
+    findings.push(Finding::info(
+        "delivery evidence",
+        "A daemon ACK confirms transport only; it does not prove the intended agent received or consumed a message",
+    ));
     findings
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The diagnostic must use the administrative peer snapshot, including its
-    // self-identity exclusion, rather than count every OwnAccount trust row.
-    #[tokio::test]
-    async fn own_account_snapshot_excludes_self_and_other_trust_tiers() {
-        let home = tempfile::tempdir().unwrap();
-        let identity = airc_identity::LocalIdentity::load_or_generate(home.path())
-            .await
-            .unwrap();
-        let remote = airc_core::PeerId::from_u128(42);
-        let other = airc_core::PeerId::from_u128(43);
-        for (peer, key) in [
-            (identity.peer_id, identity.keypair.public_bytes()),
-            (remote, [7; 32]),
-            (other, [8; 32]),
-        ] {
-            airc_trust::add(home.path(), peer, key).await.unwrap();
-        }
-        for peer in [identity.peer_id, remote] {
-            airc_trust::set_tier(home.path(), peer, airc_store::TrustTier::OwnAccount)
-                .await
-                .unwrap()
-                .expect("fixture peer is enrolled");
-        }
-
-        let own = own_account_peers(home.path()).await.unwrap();
-        assert_eq!(own, std::collections::HashSet::from([remote]));
-    }
 
     /// what this catches: THE 10-HOUR LIE. On 2026-08-05 `airc doctor` printed
     /// `[ok] delivery truth: <peer>: last confirmed delivery 10h ago` on a route
@@ -328,7 +248,7 @@ mod tests {
             rtt_ema_ms: Some(50),
             suspect: false,
         };
-        let findings = delivery_findings(&[peer], Ok(&Default::default()), now);
+        let findings = delivery_findings(&[peer], now);
         assert_eq!(findings[0].status, super::super::Status::Warn);
         assert!(findings[0].detail.contains("still unacked"));
     }
@@ -351,7 +271,7 @@ mod tests {
             rtt_ema_ms: Some(50),
             suspect: false,
         };
-        let findings = delivery_findings(&[peer], Ok(&Default::default()), now);
+        let findings = delivery_findings(&[peer], now);
         assert_eq!(findings[0].status, super::super::Status::Ok);
         assert!(findings[0].detail.contains("last confirmed delivery"));
     }
@@ -372,39 +292,10 @@ mod tests {
             rtt_ema_ms: Some(50),
             suspect: false,
         };
-        let fast = delivery_findings(&[peer.clone()], Ok(&Default::default()), now);
+        let fast = delivery_findings(&[peer.clone()], now);
         peer.rtt_ema_ms = Some(2_000);
-        let slow = delivery_findings(&[peer], Ok(&Default::default()), now);
+        let slow = delivery_findings(&[peer], now);
         assert_eq!(fast[0].status, super::super::Status::Warn);
         assert_eq!(slow[0].status, super::super::Status::Ok);
-    }
-
-    // c7873cba: an OwnAccount ACK is retained; a trust-store read failure must
-    // not reclassify it as another operator or physical loopback.
-    #[test]
-    fn account_scope_does_not_invent_physical_loopback() {
-        let peer = IpcPeerDeliveryStats {
-            peer_id: airc_core::PeerId::from_u128(1),
-            attempts: 1,
-            acked: 1,
-            attempts_since_ack: 0,
-            last_attempt_ms: Some(900),
-            last_ack_ms: Some(950),
-            rtt_ema_ms: Some(50),
-            suspect: false,
-        };
-        let own = std::collections::HashSet::from([peer.peer_id]);
-        let findings = delivery_findings(std::slice::from_ref(&peer), Ok(&own), 1_000);
-        assert_eq!(findings[0].status, super::super::Status::Ok);
-        assert_eq!(findings[1].status, super::super::Status::Info);
-        assert!(findings[1].detail.contains("1 OwnAccount peer(s)"));
-        assert!(findings[1]
-            .detail
-            .contains("does not imply physical loopback"));
-
-        let findings = delivery_findings(&[peer], Err("trust read failed"), 1_000);
-        assert_eq!(findings[0].status, super::super::Status::Ok);
-        assert_eq!(findings[1].status, super::super::Status::Warn);
-        assert!(findings[1].detail.contains("trust read failed"));
     }
 }

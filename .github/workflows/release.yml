@@ -26,6 +26,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: [canary]
   # Manual dispatch is BUILD + smoke-test + checksum ONLY — it never
   # publishes. Publishing is gated to real `v*` tag pushes (a dispatch's
   # ref is a branch, not a tag, so deriving a release tag from it would
@@ -186,6 +187,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME:-dev}"
+          if [ "$GITHUB_REF_TYPE" = branch ]; then version="canary-$GITHUB_SHA"; fi
           bin="${{ env.BINARY_NAME }}${{ matrix.ext }}"
           src="target/${{ matrix.target }}/release/$bin"
           stage="$RUNNER_TEMP/stage"
@@ -225,11 +227,9 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
-    # Publish ONLY on a real `v*` tag push. A `workflow_dispatch` ref is a
-    # branch, not a tag, so deriving a release tag from `GITHUB_REF_NAME`
-    # there would mislabel the release or fail `--verify-tag` after a full
-    # signed build — dispatch is build/verify-only by design.
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    # Stable tag pushes and immutable canary revision pushes share one asset
+    # contract. Manual dispatch stays build-only; it cannot publish a branch tag.
+    if: ${{ github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/canary') }}
     steps:
       - name: download all artifacts
         uses: actions/download-artifact@v4
@@ -241,6 +241,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_REF_TYPE" = branch ]; then tag="canary-$GITHUB_SHA"; fi
           # fail-fast: false lets one matrix leg fail without aborting the
           # others — good for seeing every failure, but it means publish
           # must REFUSE to ship a release missing a platform (an installer
@@ -270,8 +271,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          flags=(--verify-tag)
+          if [ "$GITHUB_REF_TYPE" = branch ]; then tag="canary-$GITHUB_SHA"; flags=(--target "$GITHUB_SHA" --prerelease); fi
           gh release create "$tag" dist/* \
             --repo "${{ github.repository }}" \
             --title "$tag" \
             --generate-notes \
-            --verify-tag
+            "${flags[@]}"

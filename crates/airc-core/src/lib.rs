@@ -20,6 +20,8 @@
 //! - [`receipt`]    — delivered/read/applied acknowledgments
 //! - [`attachment`] — file-attachment manifest (consumer-side richer view)
 //! - [`filter`]     — self-echo filtering for multi-tab consumers
+//! - [`addressing`] — who an event could be addressed to, as stores index it
+//! - [`history_match`] — the predicate a bounded history scan matches
 //! - [`headers`]    — envelope headers for routing/filtering without body parse
 //! - [`humanhash`]  — stable hash mnemonics for invite/client labels
 //! - [`temp_home`]  — temp-rooted scope-home detection (hermetic test daemons)
@@ -27,6 +29,7 @@
 //! Every public type a consumer needs is re-exported at the crate root so
 //! `use airc_core::Identity;` works without knowing the module split.
 
+pub mod addressing;
 pub mod attachment;
 pub mod body;
 pub mod channel_purpose;
@@ -36,6 +39,8 @@ pub mod doctrine;
 pub mod filter;
 pub mod gh_executable;
 pub mod headers;
+pub mod history_count;
+pub mod history_match;
 pub mod humanhash;
 pub mod identity;
 pub mod ids;
@@ -51,12 +56,15 @@ pub mod transcript;
 // use `airc_core::Foo`; internal cross-module references use the explicit
 // module paths so refactors stay clear.
 
+pub use addressing::{leading_mentions, AddresseeFilter, Addressing};
 pub use attachment::AttachmentManifest;
 pub use body::Body;
 pub use cursor::{page_before, page_recent, TranscriptCursor, TranscriptPage};
 pub use datetime::{iso_to_epoch, DateTimeError};
-pub use filter::{filter_self_echoes, SelfFilter};
+pub use filter::{filter_self_echoes, RuntimeSelf, SelfFilter};
 pub use headers::{HeaderFilter, Headers};
+pub use history_count::{HistoryCount, HISTORY_COUNT_CAP};
+pub use history_match::HistoryMatch;
 pub use humanhash::{humanhash, HumanhashError};
 pub use identity::Identity;
 pub use ids::{ClientId, ContentHash, EventId, FileId, PeerId, RoomId};
@@ -65,3 +73,5 @@ pub use receipt::{Receipt, ReceiptKind};
 pub use scoped_state::{ScopeRef, ScopedStateEntry, PEER_IDENTITY_STATE_KEY};
 pub use temp_home::scope_home_is_temp_rooted;
 pub use transcript::{MentionTarget, TranscriptEvent, TranscriptKind};
+
+pub mod bounded_selection;

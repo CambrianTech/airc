@@ -313,7 +313,7 @@ foreach ($setting in @('RUSTUP_HOME','CARGO_HOME','CARGO_TARGET_DIR')) {
         if ($persisted) { [Environment]::SetEnvironmentVariable($setting,$persisted,'Process') }
     }
 }
-Initialize-AircBuildStorage
+if ($env:AIRC_DEVELOPER_BUILD -eq '1') { Initialize-AircBuildStorage }
 
 # -- Install prereqs -----------------------------------------------------
 # Order matters lightly: git first so we can clone, then gh for the
@@ -328,6 +328,7 @@ Install-GitHubCli -SourceDirectory $SourceDirectory
 # Identity, signing, hooks, config, and JSON handling are all Rust-owned.
 
 # -- Rust toolchain ------------------------------------------------------
+if ($env:AIRC_DEVELOPER_BUILD -eq '1') {
 # airc IS a Rust binary; cargo is a hard prereq. install.sh auto-installs
 # Rustlang.Rustup on the winget path -- mirror that here instead of the
 # old hard-exit "go install Rust yourself". winget's Rustup package runs
@@ -417,6 +418,7 @@ if ($script:AircBuildStorage -and -not $env:CARGO_TARGET_DIR) {
         $env:CARGO_TARGET_DIR = Join-Path $script:AircBuildStorage 'target'
     }
 }
+} # Explicit contributor build only; published installs need no compiler/cache.
 Update-SessionPath
 $values = New-Object System.Collections.Generic.List[string]
 foreach ($name in @('PATH','CARGO_HOME','RUSTUP_HOME','CARGO_TARGET_DIR','TEMP','TMP')) {

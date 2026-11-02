@@ -45,6 +45,7 @@ pub struct ReviewWorkSubmission {
     pub review_claim_id: ClaimId,
     pub outcome: airc_work::WorkReviewOutcome,
     pub evidence: airc_work::SubmissionArtifact,
+    pub evidence_text: Option<String>,
 }
 
 /// Canonical pagination size for complete work-board projections.
@@ -453,6 +454,35 @@ fn build_operator_card_created(
 }
 
 impl Airc {
+    /// Materialize one peer-review handoff for an accepted candidate in its own
+    /// room. Retries (including concurrent publishers) preserve reviewer custody.
+    /// Policy deciding whether review is required belongs to the caller.
+    pub async fn ensure_submission_review_in(
+        &self,
+        room: &Room,
+        parent: WorkCardId,
+        submission: airc_work::SubmissionId,
+        mut request: CreateWorkCard,
+    ) -> Result<WorkCardId, AircError> {
+        let board = self.work_board_in(room).await?;
+        let card_id = airc_work::submission_review_card_id(parent, submission);
+        if let Some(recorded) = board.review_request(card_id) {
+            // Returning accepted custody is a read; only materializing a new
+            // request below requires the candidate publisher's signature.
+            recorded.validate_for_board(&board)?;
+            return Ok(card_id);
+        }
+        request.reviews = Some(parent);
+        let handoff = airc_work::SubmissionReviewRequested {
+            card: build_operator_card_created(card_id, self.peer_id(), now_ms()?, request),
+            submission_id: submission,
+        };
+        handoff.validate_for_board(&board)?;
+        self.publish_work_event_in(room, &WorkEvent::SubmissionReviewRequested(handoff))
+            .await?;
+        Ok(card_id)
+    }
+
     /// Record judgement with evidence under the historical linked review claim.
     /// This does not infer a pass from card state, fetch evidence, or establish
     /// independent review: consumers compare the reviewer with the publisher.
@@ -472,6 +502,7 @@ impl Airc {
             reviewer: self.peer_id(),
             outcome: request.outcome,
             evidence: request.evidence,
+            evidence_text: request.evidence_text,
             reviewed_at_ms: now_ms()?,
         };
         review.validate_for_board(&board)?;
@@ -1158,6 +1189,21 @@ impl Airc {
     pub async fn work_board_in(&self, room: &Room) -> Result<WorkBoardProjection, AircError> {
         self.project_room_work_board(room, WORK_BOARD_PROJECTION_PAGE_SIZE)
             .await
+    }
+
+    /// The complete work board of every room this scope subscribes to. For a
+    /// caller that owns per-card state independent of where the agent stands —
+    /// a claim worktree belongs to its card, wherever the card lives, so
+    /// classifying worktrees against one room's board leaves every other
+    /// room's worktrees looking orphaned and never reclaimed.
+    pub async fn work_boards_in_subscribed_rooms(
+        &self,
+    ) -> Result<Vec<WorkBoardProjection>, AircError> {
+        let mut boards = Vec::new();
+        for subscription in self.subscriptions().await? {
+            boards.push(self.work_board_in(&subscription.as_room()).await?);
+        }
+        Ok(boards)
     }
 
     /// Rebuild the current room's complete work board. Scheduling and
@@ -1945,6 +1991,54 @@ mod tests {
             )
             .await
             .unwrap();
+        // Regression d4955232: publication hands off the exact candidate. A
+        // retry cannot create another card or replace an existing review claim.
+        let handoff = CreateWorkCard::new(repo.clone(), "review exact artifact", Priority::P1);
+        let review_card = airc
+            .ensure_submission_review_in(&room, parent, submission.submission_id, handoff.clone())
+            .await
+            .unwrap();
+        let requested = airc.work_board_in(&room).await.unwrap();
+        assert_eq!(requested.card(parent).unwrap().claim_id, Some(claim));
+        assert_eq!(requested.card(review_card).unwrap().state, CardState::Open);
+        let request_event = requested.review_request(review_card).unwrap().clone();
+        let review_claim = airc
+            .claim_work_card(ClaimWorkCard {
+                card_id: review_card,
+                ttl_ms: 600_000,
+            })
+            .await
+            .unwrap();
+        airc.publish_work_event_in(&room, &WorkEvent::SubmissionReviewRequested(request_event))
+            .await
+            .unwrap(); // force the stale-reader/concurrent-publisher replay case
+        assert_eq!(
+            airc.ensure_submission_review_in(
+                &room,
+                parent,
+                submission.submission_id,
+                handoff.clone()
+            )
+            .await
+            .unwrap(),
+            review_card
+        );
+        let retried = airc.work_board_in(&room).await.unwrap();
+        assert_eq!(retried.review_cards_for(parent).count(), 1);
+        assert_eq!(
+            retried.card(review_card).unwrap().claim_id,
+            Some(review_claim)
+        );
+        assert_eq!(retried.card(review_card).unwrap().state, CardState::Claimed);
+        assert!(airc
+            .ensure_submission_review_in(
+                &room,
+                parent,
+                airc_work::SubmissionId::new(),
+                handoff.clone()
+            )
+            .await
+            .is_err());
         // Regression for #1454: a v3 reader can advance its cursor while
         // rejecting a Review-state correction. Upgrade must replay that event.
         airc.publish_work_event_in(
@@ -1974,7 +2068,11 @@ mod tests {
             .unwrap();
         let current = airc.work_board_in(&room).await.unwrap();
         assert_eq!(current.card(parent).unwrap().submissions[0], corrected);
-        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(
+            airc.home(),
+            room.channel,
+            WorkBoardCacheSource::Store,
+        );
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
         legacy["version"] = 3.into();
@@ -1987,21 +2085,28 @@ mod tests {
         assert_eq!(rebuilt_card.submissions.len(), 2);
         assert_eq!(rebuilt_card.state, CardState::Review);
         assert_eq!(rebuilt_card.claim_id, Some(claim));
-        let review_card = airc
-            .create_work_card(
-                CreateWorkCard::new(repo, "review exact artifact", Priority::P1).reviewing(parent),
-            )
+        assert_eq!(
+            rebuilt
+                .candidate_for_review(review_card, None)
+                .unwrap()
+                .submission_id,
+            submission.submission_id
+        );
+        assert!(rebuilt
+            .candidate_for_review(review_card, Some(corrected.submission_id))
+            .is_err());
+        let corrected_review = airc
+            .ensure_submission_review_in(&room, parent, corrected.submission_id, handoff.clone())
             .await
             .unwrap();
-        let review_claim = airc
-            .claim_work_card(ClaimWorkCard {
-                card_id: review_card,
-                ttl_ms: 600_000,
-            })
-            .await
-            .unwrap();
+        assert_ne!(corrected_review, review_card);
         let other_room = airc.join("unrelated").await.unwrap();
+        assert!(airc
+            .ensure_submission_review_in(&other_room, parent, submission.submission_id, handoff)
+            .await
+            .is_err());
         let request = ReviewWorkSubmission {
+            evidence_text: None,
             review_id: airc_work::WorkReviewId::new(),
             card_id: parent,
             submission_id: submission.submission_id,
@@ -2030,7 +2135,11 @@ mod tests {
         );
         // A legacy reader advanced its cursor over an unfamiliar review hint.
         // Upgrade must replay it, not accept that apparently current old cache.
-        let cache_path = ProjectionCache::<WorkBoardProjection>::path(airc.home(), room.channel);
+        let cache_path = ProjectionCache::<WorkBoardProjection>::path(
+            airc.home(),
+            room.channel,
+            WorkBoardCacheSource::Store,
+        );
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
         legacy["version"] = 2.into();

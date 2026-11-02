@@ -21,6 +21,8 @@ use crate::request::IpcCursor;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    /// Fresh challenge consumed only on this IPC connection.
+    AddressedChallenge(airc_protocol::addressed_attach::AttachChallenge),
     /// Response to `Ping`.
     Pong,
     /// Response to `Status`.
@@ -29,6 +31,9 @@ pub enum Response {
     /// "newest cursor" the caller threads back on the next call to keep
     /// the stream consume-once.
     Inbox(InboxResponse),
+    ScanInbox(ScanInboxResponse),
+    /// Response to `CountInbox`: three numbers, never an event.
+    CountInbox(airc_core::HistoryCount),
     /// **Card a1562dbc.** Response to `RoomTip` — the cursor of the
     /// newest durable event on the requested channel, straight from the
     /// store's index. No envelope bytes ride along: the probe returns
@@ -55,7 +60,14 @@ pub enum Response {
     /// One live event emitted by an `Attach` stream — the airc-wire
     /// encoding of the bus `Envelope`. The client decodes via
     /// `airc_wire::decode`.
-    Event { envelope: Vec<u8> },
+    Event {
+        envelope: Vec<u8>,
+    },
+    /// One addressed frame for an `AttachAddressed` stream's peer, exactly as
+    /// its sender sealed and signed it. Never a bus event.
+    Addressed {
+        frame: airc_protocol::Frame,
+    },
     /// **Card 7d5b6a65.** Emitted by an `Attach` stream when the
     /// client requested `coalesce_backlog: true` and the daemon had
     /// backlog to catch up on. ONE summary frame per attach catch-up,
@@ -99,7 +111,9 @@ pub enum Response {
     /// `RemovePeer`, `Stop`, and the initial `Attach` ack).
     Ok,
     /// Failure — typed message so the client can render it.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 impl Response {
@@ -685,4 +699,12 @@ mod tests {
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, response);
     }
+}
+
+/// Distinct response tag is positive acknowledgment that the filter was honored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanInboxResponse {
+    pub envelopes: Vec<Vec<u8>>,
+    pub scanned_through: IpcCursor,
+    pub has_more: bool,
 }

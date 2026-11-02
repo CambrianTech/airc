@@ -21,5 +21,7 @@ airc-store = { path = "../airc-store" }
 base64 = "0.22"
 
 [dev-dependencies]
+# Test binaries may open stores without installing a write admission.
+airc-store = { path = "../airc-store", features = ["test-fixtures"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }

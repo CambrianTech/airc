@@ -361,6 +361,84 @@ fn releasing_claim_clears_owner_without_reopening_closed_card() {
     assert_eq!(card.claim_id, None);
 }
 
+// what this catches: a reopen that kept the claim, so the holder's renewal held an Open card
+// forever and no reader agreed whether it was held (card 12afbb2f, Atlas on the M5).
+#[test]
+fn a_reopen_to_open_ends_the_claim_and_only_a_reopen_does() {
+    let card_id = WorkCardId::from_u128(16);
+    let claim_id = ClaimId::from_u128(17);
+    let holder = peer(18);
+    let operator = peer(19);
+    let next = peer(20);
+    let state = |state, changed_at_ms| {
+        WorkEvent::CardStateChanged(CardStateChanged {
+            card_id,
+            state,
+            changed_by: operator,
+            changed_at_ms,
+        })
+    };
+    let mut projection = WorkBoardProjection::replay(vec![
+        WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: repo(),
+            title: "reopened under its holder".to_string(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: operator,
+            created_at_ms: 100,
+            reviews: None,
+            origin: None,
+        }),
+        WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
+            card_id,
+            claim_id,
+            owner: holder,
+            ttl_ms: 1_000,
+            claimed_at_ms: 110,
+            origin: crate::ClaimOrigin::Unknown,
+        }),
+        state(CardState::Review, 120),
+        state(CardState::InProgress, 130),
+    ])
+    .unwrap();
+    // A send-back is work that continues: the claim stands.
+    assert_eq!(projection.card(card_id).unwrap().claim_id, Some(claim_id));
+
+    projection.apply(&state(CardState::Open, 140)).unwrap();
+    // The holder's renewal names a claim that ended: it does not bring it back.
+    projection
+        .apply(&WorkEvent::ClaimHeartbeat(ClaimHeartbeat {
+            card_id,
+            claim_id,
+            owner: holder,
+            ttl_ms: 1_000,
+            heartbeat_at_ms: 150,
+        }))
+        .unwrap();
+    let card = projection.card(card_id).unwrap();
+    assert_eq!(
+        (card.state, card.owner, card.claim_id),
+        (CardState::Open, None, None)
+    );
+
+    // Nobody holds it, so another peer's claim is not a stranger's takeover.
+    projection
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            selected_at_ms: None,
+            card_id,
+            claim_id: ClaimId::from_u128(21),
+            owner: next,
+            ttl_ms: 1_000,
+            claimed_at_ms: TAKEOVER_ON_RECORD_SINCE_MS + 1,
+            origin: crate::ClaimOrigin::Unknown,
+        }))
+        .unwrap();
+    assert_eq!(projection.card(card_id).unwrap().owner, Some(next));
+}
+
 #[test]
 fn duplicate_claim_release_is_idempotent_after_claim_is_already_clear() {
     let card_id = WorkCardId::from_u128(13);

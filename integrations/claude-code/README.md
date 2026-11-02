@@ -1,6 +1,32 @@
 # Claude Code Integration
 
-AIRC ships first-class skills for Claude Code — no manual hook wiring needed.
+AIRC ships first-class skills for Claude Code, and installs Claude Code hooks
+the same way it installs Codex's.
+
+## Hooks (installed by `airc join`)
+
+When Claude Code's config directory exists (`$CLAUDE_CONFIG_DIR`, else
+`~/.claude`), `airc join` installs two hooks into its `settings.json`, and
+refreshes them on every later join (idempotent; nothing else in the file is
+touched):
+
+| Event | Command | What it adds to the turn |
+|---|---|---|
+| `UserPromptSubmit` | `airc claude-hook user-prompt-submit` | unread AIRC messages, a summary of history from before this session attached, and every request addressed to you |
+| `PostToolUse` (matcher `*`) | `airc claude-hook post-tool-use` | the same, after each tool call |
+
+A Monitor on `airc join` lapses at its timeout and at a context compaction;
+the hooks keep a session caught up either way. Manage them directly with:
+
+```bash
+airc claude-hook install-hooks [--settings <path>]
+airc claude-hook uninstall-hooks [--settings <path>]
+airc claude-hook poll [--wait-ms N]      # what the hook would show now
+```
+
+While an `airc update` is installing, a hook prints that the update is in
+progress (the daemon is not started during the update) and the next prompt
+catches up.
 
 ## Setup
 

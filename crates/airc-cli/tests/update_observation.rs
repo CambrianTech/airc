@@ -736,6 +736,7 @@ if($PrepareArtifact){
                 .env("AIRC_UPDATE_CHANNEL", "canary")
                 .env("AIRC_NO_STALENESS", "1")
                 .env("AIRC_DISABLE_ACCOUNT_REGISTRY", "1")
+                .env("AIRC_UPDATE_DIAGNOSTICS", "1")
                 .env("UPDATE_TEST_ORIGINAL", original)
                 .env("UPDATE_TEST_CURRENT", &current)
                 .env("UPDATE_TEST_HOME", account.join(".airc"))
@@ -757,8 +758,9 @@ if($PrepareArtifact){
                 (running && !stop_during_prepare).then(|| RestoredOwner::connect(&socket));
             // Fixed-size last-case receipts survive only on failure. No host
             // process scan or account data is captured; these are owned children.
+            let previous_exit = previous_owner.as_mut().map(|owner| owner.child.try_wait());
             let receipt = format!(
-                "running={running} stop_during_prepare={stop_during_prepare} args={args:?}\nupdater_pid={updater_pid} previous_fixture_pid={:?} exit={:?}\ncurrent={}\n",
+                "running={running} stop_during_prepare={stop_during_prepare} args={args:?}\nupdater_pid={updater_pid} previous_fixture_pid={:?} exit={:?}\ncurrent={}\nprevious_fixture_exit={previous_exit:?}\n",
                 previous_owner.as_ref().map(|owner| owner.child.id()),
                 result.status.code(), current.display()
             );
@@ -772,6 +774,38 @@ if($PrepareArtifact){
             }
             if !String::from_utf8_lossy(&result.stderr).contains("restored and verified") {
                 eprintln!("unexpected recovery outcome: {receipt}");
+                // Export only bounded receipts, not binaries, account state or source.
+                if let Some(directory) = std::env::var_os("AIRC_UPDATE_TEST_RECEIPTS") {
+                    let directory =
+                        PathBuf::from(directory).join(format!("rollback-{}", std::process::id()));
+                    let export = (|| -> std::io::Result<()> {
+                        use std::io::Read;
+                        std::fs::create_dir_all(&directory)?;
+                        for name in [
+                            "last-update.txt",
+                            "last-update.stdout",
+                            "last-update.stderr",
+                        ] {
+                            let mut data = Vec::new();
+                            std::fs::File::open(temp.path().join(name))?
+                                .take(64 * 1024)
+                                .read_to_end(&mut data)?;
+                            std::fs::write(directory.join(name), data)?;
+                        }
+                        if running {
+                            let mut data = Vec::new();
+                            std::fs::File::open(ready.with_extension("log"))?
+                                .take(64 * 1024)
+                                .read_to_end(&mut data)?;
+                            std::fs::write(directory.join("previous-fixture.log"), data)?;
+                        }
+                        Ok(())
+                    })();
+                    // Diagnostic export must never replace the original assertion failure.
+                    if let Err(error) = export {
+                        eprintln!("rollback receipt export failed: {error}");
+                    }
+                }
             }
             let stderr = String::from_utf8_lossy(&result.stderr);
             assert!(

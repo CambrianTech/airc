@@ -24,13 +24,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use airc_lib::{Airc, CapabilityRegistry, PeerId, PersonaCapabilities, TrustTier};
+use airc_lib::{AddressedKind, Airc, CapabilityRegistry, PeerId, PersonaCapabilities, TrustTier};
 use consumer_shapes::continuum::{
     decode_persona_event, ingest_capability_offer, reply_turn_emitted, request_inference_remote,
     resolve_inference_target, CapabilityOffer, InferenceTarget, PersonaEvent, TurnEmitted,
     TurnRequested, BODY_HINT_FORGE_PERSONA_EVENT,
 };
-use futures::StreamExt;
+
 use tempfile::TempDir;
 
 const HEADER_FORGE_BODY_HINT: &str = "forge.body_hint";
@@ -177,17 +177,20 @@ async fn remote_inference_resolves_and_round_trips_end_to_end() {
 /// `TurnRequested`, reply with the canned `TurnEmitted` echoing the
 /// command-bus correlation via `reply_turn_emitted`.
 async fn stub_persona_answers_one_turn(server: Airc, ready: tokio::sync::oneshot::Sender<()>) {
-    let mut stream = server.subscribe().await.unwrap();
+    let mut stream = server
+        .addressed_inbox(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let _ = ready.send(());
     loop {
-        let Some(Ok(event)) = stream.next().await else {
-            continue;
+        let Ok(event) = stream.next().await else {
+            panic!("addressed inbox closed before request");
         };
-        if event.peer_id == server.peer_id() {
+        if event.kind() != AddressedKind::Command || event.to() != server.peer_id() {
             continue;
         }
         if event
-            .headers
+            .headers()
             .get(HEADER_FORGE_BODY_HINT)
             .map(String::as_str)
             != Some(BODY_HINT_FORGE_PERSONA_EVENT)
@@ -195,11 +198,11 @@ async fn stub_persona_answers_one_turn(server: Airc, ready: tokio::sync::oneshot
             continue;
         }
         let PersonaEvent::TurnRequested(_request) =
-            decode_persona_event(&event.headers, event.body.as_ref()).unwrap()
+            decode_persona_event(event.headers(), Some(event.body())).unwrap()
         else {
             continue;
         };
-        reply_turn_emitted(&server, &event.headers, &clio_reply())
+        reply_turn_emitted(&server, &event, &clio_reply())
             .await
             .expect("stub persona reply emits");
         return;

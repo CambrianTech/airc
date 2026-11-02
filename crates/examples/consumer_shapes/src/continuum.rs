@@ -409,17 +409,15 @@ pub async fn request_turn(
 
 /// Reply to a command-bus [`TurnRequested`] with a [`TurnEmitted`],
 /// echoing the request's correlation id so the requester's
-/// [`Airc::await_reply`] resolves with this event. `request_headers`
-/// are the headers off the request event as received.
+/// [`Airc::await_reply`] resolves with this event. The original verified request supplies the
+/// authenticated sender and correlation; headers cannot override them.
 pub async fn reply_turn_emitted(
     airc: &Airc,
-    request_headers: &Headers,
+    request: &airc_lib::VerifiedAddressed,
     emitted: &TurnEmitted,
 ) -> Result<(), PersonaTurnError> {
-    let address = turn_reply_address(request_headers)?;
     let (headers, body) = encode_persona_event(&PersonaEvent::TurnEmitted(emitted.clone()))?;
-    airc.reply(address.reply_to, address.correlation_id, headers, body)
-        .await?;
+    airc.reply(request, headers, body).await?;
     Ok(())
 }
 
@@ -710,7 +708,7 @@ pub async fn request_inference_remote(
     )
     .await?;
     let reply = airc.await_reply(pending).await?;
-    match decode_persona_event(&reply.headers, reply.body.as_ref())? {
+    match decode_persona_event(reply.headers(), Some(reply.body()))? {
         PersonaEvent::TurnEmitted(emitted) => Ok(emitted),
         other @ (PersonaEvent::TurnRequested(_)
         | PersonaEvent::ActivityStarted(_)
@@ -952,13 +950,11 @@ pub async fn request_embedding(
 /// request's correlation so the requester's [`Airc::await_reply`] resolves.
 pub async fn reply_embedding_emitted(
     airc: &Airc,
-    request_headers: &Headers,
+    request: &airc_lib::VerifiedAddressed,
     emitted: &EmbeddingEmitted,
 ) -> Result<(), PersonaTurnError> {
-    let address = turn_reply_address(request_headers)?;
     let (headers, body) = encode_embedding_event(&EmbeddingEvent::Emitted(emitted.clone()))?;
-    airc.reply(address.reply_to, address.correlation_id, headers, body)
-        .await?;
+    airc.reply(request, headers, body).await?;
     Ok(())
 }
 
@@ -980,7 +976,7 @@ pub async fn request_embedding_remote(
     )
     .await?;
     let reply = airc.await_reply(pending).await?;
-    match decode_embedding_event(&reply.headers, reply.body.as_ref())? {
+    match decode_embedding_event(reply.headers(), Some(reply.body()))? {
         EmbeddingEvent::Emitted(emitted) => Ok(emitted),
         EmbeddingEvent::Requested(_) => Err(PersonaTurnError::Codec(
             PersonaCodecError::UnexpectedReplyVariant {

@@ -9,6 +9,7 @@ param(
     [Parameter(Mandatory=$true,ParameterSetName='Update')][string]$UpdaterPath,
     [Parameter(Mandatory=$true,ParameterSetName='Update')][string]$HomePath,
     [Parameter(ParameterSetName='Update')][switch]$AutoUpdate,
+    [Parameter(ParameterSetName='Update')][string]$Revision,
     [Parameter(Mandatory=$true,ParameterSetName='Validate')][switch]$ValidateOnly
 )
 $sessionMode = $PSCmdlet.ParameterSetName
@@ -36,6 +37,7 @@ try {
         $env:AIRC_UPDATE_SESSION_OWNER = [string]$PID
         $arguments = @('--home', $HomePath, 'update')
         if ($AutoUpdate) { $arguments += '--auto' }
+        if ($Revision) { $arguments += @('--revision', $Revision) }
         Invoke-InstallerProcess -OwnProcessTree -PreserveChildrenOnSuccess -PreserveChildrenOnExitCode @(200) $UpdaterPath $arguments
         # Internal 200 means verified recovery, not successful update.
         $result = if ($LASTEXITCODE -eq 200) { 1 } else { $LASTEXITCODE }

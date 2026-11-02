@@ -13,6 +13,8 @@
 //! each, hence `dead_code` is allowed.
 #![allow(dead_code)]
 
+pub mod projection_cache;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
