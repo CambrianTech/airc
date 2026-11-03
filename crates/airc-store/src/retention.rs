@@ -98,6 +98,26 @@ pub struct DrainReport {
     pub after: StoreFootprint,
 }
 
+/// What a WAL checkpoint did, as SQLite reports it: `busy` when a reader or writer kept it from
+/// finishing, the frames in the log, and the frames copied back into the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalCheckpoint {
+    pub busy: bool,
+    pub log_frames: u64,
+    pub checkpointed_frames: u64,
+    /// The WAL file was truncated to zero after a complete checkpoint.
+    pub truncated: bool,
+}
+
+impl WalCheckpoint {
+    /// An open read snapshot (or a writer) held part of the log: the frames past it stay, and the
+    /// file cannot shrink. On the M5 on 2026-11-03 such a reader grew the WAL to 14 GB and slowed
+    /// every reader with it, because nothing checkpointed outside a full vacuum.
+    pub fn pinned(&self) -> bool {
+        self.busy || self.checkpointed_frames < self.log_frames
+    }
+}
+
 /// How the freelist is given back to the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reclaim {
@@ -241,12 +261,49 @@ impl SqliteEventStore {
         self.footprint().await
     }
 
+    /// Checkpoint the WAL on every pass, not only after a full vacuum: a passive checkpoint first,
+    /// which never waits and reports what held it; then, only when it copied every frame with no
+    /// one in the way, a TRUNCATE that gives the file back. A pinned log is reported, never waited
+    /// on: a TRUNCATE behind an open reader would hold the write lock for the busy timeout.
+    pub async fn checkpoint_wal(&self) -> Result<WalCheckpoint, StoreError> {
+        let _write = self.admit_write().await?;
+        let db = self.connection();
+        let passive = checkpoint_row(&sqlite_only(db, SqliteOnly::WalCheckpointPassive).await?)?;
+        if passive.pinned() {
+            return Ok(passive);
+        }
+        let truncate = checkpoint_row(&sqlite_only(db, SqliteOnly::WalCheckpointTruncate).await?)?;
+        Ok(WalCheckpoint {
+            truncated: !truncate.busy,
+            ..truncate
+        })
+    }
+
     /// Whether the file has LEFT `auto_vacuum = NONE` (0): `INCREMENTAL` (2) returns any
     /// freelist through the bounded steps, and `FULL` (1) shrinks itself on every commit
     /// (Fable on #1462). Either way a full VACUUM is never needed again.
     pub async fn is_incremental(&self) -> Result<bool, StoreError> {
         Ok(pragma_u64(self.connection(), Pragma::AutoVacuum).await? != 0)
     }
+}
+
+/// SQLite's `wal_checkpoint` row: `(busy, log, checkpointed)`. A database not in WAL mode reports
+/// `-1` for both counts; that is no log at all, read as zero.
+fn checkpoint_row(rows: &[sea_orm::QueryResult]) -> Result<WalCheckpoint, StoreError> {
+    let row = rows
+        .first()
+        .ok_or_else(|| StoreError::Migration("wal_checkpoint returned no row".into()))?;
+    let busy: i64 = row.try_get_by_index(0)?;
+    let frames = |i: usize| -> Result<u64, StoreError> {
+        let n: i64 = row.try_get_by_index(i)?;
+        Ok(u64::try_from(n).unwrap_or(0)) // unwrap_or: -1 means "not in WAL mode", which has no frames
+    };
+    Ok(WalCheckpoint {
+        busy: busy != 0,
+        log_frames: frames(1)?,
+        checkpointed_frames: frames(2)?,
+        truncated: false,
+    })
 }
 
 #[cfg(test)]
@@ -417,6 +474,70 @@ mod tests {
     // what this catches: the part a DELETE cannot do. The freelist a drain leaves
     // behind is only returned by a vacuum; the full pass shrinks the file and
     // enables incremental reclaim for every pass after it.
+
+    // what this catches (the M5, 2026-11-03, card e719540d): a WAL that never shrinks because
+    // nothing checkpoints it outside a full vacuum, and a reader that pins it, unreported. An
+    // open read transaction on another connection makes the checkpoint report PINNED without
+    // waiting on it; once the reader ends, the next checkpoint copies every frame and truncates
+    // the file to zero.
+    #[tokio::test]
+    async fn an_open_reader_pins_the_wal_and_a_checkpoint_says_so_then_truncates() {
+        use sea_orm::{EntityTrait, TransactionTrait};
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let path = dir.path().join("events.sqlite");
+        let store = SqliteEventStore::open_path(&path)
+            .await
+            .expect("test: store");
+        let sink = SqliteDurableSink::open_path(&path)
+            .await
+            .expect("test: sink");
+        let ch = RoomId::from_u128(0xcafe);
+        for counter in 0..200u64 {
+            sink.append(&bus_event(ch, counter, &[]))
+                .await
+                .expect("test: row");
+        }
+        // A second connection holds a read snapshot open, as the M5's supervisor join did.
+        let reader = sea_orm::Database::connect(format!("sqlite://{}?mode=ro", path.display()))
+            .await
+            .expect("test: reader");
+        let snapshot = reader.begin().await.expect("test: read txn");
+        crate::entities::bus_event::Entity::find()
+            .one(&snapshot)
+            .await
+            .expect("test: snapshot read");
+        // Writes after the snapshot stay in the log past it.
+        for counter in 200..400u64 {
+            sink.append(&bus_event(ch, counter, &[]))
+                .await
+                .expect("test: row");
+        }
+        let started = std::time::Instant::now();
+        let pinned = store.checkpoint_wal().await.expect("test: checkpoint");
+        assert!(pinned.pinned(), "an open reader holds the log: {pinned:?}");
+        assert!(
+            started.elapsed() < crate::sqlite::POOL_ACQUIRE_TIMEOUT / 2,
+            "a pinned checkpoint returns at once, never waiting out the busy timeout behind the reader"
+        );
+        assert!(
+            !pinned.truncated,
+            "a pinned log is never truncated (no wait behind the reader)"
+        );
+
+        snapshot.rollback().await.expect("test: end the read");
+        drop(reader);
+        let clear = store.checkpoint_wal().await.expect("test: checkpoint");
+        assert!(
+            !clear.pinned(),
+            "the reader gone, every frame is checkpointed: {clear:?}"
+        );
+        assert!(clear.truncated, "and the file is given back");
+        let wal = std::fs::metadata(dir.path().join("events.sqlite-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0); // unwrap_or: a missing -wal file is an empty log
+        assert_eq!(wal, 0, "the WAL file is truncated on disk");
+    }
+
     #[tokio::test]
     async fn a_full_reclaim_returns_the_freelist_and_enables_incremental_passes() {
         let dir = tempfile::tempdir().expect("test: tempdir");

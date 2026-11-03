@@ -94,6 +94,22 @@ pub async fn pass(store: &SqliteEventStore, is_idle: bool) {
         footprint.free_bytes / 1_000_000,
         footprint.free_percent(),
     );
+    // Every pass, not only after a full vacuum: the WAL is checkpointed and, when nothing holds
+    // it, truncated. A pinned log is said loudly, because a reader that never lets go is how the
+    // M5's WAL reached 14 GB beside a 2.9 GB file on 2026-11-03 (card e719540d).
+    match store.checkpoint_wal().await {
+        Ok(wal) if wal.pinned() => eprintln!(
+            "airc store retention: WAL PINNED: {} of {} frames checkpointed (busy={}); an open read transaction \
+             is holding the log, which cannot shrink until it ends",
+            wal.checkpointed_frames, wal.log_frames, wal.busy,
+        ),
+        Ok(wal) => eprintln!(
+            "airc store retention: WAL checkpointed {} frames{}",
+            wal.checkpointed_frames,
+            if wal.truncated { ", file truncated" } else { "" },
+        ),
+        Err(error) => eprintln!("airc store retention: WAL checkpoint failed: {error}"),
+    }
 }
 
 /// The periodic loop. Spawn on the daemon runtime; exits on `shutdown`.
