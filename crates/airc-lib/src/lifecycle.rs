@@ -71,14 +71,6 @@ pub struct WireLostBody {
     pub reason: String,
 }
 
-/// Body for `TranscriptKind::SubscriptionAdvanced`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscriptionAdvancedBody {
-    pub consumer_id: String,
-    pub lamport: u64,
-    pub event_id: EventId,
-}
-
 impl Airc {
     /// Emit a lifecycle event for the given room transition. Builds
     /// a [`TranscriptEvent`](airc_core::TranscriptEvent) signed
@@ -101,13 +93,13 @@ impl Airc {
     ///   either because the stream ended (`reason="stream_ended"`)
     ///   or because `Airc::teardown_wire` signalled it
     ///   (`reason="teardown"`).
-    /// - `SubscriptionAdvanced` — fired when a runtime consumer cursor
-    ///   advances, except for cursor advances caused by
-    ///   `SubscriptionAdvanced` itself.
+    /// - `SubscriptionAdvanced` is never emitted any more: a consumer's cursor is the
+    ///   durable `runtime_cursor` row, and the kind survives only so old rows decode until
+    ///   the store's drain removes them (it is declared dead on arrival).
     /// - `RoomParted` — fired from [`Airc::part_channel`] after the
     ///   subscription row is tombstoned and presence is refreshed.
     ///
-    /// All seven Phase 2 lifecycle variants are now wired.
+    /// Six of the seven Phase 2 lifecycle variants are emitted; `SubscriptionAdvanced` only decodes.
     pub(crate) async fn emit_lifecycle(
         &self,
         kind: TranscriptKind,
@@ -155,24 +147,6 @@ impl Airc {
             Err(error) => Err(error.into()),
         }
     }
-
-    pub(crate) async fn emit_subscription_advanced(
-        &self,
-        consumer_id: &str,
-        cursor: &airc_core::TranscriptCursor,
-        room_id: RoomId,
-    ) -> Result<(), AircError> {
-        let body = Body::Json(
-            serde_json::to_value(SubscriptionAdvancedBody {
-                consumer_id: consumer_id.to_string(),
-                lamport: cursor.lamport,
-                event_id: cursor.event_id,
-            })
-            .map_err(|e| AircError::Crypto(format!("lifecycle body serialize: {e}")))?,
-        );
-        self.emit_lifecycle(TranscriptKind::SubscriptionAdvanced, room_id, body)
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -219,18 +193,6 @@ mod tests {
         };
         let json = serde_json::to_string(&body).unwrap();
         let parsed: RoomJoinedBody = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, body);
-    }
-
-    #[test]
-    fn subscription_advanced_body_round_trips_through_json() {
-        let body = SubscriptionAdvancedBody {
-            consumer_id: "codex-hook:thread-1".to_string(),
-            lamport: 42,
-            event_id: EventId::from_u128(7),
-        };
-        let json = serde_json::to_string(&body).unwrap();
-        let parsed: SubscriptionAdvancedBody = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, body);
     }
 

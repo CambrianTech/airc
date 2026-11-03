@@ -15,6 +15,7 @@ use crate::cursor::TranscriptCursor;
 use crate::filter::SelfFilter;
 use crate::headers::Headers;
 use crate::ids::{ClientId, EventId, PeerId, RoomId};
+use crate::retention::{Retention, RetentionKey};
 
 /// The category of a transcript event. Different kinds may carry
 /// different optional fields on `TranscriptEvent`.
@@ -206,6 +207,43 @@ impl TranscriptKind {
             "channel_purpose_published" => TranscriptKind::ChannelPurposePublished,
             _ => return None,
         })
+    }
+
+    /// What a stored row of this kind is worth once it has landed: the ONE place a kind's
+    /// retention is decided, read by the one drain in `airc-store`. Exhaustive, so a new kind
+    /// does not compile without declaring it ([`Retention`]).
+    pub const fn retention(self) -> Retention {
+        match self {
+            // Nothing reads it: the cursor it reports is durable in `runtime_cursor`, which
+            // every surface reads, and no consumer acts on the event (continuum's arrival maps
+            // it to nothing; the join feed filters it out). Measured at 99.93% of the M5's
+            // store on 2026-08-04 and 1,626,658 rows of a 902 MB project store on 2026-11-03.
+            TranscriptKind::SubscriptionAdvanced => Retention::DeadOnArrival,
+            // Roster projections take the newest card per peer (the variant's own contract);
+            // a 60 s republish into every room left 2,205,371 of them in one resident's
+            // 1.55 GB store (2026-11-03).
+            TranscriptKind::IdentityPublished => Retention::NewestPer(RetentionKey::RoomAndPeer),
+            // Last writer wins per room (each variant's own contract).
+            TranscriptKind::DoctrinePublished | TranscriptKind::ChannelPurposePublished => {
+                Retention::NewestPer(RetentionKey::Room)
+            }
+            TranscriptKind::Message
+            | TranscriptKind::Command
+            | TranscriptKind::CommandResult
+            | TranscriptKind::Attachment
+            | TranscriptKind::Receipt
+            | TranscriptKind::Presence
+            | TranscriptKind::SessionControl
+            | TranscriptKind::System
+            | TranscriptKind::PeerArrived
+            | TranscriptKind::PeerDeparted
+            | TranscriptKind::WireEstablished
+            | TranscriptKind::WireLost
+            | TranscriptKind::RoomJoined
+            | TranscriptKind::RoomParted
+            // A post is superseded by post id, which lives in the body, not a column.
+            | TranscriptKind::WallPostPublished => Retention::History,
+        }
     }
 
     /// Every variant of [`TranscriptKind`], in declaration order. The

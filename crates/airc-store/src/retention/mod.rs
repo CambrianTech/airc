@@ -11,17 +11,26 @@
 //! | `bus_events` with header `airc.heartbeat.kind` | 858,993 of 1,394,279 | — | nothing since #1458 (presence is the router snapshot) |
 //! | `events` whose body carries `cursor_paging` | 51,863 of 678,889 | 1.234 GB | nothing since #1457 (paging frames route live) |
 //!
-//! Two classes, most of the file. This module deletes exactly those, reports the
-//! file's footprint, and gives the bytes back — a `DELETE` alone frees nothing
-//! from an `auto_vacuum=0` file (the pages go to the freelist and the file keeps
-//! its size), so a pass that reports rows removed and a file unchanged would be a
-//! success signal that cannot report failure. The daemon runs it on its tick
-//! (`airc_daemon::store_retention`); `airc doctor` prints the footprint.
+//! Two classes, most of the file then. On 2026-11-03 the IntelMac's stores held two
+//! more, by kind: 2,205,371 of a resident store's rows were identity cards (a 60 s
+//! republish into every room) and 1,626,658 of a project store's were cursor
+//! advances (a lifecycle event per cursor save, read by nothing). Those are not
+//! classes here: every kind declares its own retention at its definition
+//! ([`airc_core::TranscriptKind::retention`]), and [`declared`] turns the
+//! declarations into the drain's predicate, so there is one drain and no per-kind
+//! code.
 //!
-//! Age-based retention of live classes is NOT here: a `bus_events` row of a durable
-//! kind is what an offline peer backfills from, and an age cutoff would decide for
-//! that peer how long it may be away. That is a policy decision with an owner,
-//! not a drain.
+//! The drain reports the file's footprint before and after and gives the bytes
+//! back: a `DELETE` alone frees nothing from an `auto_vacuum=0` file (the pages go
+//! to the freelist and the file keeps its size), so a pass that reports rows
+//! removed and a file unchanged would be a success signal that cannot report
+//! failure. Every store runs it in the background, the daemon's and every store a
+//! process opens itself ([`run`]); `airc doctor` prints the footprint.
+//!
+//! History (every kind declared [`airc_core::Retention::History`]) is kept here
+//! until the store's byte budget lands (card e95d41a4, slice 2): a `bus_events` row
+//! of a durable kind is what an offline peer backfills from, so trimming history
+//! decides how long a peer may be away, and the budget is that decision.
 
 use airc_core::HeaderFilter;
 use sea_orm::sea_query::{Alias, Expr, SimpleExpr};
@@ -33,6 +42,9 @@ use crate::event_table::EventTable;
 use crate::header_query::predicate;
 use crate::sqlite::SqliteEventStore;
 use crate::sqlite_only::{pragma_u64, sqlite_only, Pragma, SqliteOnly};
+
+mod declared;
+pub mod run;
 
 /// `bus_events` rows that were heartbeats: the header every heartbeat carries.
 fn heartbeat_row() -> HeaderFilter {
@@ -58,14 +70,61 @@ fn non_durable_row() -> HeaderFilter {
     ])
 }
 
-/// Rows of rowid space one DELETE statement covers. The pools are
-/// `max_connections(1)` and SQLite has one writer: a single statement over a
-/// multi-GB backlog held both for its whole run — at boot, while peers backfill —
-/// which is the >2 s acquire stall that darkened a node for 7 h on 2026-09-26. A
-/// rowid WINDOW bounds each statement's work by the b-tree range it walks, not by
-/// how many rows match, so the first pass over a 1.4M-row table is ~140 short
-/// transactions with the connection and the write lock released between them.
-const DRAIN_WINDOW_ROWS: i64 = 10_000;
+/// The rowid span one drain DELETE covers. A rowid window bounds each statement's work by the
+/// b-tree range it walks, not by how many rows match, and the pass yields between statements so
+/// queued appends and reads take the connection and the write lock.
+///
+/// The span is sized from what the last statement cost, never a fixed count. The store's pool is
+/// one connection (`max_connections(1)`), so a read queued behind a drain statement waits its
+/// whole run: on 2026-11-03 a fixed 10,000-row window over a 1.1 GB resident store copy ran
+/// about 0.7 s a statement, and the newest-page read beside it took 1.2 s p50, 1.7 s p99. Each
+/// statement is timed and the next span scaled toward [`STATEMENT_BUDGET`], growing at most
+/// twofold a step so one cheap window never buys an expensive next one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Window {
+    rows: i64,
+    /// `None` keeps the span fixed (the tests' small windows).
+    budget: Option<std::time::Duration>,
+}
+
+/// What one drain statement may hold the connection for: a read queued behind it waits at most
+/// this long. Joel, 2026-11-03: reads stay in milliseconds while a drain runs.
+const STATEMENT_BUDGET: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The first statement's span, before anything is measured: small enough that even a slow host
+/// stays near the budget, and the second statement is already sized from the first.
+const FIRST_WINDOW_ROWS: i64 = 256;
+
+impl Window {
+    pub(crate) fn adaptive() -> Self {
+        Self {
+            rows: FIRST_WINDOW_ROWS,
+            budget: Some(STATEMENT_BUDGET),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed(rows: i64) -> Self {
+        Self {
+            rows: rows.max(1),
+            budget: None,
+        }
+    }
+
+    pub(crate) fn rows(&self) -> i64 {
+        self.rows
+    }
+
+    /// Size the next span from the statement that covered `self.rows()` in `took`.
+    pub(crate) fn after(&mut self, took: std::time::Duration) {
+        let Some(budget) = self.budget else { return };
+        let scaled = match took.as_micros() {
+            0 => self.rows.saturating_mul(2),
+            micros => (self.rows as u128 * budget.as_micros() / micros) as i64,
+        };
+        self.rows = scaled.clamp(1, self.rows.saturating_mul(2));
+    }
+}
 
 /// Freelist pages one `incremental_vacuum` step returns (8 MB at 4 KiB pages):
 /// the same bound on the reclaim that the window is on the delete.
@@ -92,6 +151,10 @@ impl StoreFootprint {
 /// What one drain pass removed, and the footprint after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrainReport {
+    pub before: StoreFootprint,
+    /// `events` rows their kind's declared retention says are dead: dead on arrival, or
+    /// superseded by a newer row of the same kind and key ([`declared`]).
+    pub declared_rows: u64,
     pub heartbeat_rows: u64,
     /// `events` rows of a non-durable class (backfill frames above all).
     pub non_durable_rows: u64,
@@ -133,15 +196,18 @@ pub enum Reclaim {
 }
 
 impl SqliteEventStore {
-    /// Delete the two dead classes and report the footprint after.
-    pub async fn drain_dead_rows(&self) -> Result<DrainReport, StoreError> {
-        self.drain_dead_rows_windowed(DRAIN_WINDOW_ROWS).await
+    /// The one drain: every row a declaration or a dead class marks, and the footprint before
+    /// and after.
+    pub async fn drain(&self) -> Result<DrainReport, StoreError> {
+        self.drain_windowed(Window::adaptive()).await
     }
 
-    pub(crate) async fn drain_dead_rows_windowed(
-        &self,
-        window: i64,
-    ) -> Result<DrainReport, StoreError> {
+    pub(crate) async fn drain_windowed(&self, window: Window) -> Result<DrainReport, StoreError> {
+        let before = self.footprint().await?;
+        let declared_rows = match declared::dead_rows() {
+            Some(dead) => self.delete_declared_in_windows(&dead, window).await?,
+            None => 0,
+        };
         let heartbeat_rows = self
             .delete_in_windows::<bus_event::Entity>(&heartbeat_row(), window)
             .await?;
@@ -149,6 +215,8 @@ impl SqliteEventStore {
             .delete_in_windows::<event::Entity>(&non_durable_row(), window)
             .await?;
         Ok(DrainReport {
+            before,
+            declared_rows,
             heartbeat_rows,
             non_durable_rows,
             after: self.footprint().await?,
@@ -158,12 +226,12 @@ impl SqliteEventStore {
     /// Delete the rows of `T` whose headers match `dead`, with their
     /// header rows, one rowid window at a time, yielding between windows so
     /// queued appends and reads take the connection and the write lock
-    /// ([`DRAIN_WINDOW_ROWS`]). Bounded by the table's max rowid at the start:
+    /// ([`Window`]). Bounded by the table's max rowid at the start:
     /// rows written during the pass are the next pass's.
     async fn delete_in_windows<T: EventTable>(
         &self,
         dead: &HeaderFilter,
-        window: i64,
+        mut window: Window,
     ) -> Result<u64, StoreError> {
         let db = self.connection();
         let rowid = || Expr::col((T::default(), Alias::new("rowid")));
@@ -180,7 +248,8 @@ impl SqliteEventStore {
         let mut low = 0i64;
         let mut removed = 0u64;
         while low < max_rowid {
-            let high = low.saturating_add(window.max(1));
+            let high = low.saturating_add(window.rows());
+            let started = std::time::Instant::now();
             let in_window: SimpleExpr = rowid()
                 .gt(low)
                 .and(rowid().lte(high))
@@ -207,6 +276,7 @@ impl SqliteEventStore {
                     .rows_affected;
                 txn.commit().await?;
             }
+            window.after(started.elapsed());
             low = high;
             tokio::task::yield_now().await;
         }
@@ -317,6 +387,7 @@ mod tests {
         Body, ClientId, EventId, Headers, MentionTarget, PeerId, RoomId, TranscriptEvent,
         TranscriptKind,
     };
+    use sea_orm::PaginatorTrait;
 
     fn bus_event(channel: RoomId, counter: u64, headers: &[(&str, &str)]) -> Envelope {
         let mut e = Envelope::new(
@@ -437,7 +508,7 @@ mod tests {
             .await
             .expect("test: pre-gate ephemeral row");
 
-        let report = store.drain_dead_rows().await.expect("test: drain");
+        let report = store.drain().await.expect("test: drain");
         assert_eq!(
             (report.heartbeat_rows, report.non_durable_rows),
             (1, 2),
@@ -467,8 +538,111 @@ mod tests {
         );
 
         // A second pass finds nothing: the drain is idempotent.
-        let again = store.drain_dead_rows().await.expect("test: drain again");
+        let again = store.drain().await.expect("test: drain again");
         assert_eq!((again.heartbeat_rows, again.non_durable_rows), (0, 0));
+    }
+
+    // what this catches (2026-11-03, IntelMac: 2,205,371 of a resident store's rows were identity
+    // cards and 1,626,658 of a project store's were cursor advances): the one drain reading each
+    // kind's declared retention. A dead-on-arrival kind goes whole; a newest-per-key kind keeps
+    // exactly its newest row per key (room and peer, or room); history stays; the header rows of
+    // a deleted event go with it; windows smaller than the table cover it; a second pass finds
+    // nothing.
+    #[tokio::test]
+    async fn the_drain_removes_what_each_kind_declares_dead_and_keeps_the_newest_per_key() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let store = SqliteEventStore::open_path(&dir.path().join("events.sqlite"))
+            .await
+            .expect("test: store");
+        let (room, other_room) = (RoomId::from_u128(0xa), RoomId::from_u128(0xb));
+        let (ada, bo) = (PeerId::from_u128(0xad), PeerId::from_u128(0xb0));
+        let row = |kind, room, peer, lamport| {
+            let mut event =
+                transcript_event_with(room, lamport, serde_json::json!({}), &[("k", "v")]);
+            event.kind = kind;
+            event.peer_id = peer;
+            event
+        };
+        use TranscriptKind::{DoctrinePublished, IdentityPublished, Message, SubscriptionAdvanced};
+        let rows = [
+            row(IdentityPublished, room, ada, 1),
+            row(IdentityPublished, room, ada, 2),
+            row(IdentityPublished, room, ada, 3),
+            row(IdentityPublished, room, bo, 4),
+            row(IdentityPublished, other_room, ada, 5),
+            row(SubscriptionAdvanced, room, ada, 6),
+            row(SubscriptionAdvanced, room, bo, 7),
+            row(DoctrinePublished, room, ada, 8),
+            row(DoctrinePublished, room, bo, 9),
+            row(Message, room, ada, 10),
+        ];
+        for event in rows.iter().cloned() {
+            store.append(event).await.expect("test: append");
+        }
+
+        let report = store
+            .drain_windowed(Window::fixed(3))
+            .await
+            .expect("test: drain");
+        assert_eq!(
+            report.declared_rows, 5,
+            "two old cards, two cursor advances, one old doctrine"
+        );
+
+        let mut left: Vec<u64> = store
+            .page_recent(None, 100)
+            .await
+            .expect("test: recent")
+            .iter()
+            .map(|event| event.lamport)
+            .collect();
+        left.sort_unstable();
+        assert_eq!(
+            left,
+            [3, 4, 5, 9, 10],
+            "the newest card per room and peer, the newest doctrine per room, the message"
+        );
+        let headers = crate::entities::event_header::Entity::find()
+            .count(store.connection())
+            .await
+            .expect("test: header rows");
+        assert_eq!(headers, 5, "a deleted event's header rows went with it");
+
+        let again = store
+            .drain_windowed(Window::fixed(3))
+            .await
+            .expect("test: drain again");
+        assert_eq!(again.declared_rows, 0, "idempotent");
+    }
+
+    // what this catches (2026-11-03: a fixed 10,000-row window held the store's one connection
+    // ~0.7 s a statement and the newest-page read beside it took 1.2 s p50): a drain statement
+    // sized by a count instead of by its cost. The next span scales toward the budget, never
+    // more than doubles, never drops below one row; a fixed window never moves.
+    #[test]
+    fn a_window_is_sized_from_what_the_last_statement_cost() {
+        let mut window = Window::adaptive();
+        let first = window.rows();
+        window.after(STATEMENT_BUDGET * 4);
+        assert_eq!(
+            window.rows(),
+            first / 4,
+            "four times over budget: a quarter the span"
+        );
+        let shrunk = window.rows();
+        window.after(std::time::Duration::ZERO);
+        assert_eq!(window.rows(), shrunk * 2, "free: at most double");
+        window.after(STATEMENT_BUDGET / 100);
+        assert_eq!(
+            window.rows(),
+            shrunk * 4,
+            "far under budget: still at most double a step"
+        );
+        window.after(std::time::Duration::from_secs(60));
+        assert_eq!(window.rows(), 1, "never below one row");
+        let mut fixed = Window::fixed(3);
+        fixed.after(std::time::Duration::from_secs(60));
+        assert_eq!(fixed.rows(), 3, "a fixed window never moves");
     }
 
     // what this catches: the part a DELETE cannot do. The freelist a drain leaves
@@ -559,7 +733,7 @@ mod tests {
         // A window far below the row count: the drain must cover every window, not
         // just the first one (the batched pass that keeps the connection free).
         let drained = store
-            .drain_dead_rows_windowed(64)
+            .drain_windowed(Window::fixed(64))
             .await
             .expect("test: drain");
         assert_eq!(drained.heartbeat_rows, 2_000);
@@ -592,7 +766,7 @@ mod tests {
                 .await
                 .expect("test: heartbeat row");
         }
-        store.drain_dead_rows().await.expect("test: drain");
+        store.drain().await.expect("test: drain");
         let incremental = store
             .reclaim(Reclaim::Incremental)
             .await

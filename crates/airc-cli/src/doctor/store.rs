@@ -11,7 +11,7 @@ use std::path::Path;
 
 use super::{Check, CheckConfig, CheckContext, Finding};
 
-/// Above this the daemon's drain (`airc_daemon::store_retention`) should already
+/// Above this the daemon's drain (`airc_store::retention::run`) should already
 /// have brought the file down; a file still here on a daemon that has run for a
 /// day means the drain is not running or not enough.
 pub const LARGE_STORE_BYTES: u64 = 512 * 1_000_000;

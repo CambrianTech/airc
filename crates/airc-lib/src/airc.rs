@@ -682,10 +682,13 @@ impl Airc {
         .await?;
 
         let store_path = home.join(EVENTS_DB_FILENAME);
-        let store: Arc<dyn EventStore> = Arc::new(SqliteEventStore::open_path(&store_path).await?);
+        let home_store = Arc::new(SqliteEventStore::open_path(&store_path).await?);
+        drain_in_background(&home_store, &store_path);
+        let store: Arc<dyn EventStore> = home_store;
         let coordinator_store_path = wire_root.join(EVENTS_DB_FILENAME);
-        let coordinator_store: Arc<dyn EventStore> =
-            Arc::new(SqliteEventStore::open_path(&coordinator_store_path).await?);
+        let coordinator = Arc::new(SqliteEventStore::open_path(&coordinator_store_path).await?);
+        drain_in_background(&coordinator, &coordinator_store_path);
+        let coordinator_store: Arc<dyn EventStore> = coordinator;
 
         let registry = Arc::new(PeerKeyRegistry::new());
         registry
@@ -2409,59 +2412,19 @@ impl Airc {
         Ok(self.inner.store.load_runtime_cursor(consumer_id).await?)
     }
 
-    /// Persist a named runtime consumer checkpoint in the durable
-    /// store.
-    pub async fn save_runtime_cursor(
-        &self,
-        consumer_id: &str,
-        cursor: &airc_core::TranscriptCursor,
-    ) -> Result<(), AircError> {
-        let room = self.current_room().await?;
-        self.inner
-            .store
-            .save_runtime_cursor(consumer_id, cursor, time::now_ms()?)
-            .await?;
-        self.emit_subscription_advanced(consumer_id, cursor, room.channel)
-            .await?;
-        Ok(())
-    }
-
-    /// Checkpoint a bounded transcript scan without publishing a lifecycle event.
-    /// The caller must stop before any visible event it has not delivered. Emitting
-    /// SubscriptionAdvanced for an excluded-only scan would create its own backlog.
-    pub async fn save_runtime_scan_cursor(
-        &self,
-        consumer_id: &str,
-        cursor: &airc_core::TranscriptCursor,
-    ) -> Result<(), AircError> {
-        self.inner
-            .store
-            .save_runtime_cursor(consumer_id, cursor, time::now_ms()?)
-            .await?;
-        Ok(())
-    }
-
-    /// Persist a runtime consumer checkpoint for a concrete event.
-    ///
-    /// This is the preferred path for hooks and live feeds because it
-    /// carries the source event's room and kind. Cursor advancement for
-    /// a `SubscriptionAdvanced` lifecycle event is stored but does not
-    /// emit another `SubscriptionAdvanced`, preventing self-amplifying
-    /// cursor loops.
+    /// Persist a runtime consumer checkpoint at a concrete event: the durable `runtime_cursor`
+    /// row every surface reads. Nothing is written to the transcript: the cursor IS the fact,
+    /// and a lifecycle event per save was 99.93% of the M5's store on 2026-08-04 and 1,626,658
+    /// rows of a 902 MB project store on 2026-11-03, read by nothing.
     pub async fn save_runtime_cursor_for_event(
         &self,
         consumer_id: &str,
         event: &airc_core::TranscriptEvent,
     ) -> Result<(), AircError> {
-        let cursor = event.cursor();
         self.inner
             .store
-            .save_runtime_cursor(consumer_id, &cursor, time::now_ms()?)
+            .save_runtime_cursor(consumer_id, &event.cursor(), time::now_ms()?)
             .await?;
-        if event.kind != airc_core::TranscriptKind::SubscriptionAdvanced {
-            self.emit_subscription_advanced(consumer_id, &cursor, event.room_id)
-                .await?;
-        }
         Ok(())
     }
 
@@ -3402,4 +3365,18 @@ mod scoped_state_tests {
 fn is_a_real_name(agent_name: &str) -> bool {
     let n = agent_name.trim();
     !n.is_empty() && n != airc_store::DEFAULT_AGENT_NAME
+}
+/// The store's one drain for a store this handle opened itself
+/// ([`airc_store::retention::run::spawn`]): it runs while any handle on the file is open in
+/// this process, and every pass goes to the tracing log. No mesh is known here, so it never
+/// reports idle: a full vacuum runs only past the store's mostly-air threshold.
+fn drain_in_background(store: &Arc<SqliteEventStore>, path: &Path) {
+    let shown = path.display().to_string();
+    airc_store::retention::run::spawn(
+        store,
+        path,
+        std::future::pending(),
+        || false,
+        move |pass| tracing::info!(store = %shown, "airc store retention: {pass}"),
+    );
 }
