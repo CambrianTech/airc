@@ -25,8 +25,12 @@ pub(crate) enum SqliteOnly {
     AutoVacuumIncremental,
     /// A full `VACUUM` (rebuilds the file).
     Vacuum,
-    /// `wal_checkpoint(TRUNCATE)`: checkpoint and truncate the WAL file.
+    /// `wal_checkpoint(TRUNCATE)`: checkpoint and truncate the WAL file. Waits for readers on
+    /// the busy timeout, so run it only after a passive checkpoint found none in the way.
     WalCheckpointTruncate,
+    /// `wal_checkpoint(PASSIVE)`: checkpoint what no reader is using, never waiting. Its row is
+    /// `(busy, log frames, checkpointed frames)`.
+    WalCheckpointPassive,
     /// `incremental_vacuum(pages)`: return up to `pages` freelist pages.
     IncrementalVacuum(u64),
     /// `EXPLAIN QUERY PLAN` of an ORM-built statement: how SQLite will run it
@@ -54,6 +58,7 @@ pub(crate) async fn sqlite_only(
         SqliteOnly::AutoVacuumIncremental => sql("PRAGMA auto_vacuum = INCREMENTAL".into()),
         SqliteOnly::Vacuum => sql("VACUUM".into()),
         SqliteOnly::WalCheckpointTruncate => sql("PRAGMA wal_checkpoint(TRUNCATE)".into()),
+        SqliteOnly::WalCheckpointPassive => sql("PRAGMA wal_checkpoint(PASSIVE)".into()),
         SqliteOnly::IncrementalVacuum(pages) => sql(format!("PRAGMA incremental_vacuum({pages})")),
         #[cfg(test)]
         SqliteOnly::QueryPlan(built) => Statement {
