@@ -137,9 +137,10 @@ impl SqliteEventStore {
         });
         let write = custody.admit()?;
         let db = Database::connect(opts).await?;
-        // Migrate forward atomically, derive what rows owe, and refuse a DB
-        // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
+        // Migrate forward atomically (schema only) and refuse a DB migrated
+        // AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db).await?;
+        crate::derive::settle_if_empty(&db, &gate).await?;
         drop(write);
         Ok(Self {
             db,

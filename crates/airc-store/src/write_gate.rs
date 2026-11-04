@@ -32,6 +32,10 @@ pub(crate) struct FileGate {
     /// Bumped as the drain's checkpoint starts and again as it ends (odd while one runs), so a
     /// write can tell whether a checkpoint ran during its life.
     checkpoint_epoch: std::sync::atomic::AtomicU64,
+    /// Whether every row retention keeps has its derived data ([`crate::derive`]): per file, so
+    /// every handle's filtered reads report the same [`airc_core::Settlement`]. Set at open for
+    /// a file with no events, otherwise by the background derivation; it never goes back.
+    settled: std::sync::atomic::AtomicBool,
 }
 
 impl FileGate {
@@ -56,6 +60,19 @@ impl FileGate {
     /// The drain's checkpoint is starting or has ended: each call moves the epoch one step.
     pub(crate) fn checkpoint_edge(&self) {
         self.checkpoint_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Every row retention keeps on this file is derived.
+    pub(crate) fn settle(&self) {
+        self.settled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn settlement(&self) -> airc_core::Settlement {
+        if self.settled.load(Ordering::Acquire) {
+            airc_core::Settlement::Settled
+        } else {
+            airc_core::Settlement::Unsettled
+        }
     }
 
     fn epoch(&self) -> u64 {

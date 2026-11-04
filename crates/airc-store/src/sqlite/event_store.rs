@@ -97,46 +97,27 @@ impl EventStore for SqliteEventStore {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        let read = || async {
-            let mut branches = Vec::new();
-            for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail)
-            {
-                branches.push(query.all(&self.db).await?);
-            }
-            crate::event_table::merge_branches(
-                branches,
-                |row| (row.lamport, row.event_id),
-                limit,
-                tail,
-            )
-            .into_iter()
-            .map(from_model)
-            .collect::<Result<Vec<_>, StoreError>>()
-        };
-        // A predicate on derived data first derives the owed rows that could belong to its page,
-        // nearest first; a plain page derives nothing (crate::derive).
-        if !crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
-            return read().await;
+    ) -> Result<airc_core::HistoryPage<TranscriptEvent>, StoreError> {
+        let mut branches = Vec::new();
+        for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail) {
+            branches.push(query.all(&self.db).await?);
         }
-        crate::derive::settle_page::<event::Entity, _, _, StoreError, _, _, _, _>(
-            &self.db,
-            crate::event_query::in_range(cursor, through, channels),
-            tail,
+        let rows = crate::event_table::merge_branches(
+            branches,
+            |row| (row.lamport, row.event_id),
             limit,
-            || self.admit_write(),
-            std::convert::identity,
-            read,
-            |far: &TranscriptEvent| {
-                let far = far.cursor();
-                if tail {
-                    crate::event_query::before(&far).not()
-                } else {
-                    crate::event_query::after(&far).not()
-                }
-            },
+            tail,
         )
-        .await
+        .into_iter()
+        .map(from_model)
+        .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(airc_core::HistoryPage {
+            rows,
+            settlement: crate::derive::settlement_of(
+                crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false),
+                self.gate(),
+            ),
+        })
     }
 
     async fn resume_from(

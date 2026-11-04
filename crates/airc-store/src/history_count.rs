@@ -7,7 +7,7 @@
 //! body is read or allocated.
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 
 use airc_core::{HeaderFilter, HistoryCount, RoomId, RuntimeSelf, TranscriptCursor};
 
@@ -46,18 +46,14 @@ impl CountHistory for SqliteEventStore {
         headers: &HeaderFilter,
         exclude: Option<&RuntimeSelf>,
     ) -> Result<HistoryCount, StoreError> {
-        let range = crate::event_query::in_range(after, through, channels);
-        // A count derives nothing: rows in its range that still owe their header rows make it a
-        // lower bound (`more`), never a wait on a derivation (crate::derive).
-        let owed = crate::derive::reads_derived(headers, false, exclude.is_some())
-            && crate::derive::owes::<event::Entity>(self.connection(), range.clone()).await?;
+        let reads_derived = crate::derive::reads_derived(headers, false, exclude.is_some());
         let mut query = event::Entity::find()
-            .filter(range)
+            .filter(crate::event_query::in_range(after, through, channels))
             .filter(crate::header_query::predicate::<event::Entity>(headers));
-        if owed {
+        if reads_derived {
             // An owed row has no header rows yet, so a negated filter would count it falsely:
-            // counting derived rows only keeps the count a lower bound.
-            query = query.filter(event::Column::DerivedVersion.eq(crate::derive::DERIVED_VERSION));
+            // count derived rows only, and say whether that was all of them.
+            query = query.filter(crate::derive::derived::<event::Entity>());
         }
         if let Some(rule) = exclude {
             query = query.filter(crate::header_query::not_runtime_self::<event::Entity>(rule));
@@ -77,7 +73,7 @@ impl CountHistory for SqliteEventStore {
             .map(|ms| to_u64("occurred_at_ms", ms))
             .collect::<Result<Vec<_>, _>>()?;
         let mut count = HistoryCount::of_newest(times);
-        count.more |= owed;
+        count.settlement = crate::derive::settlement_of(reads_derived, self.gate());
         Ok(count)
     }
 }

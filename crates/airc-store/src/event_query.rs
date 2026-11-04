@@ -23,16 +23,6 @@ pub(crate) fn after(c: &TranscriptCursor) -> SimpleExpr {
             .and(Expr::col(event::Column::EventId).gt(c.event_id.as_uuid())))
 }
 
-/// Events strictly before `c` in transcript order.
-pub(crate) fn before(c: &TranscriptCursor) -> SimpleExpr {
-    let lamport = c.lamport as i64;
-    Expr::col(event::Column::Lamport)
-        .lt(lamport)
-        .or(Expr::col(event::Column::Lamport)
-            .eq(lamport)
-            .and(Expr::col(event::Column::EventId).lt(c.event_id.as_uuid())))
-}
-
 /// Events of `channels` strictly after `cursor` and at or before `through`: the one range every
 /// history read, count and derivation scopes to.
 pub(crate) fn in_range(
@@ -62,7 +52,7 @@ pub(crate) fn matching(
     } else {
         sea_orm::Order::Asc
     };
-    let query = event::Entity::find()
+    let mut query = event::Entity::find()
         .filter(in_range(cursor, through, channels))
         .filter(crate::header_query::predicate::<event::Entity>(
             rule.headers,
@@ -70,5 +60,8 @@ pub(crate) fn matching(
         .order_by(event::Column::Lamport, order.clone())
         .order_by(event::Column::EventId, order)
         .limit(limit as u64);
+    if crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
+        query = query.filter(crate::derive::derived::<event::Entity>());
+    }
     crate::event_table::addressee_branches(query, rule.addressed_to)
 }

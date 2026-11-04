@@ -605,7 +605,7 @@ async fn handle_scan_inbox(
             message: "scan inbox: invalid bounds or limit (1..4096)".into(),
         };
     }
-    let events = match state
+    let page = match state
         .router
         .matching_history(
             request.channel,
@@ -620,14 +620,14 @@ async fn handle_scan_inbox(
         )
         .await
     {
-        Ok(events) => events,
+        Ok(page) => page,
         Err(error) => {
             return Response::Error {
                 message: format!("scan inbox: {error}"),
             }
         }
     };
-    scan_page_response(events, request, airc_ipc::codec::MAX_FRAME_BYTES as usize)
+    scan_page_response(page, request, airc_ipc::codec::MAX_FRAME_BYTES as usize)
 }
 
 async fn handle_count_inbox(
@@ -661,10 +661,11 @@ async fn handle_count_inbox(
 }
 
 fn scan_page_response(
-    mut events: Vec<Arc<Envelope>>,
+    page: airc_core::HistoryPage<Arc<Envelope>>,
     request: airc_ipc::request::ScanInboxRequest,
     budget: usize,
 ) -> Response {
+    let mut events = page.rows;
     let mut more = events.len() > request.limit;
     if request.tail && more {
         events.remove(0);
@@ -724,12 +725,20 @@ fn scan_page_response(
         envelopes,
         scanned_through,
         has_more: more,
+        settlement: page.settlement,
     })
 }
 
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    fn settled<T>(rows: Vec<T>) -> airc_core::HistoryPage<T> {
+        airc_core::HistoryPage {
+            rows,
+            settlement: airc_core::Settlement::Settled,
+        }
+    }
     #[test]
     fn maximum_cursor_and_high_bytes_fit_real_codec_or_fail_without_progress() {
         let room = RoomId::from_u128(1);
@@ -763,7 +772,7 @@ mod scan_tests {
             tail: false,
         };
         let response = scan_page_response(
-            vec![make(1, cap / 4), make(2, cap / 4)],
+            settled(vec![make(1, cap / 4), make(2, cap / 4)]),
             request.clone(),
             cap,
         );
@@ -774,12 +783,12 @@ mod scan_tests {
         assert!(page.has_more);
         assert_eq!(page.scanned_through.counter, 1);
         assert!(airc_ipc::codec::encode_frame_payload(&response).is_ok());
-        let oversized = scan_page_response(vec![make(1, cap / 2)], request.clone(), cap);
+        let oversized = scan_page_response(settled(vec![make(1, cap / 2)]), request.clone(), cap);
         assert!(matches!(oversized, Response::Error { .. }));
         let mut tail = request;
         tail.tail = true;
         assert!(matches!(
-            scan_page_response(vec![make(1, cap / 4), make(2, cap / 4)], tail, cap),
+            scan_page_response(settled(vec![make(1, cap / 4), make(2, cap / 4)]), tail, cap),
             Response::Error { .. }
         ));
     }
@@ -819,17 +828,31 @@ mod scan_tests {
         };
         let budget = airc_ipc::codec::byte_array_payload_len(&airc_wire::encode(&events[0]))
             + airc_ipc::codec::scan_inbox_payload_overhead(request.through, true, 1).unwrap();
-        let Response::ScanInbox(page) = scan_page_response(events, request.clone(), budget) else {
+        let Response::ScanInbox(page) =
+            scan_page_response(settled(events), request.clone(), budget)
+        else {
             panic!("scan response expected")
         };
         assert_eq!(page.envelopes.len(), 1);
         assert!(page.has_more);
         assert_eq!(page.scanned_through.counter, 1);
-        let Response::ScanInbox(empty) = scan_page_response(vec![], request.clone(), budget) else {
+        let Response::ScanInbox(empty) =
+            scan_page_response(settled(vec![]), request.clone(), budget)
+        else {
             panic!("scan response expected")
         };
         assert_eq!(empty.scanned_through, request.through);
         assert!(!empty.has_more);
+        // The store's settlement reaches the client unchanged (card 70055c76).
+        let unsettled = airc_core::HistoryPage {
+            rows: vec![],
+            settlement: airc_core::Settlement::Unsettled,
+        };
+        let Response::ScanInbox(unsettled) = scan_page_response(unsettled, request.clone(), budget)
+        else {
+            panic!("scan response expected")
+        };
+        assert_eq!(unsettled.settlement, airc_core::Settlement::Unsettled);
         // An ordinary Inbox reply cannot be mistaken for the positive ScanInbox contract.
         let mut encoded = Vec::new();
         airc_ipc::codec::write_frame(

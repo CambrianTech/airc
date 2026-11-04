@@ -51,6 +51,9 @@ pub struct PassReport {
     pub indexes: Option<Result<IndexReport, StoreError>>,
     /// Rows derived after the drain ([`crate::derive`]); `None` when the drain failed.
     pub derived: Option<Result<usize, StoreError>>,
+    /// The first report only: the rows retention keeps that the task derived at open, before
+    /// its first pass, which settles the file ([`SqliteEventStore::settle`]).
+    pub settled_at_open: Option<Result<usize, StoreError>>,
     /// `None` when the pass never reached the checkpoint (the drain's connection did not open).
     pub wal: Option<Result<WalCheckpoint, StoreError>>,
 }
@@ -58,6 +61,11 @@ pub struct PassReport {
 impl std::fmt::Display for PassReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mb = |bytes: u64| bytes / 1_000_000;
+        match &self.settled_at_open {
+            Some(Ok(rows)) => write!(f, "settled at open after deriving {rows} rows; ")?,
+            Some(Err(error)) => write!(f, "settling at open failed: {error}; ")?,
+            None => {}
+        }
         match &self.drain {
             Ok(report) => write!(
                 f,
@@ -168,6 +176,7 @@ pub async fn pass(store: &SqliteEventStore) -> PassReport {
         awaiting_compaction,
         indexes,
         derived,
+        settled_at_open: None,
         wal: Some(store.checkpoint_wal().await),
     }
 }
@@ -191,6 +200,20 @@ pub async fn run(
     report: impl Fn(&PassReport),
 ) -> Ended {
     tokio::pin!(shutdown);
+    // First, at once: derive the rows retention keeps that still owe their derivation, so every
+    // filtered read is settled long before the first pass (on a copy of a resident's 1.55 GB
+    // store, the scan for them took 25 s; with nothing owed it is one index seek). A failure is
+    // reported with the first pass, whose own derivation settles the file.
+    let (mut own, mut settled_at_open) = tokio::select! {
+        _ = &mut shutdown => return Ended::Shutdown,
+        opened = SqliteEventStore::open_path_for_drain(&path) => match opened {
+            Ok(store) => {
+                let settled = store.settle().await;
+                (Some(store), Some(settled))
+            }
+            Err(error) => (None, Some(Err(error))),
+        },
+    };
     tokio::select! {
         _ = &mut shutdown => return Ended::Shutdown,
         _ = tokio::time::sleep(FIRST_PASS_AFTER) => {}
@@ -199,7 +222,6 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick is immediate: the first pass runs now.
     ticker.tick().await;
-    let mut own: Option<SqliteEventStore> = None;
     loop {
         if !any_open() {
             return Ended::NoHandle;
@@ -210,7 +232,9 @@ pub async fn run(
         };
         match opened {
             Ok(store) => {
-                report(&pass(&store).await);
+                let mut done = pass(&store).await;
+                done.settled_at_open = settled_at_open.take();
+                report(&done);
                 own = Some(store);
             }
             Err(error) => report(&PassReport {
@@ -219,6 +243,7 @@ pub async fn run(
                 awaiting_compaction: None,
                 indexes: None,
                 derived: None,
+                settled_at_open: settled_at_open.take(),
                 wal: None,
             }),
         }

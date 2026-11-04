@@ -98,9 +98,12 @@ impl SqliteDurableSink {
         let db = Database::connect(opts)
             .await
             .map_err(BusError::sink_source)?;
-        // Migrate forward atomically, derive what rows owe, and refuse a DB
-        // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
+        // Migrate forward atomically (schema only) and refuse a DB migrated
+        // AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db)
+            .await
+            .map_err(BusError::sink_source)?;
+        crate::derive::settle_if_empty(&db, &gate)
             .await
             .map_err(BusError::sink_source)?;
         // Inspect the driver's resolved mode rather than guessing from the
@@ -286,7 +289,7 @@ impl DurableSink for SqliteDurableSink {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> Result<Vec<Envelope>, BusError> {
+    ) -> Result<airc_core::HistoryPage<Envelope>, BusError> {
         // Bounded by `limit`. The trait caller (the router's deep-replay)
         // may pass a very large limit to mean "the whole tail"; clamp to
         // `i64::MAX` so the SQL bind never overflows and we never use
@@ -296,48 +299,31 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
-        let read = || async {
-            let mut branches = Vec::new();
-            for query in page_rows(channel, after, through, rule, bounded, tail) {
-                branches.push(
-                    query
-                        .all(&self.readers)
-                        .await
-                        .map_err(BusError::sink_source)?,
-                );
-            }
-            crate::event_table::merge_branches(
-                branches,
-                |row| (row.epoch, row.counter, row.event_id),
-                limit,
-                tail,
-            )
-            .into_iter()
-            .map(from_model)
-            .collect::<Result<Vec<_>, BusError>>()
-        };
-        // A predicate on derived data first derives the owed rows that could belong to its page,
-        // nearest first; a plain page derives nothing (crate::derive).
-        if !crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
-            return read().await;
+        let mut branches = Vec::new();
+        for query in page_rows(channel, after, through, rule, bounded, tail) {
+            branches.push(
+                query
+                    .all(&self.readers)
+                    .await
+                    .map_err(BusError::sink_source)?,
+            );
         }
-        crate::derive::settle_page::<bus_event::Entity, _, _, BusError, _, _, _, _>(
-            &self.db,
-            in_range(channel, after, through),
-            tail,
+        let rows = crate::event_table::merge_branches(
+            branches,
+            |row| (row.epoch, row.counter, row.event_id),
             limit,
-            || self.admit_write(),
-            BusError::sink_source,
-            read,
-            |far: &Envelope| {
-                if tail {
-                    strictly_before(far.cursor()).not()
-                } else {
-                    strictly_after(far.cursor()).not()
-                }
-            },
+            tail,
         )
-        .await
+        .into_iter()
+        .map(from_model)
+        .collect::<Result<Vec<_>, BusError>>()?;
+        Ok(airc_core::HistoryPage {
+            rows,
+            settlement: crate::derive::settlement_of(
+                crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false),
+                &self.gate,
+            ),
+        })
     }
 
     async fn count_matching(
@@ -348,19 +334,11 @@ impl DurableSink for SqliteDurableSink {
         headers: &airc_core::HeaderFilter,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, BusError> {
-        // A count derives nothing: rows in its range that still owe their header rows make it a
-        // lower bound (`more`), never a wait on a derivation (crate::derive).
-        let owed = crate::derive::reads_derived(headers, false, exclude.is_some())
-            && crate::derive::owes::<bus_event::Entity>(
-                &self.readers,
-                in_range(channel, after, through),
-            )
-            .await
-            .map_err(BusError::sink_source)?;
+        let reads_derived = crate::derive::reads_derived(headers, false, exclude.is_some());
         let mut rows = matching_rows(channel, after, through, headers);
-        if owed {
+        if reads_derived {
             // An owed row has no header rows yet, so a negated filter would count it falsely:
-            // counting derived rows only keeps the count a lower bound.
+            // count derived rows only, and say whether that was all of them.
             rows =
                 rows.filter(bus_event::Column::DerivedVersion.eq(crate::derive::DERIVED_VERSION));
         }
@@ -387,7 +365,7 @@ impl DurableSink for SqliteDurableSink {
             .map(|ms| i64_to_u64("occurred_at_ms", ms))
             .collect::<Result<Vec<_>, _>>()?;
         let mut count = airc_core::HistoryCount::of_newest(times);
-        count.more |= owed;
+        count.settlement = crate::derive::settlement_of(reads_derived, &self.gate);
         Ok(count)
     }
 
@@ -671,11 +649,14 @@ fn page_rows(
     } else {
         sea_orm::Order::Asc
     };
-    let query = matching_rows(channel, after, through, rule.headers)
+    let mut query = matching_rows(channel, after, through, rule.headers)
         .order_by(bus_event::Column::Epoch, order.clone())
         .order_by(bus_event::Column::Counter, order.clone())
         .order_by(bus_event::Column::EventId, order)
         .limit(limit);
+    if crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
+        query = query.filter(crate::derive::derived::<bus_event::Entity>());
+    }
     crate::event_table::addressee_branches(query, rule.addressed_to)
 }
 

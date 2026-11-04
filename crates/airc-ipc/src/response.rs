@@ -707,4 +707,6 @@ pub struct ScanInboxResponse {
     pub envelopes: Vec<Vec<u8>>,
     pub scanned_through: IpcCursor,
     pub has_more: bool,
+    /// Whether the store had derived every row the filter could match ([`airc_core::Settlement`]).
+    pub settlement: airc_core::Settlement,
 }

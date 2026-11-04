@@ -5,31 +5,29 @@
 //! A row is current when its `derived_version` is [`DERIVED_VERSION`]. Appends
 //! by this binary write it current. A row at an older version (stored before
 //! migration 000021, or inserted by an older writer without the column) is
-//! derived a batch at a time, each batch in one transaction under the file's
-//! write gate: its header rows are replaced (deleted, then inserted), its
-//! addressing recomputed and its version set, so a half-derived row is never
-//! visible.
+//! derived by the store's background task, a batch at a time: the batch is
+//! found without the write gate, then written in one transaction under it (its
+//! header rows replaced, its addressing recomputed, its version set), so a
+//! half-derived row is never visible and no scan holds the gate.
 //!
-//! Nothing derives at open (card 70055c76: open did the whole table, 23.4 s on a
-//! 1.56 GB store). Who derives, and only what they reach:
-//! - a read whose predicate reads derived data ([`reads_derived`]) derives only
-//!   the owed rows that could still belong to its page, nearest first, batch by
-//!   batch until the page is settled ([`settle_page`]); a rare filter derives back
-//!   only as far as its page needs. A read that reads no derived data (the plain
-//!   newest page) derives nothing;
-//! - a count derives nothing: it counts derived rows only, and owed rows in its
-//!   range make it a lower bound (`HistoryCount::more`, [`owes`]);
-//! - the store's background pass derives every owed row after its drain, when
-//!   the table is small (`crate::retention::run::pass`).
+//! Nothing derives at open or in a read (card 70055c76: open derived the whole
+//! table, 23.4 s on a 1.56 GB store; a 50-row inbox read that derived its own
+//! range took 99.8 s before the first pass). Instead:
+//! - a read on derived data ([`reads_derived`]) matches derived rows only
+//!   ([`derived`]) and reports the file's [`Settlement`]: unsettled while the
+//!   background derivation has not finished, so a missing old match is never
+//!   silent;
+//! - the background task's first step, at open, derives the owed rows retention
+//!   keeps, newest first, then settles the file ([`SqliteEventStore::settle`]);
+//! - each pass derives what remains after its drain (`crate::retention::run::pass`).
 
 use std::collections::BTreeMap;
-use std::future::Future;
 
-use airc_core::HeaderFilter;
+use airc_core::{HeaderFilter, Settlement};
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder,
-    QuerySelect, TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, Order, QueryFilter,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -39,6 +37,7 @@ use crate::event_table::EventTable;
 use crate::header_query::write_header_rows;
 use crate::migration::fault::{self, Fault};
 use crate::sqlite::SqliteEventStore;
+use crate::write_gate::FileGate;
 
 /// The version of the derived data this binary writes.
 pub(crate) const DERIVED_VERSION: i32 = 1;
@@ -46,122 +45,107 @@ pub(crate) const DERIVED_VERSION: i32 = 1;
 /// Rows derived per transaction.
 const BATCH: u64 = 1000;
 
+/// What the drain deletes from a table, judged from a row's own columns, so it holds for a row
+/// that owes its derivation (no header rows yet). One owner: `crate::retention`. The derivation
+/// at open skips these: the next pass deletes them, so no read can ever need them.
+pub(crate) trait Dropped {
+    fn dropped() -> Option<SimpleExpr>;
+}
+
+/// `scope` without the rows the drain deletes.
+fn kept<T: Dropped>(scope: Condition) -> Condition {
+    match T::dropped() {
+        Some(dropped) => scope.add(dropped.not()),
+        None => scope,
+    }
+}
+
 /// Whether a read's predicate reads derived data: a header predicate and the exclusion of a
 /// runtime's own sends read the header rows, an addressee filter the addressing columns.
 pub(crate) fn reads_derived(headers: &HeaderFilter, addressee: bool, exclude: bool) -> bool {
     !matches!(headers, HeaderFilter::Any) || addressee || exclude
 }
 
-/// Whether any row of `T` within `scope` still owes its derivation.
-pub(crate) async fn owes<T: EventTable>(
+/// Rows of `T` whose derived data is current: what a read on derived data may match, so an owed
+/// row (no header rows yet) never matches a negated filter falsely.
+pub(crate) fn derived<T: EventTable>() -> SimpleExpr {
+    Expr::col(T::DERIVED_VERSION).eq(DERIVED_VERSION)
+}
+
+/// A read's settlement: a read on derived data is as settled as its file; any other read is
+/// exact whatever is owed.
+pub(crate) fn settlement_of(reads_derived: bool, gate: &FileGate) -> Settlement {
+    if reads_derived {
+        gate.settlement()
+    } else {
+        Settlement::Settled
+    }
+}
+
+/// At open: a file with no events owes nothing, so it is settled now (a new store, a test's
+/// in-memory one). Two one-row reads; any other file waits for the background derivation.
+pub(crate) async fn settle_if_empty(
     db: &DatabaseConnection,
-    scope: Condition,
-) -> Result<bool, StoreError> {
-    let owed: Option<Uuid> = T::find()
+    gate: &FileGate,
+) -> Result<(), StoreError> {
+    if is_empty::<event::Entity>(db).await? && is_empty::<bus_event::Entity>(db).await? {
+        gate.settle();
+    }
+    Ok(())
+}
+
+async fn is_empty<T: EventTable>(db: &DatabaseConnection) -> Result<bool, StoreError> {
+    let any: Option<Uuid> = T::find()
         .select_only()
         .column(T::EVENT_ID)
-        .filter(scope)
-        .filter(T::DERIVED_VERSION.lt(DERIVED_VERSION))
         .limit(1)
         .into_tuple()
         .one(db)
         .await?;
-    Ok(owed.is_some())
-}
-
-/// Derive every owed row of `T` within `scope`, one batch per transaction, each under the
-/// write admission `admit` returns (the file's gate, held for that batch only); how many.
-/// `lift` is the caller's error for a store failure (the sink's is `BusError::sink_source`).
-pub(crate) async fn derive_owed<T, G, E, Admit, Admitted>(
-    db: &DatabaseConnection,
-    scope: Condition,
-    admit: Admit,
-    lift: fn(StoreError) -> E,
-) -> Result<usize, E>
-where
-    T: EventTable,
-    <T::Headers as EntityTrait>::ActiveModel: Send,
-    Admit: Fn() -> Admitted,
-    Admitted: Future<Output = Result<G, E>>,
-{
-    let mut derived = 0;
-    loop {
-        let write = admit().await?;
-        let count = derive_batch::<T>(db, scope.clone(), Order::Desc)
-            .await
-            .map_err(lift)?;
-        drop(write);
-        if count == 0 {
-            return Ok(derived);
-        }
-        derived += count;
-        fault::hit(Fault::AfterDerivedBatch).map_err(|e| lift(e.into()))?;
-    }
-}
-
-/// A page on derived data, made exact. Run `page` (rows in cursor order); while an owed row of
-/// `T` could still belong to it, derive one batch of those, nearest the read's near end first,
-/// and run it again. An owed row could belong when the page is short (anywhere in `range`), or
-/// lies between the page's far-end row and the range's near end (`reaches(far_end)`, inclusive:
-/// an owed row in the page could be a false match). A tail read's near end is the newest.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn settle_page<T, Row, G, E, Admit, Admitted, Page, Paged>(
-    db: &DatabaseConnection,
-    range: Condition,
-    tail: bool,
-    limit: usize,
-    admit: Admit,
-    lift: fn(StoreError) -> E,
-    page: Page,
-    reaches: impl Fn(&Row) -> SimpleExpr,
-) -> Result<Vec<Row>, E>
-where
-    T: EventTable,
-    <T::Headers as EntityTrait>::ActiveModel: Send,
-    Admit: Fn() -> Admitted,
-    Admitted: Future<Output = Result<G, E>>,
-    Page: Fn() -> Paged,
-    Paged: Future<Output = Result<Vec<Row>, E>>,
-{
-    let near_first = if tail { Order::Desc } else { Order::Asc };
-    loop {
-        let rows = page().await?;
-        let far_end = if tail { rows.first() } else { rows.last() };
-        let unsettled = match far_end {
-            Some(row) if rows.len() >= limit => range.clone().add(reaches(row)),
-            _ => range.clone(),
-        };
-        if !owes::<T>(db, unsettled.clone()).await.map_err(lift)? {
-            return Ok(rows);
-        }
-        let write = admit().await?;
-        derive_batch::<T>(db, unsettled, near_first.clone())
-            .await
-            .map_err(lift)?;
-        drop(write);
-        fault::hit(Fault::AfterDerivedBatch).map_err(|e| lift(e.into()))?;
-    }
+    Ok(any.is_none())
 }
 
 impl SqliteEventStore {
-    /// Derive every owed row of both event tables ([`derive_owed`]): the background pass's step
-    /// after its drain, when the tables are small. How many rows it derived.
+    /// Derive the owed rows retention keeps in both event tables, newest first, then settle the
+    /// file: the background task's first step, at open. How many rows it derived.
+    pub async fn settle(&self) -> Result<usize, StoreError> {
+        let derived = self
+            .derive_owed::<event::Entity>(kept::<event::Entity>(Condition::all()))
+            .await?
+            + self
+                .derive_owed::<bus_event::Entity>(kept::<bus_event::Entity>(Condition::all()))
+                .await?;
+        self.gate().settle();
+        Ok(derived)
+    }
+
+    /// Derive every owed row of both event tables: each pass's step after its drain. How many.
     pub async fn derive_all_owed(&self) -> Result<usize, StoreError> {
-        let events = derive_owed::<event::Entity, _, _, _, _>(
-            self.connection(),
-            Condition::all(),
-            || self.admit_write(),
-            std::convert::identity,
-        )
-        .await?;
-        let bus_events = derive_owed::<bus_event::Entity, _, _, _, _>(
-            self.connection(),
-            Condition::all(),
-            || self.admit_write(),
-            std::convert::identity,
-        )
-        .await?;
-        Ok(events + bus_events)
+        let derived = self.derive_owed::<event::Entity>(Condition::all()).await?
+            + self
+                .derive_owed::<bus_event::Entity>(Condition::all())
+                .await?;
+        self.gate().settle();
+        Ok(derived)
+    }
+
+    /// Derive every owed row of `T` within `scope`, newest first: each batch found without the
+    /// gate, written under it.
+    async fn derive_owed<T: EventTable>(&self, scope: Condition) -> Result<usize, StoreError>
+    where
+        <T::Headers as EntityTrait>::ActiveModel: Send,
+    {
+        let mut derived = 0;
+        loop {
+            let batch = owed_batch::<T>(self.connection(), scope.clone()).await?;
+            if batch.is_empty() {
+                return Ok(derived);
+            }
+            let write = self.admit_write().await?;
+            derived += write_batch::<T>(self.connection(), batch).await?;
+            drop(write);
+            fault::hit(Fault::AfterDerivedBatch)?;
+        }
     }
 }
 
@@ -184,21 +168,24 @@ impl Grouped {
     }
 }
 
-/// Derive up to [`BATCH`] owed rows of `T` within `scope`, the first in `order` (cursor order),
-/// in one transaction; how many there were.
-async fn derive_batch<T: EventTable>(
+/// One owed row's stored fields: what its derivation reads.
+type Owed<T> = (
+    Uuid,
+    serde_json::Value,
+    <T as EventTable>::Content,
+    serde_json::Value,
+);
+
+/// Up to [`BATCH`] owed rows of `T` within `scope`, newest first.
+async fn owed_batch<T: EventTable>(
     db: &DatabaseConnection,
     scope: Condition,
-    order: Order,
-) -> Result<usize, StoreError>
-where
-    <T::Headers as EntityTrait>::ActiveModel: Send,
-{
+) -> Result<Vec<Owed<T>>, StoreError> {
     let mut owed = T::find();
     for column in T::ORDER {
-        owed = owed.order_by(*column, order.clone());
+        owed = owed.order_by(*column, Order::Desc);
     }
-    let rows: Vec<(Uuid, serde_json::Value, T::Content, serde_json::Value)> = owed
+    Ok(owed
         .select_only()
         .column(T::EVENT_ID)
         .column(T::TARGET)
@@ -209,22 +196,36 @@ where
         .limit(BATCH)
         .into_tuple()
         .all(db)
-        .await?;
-    let count = rows.len();
-    if count == 0 {
-        return Ok(0);
-    }
-    let mut ids = Vec::with_capacity(count);
+        .await?)
+}
+
+/// Derive `batch` in one transaction (the caller holds the write gate); how many rows it
+/// derived. The batch was found without the gate, so only its rows still present and still
+/// owed are written: a row another writer deleted or derived meanwhile is left alone.
+async fn write_batch<T: EventTable>(
+    db: &DatabaseConnection,
+    batch: Vec<Owed<T>>,
+) -> Result<usize, StoreError>
+where
+    <T::Headers as EntityTrait>::ActiveModel: Send,
+{
+    let txn = db.begin().await?;
+    let still_owed: std::collections::HashSet<Uuid> =
+        still_owed::<T>(&txn, batch.iter().map(|(id, ..)| *id).collect()).await?;
+    let mut ids = Vec::with_capacity(still_owed.len());
     let mut grouped = Grouped::default();
-    let mut headers = Vec::with_capacity(count);
-    for (id, target, content, held) in rows {
+    let mut headers = Vec::with_capacity(still_owed.len());
+    for (id, target, content, held) in batch {
+        if !still_owed.contains(&id) {
+            continue;
+        }
         let held: airc_core::Headers = serde_json::from_value(held)
             .map_err(|e| StoreError::Migration(format!("decoding headers: {e}")))?;
         grouped.add(id, T::addressing(target, content)?);
         headers.push((id, held));
         ids.push(id);
     }
-    let txn = db.begin().await?;
+    let count = ids.len();
     T::Headers::delete_many()
         .filter(T::HEADER_EVENT_ID.is_in(ids.clone()))
         .exec(&txn)
@@ -253,6 +254,22 @@ where
     }
     txn.commit().await?;
     Ok(count)
+}
+
+/// Which of `ids` are still rows of `T` that owe their derivation.
+async fn still_owed<T: EventTable>(
+    db: &impl ConnectionTrait,
+    ids: Vec<Uuid>,
+) -> Result<std::collections::HashSet<Uuid>, StoreError> {
+    let rows: Vec<Uuid> = T::find()
+        .select_only()
+        .column(T::EVENT_ID)
+        .filter(T::EVENT_ID.is_in(ids))
+        .filter(T::DERIVED_VERSION.lt(DERIVED_VERSION))
+        .into_tuple()
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -424,27 +441,32 @@ mod tests {
         assert_eq!(event_header::Entity::find().count(db).await.unwrap(), 2500);
     }
 
-    // what this catches (card 70055c76): a row an older writer inserts without the derived
-    // data (`derived_version` 0, no header rows) is answered exactly by every read that
-    // depends on it, in both event tables: a filtered read derives its own range first; a
-    // count derives nothing and says it is a lower bound; a plain page derives nothing.
+    // what this catches (Fable on #1654): a read that derived its own range took 99.8 s on a
+    // 1.55 GB store before the first pass; and a filtered read that skipped owed rows silently
+    // would let a resident miss an old DM with nobody able to tell why. A read never derives:
+    // before the file settles, a filtered page and count over pre-migration rows say Unsettled;
+    // after `settle`, Settled with the old match included. In both event tables; a plain page
+    // is exact either way.
     #[tokio::test]
-    async fn owed_rows_are_derived_by_the_read_that_reaches_them() {
+    async fn a_filtered_read_is_unsettled_until_the_derivation_at_open_settles_it() {
         use crate::{CountHistory, EventStore, SqliteDurableSink};
         use airc_bus::envelope::Cursor;
         use airc_bus::{DurableSink, Seq};
-        use airc_core::{HeaderFilter, HistoryMatch, RoomId};
+        use airc_core::{HeaderFilter, HistoryMatch, RoomId, Settlement};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.sqlite");
         let me = PeerId::from_u128(0x3e);
         let room = RoomId::from_u128(7);
-        let store = SqliteEventStore::open_path(&path).await.unwrap();
-        let db = store.connection();
+        let db = connect(&path).await;
+        Migrator::up(&db, Some(BEFORE_DERIVED)).await.unwrap();
         event::Entity::insert(old_row(1, MentionTarget::Peer(me), "plain"))
-            .exec(db)
+            .exec(&db)
             .await
             .unwrap();
+        drop(db);
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        let db = store.connection();
         bus_event::Entity::insert(bus_event::ActiveModel {
             event_id: Set(Uuid::from_u128(2)),
             room_id: Set(room.as_uuid()),
@@ -467,7 +489,10 @@ mod tests {
         .exec(db)
         .await
         .unwrap();
+        let sink = SqliteDurableSink::open_path(&path).await.unwrap();
         let keyed = HeaderFilter::Has { key: "k".into() };
+        let bus_origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+        let bus_through = Cursor::new(Seq::new(1, 1), EventId::from_u128(2));
 
         let plain = store
             .matching_history(
@@ -480,16 +505,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(plain.len(), 1);
-        assert_eq!(not_current(db).await, 1, "a plain page derives nothing");
-
-        let count = store
-            .count_history(&origin(), &newest(), &[room], &keyed, None)
-            .await
-            .unwrap();
-        assert!(count.more, "owed rows in range: the count is a lower bound");
-        assert_eq!(not_current(db).await, 1, "a count derives nothing");
-
+        assert_eq!(
+            (plain.rows.len(), plain.settlement),
+            (1, Settlement::Settled)
+        );
         let page = store
             .matching_history(
                 &origin(),
@@ -502,10 +521,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            page.len(),
-            1,
-            "the filtered read derived its range, then matched"
+            (page.rows.len(), page.settlement),
+            (0, Settlement::Unsettled)
         );
+        let count = store
+            .count_history(&origin(), &newest(), &[room], &keyed, None)
+            .await
+            .unwrap();
+        assert_eq!((count.count, count.settlement), (0, Settlement::Unsettled));
+        let bus = sink
+            .page_matching(
+                room,
+                bus_origin,
+                bus_through,
+                HistoryMatch::headers(&keyed),
+                10,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!((bus.rows.len(), bus.settlement), (0, Settlement::Unsettled));
+        assert_eq!(not_current(db).await, 1, "a read derives nothing");
+
+        assert_eq!(store.settle().await.unwrap(), 2, "one row of each table");
+        assert_eq!(bus_event_header::Entity::find().count(db).await.unwrap(), 1);
+        let page = store
+            .matching_history(
+                &origin(),
+                &newest(),
+                &[room],
+                HistoryMatch::headers(&keyed),
+                10,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!((page.rows.len(), page.settlement), (1, Settlement::Settled));
         let row = event::Entity::find_by_id(Uuid::from_u128(1))
             .one(db)
             .await
@@ -519,17 +570,8 @@ mod tests {
             .count_history(&origin(), &newest(), &[room], &keyed, None)
             .await
             .unwrap();
-        assert_eq!((count.count, count.more), (1, false), "exact once derived");
-
-        let sink = SqliteDurableSink::open_path(&path).await.unwrap();
-        let bus_origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
-        let bus_through = Cursor::new(Seq::new(1, 1), EventId::from_u128(2));
-        let count = sink
-            .count_matching(room, bus_origin, bus_through, &keyed, None)
-            .await
-            .unwrap();
-        assert!(count.more, "the sink's count is a lower bound too");
-        let page = sink
+        assert_eq!((count.count, count.settlement), (1, Settlement::Settled));
+        let bus = sink
             .page_matching(
                 room,
                 bus_origin,
@@ -540,42 +582,46 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(page.len(), 1);
-        let bus = bus_event::Entity::find_by_id(Uuid::from_u128(2))
-            .one(db)
+        assert_eq!(
+            (bus.rows.len(), bus.settlement),
+            (1, Settlement::Settled),
+            "the sink shares the file's settlement"
+        );
+        let bus_count = sink
+            .count_matching(room, bus_origin, bus_through, &keyed, None)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(
-            (bus.leading_mention, bus.derived_version),
-            (true, DERIVED_VERSION)
+            (bus_count.count, bus_count.settlement),
+            (1, Settlement::Settled)
         );
-        assert_eq!(event_header::Entity::find().count(db).await.unwrap(), 1);
-        assert_eq!(bus_event_header::Entity::find().count(db).await.unwrap(), 1);
     }
-    // what this catches (Fable on #1654): a filtered newest page on a store full of owed rows
-    // derived its whole range, up to 2.2M rows the drain was about to delete, before answering.
-    // Matches only among the newest few: the page is exact after about one batch, and a count
-    // meanwhile counts derived rows only (a negated filter never counts an owed row).
+
+    // what this catches (Fable on #1654): settling a resident store derived the 2.2M rows its
+    // next pass deletes. `settle` derives only the rows retention keeps (the drain's own
+    // predicate, `Dropped`); the rest stay owed for the drain, and the filtered page is exact.
     #[tokio::test]
-    async fn a_filtered_newest_page_derives_only_back_to_its_page() {
-        use crate::{CountHistory, EventStore};
-        use airc_core::{HeaderFilter, HistoryMatch, RoomId};
+    async fn settling_derives_only_what_retention_keeps() {
+        use crate::EventStore;
+        use airc_core::{HeaderFilter, HistoryMatch, RoomId, Settlement};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.sqlite");
-        let owed = 5000u128;
+        let (dropped, kept) = (4000u128, 1000u128);
         let db = connect(&path).await;
         Migrator::up(&db, Some(BEFORE_DERIVED)).await.unwrap();
-        let rows: Vec<_> = (1..=owed)
+        let rows: Vec<_> = (1..=dropped + kept)
             .map(|n| {
                 let mut row = old_row(n, MentionTarget::All, "plain");
-                let headers = if n > owed - 3 {
-                    serde_json::json!({ "k": "v" })
+                if n <= dropped {
+                    // One peer's identity republished: only the newest survives the drain.
+                    row.kind = Set("identity_published".into());
+                    row.headers = Set(serde_json::json!({ "k": "stale" }));
+                } else if n % 300 == 0 {
+                    row.headers = Set(serde_json::json!({ "k": "v" }));
                 } else {
-                    serde_json::json!({ "other": "v" })
-                };
-                row.headers = Set(headers);
+                    row.headers = Set(serde_json::json!({ "other": "v" }));
+                }
                 row
             })
             .collect();
@@ -588,32 +634,29 @@ mod tests {
         drop(db);
         let store = SqliteEventStore::open_path(&path).await.unwrap();
         let db = store.connection();
-        let room = RoomId::from_u128(7);
-        let keyed = HeaderFilter::Has { key: "k".into() };
+        assert_eq!(store.settle().await.unwrap() as u128, kept + 1);
+        assert_eq!(
+            not_current(db).await,
+            (dropped - 1) as u64,
+            "every row the drain drops still owed; the kept rows (and the newest identity) derived"
+        );
+        let keyed = HeaderFilter::Exact {
+            key: "k".into(),
+            value: "v".into(),
+        };
         let page = store
             .matching_history(
                 &origin(),
                 &newest(),
-                &[room],
+                &[RoomId::from_u128(7)],
                 HistoryMatch::headers(&keyed),
-                3,
+                50,
                 true,
             )
             .await
             .unwrap();
-        let lamports: Vec<u64> = page.iter().map(|e| e.lamport).collect();
-        assert_eq!(lamports, [4998, 4999, 5000]);
-        assert_eq!(
-            not_current(db).await,
-            (owed as u64) - BATCH,
-            "one batch derived, nearest first, not the whole range"
-        );
-        let unkeyed = HeaderFilter::Not(Box::new(keyed.clone()));
-        let count = store
-            .count_history(&origin(), &newest(), &[room], &unkeyed, None)
-            .await
-            .unwrap();
-        assert!(count.more, "owed rows remain: a lower bound");
-        assert_eq!(count.count, BATCH - 3, "derived rows only");
+        let lamports: Vec<u64> = page.rows.iter().map(|e| e.lamport).collect();
+        assert_eq!(lamports, [4200, 4500, 4800], "short, and exact");
+        assert_eq!(page.settlement, Settlement::Settled);
     }
 }

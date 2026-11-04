@@ -158,19 +158,23 @@ impl EventStore for InMemoryEventStore {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> Result<Vec<TranscriptEvent>, StoreError> {
+    ) -> Result<airc_core::HistoryPage<TranscriptEvent>, StoreError> {
         let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
-        Ok(airc_core::bounded_selection::select(
-            events.iter().filter(|e| {
-                channels.contains(&e.room_id)
-                    && strictly_after(e, after)
-                    && !strictly_after(e, through)
-                    && rule.matches_event(e)
-            }),
-            |e| (e.lamport, e.event_id.0),
-            limit,
-            tail,
-        ))
+        // Matched on demand from each event: nothing here is ever owed.
+        Ok(airc_core::HistoryPage {
+            rows: airc_core::bounded_selection::select(
+                events.iter().filter(|e| {
+                    channels.contains(&e.room_id)
+                        && strictly_after(e, after)
+                        && !strictly_after(e, through)
+                        && rule.matches_event(e)
+                }),
+                |e| (e.lamport, e.event_id.0),
+                limit,
+                tail,
+            ),
+            settlement: airc_core::Settlement::Settled,
+        })
     }
 
     async fn resume_from(

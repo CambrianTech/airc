@@ -94,7 +94,12 @@ async fn addressee_scan_selects_candidates_by_indexed_columns() {
         .matching_history(&origin, &through, &[room], rule, 10, true)
         .await
         .unwrap();
-    assert_eq!(page, [typed, led]);
+    assert_eq!(page.rows, [typed, led]);
+    assert_eq!(
+        page.settlement,
+        airc_core::Settlement::Settled,
+        "a store with no events at open owes nothing"
+    );
 }
 
 // what this catches: the addressee scan must SEARCH the addressing indexes
@@ -132,7 +137,7 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         .matching_history(&origin, &through, &[room], rule, 10, true)
         .await
         .unwrap();
-    assert_eq!(unindexed, requests, "correct without the indexes");
+    assert_eq!(unindexed.rows, requests, "correct without the indexes");
     let report = store.ensure_indexes().await.unwrap();
     assert_eq!(report.built.len(), crate::indexes::EventIndex::ALL.len());
     assert!(
@@ -166,7 +171,7 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         .await
         .unwrap();
     let elapsed = started.elapsed();
-    assert_eq!(page, requests);
+    assert_eq!(page.rows, requests);
     // Two index searches and a merge of three rows; a walk of 20k rows
     // is the regression this bound would catch.
     assert!(

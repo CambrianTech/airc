@@ -582,7 +582,7 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         )
         .await
         .unwrap();
-    assert_eq!(page[0].event_id, first.event_id);
+    assert_eq!(page.rows[0].event_id, first.event_id);
     let next = sink
         .page_matching(
             ch,
@@ -594,7 +594,7 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         )
         .await
         .unwrap();
-    assert_eq!(next[0].event_id, second.event_id);
+    assert_eq!(next.rows[0].event_id, second.event_id);
     assert_eq!(sink.page(ch, None, 600).await.unwrap().len(), 514);
     // The count is the same range, counted in the store: it agrees with the page.
     let routed = sink
@@ -618,7 +618,15 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         .count_matching(ch, second.cursor(), second.cursor(), &filter, None)
         .await
         .unwrap();
-    assert_eq!(empty, airc_core::HistoryCount::default());
+    assert_eq!(
+        empty,
+        airc_core::HistoryCount {
+            // Reopened with events and nothing has settled it: the background derivation
+            // (`retention::run`) is what says every kept row is derived (card 70055c76).
+            settlement: airc_core::Settlement::Unsettled,
+            ..airc_core::HistoryCount::default()
+        }
+    );
 }
 
 // what this catches: an addressee scan is answered by the indexed addressing
@@ -658,7 +666,7 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         .page_matching(ch, origin, through, rule, 10, true)
         .await
         .unwrap();
-    let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
+    let ids: Vec<_> = page.rows.iter().map(|e| e.event_id).collect();
     // Before the background pass builds the addressing indexes (card 70055c76) the
     // same page answers, only by a slower plan.
     assert_eq!(
@@ -671,7 +679,7 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         .page_matching(ch, origin, through, rule, 10, true)
         .await
         .unwrap();
-    let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
+    let ids: Vec<_> = page.rows.iter().map(|e| e.event_id).collect();
     assert_eq!(ids, [typed.event_id, led.event_id], "the same with them");
     // Index evidence: each branch SEARCHes its own addressing index (rows
     // touched are candidates), never walks the room in cursor order.

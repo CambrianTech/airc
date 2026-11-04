@@ -49,6 +49,7 @@ pub mod process;
 pub mod receipt;
 pub mod retention;
 pub mod scoped_state;
+pub mod settlement;
 pub mod shown_id;
 pub mod temp_home;
 pub mod transcript;
@@ -73,6 +74,7 @@ pub use persona::{PersonaCapabilities, PersonaCapabilitiesError, PERSONA_CAPABIL
 pub use receipt::{Receipt, ReceiptKind};
 pub use retention::{Retention, RetentionKey};
 pub use scoped_state::{ScopeRef, ScopedStateEntry, PEER_IDENTITY_STATE_KEY};
+pub use settlement::{HistoryPage, Settlement};
 pub use temp_home::scope_home_is_temp_rooted;
 pub use transcript::{MentionTarget, TranscriptEvent, TranscriptKind};
 
