@@ -74,7 +74,12 @@ fn non_durable_row() -> HeaderFilter {
 /// b-tree range it walks, not by how many rows match, and the pass yields between statements so
 /// queued appends and reads take the connection and the write lock.
 ///
-/// The span is sized from what the last statement cost, never a fixed count. The store's pool is
+/// The span is sized from what the last statement's work cost, never a fixed count. The work is
+/// the range's reads and deletes, not its commit: a commit's sync is a fixed cost per statement
+/// that no span can shrink, and counted in, it collapsed the span to one row wherever a sync costs
+/// more than the budget. On Windows CI (airc #1655, 2026-11-04) the drain of 2,000 heartbeat rows
+/// then paid a commit, a checkpoint and a timer tick per row and ran past 120 s twice, against the
+/// whole suite in 59.85 s on #1654's runner. The store's pool is
 /// one connection (`max_connections(1)`), so a read queued behind a drain statement waits its
 /// whole run: on 2026-11-03 a fixed 10,000-row window over a 1.1 GB resident store copy ran
 /// about 0.7 s a statement, and the newest-page read beside it took 1.2 s p50, 1.7 s p99. Each
@@ -397,6 +402,8 @@ impl SqliteEventStore {
                 .into_tuple()
                 .all(db)
                 .await?;
+            // The window's own work: the reads and deletes, never the commit (see [`Window`]).
+            let mut worked = started.elapsed();
             if !ids.is_empty() {
                 let _write = self.admit_write().await?;
                 let txn = db.begin().await?;
@@ -409,10 +416,11 @@ impl SqliteEventStore {
                     .exec(&txn)
                     .await?
                     .rows_affected;
+                worked = started.elapsed();
                 txn.commit().await?;
             }
             let held = started.elapsed();
-            window.after(held);
+            window.after(worked);
             if let Checkpointed::Pinned(_) = self.checkpoint_after_window(held).await? {
                 break;
             }
