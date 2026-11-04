@@ -107,7 +107,7 @@ impl<T: ShownKind> TryFrom<&str> for Shown<T> {
     /// No repair of a well-formed id: an exact UUID is used as given, never
     /// retried on its head. A UUID one hex digit off (a model added or dropped
     /// one) is not a UUID at all, so it is read as the short form it leads with
-    /// ([`one_off_uuid`]); like any prefix it names only one of the caller's own
+    /// ([`mistyped_uuid`]); like any prefix it names only one of the caller's own
     /// candidates or is refused.
     fn try_from(raw: &str) -> Result<Self, ShownIdError> {
         let raw = raw.trim();
@@ -124,15 +124,16 @@ impl<T: ShownKind> TryFrom<&str> for Shown<T> {
                 len: u8::try_from(hex.len()).ok()?,
             })
         };
-        let form = match Uuid::parse_str(raw) {
-            Ok(id) => Form::Full(id),
-            Err(_) => prefix(raw)
-                .or_else(|| one_off_uuid(raw).and_then(prefix))
-                .ok_or_else(|| ShownIdError::NotAnId {
-                    raw: raw.to_string(),
-                    label: T::LABEL,
+        let form =
+            match Uuid::parse_str(raw) {
+                Ok(id) => Form::Full(id),
+                Err(_) => prefix(raw).or_else(|| mistyped_uuid(raw)).ok_or_else(|| {
+                    ShownIdError::NotAnId {
+                        raw: raw.to_string(),
+                        label: T::LABEL,
+                    }
                 })?,
-        };
+            };
         Ok(Self {
             form,
             kind: PhantomData,
@@ -140,23 +141,37 @@ impl<T: ShownKind> TryFrom<&str> for Shown<T> {
     }
 }
 
-/// The short form a UUID one hex digit off leads with: `raw` is only hex
-/// digits and dashes and carries 31 or 33 hex digits, one dropped or one added
-/// by whoever copied it. On 2026-07-13 that was 28% of live `work/claim` calls
-/// (`d7cfe47e0-8e39-...`, a nine-digit first group). Continuum's persona-id
-/// verbs read it by its leading short form through `id_resolve::resolve`; this
-/// is that reading in the one id type, so they can move here without losing it. Anything else (words around an
-/// id, a fragment, a well-formed id) is not this and is not read as it.
-fn one_off_uuid(raw: &str) -> Option<&str> {
+/// What a UUID written with odd separators or one hex digit off reads as. `raw`
+/// must be only hex digits and dashes, so words around an id are never mined for
+/// hex (`card d7cf...` is not read as `cad...`, which continuum's `normalize` did).
+/// - 32 hex digits under misplaced or doubled dashes are every digit of one id:
+///   that exact id, never a repair (the verb's own lookup refuses an unknown id).
+/// - 31 or 33 hex digits, one dropped or added by whoever copied it, are read by
+///   the 8-hex short form they lead with. On 2026-07-13 that was 28% of live
+///   `work/claim` calls (`d7cfe47e0-8e39-...`, a nine-digit first group).
+///   Continuum's persona-id verbs read it this way through `id_resolve::resolve`;
+///   this is that reading in the one id type, so they can move here without
+///   losing it. Like any prefix it names only one of the caller's candidates.
+/// - Anything else (30 or 34 digits, a fragment) is not an id here.
+fn mistyped_uuid(raw: &str) -> Option<Form> {
     if !raw.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
         return None;
     }
-    let hex = raw.bytes().filter(u8::is_ascii_hexdigit).count();
-    if hex != 31 && hex != 33 {
-        return None;
+    let hex: String = raw.chars().filter(char::is_ascii_hexdigit).collect();
+    match hex.len() {
+        32 => Uuid::parse_str(&hex).ok().map(Form::Full),
+        31 | 33 => {
+            let head = raw.get(..SHORT_ID_LEN)?;
+            if !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some(Form::Prefix {
+                digits: u128::from_str_radix(head, 16).ok()?,
+                len: u8::try_from(SHORT_ID_LEN).ok()?,
+            })
+        }
+        _ => None,
     }
-    raw.get(..SHORT_ID_LEN)
-        .filter(|head| head.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 impl<'de, T: ShownKind> Deserialize<'de> for Shown<T> {
@@ -380,6 +395,20 @@ mod tests {
         // A digit dropped inside the leading group leaves no clean short form: refused.
         assert!(matches!(
             resolve("d7cfe47-8e39-4a1b-9c2d-0123456789ab", &[target]),
+            Err(ShownIdError::NotAnId { .. })
+        ));
+        // Every digit of one id under doubled or misplaced dashes is that exact id.
+        assert_eq!(
+            resolve("d7cfe47e--8e39-4a1b-9c2d-0123456789ab", &[]),
+            Ok(target)
+        );
+        assert_eq!(
+            resolve("d7cf-e47e8e39-4a1b9c2d-0123456789ab", &[]),
+            Ok(target)
+        );
+        // Words or spaces around an id are not mined for its hex.
+        assert!(matches!(
+            resolve("card d7cfe47e0-8e39-4a1b-9c2d-0123456789ab", &[target]),
             Err(ShownIdError::NotAnId { .. })
         ));
         // A well-formed id is used exactly as given, never retried on its head.
