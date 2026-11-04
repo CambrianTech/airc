@@ -115,9 +115,10 @@ impl SqliteEventStore {
                 .rows_affected;
             txn.commit().await?;
             drop(write);
-            window.after(started.elapsed());
+            let took = started.elapsed();
+            window.after(took);
             low = high;
-            tokio::task::yield_now().await;
+            window.rest(took).await;
         }
         Ok(removed)
     }

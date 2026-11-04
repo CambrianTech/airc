@@ -115,6 +115,20 @@ impl Window {
         self.rows
     }
 
+    /// Rest after a statement that held the write lock for `took`, as long again: the drain holds
+    /// the lock at most half the time, so a writer waiting in SQLite's busy handler (which sleeps
+    /// in growing steps, not until the lock frees) finds it free on its next retry. With only a
+    /// yield the drain re-took the lock before the sleeper woke: on 2026-11-04, a 979 MB copy, a
+    /// reader sharing a handle with a waiting appender went from p99 1.50 ms with no drain to 19.9
+    /// ms during it, and the appender's own p99 from 31.7 ms to 40.6 ms. A fixed window (the tests)
+    /// only yields.
+    pub(crate) async fn rest(&self, took: std::time::Duration) {
+        match self.budget {
+            Some(_) => tokio::time::sleep(took).await,
+            None => tokio::task::yield_now().await,
+        }
+    }
+
     /// Size the next span from the statement that covered `self.rows()` in `took`.
     pub(crate) fn after(&mut self, took: std::time::Duration) {
         let Some(budget) = self.budget else { return };
@@ -276,9 +290,10 @@ impl SqliteEventStore {
                     .rows_affected;
                 txn.commit().await?;
             }
-            window.after(started.elapsed());
+            let took = started.elapsed();
+            window.after(took);
             low = high;
-            tokio::task::yield_now().await;
+            window.rest(took).await;
         }
         Ok(removed)
     }
