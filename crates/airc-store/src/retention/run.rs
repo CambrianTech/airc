@@ -204,16 +204,21 @@ pub async fn run(
     // filtered read is settled long before the first pass (on a copy of a resident's 1.55 GB
     // store, the scan for them took 25 s; with nothing owed it is one index seek). A failure is
     // reported with the first pass, whose own derivation settles the file.
-    let (mut own, mut settled_at_open) = tokio::select! {
-        _ = &mut shutdown => return Ended::Shutdown,
-        opened = SqliteEventStore::open_path_for_drain(&path) => match opened {
-            Ok(store) => {
-                let settled = store.settle().await;
-                (Some(store), Some(settled))
-            }
-            Err(error) => (None, Some(Err(error))),
+    // Its connection is closed again once settled: held through the wait it doubled every
+    // process's descriptors for a store it would not touch for minutes (airc-lib's suite failed
+    // under a 256-descriptor limit that the base passes, #1654). The first pass opens its own.
+    // A file its opener already found settled needs nothing here: no connection is opened.
+    let mut settled_at_open = match crate::write_gate::for_path(&path).settling.settlement() {
+        airc_core::Settlement::Settled => None,
+        airc_core::Settlement::Unsettled => tokio::select! {
+            _ = &mut shutdown => return Ended::Shutdown,
+            opened = SqliteEventStore::open_path_for_drain(&path) => match opened {
+                Ok(store) => Some(store.settle().await),
+                Err(error) => Some(Err(error)),
+            },
         },
     };
+    let mut own: Option<SqliteEventStore> = None;
     tokio::select! {
         _ = &mut shutdown => return Ended::Shutdown,
         _ = tokio::time::sleep(FIRST_PASS_AFTER) => {}

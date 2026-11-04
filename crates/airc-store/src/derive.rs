@@ -72,10 +72,14 @@ pub(crate) fn derived<T: EventTable>() -> SimpleExpr {
     Expr::col(T::DERIVED_VERSION).eq(DERIVED_VERSION)
 }
 
-/// At open: a file with no events owes nothing, so its indexes are built (on empty tables, at
-/// once) and it is settled now (a new store, a test's in-memory one). Any other file is indexed
-/// if its indexes already exist (a store migrated before 000021 stopped building them), and
-/// derived when the background task says so. Two one-row reads and six catalog lookups.
+/// At open, from what is cheap to know:
+/// - a file with no events owes nothing: its indexes are built (on empty tables, at once) and it
+///   is settled now (a new store, a test's in-memory one);
+/// - a file with its indexes is indexed, and settled now when no row owes its derivation, which
+///   the `derived_version` index answers with one seek (every store this binary wrote: a restart
+///   is exact at once, so an addressed request older than any walk is never missed);
+/// - any other file (no indexes: a store that never ran 000021) is settled by the background
+///   task, and its filtered reads walk their newest rows until then (`crate::settling`).
 pub(crate) async fn settle_at_open(
     db: &DatabaseConnection,
     gate: &FileGate,
@@ -86,8 +90,24 @@ pub(crate) async fn settle_at_open(
         gate.settling.mark_derived();
     } else if crate::indexes::all_exist(db).await? {
         gate.settling.mark_indexed();
+        if !owes_any::<event::Entity>(db).await? && !owes_any::<bus_event::Entity>(db).await? {
+            gate.settling.mark_derived();
+        }
     }
     Ok(())
+}
+
+/// Whether any row of `T` owes its derivation: one seek on its `derived_version` index.
+async fn owes_any<T: EventTable>(db: &DatabaseConnection) -> Result<bool, StoreError> {
+    let owed: Option<Uuid> = T::find()
+        .select_only()
+        .column(T::EVENT_ID)
+        .filter(T::DERIVED_VERSION.lt(DERIVED_VERSION))
+        .limit(1)
+        .into_tuple()
+        .one(db)
+        .await?;
+    Ok(owed.is_some())
 }
 
 async fn is_empty<T: EventTable>(db: &DatabaseConnection) -> Result<bool, StoreError> {

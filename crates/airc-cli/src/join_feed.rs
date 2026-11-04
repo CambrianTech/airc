@@ -545,18 +545,14 @@ mod tests {
     #[tokio::test]
     async fn an_operator_stop_ends_the_wait_for_the_daemon() {
         let (dir, airc, _room) = fixture().await;
-        // The operator's stop is another process taking a blocking file lock. Taken on this
-        // test's one runtime thread, it waited on the open's custody share that the store's
-        // background task (spawned at open) could then never release: a hang on Windows CI
-        // (airc #1654). On its own thread, as the CLI's stop runs.
-        let home = dir.path().to_owned();
-        tokio::task::spawn_blocking(move || {
-            airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(&home)?
-                .record_operator_stop()
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        // Taken on this test's one runtime thread, the operator's blocking lock waited on the
+        // open's custody share that the store's background task (spawned at open) could then
+        // never release: a hang on Windows CI (airc #1654).
+        airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance_off_runtime(dir.path())
+            .await
+            .unwrap()
+            .record_operator_stop()
+            .unwrap();
         let ended = reattach(&airc, dir.path()).await.err().unwrap().to_string();
         assert!(ended.contains("stopped by the operator"), "{ended}");
     }

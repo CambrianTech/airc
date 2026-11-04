@@ -618,15 +618,9 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         .count_matching(ch, second.cursor(), second.cursor(), &filter, None)
         .await
         .unwrap();
-    assert_eq!(
-        empty,
-        airc_core::HistoryCount {
-            // Reopened with events and nothing has settled it: the background derivation
-            // (`retention::run`) is what says every kept row is derived (card 70055c76).
-            settlement: airc_core::Settlement::Unsettled,
-            ..airc_core::HistoryCount::default()
-        }
-    );
+    // Reopened with its indexes and every row derived (this binary wrote them all): settled at
+    // open, so the count is exact at once (card 70055c76).
+    assert_eq!(empty, airc_core::HistoryCount::default());
 }
 
 // what this catches: an addressee scan is answered by the indexed addressing

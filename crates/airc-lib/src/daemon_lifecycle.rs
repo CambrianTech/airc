@@ -150,6 +150,16 @@ impl DaemonLifecycleGuard {
         })
     }
 
+    /// [`Self::maintenance`] from async code, on a blocking thread: on a runtime thread the lock
+    /// waits on a store's in-flight write that the blocked thread may be the one to finish (a hang
+    /// on Windows CI, airc #1654), and it never relies on how many workers the runtime has.
+    pub async fn maintenance_off_runtime(home: &Path) -> io::Result<Self> {
+        let home = home.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::maintenance(&home))
+            .await
+            .map_err(io::Error::other)?
+    }
+
     /// Read while admission is serialized. Unreadable state never means permission
     /// to start; a stop has no expiry and survives the operator command exiting.
     pub fn operator_stopped(&self) -> io::Result<bool> {
