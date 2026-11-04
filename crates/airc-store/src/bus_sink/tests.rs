@@ -421,6 +421,7 @@ async fn persists_across_handles_on_disk() {
         db,
         readers,
         custody: _,
+        gate: _,
     } = sink;
     readers.close().await.unwrap();
     db.close().await.unwrap();

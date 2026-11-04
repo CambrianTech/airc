@@ -45,7 +45,7 @@ impl SqliteEventStore {
         pubkey_b64: String,
         added_at_ms: u64,
     ) -> Result<StoredPeer, StoreError> {
-        let _write = self.admit_write().await?;
+        // Admission is `add_peer_trust_with_tier`'s: the file's write gate is not reentrant.
         // Card 34942ec1 Sub-A: defaults to the safe-conservative
         // tier (Untrusted). Sub-B detection and explicit-enrolment
         // CLI paths land via [`set_peer_trust_tier`] in a follow-up

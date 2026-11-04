@@ -63,6 +63,11 @@ pub struct SqliteEventStore {
     /// How this store's writes are admitted ([`crate::custody`]): every write
     /// method takes a ticket for its own length.
     custody: crate::custody::WriteGate,
+    /// The file's write gate, shared by every handle on it in this process ([`crate::write_gate`]).
+    gate: std::sync::Arc<crate::write_gate::FileGate>,
+    /// Whether this handle's writes are foreground (every handle but the drain's own): the pace
+    /// steers by them.
+    foreground: bool,
 }
 
 impl SqliteEventStore {
@@ -73,6 +78,25 @@ impl SqliteEventStore {
     /// store use `"sqlite://<path>?mode=rwc"` so SQLite creates the
     /// file if missing.
     async fn open(db_url: &str, admission: crate::custody::Admission) -> Result<Self, StoreError> {
+        Self::open_gated(
+            db_url,
+            admission,
+            crate::write_gate::unshared(),
+            file_options,
+            true,
+        )
+        .await
+    }
+
+    async fn open_gated(
+        db_url: &str,
+        admission: crate::custody::Admission,
+        gate: std::sync::Arc<crate::write_gate::FileGate>,
+        options: fn(
+            sea_orm::sqlx::sqlite::SqliteConnectOptions,
+        ) -> sea_orm::sqlx::sqlite::SqliteConnectOptions,
+        foreground: bool,
+    ) -> Result<Self, StoreError> {
         let custody = crate::custody::WriteGate::new(admission)?;
         let mut opts = ConnectOptions::new(db_url.to_owned());
         // Keep timeouts predictable for tests — long enough to absorb
@@ -100,8 +124,7 @@ impl SqliteEventStore {
         //
         // Typed builder, not literal SQL — `SqliteConnectOptions`
         // is sea-orm's ORM-level connection-config surface.
-        opts.sqlx_logging(false).map_sqlx_sqlite_opts(|so| {
-            use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
+        opts.sqlx_logging(false).map_sqlx_sqlite_opts(move |so| {
             // A SECOND OPENER WAITS, IT DOES NOT FAIL (2026-09-14). Several processes
             // open one events.sqlite on a machine: the daemon, every attached scope, a
             // test's LAN-gateway handle. Opening runs migrations (DDL = a write lock);
@@ -110,9 +133,7 @@ impl SqliteEventStore {
             // attach (airc #1419/#1420; the two-pools-on-one-file flake). WAL was
             // already set; the missing piece was telling SQLite to WAIT as long as
             // the pool itself waits — one bound, one clock.
-            so.journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
+            options(so)
         });
         let write = custody.admit()?;
         let db = Database::connect(opts).await?;
@@ -120,7 +141,12 @@ impl SqliteEventStore {
         // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db).await?;
         drop(write);
-        Ok(Self { db, custody })
+        Ok(Self {
+            db,
+            custody,
+            gate,
+            foreground,
+        })
     }
 
     /// Open a file-backed SQLite store from a filesystem path.
@@ -136,7 +162,29 @@ impl SqliteEventStore {
             }
         }
         let admission = crate::custody::resolve(path)?;
-        Self::open(&sqlite_file_url(path), admission).await
+        Self::open_gated(
+            &sqlite_file_url(path),
+            admission,
+            crate::write_gate::for_path(path),
+            file_options,
+            true,
+        )
+        .await
+    }
+
+    /// A handle on the store file at `path` for its drain ([`crate::retention::run`]): the file's
+    /// shared write gate, and no automatic checkpoint ([`drain_options`]). The drain checkpoints its
+    /// own writes after each window, outside the gate, so no writer's commit pays for them.
+    pub async fn open_path_for_drain(path: &Path) -> Result<Self, StoreError> {
+        let admission = crate::custody::resolve(path)?;
+        Self::open_gated(
+            &sqlite_file_url(path),
+            admission,
+            crate::write_gate::for_path(path),
+            drain_options,
+            false,
+        )
+        .await
     }
 
     /// Open an ephemeral in-memory store. Convenience for tests.
@@ -144,17 +192,35 @@ impl SqliteEventStore {
         Self::open("sqlite::memory:", crate::custody::Admission::Unmanaged).await
     }
 
-    /// Admit one write: this process's custody for it ([`crate::custody`]),
-    /// then the database must not have been migrated past this binary since it
-    /// was opened ([`StoreError::AheadOfBinary`]). Held until the write ends.
-    pub(crate) async fn admit_write(&self) -> Result<crate::custody::WriteTicket<'_>, StoreError> {
+    /// Admit one write: the file's turn among this process's writers ([`crate::write_gate`]), then
+    /// this process's custody for it ([`crate::custody`]), then the database must not have been
+    /// migrated past this binary since it was opened ([`StoreError::AheadOfBinary`]). Held until the
+    /// write ends.
+    pub(crate) async fn admit_write(&self) -> Result<crate::write_gate::Write<'_>, StoreError> {
+        let queued = std::time::Instant::now();
+        let epoch = self.gate.epoch_now();
+        let turn = self.gate.enter().await;
+        let entered = std::time::Instant::now();
         let ticket = self.custody.admit()?;
         crate::migration::refuse_if_ahead(&self.db).await?;
-        Ok(ticket)
+        Ok(crate::write_gate::Write::new(
+            &self.gate,
+            queued,
+            entered,
+            epoch,
+            self.foreground,
+            turn,
+            ticket,
+        ))
     }
 
     /// The one ORM, for the sibling modules of this crate that run statements the
     /// entity API does not express (`retention`: windowed deletes, pragmas).
+    /// The file's write gate, shared by every handle on it in this process.
+    pub(crate) fn gate(&self) -> &crate::write_gate::FileGate {
+        &self.gate
+    }
+
     pub(crate) fn connection(&self) -> &DatabaseConnection {
         &self.db
     }
@@ -532,6 +598,35 @@ fn stored_endpoints_stamp_ms(column: Option<i64>) -> Result<u64, StoreError> {
         Some(value) => i64_to_u64("peer_trust.endpoints_advertised_at_ms", value),
         None => Ok(0),
     }
+}
+
+/// The options every writable store connection opens with, one owner for both the store and the
+/// sink. `auto_vacuum = INCREMENTAL` comes first: SQLite takes it only on a file with no tables yet
+/// and ignores it after WAL is on, so a new file is born incremental (every later drain returns
+/// its pages in bounded steps, no rebuild) while an existing file keeps its mode until
+/// `SqliteEventStore::compact` (Fable on #1653). Then WAL, `synchronous = NORMAL`, and a busy
+/// timeout that waits as long as the pool does.
+pub(crate) fn file_options(
+    so: sea_orm::sqlx::sqlite::SqliteConnectOptions,
+) -> sea_orm::sqlx::sqlite::SqliteConnectOptions {
+    use sea_orm::sqlx::sqlite::{SqliteAutoVacuum, SqliteJournalMode, SqliteSynchronous};
+    so.auto_vacuum(SqliteAutoVacuum::Incremental)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(POOL_ACQUIRE_TIMEOUT)
+}
+
+/// The drain's connection ([`SqliteEventStore::open_path_for_drain`]): [`file_options`] with no
+/// automatic checkpoint. The committing connection runs SQLite's automatic checkpoint, so inside the
+/// write gate every commit used to copy the drain's newly written frames back into the database.
+/// On 2026-11-04, on a 982 MB resident store copy, 27,412 windows held the gate 280.8 s, 239.4 s of
+/// it in commit, and an append beside the drain paid p50 41 ms against 1.8 ms with no drain. With
+/// this off, the drain checkpoints PASSIVE after each window, outside the gate, and a writer's own
+/// automatic checkpoint finds only its own frames.
+pub(crate) fn drain_options(
+    so: sea_orm::sqlx::sqlite::SqliteConnectOptions,
+) -> sea_orm::sqlx::sqlite::SqliteConnectOptions {
+    file_options(so).pragma("wal_autocheckpoint", "0")
 }
 
 pub(crate) fn sqlite_file_url(path: &Path) -> String {

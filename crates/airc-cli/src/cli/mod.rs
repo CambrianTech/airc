@@ -537,6 +537,16 @@ pub enum Command {
         adopt_installed: bool,
     },
 
+    /// Give an event store file's freelist back to the filesystem: the one full rebuild a legacy
+    /// `auto_vacuum=0` file needs, which also makes it incremental so every later drain returns
+    /// pages in short steps. It holds every write for the whole rebuild, so run it where nothing
+    /// writes the file: continuum calls it for its residents' stores in its deploy window, while
+    /// serving is down. An incremental file is left as it is. Prints the footprint before and after.
+    StoreCompact {
+        /// The `events.sqlite` to compact.
+        path: PathBuf,
+    },
+
     /// Self-diagnose the airc install + scope state.
     ///
     /// Walks the install/identity/daemon/route checklist that

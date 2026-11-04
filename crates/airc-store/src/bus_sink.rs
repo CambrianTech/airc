@@ -55,6 +55,8 @@ pub struct SqliteDurableSink {
     readers: DatabaseConnection,
     /// How this sink's writes are admitted ([`crate::custody`]).
     custody: crate::custody::WriteGate,
+    /// The file's write gate, shared by every handle on it in this process ([`crate::write_gate`]).
+    gate: std::sync::Arc<crate::write_gate::FileGate>,
 }
 
 impl SqliteDurableSink {
@@ -75,6 +77,14 @@ impl SqliteDurableSink {
         db_url: &str,
         admission: crate::custody::Admission,
     ) -> Result<Self, BusError> {
+        Self::open_gated(db_url, admission, crate::write_gate::unshared()).await
+    }
+
+    async fn open_gated(
+        db_url: &str,
+        admission: crate::custody::Admission,
+        gate: std::sync::Arc<crate::write_gate::FileGate>,
+    ) -> Result<Self, BusError> {
         let custody = crate::custody::WriteGate::new(admission).map_err(BusError::sink_source)?;
         let mut opts = Self::pool_options(db_url);
         // WAL + the busy timeout ride the connection options so the journal switch
@@ -83,12 +93,7 @@ impl SqliteDurableSink {
         // Windows CI). The driver applies them to every connection it opens, an
         // old DB's included (§3.3: WAL lets deep-replay reads run beside the one
         // writer; `synchronous=NORMAL` fsyncs per checkpoint, not per commit).
-        opts.map_sqlx_sqlite_opts(|so| {
-            use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
-            so.journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
-        });
+        opts.map_sqlx_sqlite_opts(crate::sqlite::file_options);
         let write = custody.admit().map_err(BusError::sink_source)?;
         let db = Database::connect(opts)
             .await
@@ -131,13 +136,10 @@ impl SqliteDurableSink {
         let readers = if share_pool {
             db.clone()
         } else {
-            // Preserve the exact filename/VFS/cache options of the opened
-            // writer. Only reads use this pool; migrations run once above.
-            let read_options = sqlite_options
-                .as_ref()
-                .clone()
-                .read_only(true)
-                .create_if_missing(false);
+            // The writer's FILE, not its pragmas: `auto_vacuum` (`sqlite::file_options`) is a
+            // write a read-only connection refuses. Only reads use this pool; migrations run once
+            // above.
+            let read_options = read_only_options(sqlite_options.get_filename());
             let mut opts = Self::pool_options(db_url);
             opts.map_sqlx_sqlite_opts(move |_| read_options.clone());
             Database::connect(opts)
@@ -149,17 +151,24 @@ impl SqliteDurableSink {
             db,
             readers,
             custody,
+            gate,
         })
     }
 
-    /// Admit one write: custody, then no migration past this binary since
-    /// open ([`crate::SqliteEventStore::admit_write`] is the same rule).
-    async fn admit_write(&self) -> Result<crate::custody::WriteTicket<'_>, BusError> {
+    /// Admit one write: the file's turn ([`crate::write_gate`]), custody, then no migration past
+    /// this binary since open ([`crate::SqliteEventStore::admit_write`] is the same rule).
+    async fn admit_write(&self) -> Result<crate::write_gate::Write<'_>, BusError> {
+        let queued = std::time::Instant::now();
+        let epoch = self.gate.epoch_now();
+        let turn = self.gate.enter().await;
+        let entered = std::time::Instant::now();
         let ticket = self.custody.admit().map_err(BusError::sink_source)?;
         crate::migration::refuse_if_ahead(&self.db)
             .await
             .map_err(BusError::sink_source)?;
-        Ok(ticket)
+        Ok(crate::write_gate::Write::new(
+            &self.gate, queued, entered, epoch, true, turn, ticket,
+        ))
     }
 
     /// Open a file-backed durable tier from a filesystem path. Keeps
@@ -171,7 +180,12 @@ impl SqliteDurableSink {
             }
         }
         let admission = crate::custody::resolve(path).map_err(BusError::sink_source)?;
-        Self::open(&sqlite_file_url(path), admission).await
+        Self::open_gated(
+            &sqlite_file_url(path),
+            admission,
+            crate::write_gate::for_path(path),
+        )
+        .await
     }
 
     /// Inspect an existing owner store without creating it, migrating it, or
@@ -183,13 +197,7 @@ impl SqliteDurableSink {
         opts.sqlx_logging(false);
         // Supply the native filename through the typed driver, not a URI: `?`
         // and `#` in a path must not become connection parameters.
-        opts.map_sqlx_sqlite_opts(move |_| {
-            sea_orm::sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&path)
-                .read_only(true)
-                .create_if_missing(false)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
-        });
+        opts.map_sqlx_sqlite_opts(move |_| read_only_options(&path));
         let db = Database::connect(opts)
             .await
             .map_err(BusError::sink_source)?;
@@ -199,6 +207,7 @@ impl SqliteDurableSink {
             db,
             custody: crate::custody::WriteGate::new(crate::custody::Admission::Unmanaged)
                 .map_err(BusError::sink_source)?,
+            gate: crate::write_gate::unshared(),
         })
     }
 
@@ -629,6 +638,17 @@ fn page_rows(
         .order_by(bus_event::Column::EventId, order)
         .limit(limit);
     crate::event_table::addressee_branches(query, rule.addressed_to)
+}
+
+/// A read-only connection to the store file at `path`: the typed filename (`?` and `#` in a path
+/// never become connection parameters), never created, waiting as long as the pool does, and no
+/// pragma that writes. The one shape for the sink's reader pool and `open_read_only_path`.
+fn read_only_options(path: &Path) -> sea_orm::sqlx::sqlite::SqliteConnectOptions {
+    sea_orm::sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false)
+        .busy_timeout(POOL_ACQUIRE_TIMEOUT)
 }
 
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],

@@ -22,7 +22,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn append(&self, ev: TranscriptEvent) -> Result<(), StoreError> {
-        let _write = self.admit_write().await?;
+        let mut write = self.admit_write().await?;
         let active = to_active_model(&ev)?;
         // Card 127816bd Phase 1.C — eliminate the post-insert SELECT.
         //
@@ -64,7 +64,9 @@ impl EventStore for SqliteEventStore {
             [(ev.event_id.as_uuid(), &ev.headers)],
         )
         .await?;
+        write.committing();
         txn.commit().await?;
+        drop(write);
         Ok(())
     }
 

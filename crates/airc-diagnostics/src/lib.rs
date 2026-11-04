@@ -48,6 +48,9 @@ pub enum DiagnosticCode {
     IpcAcceptFailed,
     /// Startup descriptor capacity, including restricted hard limits.
     DaemonFileCapacity,
+    /// A legacy `auto_vacuum=0` event store rebuilt once, before the daemon served it: the
+    /// file's size before and after and how long the rebuild held it.
+    StoreCompacted,
     FrameVerificationFailed,
     StoreAppendFailed,
     /// The owner writer retains this batch and retries; its durable ring

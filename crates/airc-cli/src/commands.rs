@@ -1947,6 +1947,7 @@ pub async fn run_daemon(
     // bridge's unknown-channel heal reads the account-registry CACHE
     // (a concrete SqliteAccountRegistryStore over this same file).
     let machine_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    airc_daemon::store_compaction::before_serving(&machine_store).await;
     let coordinator_store: Arc<dyn EventStore> = machine_store.clone();
     let state = Arc::new(
         DaemonState::build(
@@ -2091,20 +2092,17 @@ pub async fn run_daemon(
                 .await;
         })
     };
-    // The drain (card 6781d7e9): the daemon that writes events.sqlite is the one
-    // that keeps it bounded — 2.65 GB of heartbeat rows and paging frames is what
-    // slowed this daemon past the core's patience on 2026-09-26. Same lifecycle
-    // as the auto-update loop; the full vacuum shares its quiet-mesh gate.
-    let store_retention_task = {
-        let daemon_state = state.clone();
-        let store = machine_store.clone();
-        tokio::spawn(async move {
-            airc_daemon::store_retention::run(&daemon_state.shutdown, store, || {
-                mesh_quiet_now(&daemon_state)
-            })
-            .await;
-        })
-    };
+    // The store's one drain (airc_store::retention::run), as every store runs it: here
+    // on the daemon's lifecycle, every pass on stderr (the daemon's log sink).
+    {
+        let shutdown_state = state.clone();
+        airc_store::retention::run::spawn(
+            &machine_store,
+            &db_path,
+            async move { shutdown_state.shutdown.notified().await },
+            |pass| eprintln!("airc store retention: {pass}"),
+        );
+    }
 
     // KEYSTONE (card a134b370-10b1-49c6-aa42-e1a05446e887): spawn the
     // account-registry publish/refresh loop alongside the IPC accept
@@ -2369,7 +2367,6 @@ pub async fn run_daemon(
     // abort is the same listener-error backstop. (The detached updater it may
     // have spawned is independent and intentionally outlives this process.)
     auto_update_task.abort();
-    store_retention_task.abort();
     // Server returned ⇒ shutdown fired ⇒ the registry loop's shutdown
     // waiter was woken by the same `notify_waiters()`. Await its clean
     // exit so the process doesn't drop an in-flight gist write
