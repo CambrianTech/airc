@@ -6,35 +6,44 @@
 
 use airc_core::{HistoryMatch, RoomId, TranscriptCursor};
 use sea_orm::{
-    sea_query::Expr, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Select,
+    sea_query::{Expr, SimpleExpr},
+    ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select,
 };
 
 use crate::entities::event;
 
-/// Events of `channels` strictly after `cursor` and at or before `through`, in transcript order
-/// (lamport, then event id as the deterministic tiebreak): the one range every history read,
-/// count and derivation scopes to.
+/// Events strictly after `c` in transcript order (lamport, then event id as the deterministic
+/// tiebreak).
+pub(crate) fn after(c: &TranscriptCursor) -> SimpleExpr {
+    let lamport = c.lamport as i64;
+    Expr::col(event::Column::Lamport)
+        .gt(lamport)
+        .or(Expr::col(event::Column::Lamport)
+            .eq(lamport)
+            .and(Expr::col(event::Column::EventId).gt(c.event_id.as_uuid())))
+}
+
+/// Events strictly before `c` in transcript order.
+pub(crate) fn before(c: &TranscriptCursor) -> SimpleExpr {
+    let lamport = c.lamport as i64;
+    Expr::col(event::Column::Lamport)
+        .lt(lamport)
+        .or(Expr::col(event::Column::Lamport)
+            .eq(lamport)
+            .and(Expr::col(event::Column::EventId).lt(c.event_id.as_uuid())))
+}
+
+/// Events of `channels` strictly after `cursor` and at or before `through`: the one range every
+/// history read, count and derivation scopes to.
 pub(crate) fn in_range(
     cursor: &TranscriptCursor,
     through: &TranscriptCursor,
     channels: &[RoomId],
 ) -> Condition {
-    let lamport = |c: &TranscriptCursor| c.lamport as i64;
-    let after = Expr::col(event::Column::Lamport)
-        .gt(lamport(cursor))
-        .or(Expr::col(event::Column::Lamport)
-            .eq(lamport(cursor))
-            .and(Expr::col(event::Column::EventId).gt(cursor.event_id.as_uuid())));
-    let until = Expr::col(event::Column::Lamport)
-        .lt(lamport(through))
-        .or(Expr::col(event::Column::Lamport)
-            .eq(lamport(through))
-            .and(Expr::col(event::Column::EventId).lte(through.event_id.as_uuid())));
     Condition::all()
         .add(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
-        .add(after)
-        .add(until)
+        .add(after(cursor))
+        .add(after(through).not())
 }
 
 /// Events of `channels` in `(cursor, through]` matching `rule`, the first

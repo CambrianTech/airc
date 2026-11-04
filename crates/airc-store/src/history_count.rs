@@ -7,7 +7,7 @@
 //! body is read or allocated.
 
 use async_trait::async_trait;
-use sea_orm::{EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 
 use airc_core::{HeaderFilter, HistoryCount, RoomId, RuntimeSelf, TranscriptCursor};
 
@@ -54,6 +54,11 @@ impl CountHistory for SqliteEventStore {
         let mut query = event::Entity::find()
             .filter(range)
             .filter(crate::header_query::predicate::<event::Entity>(headers));
+        if owed {
+            // An owed row has no header rows yet, so a negated filter would count it falsely:
+            // counting derived rows only keeps the count a lower bound.
+            query = query.filter(event::Column::DerivedVersion.eq(crate::derive::DERIVED_VERSION));
+        }
         if let Some(rule) = exclude {
             query = query.filter(crate::header_query::not_runtime_self::<event::Entity>(rule));
         }

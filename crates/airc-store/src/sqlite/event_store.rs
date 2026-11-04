@@ -98,25 +98,45 @@ impl EventStore for SqliteEventStore {
         limit: usize,
         tail: bool,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        // A predicate on derived data derives its own range's owed rows first, so the page is
-        // exact; a plain page derives nothing (crate::derive).
-        if crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
-            crate::derive::derive_owed::<event::Entity, _, StoreError, _, _>(
-                &self.db,
-                crate::event_query::in_range(cursor, through, channels),
-                || self.admit_write(),
-                std::convert::identity,
+        let read = || async {
+            let mut branches = Vec::new();
+            for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail)
+            {
+                branches.push(query.all(&self.db).await?);
+            }
+            crate::event_table::merge_branches(
+                branches,
+                |row| (row.lamport, row.event_id),
+                limit,
+                tail,
             )
-            .await?;
-        }
-        let mut branches = Vec::new();
-        for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail) {
-            branches.push(query.all(&self.db).await?);
-        }
-        crate::event_table::merge_branches(branches, |row| (row.lamport, row.event_id), limit, tail)
             .into_iter()
             .map(from_model)
-            .collect()
+            .collect::<Result<Vec<_>, StoreError>>()
+        };
+        // A predicate on derived data first derives the owed rows that could belong to its page,
+        // nearest first; a plain page derives nothing (crate::derive).
+        if !crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
+            return read().await;
+        }
+        crate::derive::settle_page::<event::Entity, _, _, StoreError, _, _, _, _>(
+            &self.db,
+            crate::event_query::in_range(cursor, through, channels),
+            tail,
+            limit,
+            || self.admit_write(),
+            std::convert::identity,
+            read,
+            |far: &TranscriptEvent| {
+                let far = far.cursor();
+                if tail {
+                    crate::event_query::before(&far).not()
+                } else {
+                    crate::event_query::after(&far).not()
+                }
+            },
+        )
+        .await
     }
 
     async fn resume_from(

@@ -296,35 +296,48 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
-        // A predicate on derived data derives its own range's owed rows first, so the page is
-        // exact; a plain page derives nothing (crate::derive).
-        if crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
-            crate::derive::derive_owed::<bus_event::Entity, _, BusError, _, _>(
-                &self.db,
-                in_range(channel, after, through),
-                || self.admit_write(),
-                BusError::sink_source,
+        let read = || async {
+            let mut branches = Vec::new();
+            for query in page_rows(channel, after, through, rule, bounded, tail) {
+                branches.push(
+                    query
+                        .all(&self.readers)
+                        .await
+                        .map_err(BusError::sink_source)?,
+                );
+            }
+            crate::event_table::merge_branches(
+                branches,
+                |row| (row.epoch, row.counter, row.event_id),
+                limit,
+                tail,
             )
-            .await?;
+            .into_iter()
+            .map(from_model)
+            .collect::<Result<Vec<_>, BusError>>()
+        };
+        // A predicate on derived data first derives the owed rows that could belong to its page,
+        // nearest first; a plain page derives nothing (crate::derive).
+        if !crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
+            return read().await;
         }
-        let mut branches = Vec::new();
-        for query in page_rows(channel, after, through, rule, bounded, tail) {
-            branches.push(
-                query
-                    .all(&self.readers)
-                    .await
-                    .map_err(BusError::sink_source)?,
-            );
-        }
-        crate::event_table::merge_branches(
-            branches,
-            |row| (row.epoch, row.counter, row.event_id),
-            limit,
+        crate::derive::settle_page::<bus_event::Entity, _, _, BusError, _, _, _, _>(
+            &self.db,
+            in_range(channel, after, through),
             tail,
+            limit,
+            || self.admit_write(),
+            BusError::sink_source,
+            read,
+            |far: &Envelope| {
+                if tail {
+                    strictly_before(far.cursor()).not()
+                } else {
+                    strictly_after(far.cursor()).not()
+                }
+            },
         )
-        .into_iter()
-        .map(from_model)
-        .collect()
+        .await
     }
 
     async fn count_matching(
@@ -345,6 +358,12 @@ impl DurableSink for SqliteDurableSink {
             .await
             .map_err(BusError::sink_source)?;
         let mut rows = matching_rows(channel, after, through, headers);
+        if owed {
+            // An owed row has no header rows yet, so a negated filter would count it falsely:
+            // counting derived rows only keeps the count a lower bound.
+            rows =
+                rows.filter(bus_event::Column::DerivedVersion.eq(crate::derive::DERIVED_VERSION));
+        }
         if let Some(rule) = exclude {
             rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
                 rule,
@@ -596,18 +615,24 @@ fn from_model(m: bus_event::Model) -> Result<Envelope, BusError> {
 /// The durable rows of `channel` in `(after, through]`: one owner for the range `page_matching`
 /// pages, `count_matching` counts and a derivation of either scopes to.
 fn in_range(channel: RoomId, after: Cursor, through: Cursor) -> sea_orm::Condition {
-    // Strictly after the cursor in generational order:
-    //   epoch > c.epoch
-    //   OR (epoch == c.epoch AND counter > c.counter)
-    //   OR (epoch == c.epoch AND counter == c.counter
-    //       AND event_id > c.event_id).
-    // event_id is the deterministic tiebreaker (§3.5); within one
-    // epoch the monotonic counter forbids a tie, but the tiebreak
-    // keeps the order total independent of how `seq` was produced.
-    let epoch = after.seq.epoch as i64;
-    let counter = after.seq.counter as i64;
-    let event_id = after.event_id.as_uuid();
-    let strictly_after = Expr::col(bus_event::Column::Epoch)
+    sea_orm::Condition::all()
+        .add(bus_event::Column::RoomId.eq(channel.as_uuid()))
+        .add(strictly_after(after))
+        .add(strictly_after(through).not())
+        .add(bus_event::Column::Delivery.eq("durable"))
+}
+
+/// Strictly after `c` in generational order:
+///   epoch > c.epoch
+///   OR (epoch == c.epoch AND counter > c.counter)
+///   OR (epoch == c.epoch AND counter == c.counter AND event_id > c.event_id).
+/// event_id is the deterministic tiebreaker (§3.5); within one epoch the monotonic counter
+/// forbids a tie, but the tiebreak keeps the order total independent of how `seq` was produced.
+fn strictly_after(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
+    let epoch = c.seq.epoch as i64;
+    let counter = c.seq.counter as i64;
+    let event_id = c.event_id.as_uuid();
+    Expr::col(bus_event::Column::Epoch)
         .gt(epoch)
         .or(Expr::col(bus_event::Column::Epoch)
             .eq(epoch)
@@ -615,15 +640,7 @@ fn in_range(channel: RoomId, after: Cursor, through: Cursor) -> sea_orm::Conditi
         .or(Expr::col(bus_event::Column::Epoch)
             .eq(epoch)
             .and(Expr::col(bus_event::Column::Counter).eq(counter))
-            .and(Expr::col(bus_event::Column::EventId).gt(event_id)));
-    sea_orm::Condition::all()
-        .add(bus_event::Column::RoomId.eq(channel.as_uuid()))
-        .add(strictly_after)
-        .add(
-            strictly_before(through)
-                .or(Expr::col(bus_event::Column::EventId).eq(through.event_id.as_uuid())),
-        )
-        .add(bus_event::Column::Delivery.eq("durable"))
+            .and(Expr::col(bus_event::Column::EventId).gt(event_id)))
 }
 
 /// [`in_range`]'s rows whose headers match.

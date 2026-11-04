@@ -12,11 +12,13 @@
 //!
 //! Nothing derives at open (card 70055c76: open did the whole table, 23.4 s on a
 //! 1.56 GB store). Who derives, and only what they reach:
-//! - a read whose predicate reads derived data ([`reads_derived`]) derives the
-//!   owed rows of its own range first ([`derive_owed`]), so its answer is exact;
-//!   a read that does not (the plain newest page) derives nothing;
-//! - a count derives nothing: owed rows in its range make it a lower bound
-//!   (`HistoryCount::more`, [`owes`]);
+//! - a read whose predicate reads derived data ([`reads_derived`]) derives only
+//!   the owed rows that could still belong to its page, nearest first, batch by
+//!   batch until the page is settled ([`settle_page`]); a rare filter derives back
+//!   only as far as its page needs. A read that reads no derived data (the plain
+//!   newest page) derives nothing;
+//! - a count derives nothing: it counts derived rows only, and owed rows in its
+//!   range make it a lower bound (`HistoryCount::more`, [`owes`]);
 //! - the store's background pass derives every owed row after its drain, when
 //!   the table is small (`crate::retention::run::pass`).
 
@@ -24,10 +26,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use airc_core::HeaderFilter;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
-    TransactionTrait,
+    ColumnTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder,
+    QuerySelect, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -85,12 +87,58 @@ where
     let mut derived = 0;
     loop {
         let write = admit().await?;
-        let count = derive_batch::<T>(db, scope.clone()).await.map_err(lift)?;
+        let count = derive_batch::<T>(db, scope.clone(), Order::Desc)
+            .await
+            .map_err(lift)?;
         drop(write);
         if count == 0 {
             return Ok(derived);
         }
         derived += count;
+        fault::hit(Fault::AfterDerivedBatch).map_err(|e| lift(e.into()))?;
+    }
+}
+
+/// A page on derived data, made exact. Run `page` (rows in cursor order); while an owed row of
+/// `T` could still belong to it, derive one batch of those, nearest the read's near end first,
+/// and run it again. An owed row could belong when the page is short (anywhere in `range`), or
+/// lies between the page's far-end row and the range's near end (`reaches(far_end)`, inclusive:
+/// an owed row in the page could be a false match). A tail read's near end is the newest.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn settle_page<T, Row, G, E, Admit, Admitted, Page, Paged>(
+    db: &DatabaseConnection,
+    range: Condition,
+    tail: bool,
+    limit: usize,
+    admit: Admit,
+    lift: fn(StoreError) -> E,
+    page: Page,
+    reaches: impl Fn(&Row) -> SimpleExpr,
+) -> Result<Vec<Row>, E>
+where
+    T: EventTable,
+    <T::Headers as EntityTrait>::ActiveModel: Send,
+    Admit: Fn() -> Admitted,
+    Admitted: Future<Output = Result<G, E>>,
+    Page: Fn() -> Paged,
+    Paged: Future<Output = Result<Vec<Row>, E>>,
+{
+    let near_first = if tail { Order::Desc } else { Order::Asc };
+    loop {
+        let rows = page().await?;
+        let far_end = if tail { rows.first() } else { rows.last() };
+        let unsettled = match far_end {
+            Some(row) if rows.len() >= limit => range.clone().add(reaches(row)),
+            _ => range.clone(),
+        };
+        if !owes::<T>(db, unsettled.clone()).await.map_err(lift)? {
+            return Ok(rows);
+        }
+        let write = admit().await?;
+        derive_batch::<T>(db, unsettled, near_first.clone())
+            .await
+            .map_err(lift)?;
+        drop(write);
         fault::hit(Fault::AfterDerivedBatch).map_err(|e| lift(e.into()))?;
     }
 }
@@ -136,16 +184,21 @@ impl Grouped {
     }
 }
 
-/// Derive up to [`BATCH`] owed rows of `T` within `scope`, in one transaction;
-/// how many there were.
+/// Derive up to [`BATCH`] owed rows of `T` within `scope`, the first in `order` (cursor order),
+/// in one transaction; how many there were.
 async fn derive_batch<T: EventTable>(
     db: &DatabaseConnection,
     scope: Condition,
+    order: Order,
 ) -> Result<usize, StoreError>
 where
     <T::Headers as EntityTrait>::ActiveModel: Send,
 {
-    let rows: Vec<(Uuid, serde_json::Value, T::Content, serde_json::Value)> = T::find()
+    let mut owed = T::find();
+    for column in T::ORDER {
+        owed = owed.order_by(*column, order.clone());
+    }
+    let rows: Vec<(Uuid, serde_json::Value, T::Content, serde_json::Value)> = owed
         .select_only()
         .column(T::EVENT_ID)
         .column(T::TARGET)
@@ -499,5 +552,68 @@ mod tests {
         );
         assert_eq!(event_header::Entity::find().count(db).await.unwrap(), 1);
         assert_eq!(bus_event_header::Entity::find().count(db).await.unwrap(), 1);
+    }
+    // what this catches (Fable on #1654): a filtered newest page on a store full of owed rows
+    // derived its whole range, up to 2.2M rows the drain was about to delete, before answering.
+    // Matches only among the newest few: the page is exact after about one batch, and a count
+    // meanwhile counts derived rows only (a negated filter never counts an owed row).
+    #[tokio::test]
+    async fn a_filtered_newest_page_derives_only_back_to_its_page() {
+        use crate::{CountHistory, EventStore};
+        use airc_core::{HeaderFilter, HistoryMatch, RoomId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sqlite");
+        let owed = 5000u128;
+        let db = connect(&path).await;
+        Migrator::up(&db, Some(BEFORE_DERIVED)).await.unwrap();
+        let rows: Vec<_> = (1..=owed)
+            .map(|n| {
+                let mut row = old_row(n, MentionTarget::All, "plain");
+                let headers = if n > owed - 3 {
+                    serde_json::json!({ "k": "v" })
+                } else {
+                    serde_json::json!({ "other": "v" })
+                };
+                row.headers = Set(headers);
+                row
+            })
+            .collect();
+        for chunk in rows.chunks(500) {
+            event::Entity::insert_many(chunk.to_vec())
+                .exec(&db)
+                .await
+                .unwrap();
+        }
+        drop(db);
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        let db = store.connection();
+        let room = RoomId::from_u128(7);
+        let keyed = HeaderFilter::Has { key: "k".into() };
+        let page = store
+            .matching_history(
+                &origin(),
+                &newest(),
+                &[room],
+                HistoryMatch::headers(&keyed),
+                3,
+                true,
+            )
+            .await
+            .unwrap();
+        let lamports: Vec<u64> = page.iter().map(|e| e.lamport).collect();
+        assert_eq!(lamports, [4998, 4999, 5000]);
+        assert_eq!(
+            not_current(db).await,
+            (owed as u64) - BATCH,
+            "one batch derived, nearest first, not the whole range"
+        );
+        let unkeyed = HeaderFilter::Not(Box::new(keyed.clone()));
+        let count = store
+            .count_history(&origin(), &newest(), &[room], &unkeyed, None)
+            .await
+            .unwrap();
+        assert!(count.more, "owed rows remain: a lower bound");
+        assert_eq!(count.count, BATCH - 3, "derived rows only");
     }
 }
