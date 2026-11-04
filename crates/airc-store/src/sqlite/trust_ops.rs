@@ -7,36 +7,17 @@ impl SqliteEventStore {
             .order_by_asc(peer_trust::Column::PeerId)
             .all(&self.db)
             .await?;
-        rows.into_iter()
-            .map(|row| {
-                // Card 34942ec1 Sub-A: parse the stored tier wire
-                // string into TrustTier. An unknown string surfaces
-                // honestly via InvalidStoredValue so a forwards-
-                // version-skew bug doesn't silently downgrade trust
-                // (a newer binary writing "own_account" being read
-                // by an older binary that doesn't know that variant
-                // is a real condition we'd want to see).
-                let tier = TrustTier::from_wire_str(&row.tier).ok_or_else(|| {
-                    StoreError::InvalidStoredEnumString {
-                        column: "peer_trust.tier",
-                        value: row.tier.clone(),
-                    }
-                })?;
-                let added_at_ms = i64_to_u64("peer_trust.added_at_ms", row.added_at_ms)?;
-                Ok(StoredPeer {
-                    peer_id: PeerId::from_uuid(row.peer_id),
-                    pubkey_b64: row.pubkey_b64,
-                    added_at_ms,
-                    tier,
-                    endpoints_json: row.endpoints_json,
-                    last_seen_ms: stored_last_seen_ms(row.last_seen_ms, added_at_ms)?,
-                    endpoints_peer_id: row.endpoints_peer_id.map(PeerId::from_uuid),
-                    endpoints_advertised_at_ms: stored_endpoints_stamp_ms(
-                        row.endpoints_advertised_at_ms,
-                    )?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(stored_peer).collect()
+    }
+
+    /// One peer's trust row by its id (the primary key): an index seek, not a load of every
+    /// peer. `None` when the peer is not enrolled.
+    pub async fn peer_trust(&self, peer_id: PeerId) -> Result<Option<StoredPeer>, StoreError> {
+        peer_trust::Entity::find_by_id(peer_id.as_uuid())
+            .one(&self.db)
+            .await?
+            .map(stored_peer)
+            .transpose()
     }
 
     pub async fn add_peer_trust(
@@ -490,4 +471,31 @@ impl SqliteEventStore {
             })
             .collect()
     }
+}
+
+/// A stored trust row as the typed peer it records.
+fn stored_peer(row: peer_trust::Model) -> Result<StoredPeer, StoreError> {
+    // Card 34942ec1 Sub-A: parse the stored tier wire
+    // string into TrustTier. An unknown string surfaces
+    // honestly via InvalidStoredValue so a forwards-
+    // version-skew bug doesn't silently downgrade trust
+    // (a newer binary writing "own_account" being read
+    // by an older binary that doesn't know that variant
+    // is a real condition we'd want to see).
+    let tier =
+        TrustTier::from_wire_str(&row.tier).ok_or_else(|| StoreError::InvalidStoredEnumString {
+            column: "peer_trust.tier",
+            value: row.tier.clone(),
+        })?;
+    let added_at_ms = i64_to_u64("peer_trust.added_at_ms", row.added_at_ms)?;
+    Ok(StoredPeer {
+        peer_id: PeerId::from_uuid(row.peer_id),
+        pubkey_b64: row.pubkey_b64,
+        added_at_ms,
+        tier,
+        endpoints_json: row.endpoints_json,
+        last_seen_ms: stored_last_seen_ms(row.last_seen_ms, added_at_ms)?,
+        endpoints_peer_id: row.endpoints_peer_id.map(PeerId::from_uuid),
+        endpoints_advertised_at_ms: stored_endpoints_stamp_ms(row.endpoints_advertised_at_ms)?,
+    })
 }

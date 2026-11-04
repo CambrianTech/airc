@@ -51,6 +51,9 @@ pub struct DaemonState {
     /// beacons (presence), mesh identity. The durable *event* transcript
     /// is the router's sink, not this store.
     pub coordinator_store: Arc<dyn EventStore>,
+    /// The one handle addressed admission reads durable trust through, opened at start on
+    /// `home`'s store: a per-frame open was ~24 SQLite connections a second (card 0dc9af03).
+    pub(crate) trust: airc_trust::TrustStore,
     /// Trust roots already watched by this daemon (cross-machine peer
     /// trust; same-machine publishers are in-process trusted).
     pub trusted_roots: Mutex<HashMap<PathBuf, ()>>,
@@ -142,6 +145,9 @@ impl DaemonState {
         #[cfg(unix)]
         crate::file_capacity::prepare();
         let sink = Arc::new(SqliteDurableSink::open_path(db_path).await?);
+        let trust = airc_trust::TrustStore::open(&home)
+            .await
+            .map_err(|error| BusError::SinkSource(Box::new(error)))?;
         let epoch_store = sink.bump_epoch().await?;
         let seq = Arc::new(SeqSource::start(&epoch_store));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -169,6 +175,7 @@ impl DaemonState {
             started_at: Instant::now(),
             router,
             coordinator_store,
+            trust,
             trusted_roots: Mutex::new(HashMap::new()),
             shutdown: Arc::new(Notify::new()),
             runtime,

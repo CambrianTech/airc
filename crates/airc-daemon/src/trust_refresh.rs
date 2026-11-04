@@ -60,11 +60,11 @@ impl std::error::Error for TrustRefreshError {
 /// An IPC caller may name an expected key, but cannot install it.
 pub async fn refresh_peer(
     registry: &PeerKeyRegistry,
-    root: &Path,
+    trust: &airc_trust::TrustStore,
     peer_id: airc_core::PeerId,
     expected: Option<[u8; 32]>,
 ) -> Result<(), TrustRefreshError> {
-    let key = durable_peer_key(root, peer_id).await?;
+    let key = durable_peer_key(trust, peer_id).await?;
     if expected.is_some_and(|expected| expected != key) {
         return Err(TrustRefreshError::KeyMismatch(peer_id));
     }
@@ -74,13 +74,12 @@ pub async fn refresh_peer(
 }
 
 async fn durable_peer_key(
-    root: &Path,
+    trust: &airc_trust::TrustStore,
     peer_id: airc_core::PeerId,
 ) -> Result<[u8; 32], TrustRefreshError> {
-    let peer = airc_trust::load(root)
+    let peer = trust
+        .peer(peer_id)
         .await?
-        .into_iter()
-        .find(|peer| peer.peer_id == peer_id)
         .ok_or(TrustRefreshError::UnknownPeer(peer_id))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(peer.pubkey_b64.as_bytes())
@@ -91,15 +90,16 @@ async fn durable_peer_key(
     Ok(key)
 }
 
-/// Admission uses its own durable snapshot, never the shared transport cache.
+/// Admission reads durable trust through the daemon's one held handle (`DaemonState::trust`),
+/// never the shared transport cache.
 /// Durable trust currently represents only key generation zero.
 pub async fn admission_registry(
-    root: &Path,
+    trust: &airc_trust::TrustStore,
     peer_id: airc_core::PeerId,
 ) -> Result<PeerKeyRegistry, TrustRefreshError> {
     let registry = PeerKeyRegistry::new();
     registry
-        .enrol(peer_id, 0, durable_peer_key(root, peer_id).await?)
+        .enrol(peer_id, 0, durable_peer_key(trust, peer_id).await?)
         .map_err(TrustRefreshError::InvalidPubkey)?;
     Ok(registry)
 }
