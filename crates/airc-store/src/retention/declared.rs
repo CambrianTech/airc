@@ -140,7 +140,8 @@ impl SqliteEventStore {
             drop(write);
             let held = started.elapsed();
             stats.add(headers_done, events_done - headers_done, held - events_done);
-            window.after(held);
+            // Sized by the deletes' work, never the commit's fixed sync (see [`super::Window`]).
+            window.after(events_done);
             match self.checkpoint_after_window(held).await? {
                 Checkpointed::Copied(took) => stats.checkpoint += took,
                 Checkpointed::Pinned(_) => {
