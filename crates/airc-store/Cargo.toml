@@ -39,7 +39,7 @@ sea-orm-migration = { version = "1", default-features = false, features = [
     "sqlx-sqlite",
     "runtime-tokio-rustls",
 ] }
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 
 [features]
 # Lets a test binary open file stores without installing a write

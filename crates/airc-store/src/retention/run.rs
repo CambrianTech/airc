@@ -55,13 +55,25 @@ impl std::fmt::Display for PassReport {
         match &self.drain {
             Ok(report) => write!(
                 f,
-                "drained {} declared, {} heartbeat and {} non-durable rows; file {} MB before",
+                "drained {} declared rows in {} windows (gate held {} ms in all, {} ms at most), {} \
+                 heartbeat and {} non-durable rows; file {} MB before",
                 report.declared_rows,
+                report.declared_windows.windows,
+                report.declared_windows.held.as_millis(),
+                report.declared_windows.max_held.as_millis(),
                 report.heartbeat_rows,
                 report.non_durable_rows,
                 mb(report.before.file_bytes),
             )?,
             Err(error) => write!(f, "drain failed: {error}")?,
+        }
+        if let Ok(report) = &self.drain {
+            if report.declared_windows.stopped_pinned {
+                write!(
+                    f,
+                    "; stopped early: a reader holds the WAL, the next pass resumes"
+                )?;
+            }
         }
         match &self.reclaim {
             Some(Ok(after)) => write!(
@@ -164,7 +176,7 @@ pub async fn run(
         }
         let opened = match own.take() {
             Some(store) => Ok(store),
-            None => SqliteEventStore::open_path(&path).await,
+            None => SqliteEventStore::open_path_for_drain(&path).await,
         };
         match opened {
             Ok(store) => {

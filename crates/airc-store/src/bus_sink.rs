@@ -55,6 +55,8 @@ pub struct SqliteDurableSink {
     readers: DatabaseConnection,
     /// How this sink's writes are admitted ([`crate::custody`]).
     custody: crate::custody::WriteGate,
+    /// The file's write gate, shared by every handle on it in this process ([`crate::write_gate`]).
+    gate: std::sync::Arc<crate::write_gate::FileGate>,
 }
 
 impl SqliteDurableSink {
@@ -74,6 +76,14 @@ impl SqliteDurableSink {
     pub(crate) async fn open(
         db_url: &str,
         admission: crate::custody::Admission,
+    ) -> Result<Self, BusError> {
+        Self::open_gated(db_url, admission, crate::write_gate::unshared()).await
+    }
+
+    async fn open_gated(
+        db_url: &str,
+        admission: crate::custody::Admission,
+        gate: std::sync::Arc<crate::write_gate::FileGate>,
     ) -> Result<Self, BusError> {
         let custody = crate::custody::WriteGate::new(admission).map_err(BusError::sink_source)?;
         let mut opts = Self::pool_options(db_url);
@@ -141,17 +151,19 @@ impl SqliteDurableSink {
             db,
             readers,
             custody,
+            gate,
         })
     }
 
-    /// Admit one write: custody, then no migration past this binary since
-    /// open ([`crate::SqliteEventStore::admit_write`] is the same rule).
-    async fn admit_write(&self) -> Result<crate::custody::WriteTicket<'_>, BusError> {
+    /// Admit one write: the file's turn ([`crate::write_gate`]), custody, then no migration past
+    /// this binary since open ([`crate::SqliteEventStore::admit_write`] is the same rule).
+    async fn admit_write(&self) -> Result<crate::write_gate::Write<'_>, BusError> {
+        let turn = self.gate.enter().await;
         let ticket = self.custody.admit().map_err(BusError::sink_source)?;
         crate::migration::refuse_if_ahead(&self.db)
             .await
             .map_err(BusError::sink_source)?;
-        Ok(ticket)
+        Ok(crate::write_gate::Write::new(turn, ticket))
     }
 
     /// Open a file-backed durable tier from a filesystem path. Keeps
@@ -163,7 +175,12 @@ impl SqliteDurableSink {
             }
         }
         let admission = crate::custody::resolve(path).map_err(BusError::sink_source)?;
-        Self::open(&sqlite_file_url(path), admission).await
+        Self::open_gated(
+            &sqlite_file_url(path),
+            admission,
+            crate::write_gate::for_path(path),
+        )
+        .await
     }
 
     /// Inspect an existing owner store without creating it, migrating it, or
@@ -185,6 +202,7 @@ impl SqliteDurableSink {
             db,
             custody: crate::custody::WriteGate::new(crate::custody::Admission::Unmanaged)
                 .map_err(BusError::sink_source)?,
+            gate: crate::write_gate::unshared(),
         })
     }
 

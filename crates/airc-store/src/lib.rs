@@ -60,6 +60,7 @@ pub mod sqlite;
 mod sqlite_only;
 pub mod store;
 pub mod subscriptions;
+mod write_gate;
 
 pub use account_registry::{StoredAccountRegistry, StoredAccountRegistryGistSentinel};
 pub use beacon::StoredBeacon;

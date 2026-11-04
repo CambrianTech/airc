@@ -115,20 +115,6 @@ impl Window {
         self.rows
     }
 
-    /// Rest after a statement that held the write lock for `took`, as long again: the drain holds
-    /// the lock at most half the time, so a writer waiting in SQLite's busy handler (which sleeps
-    /// in growing steps, not until the lock frees) finds it free on its next retry. With only a
-    /// yield the drain re-took the lock before the sleeper woke: on 2026-11-04, a 979 MB copy, a
-    /// reader sharing a handle with a waiting appender went from p99 1.50 ms with no drain to 19.9
-    /// ms during it, and the appender's own p99 from 31.7 ms to 40.6 ms. A fixed window (the tests)
-    /// only yields.
-    pub(crate) async fn rest(&self, took: std::time::Duration) {
-        match self.budget {
-            Some(_) => tokio::time::sleep(took).await,
-            None => tokio::task::yield_now().await,
-        }
-    }
-
     /// Size the next span from the statement that covered `self.rows()` in `took`.
     pub(crate) fn after(&mut self, took: std::time::Duration) {
         let Some(budget) = self.budget else { return };
@@ -169,10 +155,57 @@ pub struct DrainReport {
     /// `events` rows their kind's declared retention says are dead: dead on arrival, or
     /// superseded by a newer row of the same kind and key ([`declared`]).
     pub declared_rows: u64,
+    /// How the declared deletes held the file's write gate: the drain's rate and its cost to
+    /// every other writer.
+    pub declared_windows: WindowStats,
     pub heartbeat_rows: u64,
     /// `events` rows of a non-durable class (backfill frames above all).
     pub non_durable_rows: u64,
     pub after: StoreFootprint,
+}
+
+/// How a drain's windows held the file's write gate, each timed from the grant: how many there
+/// were, how long they held it in all and at most (what one waiting writer can pay), and where the
+/// time went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowStats {
+    pub windows: u64,
+    pub held: std::time::Duration,
+    pub max_held: std::time::Duration,
+    pub header_delete: std::time::Duration,
+    pub event_delete: std::time::Duration,
+    pub commit: std::time::Duration,
+    /// The drain's PASSIVE checkpoints after each window, outside the gate: what used to run inside
+    /// every commit.
+    pub checkpoint: std::time::Duration,
+    /// The pass stopped early: a reader held a snapshot no checkpoint could move past. The next
+    /// pass resumes.
+    pub stopped_pinned: bool,
+}
+
+impl WindowStats {
+    fn add(
+        &mut self,
+        header_delete: std::time::Duration,
+        event_delete: std::time::Duration,
+        commit: std::time::Duration,
+    ) {
+        let held = header_delete + event_delete + commit;
+        self.windows += 1;
+        self.held += held;
+        self.max_held = self.max_held.max(held);
+        self.header_delete += header_delete;
+        self.event_delete += event_delete;
+        self.commit += commit;
+    }
+}
+
+/// How a drain window's checkpoint ended: its frames copied (and how long that took), or a reader
+/// holding a snapshot that no try moves past, which stops the pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Checkpointed {
+    Copied(std::time::Duration),
+    Pinned(WalCheckpoint),
 }
 
 /// What a WAL checkpoint did, as SQLite reports it: `busy` when a reader or writer kept it from
@@ -218,9 +251,9 @@ impl SqliteEventStore {
 
     pub(crate) async fn drain_windowed(&self, window: Window) -> Result<DrainReport, StoreError> {
         let before = self.footprint().await?;
-        let declared_rows = match declared::dead_rows() {
+        let (declared_rows, declared_windows) = match declared::dead_rows() {
             Some(dead) => self.delete_declared_in_windows(&dead, window).await?,
-            None => 0,
+            None => (0, WindowStats::default()),
         };
         let heartbeat_rows = self
             .delete_in_windows::<bus_event::Entity>(&heartbeat_row(), window)
@@ -231,6 +264,7 @@ impl SqliteEventStore {
         Ok(DrainReport {
             before,
             declared_rows,
+            declared_windows,
             heartbeat_rows,
             non_durable_rows,
             after: self.footprint().await?,
@@ -290,12 +324,51 @@ impl SqliteEventStore {
                     .rows_affected;
                 txn.commit().await?;
             }
-            let took = started.elapsed();
-            window.after(took);
+            let held = started.elapsed();
+            window.after(held);
+            if let Checkpointed::Pinned(_) = self.checkpoint_after_window(held).await? {
+                break;
+            }
             low = high;
-            window.rest(took).await;
+            tokio::task::yield_now().await;
         }
         Ok(removed)
+    }
+
+    /// The checkpoint after a drain window: PASSIVE, outside the write gate and custody, on the
+    /// drain's own connection, whose commits run no automatic checkpoint
+    /// ([`crate::sqlite::drain_options`]). PASSIVE never takes the write lock, so writers append
+    /// while it copies, and their own automatic checkpoint then finds only their own frames. A
+    /// checkpoint changes no data, so it needs no write admission. Returns how long it took.
+    ///
+    /// The next window waits for this one's frames to be copied: a PASSIVE checkpoint copies only up
+    /// to the oldest open reader's snapshot, and on 2026-11-04 (a 982 MB copy, a reader every 100
+    /// ms) the uncopied tail grew the WAL to 1,782 MB. Every append's own automatic checkpoint then
+    /// copied from it (p99 25.1 ms against 3.7 ms with no drain), and reads walked it. So while a
+    /// reader pins frames this window wrote, it waits (as long as the window held the gate, at
+    /// least the statement budget) and checkpoints again, for as long as each try copies more: the
+    /// drain goes at the pace its writes are copied, and the WAL stays small. A try that copies
+    /// nothing new means a snapshot is held open (the M5's 14 GB WAL on 2026-11-03), so the pass
+    /// stops there, reported, and the next pass resumes; it never waits on a reader that does not
+    /// move.
+    pub(super) async fn checkpoint_after_window(
+        &self,
+        held: std::time::Duration,
+    ) -> Result<Checkpointed, StoreError> {
+        let started = std::time::Instant::now();
+        let mut copied = None;
+        loop {
+            let rows = sqlite_only(self.connection(), SqliteOnly::WalCheckpointPassive).await?;
+            let wal = checkpoint_row(&rows)?;
+            if !wal.pinned() {
+                return Ok(Checkpointed::Copied(started.elapsed()));
+            }
+            if copied == Some(wal.checkpointed_frames) {
+                return Ok(Checkpointed::Pinned(wal));
+            }
+            copied = Some(wal.checkpointed_frames);
+            tokio::time::sleep(held.max(STATEMENT_BUDGET)).await;
+        }
     }
 
     /// `page_size × page_count` and `page_size × freelist_count`, from SQLite

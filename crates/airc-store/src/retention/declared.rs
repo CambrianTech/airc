@@ -11,7 +11,7 @@ use airc_core::{Retention, RetentionKey, TranscriptKind};
 use sea_orm::sea_query::{Alias, Expr, Query, SelectStatement, SimpleExpr};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
 
-use super::Window;
+use super::{Checkpointed, Window, WindowStats};
 use crate::entities::{event, event_header};
 use crate::error::StoreError;
 use crate::sqlite::SqliteEventStore;
@@ -75,7 +75,7 @@ impl SqliteEventStore {
         &self,
         dead: &SimpleExpr,
         mut window: Window,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<(u64, WindowStats), StoreError> {
         let db = self.connection();
         let rowid = || Expr::col((event::Entity, Alias::new("rowid")));
         let max_rowid: Option<Option<i64>> = event::Entity::find()
@@ -85,15 +85,17 @@ impl SqliteEventStore {
             .one(db)
             .await?;
         let Some(max_rowid) = max_rowid.flatten() else {
-            return Ok(0);
+            return Ok((0, WindowStats::default()));
         };
         let mut low = 0i64;
         let mut removed = 0u64;
+        let mut stats = WindowStats::default();
         while low < max_rowid {
             let high = low.saturating_add(window.rows());
-            let started = std::time::Instant::now();
             let in_window = rowid().gt(low).and(rowid().lte(high)).and(dead.clone());
             let write = self.admit_write().await?;
+            // Timed from the grant: the window adapts to its own cost, never to its queueing.
+            let started = std::time::Instant::now();
             let txn = db.begin().await?;
             // The header rows first, while the window still names the events they belong to.
             event_header::Entity::delete_many()
@@ -108,18 +110,28 @@ impl SqliteEventStore {
                 )
                 .exec(&txn)
                 .await?;
+            let headers_done = started.elapsed();
             removed += event::Entity::delete_many()
                 .filter(in_window)
                 .exec(&txn)
                 .await?
                 .rows_affected;
+            let events_done = started.elapsed();
             txn.commit().await?;
             drop(write);
-            let took = started.elapsed();
-            window.after(took);
+            let held = started.elapsed();
+            stats.add(headers_done, events_done - headers_done, held - events_done);
+            window.after(held);
+            match self.checkpoint_after_window(held).await? {
+                Checkpointed::Copied(took) => stats.checkpoint += took,
+                Checkpointed::Pinned(_) => {
+                    stats.stopped_pinned = true;
+                    break;
+                }
+            }
             low = high;
-            window.rest(took).await;
+            tokio::task::yield_now().await;
         }
-        Ok(removed)
+        Ok((removed, stats))
     }
 }
