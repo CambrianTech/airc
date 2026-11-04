@@ -296,6 +296,17 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
+        // A predicate on derived data derives its own range's owed rows first, so the page is
+        // exact; a plain page derives nothing (crate::derive).
+        if crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
+            crate::derive::derive_owed::<bus_event::Entity, _, BusError, _, _>(
+                &self.db,
+                in_range(channel, after, through),
+                || self.admit_write(),
+                BusError::sink_source,
+            )
+            .await?;
+        }
         let mut branches = Vec::new();
         for query in page_rows(channel, after, through, rule, bounded, tail) {
             branches.push(
@@ -324,6 +335,15 @@ impl DurableSink for SqliteDurableSink {
         headers: &airc_core::HeaderFilter,
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, BusError> {
+        // A count derives nothing: rows in its range that still owe their header rows make it a
+        // lower bound (`more`), never a wait on a derivation (crate::derive).
+        let owed = crate::derive::reads_derived(headers, false, exclude.is_some())
+            && crate::derive::owes::<bus_event::Entity>(
+                &self.readers,
+                in_range(channel, after, through),
+            )
+            .await
+            .map_err(BusError::sink_source)?;
         let mut rows = matching_rows(channel, after, through, headers);
         if let Some(rule) = exclude {
             rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
@@ -347,7 +367,9 @@ impl DurableSink for SqliteDurableSink {
             .into_iter()
             .map(|ms| i64_to_u64("occurred_at_ms", ms))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(airc_core::HistoryCount::of_newest(times))
+        let mut count = airc_core::HistoryCount::of_newest(times);
+        count.more |= owed;
+        Ok(count)
     }
 
     async fn page(
@@ -571,17 +593,9 @@ fn from_model(m: bus_event::Model) -> Result<Envelope, BusError> {
 ///   OR (epoch == c.epoch AND counter < c.counter)
 ///   OR (epoch == c.epoch AND counter == c.counter
 ///       AND event_id < c.event_id).
-/// The durable rows of `channel` in `(after, through]` whose headers match: one
-/// owner for the range `page_matching` pages and `count_matching` counts.
-fn matching_rows(
-    channel: RoomId,
-    after: Cursor,
-    through: Cursor,
-    headers: &airc_core::HeaderFilter,
-) -> sea_orm::Select<bus_event::Entity> {
-    let mut query =
-        bus_event::Entity::find().filter(bus_event::Column::RoomId.eq(channel.as_uuid()));
-
+/// The durable rows of `channel` in `(after, through]`: one owner for the range `page_matching`
+/// pages, `count_matching` counts and a derivation of either scopes to.
+fn in_range(channel: RoomId, after: Cursor, through: Cursor) -> sea_orm::Condition {
     // Strictly after the cursor in generational order:
     //   epoch > c.epoch
     //   OR (epoch == c.epoch AND counter > c.counter)
@@ -590,30 +604,38 @@ fn matching_rows(
     // event_id is the deterministic tiebreaker (§3.5); within one
     // epoch the monotonic counter forbids a tie, but the tiebreak
     // keeps the order total independent of how `seq` was produced.
-    {
-        let c = after;
-        let epoch = c.seq.epoch as i64;
-        let counter = c.seq.counter as i64;
-        let event_id = c.event_id.as_uuid();
-        let strictly_after = Expr::col(bus_event::Column::Epoch)
-            .gt(epoch)
-            .or(Expr::col(bus_event::Column::Epoch)
-                .eq(epoch)
-                .and(Expr::col(bus_event::Column::Counter).gt(counter)))
-            .or(Expr::col(bus_event::Column::Epoch)
-                .eq(epoch)
-                .and(Expr::col(bus_event::Column::Counter).eq(counter))
-                .and(Expr::col(bus_event::Column::EventId).gt(event_id)));
-        query = query.filter(strictly_after);
-    }
-
-    query
-        .filter(
+    let epoch = after.seq.epoch as i64;
+    let counter = after.seq.counter as i64;
+    let event_id = after.event_id.as_uuid();
+    let strictly_after = Expr::col(bus_event::Column::Epoch)
+        .gt(epoch)
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).gt(counter)))
+        .or(Expr::col(bus_event::Column::Epoch)
+            .eq(epoch)
+            .and(Expr::col(bus_event::Column::Counter).eq(counter))
+            .and(Expr::col(bus_event::Column::EventId).gt(event_id)));
+    sea_orm::Condition::all()
+        .add(bus_event::Column::RoomId.eq(channel.as_uuid()))
+        .add(strictly_after)
+        .add(
             strictly_before(through)
                 .or(Expr::col(bus_event::Column::EventId).eq(through.event_id.as_uuid())),
         )
+        .add(bus_event::Column::Delivery.eq("durable"))
+}
+
+/// [`in_range`]'s rows whose headers match.
+fn matching_rows(
+    channel: RoomId,
+    after: Cursor,
+    through: Cursor,
+    headers: &airc_core::HeaderFilter,
+) -> sea_orm::Select<bus_event::Entity> {
+    bus_event::Entity::find()
+        .filter(in_range(channel, after, through))
         .filter(crate::header_query::predicate::<bus_event::Entity>(headers))
-        .filter(bus_event::Column::Delivery.eq("durable"))
 }
 
 /// The selects `page_matching` reads: [`matching_rows`], the first `limit` in

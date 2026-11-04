@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use super::{DrainReport, Reclaim, StoreFootprint, WalCheckpoint};
 use crate::error::StoreError;
+use crate::indexes::IndexReport;
 use crate::sqlite::SqliteEventStore;
 
 /// The first pass waits for the host to settle (the boot window is when every peer backfills
@@ -45,6 +46,11 @@ pub struct PassReport {
     /// A legacy `auto_vacuum=0` file's freelist, bytes, that only [`SqliteEventStore::compact`]
     /// in a stop window gives back; `None` for an incremental file.
     pub awaiting_compaction: Option<u64>,
+    /// The indexes built after the drain, on the drained table ([`crate::indexes`]); `None` when
+    /// the drain failed, since a build on an undrained table holds every write for its whole run.
+    pub indexes: Option<Result<IndexReport, StoreError>>,
+    /// Rows derived after the drain ([`crate::derive`]); `None` when the drain failed.
+    pub derived: Option<Result<usize, StoreError>>,
     /// `None` when the pass never reached the checkpoint (the drain's connection did not open).
     pub wal: Option<Result<WalCheckpoint, StoreError>>,
 }
@@ -74,6 +80,21 @@ impl std::fmt::Display for PassReport {
                     "; stopped early: a reader holds the WAL, the next pass resumes"
                 )?;
             }
+        }
+        match &self.indexes {
+            Some(Ok(report)) if !report.built.is_empty() => write!(
+                f,
+                "; built indexes {} (gate held {} ms)",
+                report.built.join(", "),
+                report.held.as_millis(),
+            )?,
+            Some(Ok(_)) | None => {}
+            Some(Err(error)) => write!(f, "; index build failed: {error}")?,
+        }
+        match &self.derived {
+            Some(Ok(0)) | None => {}
+            Some(Ok(rows)) => write!(f, "; derived {rows} rows")?,
+            Some(Err(error)) => write!(f, "; derivation failed: {error}")?,
         }
         match &self.reclaim {
             Some(Ok(after)) => write!(
@@ -116,11 +137,18 @@ impl std::fmt::Display for PassReport {
     }
 }
 
-/// One pass: the drain, then the reclaim the footprint and the idle signal allow, then the WAL
-/// checkpoint. Every pass checkpoints, not only after a full vacuum: a reader that never lets
+/// One pass: the drain, then on the drained tables the missing indexes and the owed derivations,
+/// then the reclaim the footprint and the idle signal allow, then the WAL checkpoint. Every pass checkpoints, not only after a full vacuum: a reader that never lets
 /// go is how the M5's WAL reached 14 GB beside a 2.9 GB file on 2026-11-03 (card e719540d).
 pub async fn pass(store: &SqliteEventStore) -> PassReport {
     let drain = store.drain().await;
+    let (indexes, derived) = match &drain {
+        Ok(_) => (
+            Some(store.ensure_indexes().await),
+            Some(store.derive_all_owed().await),
+        ),
+        Err(_) => (None, None),
+    };
     let (reclaim, awaiting_compaction) = match &drain {
         Ok(report) => match store.is_incremental().await {
             Ok(incremental) => (
@@ -138,6 +166,8 @@ pub async fn pass(store: &SqliteEventStore) -> PassReport {
         drain,
         reclaim,
         awaiting_compaction,
+        indexes,
+        derived,
         wal: Some(store.checkpoint_wal().await),
     }
 }
@@ -187,6 +217,8 @@ pub async fn run(
                 drain: Err(error),
                 reclaim: None,
                 awaiting_compaction: None,
+                indexes: None,
+                derived: None,
                 wal: None,
             }),
         }

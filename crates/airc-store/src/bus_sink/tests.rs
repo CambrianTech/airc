@@ -659,7 +659,20 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         .await
         .unwrap();
     let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids, [typed.event_id, led.event_id]);
+    // Before the background pass builds the addressing indexes (card 70055c76) the
+    // same page answers, only by a slower plan.
+    assert_eq!(
+        ids,
+        [typed.event_id, led.event_id],
+        "correct without the indexes"
+    );
+    crate::indexes::ensure(&sink.db).await.unwrap();
+    let page = sink
+        .page_matching(ch, origin, through, rule, 10, true)
+        .await
+        .unwrap();
+    let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
+    assert_eq!(ids, [typed.event_id, led.event_id], "the same with them");
     // Index evidence: each branch SEARCHes its own addressing index (rows
     // touched are candidates), never walks the room in cursor order.
     let branches = page_rows(ch, origin, through, rule, 10, true);

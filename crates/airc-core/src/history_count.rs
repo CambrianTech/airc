@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 pub const HISTORY_COUNT_CAP: u64 = 999;
 
 /// Matching events in a range, and the original times of the oldest and newest counted.
-/// `more`: the range holds more than `count`; the store stopped at [`HISTORY_COUNT_CAP`] and
-/// counted the newest ones, so `oldest_ms` is the oldest of those, not of the range.
+/// `more`: `count` is a lower bound. Either the store stopped at [`HISTORY_COUNT_CAP`] and
+/// counted the newest ones (so `oldest_ms` is the oldest of those, not of the range), or rows in
+/// the range have not yet been indexed for the filter and may match too (a count never waits
+/// on that indexing).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryCount {
     pub count: u64,

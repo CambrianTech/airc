@@ -1,21 +1,33 @@
-//! Data the store derives from each stored event, kept current by one
-//! resumable pass: the addressing columns ([`airc_core::Addressing`]) and the
-//! header rows (`crate::header_query`) of `events` and `bus_events`.
+//! Data the store derives from each stored event: the addressing columns
+//! ([`airc_core::Addressing`]) and the header rows (`crate::header_query`) of
+//! `events` and `bus_events`.
 //!
 //! A row is current when its `derived_version` is [`DERIVED_VERSION`]. Appends
-//! by this binary write it current. Rows at an older version (everything stored
-//! before migration 000021, a derivation interrupted midway, or a row an older
-//! writer inserted without the column) are derived here, a batch at a time,
-//! each batch in one transaction: its header rows are replaced (deleted, then
-//! inserted), its addressing recomputed and its version set, so a half-derived
-//! row is never visible. [`derive_pending`] runs on every store open, so
-//! nothing is silently skipped.
+//! by this binary write it current. A row at an older version (stored before
+//! migration 000021, or inserted by an older writer without the column) is
+//! derived a batch at a time, each batch in one transaction under the file's
+//! write gate: its header rows are replaced (deleted, then inserted), its
+//! addressing recomputed and its version set, so a half-derived row is never
+//! visible.
+//!
+//! Nothing derives at open (card 70055c76: open did the whole table, 23.4 s on a
+//! 1.56 GB store). Who derives, and only what they reach:
+//! - a read whose predicate reads derived data ([`reads_derived`]) derives the
+//!   owed rows of its own range first ([`derive_owed`]), so its answer is exact;
+//!   a read that does not (the plain newest page) derives nothing;
+//! - a count derives nothing: owed rows in its range make it a lower bound
+//!   (`HistoryCount::more`, [`owes`]);
+//! - the store's background pass derives every owed row after its drain, when
+//!   the table is small (`crate::retention::run::pass`).
 
 use std::collections::BTreeMap;
+use std::future::Future;
 
+use airc_core::HeaderFilter;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+    ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
+    TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -24,6 +36,7 @@ use crate::error::StoreError;
 use crate::event_table::EventTable;
 use crate::header_query::write_header_rows;
 use crate::migration::fault::{self, Fault};
+use crate::sqlite::SqliteEventStore;
 
 /// The version of the derived data this binary writes.
 pub(crate) const DERIVED_VERSION: i32 = 1;
@@ -31,15 +44,76 @@ pub(crate) const DERIVED_VERSION: i32 = 1;
 /// Rows derived per transaction.
 const BATCH: u64 = 1000;
 
-/// Derive every row of both event tables that is not current.
-pub(crate) async fn derive_pending(db: &DatabaseConnection) -> Result<(), StoreError> {
+/// Whether a read's predicate reads derived data: a header predicate and the exclusion of a
+/// runtime's own sends read the header rows, an addressee filter the addressing columns.
+pub(crate) fn reads_derived(headers: &HeaderFilter, addressee: bool, exclude: bool) -> bool {
+    !matches!(headers, HeaderFilter::Any) || addressee || exclude
+}
+
+/// Whether any row of `T` within `scope` still owes its derivation.
+pub(crate) async fn owes<T: EventTable>(
+    db: &DatabaseConnection,
+    scope: Condition,
+) -> Result<bool, StoreError> {
+    let owed: Option<Uuid> = T::find()
+        .select_only()
+        .column(T::EVENT_ID)
+        .filter(scope)
+        .filter(T::DERIVED_VERSION.lt(DERIVED_VERSION))
+        .limit(1)
+        .into_tuple()
+        .one(db)
+        .await?;
+    Ok(owed.is_some())
+}
+
+/// Derive every owed row of `T` within `scope`, one batch per transaction, each under the
+/// write admission `admit` returns (the file's gate, held for that batch only); how many.
+/// `lift` is the caller's error for a store failure (the sink's is `BusError::sink_source`).
+pub(crate) async fn derive_owed<T, G, E, Admit, Admitted>(
+    db: &DatabaseConnection,
+    scope: Condition,
+    admit: Admit,
+    lift: fn(StoreError) -> E,
+) -> Result<usize, E>
+where
+    T: EventTable,
+    <T::Headers as EntityTrait>::ActiveModel: Send,
+    Admit: Fn() -> Admitted,
+    Admitted: Future<Output = Result<G, E>>,
+{
+    let mut derived = 0;
     loop {
-        let events = derive_batch::<event::Entity>(db).await?;
-        let bus_events = derive_batch::<bus_event::Entity>(db).await?;
-        if events == 0 && bus_events == 0 {
-            return Ok(());
+        let write = admit().await?;
+        let count = derive_batch::<T>(db, scope.clone()).await.map_err(lift)?;
+        drop(write);
+        if count == 0 {
+            return Ok(derived);
         }
-        fault::hit(Fault::AfterDerivedBatch)?;
+        derived += count;
+        fault::hit(Fault::AfterDerivedBatch).map_err(|e| lift(e.into()))?;
+    }
+}
+
+impl SqliteEventStore {
+    /// Derive every owed row of both event tables ([`derive_owed`]): the background pass's step
+    /// after its drain, when the tables are small. How many rows it derived.
+    pub async fn derive_all_owed(&self) -> Result<usize, StoreError> {
+        let events = derive_owed::<event::Entity, _, _, _, _>(
+            self.connection(),
+            Condition::all(),
+            || self.admit_write(),
+            std::convert::identity,
+        )
+        .await?;
+        let bus_events = derive_owed::<bus_event::Entity, _, _, _, _>(
+            self.connection(),
+            Condition::all(),
+            || self.admit_write(),
+            std::convert::identity,
+        )
+        .await?;
+        Ok(events + bus_events)
     }
 }
 
@@ -62,9 +136,12 @@ impl Grouped {
     }
 }
 
-/// Derive up to [`BATCH`] rows of `T` that are not current, in one
-/// transaction; how many there were.
-async fn derive_batch<T: EventTable>(db: &DatabaseConnection) -> Result<usize, StoreError>
+/// Derive up to [`BATCH`] owed rows of `T` within `scope`, in one transaction;
+/// how many there were.
+async fn derive_batch<T: EventTable>(
+    db: &DatabaseConnection,
+    scope: Condition,
+) -> Result<usize, StoreError>
 where
     <T::Headers as EntityTrait>::ActiveModel: Send,
 {
@@ -74,6 +151,7 @@ where
         .column(T::TARGET)
         .column(T::CONTENT)
         .column(T::HEADERS)
+        .filter(scope)
         .filter(T::DERIVED_VERSION.lt(DERIVED_VERSION))
         .limit(BATCH)
         .into_tuple()
@@ -130,7 +208,7 @@ mod tests {
     use crate::entities::{bus_event_header, event_header};
     use crate::migration::{apply_migrations, Migrator};
     use crate::SqliteEventStore;
-    use airc_core::{Body, MentionTarget, PeerId};
+    use airc_core::{Body, EventId, MentionTarget, PeerId, TranscriptCursor};
     use sea_orm::ActiveValue::{NotSet, Set};
     use sea_orm::{Database, PaginatorTrait};
     use sea_orm_migration::seaql_migrations;
@@ -182,10 +260,25 @@ mod tests {
         }
     }
 
+    fn origin() -> TranscriptCursor {
+        TranscriptCursor {
+            lamport: 0,
+            event_id: EventId::from_u128(0),
+        }
+    }
+
+    fn newest() -> TranscriptCursor {
+        TranscriptCursor {
+            lamport: u64::MAX >> 1,
+            event_id: EventId::from_u128(u128::MAX),
+        }
+    }
+
     // what this catches (Codex on #1618): sea-orm-migration runs SQLite migrations
     // without a transaction, so a crash after 000021's DDL and before its version row
     // left a schema the retry could not re-apply (duplicate column). Interrupted there,
-    // nothing of the step is left; the reopen applies it and derives the old row.
+    // nothing of the step is left; the reopen applies it, derives no row (card 70055c76:
+    // open does no data work), and the derivation completes the old row.
     #[tokio::test]
     async fn a_fault_after_the_ddl_rolls_back_and_the_reopen_completes() {
         let dir = tempfile::tempdir().unwrap();
@@ -208,11 +301,13 @@ mod tests {
         );
         assert_eq!(applied(&db).await, u64::from(BEFORE_DERIVED));
         drop(db);
-        let db = connect(&path).await;
-        apply_migrations(&db).await.unwrap();
-        assert_eq!(applied(&db).await, Migrator::migrations().len() as u64);
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        let db = store.connection();
+        assert_eq!(applied(db).await, Migrator::migrations().len() as u64);
+        assert_eq!(not_current(db).await, 1, "the open derived nothing");
+        assert_eq!(store.derive_all_owed().await.unwrap(), 1);
         let row = event::Entity::find_by_id(Uuid::from_u128(1))
-            .one(&db)
+            .one(db)
             .await
             .unwrap()
             .unwrap();
@@ -220,14 +315,15 @@ mod tests {
             (row.addressed_peer, row.leading_mention, row.derived_version),
             (Some(me.as_uuid()), true, DERIVED_VERSION)
         );
-        assert_eq!(event_header::Entity::find().count(&db).await.unwrap(), 1);
+        assert_eq!(event_header::Entity::find().count(db).await.unwrap(), 1);
     }
 
     // what this catches (Codex on #1618): a derivation interrupted midway is never
-    // silently skipped. One batch commits, the open fails; the reopen resumes, and
-    // every row ends current with the right addressing and header rows.
+    // silently skipped. One batch commits, the pass fails; the next pass resumes, and
+    // every row ends current with the right addressing and header rows. The open in
+    // between derives nothing.
     #[tokio::test]
-    async fn a_fault_midway_through_derivation_resumes_on_reopen() {
+    async fn a_fault_midway_through_derivation_resumes_on_the_next_pass() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.sqlite");
         let me = PeerId::from_u128(0x3e);
@@ -248,39 +344,48 @@ mod tests {
                 .await
                 .unwrap();
         }
+        drop(db);
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        let db = store.connection();
+        assert_eq!(not_current(db).await, 2500, "the open derived nothing");
         fault::arm(Fault::AfterDerivedBatch);
-        assert!(apply_migrations(&db).await.is_err());
+        assert!(store.derive_all_owed().await.is_err());
         assert_eq!(
-            not_current(&db).await,
+            not_current(db).await,
             2500 - BATCH,
             "one batch derived, the rest still owed"
         );
-        drop(db);
-        let db = connect(&path).await;
-        apply_migrations(&db).await.unwrap();
-        assert_eq!(not_current(&db).await, 0, "every row derived");
+        assert_eq!(store.derive_all_owed().await.unwrap() as u64, 2500 - BATCH);
+        assert_eq!(not_current(db).await, 0, "every row derived");
         let addressed = event::Entity::find()
             .filter(event::Column::AddressedPeer.eq(me.as_uuid()))
-            .count(&db)
+            .count(db)
             .await
             .unwrap();
         let leading = event::Entity::find()
             .filter(event::Column::LeadingMention.eq(true))
-            .count(&db)
+            .count(db)
             .await
             .unwrap();
         assert_eq!((addressed, leading), (1250, 1250));
-        assert_eq!(event_header::Entity::find().count(&db).await.unwrap(), 2500);
+        assert_eq!(event_header::Entity::find().count(db).await.unwrap(), 2500);
     }
 
-    // what this catches (Codex on #1618): a row an older writer inserts without the
-    // derived data (`derived_version` 0, no header rows) is derived on the next open,
-    // in both event tables.
+    // what this catches (card 70055c76): a row an older writer inserts without the derived
+    // data (`derived_version` 0, no header rows) is answered exactly by every read that
+    // depends on it, in both event tables: a filtered read derives its own range first; a
+    // count derives nothing and says it is a lower bound; a plain page derives nothing.
     #[tokio::test]
-    async fn rows_an_older_writer_inserted_are_derived_on_the_next_open() {
+    async fn owed_rows_are_derived_by_the_read_that_reaches_them() {
+        use crate::{CountHistory, EventStore, SqliteDurableSink};
+        use airc_bus::envelope::Cursor;
+        use airc_bus::{DurableSink, Seq};
+        use airc_core::{HeaderFilter, HistoryMatch, RoomId};
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.sqlite");
         let me = PeerId::from_u128(0x3e);
+        let room = RoomId::from_u128(7);
         let store = SqliteEventStore::open_path(&path).await.unwrap();
         let db = store.connection();
         event::Entity::insert(old_row(1, MentionTarget::Peer(me), "plain"))
@@ -289,7 +394,7 @@ mod tests {
             .unwrap();
         bus_event::Entity::insert(bus_event::ActiveModel {
             event_id: Set(Uuid::from_u128(2)),
-            room_id: Set(Uuid::from_u128(7)),
+            room_id: Set(room.as_uuid()),
             epoch: Set(1),
             counter: Set(1),
             kind: Set("message".into()),
@@ -309,10 +414,45 @@ mod tests {
         .exec(db)
         .await
         .unwrap();
-        assert_eq!(not_current(db).await, 1, "the old writer's row is owed");
-        drop(store);
-        let store = SqliteEventStore::open_path(&path).await.unwrap();
-        let db = store.connection();
+        let keyed = HeaderFilter::Has { key: "k".into() };
+
+        let plain = store
+            .matching_history(
+                &origin(),
+                &newest(),
+                &[room],
+                HistoryMatch::headers(&HeaderFilter::Any),
+                10,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(not_current(db).await, 1, "a plain page derives nothing");
+
+        let count = store
+            .count_history(&origin(), &newest(), &[room], &keyed, None)
+            .await
+            .unwrap();
+        assert!(count.more, "owed rows in range: the count is a lower bound");
+        assert_eq!(not_current(db).await, 1, "a count derives nothing");
+
+        let page = store
+            .matching_history(
+                &origin(),
+                &newest(),
+                &[room],
+                HistoryMatch::headers(&keyed),
+                10,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.len(),
+            1,
+            "the filtered read derived its range, then matched"
+        );
         let row = event::Entity::find_by_id(Uuid::from_u128(1))
             .one(db)
             .await
@@ -322,6 +462,32 @@ mod tests {
             (row.addressed_peer, row.derived_version),
             (Some(me.as_uuid()), DERIVED_VERSION)
         );
+        let count = store
+            .count_history(&origin(), &newest(), &[room], &keyed, None)
+            .await
+            .unwrap();
+        assert_eq!((count.count, count.more), (1, false), "exact once derived");
+
+        let sink = SqliteDurableSink::open_path(&path).await.unwrap();
+        let bus_origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+        let bus_through = Cursor::new(Seq::new(1, 1), EventId::from_u128(2));
+        let count = sink
+            .count_matching(room, bus_origin, bus_through, &keyed, None)
+            .await
+            .unwrap();
+        assert!(count.more, "the sink's count is a lower bound too");
+        let page = sink
+            .page_matching(
+                room,
+                bus_origin,
+                bus_through,
+                HistoryMatch::headers(&keyed),
+                10,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
         let bus = bus_event::Entity::find_by_id(Uuid::from_u128(2))
             .one(db)
             .await

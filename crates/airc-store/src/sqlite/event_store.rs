@@ -98,6 +98,17 @@ impl EventStore for SqliteEventStore {
         limit: usize,
         tail: bool,
     ) -> Result<Vec<TranscriptEvent>, StoreError> {
+        // A predicate on derived data derives its own range's owed rows first, so the page is
+        // exact; a plain page derives nothing (crate::derive).
+        if crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false) {
+            crate::derive::derive_owed::<event::Entity, _, StoreError, _, _>(
+                &self.db,
+                crate::event_query::in_range(cursor, through, channels),
+                || self.admit_write(),
+                std::convert::identity,
+            )
+            .await?;
+        }
         let mut branches = Vec::new();
         for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail) {
             branches.push(query.all(&self.db).await?);

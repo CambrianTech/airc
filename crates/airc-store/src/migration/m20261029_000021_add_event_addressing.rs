@@ -10,10 +10,12 @@
 //!
 //! A third column, `derived_version`, marks rows whose derived data
 //! (addressing, and the header rows of migration 000022) is current. This
-//! migration is DDL only and runs, with its version row, inside the one
-//! transaction `apply_migrations` wraps around `Migrator::up`; the derivation
-//! itself is `crate::derive`, resumable and run after every open, so rows an
-//! interrupted backfill or an older writer left at version 0 are healed.
+//! migration adds the columns only, which SQLite does without touching a row,
+//! and runs with its version row inside the one transaction `apply_migrations`
+//! wraps around `Migrator::up`. Nothing here reads or writes rows: a reader
+//! derives the rows of the page it returns (`crate::derive`), and the indexes
+//! are built by the store's background task after its drain ([`crate::indexes`],
+//! card 70055c76: building them here held a 1.56 GB store's write lock 23.4 s).
 
 use sea_orm_migration::prelude::*;
 
@@ -63,86 +65,11 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
         }
-        // An addressee scan is `room AND (addressed_peer = me OR leading_mention)`
-        // in cursor order: one index per OR arm, each in the table's cursor order.
-        for (name, column) in [
-            ("idx_events_room_addressed_peer", Addressing::AddressedPeer),
-            (
-                "idx_events_room_leading_mention",
-                Addressing::LeadingMention,
-            ),
-        ] {
-            manager
-                .create_index(
-                    Index::create()
-                        .name(name)
-                        .table(Events::Table)
-                        .col(Events::RoomId)
-                        .col(column)
-                        .col(Events::Lamport)
-                        .col(Events::EventId)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        for (name, column) in [
-            (
-                "idx_bus_events_room_addressed_peer",
-                Addressing::AddressedPeer,
-            ),
-            (
-                "idx_bus_events_room_leading_mention",
-                Addressing::LeadingMention,
-            ),
-        ] {
-            manager
-                .create_index(
-                    Index::create()
-                        .name(name)
-                        .table(BusEvents::Table)
-                        .col(BusEvents::RoomId)
-                        .col(column)
-                        .col(BusEvents::Epoch)
-                        .col(BusEvents::Counter)
-                        .col(BusEvents::EventId)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        // The derivation finds the rows it still owes by this column.
-        for (name, table) in [
-            ("idx_events_derived_version", Events::Table.into_iden()),
-            (
-                "idx_bus_events_derived_version",
-                BusEvents::Table.into_iden(),
-            ),
-        ] {
-            manager
-                .create_index(
-                    Index::create()
-                        .name(name)
-                        .table(table)
-                        .col(Addressing::DerivedVersion)
-                        .to_owned(),
-                )
-                .await?;
-        }
         fault::hit(Fault::AfterAddressingDdl)
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for name in [
-            "idx_events_room_addressed_peer",
-            "idx_events_room_leading_mention",
-            "idx_bus_events_room_addressed_peer",
-            "idx_bus_events_room_leading_mention",
-            "idx_events_derived_version",
-            "idx_bus_events_derived_version",
-        ] {
-            manager
-                .drop_index(Index::drop().name(name).to_owned())
-                .await?;
-        }
+        crate::indexes::drop_all(manager).await?;
         // SQLite takes one alter option per statement.
         for table in [Events::Table.into_iden(), BusEvents::Table.into_iden()] {
             for column in [
@@ -167,18 +94,11 @@ impl MigrationTrait for Migration {
 #[derive(DeriveIden)]
 enum Events {
     Table,
-    RoomId,
-    Lamport,
-    EventId,
 }
 
 #[derive(DeriveIden)]
 enum BusEvents {
     Table,
-    RoomId,
-    Epoch,
-    Counter,
-    EventId,
 }
 
 #[derive(DeriveIden)]
