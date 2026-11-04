@@ -164,6 +164,61 @@ pub struct DrainReport {
     pub after: StoreFootprint,
 }
 
+/// The drain's pace: how long it rests after each window, steered by the foreground latency it can
+/// see (Fable on #1653: a loop on the measurement, never a fixed duty, since "every time we use a
+/// constant we get stuck at that constant"). Above the bar (this store's no-drain latency, measured
+/// before the pass, plus one window's budget), the rest doubles; under it, it shrinks by one budget
+/// (AIMD). So the drain converges on the fastest pace that keeps the foreground within its bar, on
+/// any disk, and moves both ways.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pace {
+    rest: std::time::Duration,
+    /// `None`: never rests (the tests' fixed windows).
+    bar: Option<std::time::Duration>,
+}
+
+impl Pace {
+    /// A pace against `baseline`, this store's foreground latency with no drain running.
+    pub(crate) fn against(baseline: std::time::Duration) -> Self {
+        Self {
+            rest: std::time::Duration::ZERO,
+            bar: Some(baseline + STATEMENT_BUDGET),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn never() -> Self {
+        Self {
+            rest: std::time::Duration::ZERO,
+            bar: None,
+        }
+    }
+
+    /// Steer by the slowest foreground write since the last window, or hold when there was none:
+    /// the pace moves only on evidence. Shrinking on every window with no write in it (a write every
+    /// 100 ms, a window every ~25 ms) gave back each excursion's rest before the next write could
+    /// show it was still needed: 580 ms rested over 18,014 windows on 2026-11-04, appends' p99 still
+    /// 23.3 ms against 3.0 ms with no drain.
+    pub(crate) fn observe(&mut self, slowest_write: Option<std::time::Duration>) {
+        let (Some(bar), Some(foreground)) = (self.bar, slowest_write) else {
+            return;
+        };
+        self.rest = match foreground > bar {
+            true => (self.rest * 2).max(STATEMENT_BUDGET),
+            false => self.rest.saturating_sub(STATEMENT_BUDGET),
+        };
+    }
+
+    pub(crate) fn rest(&self) -> std::time::Duration {
+        self.rest
+    }
+
+    /// The foreground latency the drain is held to; zero when it never rests.
+    pub(crate) fn bar(&self) -> std::time::Duration {
+        self.bar.unwrap_or_default() // unwrap_or_default: a pace that never rests holds the drain to nothing
+    }
+}
+
 /// How a drain's windows held the file's write gate, each timed from the grant: how many there
 /// were, how long they held it in all and at most (what one waiting writer can pay), and where the
 /// time went.
@@ -181,6 +236,10 @@ pub struct WindowStats {
     /// The pass stopped early: a reader held a snapshot no checkpoint could move past. The next
     /// pass resumes.
     pub stopped_pinned: bool,
+    /// Rested between windows by the pace ([`Pace`]).
+    pub rested: std::time::Duration,
+    /// The foreground latency the pace steered against: the bar it held the drain to.
+    pub bar: std::time::Duration,
 }
 
 impl WindowStats {
@@ -246,20 +305,29 @@ impl SqliteEventStore {
     /// The one drain: every row a declaration or a dead class marks, and the footprint before
     /// and after.
     pub async fn drain(&self) -> Result<DrainReport, StoreError> {
-        self.drain_windowed(Window::adaptive()).await
+        let baseline = self.foreground_baseline().await?;
+        self.drain_windowed(Window::adaptive(), Pace::against(baseline))
+            .await
     }
 
-    pub(crate) async fn drain_windowed(&self, window: Window) -> Result<DrainReport, StoreError> {
+    pub(crate) async fn drain_windowed(
+        &self,
+        window: Window,
+        mut pace: Pace,
+    ) -> Result<DrainReport, StoreError> {
         let before = self.footprint().await?;
         let (declared_rows, declared_windows) = match declared::dead_rows() {
-            Some(dead) => self.delete_declared_in_windows(&dead, window).await?,
+            Some(dead) => {
+                self.delete_declared_in_windows(&dead, window, &mut pace)
+                    .await?
+            }
             None => (0, WindowStats::default()),
         };
         let heartbeat_rows = self
-            .delete_in_windows::<bus_event::Entity>(&heartbeat_row(), window)
+            .delete_in_windows::<bus_event::Entity>(&heartbeat_row(), window, &mut pace)
             .await?;
         let non_durable_rows = self
-            .delete_in_windows::<event::Entity>(&non_durable_row(), window)
+            .delete_in_windows::<event::Entity>(&non_durable_row(), window, &mut pace)
             .await?;
         Ok(DrainReport {
             before,
@@ -280,6 +348,7 @@ impl SqliteEventStore {
         &self,
         dead: &HeaderFilter,
         mut window: Window,
+        pace: &mut Pace,
     ) -> Result<u64, StoreError> {
         let db = self.connection();
         let rowid = || Expr::col((T::default(), Alias::new("rowid")));
@@ -329,10 +398,52 @@ impl SqliteEventStore {
             if let Checkpointed::Pinned(_) = self.checkpoint_after_window(held).await? {
                 break;
             }
+            self.rest_at_pace(pace).await?;
             low = high;
             tokio::task::yield_now().await;
         }
         Ok(removed)
+    }
+
+    /// This store's foreground latency with no drain running, measured before a pass: the longest
+    /// of a hundred cheap timed reads (a p99 needs about a hundred samples). The pace's bar is this
+    /// plus one window's budget ([`Pace`]).
+    pub(super) async fn foreground_baseline(&self) -> Result<std::time::Duration, StoreError> {
+        let mut longest = std::time::Duration::ZERO;
+        for _ in 0..100 {
+            longest = longest.max(self.timed_read().await?);
+        }
+        self.gate().take_longest_write();
+        Ok(longest)
+    }
+
+    /// One cheap read on this connection, timed: what a reader beside the drain pays now.
+    async fn timed_read(&self) -> Result<std::time::Duration, StoreError> {
+        let started = std::time::Instant::now();
+        let _: Option<uuid::Uuid> = event::Entity::find()
+            .select_only()
+            .column(event::Column::EventId)
+            .limit(1)
+            .into_tuple()
+            .one(self.connection())
+            .await?;
+        Ok(started.elapsed())
+    }
+
+    /// After a window: steer the pace by the slowest foreground write since the last window (its I/O
+    /// included), and rest as long as the pace says. Returns the rest.
+    pub(super) async fn rest_at_pace(
+        &self,
+        pace: &mut Pace,
+    ) -> Result<std::time::Duration, StoreError> {
+        let slowest = self.gate().take_longest_write();
+        let foreground = (!slowest.is_zero()).then_some(slowest);
+        pace.observe(foreground);
+        let rest = pace.rest();
+        if !rest.is_zero() {
+            tokio::time::sleep(rest).await;
+        }
+        Ok(rest)
     }
 
     /// The checkpoint after a drain window: PASSIVE, outside the write gate and custody, on the
@@ -681,7 +792,7 @@ mod tests {
         }
 
         let report = store
-            .drain_windowed(Window::fixed(3))
+            .drain_windowed(Window::fixed(3), Pace::never())
             .await
             .expect("test: drain");
         assert_eq!(
@@ -709,10 +820,64 @@ mod tests {
         assert_eq!(headers, 5, "a deleted event's header rows went with it");
 
         let again = store
-            .drain_windowed(Window::fixed(3))
+            .drain_windowed(Window::fixed(3), Pace::never())
             .await
             .expect("test: drain again");
         assert_eq!(again.declared_rows, 0, "idempotent");
+    }
+
+    // what this catches (Fable on #1653: a fixed rest is a constant duty, and the drain gets stuck
+    // at it): a pace that does not move both ways. Over the bar the rest doubles from one budget; back
+    // under it, the rest shrinks one budget at a time to zero; never below zero.
+    #[test]
+    fn the_pace_grows_on_a_latency_excursion_and_shrinks_back_after() {
+        let baseline = std::time::Duration::from_millis(2);
+        let mut pace = Pace::against(baseline);
+        let bar = baseline + STATEMENT_BUDGET;
+        assert_eq!(pace.bar(), bar);
+        assert_eq!(
+            pace.rest(),
+            std::time::Duration::ZERO,
+            "no rest before any excursion"
+        );
+        let over = Some(bar + std::time::Duration::from_millis(10));
+        pace.observe(over);
+        assert_eq!(
+            pace.rest(),
+            STATEMENT_BUDGET,
+            "the first excursion rests one budget"
+        );
+        pace.observe(over);
+        pace.observe(over);
+        assert_eq!(
+            pace.rest(),
+            STATEMENT_BUDGET * 4,
+            "it doubles while over the bar"
+        );
+        pace.observe(None);
+        pace.observe(None);
+        assert_eq!(
+            pace.rest(),
+            STATEMENT_BUDGET * 4,
+            "no foreground write, no evidence: the rest holds"
+        );
+        for left in [3, 2, 1, 0] {
+            pace.observe(Some(baseline));
+            assert_eq!(
+                pace.rest(),
+                STATEMENT_BUDGET * left,
+                "under the bar it shrinks one budget a step"
+            );
+        }
+        pace.observe(Some(baseline));
+        assert_eq!(pace.rest(), std::time::Duration::ZERO, "never below zero");
+        let mut never = Pace::never();
+        never.observe(over);
+        assert_eq!(
+            never.rest(),
+            std::time::Duration::ZERO,
+            "a pace with no bar never rests"
+        );
     }
 
     // what this catches (2026-11-03: a fixed 10,000-row window held the store's one connection
@@ -842,7 +1007,7 @@ mod tests {
         heartbeats(&sink, RoomId::from_u128(0xbeef), 0..2_000).await;
         let before = store.footprint().await.expect("test: footprint");
         let drained = store
-            .drain_windowed(Window::fixed(64))
+            .drain_windowed(Window::fixed(64), Pace::never())
             .await
             .expect("test: drain");
         assert_eq!(drained.heartbeat_rows, 2_000);

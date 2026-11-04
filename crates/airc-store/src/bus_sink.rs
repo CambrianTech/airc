@@ -158,12 +158,15 @@ impl SqliteDurableSink {
     /// Admit one write: the file's turn ([`crate::write_gate`]), custody, then no migration past
     /// this binary since open ([`crate::SqliteEventStore::admit_write`] is the same rule).
     async fn admit_write(&self) -> Result<crate::write_gate::Write<'_>, BusError> {
+        let queued = std::time::Instant::now();
         let turn = self.gate.enter().await;
         let ticket = self.custody.admit().map_err(BusError::sink_source)?;
         crate::migration::refuse_if_ahead(&self.db)
             .await
             .map_err(BusError::sink_source)?;
-        Ok(crate::write_gate::Write::new(turn, ticket))
+        Ok(crate::write_gate::Write::new(
+            &self.gate, queued, true, turn, ticket,
+        ))
     }
 
     /// Open a file-backed durable tier from a filesystem path. Keeps

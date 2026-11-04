@@ -65,6 +65,9 @@ pub struct SqliteEventStore {
     custody: crate::custody::WriteGate,
     /// The file's write gate, shared by every handle on it in this process ([`crate::write_gate`]).
     gate: std::sync::Arc<crate::write_gate::FileGate>,
+    /// Whether this handle's writes are foreground (every handle but the drain's own): the pace
+    /// steers by them.
+    foreground: bool,
 }
 
 impl SqliteEventStore {
@@ -80,6 +83,7 @@ impl SqliteEventStore {
             admission,
             crate::write_gate::unshared(),
             file_options,
+            true,
         )
         .await
     }
@@ -91,6 +95,7 @@ impl SqliteEventStore {
         options: fn(
             sea_orm::sqlx::sqlite::SqliteConnectOptions,
         ) -> sea_orm::sqlx::sqlite::SqliteConnectOptions,
+        foreground: bool,
     ) -> Result<Self, StoreError> {
         let custody = crate::custody::WriteGate::new(admission)?;
         let mut opts = ConnectOptions::new(db_url.to_owned());
@@ -136,7 +141,12 @@ impl SqliteEventStore {
         // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db).await?;
         drop(write);
-        Ok(Self { db, custody, gate })
+        Ok(Self {
+            db,
+            custody,
+            gate,
+            foreground,
+        })
     }
 
     /// Open a file-backed SQLite store from a filesystem path.
@@ -157,6 +167,7 @@ impl SqliteEventStore {
             admission,
             crate::write_gate::for_path(path),
             file_options,
+            true,
         )
         .await
     }
@@ -171,6 +182,7 @@ impl SqliteEventStore {
             admission,
             crate::write_gate::for_path(path),
             drain_options,
+            false,
         )
         .await
     }
@@ -185,14 +197,26 @@ impl SqliteEventStore {
     /// migrated past this binary since it was opened ([`StoreError::AheadOfBinary`]). Held until the
     /// write ends.
     pub(crate) async fn admit_write(&self) -> Result<crate::write_gate::Write<'_>, StoreError> {
+        let queued = std::time::Instant::now();
         let turn = self.gate.enter().await;
         let ticket = self.custody.admit()?;
         crate::migration::refuse_if_ahead(&self.db).await?;
-        Ok(crate::write_gate::Write::new(turn, ticket))
+        Ok(crate::write_gate::Write::new(
+            &self.gate,
+            queued,
+            self.foreground,
+            turn,
+            ticket,
+        ))
     }
 
     /// The one ORM, for the sibling modules of this crate that run statements the
     /// entity API does not express (`retention`: windowed deletes, pragmas).
+    /// The file's write gate, shared by every handle on it in this process.
+    pub(crate) fn gate(&self) -> &crate::write_gate::FileGate {
+        &self.gate
+    }
+
     pub(crate) fn connection(&self) -> &DatabaseConnection {
         &self.db
     }

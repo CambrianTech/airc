@@ -11,7 +11,7 @@ use airc_core::{Retention, RetentionKey, TranscriptKind};
 use sea_orm::sea_query::{Alias, Expr, Query, SelectStatement, SimpleExpr};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
 
-use super::{Checkpointed, Window, WindowStats};
+use super::{Checkpointed, Pace, Window, WindowStats};
 use crate::entities::{event, event_header};
 use crate::error::StoreError;
 use crate::sqlite::SqliteEventStore;
@@ -75,6 +75,7 @@ impl SqliteEventStore {
         &self,
         dead: &SimpleExpr,
         mut window: Window,
+        pace: &mut Pace,
     ) -> Result<(u64, WindowStats), StoreError> {
         let db = self.connection();
         let rowid = || Expr::col((event::Entity, Alias::new("rowid")));
@@ -89,7 +90,10 @@ impl SqliteEventStore {
         };
         let mut low = 0i64;
         let mut removed = 0u64;
-        let mut stats = WindowStats::default();
+        let mut stats = WindowStats {
+            bar: pace.bar(),
+            ..WindowStats::default()
+        };
         while low < max_rowid {
             let high = low.saturating_add(window.rows());
             let in_window = rowid().gt(low).and(rowid().lte(high)).and(dead.clone());
@@ -129,6 +133,7 @@ impl SqliteEventStore {
                     break;
                 }
             }
+            stats.rested += self.rest_at_pace(pace).await?;
             low = high;
             tokio::task::yield_now().await;
         }

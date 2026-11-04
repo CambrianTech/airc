@@ -24,6 +24,11 @@ pub(crate) struct FileGate {
     /// Writers queued for the gate now: what a test reads to see a writer waiting HERE, where the
     /// commit before it wakes it, rather than inside SQLite.
     waiting: AtomicUsize,
+    /// The longest any foreground write took since the drain last read it, from queueing for the
+    /// gate to its commit, microseconds: the latency the drain's pace steers by
+    /// ([`crate::retention::Pace`]). It includes the I/O a write pays while the drain's checkpoint
+    /// runs with the gate free, which a gate wait alone never sees.
+    longest_write_us: std::sync::atomic::AtomicU64,
 }
 
 impl FileGate {
@@ -33,6 +38,11 @@ impl FileGate {
         let guard = Arc::clone(&self.lock).lock_owned().await;
         self.waiting.fetch_sub(1, Ordering::AcqRel);
         guard
+    }
+
+    /// The longest foreground write since the last call, and reset: what one writer paid.
+    pub(crate) fn take_longest_write(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.longest_write_us.swap(0, Ordering::AcqRel))
     }
 
     #[cfg(test)]
@@ -69,16 +79,36 @@ static GATES: Mutex<Option<HashMap<PathBuf, Weak<FileGate>>>> = Mutex::new(None)
 pub(crate) struct Write<'a> {
     _turn: tokio::sync::OwnedMutexGuard<()>,
     _custody: crate::custody::WriteTicket<'a>,
+    gate: &'a FileGate,
+    /// When this write queued for the gate.
+    queued: std::time::Instant,
+    /// A write the drain's pace steers by; the drain's own windows are not.
+    foreground: bool,
 }
 
 impl<'a> Write<'a> {
     pub(crate) fn new(
+        gate: &'a FileGate,
+        queued: std::time::Instant,
+        foreground: bool,
         turn: tokio::sync::OwnedMutexGuard<()>,
         custody: crate::custody::WriteTicket<'a>,
     ) -> Self {
         Self {
             _turn: turn,
             _custody: custody,
+            gate,
+            queued,
+            foreground,
+        }
+    }
+}
+
+impl Drop for Write<'_> {
+    fn drop(&mut self) {
+        if self.foreground {
+            let took = u64::try_from(self.queued.elapsed().as_micros()).unwrap_or(u64::MAX); // unwrap_or: a write past u64 microseconds saturates
+            self.gate.longest_write_us.fetch_max(took, Ordering::AcqRel);
         }
     }
 }
