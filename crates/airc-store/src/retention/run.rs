@@ -4,12 +4,12 @@
 //! between them ([`SqliteEventStore::drain`]), so it never holds a transaction or a lock across
 //! a wait, and it can stop anywhere and resume on the next pass.
 //!
-//! Two costs, two gates. The DELETEs run on every pass. Giving the pages back needs a full
-//! `VACUUM` ONCE per file (an `auto_vacuum=0` file cannot be shrunk any other way): that holds
-//! the write lock for the whole rebuild, tens of seconds on a 2.7 GB file, and a send that
-//! lands inside it waits or times out. So the full pass runs only when the freelist is worth it
-//! AND the host says it is idle, and it flips the file to incremental mode so every later pass
-//! returns pages in short transactions.
+//! A pass never rebuilds a file. Its deletes return pages to the freelist, and an incremental file
+//! (every store created since #1653, `migration::apply_migrations`) gives them back in bounded
+//! `incremental_vacuum` steps. A legacy `auto_vacuum=0` file can only shrink by a full `VACUUM`,
+//! which holds every write for the whole rebuild (6.8 s on a 2.9 GB file), so a pass only reports
+//! its freelist; the rebuild is [`SqliteEventStore::compact`], run in a lifecycle stop window where
+//! nothing writes (Fable on #1653).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -29,39 +29,11 @@ pub const FIRST_PASS_AFTER: Duration = Duration::from_secs(120);
 /// Then steady state: what a pass drains grows only from the writers between passes.
 pub const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// A full vacuum is worth its lock when at least this share of the file is freelist. Below it,
-/// the incremental pass on every tick is enough.
-pub const FULL_RECLAIM_AT_FREE_PERCENT: u64 = 25;
-
-/// Past this share the file is mostly air and the full vacuum runs whether the host is idle or
-/// not (card 4de825ce): on BigMama the first pass after #1459 left 2,026 MB of 2,917 on the
-/// freelist and the quiet gate never opened (a serving node is never quiet), so nothing came
-/// back until an operator ran VACUUM by hand (6.8 s of held writes for 2.9 GB). A minute of
-/// held writes is cheaper than two gigabytes of dead file forever.
-pub const FULL_RECLAIM_REGARDLESS_AT_FREE_PERCENT: u64 = 60;
-
-/// PURE: which reclaim a pass should run, from the footprint, the file's vacuum mode and the
-/// idle signal. `None` when the freelist is not worth a transaction at all.
-///
-/// A full VACUUM is needed exactly ONCE per file: to leave `auto_vacuum=0` (card d0d5a927).
-/// Once the file is `INCREMENTAL`, any freelist comes back through bounded
-/// `incremental_vacuum` steps, so a full rebuild of an incremental file rewrites the whole file
-/// for nothing.
-pub fn reclaim_for(after: StoreFootprint, incremental: bool, is_idle: bool) -> Option<Reclaim> {
-    if after.free_bytes == 0 {
-        return None;
-    }
-    if incremental {
-        return Some(Reclaim::Incremental);
-    }
-    let free = after.free_percent();
-    if free >= FULL_RECLAIM_REGARDLESS_AT_FREE_PERCENT
-        || (free >= FULL_RECLAIM_AT_FREE_PERCENT && is_idle)
-    {
-        Some(Reclaim::Full)
-    } else {
-        Some(Reclaim::Incremental)
-    }
+/// PURE: the reclaim a pass runs: the bounded incremental steps, on an incremental file with a
+/// freelist. A legacy `auto_vacuum=0` file is never rebuilt by a pass (`None`): its freelist waits
+/// for [`SqliteEventStore::compact`] in a stop window.
+pub fn reclaim_for(after: StoreFootprint, incremental: bool) -> Option<Reclaim> {
+    (incremental && after.free_bytes > 0).then_some(Reclaim::Incremental)
 }
 
 /// What one pass did, every step's outcome kept: a drain that silently stopped running is how
@@ -69,7 +41,10 @@ pub fn reclaim_for(after: StoreFootprint, incremental: bool, is_idle: bool) -> O
 #[derive(Debug)]
 pub struct PassReport {
     pub drain: Result<DrainReport, StoreError>,
-    pub reclaim: Option<Result<(Reclaim, StoreFootprint), StoreError>>,
+    pub reclaim: Option<Result<StoreFootprint, StoreError>>,
+    /// A legacy `auto_vacuum=0` file's freelist, bytes, that only [`SqliteEventStore::compact`]
+    /// in a stop window gives back; `None` for an incremental file.
+    pub awaiting_compaction: Option<u64>,
     /// `None` when the pass never reached the checkpoint (the drain's connection did not open).
     pub wal: Option<Result<WalCheckpoint, StoreError>>,
 }
@@ -89,15 +64,22 @@ impl std::fmt::Display for PassReport {
             Err(error) => write!(f, "drain failed: {error}")?,
         }
         match &self.reclaim {
-            Some(Ok((mode, after))) => write!(
+            Some(Ok(after)) => write!(
                 f,
-                "; {mode:?} reclaim: file {} MB, free {} MB ({}%)",
+                "; reclaimed: file {} MB, free {} MB ({}%)",
                 mb(after.file_bytes),
                 mb(after.free_bytes),
                 after.free_percent(),
             )?,
             Some(Err(error)) => write!(f, "; reclaim failed: {error}")?,
             None => write!(f, "; nothing to reclaim")?,
+        }
+        if let Some(free) = self.awaiting_compaction {
+            write!(
+                f,
+                "; legacy file: {} MB free awaits compaction in a stop window",
+                mb(free)
+            )?;
         }
         match &self.wal {
             None => write!(f, "; WAL not reached"),
@@ -125,23 +107,25 @@ impl std::fmt::Display for PassReport {
 /// One pass: the drain, then the reclaim the footprint and the idle signal allow, then the WAL
 /// checkpoint. Every pass checkpoints, not only after a full vacuum: a reader that never lets
 /// go is how the M5's WAL reached 14 GB beside a 2.9 GB file on 2026-11-03 (card e719540d).
-pub async fn pass(store: &SqliteEventStore, is_idle: bool) -> PassReport {
+pub async fn pass(store: &SqliteEventStore) -> PassReport {
     let drain = store.drain().await;
-    let reclaim = match &drain {
-        Ok(report) => {
-            // Unknown mode reads as NOT incremental: the worst case is the one-time full pass
-            // this file would have needed anyway.
-            let incremental = store.is_incremental().await.unwrap_or(false); // unwrap_or: an unreadable pragma falls to the full-pass decision, never to skipping a reclaim
-            match reclaim_for(report.after, incremental, is_idle) {
-                Some(mode) => Some(store.reclaim(mode).await.map(|after| (mode, after))),
-                None => None,
-            }
-        }
-        Err(_) => None,
+    let (reclaim, awaiting_compaction) = match &drain {
+        Ok(report) => match store.is_incremental().await {
+            Ok(incremental) => (
+                match reclaim_for(report.after, incremental) {
+                    Some(mode) => Some(store.reclaim(mode).await),
+                    None => None,
+                },
+                (!incremental && report.after.free_bytes > 0).then_some(report.after.free_bytes),
+            ),
+            Err(error) => (Some(Err(error)), None),
+        },
+        Err(_) => (None, None),
     };
     PassReport {
         drain,
         reclaim,
+        awaiting_compaction,
         wal: Some(store.checkpoint_wal().await),
     }
 }
@@ -162,7 +146,6 @@ pub async fn run(
     path: PathBuf,
     any_open: impl Fn() -> bool,
     shutdown: impl Future<Output = ()>,
-    is_idle: impl Fn() -> bool,
     report: impl Fn(&PassReport),
 ) -> Ended {
     tokio::pin!(shutdown);
@@ -185,12 +168,13 @@ pub async fn run(
         };
         match opened {
             Ok(store) => {
-                report(&pass(&store, is_idle()).await);
+                report(&pass(&store).await);
                 own = Some(store);
             }
             Err(error) => report(&PassReport {
                 drain: Err(error),
                 reclaim: None,
+                awaiting_compaction: None,
                 wal: None,
             }),
         }
@@ -234,13 +218,12 @@ fn any_open(path: &Path) -> bool {
 
 /// Register `store`, a handle on the file at `path`, with the file's drain, starting the drain
 /// (on its own connection, [`run`]) as a background task on the current tokio runtime when this
-/// process does not already run one for the file. Returns whether it started one; `shutdown`, `is_idle` and `report` are the
+/// process does not already run one for the file. Returns whether it started one; `shutdown` and `report` are the
 /// starting host's.
 pub fn spawn(
     store: &Arc<SqliteEventStore>,
     path: &Path,
     shutdown: impl Future<Output = ()> + Send + 'static,
-    is_idle: impl Fn() -> bool + Send + Sync + 'static,
     report: impl Fn(&PassReport) + Send + Sync + 'static,
 ) -> bool {
     let path = path.to_path_buf();
@@ -254,7 +237,7 @@ pub fn spawn(
         files.insert(path.clone(), vec![Arc::downgrade(store)]);
     }
     tokio::spawn(async move {
-        let ended = run(path.clone(), || any_open(&path), shutdown, is_idle, report).await;
+        let ended = run(path.clone(), || any_open(&path), shutdown, report).await;
         if ended == Ended::Shutdown {
             // The task is gone but handles may remain: the next open starts a new one.
             let mut draining = DRAINING.lock().unwrap_or_else(|p| p.into_inner());
@@ -270,51 +253,28 @@ pub fn spawn(
 mod tests {
     use super::*;
 
-    // what this catches: the two gates on the expensive pass. A full vacuum on a busy host
-    // would hold every send behind a rebuild; skipping reclaim entirely below the threshold
-    // would let the freelist ride forever; reclaiming an empty freelist is a transaction for
-    // nothing.
+    // what this catches (Fable on #1653: the full VACUUM held every send for the whole rebuild on
+    // a serving node, 6.8 s on 2.9 GB): a pass that rebuilds a file. An incremental file with a
+    // freelist takes the bounded steps; a legacy file and a file with nothing free take none.
     #[test]
-    fn a_full_reclaim_needs_both_a_worthwhile_freelist_and_a_quiet_host() {
+    fn a_pass_never_rebuilds_a_file_it_only_takes_bounded_steps() {
         let footprint = |free_bytes| StoreFootprint {
-            file_bytes: 2_700_000_000,
+            file_bytes: 2_917_000_000,
             free_bytes,
         };
-        let (heavy, light, clean) = (
-            footprint(1_300_000_000),
-            footprint(100_000_000),
-            footprint(0),
-        );
-        assert_eq!(reclaim_for(heavy, false, true), Some(Reclaim::Full));
         assert_eq!(
-            reclaim_for(heavy, false, false),
-            Some(Reclaim::Incremental),
-            "busy: never the rebuild"
+            reclaim_for(footprint(2_026_000_000), true),
+            Some(Reclaim::Incremental)
         );
         assert_eq!(
-            reclaim_for(light, false, true),
-            Some(Reclaim::Incremental),
-            "not worth the lock"
+            reclaim_for(footprint(2_026_000_000), false),
+            None,
+            "legacy: waits for a stop window"
         );
         assert_eq!(
-            reclaim_for(clean, false, true),
+            reclaim_for(footprint(0), true),
             None,
             "nothing to give back"
-        );
-        // card d0d5a927: an INCREMENTAL file never takes the full rebuild, however much is
-        // free, because the bounded steps return it all.
-        assert_eq!(reclaim_for(heavy, true, true), Some(Reclaim::Incremental));
-        // card 4de825ce: BigMama's first pass, 2,026 MB of 2,917 free, on a host that is never
-        // quiet: the rebuild runs anyway, or the file stays dead weight forever.
-        let air = StoreFootprint {
-            file_bytes: 2_917_000_000,
-            free_bytes: 2_026_000_000,
-        };
-        assert_eq!(reclaim_for(air, true, false), Some(Reclaim::Incremental));
-        assert_eq!(
-            reclaim_for(air, false, false),
-            Some(Reclaim::Full),
-            "mostly air: quiet or not"
         );
     }
 }

@@ -295,6 +295,18 @@ impl SqliteEventStore {
         })
     }
 
+    /// The one rebuild a legacy `auto_vacuum=0` file needs: a full VACUUM that also makes it
+    /// incremental, then a TRUNCATE checkpoint. It holds every write for the whole rebuild (6.8 s
+    /// on a 2.9 GB file), so it runs only in a lifecycle stop window where nothing writes: the
+    /// daemon before it serves its file, and `airc store compact` for a store a process opens
+    /// itself, while that process is down. An incremental file is returned as it is.
+    pub async fn compact(&self) -> Result<StoreFootprint, StoreError> {
+        if self.is_incremental().await? {
+            return self.footprint().await;
+        }
+        self.reclaim(Reclaim::Full).await
+    }
+
     /// Give freelist pages back to the filesystem. See [`Reclaim`] for the cost of
     /// each mode; the caller decides when the daemon can afford which.
     pub async fn reclaim(&self, mode: Reclaim) -> Result<StoreFootprint, StoreError> {
@@ -712,8 +724,21 @@ mod tests {
         assert_eq!(wal, 0, "the WAL file is truncated on disk");
     }
 
+    /// Heartbeat rows enough to occupy pages a drain will free.
+    async fn heartbeats(sink: &SqliteDurableSink, ch: RoomId, counters: std::ops::Range<u64>) {
+        for counter in counters {
+            sink.append(&bus_event(ch, counter, &[("airc.heartbeat.kind", "alive")]))
+                .await
+                .expect("test: heartbeat row");
+        }
+    }
+
+    // what this catches (Fable on #1653: stores were born auto_vacuum=0, so every one would one day
+    // need the full rebuild that holds every write): a new store that is not incremental from
+    // birth. A drain's freed pages come back in bounded steps, the file shrinks on disk, and no
+    // rebuild runs. Windows far below the row count cover the whole table.
     #[tokio::test]
-    async fn a_full_reclaim_returns_the_freelist_and_enables_incremental_passes() {
+    async fn a_new_store_is_incremental_and_a_drain_gives_its_pages_back_in_steps() {
         let dir = tempfile::tempdir().expect("test: tempdir");
         let path = dir.path().join("events.sqlite");
         let store = SqliteEventStore::open_path(&path)
@@ -722,16 +747,12 @@ mod tests {
         let sink = SqliteDurableSink::open_path(&path)
             .await
             .expect("test: sink");
-        let ch = RoomId::from_u128(0xbeef);
-        // Enough heartbeat rows to occupy pages the drain will free.
-        for counter in 0..2_000u64 {
-            sink.append(&bus_event(ch, counter, &[("airc.heartbeat.kind", "alive")]))
-                .await
-                .expect("test: heartbeat row");
-        }
+        assert!(
+            store.is_incremental().await.expect("test: mode"),
+            "born incremental"
+        );
+        heartbeats(&sink, RoomId::from_u128(0xbeef), 0..2_000).await;
         let before = store.footprint().await.expect("test: footprint");
-        // A window far below the row count: the drain must cover every window, not
-        // just the first one (the batched pass that keeps the connection free).
         let drained = store
             .drain_windowed(Window::fixed(64))
             .await
@@ -739,41 +760,76 @@ mod tests {
         assert_eq!(drained.heartbeat_rows, 2_000);
         assert!(
             drained.after.free_bytes > 0,
-            "a DELETE leaves the pages on the freelist: {:?}",
-            drained.after
+            "a DELETE leaves pages on the freelist"
         );
         assert_eq!(
-            drained.after.file_bytes, before.file_bytes,
-            "…and the file does not shrink by itself"
+            run::reclaim_for(drained.after, true),
+            Some(Reclaim::Incremental)
         );
-        let after = store.reclaim(Reclaim::Full).await.expect("test: vacuum");
-        assert_eq!(after.free_bytes, 0, "a full vacuum returns every free page");
+        let after = store
+            .reclaim(Reclaim::Incremental)
+            .await
+            .expect("test: steps");
+        assert_eq!(
+            after.free_bytes, 0,
+            "the bounded steps returned the freelist"
+        );
         assert!(
             after.file_bytes < before.file_bytes,
-            "the file shrank: {before:?} -> {after:?}"
+            "{before:?} -> {after:?}"
         );
-        // …and the OS file followed, not just the page accounting (WAL checkpointed).
+        store.checkpoint_wal().await.expect("test: checkpoint");
         let on_disk = std::fs::metadata(&path).expect("test: db file").len();
         assert!(
             on_disk <= after.file_bytes + 65_536,
             "the file on disk is the page accounting: {on_disk} vs {}",
             after.file_bytes
         );
-        // Incremental reclaim is now live: rows deleted from here on come back
-        // without a full vacuum.
-        for counter in 2_000..2_500u64 {
-            sink.append(&bus_event(ch, counter, &[("airc.heartbeat.kind", "alive")]))
-                .await
-                .expect("test: heartbeat row");
-        }
-        store.drain().await.expect("test: drain");
-        let incremental = store
-            .reclaim(Reclaim::Incremental)
+    }
+
+    // what this catches: a legacy auto_vacuum=0 file that a pass cannot shrink and that nothing
+    // converts. A pass leaves it alone (it reports the freelist); `compact`, in a stop window, gives
+    // the pages back and makes it incremental, after which it is never rebuilt again.
+    #[tokio::test]
+    async fn compact_converts_a_legacy_file_once() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let path = dir.path().join("events.sqlite");
+        // A store as every binary before #1653 created it: migrated with no vacuum mode set.
+        let raw = sea_orm::Database::connect(crate::sqlite::sqlite_file_url(&path))
             .await
-            .expect("test: incremental");
+            .expect("test: connect");
+        <crate::migration::Migrator as sea_orm_migration::MigratorTrait>::up(&raw, None)
+            .await
+            .expect("test: legacy migrate");
+        drop(raw);
+        let store = SqliteEventStore::open_path(&path)
+            .await
+            .expect("test: store");
+        let sink = SqliteDurableSink::open_path(&path)
+            .await
+            .expect("test: sink");
+        assert!(!store.is_incremental().await.expect("test: mode"), "legacy");
+        heartbeats(&sink, RoomId::from_u128(0xfeed), 0..2_000).await;
+        let drained = store.drain().await.expect("test: drain");
+        assert!(drained.after.free_bytes > 0);
         assert_eq!(
-            incremental.free_bytes, 0,
-            "incremental vacuum returned the freelist"
+            run::reclaim_for(drained.after, false),
+            None,
+            "a pass never rebuilds"
+        );
+        let compacted = store.compact().await.expect("test: compact");
+        assert_eq!(
+            compacted.free_bytes, 0,
+            "the rebuild returned every free page"
+        );
+        assert!(
+            store.is_incremental().await.expect("test: mode"),
+            "and made it incremental"
+        );
+        assert_eq!(
+            store.compact().await.expect("test: again"),
+            store.footprint().await.expect("test: footprint"),
+            "an incremental file is left as it is"
         );
     }
 }

@@ -101,7 +101,6 @@ impl SqliteEventStore {
         // Typed builder, not literal SQL — `SqliteConnectOptions`
         // is sea-orm's ORM-level connection-config surface.
         opts.sqlx_logging(false).map_sqlx_sqlite_opts(|so| {
-            use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
             // A SECOND OPENER WAITS, IT DOES NOT FAIL (2026-09-14). Several processes
             // open one events.sqlite on a machine: the daemon, every attached scope, a
             // test's LAN-gateway handle. Opening runs migrations (DDL = a write lock);
@@ -110,9 +109,7 @@ impl SqliteEventStore {
             // attach (airc #1419/#1420; the two-pools-on-one-file flake). WAL was
             // already set; the missing piece was telling SQLite to WAIT as long as
             // the pool itself waits — one bound, one clock.
-            so.journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
+            file_options(so)
         });
         let write = custody.admit()?;
         let db = Database::connect(opts).await?;
@@ -532,6 +529,22 @@ fn stored_endpoints_stamp_ms(column: Option<i64>) -> Result<u64, StoreError> {
         Some(value) => i64_to_u64("peer_trust.endpoints_advertised_at_ms", value),
         None => Ok(0),
     }
+}
+
+/// The options every writable store connection opens with, one owner for both the store and the
+/// sink. `auto_vacuum = INCREMENTAL` comes first: SQLite takes it only on a file with no tables yet
+/// and ignores it after WAL is on, so a new file is born incremental (every later drain returns
+/// its pages in bounded steps, no rebuild) while an existing file keeps its mode until
+/// `SqliteEventStore::compact` (Fable on #1653). Then WAL, `synchronous = NORMAL`, and a busy
+/// timeout that waits as long as the pool does.
+pub(crate) fn file_options(
+    so: sea_orm::sqlx::sqlite::SqliteConnectOptions,
+) -> sea_orm::sqlx::sqlite::SqliteConnectOptions {
+    use sea_orm::sqlx::sqlite::{SqliteAutoVacuum, SqliteJournalMode, SqliteSynchronous};
+    so.auto_vacuum(SqliteAutoVacuum::Incremental)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(POOL_ACQUIRE_TIMEOUT)
 }
 
 pub(crate) fn sqlite_file_url(path: &Path) -> String {

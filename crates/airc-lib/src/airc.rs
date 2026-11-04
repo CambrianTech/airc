@@ -3368,15 +3368,13 @@ fn is_a_real_name(agent_name: &str) -> bool {
 }
 /// The store's one drain for a store this handle opened itself
 /// ([`airc_store::retention::run::spawn`]): it runs while any handle on the file is open in
-/// this process, and every pass goes to the tracing log. No mesh is known here, so it never
-/// reports idle: a full vacuum runs only past the store's mostly-air threshold.
+/// this process, and every pass goes to the tracing log.
 fn drain_in_background(store: &Arc<SqliteEventStore>, path: &Path) {
     let shown = path.display().to_string();
     airc_store::retention::run::spawn(
         store,
         path,
         std::future::pending(),
-        || false,
         move |pass| tracing::info!(store = %shown, "airc store retention: {pass}"),
     );
 }

@@ -1947,6 +1947,7 @@ pub async fn run_daemon(
     // bridge's unknown-channel heal reads the account-registry CACHE
     // (a concrete SqliteAccountRegistryStore over this same file).
     let machine_store = Arc::new(SqliteEventStore::open_path(&db_path).await?);
+    airc_daemon::store_compaction::before_serving(&machine_store).await;
     let coordinator_store: Arc<dyn EventStore> = machine_store.clone();
     let state = Arc::new(
         DaemonState::build(
@@ -2092,16 +2093,13 @@ pub async fn run_daemon(
         })
     };
     // The store's one drain (airc_store::retention::run), as every store runs it: here
-    // on the daemon's lifecycle, the full vacuum behind its quiet-mesh gate, and every
-    // pass on stderr, the daemon's log sink.
+    // on the daemon's lifecycle, every pass on stderr (the daemon's log sink).
     {
         let shutdown_state = state.clone();
-        let idle_state = state.clone();
         airc_store::retention::run::spawn(
             &machine_store,
             &db_path,
             async move { shutdown_state.shutdown.notified().await },
-            move || mesh_quiet_now(&idle_state),
             |pass| eprintln!("airc store retention: {pass}"),
         );
     }

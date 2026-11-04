@@ -83,12 +83,7 @@ impl SqliteDurableSink {
         // Windows CI). The driver applies them to every connection it opens, an
         // old DB's included (§3.3: WAL lets deep-replay reads run beside the one
         // writer; `synchronous=NORMAL` fsyncs per checkpoint, not per commit).
-        opts.map_sqlx_sqlite_opts(|so| {
-            use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
-            so.journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
-        });
+        opts.map_sqlx_sqlite_opts(crate::sqlite::file_options);
         let write = custody.admit().map_err(BusError::sink_source)?;
         let db = Database::connect(opts)
             .await
@@ -131,13 +126,10 @@ impl SqliteDurableSink {
         let readers = if share_pool {
             db.clone()
         } else {
-            // Preserve the exact filename/VFS/cache options of the opened
-            // writer. Only reads use this pool; migrations run once above.
-            let read_options = sqlite_options
-                .as_ref()
-                .clone()
-                .read_only(true)
-                .create_if_missing(false);
+            // The writer's FILE, not its pragmas: `auto_vacuum` (`sqlite::file_options`) is a
+            // write a read-only connection refuses. Only reads use this pool; migrations run once
+            // above.
+            let read_options = read_only_options(sqlite_options.get_filename());
             let mut opts = Self::pool_options(db_url);
             opts.map_sqlx_sqlite_opts(move |_| read_options.clone());
             Database::connect(opts)
@@ -183,13 +175,7 @@ impl SqliteDurableSink {
         opts.sqlx_logging(false);
         // Supply the native filename through the typed driver, not a URI: `?`
         // and `#` in a path must not become connection parameters.
-        opts.map_sqlx_sqlite_opts(move |_| {
-            sea_orm::sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&path)
-                .read_only(true)
-                .create_if_missing(false)
-                .busy_timeout(POOL_ACQUIRE_TIMEOUT)
-        });
+        opts.map_sqlx_sqlite_opts(move |_| read_only_options(&path));
         let db = Database::connect(opts)
             .await
             .map_err(BusError::sink_source)?;
@@ -629,6 +615,17 @@ fn page_rows(
         .order_by(bus_event::Column::EventId, order)
         .limit(limit);
     crate::event_table::addressee_branches(query, rule.addressed_to)
+}
+
+/// A read-only connection to the store file at `path`: the typed filename (`?` and `#` in a path
+/// never become connection parameters), never created, waiting as long as the pool does, and no
+/// pragma that writes. The one shape for the sink's reader pool and `open_read_only_path`.
+fn read_only_options(path: &Path) -> sea_orm::sqlx::sqlite::SqliteConnectOptions {
+    sea_orm::sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false)
+        .busy_timeout(POOL_ACQUIRE_TIMEOUT)
 }
 
 /// Shared by both reverse-paging legs ([`DurableSink::page_tail`],

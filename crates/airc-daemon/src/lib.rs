@@ -45,6 +45,7 @@ pub mod route_refresh;
 pub mod server;
 mod shared_frames;
 pub mod state;
+pub mod store_compaction;
 pub mod trust_refresh;
 
 pub use server::{run, DaemonError};
