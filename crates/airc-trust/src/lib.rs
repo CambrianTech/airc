@@ -186,6 +186,28 @@ async fn open_store(home: &Path) -> Result<SqliteEventStore, PeersStoreError> {
     Ok(SqliteEventStore::open_path(&store_path(home)).await?)
 }
 
+/// One open handle on `home`'s trust rows, for a reader that asks on every request (the
+/// daemon's addressed admission). The free functions here open the store per call, which suits a
+/// one-shot CLI command; a reader per frame opened a pool, loaded every peer and scanned for one,
+/// about 24 SQLite connections a second on a quiet IntelMac (card 0dc9af03). Rows another process
+/// writes are seen on the next read, so admission still reads durable trust, never a cache.
+pub struct TrustStore {
+    store: SqliteEventStore,
+}
+
+impl TrustStore {
+    pub async fn open(home: &Path) -> Result<Self, PeersStoreError> {
+        Ok(Self {
+            store: open_store(home).await?,
+        })
+    }
+
+    /// One peer's trust row: a primary-key seek on the held handle. `None` when not enrolled.
+    pub async fn peer(&self, peer_id: PeerId) -> Result<Option<StoredPeer>, PeersStoreError> {
+        self.store.peer_trust(peer_id).await.map_err(Into::into)
+    }
+}
+
 /// Load the peer list from `home`. Returns an empty list when no
 /// peer trust rows exist yet (normal for a fresh install).
 pub async fn load(home: &Path) -> Result<Vec<StoredPeer>, PeersStoreError> {

@@ -146,7 +146,7 @@ async fn verify_addressed(
         return Err(AddressedAdmissionError::SenderMustSign);
     }
     let registry =
-        match crate::trust_refresh::admission_registry(&state.home, frame.envelope.sender).await {
+        match crate::trust_refresh::admission_registry(&state.trust, frame.envelope.sender).await {
             Ok(registry) => registry,
             Err(error) => return Err(AddressedAdmissionError::Trust(error)),
         };
@@ -201,7 +201,7 @@ where
         let request = read_frame::<_, Request>(&mut reader).await?;
         Ok::<_, std::io::Error>(match request {
             Some(Request::ProveAddressed(proof)) => {
-                let registry = crate::trust_refresh::admission_registry(&state.home, peer)
+                let registry = crate::trust_refresh::admission_registry(&state.trust, peer)
                     .await
                     .map_err(std::io::Error::other)?;
                 challenge.verify(&proof, &registry).is_ok()
@@ -566,13 +566,13 @@ mod tests {
             airc_protocol::trust_rotation::sign_rotation(&old, peer, next.public_bytes(), 1, 1)
                 .unwrap();
         airc_trust::rotate(&state.home, &rotation).await.unwrap();
-        crate::trust_refresh::refresh_peer(&state.registry, &state.home, peer, None)
+        crate::trust_refresh::refresh_peer(&state.registry, &state.trust, peer, None)
             .await
             .unwrap();
         // Deterministically finish a delayed old cache write after the new one.
         state.registry.enrol(peer, 0, old.public_bytes()).unwrap();
         state.registry.enrol(peer, 7, old.public_bytes()).unwrap();
-        let registry = crate::trust_refresh::admission_registry(&state.home, peer)
+        let registry = crate::trust_refresh::admission_registry(&state.trust, peer)
             .await
             .unwrap();
         let challenge = AttachChallenge {
@@ -590,7 +590,7 @@ mod tests {
             .verify(&challenge.sign(&next, 0), &registry)
             .is_ok());
         airc_trust::remove(&state.home, peer).await.unwrap();
-        assert!(crate::trust_refresh::admission_registry(&state.home, peer)
+        assert!(crate::trust_refresh::admission_registry(&state.trust, peer)
             .await
             .is_err());
     }
@@ -627,7 +627,7 @@ mod tests {
         assert!(state.registry.lookup(unknown, 0).is_none());
         // A fresh verifier (daemon restart) recovers admission from durable trust.
         let restarted = PeerKeyRegistry::new();
-        crate::trust_refresh::refresh_peer(&restarted, &state.home, peer, None)
+        crate::trust_refresh::refresh_peer(&restarted, &state.trust, peer, None)
             .await
             .unwrap();
         assert_eq!(
