@@ -24,11 +24,14 @@ pub(crate) struct FileGate {
     /// Writers queued for the gate now: what a test reads to see a writer waiting HERE, where the
     /// commit before it wakes it, rather than inside SQLite.
     waiting: AtomicUsize,
-    /// The longest any foreground write took since the drain last read it, from queueing for the
-    /// gate to its commit, microseconds: the latency the drain's pace steers by
-    /// ([`crate::retention::Pace`]). It includes the I/O a write pays while the drain's checkpoint
-    /// runs with the gate free, which a gate wait alone never sees.
-    longest_write_us: std::sync::atomic::AtomicU64,
+    /// The slowest foreground write since the drain last read it, by layer: the latency the
+    /// drain's pace steers by ([`crate::retention::Pace`]), and where it went. It includes the I/O
+    /// a write pays while the drain's checkpoint runs with the gate free, which a gate wait alone
+    /// never sees.
+    slowest: Mutex<Option<WriteLayers>>,
+    /// Bumped as the drain's checkpoint starts and again as it ends (odd while one runs), so a
+    /// write can tell whether a checkpoint ran during its life.
+    checkpoint_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl FileGate {
@@ -40,9 +43,23 @@ impl FileGate {
         guard
     }
 
-    /// The longest foreground write since the last call, and reset: what one writer paid.
-    pub(crate) fn take_longest_write(&self) -> std::time::Duration {
-        std::time::Duration::from_micros(self.longest_write_us.swap(0, Ordering::AcqRel))
+    /// The slowest foreground write since the last call, by layer, and reset: what one writer
+    /// paid, and where.
+    pub(crate) fn take_slowest_write(&self) -> Option<WriteLayers> {
+        // A poisoned lock still holds a valid record: no invariant spans its update.
+        self.slowest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
+    /// The drain's checkpoint is starting or has ended: each call moves the epoch one step.
+    pub(crate) fn checkpoint_edge(&self) {
+        self.checkpoint_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn epoch(&self) -> u64 {
+        self.checkpoint_epoch.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -76,12 +93,37 @@ static GATES: Mutex<Option<HashMap<PathBuf, Weak<FileGate>>>> = Mutex::new(None)
 
 /// One admitted write: the file's turn, then this process's custody for it ([`crate::custody`]).
 /// Held for the write's whole transaction.
+/// One foreground write's time, by layer: queued for the gate, BEGIN plus its statements, and
+/// COMMIT; and whether a drain checkpoint ran during it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteLayers {
+    /// Queued for the file's gate.
+    pub wait: std::time::Duration,
+    /// After the gate: custody and the version check (`migration::refuse_if_ahead`, a query).
+    pub admission: std::time::Duration,
+    pub statement: std::time::Duration,
+    pub commit: std::time::Duration,
+    pub overlapped_checkpoint: bool,
+}
+
+impl WriteLayers {
+    pub fn total(&self) -> std::time::Duration {
+        self.wait + self.admission + self.statement + self.commit
+    }
+}
+
 pub(crate) struct Write<'a> {
     _turn: tokio::sync::OwnedMutexGuard<()>,
     _custody: crate::custody::WriteTicket<'a>,
     gate: &'a FileGate,
-    /// When this write queued for the gate.
+    /// When this write queued for the gate, and the checkpoint epoch then.
     queued: std::time::Instant,
+    epoch: u64,
+    /// When the gate granted it, and when custody and the version check then admitted it.
+    entered: std::time::Instant,
+    granted: std::time::Instant,
+    /// When its COMMIT began ([`Self::committing`]); `None` for a path that never marks it.
+    commit_started: Option<std::time::Instant>,
     /// A write the drain's pace steers by; the drain's own windows are not.
     foreground: bool,
 }
@@ -90,6 +132,8 @@ impl<'a> Write<'a> {
     pub(crate) fn new(
         gate: &'a FileGate,
         queued: std::time::Instant,
+        entered: std::time::Instant,
+        epoch: u64,
         foreground: bool,
         turn: tokio::sync::OwnedMutexGuard<()>,
         custody: crate::custody::WriteTicket<'a>,
@@ -99,16 +143,45 @@ impl<'a> Write<'a> {
             _custody: custody,
             gate,
             queued,
+            entered,
+            epoch,
+            granted: std::time::Instant::now(),
+            commit_started: None,
             foreground,
         }
+    }
+
+    /// The write's COMMIT begins now: the layers split statement time from commit time.
+    pub(crate) fn committing(&mut self) {
+        self.commit_started = Some(std::time::Instant::now());
+    }
+}
+
+impl FileGate {
+    /// The checkpoint epoch a write starting now records.
+    pub(crate) fn epoch_now(&self) -> u64 {
+        self.epoch()
     }
 }
 
 impl Drop for Write<'_> {
     fn drop(&mut self) {
-        if self.foreground {
-            let took = u64::try_from(self.queued.elapsed().as_micros()).unwrap_or(u64::MAX); // unwrap_or: a write past u64 microseconds saturates
-            self.gate.longest_write_us.fetch_max(took, Ordering::AcqRel);
+        if !self.foreground {
+            return;
+        }
+        let end = std::time::Instant::now();
+        let commit_started = self.commit_started.unwrap_or(end); // unwrap_or: a path that never marks its commit counts it all as statement
+        let now = self.gate.epoch();
+        let layers = WriteLayers {
+            wait: self.entered - self.queued,
+            admission: self.granted - self.entered,
+            statement: commit_started - self.granted,
+            commit: end - commit_started,
+            overlapped_checkpoint: self.epoch % 2 == 1 || now != self.epoch,
+        };
+        let mut slowest = self.gate.slowest.lock().unwrap_or_else(|p| p.into_inner());
+        if slowest.is_none_or(|s| layers.total() > s.total()) {
+            *slowest = Some(layers);
         }
     }
 }

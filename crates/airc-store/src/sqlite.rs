@@ -198,12 +198,16 @@ impl SqliteEventStore {
     /// write ends.
     pub(crate) async fn admit_write(&self) -> Result<crate::write_gate::Write<'_>, StoreError> {
         let queued = std::time::Instant::now();
+        let epoch = self.gate.epoch_now();
         let turn = self.gate.enter().await;
+        let entered = std::time::Instant::now();
         let ticket = self.custody.admit()?;
         crate::migration::refuse_if_ahead(&self.db).await?;
         Ok(crate::write_gate::Write::new(
             &self.gate,
             queued,
+            entered,
+            epoch,
             self.foreground,
             turn,
             ticket,

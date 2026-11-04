@@ -133,7 +133,11 @@ impl SqliteEventStore {
                     break;
                 }
             }
-            stats.rested += self.rest_at_pace(pace).await?;
+            let (rested, slow) = self.rest_at_pace(pace).await?;
+            stats.rested += rested;
+            if let Some(layers) = slow {
+                stats.slow(layers);
+            }
             low = high;
             tokio::task::yield_now().await;
         }

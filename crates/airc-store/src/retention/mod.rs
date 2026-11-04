@@ -238,11 +238,29 @@ pub struct WindowStats {
     pub stopped_pinned: bool,
     /// Rested between windows by the pace ([`Pace`]).
     pub rested: std::time::Duration,
+    /// Windows whose slowest foreground write was over the bar, with that write's layers summed,
+    /// and how many of those writes overlapped a drain checkpoint: where the tail goes.
+    pub slow_writes: u64,
+    pub slow_overlapping_checkpoint: u64,
+    pub slow_wait: std::time::Duration,
+    pub slow_admission: std::time::Duration,
+    pub slow_statement: std::time::Duration,
+    pub slow_commit: std::time::Duration,
     /// The foreground latency the pace steered against: the bar it held the drain to.
     pub bar: std::time::Duration,
 }
 
 impl WindowStats {
+    /// Count a window whose slowest foreground write was over the bar.
+    pub(super) fn slow(&mut self, layers: crate::write_gate::WriteLayers) {
+        self.slow_writes += 1;
+        self.slow_overlapping_checkpoint += u64::from(layers.overlapped_checkpoint);
+        self.slow_wait += layers.wait;
+        self.slow_admission += layers.admission;
+        self.slow_statement += layers.statement;
+        self.slow_commit += layers.commit;
+    }
+
     fn add(
         &mut self,
         header_delete: std::time::Duration,
@@ -398,7 +416,7 @@ impl SqliteEventStore {
             if let Checkpointed::Pinned(_) = self.checkpoint_after_window(held).await? {
                 break;
             }
-            self.rest_at_pace(pace).await?;
+            let _ = self.rest_at_pace(pace).await?;
             low = high;
             tokio::task::yield_now().await;
         }
@@ -413,7 +431,7 @@ impl SqliteEventStore {
         for _ in 0..100 {
             longest = longest.max(self.timed_read().await?);
         }
-        self.gate().take_longest_write();
+        self.gate().take_slowest_write();
         Ok(longest)
     }
 
@@ -432,18 +450,18 @@ impl SqliteEventStore {
 
     /// After a window: steer the pace by the slowest foreground write since the last window (its I/O
     /// included), and rest as long as the pace says. Returns the rest.
+    /// Returns the rest, and the slowest foreground write's layers when it was over the bar.
     pub(super) async fn rest_at_pace(
         &self,
         pace: &mut Pace,
-    ) -> Result<std::time::Duration, StoreError> {
-        let slowest = self.gate().take_longest_write();
-        let foreground = (!slowest.is_zero()).then_some(slowest);
-        pace.observe(foreground);
+    ) -> Result<(std::time::Duration, Option<crate::write_gate::WriteLayers>), StoreError> {
+        let slowest = self.gate().take_slowest_write();
+        pace.observe(slowest.map(|layers| layers.total()));
         let rest = pace.rest();
         if !rest.is_zero() {
             tokio::time::sleep(rest).await;
         }
-        Ok(rest)
+        Ok((rest, slowest.filter(|layers| layers.total() > pace.bar())))
     }
 
     /// The checkpoint after a drain window: PASSIVE, outside the write gate and custody, on the
@@ -463,6 +481,20 @@ impl SqliteEventStore {
     /// stops there, reported, and the next pass resumes; it never waits on a reader that does not
     /// move.
     pub(super) async fn checkpoint_after_window(
+        &self,
+        held: std::time::Duration,
+    ) -> Result<Checkpointed, StoreError> {
+        let started = std::time::Instant::now();
+        self.gate().checkpoint_edge();
+        let ended = self.checkpoint_until_copied(held).await;
+        self.gate().checkpoint_edge();
+        ended.map(|ended| match ended {
+            Checkpointed::Copied(_) => Checkpointed::Copied(started.elapsed()),
+            pinned => pinned,
+        })
+    }
+
+    async fn checkpoint_until_copied(
         &self,
         held: std::time::Duration,
     ) -> Result<Checkpointed, StoreError> {
