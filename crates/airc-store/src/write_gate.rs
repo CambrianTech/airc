@@ -32,6 +32,9 @@ pub(crate) struct FileGate {
     /// Bumped as the drain's checkpoint starts and again as it ends (odd while one runs), so a
     /// write can tell whether a checkpoint ran during its life.
     checkpoint_epoch: std::sync::atomic::AtomicU64,
+    /// Whether this file answers filtered reads exactly ([`crate::settling`]): per file, so every
+    /// handle's filtered reads report the same [`airc_core::Settlement`].
+    pub(crate) settling: crate::settling::Settling,
 }
 
 impl FileGate {

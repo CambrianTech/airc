@@ -7,8 +7,7 @@
 //! body is read or allocated.
 
 use async_trait::async_trait;
-use sea_orm::sea_query::{Expr, SimpleExpr};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 
 use airc_core::{HeaderFilter, HistoryCount, RoomId, RuntimeSelf, TranscriptCursor};
 
@@ -30,22 +29,6 @@ pub trait CountHistory: Send + Sync {
     ) -> Result<HistoryCount, StoreError>;
 }
 
-/// `(after, through]` in transcript order: lamport, then event id.
-fn transcript_range(after: &TranscriptCursor, through: &TranscriptCursor) -> SimpleExpr {
-    let lamport = |c: &TranscriptCursor| c.lamport as i64;
-    let after_range = Expr::col(event::Column::Lamport)
-        .gt(lamport(after))
-        .or(Expr::col(event::Column::Lamport)
-            .eq(lamport(after))
-            .and(Expr::col(event::Column::EventId).gt(after.event_id.as_uuid())));
-    let through_range = Expr::col(event::Column::Lamport)
-        .lt(lamport(through))
-        .or(Expr::col(event::Column::Lamport)
-            .eq(lamport(through))
-            .and(Expr::col(event::Column::EventId).lte(through.event_id.as_uuid())));
-    after_range.and(through_range)
-}
-
 fn to_u64(field: &'static str, value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::InvalidStoredValue {
         field,
@@ -63,14 +46,76 @@ impl CountHistory for SqliteEventStore {
         headers: &HeaderFilter,
         exclude: Option<&RuntimeSelf>,
     ) -> Result<HistoryCount, StoreError> {
+        let reads_derived = crate::derive::reads_derived(headers, false, exclude.is_some());
+        let (count, settlement) = self
+            .gate()
+            .settling
+            .read::<event::Entity, _, _, _, _>(
+                self.connection(),
+                reads_derived,
+                std::convert::identity,
+                |reach| async move {
+                    let span = match reach {
+                        crate::settling::Reach::Newest(span) => *span,
+                        crate::settling::Reach::Whole => {
+                            return self
+                                .count_indexed(
+                                    after,
+                                    through,
+                                    channels,
+                                    headers,
+                                    exclude,
+                                    reads_derived,
+                                )
+                                .await
+                        }
+                    };
+                    let events = span
+                        .all(self.connection())
+                        .await?
+                        .into_iter()
+                        .map(crate::sqlite::from_model)
+                        .collect::<Result<Vec<_>, StoreError>>()?;
+                    Ok(crate::matched::count(
+                        events.iter(),
+                        after,
+                        through,
+                        channels,
+                        headers,
+                        exclude,
+                    ))
+                },
+            )
+            .await?;
+        Ok(HistoryCount {
+            settlement,
+            ..count
+        })
+    }
+}
+
+impl SqliteEventStore {
+    /// The count by the store's indexes: newest first, at most one past the cap, so it never
+    /// walks the whole range.
+    async fn count_indexed(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        headers: &HeaderFilter,
+        exclude: Option<&RuntimeSelf>,
+        reads_derived: bool,
+    ) -> Result<HistoryCount, StoreError> {
         let mut query = event::Entity::find()
-            .filter(event::Column::RoomId.is_in(channels.iter().map(|room| room.as_uuid())))
-            .filter(transcript_range(after, through))
+            .filter(crate::event_query::in_range(after, through, channels))
             .filter(crate::header_query::predicate::<event::Entity>(headers));
+        if reads_derived {
+            // An owed row has no header rows yet, so a negated filter would count it falsely.
+            query = query.filter(crate::derive::derived::<event::Entity>());
+        }
         if let Some(rule) = exclude {
             query = query.filter(crate::header_query::not_runtime_self::<event::Entity>(rule));
         }
-        // Newest first, at most one past the cap: the count never walks the whole range.
         let times: Vec<i64> = query
             .select_only()
             .column(event::Column::OccurredAtMs)

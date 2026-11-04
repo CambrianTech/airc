@@ -97,15 +97,56 @@ impl EventStore for SqliteEventStore {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> Result<Vec<TranscriptEvent>, StoreError> {
-        let mut branches = Vec::new();
-        for query in crate::event_query::matching(cursor, through, channels, rule, limit, tail) {
-            branches.push(query.all(&self.db).await?);
-        }
-        crate::event_table::merge_branches(branches, |row| (row.lamport, row.event_id), limit, tail)
-            .into_iter()
-            .map(from_model)
-            .collect()
+    ) -> Result<airc_core::HistoryPage<TranscriptEvent>, StoreError> {
+        let reads_derived =
+            crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false);
+        let (rows, settlement) = self
+            .gate()
+            .settling
+            .read::<event::Entity, _, _, _, _>(
+                &self.db,
+                reads_derived,
+                std::convert::identity,
+                |reach| async move {
+                    let span = match reach {
+                        crate::settling::Reach::Newest(span) => *span,
+                        crate::settling::Reach::Whole => {
+                            let mut branches = Vec::new();
+                            for query in crate::event_query::matching(
+                                cursor, through, channels, rule, limit, tail,
+                            ) {
+                                branches.push(query.all(&self.db).await?);
+                            }
+                            return crate::event_table::merge_branches(
+                                branches,
+                                |row| (row.lamport, row.event_id),
+                                limit,
+                                tail,
+                            )
+                            .into_iter()
+                            .map(from_model)
+                            .collect::<Result<Vec<_>, StoreError>>();
+                        }
+                    };
+                    let events = span
+                        .all(&self.db)
+                        .await?
+                        .into_iter()
+                        .map(from_model)
+                        .collect::<Result<Vec<_>, StoreError>>()?;
+                    Ok(crate::matched::page(
+                        events.iter(),
+                        cursor,
+                        through,
+                        channels,
+                        rule,
+                        limit,
+                        tail,
+                    ))
+                },
+            )
+            .await?;
+        Ok(airc_core::HistoryPage { rows, settlement })
     }
 
     async fn resume_from(

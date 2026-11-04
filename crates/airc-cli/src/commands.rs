@@ -248,7 +248,8 @@ pub async fn run_join(
 ) -> Result<(), Box<dyn std::error::Error>> {
     reject_recovery_room(room.as_deref())?;
     if crate::runtime_context::join_resumes_daemon(ensure_only) {
-        let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+        let lifecycle =
+            airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance_off_runtime(home).await?;
         lifecycle.clear_operator_stop()?;
     }
     // Start the machine-singular daemon and attach: join, heartbeat, and
@@ -2828,7 +2829,8 @@ pub async fn run_stop(home: &Path, socket: PathBuf) -> Result<(), Box<dyn std::e
             "operator stop requires this home's canonical endpoint; use the matching --home".into(),
         );
     }
-    let lifecycle = airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance(home)?;
+    let lifecycle =
+        airc_lib::daemon_lifecycle::DaemonLifecycleGuard::maintenance_off_runtime(home).await?;
     lifecycle.record_operator_stop()?;
     crate::update_shutdown::stop(&socket)?;
     lifecycle.confirm_no_startup()?;

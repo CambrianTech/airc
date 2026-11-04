@@ -25,6 +25,21 @@ pub(super) fn dead_rows() -> Option<SimpleExpr> {
         .reduce(SimpleExpr::or)
 }
 
+/// A read on derived data never derives a row the next pass deletes (`crate::derive::Dropped`).
+impl crate::derive::Dropped for event::Entity {
+    fn dropped() -> Option<SimpleExpr> {
+        dead_rows()
+    }
+}
+
+/// `bus_events` has no declared retention: its one drain class (heartbeats) is a header
+/// predicate, which an owed row (no header rows yet) cannot answer, so a read derives it.
+impl crate::derive::Dropped for crate::entities::bus_event::Entity {
+    fn dropped() -> Option<SimpleExpr> {
+        None
+    }
+}
+
 /// The rows of `kind` its declaration says are dead.
 fn dead_of(kind: TranscriptKind) -> Option<SimpleExpr> {
     let of_kind = Expr::col((event::Entity, event::Column::Kind)).eq(kind.as_wire_str());

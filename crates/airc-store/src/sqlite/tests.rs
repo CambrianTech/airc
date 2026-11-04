@@ -94,7 +94,12 @@ async fn addressee_scan_selects_candidates_by_indexed_columns() {
         .matching_history(&origin, &through, &[room], rule, 10, true)
         .await
         .unwrap();
-    assert_eq!(page, [typed, led]);
+    assert_eq!(page.rows, [typed, led]);
+    assert_eq!(
+        page.settlement,
+        airc_core::Settlement::Settled,
+        "a store with no events at open owes nothing"
+    );
 }
 
 // what this catches: the addressee scan must SEARCH the addressing indexes
@@ -126,6 +131,12 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         headers: &airc_core::HeaderFilter::Any,
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
+    // A store with no events at open builds its indexes then, on empty tables (card 70055c76):
+    // the background pass has nothing left to build.
+    assert!(
+        store.ensure_indexes().await.unwrap().built.is_empty(),
+        "built at open"
+    );
     let branches = crate::event_query::matching(&origin, &through, &[room], rule, 10, true);
     let indexes = [
         "idx_events_room_addressed_peer",
@@ -153,7 +164,7 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         .await
         .unwrap();
     let elapsed = started.elapsed();
-    assert_eq!(page, requests);
+    assert_eq!(page.rows, requests);
     // Two index searches and a merge of three rows; a walk of 20k rows
     // is the regression this bound would catch.
     assert!(

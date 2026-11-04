@@ -644,6 +644,8 @@ impl Airc {
         Ok(EventScan {
             events,
             scanned_through,
+            // Filtered here, from each event: nothing derived is read.
+            settlement: airc_core::Settlement::Settled,
         })
     }
 

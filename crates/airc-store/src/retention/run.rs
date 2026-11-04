@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use super::{DrainReport, Reclaim, StoreFootprint, WalCheckpoint};
 use crate::error::StoreError;
+use crate::indexes::IndexReport;
 use crate::sqlite::SqliteEventStore;
 
 /// The first pass waits for the host to settle (the boot window is when every peer backfills
@@ -45,6 +46,14 @@ pub struct PassReport {
     /// A legacy `auto_vacuum=0` file's freelist, bytes, that only [`SqliteEventStore::compact`]
     /// in a stop window gives back; `None` for an incremental file.
     pub awaiting_compaction: Option<u64>,
+    /// The indexes built after the drain, on the drained table ([`crate::indexes`]); `None` when
+    /// the drain failed, since a build on an undrained table holds every write for its whole run.
+    pub indexes: Option<Result<IndexReport, StoreError>>,
+    /// Rows derived after the drain ([`crate::derive`]); `None` when the drain failed.
+    pub derived: Option<Result<usize, StoreError>>,
+    /// The first report only: the rows retention keeps that the task derived at open, before
+    /// its first pass, which settles the file ([`SqliteEventStore::settle`]).
+    pub settled_at_open: Option<Result<usize, StoreError>>,
     /// `None` when the pass never reached the checkpoint (the drain's connection did not open).
     pub wal: Option<Result<WalCheckpoint, StoreError>>,
 }
@@ -52,6 +61,11 @@ pub struct PassReport {
 impl std::fmt::Display for PassReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mb = |bytes: u64| bytes / 1_000_000;
+        match &self.settled_at_open {
+            Some(Ok(rows)) => write!(f, "settled at open after deriving {rows} rows; ")?,
+            Some(Err(error)) => write!(f, "settling at open failed: {error}; ")?,
+            None => {}
+        }
         match &self.drain {
             Ok(report) => write!(
                 f,
@@ -74,6 +88,21 @@ impl std::fmt::Display for PassReport {
                     "; stopped early: a reader holds the WAL, the next pass resumes"
                 )?;
             }
+        }
+        match &self.indexes {
+            Some(Ok(report)) if !report.built.is_empty() => write!(
+                f,
+                "; built indexes {} (gate held {} ms)",
+                report.built.join(", "),
+                report.held.as_millis(),
+            )?,
+            Some(Ok(_)) | None => {}
+            Some(Err(error)) => write!(f, "; index build failed: {error}")?,
+        }
+        match &self.derived {
+            Some(Ok(0)) | None => {}
+            Some(Ok(rows)) => write!(f, "; derived {rows} rows")?,
+            Some(Err(error)) => write!(f, "; derivation failed: {error}")?,
         }
         match &self.reclaim {
             Some(Ok(after)) => write!(
@@ -116,11 +145,18 @@ impl std::fmt::Display for PassReport {
     }
 }
 
-/// One pass: the drain, then the reclaim the footprint and the idle signal allow, then the WAL
-/// checkpoint. Every pass checkpoints, not only after a full vacuum: a reader that never lets
+/// One pass: the drain, then on the drained tables the missing indexes and the owed derivations,
+/// then the reclaim the footprint and the idle signal allow, then the WAL checkpoint. Every pass checkpoints, not only after a full vacuum: a reader that never lets
 /// go is how the M5's WAL reached 14 GB beside a 2.9 GB file on 2026-11-03 (card e719540d).
 pub async fn pass(store: &SqliteEventStore) -> PassReport {
     let drain = store.drain().await;
+    let (indexes, derived) = match &drain {
+        Ok(_) => (
+            Some(store.ensure_indexes().await),
+            Some(store.derive_all_owed().await),
+        ),
+        Err(_) => (None, None),
+    };
     let (reclaim, awaiting_compaction) = match &drain {
         Ok(report) => match store.is_incremental().await {
             Ok(incremental) => (
@@ -138,6 +174,9 @@ pub async fn pass(store: &SqliteEventStore) -> PassReport {
         drain,
         reclaim,
         awaiting_compaction,
+        indexes,
+        derived,
+        settled_at_open: None,
         wal: Some(store.checkpoint_wal().await),
     }
 }
@@ -161,6 +200,25 @@ pub async fn run(
     report: impl Fn(&PassReport),
 ) -> Ended {
     tokio::pin!(shutdown);
+    // First, at once: derive the rows retention keeps that still owe their derivation, so every
+    // filtered read is settled long before the first pass (on a copy of a resident's 1.55 GB
+    // store, the scan for them took 25 s; with nothing owed it is one index seek). A failure is
+    // reported with the first pass, whose own derivation settles the file.
+    // Its connection is closed again once settled: held through the wait it doubled every
+    // process's descriptors for a store it would not touch for minutes (airc-lib's suite failed
+    // under a 256-descriptor limit that the base passes, #1654). The first pass opens its own.
+    // A file its opener already found settled needs nothing here: no connection is opened.
+    let mut settled_at_open = match crate::write_gate::for_path(&path).settling.settlement() {
+        airc_core::Settlement::Settled => None,
+        airc_core::Settlement::Unsettled => tokio::select! {
+            _ = &mut shutdown => return Ended::Shutdown,
+            opened = SqliteEventStore::open_path_for_drain(&path) => match opened {
+                Ok(store) => Some(store.settle().await),
+                Err(error) => Some(Err(error)),
+            },
+        },
+    };
+    let mut own: Option<SqliteEventStore> = None;
     tokio::select! {
         _ = &mut shutdown => return Ended::Shutdown,
         _ = tokio::time::sleep(FIRST_PASS_AFTER) => {}
@@ -169,7 +227,6 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick is immediate: the first pass runs now.
     ticker.tick().await;
-    let mut own: Option<SqliteEventStore> = None;
     loop {
         if !any_open() {
             return Ended::NoHandle;
@@ -180,13 +237,18 @@ pub async fn run(
         };
         match opened {
             Ok(store) => {
-                report(&pass(&store).await);
+                let mut done = pass(&store).await;
+                done.settled_at_open = settled_at_open.take();
+                report(&done);
                 own = Some(store);
             }
             Err(error) => report(&PassReport {
                 drain: Err(error),
                 reclaim: None,
                 awaiting_compaction: None,
+                indexes: None,
+                derived: None,
+                settled_at_open: settled_at_open.take(),
                 wal: None,
             }),
         }

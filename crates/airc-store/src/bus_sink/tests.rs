@@ -582,7 +582,7 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         )
         .await
         .unwrap();
-    assert_eq!(page[0].event_id, first.event_id);
+    assert_eq!(page.rows[0].event_id, first.event_id);
     let next = sink
         .page_matching(
             ch,
@@ -594,7 +594,7 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         )
         .await
         .unwrap();
-    assert_eq!(next[0].event_id, second.event_id);
+    assert_eq!(next.rows[0].event_id, second.event_id);
     assert_eq!(sink.page(ch, None, 600).await.unwrap().len(), 514);
     // The count is the same range, counted in the store: it agrees with the page.
     let routed = sink
@@ -618,6 +618,8 @@ async fn cold_header_filtered_page_and_count_keep_system_events_and_cursor_ties(
         .count_matching(ch, second.cursor(), second.cursor(), &filter, None)
         .await
         .unwrap();
+    // Reopened with its indexes and every row derived (this binary wrote them all): settled at
+    // open, so the count is exact at once (card 70055c76).
     assert_eq!(empty, airc_core::HistoryCount::default());
 }
 
@@ -658,7 +660,7 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         .page_matching(ch, origin, through, rule, 10, true)
         .await
         .unwrap();
-    let ids: Vec<_> = page.iter().map(|e| e.event_id).collect();
+    let ids: Vec<_> = page.rows.iter().map(|e| e.event_id).collect();
     assert_eq!(ids, [typed.event_id, led.event_id]);
     // Index evidence: each branch SEARCHes its own addressing index (rows
     // touched are candidates), never walks the room in cursor order.

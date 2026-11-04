@@ -42,6 +42,7 @@ pub mod envelope;
 pub mod ephemeral;
 pub mod error;
 pub mod filter;
+pub mod matched;
 pub mod ring;
 pub mod router;
 pub mod seq;

@@ -106,6 +106,9 @@ pub struct LiveLag {
 pub struct EventScan {
     pub events: Vec<TranscriptEvent>,
     pub scanned_through: Option<TranscriptCursor>,
+    /// Whether the store had derived every row a filtered scan could match
+    /// ([`airc_core::Settlement`]); a scan filtered in memory is always settled.
+    pub settlement: airc_core::Settlement,
 }
 
 impl std::fmt::Display for LiveLag {

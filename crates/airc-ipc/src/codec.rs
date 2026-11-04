@@ -682,7 +682,8 @@ fn cbor_array_header_len(count: usize) -> usize {
     }
 }
 /// Exact ScanInbox metadata and outer array cost, excluding envelope arrays.
-/// Serialize the real response skeleton so tags/cursor schema stay authoritative.
+/// Serialize the real response skeleton so tags/cursor schema stay authoritative. It carries the
+/// longer settlement encoding (`Unsettled`), so the reserve holds for either.
 pub fn scan_inbox_payload_overhead(
     cursor: crate::request::IpcCursor,
     has_more: bool,
@@ -692,6 +693,7 @@ pub fn scan_inbox_payload_overhead(
         envelopes: vec![],
         scanned_through: cursor,
         has_more,
+        settlement: airc_core::Settlement::Unsettled,
     });
     Ok(
         encode_frame_payload(&skeleton)?.len() - cbor_array_header_len(0)
@@ -713,6 +715,7 @@ mod scan_size_tests {
                 envelopes: vec![vec![255; 29]; count],
                 scanned_through: cursor,
                 has_more: true,
+                settlement: airc_core::Settlement::Unsettled,
             };
             let expected = scan_inbox_payload_overhead(cursor, true, count).unwrap()
                 + page
@@ -735,6 +738,7 @@ mod scan_size_tests {
                 envelopes: vec![vec![255; size]],
                 scanned_through: cursor,
                 has_more: true,
+                settlement: airc_core::Settlement::Unsettled,
             };
             let expected = overhead + byte_array_payload_len(&page.envelopes[0]);
             let encoded = encode_frame_payload(&crate::Response::ScanInbox(page));

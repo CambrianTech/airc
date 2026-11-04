@@ -58,8 +58,9 @@ pub trait DurableSink: Send + Sync {
     /// beginning of the channel." This is the deep-replay leg of the cursor
     /// contract (§3.5).
     /// Matching durable rows within a fixed inclusive snapshot, filtered before
-    /// LIMIT by headers and, when `rule.addressed_to` is set, by addressee.
-    /// A sink without this capability must refuse, never emulate with an unbounded scan.
+    /// LIMIT by headers and, when `rule.addressed_to` is set, by addressee, with the page's
+    /// [`airc_core::Settlement`]. A sink without this capability must refuse, never emulate
+    /// with an unbounded scan.
     async fn page_matching(
         &self,
         channel: RoomId,
@@ -68,7 +69,7 @@ pub trait DurableSink: Send + Sync {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> Result<Vec<Envelope>> {
+    ) -> Result<airc_core::HistoryPage<Envelope>> {
         let _ = (channel, after, through, rule, limit, tail);
         Err(crate::BusError::Sink(
             "filtered history unsupported by sink".into(),
@@ -279,22 +280,13 @@ impl DurableSink for InMemoryDurableSink {
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(airc_core::HistoryCount::of_newest(
-            guard
-                .events
-                .get(&channel.0.as_u128())
-                .into_iter()
-                .flatten()
-                .rev()
-                .filter(|e| {
-                    e.delivery.is_durable()
-                        && e.cursor().is_after(&after)
-                        && !e.cursor().is_after(&through)
-                        && headers.matches(&e.headers)
-                        && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
-                })
-                .map(|e| e.occurred_at_ms)
-                .take(airc_core::HISTORY_COUNT_CAP as usize + 1),
+        Ok(crate::matched::count(
+            guard.events.get(&channel.0.as_u128()).into_iter().flatten(),
+            channel,
+            after,
+            through,
+            headers,
+            exclude,
         ))
     }
 
@@ -306,24 +298,21 @@ impl DurableSink for InMemoryDurableSink {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> Result<Vec<Envelope>> {
+    ) -> Result<airc_core::HistoryPage<Envelope>> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(airc_core::bounded_selection::select(
-            guard
-                .events
-                .get(&channel.0.as_u128())
-                .into_iter()
-                .flatten()
-                .filter(|e| {
-                    e.delivery.is_durable()
-                        && e.cursor().is_after(&after)
-                        && !e.cursor().is_after(&through)
-                        && e.matches_history(rule)
-                }),
-            |e| (e.seq, e.event_id.0),
-            limit,
-            tail,
-        ))
+        // Matched on demand from each envelope: nothing here is ever owed.
+        Ok(airc_core::HistoryPage {
+            rows: crate::matched::page(
+                guard.events.get(&channel.0.as_u128()).into_iter().flatten(),
+                channel,
+                after,
+                through,
+                rule,
+                limit,
+                tail,
+            ),
+            settlement: airc_core::Settlement::Settled,
+        })
     }
 
     async fn page(

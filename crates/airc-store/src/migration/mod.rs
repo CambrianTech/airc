@@ -70,7 +70,9 @@ impl MigratorTrait for Migrator {
     }
 }
 
-/// Bring the database to this binary's schema and derived data, for writing.
+/// Bring the database to this binary's schema, for writing. Schema only: no row is read or
+/// written here (card 70055c76: deriving and indexing at open took 23.4 s on a 1.56 GB store).
+/// Derived data is `crate::derive`'s, indexes `crate::indexes`'.
 ///
 /// 1. Refuse a database migrated AHEAD of this binary: a newer build added
 ///    columns or tables it keeps current at every write (the addressing
@@ -83,9 +85,6 @@ impl MigratorTrait for Migrator {
 ///    schema that the retry could not re-apply (duplicate column). Given our
 ///    transaction, the DDL and the version rows commit together or not at all
 ///    (SQLite DDL is transactional).
-/// 3. Derive what rows still owe ([`crate::derive::derive_pending`]): resumable,
-///    so an interrupted derivation or rows an older writer inserted are healed
-///    on this and every later open.
 pub async fn apply_migrations(db: &DatabaseConnection) -> Result<(), StoreError> {
     let ahead = unknown_applied(db).await?;
     if !ahead.is_empty() {
@@ -96,7 +95,7 @@ pub async fn apply_migrations(db: &DatabaseConnection) -> Result<(), StoreError>
         Migrator::up(&txn, None).await?;
         txn.commit().await?;
     }
-    crate::derive::derive_pending(db).await
+    Ok(())
 }
 
 /// Refuse a write when the database was migrated past this binary after it was

@@ -23,6 +23,8 @@ pub(crate) trait EventTable: EntityTrait {
     const ADDRESSED_PEER: Self::Column;
     const LEADING_MENTION: Self::Column;
     const DERIVED_VERSION: Self::Column;
+    /// The table's cursor order, most significant column first.
+    const ORDER: &'static [Self::Column];
     const HEADER_EVENT_ID: <Self::Headers as EntityTrait>::Column;
     const HEADER_KEY: <Self::Headers as EntityTrait>::Column;
     const HEADER_VALUE: <Self::Headers as EntityTrait>::Column;
@@ -49,6 +51,7 @@ impl EventTable for event::Entity {
     const ADDRESSED_PEER: event::Column = event::Column::AddressedPeer;
     const LEADING_MENTION: event::Column = event::Column::LeadingMention;
     const DERIVED_VERSION: event::Column = event::Column::DerivedVersion;
+    const ORDER: &'static [event::Column] = &[event::Column::Lamport, event::Column::EventId];
     const HEADER_EVENT_ID: event_header::Column = event_header::Column::EventId;
     const HEADER_KEY: event_header::Column = event_header::Column::Key;
     const HEADER_VALUE: event_header::Column = event_header::Column::Value;
@@ -78,6 +81,11 @@ impl EventTable for bus_event::Entity {
     const ADDRESSED_PEER: bus_event::Column = bus_event::Column::AddressedPeer;
     const LEADING_MENTION: bus_event::Column = bus_event::Column::LeadingMention;
     const DERIVED_VERSION: bus_event::Column = bus_event::Column::DerivedVersion;
+    const ORDER: &'static [bus_event::Column] = &[
+        bus_event::Column::Epoch,
+        bus_event::Column::Counter,
+        bus_event::Column::EventId,
+    ];
     const HEADER_EVENT_ID: bus_event_header::Column = bus_event_header::Column::EventId;
     const HEADER_KEY: bus_event_header::Column = bus_event_header::Column::Key;
     const HEADER_VALUE: bus_event_header::Column = bus_event_header::Column::Value;

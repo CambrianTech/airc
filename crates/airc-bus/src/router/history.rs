@@ -235,7 +235,8 @@ impl EventRouter {
     /// walk was O(n²/page) and never returned inside the callers' 30 s
     /// deadline, while the board — resuming from a saved cursor — was instant.
     /// Snapshot-bounded durable page filtered by `rule` (headers, and addressee
-    /// when set) before the limit. Hot pending writes remain visible.
+    /// when set) before the limit, with the sink's [`airc_core::Settlement`]. Hot
+    /// pending writes remain visible (matched on demand, so always settled).
     pub async fn matching_history(
         &self,
         channel: RoomId,
@@ -244,9 +245,12 @@ impl EventRouter {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> crate::Result<Vec<Arc<Envelope>>> {
+    ) -> crate::Result<airc_core::HistoryPage<Arc<Envelope>>> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(airc_core::HistoryPage {
+                rows: Vec::new(),
+                settlement: airc_core::Settlement::Settled,
+            });
         }
         let mut rows = {
             let shard = self.shard_for(channel);
@@ -267,14 +271,12 @@ impl EventRouter {
                 })
                 .unwrap_or_default()
         };
-        rows.extend(
-            self.inner
-                .sink
-                .page_matching(channel, after, through, rule, limit, tail)
-                .await?
-                .into_iter()
-                .map(Arc::new),
-        );
+        let durable = self
+            .inner
+            .sink
+            .page_matching(channel, after, through, rule, limit, tail)
+            .await?;
+        rows.extend(durable.rows.into_iter().map(Arc::new));
         rows.sort_by_key(|e| (e.seq, e.event_id.0));
         rows.dedup_by_key(|e| e.event_id);
         if tail {
@@ -284,7 +286,10 @@ impl EventRouter {
         if tail {
             rows.reverse();
         }
-        Ok(rows)
+        Ok(airc_core::HistoryPage {
+            rows,
+            settlement: durable.settlement,
+        })
     }
 
     pub async fn resume_from_cursor(
@@ -448,6 +453,7 @@ mod tests {
             oldest_ms: Some(7),
             newest_ms: Some(7),
             more: false,
+            settlement: airc_core::Settlement::Settled,
         };
         let any = airc_core::HeaderFilter::Any;
         assert_eq!(

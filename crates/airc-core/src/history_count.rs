@@ -16,6 +16,8 @@ pub const HISTORY_COUNT_CAP: u64 = 999;
 /// Matching events in a range, and the original times of the oldest and newest counted.
 /// `more`: the range holds more than `count`; the store stopped at [`HISTORY_COUNT_CAP`] and
 /// counted the newest ones, so `oldest_ms` is the oldest of those, not of the range.
+/// `settlement`: whether every row the filter could match was derived ([`Settlement`]); an
+/// unsettled count counted the derived rows only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryCount {
     pub count: u64,
@@ -23,6 +25,7 @@ pub struct HistoryCount {
     pub newest_ms: Option<u64>,
     #[serde(default)]
     pub more: bool,
+    pub settlement: crate::Settlement,
 }
 
 impl HistoryCount {
@@ -38,6 +41,7 @@ impl HistoryCount {
             oldest_ms: pick(self.oldest_ms, other.oldest_ms, u64::min),
             newest_ms: pick(self.newest_ms, other.newest_ms, u64::max),
             more: self.more || other.more,
+            settlement: self.settlement.merge(other.settlement),
         }
     }
 
@@ -62,6 +66,7 @@ impl HistoryCount {
             oldest_ms: Some(occurred_at_ms),
             newest_ms: Some(occurred_at_ms),
             more: false,
+            settlement: crate::Settlement::Settled,
         })
     }
 }
@@ -82,8 +87,15 @@ mod tests {
                 oldest_ms: Some(2),
                 newest_ms: Some(9),
                 more: false,
+                settlement: crate::Settlement::Settled,
             }
         );
+        // One unsettled channel makes the whole count unsettled (card 70055c76).
+        let unsettled = HistoryCount {
+            settlement: crate::Settlement::Unsettled,
+            ..HistoryCount::default()
+        };
+        assert_eq!(a.merge(unsettled).settlement, crate::Settlement::Unsettled);
     }
 
     // what this catches: a count that walks a whole range to answer. Past the cap it stops,

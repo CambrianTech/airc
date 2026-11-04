@@ -49,7 +49,12 @@ pub(crate) fn history_line(summary: &HistorySummary) -> Option<String> {
         format!(
             "AIRC: {}{} earlier events from before this session attached ({} to {}){shown} not replayed; read them with `airc inbox --all --json`.",
             counted.count,
-            if counted.more { "+" } else { "" },
+            // A lower bound either way: capped, or counted before the store finished deriving.
+            if counted.more || counted.settlement == airc_core::Settlement::Unsettled {
+                "+"
+            } else {
+                ""
+            },
             original_time(oldest),
             original_time(newest),
         )

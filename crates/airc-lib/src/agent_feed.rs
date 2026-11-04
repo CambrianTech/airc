@@ -95,6 +95,7 @@ impl Airc {
             return Ok(EventScan {
                 events: vec![],
                 scanned_through: Some(after.clone()),
+                settlement: airc_core::Settlement::Settled,
             });
         }
         let predicate = headers();
@@ -103,6 +104,7 @@ impl Airc {
             addressed_to,
         };
         let mut events = Vec::new();
+        let mut settlement = airc_core::Settlement::Settled;
         let mut safe = through.clone();
         if let Some(client) = self.daemon_client() {
             for channel in channels.iter().copied() {
@@ -124,6 +126,7 @@ impl Airc {
                 if key(&scanned) < key(&safe) {
                     safe = scanned;
                 }
+                settlement = settlement.merge(response.settlement);
                 for encoded in response.envelopes {
                     let event = crate::daemon::decode_wire_event(encoded)?;
                     if event.room_id != channel
@@ -139,11 +142,13 @@ impl Airc {
                 }
             }
         } else {
-            events = self
+            let page = self
                 .inner
                 .store
                 .matching_history(after, through, channels, rule, limit + 1, tail)
                 .await?;
+            events = page.rows;
+            settlement = page.settlement;
         }
         events.sort_by_key(|e| key(&e.cursor()));
         events.dedup_by_key(|e| e.event_id);
@@ -167,6 +172,7 @@ impl Airc {
         Ok(EventScan {
             events,
             scanned_through: Some(safe),
+            settlement,
         })
     }
 

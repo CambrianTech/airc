@@ -137,9 +137,10 @@ impl SqliteEventStore {
         });
         let write = custody.admit()?;
         let db = Database::connect(opts).await?;
-        // Migrate forward atomically, derive what rows owe, and refuse a DB
-        // migrated AHEAD of this binary (`StoreError::AheadOfBinary`).
+        // Migrate forward atomically (schema only) and refuse a DB migrated
+        // AHEAD of this binary (`StoreError::AheadOfBinary`).
         crate::migration::apply_migrations(&db).await?;
+        crate::derive::settle_at_open(&db, &gate).await?;
         drop(write);
         Ok(Self {
             db,
@@ -712,7 +713,7 @@ fn to_active_model(ev: &TranscriptEvent) -> Result<event::ActiveModel, StoreErro
     })
 }
 
-fn from_model(m: event::Model) -> Result<TranscriptEvent, StoreError> {
+pub(crate) fn from_model(m: event::Model) -> Result<TranscriptEvent, StoreError> {
     // Reverse of `to_active_model`'s `as_wire_str`. Unknown rows
     // surface as `UnknownTranscriptKind` so callers can distinguish
     // "store corruption / schema drift" from a normal decode.

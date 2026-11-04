@@ -95,7 +95,7 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// use to resume from disk after a restart or after the in-memory
     /// fan-out path missed a frame.
     /// Match `rule` (headers, and addressee when set) before the page limit
-    /// within a fixed snapshot.
+    /// within a fixed snapshot, with the page's [`airc_core::Settlement`].
     async fn matching_history(
         &self,
         after: &TranscriptCursor,
@@ -104,7 +104,7 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
         rule: airc_core::HistoryMatch<'_>,
         limit: usize,
         tail: bool,
-    ) -> Result<Vec<TranscriptEvent>, StoreError> {
+    ) -> Result<airc_core::HistoryPage<TranscriptEvent>, StoreError> {
         let _ = (after, through, channels, rule, limit, tail);
         Err(StoreError::Database(sea_orm::DbErr::Custom(
             "filtered history unsupported".into(),
