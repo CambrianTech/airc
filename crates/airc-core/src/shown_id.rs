@@ -104,35 +104,59 @@ pub enum ShownIdError {
 impl<T: ShownKind> TryFrom<&str> for Shown<T> {
     type Error = ShownIdError;
 
-    /// No repair: a malformed id is refused, never trimmed into a prefix that
-    /// might name something else.
+    /// No repair of a well-formed id: an exact UUID is used as given, never
+    /// retried on its head. A UUID one hex digit off (a model added or dropped
+    /// one) is not a UUID at all, so it is read as the short form it leads with
+    /// ([`one_off_uuid`]); like any prefix it names only one of the caller's own
+    /// candidates or is refused.
     fn try_from(raw: &str) -> Result<Self, ShownIdError> {
         let raw = raw.trim();
-        let prefix = || -> Option<Form> {
-            if !(MIN_PREFIX_HEX..32).contains(&raw.len()) {
+        let prefix = |hex: &str| -> Option<Form> {
+            if !(MIN_PREFIX_HEX..32).contains(&hex.len()) {
                 return None;
             }
             // from_str_radix alone would take a leading '+'; every byte is hex.
-            if !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return None;
             }
             Some(Form::Prefix {
-                digits: u128::from_str_radix(raw, 16).ok()?,
-                len: u8::try_from(raw.len()).ok()?,
+                digits: u128::from_str_radix(hex, 16).ok()?,
+                len: u8::try_from(hex.len()).ok()?,
             })
         };
         let form = match Uuid::parse_str(raw) {
             Ok(id) => Form::Full(id),
-            Err(_) => prefix().ok_or_else(|| ShownIdError::NotAnId {
-                raw: raw.to_string(),
-                label: T::LABEL,
-            })?,
+            Err(_) => prefix(raw)
+                .or_else(|| one_off_uuid(raw).and_then(prefix))
+                .ok_or_else(|| ShownIdError::NotAnId {
+                    raw: raw.to_string(),
+                    label: T::LABEL,
+                })?,
         };
         Ok(Self {
             form,
             kind: PhantomData,
         })
     }
+}
+
+/// The short form a UUID one hex digit off leads with: `raw` is only hex
+/// digits and dashes and carries 31 or 33 hex digits, one dropped or one added
+/// by whoever copied it. On 2026-07-13 that was 28% of live `work/claim` calls
+/// (`d7cfe47e0-8e39-...`, a nine-digit first group). Continuum's persona-id
+/// verbs read it by its leading short form through `id_resolve::resolve`; this
+/// is that reading in the one id type, so they can move here without losing it. Anything else (words around an
+/// id, a fragment, a well-formed id) is not this and is not read as it.
+fn one_off_uuid(raw: &str) -> Option<&str> {
+    if !raw.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return None;
+    }
+    let hex = raw.bytes().filter(u8::is_ascii_hexdigit).count();
+    if hex != 31 && hex != 33 {
+        return None;
+    }
+    raw.get(..SHORT_ID_LEN)
+        .filter(|head| head.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 impl<'de, T: ShownKind> Deserialize<'de> for Shown<T> {
@@ -319,5 +343,51 @@ mod tests {
             "{miss}"
         );
         assert_eq!(shown_form(c.0), "abcdef01");
+    }
+
+    // what this catches (2026-07-13: 28% of live work/claim calls): a model that copies a full
+    // UUID one hex digit off (an added or dropped digit) is refused outright, where continuum's
+    // id_resolve::resolve (its persona-id verbs) read it by its leading short form. Read here
+    // the same way, it still names only one of the caller's own candidates: a tie is refused, a
+    // dropped digit inside the leading group (no clean short form) is refused, and a well-formed
+    // id is never repaired.
+    #[test]
+    fn a_uuid_one_digit_off_is_read_by_its_short_form_against_the_candidates() {
+        let resolve =
+            |raw: &str, set: &[Card]| Shown::<Card>::try_from(raw)?.resolve(set.iter().copied());
+        let target = card("d7cfe47e-8e39-4a1b-9c2d-0123456789ab");
+        let other = card("12345678-0000-4000-8000-000000000000");
+        // An added digit (a nine-digit first group) and a dropped one in a later group.
+        assert_eq!(
+            resolve("d7cfe47e0-8e39-4a1b-9c2d-0123456789ab", &[target, other]),
+            Ok(target)
+        );
+        assert_eq!(
+            resolve("d7cfe47e-8e39-4a1b-9c2d-012345678ab", &[target, other]),
+            Ok(target)
+        );
+        // A 33-digit run with no dashes is the same mistake.
+        assert_eq!(
+            resolve("d7cfe47e08e394a1b9c2d0123456789ab", &[target]),
+            Ok(target)
+        );
+        // Still only a prefix: a tie on the short form is refused, never guessed.
+        let twin = card("d7cfe47e-ffff-4fff-8fff-ffffffffffff");
+        assert!(matches!(
+            resolve("d7cfe47e0-8e39-4a1b-9c2d-0123456789ab", &[target, twin]),
+            Err(ShownIdError::Ambiguous { .. })
+        ));
+        // A digit dropped inside the leading group leaves no clean short form: refused.
+        assert!(matches!(
+            resolve("d7cfe47-8e39-4a1b-9c2d-0123456789ab", &[target]),
+            Err(ShownIdError::NotAnId { .. })
+        ));
+        // A well-formed id is used exactly as given, never retried on its head.
+        let invented = "d7cfe47e-8e39-4a1b-9c2d-ffffffffffff";
+        assert_ne!(
+            resolve(invented, &[target]),
+            Ok(target),
+            "a well-formed id is never repaired"
+        );
     }
 }
