@@ -280,22 +280,13 @@ impl DurableSink for InMemoryDurableSink {
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount> {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(airc_core::HistoryCount::of_newest(
-            guard
-                .events
-                .get(&channel.0.as_u128())
-                .into_iter()
-                .flatten()
-                .rev()
-                .filter(|e| {
-                    e.delivery.is_durable()
-                        && e.cursor().is_after(&after)
-                        && !e.cursor().is_after(&through)
-                        && headers.matches(&e.headers)
-                        && !exclude.is_some_and(|rule| rule.is_self(&e.headers, e.from.1))
-                })
-                .map(|e| e.occurred_at_ms)
-                .take(airc_core::HISTORY_COUNT_CAP as usize + 1),
+        Ok(crate::matched::count(
+            guard.events.get(&channel.0.as_u128()).into_iter().flatten(),
+            channel,
+            after,
+            through,
+            headers,
+            exclude,
         ))
     }
 
@@ -311,19 +302,12 @@ impl DurableSink for InMemoryDurableSink {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Matched on demand from each envelope: nothing here is ever owed.
         Ok(airc_core::HistoryPage {
-            rows: airc_core::bounded_selection::select(
-                guard
-                    .events
-                    .get(&channel.0.as_u128())
-                    .into_iter()
-                    .flatten()
-                    .filter(|e| {
-                        e.delivery.is_durable()
-                            && e.cursor().is_after(&after)
-                            && !e.cursor().is_after(&through)
-                            && e.matches_history(rule)
-                    }),
-                |e| (e.seq, e.event_id.0),
+            rows: crate::matched::page(
+                guard.events.get(&channel.0.as_u128()).into_iter().flatten(),
+                channel,
+                after,
+                through,
+                rule,
                 limit,
                 tail,
             ),

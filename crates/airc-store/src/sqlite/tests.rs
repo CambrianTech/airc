@@ -131,18 +131,11 @@ async fn addressee_scan_searches_its_indexes_over_twenty_thousand_events() {
         headers: &airc_core::HeaderFilter::Any,
         addressed_to: Some(airc_core::AddresseeFilter { peer: me }),
     };
-    // Without the addressing indexes (built by the background pass after its drain, card
-    // 70055c76) the page is the same, only by a slower plan.
-    let unindexed = store
-        .matching_history(&origin, &through, &[room], rule, 10, true)
-        .await
-        .unwrap();
-    assert_eq!(unindexed.rows, requests, "correct without the indexes");
-    let report = store.ensure_indexes().await.unwrap();
-    assert_eq!(report.built.len(), crate::indexes::EventIndex::ALL.len());
+    // A store with no events at open builds its indexes then, on empty tables (card 70055c76):
+    // the background pass has nothing left to build.
     assert!(
         store.ensure_indexes().await.unwrap().built.is_empty(),
-        "a second pass builds nothing"
+        "built at open"
     );
     let branches = crate::event_query::matching(&origin, &through, &[room], rule, 10, true);
     let indexes = [

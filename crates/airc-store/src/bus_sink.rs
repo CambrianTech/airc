@@ -103,7 +103,7 @@ impl SqliteDurableSink {
         crate::migration::apply_migrations(&db)
             .await
             .map_err(BusError::sink_source)?;
-        crate::derive::settle_if_empty(&db, &gate)
+        crate::derive::settle_at_open(&db, &gate)
             .await
             .map_err(BusError::sink_source)?;
         // Inspect the driver's resolved mode rather than guessing from the
@@ -299,31 +299,59 @@ impl DurableSink for SqliteDurableSink {
             .unwrap_or(u64::MAX)
             .min(i64::MAX as u64);
 
-        let mut branches = Vec::new();
-        for query in page_rows(channel, after, through, rule, bounded, tail) {
-            branches.push(
-                query
-                    .all(&self.readers)
-                    .await
-                    .map_err(BusError::sink_source)?,
-            );
-        }
-        let rows = crate::event_table::merge_branches(
-            branches,
-            |row| (row.epoch, row.counter, row.event_id),
-            limit,
-            tail,
-        )
-        .into_iter()
-        .map(from_model)
-        .collect::<Result<Vec<_>, BusError>>()?;
-        Ok(airc_core::HistoryPage {
-            rows,
-            settlement: crate::derive::settlement_of(
-                crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false),
-                &self.gate,
-            ),
-        })
+        let reads_derived =
+            crate::derive::reads_derived(rule.headers, rule.addressed_to.is_some(), false);
+        let (rows, settlement) = self
+            .gate
+            .settling
+            .read::<bus_event::Entity, _, _, _, _>(
+                &self.readers,
+                reads_derived,
+                BusError::sink_source,
+                |reach| async move {
+                    let span = match reach {
+                        crate::settling::Reach::Newest(span) => *span,
+                        crate::settling::Reach::Whole => {
+                            let mut branches = Vec::new();
+                            for query in page_rows(channel, after, through, rule, bounded, tail) {
+                                branches.push(
+                                    query
+                                        .all(&self.readers)
+                                        .await
+                                        .map_err(BusError::sink_source)?,
+                                );
+                            }
+                            return crate::event_table::merge_branches(
+                                branches,
+                                |row| (row.epoch, row.counter, row.event_id),
+                                limit,
+                                tail,
+                            )
+                            .into_iter()
+                            .map(from_model)
+                            .collect::<Result<Vec<_>, BusError>>();
+                        }
+                    };
+                    let envelopes = span
+                        .all(&self.readers)
+                        .await
+                        .map_err(BusError::sink_source)?
+                        .into_iter()
+                        .map(from_model)
+                        .collect::<Result<Vec<_>, BusError>>()?;
+                    Ok(airc_bus::matched::page(
+                        envelopes.iter(),
+                        channel,
+                        after,
+                        through,
+                        rule,
+                        limit,
+                        tail,
+                    ))
+                },
+            )
+            .await?;
+        Ok(airc_core::HistoryPage { rows, settlement })
     }
 
     async fn count_matching(
@@ -335,38 +363,51 @@ impl DurableSink for SqliteDurableSink {
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, BusError> {
         let reads_derived = crate::derive::reads_derived(headers, false, exclude.is_some());
-        let mut rows = matching_rows(channel, after, through, headers);
-        if reads_derived {
-            // An owed row has no header rows yet, so a negated filter would count it falsely:
-            // count derived rows only, and say whether that was all of them.
-            rows =
-                rows.filter(bus_event::Column::DerivedVersion.eq(crate::derive::DERIVED_VERSION));
-        }
-        if let Some(rule) = exclude {
-            rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
-                rule,
-            ));
-        }
-        // Newest first, at most one past the cap: the count never walks the whole range, and
-        // no header JSON or payload leaves SQLite.
-        let times: Vec<i64> = rows
-            .select_only()
-            .column(bus_event::Column::OccurredAtMs)
-            .order_by_desc(bus_event::Column::Epoch)
-            .order_by_desc(bus_event::Column::Counter)
-            .order_by_desc(bus_event::Column::EventId)
-            .limit(airc_core::HISTORY_COUNT_CAP + 1)
-            .into_tuple()
-            .all(&self.readers)
-            .await
-            .map_err(BusError::sink_source)?;
-        let times = times
-            .into_iter()
-            .map(|ms| i64_to_u64("occurred_at_ms", ms))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut count = airc_core::HistoryCount::of_newest(times);
-        count.settlement = crate::derive::settlement_of(reads_derived, &self.gate);
-        Ok(count)
+        let (count, settlement) = self
+            .gate
+            .settling
+            .read::<bus_event::Entity, _, _, _, _>(
+                &self.readers,
+                reads_derived,
+                BusError::sink_source,
+                |reach| async move {
+                    let span = match reach {
+                        crate::settling::Reach::Newest(span) => *span,
+                        crate::settling::Reach::Whole => {
+                            return self
+                                .count_indexed(
+                                    channel,
+                                    after,
+                                    through,
+                                    headers,
+                                    exclude,
+                                    reads_derived,
+                                )
+                                .await
+                        }
+                    };
+                    let envelopes = span
+                        .all(&self.readers)
+                        .await
+                        .map_err(BusError::sink_source)?
+                        .into_iter()
+                        .map(from_model)
+                        .collect::<Result<Vec<_>, BusError>>()?;
+                    Ok(airc_bus::matched::count(
+                        envelopes.iter(),
+                        channel,
+                        after,
+                        through,
+                        headers,
+                        exclude,
+                    ))
+                },
+            )
+            .await?;
+        Ok(airc_core::HistoryCount {
+            settlement,
+            ..count
+        })
     }
 
     async fn page(
@@ -619,6 +660,47 @@ fn strictly_after(c: Cursor) -> sea_orm::sea_query::SimpleExpr {
             .eq(epoch)
             .and(Expr::col(bus_event::Column::Counter).eq(counter))
             .and(Expr::col(bus_event::Column::EventId).gt(event_id)))
+}
+
+impl SqliteDurableSink {
+    /// The count by the store's indexes: newest first, at most one past the cap, so it never
+    /// walks the whole range and no header JSON or payload leaves SQLite.
+    async fn count_indexed(
+        &self,
+        channel: RoomId,
+        after: Cursor,
+        through: Cursor,
+        headers: &airc_core::HeaderFilter,
+        exclude: Option<&airc_core::RuntimeSelf>,
+        reads_derived: bool,
+    ) -> Result<airc_core::HistoryCount, BusError> {
+        let mut rows = matching_rows(channel, after, through, headers);
+        if reads_derived {
+            // An owed row has no header rows yet, so a negated filter would count it falsely.
+            rows = rows.filter(crate::derive::derived::<bus_event::Entity>());
+        }
+        if let Some(rule) = exclude {
+            rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
+                rule,
+            ));
+        }
+        let times: Vec<i64> = rows
+            .select_only()
+            .column(bus_event::Column::OccurredAtMs)
+            .order_by_desc(bus_event::Column::Epoch)
+            .order_by_desc(bus_event::Column::Counter)
+            .order_by_desc(bus_event::Column::EventId)
+            .limit(airc_core::HISTORY_COUNT_CAP + 1)
+            .into_tuple()
+            .all(&self.readers)
+            .await
+            .map_err(BusError::sink_source)?;
+        let times = times
+            .into_iter()
+            .map(|ms| i64_to_u64("occurred_at_ms", ms))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(airc_core::HistoryCount::of_newest(times))
+    }
 }
 
 /// [`in_range`]'s rows whose headers match.

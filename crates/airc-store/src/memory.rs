@@ -30,18 +30,14 @@ impl CountHistory for InMemoryEventStore {
         exclude: Option<&airc_core::RuntimeSelf>,
     ) -> Result<airc_core::HistoryCount, StoreError> {
         let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
-        Ok(events
-            .iter()
-            .filter(|e| {
-                channels.contains(&e.room_id)
-                    && strictly_after(e, after)
-                    && !strictly_after(e, through)
-                    && headers.matches(&e.headers)
-                    && !exclude.is_some_and(|rule| rule.is_self_event(e))
-            })
-            .fold(airc_core::HistoryCount::default(), |count, e| {
-                count.with_event(e.occurred_at_ms)
-            }))
+        Ok(crate::matched::count(
+            events.iter(),
+            after,
+            through,
+            channels,
+            headers,
+            exclude,
+        ))
     }
 }
 
@@ -162,17 +158,7 @@ impl EventStore for InMemoryEventStore {
         let events = self.events.lock().map_err(|_| StoreError::LockPoisoned)?;
         // Matched on demand from each event: nothing here is ever owed.
         Ok(airc_core::HistoryPage {
-            rows: airc_core::bounded_selection::select(
-                events.iter().filter(|e| {
-                    channels.contains(&e.room_id)
-                        && strictly_after(e, after)
-                        && !strictly_after(e, through)
-                        && rule.matches_event(e)
-                }),
-                |e| (e.lamport, e.event_id.0),
-                limit,
-                tail,
-            ),
+            rows: crate::matched::page(events.iter(), after, through, channels, rule, limit, tail),
             settlement: airc_core::Settlement::Settled,
         })
     }
@@ -187,7 +173,7 @@ impl EventStore for InMemoryEventStore {
         let mut filtered: Vec<TranscriptEvent> = events
             .iter()
             .filter(|e| channel.is_none_or(|room| e.room_id == room))
-            .filter(|e| strictly_after(e, cursor))
+            .filter(|e| crate::matched::strictly_after(e, cursor))
             .cloned()
             .collect();
         filtered.sort_by(transcript_order);
@@ -434,16 +420,6 @@ fn transcript_order(a: &TranscriptEvent, b: &TranscriptEvent) -> std::cmp::Order
     a.lamport
         .cmp(&b.lamport)
         .then_with(|| a.event_id.as_uuid().cmp(&b.event_id.as_uuid()))
-}
-
-fn strictly_after(event: &TranscriptEvent, cursor: &TranscriptCursor) -> bool {
-    if event.lamport > cursor.lamport {
-        return true;
-    }
-    if event.lamport == cursor.lamport {
-        return event.event_id.as_uuid() > cursor.event_id.as_uuid();
-    }
-    false
 }
 
 #[cfg(test)]

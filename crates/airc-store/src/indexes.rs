@@ -128,11 +128,26 @@ pub(crate) async fn ensure(db: &DatabaseConnection) -> Result<IndexReport, Store
     })
 }
 
+/// Whether every index exists (a catalog lookup each).
+pub(crate) async fn all_exist(db: &DatabaseConnection) -> Result<bool, StoreError> {
+    let manager = SchemaManager::new(db);
+    for index in EventIndex::ALL {
+        if !manager.has_index(index.table(), index.name()).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl SqliteEventStore {
-    /// Build the missing indexes ([`ensure`]) under the file's write gate.
+    /// Build the missing indexes ([`ensure`]) under the file's write gate, then mark the file
+    /// indexed (`crate::settling`).
     pub async fn ensure_indexes(&self) -> Result<IndexReport, StoreError> {
-        let _write = self.admit_write().await?;
-        ensure(self.connection()).await
+        let write = self.admit_write().await?;
+        let report = ensure(self.connection()).await?;
+        drop(write);
+        self.gate().settling.mark_indexed();
+        Ok(report)
     }
 }
 

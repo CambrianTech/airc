@@ -14,16 +14,16 @@
 //! table, 23.4 s on a 1.56 GB store; a 50-row inbox read that derived its own
 //! range took 99.8 s before the first pass). Instead:
 //! - a read on derived data ([`reads_derived`]) matches derived rows only
-//!   ([`derived`]) and reports the file's [`Settlement`]: unsettled while the
-//!   background derivation has not finished, so a missing old match is never
-//!   silent;
+//!   ([`derived`]) and reports its file's settlement (`crate::settling`):
+//!   unsettled until the file is derived and indexed, so a missing old match is
+//!   never silent;
 //! - the background task's first step, at open, derives the owed rows retention
 //!   keeps, newest first, then settles the file ([`SqliteEventStore::settle`]);
 //! - each pass derives what remains after its drain (`crate::retention::run::pass`).
 
 use std::collections::BTreeMap;
 
-use airc_core::{HeaderFilter, Settlement};
+use airc_core::HeaderFilter;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, Order, QueryFilter,
@@ -72,24 +72,20 @@ pub(crate) fn derived<T: EventTable>() -> SimpleExpr {
     Expr::col(T::DERIVED_VERSION).eq(DERIVED_VERSION)
 }
 
-/// A read's settlement: a read on derived data is as settled as its file; any other read is
-/// exact whatever is owed.
-pub(crate) fn settlement_of(reads_derived: bool, gate: &FileGate) -> Settlement {
-    if reads_derived {
-        gate.settlement()
-    } else {
-        Settlement::Settled
-    }
-}
-
-/// At open: a file with no events owes nothing, so it is settled now (a new store, a test's
-/// in-memory one). Two one-row reads; any other file waits for the background derivation.
-pub(crate) async fn settle_if_empty(
+/// At open: a file with no events owes nothing, so its indexes are built (on empty tables, at
+/// once) and it is settled now (a new store, a test's in-memory one). Any other file is indexed
+/// if its indexes already exist (a store migrated before 000021 stopped building them), and
+/// derived when the background task says so. Two one-row reads and six catalog lookups.
+pub(crate) async fn settle_at_open(
     db: &DatabaseConnection,
     gate: &FileGate,
 ) -> Result<(), StoreError> {
     if is_empty::<event::Entity>(db).await? && is_empty::<bus_event::Entity>(db).await? {
-        gate.settle();
+        crate::indexes::ensure(db).await?;
+        gate.settling.mark_indexed();
+        gate.settling.mark_derived();
+    } else if crate::indexes::all_exist(db).await? {
+        gate.settling.mark_indexed();
     }
     Ok(())
 }
@@ -106,8 +102,8 @@ async fn is_empty<T: EventTable>(db: &DatabaseConnection) -> Result<bool, StoreE
 }
 
 impl SqliteEventStore {
-    /// Derive the owed rows retention keeps in both event tables, newest first, then settle the
-    /// file: the background task's first step, at open. How many rows it derived.
+    /// Derive the owed rows retention keeps in both event tables, newest first, then mark the file
+    /// derived (`crate::settling`): the background task's first step, at open. How many rows.
     pub async fn settle(&self) -> Result<usize, StoreError> {
         let derived = self
             .derive_owed::<event::Entity>(kept::<event::Entity>(Condition::all()))
@@ -115,8 +111,15 @@ impl SqliteEventStore {
             + self
                 .derive_owed::<bus_event::Entity>(kept::<bus_event::Entity>(Condition::all()))
                 .await?;
-        self.gate().settle();
+        self.gate().settling.mark_derived();
         Ok(derived)
+    }
+
+    /// The file's settlement, live: it moves to Settled once, when the file is both derived and
+    /// indexed (`crate::settling`), so a reader holding an unsettled answer re-reads on it rather
+    /// than polling.
+    pub fn settled(&self) -> tokio::sync::watch::Receiver<airc_core::Settlement> {
+        self.gate().settling.subscribe()
     }
 
     /// Derive every owed row of both event tables: each pass's step after its drain. How many.
@@ -125,7 +128,7 @@ impl SqliteEventStore {
             + self
                 .derive_owed::<bus_event::Entity>(Condition::all())
                 .await?;
-        self.gate().settle();
+        self.gate().settling.mark_derived();
         Ok(derived)
     }
 
@@ -520,15 +523,17 @@ mod tests {
             )
             .await
             .unwrap();
+        // Unsettled, the read walks its newest span and matches it from each event, owed or not:
+        // this store is small enough that the span holds the old row (crate::settling).
         assert_eq!(
             (page.rows.len(), page.settlement),
-            (0, Settlement::Unsettled)
+            (1, Settlement::Unsettled)
         );
         let count = store
             .count_history(&origin(), &newest(), &[room], &keyed, None)
             .await
             .unwrap();
-        assert_eq!((count.count, count.settlement), (0, Settlement::Unsettled));
+        assert_eq!((count.count, count.settlement), (1, Settlement::Unsettled));
         let bus = sink
             .page_matching(
                 room,
@@ -540,11 +545,28 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!((bus.rows.len(), bus.settlement), (0, Settlement::Unsettled));
+        assert_eq!((bus.rows.len(), bus.settlement), (1, Settlement::Unsettled));
         assert_eq!(not_current(db).await, 1, "a read derives nothing");
 
         assert_eq!(store.settle().await.unwrap(), 2, "one row of each table");
         assert_eq!(bus_event_header::Entity::find().count(db).await.unwrap(), 1);
+        let page = store
+            .matching_history(
+                &origin(),
+                &newest(),
+                &[room],
+                HistoryMatch::headers(&keyed),
+                10,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.settlement,
+            Settlement::Unsettled,
+            "derived, not yet indexed"
+        );
+        store.ensure_indexes().await.unwrap();
         let page = store
             .matching_history(
                 &origin(),
@@ -635,6 +657,7 @@ mod tests {
         let store = SqliteEventStore::open_path(&path).await.unwrap();
         let db = store.connection();
         assert_eq!(store.settle().await.unwrap() as u128, kept + 1);
+        store.ensure_indexes().await.unwrap();
         assert_eq!(
             not_current(db).await,
             (dropped - 1) as u64,
@@ -658,5 +681,82 @@ mod tests {
         let lamports: Vec<u64> = page.rows.iter().map(|e| e.lamport).collect();
         assert_eq!(lamports, [4200, 4500, 4800], "short, and exact");
         assert_eq!(page.settlement, Settlement::Settled);
+    }
+
+    // what this catches (Fable on #1654): a filtered read on a store with no indexes yet walked
+    // all its rows (62.6 s on a copy of a resident's 2.2M-row store, 13.2 s even once derived).
+    // Unsettled, it walks only its newest rows, so a match older than the walk's reach is
+    // missing and says so; once the file is derived AND indexed it is Settled and exact, and the
+    // settled signal fires then, once, not before.
+    #[tokio::test]
+    async fn an_unsettled_read_walks_only_its_newest_rows_and_settles_when_derived_and_indexed() {
+        use crate::EventStore;
+        use airc_core::{HeaderFilter, HistoryMatch, RoomId, Settlement};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sqlite");
+        let rows = 3000u128;
+        let db = connect(&path).await;
+        Migrator::up(&db, Some(BEFORE_DERIVED)).await.unwrap();
+        let batch: Vec<_> = (1..=rows)
+            .map(|n| {
+                let mut row = old_row(n, MentionTarget::All, "plain");
+                let wanted = n == 1 || n == rows;
+                row.headers = Set(if wanted {
+                    serde_json::json!({ "k": "v" })
+                } else {
+                    serde_json::json!({ "other": "v" })
+                });
+                row
+            })
+            .collect();
+        for chunk in batch.chunks(500) {
+            event::Entity::insert_many(chunk.to_vec())
+                .exec(&db)
+                .await
+                .unwrap();
+        }
+        drop(db);
+        // Derived already (as on a store a previous binary derived), but never indexed.
+        let first = SqliteEventStore::open_path(&path).await.unwrap();
+        first.derive_all_owed().await.unwrap();
+        crate::indexes::drop_all(&SchemaManager::new(first.connection()))
+            .await
+            .unwrap();
+        drop(first);
+
+        let store = SqliteEventStore::open_path(&path).await.unwrap();
+        let mut settled = store.settled();
+        let keyed = HeaderFilter::Has { key: "k".into() };
+        let (from, to, rooms) = (origin(), newest(), [RoomId::from_u128(7)]);
+        let read =
+            || store.matching_history(&from, &to, &rooms, HistoryMatch::headers(&keyed), 10, true);
+        let page = read().await.unwrap();
+        let lamports: Vec<u64> = page.rows.iter().map(|e| e.lamport).collect();
+        assert_eq!(
+            (lamports, page.settlement),
+            (vec![rows as u64], Settlement::Unsettled),
+            "the newest match, not the one beyond the walk's reach"
+        );
+
+        store.settle().await.unwrap();
+        assert!(
+            !settled.has_changed().unwrap(),
+            "derived alone does not settle"
+        );
+        store.ensure_indexes().await.unwrap();
+        assert!(
+            settled.has_changed().unwrap(),
+            "derived and indexed settles"
+        );
+        assert_eq!(*settled.borrow_and_update(), Settlement::Settled);
+        let page = read().await.unwrap();
+        let lamports: Vec<u64> = page.rows.iter().map(|e| e.lamport).collect();
+        assert_eq!(
+            (lamports, page.settlement),
+            (vec![1, rows as u64], Settlement::Settled)
+        );
+        store.ensure_indexes().await.unwrap();
+        assert!(!settled.has_changed().unwrap(), "it fires once");
     }
 }

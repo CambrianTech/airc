@@ -47,18 +47,75 @@ impl CountHistory for SqliteEventStore {
         exclude: Option<&RuntimeSelf>,
     ) -> Result<HistoryCount, StoreError> {
         let reads_derived = crate::derive::reads_derived(headers, false, exclude.is_some());
+        let (count, settlement) = self
+            .gate()
+            .settling
+            .read::<event::Entity, _, _, _, _>(
+                self.connection(),
+                reads_derived,
+                std::convert::identity,
+                |reach| async move {
+                    let span = match reach {
+                        crate::settling::Reach::Newest(span) => *span,
+                        crate::settling::Reach::Whole => {
+                            return self
+                                .count_indexed(
+                                    after,
+                                    through,
+                                    channels,
+                                    headers,
+                                    exclude,
+                                    reads_derived,
+                                )
+                                .await
+                        }
+                    };
+                    let events = span
+                        .all(self.connection())
+                        .await?
+                        .into_iter()
+                        .map(crate::sqlite::from_model)
+                        .collect::<Result<Vec<_>, StoreError>>()?;
+                    Ok(crate::matched::count(
+                        events.iter(),
+                        after,
+                        through,
+                        channels,
+                        headers,
+                        exclude,
+                    ))
+                },
+            )
+            .await?;
+        Ok(HistoryCount {
+            settlement,
+            ..count
+        })
+    }
+}
+
+impl SqliteEventStore {
+    /// The count by the store's indexes: newest first, at most one past the cap, so it never
+    /// walks the whole range.
+    async fn count_indexed(
+        &self,
+        after: &TranscriptCursor,
+        through: &TranscriptCursor,
+        channels: &[RoomId],
+        headers: &HeaderFilter,
+        exclude: Option<&RuntimeSelf>,
+        reads_derived: bool,
+    ) -> Result<HistoryCount, StoreError> {
         let mut query = event::Entity::find()
             .filter(crate::event_query::in_range(after, through, channels))
             .filter(crate::header_query::predicate::<event::Entity>(headers));
         if reads_derived {
-            // An owed row has no header rows yet, so a negated filter would count it falsely:
-            // count derived rows only, and say whether that was all of them.
+            // An owed row has no header rows yet, so a negated filter would count it falsely.
             query = query.filter(crate::derive::derived::<event::Entity>());
         }
         if let Some(rule) = exclude {
             query = query.filter(crate::header_query::not_runtime_self::<event::Entity>(rule));
         }
-        // Newest first, at most one past the cap: the count never walks the whole range.
         let times: Vec<i64> = query
             .select_only()
             .column(event::Column::OccurredAtMs)
@@ -72,8 +129,6 @@ impl CountHistory for SqliteEventStore {
             .into_iter()
             .map(|ms| to_u64("occurred_at_ms", ms))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut count = HistoryCount::of_newest(times);
-        count.settlement = crate::derive::settlement_of(reads_derived, self.gate());
-        Ok(count)
+        Ok(HistoryCount::of_newest(times))
     }
 }
