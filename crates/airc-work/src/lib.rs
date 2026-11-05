@@ -17,6 +17,7 @@ pub mod projection;
 pub mod pull_requests;
 pub mod recipe;
 pub mod replay;
+mod shown_scope;
 
 pub use airc_blobs::MediaRef as SubmissionArtifact;
 

@@ -45,6 +45,22 @@ pub trait ShownKind: Copy {
     fn to_uuid(self) -> Uuid;
 }
 
+/// Where a kind of id lives: the `T`s a caller can name in one scope (one room's
+/// board, one card's submissions, the live personas). Each concern implements it
+/// once, beside the data it already owns; a verb then resolves with
+/// [`Shown::resolve_in`] and never builds a candidate list of its own.
+pub trait ShownScope<T: ShownKind> {
+    /// Every `T` named here. The same id listed twice is one candidate.
+    fn shown_ids(&self) -> Vec<T>;
+}
+
+/// A plain list of ids is a scope, for a caller whose population is already in hand.
+impl<T: ShownKind> ShownScope<T> for [T] {
+    fn shown_ids(&self) -> Vec<T> {
+        self.to_vec()
+    }
+}
+
 /// A `T` as typed at a boundary, before it meets its candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shown<T> {
@@ -188,6 +204,14 @@ impl<T: ShownKind> Shown<T> {
         match &self.form {
             Form::Full(id) => Some(T::from_uuid(*id)),
             Form::Prefix { .. } => None,
+        }
+    }
+
+    /// The one `T` this names in `scope`. A full id passes without reading it.
+    pub fn resolve_in<S: ShownScope<T> + ?Sized>(&self, scope: &S) -> Result<T, ShownIdError> {
+        match self.full() {
+            Some(id) => Ok(id),
+            None => self.resolve(scope.shown_ids()),
         }
     }
 
@@ -418,5 +442,37 @@ mod tests {
             Ok(target),
             "a well-formed id is never repaired"
         );
+    }
+
+    // what this catches (Joel 2026-11-04: one lookup per concern, automatic): a scope
+    // resolves a shown id exactly as a candidate list does, and a full id passes without
+    // the scope being read at all, so a verb on an unreadable board still takes a full id.
+    #[test]
+    fn a_scope_resolves_a_shown_id_and_a_full_id_never_reads_it() {
+        struct Counted(std::cell::Cell<u32>, Vec<Card>);
+        impl ShownScope<Card> for Counted {
+            fn shown_ids(&self) -> Vec<Card> {
+                self.0.set(self.0.get() + 1);
+                self.1.clone()
+            }
+        }
+        let a = card("12345678-1000-4000-8000-000000000001");
+        let c = card("abcdef01-0000-4000-8000-000000000003");
+        let scope = Counted(std::cell::Cell::new(0), vec![a, c]);
+        let shown = |raw: &str| Shown::<Card>::try_from(raw).unwrap();
+
+        assert_eq!(shown("abcdef01").resolve_in(&scope), Ok(c));
+        assert_eq!(scope.0.get(), 1, "a prefix reads its scope");
+        assert_eq!(shown(&a.0.to_string()).resolve_in(&scope), Ok(a));
+        assert_eq!(scope.0.get(), 1, "a full id never reads it");
+        assert_eq!(
+            shown("abcdef01").resolve_in(&[a, c][..]),
+            Ok(c),
+            "a slice is a scope"
+        );
+        assert!(matches!(
+            shown("0000").resolve_in(&scope),
+            Err(ShownIdError::NoMatch { total: 2, .. })
+        ));
     }
 }
