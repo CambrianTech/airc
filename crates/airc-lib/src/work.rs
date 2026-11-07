@@ -791,7 +791,10 @@ impl Airc {
         room: &Room,
         request: MarkPullRequestMerged,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_room(room, request.card_id).await?;
+        // A merge on GitHub is an external fact, recorded like a close: a conflicted card a human
+        // merged must still reconcile to Merged instead of a refusal retried every tick (Fable on #1638).
+        self.ensure_work_card_mutable_in_room(room, request.card_id, CardMutation::Resolve)
+            .await?;
         let event = WorkEvent::PullRequestMerged(airc_work::event::PullRequestMerged {
             card_id: request.card_id,
             pull_request: request.pull_request,
@@ -1777,6 +1780,24 @@ mod tests {
             .all(|item| item.card.card_id != card));
         assert_eq!(status.conflicts.len(), 1);
         assert_eq!(status.conflicts[0].card_id, card);
+
+        // A merge a human made on GitHub is an external fact recorded like a close: it reconciles
+        // the card instead of being refused every merger tick (Fable on #1638).
+        airc.mark_pull_request_merged_in(
+            &room,
+            MarkPullRequestMerged {
+                card_id: card,
+                pull_request: airc_work::model::PullRequestRef {
+                    repo: RepoId::new("fixture/conflict").unwrap(),
+                    number: 7,
+                    head: airc_work::model::BranchName::new("topic").unwrap(),
+                    base: airc_work::model::BranchName::new("canary").unwrap(),
+                },
+                merged_at_ms: now_ms().unwrap(),
+            },
+        )
+        .await
+        .expect("recording a merge resolves a conflicted card, never refused as an action");
 
         airc.change_work_card_state_in(
             &room,

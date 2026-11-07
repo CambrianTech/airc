@@ -270,3 +270,98 @@ async fn a_card_without_a_board_verdict_costs_no_github_call() {
         "no GitHub call for a card the board already refuses"
     );
 }
+
+// what this catches (Fable on #1638): the merger landing a conflicted card. A second, different
+// creation of a card's id leaves it accepting only a release or a close, but the gate read only the
+// verdict, so a card in Review with a PASSED independent review at the PR's head merged on GitHub
+// and its PullRequestMerged was then refused, retried every tick. The gate refuses it on the board,
+// before any GitHub call.
+#[tokio::test]
+async fn a_conflicted_card_never_merges_and_costs_no_github_call() {
+    use airc_lib::gh::client::mock::MockGhClient;
+    use airc_work::{CardCreated, Priority, RepoId, WorkCardClaimed, WorkEvent};
+    let gh = MockGhClient::new();
+    let mut board = WorkBoardProjection::new();
+    let owner = peer(10);
+    let card_id = airc_work::WorkCardId::from_uuid(uuid::Uuid::from_u128(2));
+    let created = |title: &str| {
+        WorkEvent::CardCreated(CardCreated {
+            card_id,
+            repo: RepoId::new("CambrianTech/airc").unwrap(),
+            title: title.into(),
+            body: None,
+            priority: Priority::P1,
+            lane_id: None,
+            created_by: owner,
+            created_at_ms: 1,
+            reviews: None,
+            origin: None,
+        })
+    };
+    board
+        .apply_at(airc_core::EventId::from_u128(1), &created("the card"))
+        .unwrap();
+    board
+        .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+            card_id,
+            claim_id: airc_work::ClaimId::from_uuid(uuid::Uuid::from_u128(3)),
+            owner,
+            ttl_ms: 1_000_000,
+            claimed_at_ms: 2,
+            origin: airc_work::ClaimOrigin::Automatic,
+            selected_at_ms: None,
+        }))
+        .unwrap();
+    let submitted = submission(airc_work::SubmissionHead::At(sha('b')));
+    board
+        .apply(&WorkEvent::WorkSubmitted(submitted.clone()))
+        .unwrap();
+    board
+        .apply(&WorkEvent::WorkSubmissionReviewed(review(
+            &submitted,
+            20,
+            WorkReviewOutcome::Passed,
+            3,
+        )))
+        .unwrap();
+    board
+        .apply_at(
+            airc_core::EventId::from_u128(2),
+            &created("a second creation"),
+        )
+        .unwrap();
+    assert_eq!(
+        board.card_conflicts(card_id).len(),
+        1,
+        "test: the conflict is recorded"
+    );
+    let pr = airc_work::model::PullRequestRef {
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        number: 1,
+        head: airc_work::model::BranchName::new("topic").unwrap(),
+        base: airc_work::model::BranchName::new("canary").unwrap(),
+    };
+    let policy = crate::merger::GatePolicy {
+        pending_timeout_ms: 0,
+        now_ms: 0,
+    };
+    let decided = check_card_gate(
+        &gh,
+        &board,
+        board.card(card_id).unwrap(),
+        &pr,
+        &mut crate::merger::BaselineCache::default(),
+        policy,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&decided, CardGate::NotReady(reason) if reason.contains("created twice")),
+        "{decided:?}"
+    );
+    assert_eq!(
+        gh.pr_view_call_count(),
+        0,
+        "decided on the board: no GitHub call"
+    );
+}
