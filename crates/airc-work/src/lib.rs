@@ -39,10 +39,10 @@ pub use event::{
     GitDirtyStateChanged, HygieneReportRecorded, LaneCreated, LaneStateChanged, ManagerHatClaimed,
     ManagerHatReleased, PullRequestCheckSuiteChanged, PullRequestLinked,
     PullRequestMergeStateChanged, PullRequestMerged, PullRequestRelinked,
-    PullRequestReviewSubmitted, RejectedSubmission, RejectedWorkReview, SubmissionRejectionReason,
-    SubmissionReviewRequested, WorkCardClaimed, WorkEvent, WorkReviewOutcome,
-    WorkReviewRejectionReason, WorkSubmission, WorkSubmissionReview, WorkspaceAllocated,
-    WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
+    PullRequestReviewSubmitted, RejectedSubmission, RejectedWorkReview, SubmissionHead,
+    SubmissionRejectionReason, SubmissionReviewRequested, WorkCardClaimed, WorkEvent,
+    WorkReviewOutcome, WorkReviewRejectionReason, WorkSubmission, WorkSubmissionReview,
+    WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
     WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
 };
 pub use goal::{ExitCondition, Goal, GoalState};

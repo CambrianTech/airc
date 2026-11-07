@@ -313,7 +313,7 @@ pub(crate) fn validate_review_workspace(
 pub(crate) fn pr_patch(
     worktree: &str,
     base_branch: &str,
-) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+) -> Result<(String, String, Vec<u8>), Box<dyn std::error::Error>> {
     let git = |args: &[&str]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let out = airc_core::process::background("git")
             .arg("-C")
@@ -334,8 +334,33 @@ pub(crate) fn pr_patch(
     let base = String::from_utf8(git(&["merge-base", "HEAD", "FETCH_HEAD"])?)?
         .trim()
         .to_string();
-    let patch = git(&["diff", "--binary", &base, "HEAD"])?;
-    Ok((base, patch))
+    let head = String::from_utf8(git(&["rev-parse", "HEAD"])?)?
+        .trim()
+        .to_string();
+    let patch = patch_between(worktree, &base, &head)?;
+    Ok((base, head, patch))
+}
+
+/// The patch from `base` to `head` in `worktree`: the one form a submission's bytes take, so the
+/// state-review transition and `airc work submit --head` produce and verify the same bytes.
+pub(crate) fn patch_between(
+    worktree: &str,
+    base: &str,
+    head: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let out = airc_core::process::background("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--binary", base, head])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff --binary {base} {head} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(out.stdout)
 }
 
 /// `git show -s --format=<format> HEAD` from inside `worktree`. Used
@@ -487,9 +512,28 @@ mod tests {
         run(&origin, &["add", "."]);
         run(&origin, &["commit", "--quiet", "-m", "unrelated"]);
 
-        let (got_base, patch) =
+        let (got_base, got_head, bytes) =
             pr_patch(clone.to_str().expect("utf8"), "canary").expect("pr_patch");
-        let patch = String::from_utf8(patch).expect("utf8 patch");
+        // The head is the commit the patch ends at, and the one form of a patch regenerates the
+        // same bytes from it: what `airc work submit --head` verifies (card 950b3093).
+        let head = String::from_utf8(
+            airc_core::process::background("git")
+                .arg("-C")
+                .arg(&clone)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8 sha");
+        assert_eq!(got_head, head.trim(), "the head is the clone's HEAD");
+        assert_eq!(
+            patch_between(clone.to_str().expect("utf8"), &got_base, &got_head)
+                .expect("patch_between"),
+            bytes,
+            "the same base..head regenerates the same bytes"
+        );
+        let patch = String::from_utf8(bytes).expect("utf8 patch");
         assert_eq!(
             got_base, base,
             "the base is the merge-base, not origin's moved tip"
