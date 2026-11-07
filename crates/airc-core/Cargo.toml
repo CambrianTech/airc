@@ -12,6 +12,12 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+# The JSON schema a Shown id is offered under, at the version continuum's tool surface uses.
+schemars = { version = "0.8", optional = true }
+
+[features]
+schemars = ["dep:schemars"]
 
 [dev-dependencies]
 tempfile = "3"  # daemon_log tests write into a temp dir
+regex = "1"
