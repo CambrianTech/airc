@@ -310,6 +310,14 @@ pub fn shown_pattern() -> String {
     format!("^(?:{hex}{{{MIN_PREFIX_HEX},32}}|{hex}{{8}}-{hex}{{4}}-{hex}{{4}}-{hex}{{4}}-{hex}{{12}})$")
 }
 
+/// One legal value of each spelling the pattern admits, derived from the owner's constants: the
+/// [`SHORT_ID_LEN`] short form every surface shows, and the full dashed UUID. Not all zeros, which
+/// a model would copy as a placeholder (continuum refuses a run of zeros as the manual's blank).
+pub fn shown_examples() -> [String; 2] {
+    let id = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+    [shown_form(id), id.to_string()]
+}
+
 /// A Shown id is offered as the string its parser reads, never an arbitrary one (Codex's all-tool
 /// schema gate, 9ad69: a sample from `Option<String>` was refused by `Shown<T>`).
 #[cfg(feature = "schemars")]
@@ -331,6 +339,10 @@ impl<T: ShownKind> schemars::JsonSchema for Shown<T> {
                     "a {} id: its full UUID or at least {MIN_PREFIX_HEX} of its leading hex digits",
                     T::LABEL
                 )),
+                examples: shown_examples()
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
                 ..Default::default()
             })),
             ..Default::default()
@@ -404,6 +416,26 @@ mod tests {
         assert_eq!(value["type"], "string");
         assert_eq!(value["pattern"].as_str(), Some(shown_pattern().as_str()));
         assert_eq!(value["title"], "Shown_card");
+        let Ok(pattern) = regex::Regex::new(&shown_pattern()) else {
+            panic!("the pattern compiles")
+        };
+        let examples: Vec<&str> = value["examples"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            examples.len(),
+            2,
+            "a short form and a full id: {examples:?}"
+        );
+        for example in examples {
+            assert!(
+                pattern.is_match(example) && Shown::<Card>::try_from(example).is_ok(),
+                "{example} is a legal id"
+            );
+        }
     }
 
     // what this catches: the board prints short ids, so every work verb must
