@@ -1665,26 +1665,6 @@ pub(crate) fn close_transition_allowed_from_card(card: &WorkCard) -> bool {
     }
 }
 
-/// Render a peer-id for the board: 'me' for self, the published alias
-/// when known (kink 6f111211 / card c397567a — looked up via
-/// Airc::peer_alias and pre-fetched into the map by run_board), else
-/// short-uuid fallback. Honest "unknown" rendering keeps the board
-/// readable even when a peer hasn't published an identity card to
-/// this room yet.
-pub(crate) fn format_peer(
-    peer: airc_lib::PeerId,
-    me: airc_lib::PeerId,
-    aliases: &std::collections::HashMap<airc_lib::PeerId, String>,
-) -> String {
-    if peer == me {
-        "me".to_string()
-    } else if let Some(alias) = aliases.get(&peer) {
-        alias.clone()
-    } else {
-        peer.shown()
-    }
-}
-
 /// Filter for `airc work board` output — clap enforces mutual exclusion
 /// on the underlying flags, but the runtime collapses them into one
 /// value so the rest of the code doesn't carry three booleans.
@@ -1733,25 +1713,6 @@ impl BoardFilter {
             }
             Self::Mine => card.owner == Some(me),
             Self::Others => card.owner.is_some_and(|owner| owner != me),
-        }
-    }
-}
-
-/// Render claim-lease liveness inline on the board (kink ac6affc7):
-/// '-' = no claim, '<STALE>' = lease expired (eligible for reclaim per
-/// the flywheel-continuity doctrine), otherwise time remaining as
-/// 'Mm SS s'. Lets at-a-glance scanning of the board surface stale
-/// claims without having to cross-reference 'work roster' + ttl.
-pub(crate) fn format_lease(expires_at_ms: Option<u64>, now_ms: u64) -> String {
-    match expires_at_ms {
-        None => "-".to_string(),
-        Some(expires_at_ms) if expires_at_ms <= now_ms => "<STALE>".to_string(),
-        Some(expires_at_ms) => {
-            let ms_left = expires_at_ms - now_ms;
-            let s_left = ms_left / 1000;
-            let m = s_left / 60;
-            let s = s_left % 60;
-            format!("{m}m{s:02}s")
         }
     }
 }
@@ -1807,13 +1768,7 @@ pub async fn run_board(
             owner_peers.insert(claim.owner);
         }
     }
-    let mut aliases: std::collections::HashMap<airc_lib::PeerId, String> =
-        std::collections::HashMap::new();
-    for peer in owner_peers {
-        if let Ok(Some(alias)) = airc.peer_alias(peer).await {
-            aliases.insert(peer, alias);
-        }
-    }
+    let aliases = crate::work_show::aliases_for(&airc, owner_peers.into_iter()).await;
 
     print_board(&board, me, filter, &aliases, limit);
     Ok(())
@@ -2057,7 +2012,7 @@ fn print_board(
             println!(
                 "{card_id}  owner={owner}  claim={claim_id}  expired_at_ms={expired_at_ms}",
                 card_id = claim.card_id,
-                owner = format_peer(claim.owner, me, aliases),
+                owner = crate::work_show::format_peer(claim.owner, me, aliases),
                 claim_id = claim.claim_id.shown(),
                 expired_at_ms = claim.expired_at_ms,
             );
@@ -2250,7 +2205,7 @@ pub(crate) fn now_ms() -> u64 {
 /// A card id as the caller typed it: the full id, or the short form the board
 /// shows, resolved against this board's cards (refused with the candidates when
 /// it names none or several). One rule for every work verb: `airc_core::shown_id`.
-fn card_on_board(
+pub(crate) fn card_on_board(
     board: &WorkBoardProjection,
     shown: &Shown<WorkCardId>,
 ) -> Result<WorkCardId, ShownIdError> {
@@ -2471,29 +2426,6 @@ mod tests {
                 "parse_pr_spec({input:?}) must refuse, not guess"
             );
         }
-    }
-
-    #[test]
-    fn lease_renders_dash_when_no_claim() {
-        assert_eq!(format_lease(None, 1_000), "-");
-    }
-
-    #[test]
-    fn lease_renders_stale_marker_when_expired() {
-        assert_eq!(format_lease(Some(500), 1_000), "<STALE>");
-        // Exact-equal counts as expired — eligible for reclaim now.
-        assert_eq!(format_lease(Some(1_000), 1_000), "<STALE>");
-    }
-
-    #[test]
-    fn lease_renders_remaining_as_minutes_seconds() {
-        // 8 minutes 12 seconds remaining.
-        assert_eq!(
-            format_lease(Some(1_000 + 8 * 60_000 + 12_000), 1_000),
-            "8m12s"
-        );
-        // Sub-minute pads seconds with leading zero.
-        assert_eq!(format_lease(Some(1_000 + 5_000), 1_000), "0m05s");
     }
 
     // Card c9b28925 — `airc work cleanup` classifier tests. Pure
@@ -3556,24 +3488,6 @@ mod tests {
         // Length bound respected.
         let bounded = crate::work_commands_git::slugify(&"x".repeat(200), 10);
         assert!(bounded.len() <= 10, "got: {bounded}");
-    }
-
-    #[test]
-    fn format_peer_renders_alias_when_known_short_uuid_otherwise() {
-        let me = PeerId::from_u128(10);
-        let alice = PeerId::from_u128(20);
-        let bob = PeerId::from_u128(30);
-        let mut aliases = std::collections::HashMap::new();
-        aliases.insert(alice, "alice".to_string());
-
-        // Self is always "me", even if a stale alias exists for self.
-        assert_eq!(format_peer(me, me, &aliases), "me");
-        // Known peer renders by alias.
-        assert_eq!(format_peer(alice, me, &aliases), "alice");
-        // Unknown peer falls back to short-uuid — never empty string.
-        let bob_short = format_peer(bob, me, &aliases);
-        assert_eq!(bob_short.len(), 8);
-        assert_ne!(bob_short, "me");
     }
 
     #[test]
