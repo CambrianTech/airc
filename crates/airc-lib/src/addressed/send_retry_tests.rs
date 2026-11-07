@@ -306,6 +306,14 @@ async fn an_already_expired_send_is_refused_pre_dispatch_and_nothing_leaves() {
         frames.try_recv().is_err(),
         "nothing reached the peer's wire"
     );
+    assert_eq!(
+        alice
+            .inner
+            .addressed
+            .backing_off(bob.peer_id(), crate::time::now_ms().unwrap()),
+        None,
+        "the caller's own deadline never backs the recipient off"
+    );
 }
 
 // what this catches: a daemon-owner attach that cannot complete keeping the caller's whole
@@ -350,6 +358,237 @@ async fn a_blocked_owner_attach_is_refused_pre_dispatch_as_owner_unavailable() {
             })
         ),
         "a blocked owner attach is pre-dispatch OwnerUnavailable at the route budget: {sent:?}"
+    );
+    assert!(
+        airc.inner.addressed.reachability_mut().is_empty(),
+        "this process's own owner attach never backs a recipient off"
+    );
+}
+
+async fn silent_pair(
+    room: &str,
+) -> (
+    Airc,
+    Airc,
+    mpsc::Receiver<Frame>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join(room).await.unwrap();
+    bob.join(room).await.unwrap();
+    let (tx, frames) = mpsc::channel(4096);
+    bob.set_addressed_frame_sink(Arc::new(Capture(tx))).unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    (alice, bob, frames, alice_home, bob_home)
+}
+
+async fn linked_pair(room: &str) -> (Airc, Airc, tempfile::TempDir, tempfile::TempDir) {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join(room).await.unwrap();
+    bob.join(room).await.unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    (alice, bob, alice_home, bob_home)
+}
+
+fn inits_in(frames: &mut mpsc::Receiver<Frame>) -> usize {
+    let mut inits = 0;
+    while let Ok(frame) = frames.try_recv() {
+        if let AddressedWire::Init(_) =
+            AddressedWire::from_body(frame.envelope.body.as_ref().unwrap()).unwrap()
+        {
+            inits += 1;
+        }
+    }
+    inits
+}
+
+// what this catches: the 0121d959 storm (2026-11-02, ~2/s per sender on every node). Eight sends at
+// once to a routable peer that forms no session (backfill's channels, commands) share ONE probe: its
+// owner gives up at the route budget as NoHandshakeReply and backs the recipient off, the queued
+// seven recheck under the lease and return BackingOff without probing, and a later send is refused
+// locally with no init on the wire (Codex on #1649).
+#[tokio::test]
+async fn a_burst_to_a_silent_recipient_probes_once_and_then_nothing_leaves() {
+    let (alice, bob, mut frames, _a, _b) = silent_pair("burst").await;
+    let sends = (0..8).map(|_| {
+        alice.send_addressed(
+            probe_send(bob.peer_id()),
+            Instant::now() + Duration::from_secs(600),
+        )
+    });
+    let results = futures::future::join_all(sends).await;
+    let reasons: Vec<_> = results
+        .iter()
+        .map(|r| match r {
+            Err(AddressedError::SessionUnavailable { reason, .. }) => *reason,
+            other => panic!("every send is pre-dispatch: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|r| **r == SessionUnavailableReason::NoHandshakeReply)
+            .count(),
+        1,
+        "one probe owner gives up: {reasons:?}"
+    );
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|r| **r == SessionUnavailableReason::BackingOff)
+            .count(),
+        7,
+        "the queued seven back off without probing: {reasons:?}"
+    );
+    assert!(inits_in(&mut frames) >= 1, "the one probe reached the wire");
+    let later = alice
+        .send_addressed(
+            probe_send(bob.peer_id()),
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    assert!(matches!(
+        later,
+        Err(AddressedError::SessionUnavailable {
+            reason: SessionUnavailableReason::BackingOff,
+            ..
+        })
+    ));
+    assert_eq!(
+        inits_in(&mut frames),
+        0,
+        "a backing-off recipient gets nothing on the wire"
+    );
+}
+
+// what this catches: a stale failure overwriting a recovery on a real pair (the unit fence is in
+// reachability.rs). A probe generation taken before a live session forms is fenced out after it.
+#[tokio::test]
+async fn a_failure_from_before_a_live_session_is_fenced_out() {
+    let (alice, bob, _a, _b) = linked_pair("fence").await;
+    let state = &alice.inner.addressed;
+    let started = state.reachability_mut().generation(bob.peer_id());
+    alice
+        .send_addressed(
+            probe_send(bob.peer_id()),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .expect("a live pair forms a session");
+    let now = crate::time::now_ms().unwrap();
+    assert!(
+        !state
+            .reachability_mut()
+            .record_unanswered(bob.peer_id(), started, now),
+        "a failure from a probe that started before the session is fenced"
+    );
+    assert_eq!(state.backing_off(bob.peer_id(), now), None);
+}
+
+// what this catches: a follower recording a failure it never probed (Codex on #1650). With the
+// probe lease held (another owner probing), a send whose bound passes while waiting for it sends
+// nothing and records nothing.
+#[tokio::test]
+async fn a_caller_that_never_owned_the_probe_records_nothing() {
+    let (alice, bob, mut frames, _a, _b) = silent_pair("follower").await;
+    let state = &alice.inner.addressed;
+    let held = state
+        .handshake_waiters
+        .lease(bob.peer_id())
+        .await
+        .lock_owned()
+        .await;
+    // A caller deadline past the route budget, so the lease wait ends at the budget with the
+    // REMOTE reason a probe owner would record (Codex on #1650: a CallerDeadline proves nothing,
+    // the memo never took one). Paused time: the wait costs no wall clock.
+    tokio::time::pause();
+    let sent = alice
+        .send_addressed(
+            probe_send(bob.peer_id()),
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    drop(held);
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::NoHandshakeReply,
+                ..
+            })
+        ),
+        "a follower's lease wait ends at the route budget with the remote reason: {sent:?}"
+    );
+    assert!(
+        state.reachability_mut().is_empty(),
+        "the follower recorded nothing"
+    );
+    assert_eq!(inits_in(&mut frames), 0, "and probed nothing");
+}
+
+// what this catches: a probe owner dropped mid-wait recording a failure it never reached. A
+// cancelled send leaves the recipient untouched, and the next send probes it again.
+#[tokio::test]
+async fn a_cancelled_probe_owner_backs_nothing_off() {
+    let (alice, bob, mut frames, _a, _b) = silent_pair("cancelled").await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(1_500),
+        alice.send_addressed(
+            probe_send(bob.peer_id()),
+            Instant::now() + Duration::from_secs(600),
+        ),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the probe owner was dropped mid-wait");
+    assert_eq!(
+        alice
+            .inner
+            .addressed
+            .backing_off(bob.peer_id(), crate::time::now_ms().unwrap()),
+        None,
+        "a cancelled owner records nothing"
+    );
+    let _ = inits_in(&mut frames);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(1_500),
+        alice.send_addressed(
+            probe_send(bob.peer_id()),
+            Instant::now() + Duration::from_secs(600),
+        ),
+    )
+    .await;
+    assert!(
+        inits_in(&mut frames) >= 1,
+        "the next send probes the recipient again"
     );
 }
 

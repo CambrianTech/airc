@@ -15,6 +15,7 @@
 //! identity key; the AEAD covers the rest), never read from a header.
 
 mod daemon;
+mod reachability;
 mod receive;
 mod send;
 mod sink;
@@ -143,6 +144,9 @@ pub enum SessionUnavailableReason {
     /// The caller's deadline passed first (or had already passed), still before anything was
     /// sealed or sent.
     CallerDeadline,
+    /// The recipient formed no session when last asked and is on the route's bounded backoff:
+    /// refused locally, nothing sent, until the backoff passes or a session with it installs.
+    BackingOff,
 }
 
 impl std::fmt::Display for AddressedError {
@@ -255,6 +259,13 @@ pub(crate) struct AddressedState {
     /// Bumped whenever a session is installed, so senders waiting on a
     /// handshake wake and re-check.
     established: watch::Sender<u64>,
+    /// Recipients that formed no session when last asked, on the route's own bounded
+    /// backoff ([`crate::route::Quarantine`], backoff-only: an unanswered handshake is
+    /// uncertainty and never Dead). While a recipient backs off, every send to it from
+    /// every handle (commands and backfill alike) is refused locally, with nothing on the
+    /// wire. A session installed with it clears it. One owner, so no caller can storm a
+    /// peer that does not answer: the 0121d959 storm, about 2/s per sender on every node.
+    reachability: std::sync::Mutex<reachability::Reachability>,
 }
 
 impl AddressedState {
@@ -271,11 +282,28 @@ impl AddressedState {
             sessions: SessionManager::new(identity.keypair.clone(), identity.peer_id, registry),
             inbox_tx,
             established: watch::Sender::new(0),
+            reachability: std::sync::Mutex::new(reachability::Reachability::default()),
         }
     }
 
-    fn session_installed(&self) {
+    /// A session with `peer` is installed: a new session generation and no backoff for it (under
+    /// the memo's one lock), then wake handshake waiters.
+    fn session_installed(&self, peer: airc_core::PeerId) {
+        self.reachability_mut().session_installed(peer);
         self.established.send_modify(|generation| *generation += 1);
+    }
+
+    /// Whether sends to `peer` are backing off now: `Some(remaining_ms)` while they are.
+    pub(super) fn backing_off(&self, peer: airc_core::PeerId, now_ms: u64) -> Option<u64> {
+        self.reachability_mut().backing_off(peer, now_ms)
+    }
+
+    pub(super) fn reachability_mut(&self) -> std::sync::MutexGuard<'_, reachability::Reachability> {
+        // A poisoned lock still holds the memo: plain timestamps and counters, consistent at
+        // every step.
+        self.reachability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
