@@ -137,3 +137,86 @@ fn a_merge_is_pinned_to_the_head_the_gate_judged() {
         CardGate::AlreadyMerged { merged_at_ms: 9 }
     ));
 }
+
+// what this catches: the merger draining the account's GitHub API (airc 315bf919, 2026-11-07: a
+// PR view per Review card, ~60 a 30 s tick, 0/5000). A card with no board verdict (no submission,
+// a submission with no recorded head, a recorded head nobody else reviewed) is decided on the
+// board and costs no GitHub call at all.
+#[tokio::test]
+async fn a_card_without_a_board_verdict_costs_no_github_call() {
+    use airc_lib::gh::client::mock::MockGhClient;
+    use airc_work::{CardCreated, Priority, RepoId, WorkCardClaimed, WorkEvent};
+    let gh = MockGhClient::new();
+    let mut board = WorkBoardProjection::new();
+    let owner = peer(10);
+    let card = |n: u128| airc_work::WorkCardId::from_uuid(uuid::Uuid::from_u128(n));
+    for n in [2u128, 3, 4] {
+        board
+            .apply(&WorkEvent::CardCreated(CardCreated {
+                card_id: card(n),
+                repo: RepoId::new("CambrianTech/airc").unwrap(),
+                title: "a card in review".into(),
+                body: None,
+                priority: Priority::P1,
+                lane_id: None,
+                created_by: owner,
+                created_at_ms: 1,
+                reviews: None,
+                origin: None,
+            }))
+            .unwrap();
+    }
+    for n in [3u128, 4] {
+        board
+            .apply(&WorkEvent::CardClaimed(WorkCardClaimed {
+                card_id: card(n),
+                claim_id: airc_work::ClaimId::from_uuid(uuid::Uuid::from_u128(3)),
+                owner,
+                ttl_ms: 1_000_000,
+                claimed_at_ms: 2,
+                origin: airc_work::ClaimOrigin::Automatic,
+                selected_at_ms: None,
+            }))
+            .unwrap();
+    }
+    // card 3: a legacy submission (no head); card 4: a recorded head nobody reviewed
+    let mut legacy = submission(airc_work::SubmissionHead::Unrecorded);
+    legacy.card_id = card(3);
+    let mut unreviewed = submission(airc_work::SubmissionHead::At(sha('b')));
+    unreviewed.card_id = card(4);
+    unreviewed.submission_id = airc_work::SubmissionId::from_u128(9);
+    for s in [legacy, unreviewed] {
+        board.apply(&WorkEvent::WorkSubmitted(s)).unwrap();
+    }
+    let pr = airc_work::model::PullRequestRef {
+        repo: RepoId::new("CambrianTech/airc").unwrap(),
+        number: 1,
+        head: airc_work::model::BranchName::new("topic").unwrap(),
+        base: airc_work::model::BranchName::new("canary").unwrap(),
+    };
+    let policy = crate::merger::GatePolicy {
+        pending_timeout_ms: 0,
+        now_ms: 0,
+    };
+    for n in [2u128, 3, 4] {
+        let decided = check_card_gate(
+            &gh,
+            &board,
+            board.card(card(n)).unwrap(),
+            &pr,
+            &mut crate::merger::BaselineCache::default(),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(decided, CardGate::NotReady(_)),
+            "card {n}: {decided:?}"
+        );
+    }
+    assert_eq!(
+        gh.pr_view_call_count(),
+        0,
+        "no GitHub call for a card the board already refuses"
+    );
+}
