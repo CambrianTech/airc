@@ -1659,7 +1659,7 @@ impl Airc {
         }
     }
 
-    fn with_daemon_client(&self, client: DaemonClient) -> Self {
+    pub(crate) fn with_daemon_client(&self, client: DaemonClient) -> Self {
         let inner = AircInner {
             home: self.inner.home.clone(),
             wire_root: self.inner.wire_root.clone(),

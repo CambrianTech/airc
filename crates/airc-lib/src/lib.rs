@@ -99,7 +99,8 @@ pub use account_registry::{
 };
 pub use account_registry_fs::FsAccountRegistryStore;
 pub use addressed::{
-    AddressedError, AddressedInbox, AddressedKind, AddressedSend, InboxError, VerifiedAddressed,
+    AddressedError, AddressedInbox, AddressedKind, AddressedSend, InboxError,
+    SessionUnavailableReason, VerifiedAddressed,
 };
 pub use agent_heartbeat::{
     AgentHeartbeat, AgentLiveness, CoordinationSignal, HeartbeatKind, HeartbeatTask, RoomMember,

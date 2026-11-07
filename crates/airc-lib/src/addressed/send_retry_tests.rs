@@ -1,6 +1,7 @@
 use super::*;
-use crate::addressed::{AddressedFrameSink, AddressedKind};
+use crate::addressed::{AddressedFrameSink, AddressedKind, SessionUnavailableReason};
 use airc_core::{Body, Headers, PeerId};
+use airc_protocol::addressed::AddressedWire;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -124,4 +125,304 @@ async fn cancelled_owner_hands_off_same_retry_schedule_and_dead_peers_are_pruned
     let peers = waiters.peers.lock().await;
     assert_eq!(peers.len(), 1);
     assert!(!peers.contains_key(&peer));
+}
+
+// what this catches: the IntelMac 2026-11-02 shape at the wire. The route is healthy but the peer
+// forms no session: its frame sink takes every init and answers none. A send with a ten-minute
+// deadline gives up at the route's delivery budget as pre-dispatch NoHandshakeReply, and the
+// peer's wire sink saw inits only, never a sealed request, so the caller may take the work
+// elsewhere without running it twice (Codex on #1649: prove it at the sink, not the store).
+#[tokio::test]
+async fn a_peer_that_answers_no_handshake_is_given_up_at_the_budget_and_nothing_sealed_leaves() {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join("silent-seat").await.unwrap();
+    bob.join("silent-seat").await.unwrap();
+    let (tx, mut frames) = mpsc::channel(256);
+    bob.set_addressed_frame_sink(Arc::new(Capture(tx))).unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    let started = Instant::now();
+    let sent = alice
+        .send_addressed(
+            AddressedSend {
+                to: bob.peer_id(),
+                kind: AddressedKind::Command,
+                correlation: uuid::Uuid::new_v4(),
+                headers: Headers::new(),
+                body: Body::text("a request the seat must never see"),
+            },
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    let waited = started.elapsed();
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::NoHandshakeReply,
+                ..
+            })
+        ),
+        "a routable peer that forms no session is pre-dispatch NoHandshakeReply: {sent:?}"
+    );
+    assert!(
+        waited < budget + Duration::from_secs(5),
+        "given up at the route budget ({budget:?}), not the caller's 600 s: {waited:?}"
+    );
+    let (mut inits, mut sealed) = (0, 0);
+    while let Ok(frame) = frames.try_recv() {
+        match AddressedWire::from_body(frame.envelope.body.as_ref().unwrap()).unwrap() {
+            AddressedWire::Init(_) => inits += 1,
+            AddressedWire::Sealed(_) => sealed += 1,
+            AddressedWire::Resp(_) => {}
+        }
+    }
+    assert!(inits >= 1, "the handshake was attempted on the live route");
+    assert_eq!(
+        sealed, 0,
+        "nothing sealed left: the request was never dispatched"
+    );
+}
+
+// what this catches: the bound of the pre-dispatch phases. The route's delivery budget bounds
+// them when it is the earlier, typed NoHandshakeReply; the caller's deadline when it is,
+// typed CallerDeadline. Never the caller's deadline alone (the 630 s wait).
+#[test]
+fn the_pre_dispatch_bound_is_the_earlier_of_the_route_budget_and_the_caller() {
+    let now = Instant::now();
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    let (bound, reason) = pre_dispatch_bound(now, now + Duration::from_secs(600));
+    assert_eq!(
+        (bound, reason),
+        (now + budget, SessionUnavailableReason::NoHandshakeReply)
+    );
+    let short = now + Duration::from_millis(300);
+    assert_eq!(
+        pre_dispatch_bound(now, short),
+        (short, SessionUnavailableReason::CallerDeadline)
+    );
+}
+
+// what this catches: relabeling a failed init as an absent route (Codex on #1649). Only the route
+// resolver's typed refusal is NoRoute and retried; a codec, signing, clock or IPC failure returns
+// at once, typed; the bound cutting a write short ends on the session wait's own timer.
+#[test]
+fn only_a_typed_absent_route_is_retried_as_no_route() {
+    assert_eq!(InitOutcome::of(Ok(())).unwrap(), InitOutcome::Sent);
+    assert_eq!(
+        InitOutcome::of(Err(AddressedError::NoLiveRoute("none".into()))).unwrap(),
+        InitOutcome::NoRoute
+    );
+    assert_eq!(
+        InitOutcome::of(Err(AddressedError::DeadlineExceeded)).unwrap(),
+        InitOutcome::Sent
+    );
+    assert!(matches!(
+        InitOutcome::of(Err(AddressedError::Codec("bad".into()))),
+        Err(AddressedError::Codec(_))
+    ));
+    assert!(matches!(
+        InitOutcome::of(Err(AddressedError::Transport("ipc".into()))),
+        Err(AddressedError::Transport(_))
+    ));
+    use SessionUnavailableReason::*;
+    assert_eq!(
+        InitOutcome::NoRoute.give_up_reason(NoHandshakeReply),
+        NoRoute
+    );
+    assert_eq!(
+        InitOutcome::Sent.give_up_reason(NoHandshakeReply),
+        NoHandshakeReply
+    );
+    assert_eq!(
+        InitOutcome::NoRoute.give_up_reason(CallerDeadline),
+        CallerDeadline
+    );
+}
+
+fn probe_send(to: PeerId) -> AddressedSend {
+    AddressedSend {
+        to,
+        kind: AddressedKind::Command,
+        correlation: uuid::Uuid::new_v4(),
+        headers: Headers::new(),
+        body: Body::text("must not leave"),
+    }
+}
+
+// what this catches: an already-expired send reported as a post-seal DeadlineExceeded (delivery
+// unknown) when nothing was attempted. It is refused pre-dispatch as CallerDeadline, and the
+// peer's wire sink sees nothing at all (Codex on #1649).
+#[tokio::test]
+async fn an_already_expired_send_is_refused_pre_dispatch_and_nothing_leaves() {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join("expired-send").await.unwrap();
+    bob.join("expired-send").await.unwrap();
+    let (tx, mut frames) = mpsc::channel(8);
+    bob.set_addressed_frame_sink(Arc::new(Capture(tx))).unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    let sent = alice
+        .send_addressed(probe_send(bob.peer_id()), Instant::now())
+        .await;
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::CallerDeadline,
+                ..
+            })
+        ),
+        "an expired send is pre-dispatch CallerDeadline: {sent:?}"
+    );
+    assert!(
+        frames.try_recv().is_err(),
+        "nothing reached the peer's wire"
+    );
+}
+
+// what this catches: a daemon-owner attach that cannot complete keeping the caller's whole
+// deadline (the 630 s failure one layer down) or reading as delivery-unknown. With the owner slot
+// held, a send under a ten-minute deadline gives up at the route budget as pre-dispatch
+// OwnerUnavailable. Time is paused after setup: the held lock leaves the runtime idle, so the
+// budget elapses at once (Codex on #1649: hold the existing owner mutex, daemon-client mode).
+#[tokio::test]
+async fn a_blocked_owner_attach_is_refused_pre_dispatch_as_owner_unavailable() {
+    let home = tempfile::TempDir::new().unwrap();
+    let airc =
+        Airc::open(home.path())
+            .await
+            .unwrap()
+            .with_daemon_client(airc_ipc::DaemonClient::new(
+                home.path().join("no-daemon.sock"),
+            ));
+    let held = airc.inner.addressed.daemon_owner.lock().await;
+    tokio::time::pause();
+    let started = Instant::now();
+    let sent = airc
+        .send_addressed(
+            probe_send(PeerId::new()),
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    let waited = started.elapsed();
+    drop(held);
+    // The route budget exactly, give or take tokio's 1 ms timer resolution (a paused-time
+    // timeout fires at the next whole millisecond): never the caller's 600 s.
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    assert!(
+        waited >= budget && waited <= budget + Duration::from_millis(1),
+        "the owner attach is bounded by the route budget ({budget:?}), never the caller's 600 s: {waited:?}"
+    );
+    assert!(
+        matches!(
+            sent,
+            Err(AddressedError::SessionUnavailable {
+                reason: SessionUnavailableReason::OwnerUnavailable,
+                ..
+            })
+        ),
+        "a blocked owner attach is pre-dispatch OwnerUnavailable at the route budget: {sent:?}"
+    );
+}
+
+// what this catches: a send whose session is already formed but whose wire write cannot complete
+// being reported as pre-dispatch (SessionUnavailable) or bounded by the route budget instead of
+// the caller's deadline. Past the session the frame is sealed: the outcome is DeadlineExceeded
+// (delivery unknown) at the caller's deadline. The wire is blocked by holding the LAN adapter
+// slot the send path takes; time is paused after the session forms (Codex on #1649).
+#[tokio::test]
+async fn a_blocked_wire_after_a_formed_session_is_deadline_exceeded_at_the_callers_deadline() {
+    let alice_home = tempfile::TempDir::new().unwrap();
+    let bob_home = tempfile::TempDir::new().unwrap();
+    let alice = Airc::open(alice_home.path()).await.unwrap();
+    let bob = Airc::open(bob_home.path()).await.unwrap();
+    alice
+        .add_peer(bob.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    bob.add_peer(alice.peer_spec().parse().unwrap())
+        .await
+        .unwrap();
+    alice.join("blocked-wire").await.unwrap();
+    bob.join("blocked-wire").await.unwrap();
+    let (tx, mut frames) = mpsc::channel(32);
+    bob.set_addressed_frame_sink(Arc::new(Capture(tx))).unwrap();
+    let address = bob
+        .listen_lan("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    alice.connect_lan(address, bob.peer_id()).await.unwrap();
+    let formed = Instant::now() + Duration::from_secs(10);
+    let _inbox = bob.addressed_inbox(formed).await.unwrap();
+    let first = alice.send_addressed(probe_send(bob.peer_id()), formed);
+    let pump = async {
+        loop {
+            let frame = frames.recv().await.unwrap();
+            let sealed = matches!(
+                AddressedWire::from_body(frame.envelope.body.as_ref().unwrap()).unwrap(),
+                AddressedWire::Sealed(_)
+            );
+            bob.receive_addressed(frame).await;
+            if sealed {
+                break;
+            }
+        }
+    };
+    let (first, ()) = tokio::join!(first, pump);
+    first.unwrap();
+    assert!(
+        alice.inner.addressed.sessions.has_session(bob.peer_id()),
+        "the session formed"
+    );
+
+    let held = alice.inner.lan_tcp.lock().await;
+    tokio::time::pause();
+    let started = Instant::now();
+    let caller = Duration::from_secs(5);
+    let sent = alice
+        .send_addressed(probe_send(bob.peer_id()), started + caller)
+        .await;
+    let waited = started.elapsed();
+    drop(held);
+    assert!(
+        matches!(sent, Err(AddressedError::DeadlineExceeded)),
+        "past a formed session a blocked wire is delivery-unknown: {sent:?}"
+    );
+    let budget = crate::route_forwarder::RoutedForwarderConfig::default().delivery_budget();
+    assert!(
+        waited >= caller && waited <= caller + Duration::from_millis(1) && caller < budget,
+        "bounded by the caller's {caller:?}, not the route budget {budget:?}: {waited:?}"
+    );
+    assert!(
+        frames.try_recv().is_err(),
+        "nothing reached the peer's wire"
+    );
 }

@@ -229,6 +229,14 @@ pub enum AircError {
     #[error("command deadline elapsed (correlation_id={correlation_id})")]
     CommandDeadline { correlation_id: uuid::Uuid },
 
+    /// No session with the peer formed, so the request was never sealed or sent: provably
+    /// pre-dispatch. A caller may run the work elsewhere with no risk of running it twice.
+    #[error("no session with {peer} formed ({reason:?}); the request was not sent")]
+    SessionUnavailable {
+        peer: airc_core::PeerId,
+        reason: crate::addressed::SessionUnavailableReason,
+    },
+
     #[error("command {correlation_id} has already finished")]
     CommandFinished { correlation_id: uuid::Uuid },
 
