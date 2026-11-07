@@ -1854,6 +1854,7 @@ mod tests {
                             claim_id: claim,
                             instance: title.into(),
                             base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+                            head: airc_work::GitObjectId::new("e".repeat(40)).unwrap(),
                             artifact,
                         },
                     )
