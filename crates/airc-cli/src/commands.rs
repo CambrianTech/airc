@@ -13,7 +13,7 @@
 //! `VerificationPolicy::Strict` is the only policy used in CLI paths.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -665,13 +665,6 @@ pub async fn ensure_daemon_running(
     }
 
     // 3. Spawn a fresh daemon at the home-resolved socket.
-    std::fs::create_dir_all(home)?;
-    let log = home.join("airc-daemon.log");
-    let stdout = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)?;
-    let stderr = stdout.try_clone()?;
     let exe = std::env::current_exe()?;
     // The daemon's HOME must be the home that OWNS the socket, not the
     // caller's scope.
@@ -704,12 +697,10 @@ pub async fn ensure_daemon_running(
     // derived here and, separately, at `update_commands::daemon_command` —
     // where it was missed, which is how `airc update` started taking nodes
     // dark (#1352). A rule with two implementations has one that is wrong.
-    let mut command = airc_lib::daemon_command(&exe, home, "daemon", &socket);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    let child = spawn_daemon(command)?;
+    let child = crate::daemon_drain::spawn(
+        airc_lib::daemon_command(&exe, home, "daemon", &socket),
+        &airc_lib::daemon_log_path(home),
+    )?;
     let daemon_pid = child.id();
     await_daemon_ready(
         home,
@@ -2088,9 +2079,14 @@ pub async fn run_daemon(
 
     let auto_update_task = {
         let daemon_state = state.clone();
+        let log = airc_core::daemon_log::path(home);
         tokio::spawn(async move {
-            airc_daemon::auto_update::run(&daemon_state.shutdown, || mesh_quiet_now(&daemon_state))
-                .await;
+            airc_daemon::auto_update::run(
+                &daemon_state.shutdown,
+                || mesh_quiet_now(&daemon_state),
+                &log,
+            )
+            .await;
         })
     };
     // The store's one drain (airc_store::retention::run), as every store runs it: here

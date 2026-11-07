@@ -31,6 +31,7 @@ mod collaboration_cli;
 mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
+mod daemon_drain;
 mod discovery;
 mod doctor;
 #[cfg(windows)]
@@ -200,7 +201,29 @@ async fn async_main() -> ExitCode {
     // One rule for every store this process opens (airc_lib::store_admission).
     airc_lib::store_admission::install();
     let parsed = Cli::parse();
-    match dispatch(parsed).await {
+    // A detached daemon owns its log before anything else runs, so a failure from here on,
+    // dispatch's own error line included, is written to it. Dropped after that line.
+    let drain = match &parsed.command {
+        Command::Daemon {
+            log_file: Some(log),
+            ..
+        } => match daemon_drain::install(log) {
+            Ok(drain) => Some(drain),
+            Err(error) => {
+                eprintln!("airc daemon: cannot own its log {}: {error}", log.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
+    let code = exit_code(dispatch(parsed).await);
+    drop(drain);
+    code
+}
+
+/// The process's exit code for what dispatch returned, saying the error first.
+fn exit_code(result: Result<(), Box<dyn std::error::Error>>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if let Some(code) = channel_gist_commands::command_exit_code(error.as_ref()) {
@@ -418,7 +441,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::run_lan_listen(&home, parsed.peers, bind, replay).await
         }
 
-        Command::Daemon { socket } => {
+        Command::Daemon { socket, .. } => {
             let socket = default_or(socket, &home);
             commands::run_daemon(&home, parsed.peers, socket).await
         }

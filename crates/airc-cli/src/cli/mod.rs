@@ -228,6 +228,10 @@ pub enum Command {
         /// Override the default daemon IPC endpoint.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Detached: own this log file, draining stdout and stderr into it, bounded. Set by the
+        /// one detached spawn (`airc_lib::daemon_command`); a foreground daemon keeps its streams.
+        #[arg(long, hide = true)]
+        log_file: Option<PathBuf>,
     },
 
     /// Probe the daemon — returns immediately if alive.

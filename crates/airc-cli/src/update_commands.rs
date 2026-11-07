@@ -1,6 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use crate::update_shutdown::{status as daemon_status, stop as stop_daemon};
@@ -662,25 +662,14 @@ fn restart_daemon(
     home: &Path,
     socket: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    spawn_restarted_daemon(daemon_command(airc_exe, home, "daemon", socket), home)
+    spawn_restarted_daemon(
+        daemon_command(airc_exe, home, "daemon", socket),
+        &airc_lib::daemon_log_path(home),
+    )
 }
 
-fn spawn_restarted_daemon(
-    mut command: Command,
-    home: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(home)?;
-    let log = home.join("airc-daemon.log");
-    let stdout = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)?;
-    let stderr = stdout.try_clone()?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    crate::commands::spawn_daemon(command)?;
+fn spawn_restarted_daemon(command: Command, log: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    crate::daemon_drain::spawn(command, log)?;
     Ok(())
 }
 
@@ -1064,7 +1053,8 @@ mod tests {
             command
                 .args(["--exact", TEST, "--nocapture"])
                 .env(MODE, "daemon");
-            spawn_restarted_daemon(command, Path::new(&env::var(FIXTURE_HOME).unwrap())).unwrap();
+            let log = Path::new(&env::var(FIXTURE_HOME).unwrap()).join(airc_core::daemon_log::FILE);
+            spawn_restarted_daemon(command, &log).unwrap();
             // Detachment changes only the runtime child's environment. The
             // installer retains its authority through publication/recovery.
             assert_eq!(
@@ -1091,9 +1081,9 @@ mod tests {
             .env("AIRC_UPDATE_SESSION_OWNER", "fixture-owner")
             .env(FIXTURE_HOME, home.path())
             .env(ADDRESS, listener.local_addr().unwrap().to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         // Hermetic credential: Windows exercises inherited env; Unix exercises
         // keyring extraction via an isolated gh stub, never the real keychain.
         launcher
@@ -1367,7 +1357,9 @@ mod tests {
                 "/tmp/home/.airc",
                 "daemon",
                 "--socket",
-                "/tmp/airc.sock"
+                "/tmp/airc.sock",
+                "--log-file",
+                &airc_lib::daemon_log_path(Path::new("/tmp/home/.airc")).to_string_lossy(),
             ]
         );
     }

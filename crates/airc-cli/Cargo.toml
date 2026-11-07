@@ -59,6 +59,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# daemon_drain: the detached daemon's stdout/stderr become a pipe it drains into its log.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Pipes"] }
+
 [dev-dependencies]
 # Test binaries may open stores without installing a write admission.
 airc-store = { path = "../airc-store", features = ["test-fixtures"] }

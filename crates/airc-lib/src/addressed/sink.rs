@@ -62,9 +62,30 @@ impl crate::Airc {
             let event_id = frame.envelope.event_id;
             let claimed_sender = frame.envelope.sender;
             let claimed_target = frame.envelope.target.clone();
-            if let Err(error) = sink.deliver(frame).await {
-                tracing::error!(target: "airc::addressed", %error, %event_id,
-                    %claimed_sender, ?claimed_target, "opaque addressed admission refused");
+            let delivered = sink.deliver(frame).await;
+            if delivered.is_ok() {
+                // A success ends the refusal episode: the next outage is said from its first refusal.
+                self.inner
+                    .addressed
+                    .refusals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) // a poisoned count is still a count
+                    .delivered();
+            }
+            if let Err(error) = delivered {
+                // Counted by kind and said at powers of two, never per frame (card 92cd55d2).
+                let said = self
+                    .inner
+                    .addressed
+                    .refusals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) // a poisoned count is still a count
+                    .count(&error);
+                if let Some(said) = said {
+                    tracing::warn!(target: "airc::addressed", kind = ?said.kind, count = said.count,
+                        latest = %error, %event_id, %claimed_sender, ?claimed_target,
+                        "opaque addressed admissions refused (said at powers of two)");
+                }
             }
         } else {
             self.receive_addressed(frame).await;

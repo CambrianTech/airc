@@ -106,10 +106,21 @@ pub fn mesh_is_quiet(peers: impl IntoIterator<Item = (u32, bool)>) -> bool {
 /// Spawn a DETACHED `airc update --auto` — its own process group so it survives
 /// the daemon stopping itself mid-update. Best-effort: returns the spawn error;
 /// it does NOT wait (the updater outlives this process).
-pub fn spawn_detached_update() -> std::io::Result<()> {
+///
+/// Its stdout and stderr are its own handle on the daemon's log (`log`), never the daemon's
+/// streams: those are the daemon's drain pipe, which closes when the daemon stops itself, and an
+/// updater still writing to it would fail every write (card 92cd55d2).
+pub fn spawn_detached_update(log: &std::path::Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = airc_core::process::background(exe);
     cmd.arg("update").arg("--auto");
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out.try_clone()?))
+        .stderr(std::process::Stdio::from(out));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -124,7 +135,7 @@ pub fn spawn_detached_update() -> std::io::Result<()> {
 /// `is_idle` predicate (the mesh-idle signal) and spawns this on the daemon
 /// runtime, cancelling via `shutdown`. Returns immediately if disabled — opt-out
 /// means zero ticks. The first interval is awaited (never update on boot).
-pub async fn run<F>(shutdown: &tokio::sync::Notify, is_idle: F)
+pub async fn run<F>(shutdown: &tokio::sync::Notify, is_idle: F, log: &std::path::Path)
 where
     F: Fn() -> bool,
 {
@@ -139,7 +150,7 @@ where
             _ = shutdown.notified() => break,
             _ = ticker.tick() => {
                 if should_fire(enabled(), is_idle()) {
-                    if let Err(error) = spawn_detached_update() {
+                    if let Err(error) = spawn_detached_update(log) {
                         // Best-effort: a failed spawn is logged (not silent) and
                         // retried next interval. The daemon has no tracing dep;
                         // stderr is its log sink.
