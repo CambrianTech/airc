@@ -75,7 +75,7 @@ pub async fn run_merge(
     match crate::merger::check_card_gate(gh.as_ref(), &board, card, &pr, &mut baselines, policy)
         .await
     {
-        Ok(crate::merger::GateResult::Green) => {
+        Ok(crate::merger::CardGate::Merge(head)) => {
             if dry_run {
                 println!(
                     "merge_gate: GREEN — card={card_uuid} pr=#{n} repo={r} (would merge)",
@@ -87,6 +87,7 @@ pub async fn run_merge(
             gh.pr_merge(crate::gh_client::PrMergeArgs {
                 repo: pr.repo.as_str().to_string(),
                 number: pr.number,
+                head: head.commit().clone(),
             })
             .await?;
             let now_ms = std::time::SystemTime::now()
@@ -101,7 +102,7 @@ pub async fn run_merge(
             );
             Ok(())
         }
-        Ok(crate::merger::GateResult::AlreadyMerged { merged_at_ms }) => {
+        Ok(crate::merger::CardGate::AlreadyMerged { merged_at_ms }) => {
             // Card acd72c81 follow-up: PR is already merged on
             // GitHub. The manual `airc work merge` path reconciles
             // by emitting `PullRequestMerged` — no `gh pr merge`
@@ -123,7 +124,7 @@ pub async fn run_merge(
             );
             Ok(())
         }
-        Ok(crate::merger::GateResult::NotReady(reason)) => Err(format!(
+        Ok(crate::merger::CardGate::NotReady(reason)) => Err(format!(
             "refusing to merge card {card_uuid} pr=#{n}: {reason}.\n\n\
              The strictly-less-red doctrine (card d5b7b07d) already lets you through \
              when only base-inherited failures remain. If you BELIEVE this gate is \

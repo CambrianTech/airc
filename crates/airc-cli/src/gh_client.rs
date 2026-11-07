@@ -112,6 +112,8 @@ impl GhClient for ShellGhClient {
             args.repo.as_str(),
             "--squash",
             "--delete-branch",
+            "--match-head-commit",
+            args.head.as_str(),
         ])
         .output()
         .await
@@ -219,6 +221,8 @@ fn classify_gh_failure(output: &std::process::Output) -> GhError {
         || lowered.contains("could not determine repository")
     {
         GhError::NotInGithubRepo { stderr }
+    } else if lowered.contains("head branch was modified") {
+        GhError::HeadMoved { stderr }
     } else if lowered.contains("conflict") || lowered.contains("not mergeable") {
         GhError::PrNotMergeable { stderr }
     } else {

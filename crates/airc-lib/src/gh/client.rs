@@ -71,6 +71,12 @@ pub enum GhError {
     #[error("pr not mergeable: {stderr}")]
     PrNotMergeable { stderr: String },
 
+    /// The PR's head is no longer the commit the merge pinned (REST 409, gh "head branch was
+    /// modified"): something was pushed after the gate judged it. Nothing merged; the card waits
+    /// for a submission and verdict at the new head.
+    #[error("pr head moved since it was judged: {stderr}")]
+    HeadMoved { stderr: String },
+
     /// Catch-all for `gh` exiting non-zero in a way we haven't
     /// classified yet. Includes the stderr so the operator can act,
     /// but downstream code should NOT pattern-match on the string —
@@ -181,6 +187,10 @@ pub struct PrCreateArgs {
 pub struct PrMergeArgs {
     pub repo: String,
     pub number: u64,
+    /// The head commit the merge must land: GitHub refuses the merge when the PR's head is no
+    /// longer this (gh `--match-head-commit`, REST `sha`), so a push after the gate judged the PR
+    /// never lands unreviewed (card 950b3093).
+    pub head: airc_work::GitObjectId,
 }
 
 #[derive(Debug, Clone)]

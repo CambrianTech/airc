@@ -426,12 +426,12 @@ impl GhClient for ReqwestGhClient {
             "{}/repos/{}/pulls/{}/merge",
             self.api_base, args.repo, args.number
         );
-        let body = serde_json::json!({ "merge_method": "squash" });
+        let body = serde_json::json!({ "merge_method": "squash", "sha": args.head.as_str() });
         let resp = self
             .send_authed(reqwest::Method::PUT, &url, Some(&body))
             .await?;
-        // Successful merge returns 200 with `merged: true`. 405 (method
-        // not allowed) and 409 (conflict) both map to PrNotMergeable.
+        // Successful merge returns 200 with `merged: true`. 405 (method not allowed) is not
+        // mergeable; 409 is the pinned `sha` no longer being the head (card 950b3093).
         let status = resp.status();
         if status.is_success() {
             return Ok(MergeReceipt {
@@ -439,9 +439,12 @@ impl GhClient for ReqwestGhClient {
                 number: args.number,
             });
         }
-        if status == reqwest::StatusCode::METHOD_NOT_ALLOWED
-            || status == reqwest::StatusCode::CONFLICT
-        {
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(GhError::HeadMoved {
+                stderr: resp.text().await.unwrap_or_default(),
+            });
+        }
+        if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             return Err(GhError::PrNotMergeable {
                 stderr: resp.text().await.unwrap_or_default(),
             });
@@ -752,6 +755,38 @@ mod tests {
             })).collect::<Vec<_>>()
         })
         .to_string()
+    }
+
+    // what this catches: a merge landing commits pushed after the gate judged the PR (Fable on
+    // #1660). The merge PUT pins the judged head as `sha`, and GitHub's 409 for a head that moved
+    // is HeadMoved: nothing merged, never a retryable "not mergeable".
+    #[tokio::test]
+    async fn a_merge_pins_the_judged_head_and_a_moved_head_is_refused_typed() {
+        let (base, server) = scripted_server(vec![(
+            409,
+            r#"{"message":"Head branch was modified. Review and try the merge again."}"#,
+        )])
+        .await;
+        let client = ReqwestGhClient::for_test(base, "fixture-token".into()).unwrap();
+        let judged = airc_work::GitObjectId::new("b".repeat(40)).unwrap();
+        let result = client
+            .pr_merge(crate::gh_client::PrMergeArgs {
+                repo: "other/project".into(),
+                number: 42,
+                head: judged.clone(),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(GhError::HeadMoved { .. })),
+            "{result:?}"
+        );
+        let requests = join_server(server).await;
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].contains(&format!("\"sha\":\"{}\"", judged.as_str())),
+            "the merge pins the judged head: {}",
+            requests[0]
+        );
     }
 
     async fn gate_from_http(

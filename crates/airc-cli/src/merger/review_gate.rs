@@ -9,9 +9,13 @@
 //! Independence is required always. Whether a citizen's own review earns her LEARNING credit is a
 //! room policy of continuum's (its recipe binding); landing code is not credit, so the merge gate
 //! never admits a self-review.
+//!
+//! The remaining gap, named: the merger still wakes on its 30 s tick over the whole board rather
+//! than on the verdict and CI events themselves (card 7b35d0f4: a webhook -> `CiCompleted` relay).
 
 use airc_work::{
-    WorkBoardProjection, WorkCard, WorkReviewOutcome, WorkSubmission, WorkSubmissionReview,
+    GitObjectId, WorkBoardProjection, WorkCard, WorkReviewOutcome, WorkSubmission,
+    WorkSubmissionReview,
 };
 
 /// Why a card's verdict does not authorize a merge.
@@ -20,7 +24,10 @@ pub(crate) enum VerdictGap {
     NoSubmission,
     HeadUnrecorded,
     PrHeadUnknown,
-    HeadMoved { submitted: String, pr: String },
+    HeadMoved {
+        submitted: GitObjectId,
+        pr: GitObjectId,
+    },
     NoIndependentReview,
     LatestReview(WorkReviewOutcome),
 }
@@ -43,7 +50,7 @@ impl std::fmt::Display for VerdictGap {
 pub(crate) fn verdict_authorizes(
     board: &WorkBoardProjection,
     card: &WorkCard,
-    pr_head: Option<&str>,
+    pr_head: Option<&GitObjectId>,
 ) -> Result<(), VerdictGap> {
     let submission = card.submissions.last().ok_or(VerdictGap::NoSubmission)?;
     decide(
@@ -58,14 +65,14 @@ pub(crate) fn verdict_authorizes(
 fn decide<'a>(
     submission: &WorkSubmission,
     reviews: impl Iterator<Item = &'a WorkSubmissionReview>,
-    pr_head: Option<&str>,
+    pr_head: Option<&GitObjectId>,
 ) -> Result<(), VerdictGap> {
     let submitted = submission.head.commit().ok_or(VerdictGap::HeadUnrecorded)?;
     let pr_head = pr_head.ok_or(VerdictGap::PrHeadUnknown)?;
-    if submitted.as_str() != pr_head {
+    if submitted != pr_head {
         return Err(VerdictGap::HeadMoved {
-            submitted: submitted.as_str().to_owned(),
-            pr: pr_head.to_owned(),
+            submitted: submitted.clone(),
+            pr: pr_head.clone(),
         });
     }
     let latest = reviews
@@ -81,8 +88,31 @@ fn decide<'a>(
     }
 }
 
+/// The head a verdict was judged at. Its field is private and this module alone mints it, from the
+/// view the gate read, so a merge can only pin a head the gate judged (card 950b3093).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedHead(GitObjectId);
+
+impl VerifiedHead {
+    pub(crate) fn commit(&self) -> &GitObjectId {
+        &self.0
+    }
+}
+
+/// The whole gate's answer for one card.
+#[derive(Debug)]
+pub(crate) enum CardGate {
+    /// Merge, pinned to the head the verdict and the CI were judged at.
+    Merge(VerifiedHead),
+    /// Already merged on GitHub: the board reconciles, whatever its verdict.
+    AlreadyMerged {
+        merged_at_ms: u64,
+    },
+    NotReady(String),
+}
+
 /// The whole gate over one card: its verdict at the PR's head, then CI no redder than the base,
-/// both read from ONE fetched view so the head checked is the head judged.
+/// both read from ONE fetched view, so the head checked is the head judged and the head merged.
 pub(crate) async fn check_card_gate(
     gh: &dyn crate::gh_client::GhClient,
     board: &WorkBoardProjection,
@@ -90,17 +120,38 @@ pub(crate) async fn check_card_gate(
     pr: &airc_work::model::PullRequestRef,
     baselines: &mut super::BaselineCache,
     policy: super::GatePolicy,
-) -> Result<super::GateResult, crate::gh_client::GhError> {
+) -> Result<CardGate, crate::gh_client::GhError> {
     let view = super::fetch_pr_view(gh, pr).await?;
     let gate = super::check_view_gate(gh, pr, &view, baselines, policy).await;
-    // An already-merged PR reconciles whatever its verdict: the merge happened.
-    if matches!(gate, super::GateResult::AlreadyMerged { .. }) {
-        return Ok(gate);
+    let pr_head = view
+        .head_ref_oid
+        .as_deref()
+        .and_then(|head| GitObjectId::new(head).ok());
+    let verdict = verdict_authorizes(board, card, pr_head.as_ref());
+    Ok(card_gate(gate, verdict, pr_head))
+}
+
+/// The gate's answer from its two halves over one view: the CI result, the verdict, and the head
+/// that view reported. A merge is pinned to that head and to no other. Pure, so the pinning is
+/// tested on plain values.
+fn card_gate(
+    gate: super::GateResult,
+    verdict: Result<(), VerdictGap>,
+    pr_head: Option<GitObjectId>,
+) -> CardGate {
+    match (gate, verdict, pr_head) {
+        // Already merged on GitHub: the board reconciles, whatever its verdict.
+        (super::GateResult::AlreadyMerged { merged_at_ms }, _, _) => {
+            CardGate::AlreadyMerged { merged_at_ms }
+        }
+        (_, Err(gap), _) => CardGate::NotReady(gap.to_string()),
+        (super::GateResult::NotReady(reason), Ok(()), _) => CardGate::NotReady(reason),
+        (super::GateResult::Green, Ok(()), Some(head)) => CardGate::Merge(VerifiedHead(head)),
+        // A verdict cannot pass without the head; said rather than assumed.
+        (super::GateResult::Green, Ok(()), None) => {
+            CardGate::NotReady(VerdictGap::PrHeadUnknown.to_string())
+        }
     }
-    if let Err(gap) = verdict_authorizes(board, card, view.head_ref_oid.as_deref()) {
-        return Ok(super::GateResult::NotReady(gap.to_string()));
-    }
-    Ok(gate)
 }
 
 #[cfg(test)]

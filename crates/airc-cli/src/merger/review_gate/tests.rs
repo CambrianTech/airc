@@ -52,7 +52,7 @@ fn review(
 // submission that ends at the PR's exact head authorizes; every other shape names why not.
 #[test]
 fn only_a_passed_independent_review_at_the_prs_head_authorizes_a_merge() {
-    let head = 'b'.to_string().repeat(40);
+    let head = sha('b');
     let at_head = submission(airc_work::SubmissionHead::At(sha('b')));
     let passed = review(&at_head, 20, WorkReviewOutcome::Passed, 5);
     assert_eq!(decide(&at_head, [&passed].into_iter(), Some(&head)), Ok(()));
@@ -66,7 +66,7 @@ fn only_a_passed_independent_review_at_the_prs_head_authorizes_a_merge() {
         decide(&at_head, [&passed].into_iter(), None),
         Err(VerdictGap::PrHeadUnknown)
     );
-    let moved = 'c'.to_string().repeat(40);
+    let moved = sha('c');
     assert!(
         matches!(
             decide(&at_head, [&passed].into_iter(), Some(&moved)),
@@ -101,4 +101,39 @@ fn only_a_passed_independent_review_at_the_prs_head_authorizes_a_merge() {
         ),
         Ok(())
     );
+}
+
+// what this catches: a merge landing a head nobody judged (Fable on #1660: a push between the view
+// and the merge). The merge is pinned to the head the view reported, a passing CI cannot override a
+// verdict gap, and a missing head never merges.
+#[test]
+fn a_merge_is_pinned_to_the_head_the_gate_judged() {
+    let green = || crate::merger::GateResult::Green;
+    match card_gate(green(), Ok(()), Some(sha('b'))) {
+        CardGate::Merge(head) => assert_eq!(head.commit(), &sha('b')),
+        other => panic!("a passed verdict at a green head merges: {other:?}"),
+    }
+    let moved = Err(VerdictGap::HeadMoved {
+        submitted: sha('b'),
+        pr: sha('c'),
+    });
+    assert!(
+        matches!(card_gate(green(), moved, Some(sha('c'))), CardGate::NotReady(reason) if reason.contains("verdict at"))
+    );
+    assert!(matches!(
+        card_gate(green(), Ok(()), None),
+        CardGate::NotReady(_)
+    ));
+    assert!(matches!(
+        card_gate(crate::merger::GateResult::NotReady("1 failing check(s)".into()), Ok(()), Some(sha('b'))),
+        CardGate::NotReady(reason) if reason.contains("failing")
+    ));
+    assert!(matches!(
+        card_gate(
+            crate::merger::GateResult::AlreadyMerged { merged_at_ms: 9 },
+            Err(VerdictGap::NoSubmission),
+            None
+        ),
+        CardGate::AlreadyMerged { merged_at_ms: 9 }
+    ));
 }

@@ -255,6 +255,7 @@ mod tests {
             .pr_merge(PrMergeArgs {
                 repo: "CambrianTech/airc".to_string(),
                 number: 99,
+                head: airc_work::GitObjectId::new("b".repeat(40)).unwrap(),
             })
             .await;
 

@@ -144,15 +144,18 @@ async fn tick_once(
             continue;
         };
         match decision {
-            MergeDecision::Merge(pr) => {
+            MergeDecision::Merge(pr, head) => {
                 if dry_run {
                     eprintln!(
-                        "airc-merger: [DRY-RUN] would merge card={} pr=#{} ({})",
-                        card.card_id, pr.number, pr.repo
+                        "airc-merger: [DRY-RUN] would merge card={} pr=#{} ({}) at {}",
+                        card.card_id,
+                        pr.number,
+                        pr.repo,
+                        head.commit()
                     );
                     continue;
                 }
-                match perform_merge(gh, card, &pr, airc, &room).await {
+                match perform_merge(gh, card, &pr, &head, airc, &room).await {
                     Ok(()) => eprintln!(
                         "airc-merger: merged card={} pr=#{} ({})",
                         card.card_id, pr.number, pr.repo
@@ -217,7 +220,7 @@ async fn perform_reconcile(
 }
 
 enum MergeDecision {
-    Merge(airc_work::model::PullRequestRef),
+    Merge(airc_work::model::PullRequestRef, VerifiedHead),
     /// Card acd72c81 follow-up: PR is ALREADY merged on GitHub but the
     /// kanban projection hasn't observed it (no `PullRequestMerged`
     /// event for this card). The merger reconciles by emitting one
@@ -249,11 +252,11 @@ async fn evaluate(
     };
 
     match check_card_gate(gh, board, card, &pr, baselines, policy).await {
-        Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
-        Ok(GateResult::AlreadyMerged { merged_at_ms }) => {
+        Ok(CardGate::Merge(head)) => Ok(Some(MergeDecision::Merge(pr, head))),
+        Ok(CardGate::AlreadyMerged { merged_at_ms }) => {
             Ok(Some(MergeDecision::Reconcile(pr, merged_at_ms)))
         }
-        Ok(GateResult::NotReady(reason)) => Ok(Some(MergeDecision::Skip(reason))),
+        Ok(CardGate::NotReady(reason)) => Ok(Some(MergeDecision::Skip(reason))),
         Err(error) => Ok(Some(MergeDecision::Skip(format!(
             "gh status query failed: {error}"
         )))),
@@ -263,7 +266,7 @@ async fn evaluate(
 mod gate;
 mod review_gate;
 pub(crate) use gate::*;
-pub(crate) use review_gate::check_card_gate;
+pub(crate) use review_gate::{check_card_gate, CardGate, VerifiedHead};
 
 /// Actually merge. `gh pr merge --squash --delete-branch` matches the
 /// convention every recent PR has used (see merged-PR survey in card
@@ -278,12 +281,14 @@ async fn perform_merge(
     gh: &dyn crate::gh_client::GhClient,
     card: &WorkCard,
     pr: &airc_work::model::PullRequestRef,
+    head: &VerifiedHead,
     airc: &Airc,
     room: &airc_lib::Room,
 ) -> Result<(), Box<dyn std::error::Error>> {
     gh.pr_merge(crate::gh_client::PrMergeArgs {
         repo: pr.repo.as_str().to_string(),
         number: pr.number,
+        head: head.commit().clone(),
     })
     .await?;
 
