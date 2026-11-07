@@ -39,6 +39,13 @@ fn identity_pretty_matches_whois_shape() {
     );
 }
 
+/// `init` prints `peer_id:     <uuid>`; pull it back out for assertions.
+fn peer_id_from(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|line| line.strip_prefix("peer_id:"))
+        .map(|rest| rest.trim().to_string())
+}
+
 #[test]
 fn identity_pretty_defaults_unset_fields() {
     let output = Command::new(airc_core())
@@ -62,6 +69,81 @@ fn init_as_records_agent_name() {
 
     let repeat = run_ok(home, &["init", "--as", "codex"], "");
     assert!(repeat.contains("agent_name:  codex\n"));
+}
+
+/// Card 32f7dd97, review blocker P2 #3: `init --as` must route through the
+/// EXPLICIT mint path (`Airc::initialize_as`), not `open_as` — which by design
+/// refuses a populated home. So an operator adding a named citizen beside an
+/// existing default identity succeeds where `open_as` would refuse, and the
+/// repeat is idempotent: it loads what exists (stable peer_id) instead of
+/// minting a twin.
+#[test]
+fn init_as_adds_a_named_citizen_beside_the_default() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path();
+
+    let default_out = run_ok(home, &["init"], "");
+    let default_peer = peer_id_from(&default_out);
+    assert!(
+        default_peer.is_some(),
+        "init must print a peer_id: {default_out}"
+    );
+
+    // The regression itself: a populated home is exactly what `open_as`
+    // refuses. Success here proves the CLI took the explicit init path.
+    let codex = run_ok(home, &["init", "--as", "codex"], "");
+    assert!(codex.contains("agent_name:  codex\n"));
+    let codex_peer = peer_id_from(&codex).expect("init --as must print a peer_id");
+    assert_ne!(
+        default_peer.as_deref(),
+        Some(codex_peer.as_str()),
+        "a named citizen is a distinct principal from the default"
+    );
+
+    // Idempotent resume: re-init loads the existing row and key — no re-mint.
+    let again = run_ok(home, &["init", "--as", "codex"], "");
+    assert_eq!(peer_id_from(&again), Some(codex_peer));
+}
+
+/// Card 32f7dd97, review blocker P1 #1 (CLI surface): an explicit init against
+/// orphan key material fails closed and leaves that material byte-for-byte
+/// untouched — a failed mint preserves custody.
+#[test]
+fn init_as_refuses_orphan_key_material_and_leaves_it_untouched() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path();
+    std::fs::create_dir_all(home).unwrap();
+
+    let key_path = home.join("identity-codex.key");
+    let bytes = [7u8; 32];
+    std::fs::write(&key_path, bytes).unwrap();
+
+    let output = Command::new(airc_core())
+        .arg("--home")
+        .arg(home)
+        .args(["init", "--as", "codex"])
+        .output()
+        .expect("airc-core must spawn");
+
+    assert!(
+        !output.status.success(),
+        "init over orphan key material must fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("key material"),
+        "the refusal must name the orphan key: {combined}"
+    );
+    assert_eq!(
+        std::fs::read(&key_path).unwrap(),
+        bytes,
+        "a refused init must leave the orphan key untouched"
+    );
 }
 
 #[test]

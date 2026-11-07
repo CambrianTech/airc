@@ -31,17 +31,19 @@ use airc_lib::{Airc, Headers, HeartbeatTask, PeerSpec, DEFAULT_HEARTBEAT_INTERVA
 use airc_store::{EventStore, SqliteEventStore};
 use airc_trust as peers_store;
 
-/// `init` — open the substrate at `<home>`. `Airc::open` loads or
-/// generates the identity, opens the event store, applies any
-/// pending migrations, and primes the peer registry. The CLI then
-/// prints the local peer's spec so the user can share it.
+/// `init` — EXPLICITLY initialise the substrate at `<home>`.
+/// Unlike every other command, this one is allowed to mint identity:
+/// it routes through `Airc::initialize[_as]`, which loads what already
+/// exists (idempotent) or mints a new agent through the custody-safe
+/// explicit path — and refuses half-states instead of silently
+/// regenerating. A plain READ (`open`) must never add a citizen.
 pub async fn run_init(
     home: &Path,
     agent_name: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let airc = match agent_name {
-        Some(agent_name) => Airc::open_as(home, agent_name).await?,
-        None => Airc::open(home).await?,
+        Some(agent_name) => Airc::initialize_as(home, agent_name).await?,
+        None => Airc::initialize(home).await?,
     };
     let current = airc.current_room().await?;
     println!("home:        {}", airc.home().display());
