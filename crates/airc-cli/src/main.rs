@@ -101,6 +101,7 @@ mod work_cli;
 mod work_commands;
 mod work_commands_gh;
 mod work_commands_git;
+mod work_show;
 mod work_suggestions;
 mod workspace_cli;
 mod workspace_commands;
