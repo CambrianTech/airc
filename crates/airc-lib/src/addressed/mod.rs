@@ -16,8 +16,10 @@
 
 mod daemon;
 mod receive;
+mod refusals;
 mod send;
 mod sink;
+pub use refusals::{AdmissionRefusal, ForwardRefusal, QueueRefusal};
 pub use sink::AddressedFrameSink;
 
 use std::sync::Arc;
@@ -115,6 +117,12 @@ pub enum AddressedError {
     Codec(String),
     /// No session formed before the caller's deadline.
     DeadlineExceeded,
+    /// The host refused to admit the frame: its typed cause (what the refusal counter keys on) and
+    /// the host's own rendering of it, for the log line only.
+    Admission {
+        cause: AdmissionRefusal,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for AddressedError {
@@ -126,6 +134,7 @@ impl std::fmt::Display for AddressedError {
             AddressedError::DeadlineExceeded => {
                 write!(f, "addressed: no session with the peer before the deadline")
             }
+            AddressedError::Admission { detail, .. } => write!(f, "{detail}"),
         }
     }
 }
@@ -220,6 +229,8 @@ pub(crate) struct AddressedState {
     /// Bumped whenever a session is installed, so senders waiting on a
     /// handshake wake and re-check.
     established: watch::Sender<u64>,
+    /// Refused admissions counted by kind, said at powers of two (card 92cd55d2).
+    refusals: std::sync::Mutex<refusals::Refusals>,
 }
 
 impl AddressedState {
@@ -236,6 +247,7 @@ impl AddressedState {
             sessions: SessionManager::new(identity.keypair.clone(), identity.peer_id, registry),
             inbox_tx,
             established: watch::Sender::new(0),
+            refusals: Default::default(),
         }
     }
 

@@ -160,8 +160,17 @@ pub fn daemon_command(
         .arg(&daemon_home)
         .arg(subcommand)
         .arg("--socket")
-        .arg(socket);
+        .arg(socket)
+        // The detached daemon owns its log, under its own home (card 92cd55d2).
+        .arg("--log-file")
+        .arg(daemon_log_path(scope_home));
     command
+}
+
+/// The detached daemon's log for a daemon spawned from `scope_home`: under the home that owns
+/// it, which is where its spawn opens it and where the daemon drains into it.
+pub fn daemon_log_path(scope_home: &Path) -> PathBuf {
+    airc_core::daemon_log::path(&machine_account_home(scope_home))
 }
 
 fn machine_account_home_inner(scope_home: &Path) -> PathBuf {
