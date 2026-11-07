@@ -517,7 +517,7 @@ mod tests {
         // The head is the commit the patch ends at, and the one form of a patch regenerates the
         // same bytes from it: what `airc work submit --head` verifies (card 950b3093).
         let head = String::from_utf8(
-            std::process::Command::new("git")
+            airc_core::process::background("git")
                 .arg("-C")
                 .arg(&clone)
                 .args(["rev-parse", "HEAD"])

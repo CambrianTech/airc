@@ -244,6 +244,8 @@ mod ownership_tests {
             include_str!("../../airc-cli/src/cli/home.rs"),
             include_str!("../../airc-cli/src/cli/peer.rs"),
             include_str!("../../airc-cli/src/work_commands.rs"),
+            include_str!("../../airc-cli/src/work_commands/submission.rs"),
+            include_str!("../../airc-cli/src/work_commands/merge.rs"),
             include_str!("../../airc-lib/src/work_worktree.rs"),
             include_str!("../../airc-lib/src/mesh_identity.rs"),
             include_str!("../../airc-cli/src/monitor/formatter.rs"),
