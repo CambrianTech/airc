@@ -300,6 +300,57 @@ impl fmt::Display for ShownIdError {
 
 impl std::error::Error for ShownIdError {}
 
+/// The pattern of every id [`Shown::try_from`] reads exactly: a full UUID (32 hex, bare or dashed)
+/// or a hex prefix of at least [`MIN_PREFIX_HEX`] digits. Built from the parser's own bounds, so the
+/// schema a tool offers and the decoder that reads the call cannot drift. It is a SUBSET of what the
+/// parser takes (a mistyped 31- or 33-digit UUID still reads as its short form, [`mistyped_uuid`]),
+/// so every value a model generates from it decodes.
+pub fn shown_pattern() -> String {
+    let hex = "[0-9a-fA-F]";
+    format!("^(?:{hex}{{{MIN_PREFIX_HEX},32}}|{hex}{{8}}-{hex}{{4}}-{hex}{{4}}-{hex}{{4}}-{hex}{{12}})$")
+}
+
+/// One legal value of each spelling the pattern admits, derived from the owner's constants: the
+/// [`SHORT_ID_LEN`] short form every surface shows, and the full dashed UUID. Not all zeros, which
+/// a model would copy as a placeholder (continuum refuses a run of zeros as the manual's blank).
+pub fn shown_examples() -> [String; 2] {
+    let id = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+    [shown_form(id), id.to_string()]
+}
+
+/// A Shown id is offered as the string its parser reads, never an arbitrary one (Codex's all-tool
+/// schema gate, 9ad69: a sample from `Option<String>` was refused by `Shown<T>`).
+#[cfg(feature = "schemars")]
+impl<T: ShownKind> schemars::JsonSchema for Shown<T> {
+    fn schema_name() -> String {
+        format!("Shown_{}", T::LABEL)
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Metadata, SchemaObject, StringValidation};
+        SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                pattern: Some(shown_pattern()),
+                ..Default::default()
+            })),
+            metadata: Some(Box::new(Metadata {
+                description: Some(format!(
+                    "a {} id: its full UUID or at least {MIN_PREFIX_HEX} of its leading hex digits",
+                    T::LABEL
+                )),
+                examples: shown_examples()
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +370,72 @@ mod tests {
 
     fn card(s: &str) -> Card {
         Card(Uuid::parse_str(s).unwrap())
+    }
+
+    // what this catches: the offered pattern and the parser drifting apart. Every id the pattern
+    // admits (each boundary length, bare and dashed full ids, either case) must decode, and the
+    // forms just outside it (3 digits, 33 without dashes, a word) must not match it.
+    #[test]
+    fn every_id_the_shown_pattern_admits_decodes() {
+        let Ok(pattern) = regex::Regex::new(&shown_pattern()) else {
+            panic!("the pattern compiles")
+        };
+        let full = "08ece9e8-1d2c-4b3a-9f8e-7d6c5b4a3f2e";
+        let admitted = [
+            "08ec".to_string(),
+            "08ECE9E8".to_string(),
+            "0".repeat(31),
+            full.replace('-', ""),
+            full.to_string(),
+            full.to_uppercase(),
+        ];
+        for id in &admitted {
+            assert!(pattern.is_match(id), "{id} is a Shown id the parser reads");
+            assert!(
+                Shown::<Card>::try_from(id.as_str()).is_ok(),
+                "{id} matches the pattern and must decode"
+            );
+        }
+        for outside in ["08e", &"a".repeat(33), "card-08ece9e8", "08ece9e8 "] {
+            assert!(
+                !pattern.is_match(outside),
+                "{outside:?} is outside the offered pattern"
+            );
+        }
+    }
+
+    // what this catches: the schema a tool offers for a Shown id losing the parser's pattern (an
+    // arbitrary string again) or being shared by reference across kinds that name different ids.
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn a_shown_id_is_offered_as_its_pattern() {
+        let schema = schemars::schema_for!(Shown<Card>);
+        let Ok(value) = serde_json::to_value(&schema) else {
+            panic!("a schema serializes")
+        };
+        assert_eq!(value["type"], "string");
+        assert_eq!(value["pattern"].as_str(), Some(shown_pattern().as_str()));
+        assert_eq!(value["title"], "Shown_card");
+        let Ok(pattern) = regex::Regex::new(&shown_pattern()) else {
+            panic!("the pattern compiles")
+        };
+        let examples: Vec<&str> = value["examples"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            examples.len(),
+            2,
+            "a short form and a full id: {examples:?}"
+        );
+        for example in examples {
+            assert!(
+                pattern.is_match(example) && Shown::<Card>::try_from(example).is_ok(),
+                "{example} is a legal id"
+            );
+        }
     }
 
     // what this catches: the board prints short ids, so every work verb must
