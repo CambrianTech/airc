@@ -284,6 +284,7 @@ mod tests {
             manager_hats: vec![],
             agent_availability: vec![],
             hygiene_reports: vec![],
+            card_conflicts: Vec::new(),
         }
     }
 

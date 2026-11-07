@@ -153,6 +153,18 @@ pub enum AircError {
         room_id: airc_core::RoomId,
     },
 
+    /// A second, different creation claimed this card id: the board shows it,
+    /// but no action is accepted on it but a release or a close until the room
+    /// resolves it (card a3fa88ae).
+    #[error(
+        "work card {card_id} was created again by event {conflicting_event} (original creation event {original_event}); it accepts no action but a release or a close: close it and re-file the work under a new card"
+    )]
+    WorkCardConflicted {
+        card_id: airc_work::WorkCardId,
+        original_event: airc_core::EventId,
+        conflicting_event: airc_core::EventId,
+    },
+
     #[error(
         "work card {card_id} claim {claim_id} is not a live current claim owned by this caller"
     )]

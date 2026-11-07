@@ -12,12 +12,13 @@ use airc_core::{EventId, RoomId, TranscriptCursor, TranscriptEvent};
 use airc_store::{EventStore, StoreError};
 use airc_work::{
     decode_transcript_work_event, transcript_is_work_event, ProjectionError, WorkBoardProjection,
-    WorkEvent, WorkReplayError,
+    WorkReplayError, WorkReplayItem,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkEventPage {
-    pub events: Vec<WorkEvent>,
+    /// each work event with its transcript cursor (its event id is its identity on the board)
+    pub events: Vec<WorkReplayItem>,
     pub newest_cursor: Option<TranscriptCursor>,
 }
 
@@ -78,7 +79,9 @@ where
         limit: usize,
     ) -> Result<WorkBoardProjection, WorkStoreError> {
         let page = self.resume_from(cursor, channel, limit).await?;
-        Ok(WorkBoardProjection::replay(page.events)?)
+        Ok(WorkBoardProjection::replay(
+            page.events.into_iter().map(|item| item.event),
+        )?)
     }
 
     pub async fn project_complete(
@@ -126,7 +129,7 @@ pub fn project_transcripts(
 /// Apply a caller-supplied transcript page **incrementally** onto an
 /// existing projection (card 1291173d: cached work-board resume).
 /// Decode + apply rule is byte-identical to [`project_transcripts`] —
-/// both funnel through `WorkBoardProjection::apply_windowed` — so
+/// both funnel through `WorkBoardProjection::apply_at` — so
 /// `project_transcripts(a ++ b)` ≡ `project_transcripts(a)` then
 /// `apply_transcripts(b)`. Returns the cursor of the newest transcript
 /// event consumed (work event or not), i.e. the resume point for the
@@ -136,8 +139,8 @@ pub fn apply_transcripts(
     transcripts: Vec<TranscriptEvent>,
 ) -> Result<Option<TranscriptCursor>, WorkStoreError> {
     let page = decode_page(transcripts)?;
-    for event in &page.events {
-        projection.apply_windowed(event)?;
+    for item in &page.events {
+        projection.apply_at(item.cursor.event_id, &item.event)?;
     }
     Ok(page.newest_cursor)
 }
@@ -161,7 +164,7 @@ fn decode_page(transcripts: Vec<TranscriptEvent>) -> Result<WorkEventPage, WorkS
             }
             Err(error) => return Err(error.into()),
         };
-        events.push(item.event);
+        events.push(item);
     }
 
     Ok(WorkEventPage {

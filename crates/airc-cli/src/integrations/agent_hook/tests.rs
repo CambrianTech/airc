@@ -538,6 +538,105 @@ async fn burst_larger_than_a_turn_becomes_bounded_history_and_keeps_its_requests
     );
 }
 
+async fn append_work(airc: &Airc, room: RoomId, n: u64, work: &airc_work::WorkEvent) {
+    let (headers, body) = airc_work::encode_work_event(work).unwrap();
+    let mut e = event(body);
+    e.room_id = room;
+    e.lamport = n;
+    e.occurred_at_ms = n;
+    e.event_id = EventId::from_u128(n as u128);
+    e.headers = headers;
+    airc.append_event(e).await.unwrap();
+}
+
+fn card(n: u128, title: &str) -> airc_work::WorkEvent {
+    airc_work::WorkEvent::CardCreated(airc_work::CardCreated {
+        card_id: airc_work::WorkCardId::from_u128(n),
+        repo: airc_work::RepoId::new("CambrianTech/airc").unwrap(),
+        title: title.to_string(),
+        body: None,
+        priority: airc_work::Priority::P1,
+        lane_id: None,
+        created_by: PeerId::from_u128(101),
+        created_at_ms: n as u64,
+        reviews: None,
+        origin: None,
+    })
+}
+
+// what this catches (Codex on #1638): a work event in the turn made the hook read the board,
+// and a board projection error aborted the whole hook, addressed chat included, before its
+// delivery ACK. A conflicting create is named as a conflict, never offered as claimable; any
+// board error left is stated in the turn, and the chat delivers either way.
+#[tokio::test]
+async fn a_board_that_cannot_project_never_withholds_addressed_chat() {
+    let (_dir, airc, room) = fixture().await;
+    let options = super::HookOptions {
+        count: 50,
+        max_items: 8,
+        raw: false,
+        selection: DeliverySelection::default(),
+    };
+    let me = MentionTarget::Peer(airc.peer_id());
+    // attach: what lands after this is live (the board is read only for live work events)
+    drop(
+        super::prepare(&airc, "claude-hook:board", &options)
+            .await
+            .unwrap(),
+    );
+
+    append_text(&airc, room, 1, "first ask", me.clone()).await;
+    append_work(&airc, room, 2, &card(7, "the original card")).await;
+    append_work(&airc, room, 3, &card(7, "a clobber attempt")).await;
+    let mut turn = super::prepare(&airc, "claude-hook:board", &options)
+        .await
+        .unwrap();
+    let (context, end) = super::compose(&CLAUDE, &airc, &mut turn, None, &options, None)
+        .await
+        .unwrap();
+    let context = context.unwrap();
+    assert!(context.contains("first ask"), "{context}");
+    // a conflicted card is named, never offered: neither creation's title is a claim line
+    let card_id = airc_work::WorkCardId::from_u128(7);
+    assert!(
+        context.contains(&format!("CONFLICT {card_id}")),
+        "{context}"
+    );
+    assert!(
+        !context.contains(&format!("airc work claim {card_id}")),
+        "{context}"
+    );
+    turn.acknowledge(end, true).await.unwrap();
+
+    let lane = |n: u64| {
+        airc_work::WorkEvent::LaneCreated(airc_work::LaneCreated {
+            lane_id: airc_work::LaneId::from_u128(9),
+            repo: airc_work::RepoId::new("CambrianTech/airc").unwrap(),
+            title: "lane".to_string(),
+            state: airc_work::LaneState::Active,
+            created_by: PeerId::from_u128(101),
+            created_at_ms: n,
+        })
+    };
+    append_text(&airc, room, 4, "second ask", me).await;
+    append_work(&airc, room, 5, &lane(5)).await;
+    append_work(&airc, room, 6, &lane(6)).await;
+    append_work(&airc, room, 7, &card(8, "a new card")).await;
+    let mut turn = super::prepare(&airc, "claude-hook:board", &options)
+        .await
+        .unwrap();
+    let (context, _) = super::compose(&CLAUDE, &airc, &mut turn, None, &options, None)
+        .await
+        .unwrap();
+    let context = context.unwrap();
+    assert!(context.contains("second ask"), "{context}");
+    assert!(
+        context.contains("AIRC: the work board could not be read")
+            && context.contains("duplicate lane"),
+        "{context}"
+    );
+}
+
 fn event(body: Body) -> TranscriptEvent {
     TranscriptEvent {
         event_id: EventId::new(),

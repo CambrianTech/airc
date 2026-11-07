@@ -56,7 +56,10 @@ pub(crate) async fn render_claimable_work_for_event(
 }
 
 fn render_status(status: &WorkQueueStatus) -> Option<String> {
-    if status.claimable.is_empty() && status.agent_availability.is_empty() {
+    if status.claimable.is_empty()
+        && status.agent_availability.is_empty()
+        && status.conflicts.is_empty()
+    {
         return None;
     }
     let now_ms = now_ms();
@@ -81,6 +84,13 @@ fn render_status(status: &WorkQueueStatus) -> Option<String> {
             card_id = card.card_id,
             repo = card.repo,
             title = card.title
+        ));
+    }
+    for c in &status.conflicts {
+        lines.push(format!(
+            "- CONFLICT {card_id}: created again by event {again}; no action is accepted on it until it is closed",
+            card_id = c.card_id,
+            again = c.conflicting_event
         ));
     }
     if status.claimable.is_empty() {
@@ -147,6 +157,7 @@ mod tests {
             }],
             agent_availability: Vec::new(),
             active_claims_for_peer: Vec::new(),
+            conflicts: Vec::new(),
         })
         .unwrap();
 
@@ -173,6 +184,7 @@ mod tests {
                 expires_at_ms: now_ms() + 60_000,
             }],
             active_claims_for_peer: Vec::new(),
+            conflicts: Vec::new(),
         })
         .unwrap();
 

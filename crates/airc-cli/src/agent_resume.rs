@@ -404,6 +404,7 @@ mod tests {
         let mut status = WorkQueueStatus {
             claimable: vec![],
             active_claims_for_peer: vec![],
+            conflicts: vec![],
             agent_availability: vec![airc_lib::AgentAvailabilityRecord {
                 report: airc_lib::AgentAvailabilityReported {
                     repo: airc_lib::RepoId::new("example/repo").unwrap(),
