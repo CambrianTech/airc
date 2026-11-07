@@ -1,6 +1,10 @@
 //! The daemon's single transport handle feeds its bounded addressed switch.
+use airc_daemon::addressed_switch::{ForwardError, RouteError};
+use airc_daemon::AddressedAdmissionError;
 use airc_daemon::DaemonState;
-use airc_lib::addressed::{AddressedError, AddressedFrameSink};
+use airc_lib::addressed::{
+    AddressedError, AddressedFrameSink, AdmissionRefusal, ForwardRefusal, QueueRefusal,
+};
 use airc_protocol::Frame;
 use std::sync::Weak;
 
@@ -9,14 +13,60 @@ pub(crate) struct DaemonAddressedSink(pub Weak<DaemonState>);
 #[async_trait::async_trait]
 impl AddressedFrameSink for DaemonAddressedSink {
     async fn deliver(&self, frame: Frame) -> Result<(), AddressedError> {
-        let state = self
-            .0
-            .upgrade()
-            .ok_or_else(|| AddressedError::Transport("addressed daemon owner closed".into()))?;
+        let state = self.0.upgrade().ok_or_else(|| AddressedError::Admission {
+            cause: AdmissionRefusal::OwnerClosed,
+            detail: "addressed daemon owner closed".into(),
+        })?;
         state
             .receive_addressed_frame(frame)
             .await
-            .map_err(|error| AddressedError::Transport(error.to_string()))
+            .map_err(|error| AddressedError::Admission {
+                cause: admission_refusal(&error),
+                detail: error.to_string(),
+            })
+    }
+}
+
+/// The daemon's admission error as the library's typed cause: the refusal counter keys on it, so a
+/// cause is never erased into text before it is counted (Fable on #1651).
+fn admission_refusal(error: &AddressedAdmissionError) -> AdmissionRefusal {
+    match error {
+        AddressedAdmissionError::WrongKindOrChannel => AdmissionRefusal::WrongKindOrChannel,
+        AddressedAdmissionError::WrongTarget => AdmissionRefusal::WrongTarget,
+        AddressedAdmissionError::SenderMustSign => AdmissionRefusal::SenderMustSign,
+        AddressedAdmissionError::Trust(_) => AdmissionRefusal::Trust,
+        AddressedAdmissionError::Signature(_) => AdmissionRefusal::Signature,
+        AddressedAdmissionError::Queue(route) => AdmissionRefusal::Queue(queue_refusal(route)),
+        AddressedAdmissionError::Forward(forward) => {
+            AdmissionRefusal::Forward(forward_refusal(forward))
+        }
+        AddressedAdmissionError::Expiry(_) => AdmissionRefusal::Expiry,
+    }
+}
+
+fn queue_refusal(error: &RouteError) -> QueueRefusal {
+    match error {
+        RouteError::ReceiverLimit => QueueRefusal::ReceiverLimit,
+        RouteError::ReceiverBusy => QueueRefusal::ReceiverBusy,
+        RouteError::NoReceiver => QueueRefusal::NoReceiver,
+        RouteError::Backpressure => QueueRefusal::Backpressure,
+        RouteError::Closed => QueueRefusal::Closed,
+        RouteError::StatePoisoned => QueueRefusal::StatePoisoned,
+        RouteError::DeadlineElapsed => QueueRefusal::DeadlineElapsed,
+    }
+}
+
+fn forward_refusal(error: &ForwardError) -> ForwardRefusal {
+    match error {
+        ForwardError::NotInstalled => ForwardRefusal::NotInstalled,
+        ForwardError::AlreadyInstalled => ForwardRefusal::AlreadyInstalled,
+        ForwardError::UnknownRecipient => ForwardRefusal::UnknownRecipient,
+        ForwardError::UnknownHost => ForwardRefusal::UnknownHost,
+        ForwardError::LocalOwnerAbsent => ForwardRefusal::LocalOwnerAbsent,
+        ForwardError::InvalidEndpoints => ForwardRefusal::InvalidEndpoints,
+        ForwardError::Trust(_) => ForwardRefusal::Trust,
+        ForwardError::Transport(_) => ForwardRefusal::Transport,
+        ForwardError::Admission(route) => ForwardRefusal::Admission(queue_refusal(route)),
     }
 }
 
