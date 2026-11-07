@@ -48,6 +48,50 @@ impl std::fmt::Display for VerdictGap {
     }
 }
 
+/// Why a PR does not land where its repository integrates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TargetGap {
+    /// Its base is another branch (a stacked PR): merging now lands it in its parent, not the
+    /// integration line (continuum #5806 squashed into #5805's branch, 2026-11-07 08:13Z).
+    Stacked {
+        base: String,
+        default: String,
+    },
+    BaseUnknown,
+    /// The view has no default branch (the shell backend's `gh pr view` has none): refused, never guessed.
+    DefaultUnknown,
+}
+
+impl std::fmt::Display for TargetGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stacked { base, default } => write!(f, "stacked on {base}: it lands once its parent merges and it retargets to {default}"),
+            Self::BaseUnknown => f.write_str("GitHub did not report the PR's base branch, so its landing cannot be checked"),
+            Self::DefaultUnknown => f.write_str("the PR view has no repository default branch (the shell backend's gh pr view has none), so its landing cannot be checked"),
+        }
+    }
+}
+
+/// Whether the PR targets its repository's default branch, the one place a merge may land. Pure,
+/// read from the same view the verdict and the CI were judged on.
+fn lands_in_default(view: &crate::gh_client::PrView) -> Result<(), TargetGap> {
+    let base = view
+        .base_ref_name
+        .as_deref()
+        .ok_or(TargetGap::BaseUnknown)?;
+    let default = view
+        .base_default_branch
+        .as_deref()
+        .ok_or(TargetGap::DefaultUnknown)?;
+    match base == default {
+        true => Ok(()),
+        false => Err(TargetGap::Stacked {
+            base: base.to_string(),
+            default: default.to_string(),
+        }),
+    }
+}
+
 /// The verdict as far as the board alone can tell, free: the latest submission's recorded head,
 /// when its latest review by anyone but its author passed. A card that fails this costs no GitHub
 /// call (airc 315bf919 fetched a PR view for every Review card, ~60 a tick, and drained the
@@ -143,27 +187,31 @@ pub(crate) async fn check_card_gate(
         .as_deref()
         .and_then(|head| GitObjectId::new(head).ok());
     let verdict = head_matches(&submitted, pr_head.as_ref());
-    Ok(card_gate(gate, verdict, pr_head))
+    Ok(card_gate(gate, verdict, lands_in_default(&view), pr_head))
 }
 
-/// The gate's answer from its two halves over one view: the CI result, the verdict, and the head
-/// that view reported. A merge is pinned to that head and to no other. Pure, so the pinning is
-/// tested on plain values.
+/// The gate's answer from its halves over one view: the CI result, the verdict, where the PR
+/// lands, and the head that view reported. A merge is pinned to that head and to no other. Pure, so
+/// the pinning is tested on plain values.
 fn card_gate(
     gate: super::GateResult,
     verdict: Result<(), VerdictGap>,
+    target: Result<(), TargetGap>,
     pr_head: Option<GitObjectId>,
 ) -> CardGate {
-    match (gate, verdict, pr_head) {
-        // Already merged on GitHub: the board reconciles, whatever its verdict.
-        (super::GateResult::AlreadyMerged { merged_at_ms }, _, _) => {
+    match (gate, verdict, target, pr_head) {
+        // Already merged on GitHub: the board reconciles, whatever its verdict or target.
+        (super::GateResult::AlreadyMerged { merged_at_ms }, _, _, _) => {
             CardGate::AlreadyMerged { merged_at_ms }
         }
-        (_, Err(gap), _) => CardGate::NotReady(gap.to_string()),
-        (super::GateResult::NotReady(reason), Ok(()), _) => CardGate::NotReady(reason),
-        (super::GateResult::Green, Ok(()), Some(head)) => CardGate::Merge(VerifiedHead(head)),
+        (_, Err(gap), _, _) => CardGate::NotReady(gap.to_string()),
+        (_, Ok(()), Err(gap), _) => CardGate::NotReady(gap.to_string()),
+        (super::GateResult::NotReady(reason), Ok(()), Ok(()), _) => CardGate::NotReady(reason),
+        (super::GateResult::Green, Ok(()), Ok(()), Some(head)) => {
+            CardGate::Merge(VerifiedHead(head))
+        }
         // A verdict cannot pass without the head; said rather than assumed.
-        (super::GateResult::Green, Ok(()), None) => {
+        (super::GateResult::Green, Ok(()), Ok(()), None) => {
             CardGate::NotReady(VerdictGap::PrHeadUnknown.to_string())
         }
     }

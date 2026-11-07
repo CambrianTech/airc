@@ -109,7 +109,7 @@ fn only_a_passed_independent_review_at_the_prs_head_authorizes_a_merge() {
 #[test]
 fn a_merge_is_pinned_to_the_head_the_gate_judged() {
     let green = || crate::merger::GateResult::Green;
-    match card_gate(green(), Ok(()), Some(sha('b'))) {
+    match card_gate(green(), Ok(()), Ok(()), Some(sha('b'))) {
         CardGate::Merge(head) => assert_eq!(head.commit(), &sha('b')),
         other => panic!("a passed verdict at a green head merges: {other:?}"),
     }
@@ -118,23 +118,73 @@ fn a_merge_is_pinned_to_the_head_the_gate_judged() {
         pr: sha('c'),
     });
     assert!(
-        matches!(card_gate(green(), moved, Some(sha('c'))), CardGate::NotReady(reason) if reason.contains("verdict at"))
+        matches!(card_gate(green(), moved, Ok(()), Some(sha('c'))), CardGate::NotReady(reason) if reason.contains("verdict at"))
     );
     assert!(matches!(
-        card_gate(green(), Ok(()), None),
+        card_gate(green(), Ok(()), Ok(()), None),
         CardGate::NotReady(_)
     ));
     assert!(matches!(
-        card_gate(crate::merger::GateResult::NotReady("1 failing check(s)".into()), Ok(()), Some(sha('b'))),
+        card_gate(crate::merger::GateResult::NotReady("1 failing check(s)".into()), Ok(()), Ok(()), Some(sha('b'))),
         CardGate::NotReady(reason) if reason.contains("failing")
     ));
     assert!(matches!(
         card_gate(
             crate::merger::GateResult::AlreadyMerged { merged_at_ms: 9 },
             Err(VerdictGap::NoSubmission),
+            Err(TargetGap::BaseUnknown),
             None
         ),
         CardGate::AlreadyMerged { merged_at_ms: 9 }
+    ));
+}
+
+// what this catches: a stacked PR merged into its parent (2026-11-07 08:13Z: the merger squashed
+// continuum #5806 into #5805's branch, its base, not canary). A PR whose base is not its repository's
+// default branch waits, a view with no default branch is refused rather than guessed, and only a PR
+// that targets the default lands.
+#[test]
+fn a_pr_lands_only_into_its_repositorys_default_branch() {
+    let view = |base: Option<&str>, default: Option<&str>| crate::gh_client::PrView {
+        state: "OPEN".into(),
+        mergeable: "MERGEABLE".into(),
+        status_check_rollup: Some(Vec::new()),
+        merged_at: None,
+        base_ref_name: base.map(str::to_string),
+        base_ref_oid: None,
+        head_ref_oid: None,
+        base_default_branch: default.map(str::to_string),
+    };
+    assert_eq!(
+        lands_in_default(&view(Some("canary"), Some("canary"))),
+        Ok(())
+    );
+    let stacked = lands_in_default(&view(Some("fable/5805-collapse-log"), Some("canary")));
+    assert!(
+        matches!(&stacked, Err(TargetGap::Stacked { base, default }) if base == "fable/5805-collapse-log" && default == "canary")
+    );
+    assert_eq!(
+        lands_in_default(&view(Some("canary"), None)),
+        Err(TargetGap::DefaultUnknown)
+    );
+    assert_eq!(
+        lands_in_default(&view(None, Some("canary"))),
+        Err(TargetGap::BaseUnknown)
+    );
+    // A green, passed, pinned card still waits when stacked, and reconciles once already merged.
+    let green = || crate::merger::GateResult::Green;
+    assert!(matches!(
+        card_gate(green(), Ok(()), stacked.clone(), Some(sha('b'))),
+        CardGate::NotReady(reason) if reason.contains("stacked on fable/5805-collapse-log")
+    ));
+    assert!(matches!(
+        card_gate(
+            crate::merger::GateResult::AlreadyMerged { merged_at_ms: 7 },
+            Ok(()),
+            stacked,
+            Some(sha('b'))
+        ),
+        CardGate::AlreadyMerged { merged_at_ms: 7 }
     ));
 }
 

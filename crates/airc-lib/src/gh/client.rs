@@ -292,6 +292,11 @@ pub struct PrView {
     /// must have been read at (the merge gate, card 950b3093).
     #[serde(default, rename = "headRefOid")]
     pub head_ref_oid: Option<String>,
+    /// The default branch of the repository the PR targets, from the REST response's
+    /// `base.repo.default_branch`: where a merge must land. `gh pr view --json` has no such field,
+    /// so a GraphQL view leaves it unknown and the merge gate refuses rather than guess.
+    #[serde(skip)]
+    pub base_default_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -399,6 +404,10 @@ impl PrView {
                 .map(str::to_string),
             head_ref_oid: pr_json
                 .pointer("/head/sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            base_default_branch: pr_json
+                .pointer("/base/repo/default_branch")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         };

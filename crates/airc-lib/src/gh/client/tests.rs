@@ -216,6 +216,22 @@ fn from_rest_and_from_graphql_agree_on_the_canonical_vocabulary() {
     assert_eq!(check.conclusion.as_deref(), Some("SUCCESS"));
 }
 
+// what this catches: the merge gate reading no default branch from the REST view it merges on (a
+// wrong pointer would leave every PR "unknown" and stall every merge), or a GraphQL view inventing
+// one (`gh pr view --json` has none). The gate lands a PR only into this branch (continuum #5806).
+#[test]
+fn from_rest_reads_the_base_repositorys_default_branch_and_graphql_has_none() {
+    let rest = PrView::from_rest(
+        &serde_json::json!({"state": "open", "base": {"ref": "fable/5805", "repo": {"default_branch": "canary"}}}),
+        Vec::new(),
+    );
+    assert_eq!(rest.base_default_branch.as_deref(), Some("canary"));
+    assert_eq!(rest.base_ref_name.as_deref(), Some("fable/5805"));
+    let graphql = PrView::from_graphql(br#"{"state":"OPEN","baseRefName":"canary"}"#)
+        .expect("graphql parses");
+    assert_eq!(graphql.base_default_branch, None);
+}
+
 // what this catches: a PR closed WITHOUT merging keeps its real state —
 // the boundary normalizes vocabulary, it must not invent the merge fact.
 #[test]

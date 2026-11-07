@@ -667,6 +667,7 @@ fn evaluate_gh_view_routes_merged_state_to_already_merged() {
         base_ref_name: None,
         base_ref_oid: None,
         head_ref_oid: None,
+        base_default_branch: None,
     };
     let baseline = std::collections::HashSet::new();
     let policy = GatePolicy::default_for_merger(0);
@@ -694,6 +695,7 @@ fn evaluate_gh_view_reconciles_rest_shaped_closed_plus_merged_at() {
         base_ref_name: None,
         base_ref_oid: None,
         head_ref_oid: None,
+        base_default_branch: None,
     };
     match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
         GateResult::AlreadyMerged { merged_at_ms } => {
@@ -718,6 +720,7 @@ fn evaluate_gh_view_does_not_reconcile_closed_unmerged() {
         base_ref_name: None,
         base_ref_oid: None,
         head_ref_oid: None,
+        base_default_branch: None,
     };
     match evaluate_gh_view(&view, &empty_baseline(), empty_policy()) {
         GateResult::NotReady(reason) => assert!(reason.contains("CLOSED"), "{reason}"),
@@ -739,6 +742,7 @@ fn evaluate_gh_view_falls_back_to_wallclock_when_merged_at_absent() {
         base_ref_name: None,
         base_ref_oid: None,
         head_ref_oid: None,
+        base_default_branch: None,
     };
     let baseline = std::collections::HashSet::new();
     let policy = GatePolicy::default_for_merger(0);
@@ -761,6 +765,7 @@ fn evaluate_gh_view_routes_closed_state_to_not_ready() {
         base_ref_name: None,
         base_ref_oid: None,
         head_ref_oid: None,
+        base_default_branch: None,
     };
     let baseline = std::collections::HashSet::new();
     let policy = GatePolicy::default_for_merger(0);
