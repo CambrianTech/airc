@@ -93,7 +93,7 @@ impl WorkBoardProjection {
         }
         match requested.or(bound) {
             Some(id) => parent.submissions.iter().find(|s| s.submission_id == id),
-            None => parent.submissions.first(),
+            None => parent.latest_submission(),
         }
         .ok_or(Reason::UnknownSubmission)
     }

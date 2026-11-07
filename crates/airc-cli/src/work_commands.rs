@@ -2065,7 +2065,7 @@ fn print_board(
             repo = card.repo,
             title = card.title,
         );
-        if let Some(submission) = card.submissions.first() {
+        if let Some(submission) = card.latest_submission() {
             println!(
                 "  submissions={} latest={} publisher={} base={} sha256={} bytes={} (artifact reference; availability not asserted)",
                 card.submissions.len(), submission.submission_id,

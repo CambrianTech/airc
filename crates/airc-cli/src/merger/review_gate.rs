@@ -52,7 +52,7 @@ pub(crate) fn verdict_authorizes(
     card: &WorkCard,
     pr_head: Option<&GitObjectId>,
 ) -> Result<(), VerdictGap> {
-    let submission = card.submissions.last().ok_or(VerdictGap::NoSubmission)?;
+    let submission = card.latest_submission().ok_or(VerdictGap::NoSubmission)?;
     decide(
         submission,
         board.submission_reviews_for(submission.submission_id),

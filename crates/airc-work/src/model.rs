@@ -240,6 +240,16 @@ pub struct WorkCard {
     pub last_submission_rejection: Option<crate::event::RejectedSubmission>,
 }
 
+impl WorkCard {
+    /// The card's newest accepted submission: what a reviewer judges by default and what the
+    /// merge gate requires a verdict on. `submissions` is newest-first (transcript order), so this
+    /// is its head, never its tail: the one owner of "newest" (airc 315bf919 read the tail and
+    /// refused every resubmitted card, card adf6ac17).
+    pub fn latest_submission(&self) -> Option<&crate::event::WorkSubmission> {
+        self.submissions.first()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimProvenance {
     pub origin: crate::event::ClaimOrigin,
