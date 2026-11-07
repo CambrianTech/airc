@@ -244,6 +244,49 @@ fn work_close_retires_the_cards_clean_worktree_through_its_own_lifecycle_lock() 
     );
 }
 
+// what this catches (card cc99488d): a card's body (its repro, measurements and acceptance)
+// could not be read from the CLI; board and next print titles only, so a claimant had to ask
+// the author for the work it had claimed. `work show` prints the card in full, by its short
+// id, from the room named, not the current one.
+#[test]
+fn work_show_prints_the_cards_body_from_the_named_room() {
+    let workspace = common::daemon_tempdir();
+    let home = workspace.path().join("agent");
+    run_ok(&home, &["init"]);
+    run_ok(&home, &["room", "review"]);
+    let body = "Repro: start the server with -ngl 0.\nExpected: the learn refuses with a reason.";
+    let create = run_ok(
+        &home,
+        &[
+            "work",
+            "create",
+            "--repo",
+            "CambrianTech/airc",
+            "--title",
+            "show me",
+            "--body",
+            body,
+        ],
+    );
+    let card_id = extract_field(&create, "card_id:").expect("create prints card_id");
+    run_ok(&home, &["room", "general"]);
+
+    let shown = run_ok(&home, &["work", "show", &card_id[..8], "--room", "review"]);
+    assert!(
+        shown.contains(card_id) && shown.contains("title=show me"),
+        "{shown}"
+    );
+    assert!(shown.contains("room: #review"), "{shown}");
+    assert!(
+        shown.contains("Repro: start the server with -ngl 0."),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Expected: the learn refuses with a reason."),
+        "{shown}"
+    );
+}
+
 #[test]
 fn work_seed_is_idempotent_for_manager_candidates() {
     let workspace = common::daemon_tempdir();

@@ -393,7 +393,7 @@ pub(crate) async fn resolve_my_active_claim(
 /// The room a work verb acts in: `--room` resolved by name or channel (refusing a
 /// room this scope is not subscribed to), else the scope's current room. ONE place
 /// for the choice every `--room` verb makes; it never moves the current-room pointer.
-async fn room_or_current(
+pub(crate) async fn room_or_current(
     airc: &airc_lib::Airc,
     room: Option<&str>,
     verb: &str,
@@ -1671,7 +1671,7 @@ pub(crate) fn close_transition_allowed_from_card(card: &WorkCard) -> bool {
 /// short-uuid fallback. Honest "unknown" rendering keeps the board
 /// readable even when a peer hasn't published an identity card to
 /// this room yet.
-fn format_peer(
+pub(crate) fn format_peer(
     peer: airc_lib::PeerId,
     me: airc_lib::PeerId,
     aliases: &std::collections::HashMap<airc_lib::PeerId, String>,
@@ -1742,7 +1742,7 @@ impl BoardFilter {
 /// the flywheel-continuity doctrine), otherwise time remaining as
 /// 'Mm SS s'. Lets at-a-glance scanning of the board surface stale
 /// claims without having to cross-reference 'work roster' + ttl.
-fn format_lease(expires_at_ms: Option<u64>, now_ms: u64) -> String {
+pub(crate) fn format_lease(expires_at_ms: Option<u64>, now_ms: u64) -> String {
     match expires_at_ms {
         None => "-".to_string(),
         Some(expires_at_ms) if expires_at_ms <= now_ms => "<STALE>".to_string(),
@@ -2048,37 +2048,7 @@ fn print_board(
         println!("(no cards match filter {:?})", filter);
     }
     for card in &visible {
-        let owner = card
-            .owner
-            .map(|peer| format_peer(peer, me, aliases))
-            .unwrap_or_else(|| "-".to_string());
-        let claim = card
-            .claim_id
-            .map(ClaimId::shown)
-            .unwrap_or_else(|| "-".to_string());
-        let lease = format_lease(card.claim_expires_at_ms, now);
-        println!(
-            "{card_id}  {priority:?}  {state:?}  owner={owner}  claim={claim}  lease={lease}  repo={repo}  title={title}",
-            card_id = card.card_id,
-            priority = card.priority,
-            state = card.state,
-            repo = card.repo,
-            title = card.title,
-        );
-        if let Some(submission) = card.latest_submission() {
-            println!(
-                "  submissions={} latest={} publisher={} base={} sha256={} bytes={} (artifact reference; availability not asserted)",
-                card.submissions.len(), submission.submission_id,
-                format_peer(submission.publisher, me, aliases), submission.base_sha,
-                submission.artifact.hash, submission.artifact.size_bytes,
-            );
-        }
-        if let Some(rejected) = &card.last_submission_rejection {
-            println!(
-                "  submission_rejected={} reason={}",
-                rejected.submission_id, rejected.reason
-            );
-        }
+        crate::work_show::print_card_row(card, me, aliases, now);
     }
     if !stale_claims.is_empty() {
         println!();
@@ -2270,7 +2240,7 @@ fn print_manager_recommendation(recommendation: &WorkManagerRecommendation) {
     );
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
