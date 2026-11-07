@@ -621,7 +621,6 @@ pub fn parse_pr_url(stdout: &str) -> Result<PrCreated, GhError> {
 #[cfg(test)]
 mod tests;
 
-
 /// Testable [`GhClient`] impl backed by canned response queues.
 ///
 /// Card bac49e0c. Lets unit tests in airc-cli, the merger, and

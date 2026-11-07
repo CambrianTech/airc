@@ -247,8 +247,7 @@ fn refuses_when_conflicting() {
         "mergeable": "CONFLICTING",
         "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
     }));
-    let GateResult::NotReady(reason) =
-        evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), empty_policy())
     else {
         panic!("expected NotReady");
     };
@@ -269,8 +268,7 @@ fn refuses_when_any_check_failed() {
             {"conclusion": "SUCCESS", "status": "COMPLETED"},
         ]
     }));
-    let GateResult::NotReady(reason) =
-        evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), empty_policy())
     else {
         panic!("expected NotReady");
     };
@@ -368,8 +366,7 @@ fn refuses_when_a_check_is_still_running() {
             {"conclusion": null, "status": "IN_PROGRESS"},
         ]
     }));
-    let GateResult::NotReady(reason) =
-        evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), empty_policy())
     else {
         panic!("expected NotReady");
     };
@@ -498,8 +495,7 @@ fn evaluate_still_refuses_when_pr_introduces_new_failure() {
         ]
     }));
     let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
-    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline, empty_policy())
-    else {
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline, empty_policy()) else {
         panic!("expected NotReady");
     };
     assert!(
@@ -520,8 +516,7 @@ fn evaluate_with_empty_baseline_matches_old_strict_behavior() {
             {"conclusion": "FAILURE", "status": "COMPLETED", "name": "shell syntax + rust cutover guards"},
         ]
     }));
-    let GateResult::NotReady(reason) =
-        evaluate_gh_view(&view, &empty_baseline(), empty_policy())
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), empty_policy())
     else {
         panic!("expected NotReady");
     };
@@ -802,8 +797,7 @@ fn evaluate_gh_view_signals_inherited_with_dedicated_phrase() {
         ]
     }));
     let baseline = baseline_with(&["shell syntax + rust cutover guards"]);
-    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline, empty_policy())
-    else {
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &baseline, empty_policy()) else {
         panic!("expected NotReady");
     };
     assert!(
@@ -872,8 +866,7 @@ fn pending_check_younger_than_timeout_still_blocks() {
         // 5 minutes in — well under the 30-min timeout.
         now_ms: FIXED_STARTED_AT_MS + 5 * 60 * 1000,
     };
-    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy)
-    else {
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy) else {
         panic!("expected NotReady");
     };
     assert!(
@@ -903,8 +896,7 @@ fn pending_timeout_zero_keeps_strict_behavior() {
         pending_timeout_ms: 0,
         now_ms: FIXED_STARTED_AT_MS + 60 * 60 * 1000,
     };
-    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy)
-    else {
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy) else {
         panic!("expected NotReady");
     };
     assert!(
@@ -933,8 +925,7 @@ fn new_failure_still_blocks_even_with_inherited_timeouts() {
         pending_timeout_ms: 30 * 60 * 1000,
         now_ms: FIXED_STARTED_AT_MS + 60 * 60 * 1000,
     };
-    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy)
-    else {
+    let GateResult::NotReady(reason) = evaluate_gh_view(&view, &empty_baseline(), policy) else {
         panic!("expected NotReady");
     };
     assert!(

@@ -262,7 +262,6 @@ async fn evaluate(
 mod gate;
 pub(crate) use gate::*;
 
-
 /// Actually merge. `gh pr merge --squash --delete-branch` matches the
 /// convention every recent PR has used (see merged-PR survey in card
 /// 28f1440c). On success, publish `MarkPullRequestMerged` so the
