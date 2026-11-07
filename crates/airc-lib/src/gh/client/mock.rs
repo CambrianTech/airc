@@ -195,6 +195,7 @@ mod tests {
             merged_at: None,
             base_ref_name: None,
             base_ref_oid: None,
+            head_ref_oid: None,
         }
     }
 

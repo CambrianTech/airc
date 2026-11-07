@@ -1847,6 +1847,7 @@ mod tests {
                     claim_id: claim,
                     instance: "ordinary-task".into(),
                     base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+                    head: airc_work::GitObjectId::new("e".repeat(40)).unwrap(),
                     artifact: artifact.clone(),
                 },
             )
@@ -1922,6 +1923,7 @@ mod tests {
                     claim_id: claim,
                     instance: "ordinary-task".into(),
                     base_sha: airc_work::GitObjectId::new("c".repeat(40)).unwrap(),
+                    head: airc_work::GitObjectId::new("e".repeat(40)).unwrap(),
                     artifact: artifact.clone(),
                 },
             )

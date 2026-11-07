@@ -72,7 +72,9 @@ pub async fn run_merge(
         now_ms: crate::merger::now_ms(),
     };
 
-    match crate::merger::check_pr_gate(gh.as_ref(), &pr, &mut baselines, policy).await {
+    match crate::merger::check_card_gate(gh.as_ref(), &board, card, &pr, &mut baselines, policy)
+        .await
+    {
         Ok(crate::merger::GateResult::Green) => {
             if dry_run {
                 println!(

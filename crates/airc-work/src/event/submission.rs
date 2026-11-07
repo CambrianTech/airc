@@ -12,9 +12,41 @@ pub struct WorkSubmission {
     pub claim_id: ClaimId,
     pub instance: String,
     pub base_sha: GitObjectId,
+    /// The commit the patch ends at: what a verdict on this submission covers, and what the merge
+    /// gate compares with the PR's head (card 950b3093).
+    #[serde(default, skip_serializing_if = "SubmissionHead::is_unrecorded")]
+    pub head: SubmissionHead,
     pub artifact: airc_blobs::MediaRef,
     pub publisher: PeerId,
     pub submitted_at_ms: u64,
+}
+
+/// The commit a submission's patch ends at.
+///
+/// `Unrecorded` is a submission published before heads were recorded: kept as it was written
+/// (the head cannot be recovered from a patch), and never mergeable, because no verdict on it can
+/// be shown to cover the PR's head. It is not written: an `Unrecorded` submission serializes
+/// without the field, so a legacy event re-encodes to the bytes it was signed as.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionHead {
+    At(GitObjectId),
+    #[default]
+    Unrecorded,
+}
+
+impl SubmissionHead {
+    pub fn is_unrecorded(&self) -> bool {
+        matches!(self, SubmissionHead::Unrecorded)
+    }
+
+    /// The commit, when recorded.
+    pub fn commit(&self) -> Option<&GitObjectId> {
+        match self {
+            SubmissionHead::At(commit) => Some(commit),
+            SubmissionHead::Unrecorded => None,
+        }
+    }
 }
 
 /// A reviewer's judgement, not an assertion that the substrate graded the work.
@@ -223,6 +255,7 @@ impl WorkSubmission {
             && self.claim_id == other.claim_id
             && self.instance == other.instance
             && self.base_sha == other.base_sha
+            && self.head == other.head
             && self.artifact == other.artifact
             && self.publisher == other.publisher
     }

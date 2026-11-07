@@ -587,6 +587,29 @@ pub struct AgentAvailabilityReported {
 mod tests {
     use super::*;
 
+    // what this catches: recording a submission's head breaking the durable log. A submission
+    // written before heads were recorded decodes as Unrecorded and re-encodes to its own bytes, so
+    // the event it was signed as still verifies; a recorded head round-trips as itself.
+    #[test]
+    fn a_legacy_submission_decodes_unrecorded_and_reencodes_to_its_signed_bytes() {
+        let legacy = r#"{"submission_id":"00000000-0000-0000-0000-000000000004","card_id":"00000000-0000-0000-0000-000000000001","claim_id":"00000000-0000-0000-0000-000000000002","instance":"card","base_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifact":{"hash":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":1},"publisher":"00000000-0000-0000-0000-000000000003","submitted_at_ms":30}"#;
+        let decoded: WorkSubmission = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.head, crate::SubmissionHead::Unrecorded);
+        let reencoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(
+            reencoded,
+            serde_json::from_str::<serde_json::Value>(legacy).unwrap(),
+            "an unrecorded head is not written"
+        );
+        let recorded = WorkSubmission {
+            head: crate::SubmissionHead::At(GitObjectId::new("b".repeat(40)).unwrap()),
+            ..decoded
+        };
+        let back: WorkSubmission =
+            serde_json::from_value(serde_json::to_value(&recorded).unwrap()).unwrap();
+        assert_eq!(back.head, recorded.head);
+    }
+
     #[test]
     fn review_accepts_corrected_submission_without_relaxing_claim_or_terminal_guards() {
         let card_id = WorkCardId::from_u128(1);
@@ -624,6 +647,7 @@ mod tests {
             claim_id,
             instance: "card".into(),
             base_sha: GitObjectId::new("a".repeat(40)).unwrap(),
+            head: crate::SubmissionHead::At(GitObjectId::new("b".repeat(40)).unwrap()),
             artifact: airc_blobs::MediaRef {
                 hash: airc_blobs::ContentHash::from_bytes(b"corrected submission fixture"),
                 size_bytes: 100,

@@ -81,33 +81,54 @@ pub(crate) fn parse_iso8601_to_ms(s: &str) -> Option<u64> {
 /// typed [`crate::gh_client::GhError`] variants (rate-limited,
 /// auth-required, …) so callers can pattern-match on them; the
 /// decision half (`evaluate_gh_view`) remains pure for unit tests.
+/// The CI half alone over a freshly fetched view: the merger and `airc work merge` gate a card
+/// through `check_card_gate` (its verdict, then this); the HTTP client's tests drive this half.
+#[cfg(test)]
 pub(crate) async fn check_pr_gate(
     gh: &dyn crate::gh_client::GhClient,
     pr: &airc_work::model::PullRequestRef,
     baselines: &mut BaselineCache,
     policy: GatePolicy,
 ) -> Result<GateResult, crate::gh_client::GhError> {
-    let view = gh
-        .pr_view(crate::gh_client::PrViewArgs {
-            repo: pr.repo.as_str().to_string(),
-            number: pr.number,
-            cwd: None,
-        })
-        .await?;
+    let view = fetch_pr_view(gh, pr).await?;
+    Ok(check_view_gate(gh, pr, &view, baselines, policy).await)
+}
+
+/// The PR's live view: its state, checks, base and head, in one response.
+pub(crate) async fn fetch_pr_view(
+    gh: &dyn crate::gh_client::GhClient,
+    pr: &airc_work::model::PullRequestRef,
+) -> Result<crate::gh_client::PrView, crate::gh_client::GhError> {
+    gh.pr_view(crate::gh_client::PrViewArgs {
+        repo: pr.repo.as_str().to_string(),
+        number: pr.number,
+        cwd: None,
+    })
+    .await
+}
+
+/// The CI half of the gate over a view already fetched: strictly less red than the base.
+pub(crate) async fn check_view_gate(
+    gh: &dyn crate::gh_client::GhClient,
+    pr: &airc_work::model::PullRequestRef,
+    view: &crate::gh_client::PrView,
+    baselines: &mut BaselineCache,
+    policy: GatePolicy,
+) -> GateResult {
     let no_allowance = HashSet::new();
-    let without_baseline = evaluate_gh_view(&view, &no_allowance, policy);
+    let without_baseline = evaluate_gh_view(view, &no_allowance, policy);
     if !matches!(without_baseline, GateResult::NotReady(_)) {
         // A decision needing no base allowance (including the configured
         // pending-timeout policy) does not depend on another lookup succeeding.
-        return Ok(without_baseline);
+        return without_baseline;
     }
-    let Some(target) = BaselineTarget::from_view(&pr.repo, &view) else {
+    let Some(target) = BaselineTarget::from_view(&pr.repo, view) else {
         eprintln!(
             "airc-merger: PR #{} in {} has no verified target branch/revision \
              (degrading to no-allowance gate)",
             pr.number, pr.repo
         );
-        return Ok(without_baseline);
+        return without_baseline;
     };
     let failures = match baselines.failures.entry(target) {
         Entry::Occupied(entry) => entry.into_mut(),
@@ -116,7 +137,7 @@ pub(crate) async fn check_pr_gate(
             entry.insert(failures)
         }
     };
-    Ok(evaluate_gh_view(&view, failures, policy))
+    evaluate_gh_view(view, failures, policy)
 }
 
 /// Short-lived baseline observations for one merger tick or manual command.

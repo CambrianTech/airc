@@ -12,6 +12,8 @@ pub struct SubmitWork {
     pub claim_id: ClaimId,
     pub instance: String,
     pub base_sha: airc_work::GitObjectId,
+    /// The commit the patch ends at (`git diff base_sha..head`): what a verdict on it covers.
+    pub head: airc_work::GitObjectId,
     pub artifact: airc_work::SubmissionArtifact,
 }
 
@@ -127,6 +129,7 @@ impl Airc {
             claim_id: request.claim_id,
             instance: request.instance,
             base_sha: request.base_sha,
+            head: airc_work::SubmissionHead::At(request.head),
             artifact: request.artifact,
             publisher: self.peer_id(),
             submitted_at_ms: now_ms()?,

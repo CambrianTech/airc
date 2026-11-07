@@ -278,6 +278,10 @@ pub struct PrView {
     /// Target revision observed in the same PR response.
     #[serde(default, rename = "baseRefOid")]
     pub base_ref_oid: Option<String>,
+    /// The PR's head commit in the same response: what a merge would land, and what a verdict
+    /// must have been read at (the merge gate, card 950b3093).
+    #[serde(default, rename = "headRefOid")]
+    pub head_ref_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -381,6 +385,10 @@ impl PrView {
                 .map(str::to_string),
             base_ref_oid: pr_json
                 .pointer("/base/sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            head_ref_oid: pr_json
+                .pointer("/head/sha")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         };

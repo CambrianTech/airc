@@ -18,18 +18,44 @@ pub async fn run_submit(
     card_id: String,
     patch: std::path::PathBuf,
     base: String,
+    head: String,
     instance: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes =
         std::fs::read(&patch).map_err(|e| format!("patch file {}: {e}", patch.display()))?;
     let base_sha = airc_work::GitObjectId::new(base.trim())
         .map_err(|e| format!("--base `{base}`: {e} (give the FULL commit sha)"))?;
+    let head_sha = airc_work::GitObjectId::new(head.trim())
+        .map_err(|e| format!("--head `{head}`: {e} (give the FULL commit sha)"))?;
+    // The head can't be claimed: the patch must be exactly `git diff base..head` here, the same
+    // bytes the review transition submits (card 950b3093), so a verdict on it covers that commit.
+    let expected =
+        crate::work_commands_git::patch_between(".", base_sha.as_str(), head_sha.as_str())?;
+    if expected != bytes {
+        return Err(format!(
+            "the patch file is not `git diff --binary {base_sha} {head_sha}` in this checkout: \
+             a submission names the commit its patch ends at, so regenerate it from that diff"
+        )
+        .into());
+    }
     let airc = crate::commands::attached_airc(home).await?;
     let shown = Shown::try_from(card_id.as_str())?;
     let room = room_or_current(&airc, room.as_deref(), "submit work in").await?;
     let board = airc.work_board_in(&room).await?;
     let card_id = card_on_board(&board, &shown)?;
-    submit_patch(&airc, home, &room, card_id, &bytes, base_sha, instance).await
+    submit_patch(
+        &airc,
+        home,
+        &room,
+        card_id,
+        &bytes,
+        PatchRange {
+            base: base_sha,
+            head: head_sha,
+        },
+        instance,
+    )
+    .await
 }
 
 /// Publish `bytes` as a submission on `card_id`, under the caller as its holder: the
@@ -44,9 +70,13 @@ pub(crate) async fn submit_patch(
     room: &airc_lib::Room,
     card_id: airc_lib::WorkCardId,
     bytes: &[u8],
-    base_sha: airc_work::GitObjectId,
+    range: PatchRange,
     instance: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let PatchRange {
+        base: base_sha,
+        head,
+    } = range;
     let board = airc.work_board_in(room).await?;
     let card = board
         .card(card_id)
@@ -76,18 +106,26 @@ pub(crate) async fn submit_patch(
                 claim_id,
                 instance,
                 base_sha,
+                head: head.clone(),
                 artifact,
             },
         )
         .await?;
     println!(
-        "submission: {} card={} size={} base={}",
+        "submission: {} card={} size={} base={} head={}",
         submission.submission_id,
         submission.card_id,
         submission.artifact.size_bytes,
-        submission.base_sha
+        submission.base_sha,
+        head
     );
     Ok(())
+}
+
+/// The commits a submission's patch spans: it applies to `base` and ends at `head`.
+pub(crate) struct PatchRange {
+    pub base: airc_work::GitObjectId,
+    pub head: airc_work::GitObjectId,
 }
 
 /// Retain a patch in `store` and return its artifact reference: the hash the store holds

@@ -140,7 +140,7 @@ async fn tick_once(
     let policy = GatePolicy::default_for_merger(now_ms());
 
     for card in &snapshot.cards {
-        let Some(decision) = evaluate(gh, card, &mut baselines, policy).await? else {
+        let Some(decision) = evaluate(gh, &board, card, &mut baselines, policy).await? else {
             continue;
         };
         match decision {
@@ -235,6 +235,7 @@ enum MergeDecision {
 /// that failed a gate (so we can log it instead of silently dropping).
 async fn evaluate(
     gh: &dyn crate::gh_client::GhClient,
+    board: &airc_work::WorkBoardProjection,
     card: &WorkCard,
     baselines: &mut BaselineCache,
     policy: GatePolicy,
@@ -247,7 +248,7 @@ async fn evaluate(
         return Ok(None);
     };
 
-    match check_pr_gate(gh, &pr, baselines, policy).await {
+    match check_card_gate(gh, board, card, &pr, baselines, policy).await {
         Ok(GateResult::Green) => Ok(Some(MergeDecision::Merge(pr))),
         Ok(GateResult::AlreadyMerged { merged_at_ms }) => {
             Ok(Some(MergeDecision::Reconcile(pr, merged_at_ms)))
@@ -260,7 +261,9 @@ async fn evaluate(
 }
 
 mod gate;
+mod review_gate;
 pub(crate) use gate::*;
+pub(crate) use review_gate::check_card_gate;
 
 /// Actually merge. `gh pr merge --squash --delete-branch` matches the
 /// convention every recent PR has used (see merged-PR survey in card
