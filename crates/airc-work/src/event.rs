@@ -679,6 +679,12 @@ mod tests {
         let card = board.card(card_id).unwrap();
         assert_eq!(card.submissions.len(), 2);
         assert_eq!(card.submissions[0].submission_id, corrected.submission_id);
+        // what this catches: reading the tail as the newest (airc 315bf919's merge gate, card
+        // adf6ac17): submissions are newest-first, and latest_submission is their one reader.
+        assert_eq!(
+            card.latest_submission().map(|s| s.submission_id),
+            Some(corrected.submission_id)
+        );
         assert_eq!(card.state, CardState::Review);
         assert_eq!(card.owner, Some(owner));
         assert_eq!(card.claim_id, Some(claim_id));
