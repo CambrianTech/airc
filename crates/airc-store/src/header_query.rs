@@ -116,8 +116,15 @@ fn rows<T: EventTable>(key: &str, value: Option<SimpleExpr>) -> SelectStatement 
     select.to_owned()
 }
 
-fn holding<T: EventTable>(ids: SelectStatement) -> SimpleExpr {
-    Expr::col((T::default(), T::EVENT_ID)).in_subquery(ids)
+fn holding<T: EventTable>(mut ids: SelectStatement) -> SimpleExpr {
+    // Correlated on the row's own id, so each candidate is one lookup on the header table's
+    // primary key (event_id, key). `event_id IN (SELECT …)` materialized every event holding the
+    // key, which is nearly every event for the client stamp, on every read: 2-14 s per cursor read
+    // in a core restart's catch-up on the M5 (2026-11-08, card 1b0e2b64).
+    ids.and_where(
+        Expr::col((T::Headers::default(), T::HEADER_EVENT_ID)).equals((T::default(), T::EVENT_ID)),
+    );
+    Expr::exists(ids)
 }
 
 /// The least string greater than every string that starts with `prefix`:
