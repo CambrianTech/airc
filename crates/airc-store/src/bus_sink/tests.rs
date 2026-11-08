@@ -686,3 +686,48 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         );
     }
 }
+
+// what this catches (the M5, 2026-11-08 00:26Z, card 1b0e2b64): a cursor read that excludes this
+// runtime's own sends materializing every header row with the client key (`event_id IN (SELECT …)`,
+// nearly every event) on each read: 2-14 s per read in a core restart's catch-up, 164 slow
+// statements in two minutes. Each header predicate is a lookup on the header table's primary key
+// for the candidate row, never a list built from the whole table.
+#[tokio::test]
+async fn a_header_exclusion_looks_up_each_candidate_never_lists_the_header_table() {
+    let sink = SqliteDurableSink::in_memory().await.unwrap();
+    let ch = RoomId::from_u128(0x5e);
+    let rows: Vec<_> = (1..500).map(|n| durable_at(ch, 1, n)).collect();
+    sink.append_batch(&rows.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+    let through = rows[rows.len() - 1].cursor();
+    let me = airc_core::RuntimeSelf::new(ClientId::from_u128(0xc1), Some("runtime-tag"));
+    let query = counted_rows(
+        ch,
+        origin,
+        through,
+        &airc_core::HeaderFilter::Any,
+        Some(&me),
+        true,
+    );
+    let built = sea_orm::QueryTrait::build(&query, sea_orm::DbBackend::Sqlite);
+    let plan = crate::sqlite_only::query_plan(&sink.readers, built)
+        .await
+        .unwrap();
+    assert!(
+        !plan.iter().any(|step| step.contains("LIST SUBQUERY")),
+        "no list built from the header table: {plan:?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|step| step.starts_with("SCAN") && step.contains("header")),
+        "no header table walk: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("CORRELATED SCALAR SUBQUERY") || step.contains("EXISTS")),
+        "a correlated per-row lookup: {plan:?}"
+    );
+}

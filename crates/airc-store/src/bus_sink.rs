@@ -674,33 +674,46 @@ impl SqliteDurableSink {
         exclude: Option<&airc_core::RuntimeSelf>,
         reads_derived: bool,
     ) -> Result<airc_core::HistoryCount, BusError> {
-        let mut rows = matching_rows(channel, after, through, headers);
-        if reads_derived {
-            // An owed row has no header rows yet, so a negated filter would count it falsely.
-            rows = rows.filter(crate::derive::derived::<bus_event::Entity>());
-        }
-        if let Some(rule) = exclude {
-            rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
-                rule,
-            ));
-        }
-        let times: Vec<i64> = rows
-            .select_only()
-            .column(bus_event::Column::OccurredAtMs)
-            .order_by_desc(bus_event::Column::Epoch)
-            .order_by_desc(bus_event::Column::Counter)
-            .order_by_desc(bus_event::Column::EventId)
-            .limit(airc_core::HISTORY_COUNT_CAP + 1)
-            .into_tuple()
-            .all(&self.readers)
-            .await
-            .map_err(BusError::sink_source)?;
+        let times: Vec<i64> =
+            counted_rows(channel, after, through, headers, exclude, reads_derived)
+                .into_tuple()
+                .all(&self.readers)
+                .await
+                .map_err(BusError::sink_source)?;
         let times = times
             .into_iter()
             .map(|ms| i64_to_u64("occurred_at_ms", ms))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(airc_core::HistoryCount::of_newest(times))
     }
+}
+
+/// The select [`SqliteDurableSink::count_indexed`] reads: the matching rows' times, newest first,
+/// at most one past the cap.
+fn counted_rows(
+    channel: RoomId,
+    after: Cursor,
+    through: Cursor,
+    headers: &airc_core::HeaderFilter,
+    exclude: Option<&airc_core::RuntimeSelf>,
+    reads_derived: bool,
+) -> sea_orm::Select<bus_event::Entity> {
+    let mut rows = matching_rows(channel, after, through, headers);
+    if reads_derived {
+        // An owed row has no header rows yet, so a negated filter would count it falsely.
+        rows = rows.filter(crate::derive::derived::<bus_event::Entity>());
+    }
+    if let Some(rule) = exclude {
+        rows = rows.filter(crate::header_query::not_runtime_self::<bus_event::Entity>(
+            rule,
+        ));
+    }
+    rows.select_only()
+        .column(bus_event::Column::OccurredAtMs)
+        .order_by_desc(bus_event::Column::Epoch)
+        .order_by_desc(bus_event::Column::Counter)
+        .order_by_desc(bus_event::Column::EventId)
+        .limit(airc_core::HISTORY_COUNT_CAP + 1)
 }
 
 /// [`in_range`]'s rows whose headers match.
