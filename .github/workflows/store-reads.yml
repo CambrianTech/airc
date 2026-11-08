@@ -1,0 +1,90 @@
+name: store reads
+
+# STORE READS START NEWEST, WITH A LIMIT, AND THE STORE FILTERS (Joel, 2026-11-03/07).
+#
+# On 2026-11-07 the bus_events reads took 2-14 s: "You always dump the whole sql into memory
+# and do a ton of rows, like a madman." Two ratchets hold the count of the shapes that do it,
+# judged against this PR's own base (a count may stay or fall, never rise):
+#   unbounded_orm_selects  `.all(db).await` with no visible `.limit(` (or a cursor's
+#                          first/last) on its chain, its bindings, or a same-file builder.
+#                          A read bounded by construction says so in `// bounded: <why>`
+#                          on its statement, which the rule reads and the log prints.
+#   load_then_filter_rows  a load's rows filtered, sorted or searched in Rust, or handed
+#                          whole to an in-memory matcher (`page(rows.iter(), ..)`).
+#
+# The rules have ONE owner: continuum's std-only `source-hygiene` crate, whose
+# `repo_ratchets` binary runs its portable rules against any repository. This job checks out
+# only that crate at a pinned commit, builds it standalone (an empty `[workspace]` table keeps
+# it out of continuum's workspace), and scans this checkout. Bump CONTINUUM_RULES_SHA to adopt
+# a rule change; a pin means a rule change upstream never moves this gate silently.
+# Seconds: no dependency, no airc build.
+
+on:
+  pull_request:
+  push:
+    branches: [canary, main]
+
+concurrency:
+  group: store-reads-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CONTINUUM_RULES_SHA: 1f37c90a372d11b1e9bbef3b7760a9191c4c7064
+
+jobs:
+  ratchets:
+    name: store reads (unbounded selects, rows filtered in Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A PR's checkout is GitHub's merge commit; its first parent is the base it merges onto.
+          fetch-depth: 2
+
+      - name: the base the ratchets judge against
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base=$(git rev-parse HEAD^1)
+          else
+            base="${{ github.event.before }}"
+            if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ] \
+               && ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$base" || true
+            fi
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              echo "::notice::push base '${base}' is absent (new branch or force push); judging against canary"
+              git fetch --no-tags --depth=1 origin canary
+              base=$(git rev-parse FETCH_HEAD)
+            fi
+          fi
+          # repo_ratchets measures the merge base of the base and HEAD, so their history must join.
+          if ! git merge-base "$base" HEAD >/dev/null 2>&1; then
+            git fetch --no-tags --shallow-since="$(git show -s --format=%cI "$base")" origin "$GITHUB_SHA" || true
+          fi
+          if ! git merge-base "$base" HEAD >/dev/null 2>&1; then
+            git fetch --no-tags --unshallow origin
+          fi
+          git merge-base "$base" HEAD >/dev/null
+          echo "RATCHET_BASE=$base" >> "$GITHUB_ENV"
+
+      - name: the rules (continuum source-hygiene, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: CambrianTech/continuum
+          ref: ${{ env.CONTINUUM_RULES_SHA }}
+          path: .continuum-rules
+          sparse-checkout: core/source-hygiene
+          fetch-depth: 1
+
+      - name: build the rules standalone
+        run: |
+          mv .continuum-rules/core/source-hygiene "$RUNNER_TEMP/source-hygiene"
+          rm -rf .continuum-rules
+          printf '\n[workspace]\n' >> "$RUNNER_TEMP/source-hygiene/Cargo.toml"
+          cargo build -q --manifest-path "$RUNNER_TEMP/source-hygiene/Cargo.toml" --bin repo_ratchets
+
+      - name: unbounded_orm_selects and load_then_filter_rows, judged against the base
+        run: |
+          "$RUNNER_TEMP/source-hygiene/target/debug/repo_ratchets" "$GITHUB_WORKSPACE" "$RATCHET_BASE"
