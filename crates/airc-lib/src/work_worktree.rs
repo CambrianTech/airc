@@ -46,6 +46,7 @@ pub const CREATION_BASE_REF: &str = "refs/worktree/airc-creation-base";
 mod allocation;
 mod clone_staging;
 mod default_ref;
+mod unanchored;
 
 pub use allocation::{
     allocation_evidence, decode_allocation_evidence, AllocationEvidence, ALLOCATION_REF,
@@ -155,6 +156,12 @@ pub enum WorktreeOutcome {
         path: PathBuf,
         retired: PathBuf,
     },
+    /// A card clone with no allocation evidence that held nothing unpublished was moved aside,
+    /// whole, to `retired`, and a fresh allocation made in its place.
+    Reallocated {
+        path: PathBuf,
+        retired: PathBuf,
+    },
 }
 
 impl WorktreeOutcome {
@@ -162,7 +169,8 @@ impl WorktreeOutcome {
         match self {
             WorktreeOutcome::Created(p)
             | WorktreeOutcome::Reused(p)
-            | WorktreeOutcome::Migrated { path: p, .. } => p,
+            | WorktreeOutcome::Migrated { path: p, .. }
+            | WorktreeOutcome::Reallocated { path: p, .. } => p,
         }
     }
 }
@@ -450,6 +458,7 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
     let path = worktree_path_for(spec.card_id)
         .ok_or_else(|| "HOME/USERPROFILE not set; cannot resolve ~/.airc/worktrees/".to_string())?;
     let interrupted = clone_staging::interrupted_clone(&path);
+    let mut retired_unanchored = None;
     if path.exists() && !interrupted {
         // A killed clone can leave .git/HEAD -> .invalid. Preserve it, but
         // never report that partial allocation as a usable workspace.
@@ -471,12 +480,20 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
                 ),
             }
         } else if allocation_evidence(&path)?.is_none() {
-            return Err(format!(
-                "card checkout {} has no completed allocation evidence; preserved for recovery",
-                path.display()
-            ));
+            match unanchored::retire_if_nothing_hers(spec.clone_path, &path)? {
+                unanchored::Unanchored::Retired(retired) => retired_unanchored = Some(retired),
+                unanchored::Unanchored::Kept(holds) => {
+                    return Err(format!(
+                        "card checkout {} has no completed allocation evidence and holds {holds}; \
+                         preserved for its owner to publish or discard",
+                        path.display()
+                    ))
+                }
+            }
         }
-        return Ok(WorktreeOutcome::Reused(path));
+        if retired_unanchored.is_none() {
+            return Ok(WorktreeOutcome::Reused(path));
+        }
     }
     let root = path
         .parent()
@@ -525,7 +542,10 @@ pub fn ensure_card_clone(spec: &WorktreeSpec<'_>) -> Result<WorktreeOutcome, Str
         return Ok(WorktreeOutcome::Migrated { path, retired });
     }
     staging.publish(&path)?;
-    Ok(WorktreeOutcome::Created(path))
+    match retired_unanchored {
+        Some(retired) => Ok(WorktreeOutcome::Reallocated { path, retired }),
+        None => Ok(WorktreeOutcome::Created(path)),
+    }
 }
 
 /// Replace a held linked worktree with a card clone, when nothing can be lost by doing so.

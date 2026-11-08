@@ -79,8 +79,7 @@ fn a_card_clone_owns_its_git_and_borrows_only_from_a_precious_mirror() {
                     .collect()
             };
             assert!(
-                inodes(&source.join(".git/objects"))
-                    .is_disjoint(&inodes(&mirror.join("objects"))),
+                inodes(&source.join(".git/objects")).is_disjoint(&inodes(&mirror.join("objects"))),
                 "--no-hardlinks: the mirror shares no inode with the source"
             );
         }
@@ -560,4 +559,139 @@ fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+// what this catches (continuum card 7f824214, Kimi on the Windows node 2026-11-08): a card
+// clone with no allocation evidence was refused forever ("preserved for recovery") with no
+// recovery, so a resident sat on a weeks-old checkout that could never submit. One holding
+// nothing unpublished is moved aside whole and re-allocated at the current start point; one
+// holding an unpushed commit, an untracked file or a stash is kept byte-identical and the
+// refusal names what it holds.
+#[test]
+fn an_unanchored_card_clone_is_reallocated_only_when_nothing_in_it_is_unpublished() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = if cfg!(windows) {
+        tmp.path().to_path_buf()
+    } else {
+        tmp.path().canonicalize().unwrap()
+    };
+    let git = |dir: &Path, args: &[&str]| git_in(dir, args).unwrap_or_else(|e| panic!("{e}"));
+    let remote = root.join("remote.git");
+    git(
+        &root,
+        &[
+            "init",
+            "--quiet",
+            "--bare",
+            "--initial-branch=canary",
+            remote.to_str().unwrap(),
+        ],
+    );
+    let source = root.join("source");
+    git(
+        &root,
+        &[
+            "clone",
+            "--quiet",
+            remote.to_str().unwrap(),
+            source.to_str().unwrap(),
+        ],
+    );
+    let who = |dir: &Path| {
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+    };
+    who(&source);
+    let commit = |dir: &Path, text: &str| {
+        std::fs::write(dir.join("lib.rs"), text).unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "--quiet", "-m", text]);
+    };
+    commit(&source, "fn old() {}\n");
+    git(&source, &["push", "--quiet", "origin", "HEAD:canary"]);
+    let home = root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    temp_env::with_var("HOME", Some(&home), || {
+        let repo = RepoId::new("o/r").unwrap();
+        let stage = |card: WorkCardId| {
+            let mirror = ensure_mirror(&repo, &source).unwrap();
+            ensure_card_clone(&WorktreeSpec {
+                card_id: card,
+                repo: &repo,
+                clone_path: &mirror,
+                branch: "7f824214/work",
+                start_point: None,
+            })
+        };
+        // A card clone made before allocation evidence existed: the same tree, its two refs gone.
+        let unanchored = |n: u128| {
+            let card = WorkCardId::from_u128((0x7f82_4210 + n) << 96);
+            let path = stage(card).unwrap().path().to_path_buf();
+            git(&path, &["update-ref", "-d", allocation::ALLOCATION_REF]);
+            git(&path, &["update-ref", "-d", CREATION_BASE_REF]);
+            assert_eq!(allocation_evidence(&path).unwrap(), None);
+            who(&path);
+            (card, path)
+        };
+        let (clean_card, clean) = unanchored(1);
+        let (unpushed_card, unpushed) = unanchored(2);
+        commit(&unpushed, "fn hers() {}\n");
+        let (untracked_card, untracked) = unanchored(3);
+        std::fs::write(untracked.join("notes.txt"), "hers").unwrap();
+        let (stashed_card, stashed) = unanchored(4);
+        std::fs::write(stashed.join("lib.rs"), "fn wip() {}\n").unwrap();
+        git(&stashed, &["stash", "--quiet"]);
+        // canary moves on after they were made.
+        commit(&source, "fn new() {}\n");
+        git(&source, &["push", "--quiet", "origin", "HEAD:canary"]);
+        let canary = git(&source, &["rev-parse", "HEAD"]);
+
+        let Ok(WorktreeOutcome::Reallocated { path, retired }) = stage(clean_card) else {
+            panic!("a clean, published, unanchored clone is reallocated");
+        };
+        assert_eq!(path, clean);
+        assert_eq!(
+            git(&path, &["rev-parse", "HEAD"]),
+            canary,
+            "a fresh allocation at the current start point"
+        );
+        assert_eq!(
+            allocation_evidence(&path).unwrap().map(|e| e.creation_sha),
+            Some(canary),
+            "with its evidence"
+        );
+        assert!(
+            retired.starts_with(home.join(".airc/worktrees/.retired"))
+                && retired.join("lib.rs").exists(),
+            "the old tree is moved aside whole"
+        );
+        assert!(matches!(stage(clean_card), Ok(WorktreeOutcome::Reused(_))));
+
+        for (card, path, holds) in [
+            (unpushed_card, &unpushed, "not on the remote"),
+            (untracked_card, &untracked, "untracked"),
+            (stashed_card, &stashed, "a stash"),
+        ] {
+            let head = git(path, &["rev-parse", "HEAD"]);
+            let Err(refusal) = stage(card) else {
+                panic!("kept: {holds}")
+            };
+            assert!(
+                refusal.contains(holds),
+                "the refusal names what it holds: {refusal}"
+            );
+            assert_eq!(
+                git(path, &["rev-parse", "HEAD"]),
+                head,
+                "untouched: {holds}"
+            );
+            assert_eq!(
+                allocation_evidence(path).unwrap(),
+                None,
+                "never backfilled: {holds}"
+            );
+        }
+        assert!(untracked.join("notes.txt").exists());
+        assert!(!git(&stashed, &["stash", "list"]).is_empty());
+    });
 }
