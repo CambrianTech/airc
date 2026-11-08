@@ -27,10 +27,16 @@ fn sanitise_never_climbs_out_of_the_wires_directory() {
     assert_eq!(sanitise_name("../etc/passwd"), "--.etc.passwd");
     assert_eq!(sanitise_name(".."), "--");
     assert_eq!(sanitise_name("normal-name_42"), "normal-name_42");
-    assert_eq!(sanitise_name("academy/benchmarks/run-1"), "academy.benchmarks.run-1");
+    assert_eq!(
+        sanitise_name("academy/benchmarks/run-1"),
+        "academy.benchmarks.run-1"
+    );
     for name in ["..", "../..", "a/../b", ".", "/"] {
         let dir = sanitise_name(name);
-        assert!(dir != "." && dir != ".." && !dir.contains('/'), "{name:?} -> {dir:?} stays inside wires/");
+        assert!(
+            dir != "." && dir != ".." && !dir.contains('/'),
+            "{name:?} -> {dir:?} stays inside wires/"
+        );
     }
 }
 

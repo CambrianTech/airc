@@ -141,11 +141,19 @@ fn sanitise_name(name: &str) -> String {
             true => "-".to_string(),
             false => segment
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
                 .collect(),
         })
         .collect();
-    crate::subscriptions::wire_dir_name(&segments.join(&crate::subscriptions::PATH_SEPARATOR.to_string()))
+    crate::subscriptions::wire_dir_name(
+        &segments.join(&crate::subscriptions::PATH_SEPARATOR.to_string()),
+    )
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {

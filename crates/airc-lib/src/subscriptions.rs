@@ -200,7 +200,9 @@ const WIRE_DIR_SEPARATOR: &str = ".";
 /// The directory name for a room `name` (a path): its segments joined by `.`, the one form
 /// every wire path is derived through ([`ChannelName::wire_dir_name`], `Room::from_name`).
 pub(crate) fn wire_dir_name(name: &str) -> String {
-    name.split(PATH_SEPARATOR).collect::<Vec<_>>().join(WIRE_DIR_SEPARATOR)
+    name.split(PATH_SEPARATOR)
+        .collect::<Vec<_>>()
+        .join(WIRE_DIR_SEPARATOR)
 }
 
 /// Why a [`ChannelName`] failed to parse. Closed set so callers can
@@ -767,8 +769,14 @@ mod tests {
             ChannelName::new("foo bar").unwrap_err(),
             ChannelNameError::InvalidChar(' ')
         ));
-        assert_eq!(ChannelName::new("foo//bar").unwrap_err(), ChannelNameError::EmptySegment);
-        assert_eq!(ChannelName::new("foo/").unwrap_err(), ChannelNameError::EmptySegment);
+        assert_eq!(
+            ChannelName::new("foo//bar").unwrap_err(),
+            ChannelNameError::EmptySegment
+        );
+        assert_eq!(
+            ChannelName::new("foo/").unwrap_err(),
+            ChannelNameError::EmptySegment
+        );
         assert!(matches!(
             ChannelName::new("foo/b.r").unwrap_err(),
             ChannelNameError::InvalidChar('.')
@@ -787,7 +795,11 @@ mod tests {
             ChannelName::new("a-b").unwrap().wire_dir_name(),
             "a path and a hyphenated name never share a directory"
         );
-        assert_eq!(ChannelName::new("general").unwrap().wire_dir_name(), "general", "a flat name keeps its directory");
+        assert_eq!(
+            ChannelName::new("general").unwrap().wire_dir_name(),
+            "general",
+            "a flat name keeps its directory"
+        );
     }
 
     #[test]
