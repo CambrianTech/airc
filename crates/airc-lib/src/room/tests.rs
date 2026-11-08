@@ -21,9 +21,17 @@ fn from_name_differs_per_name() {
 }
 
 #[test]
-fn sanitise_replaces_path_separators() {
-    assert_eq!(sanitise_name("../etc/passwd"), "---etc-passwd");
+fn sanitise_never_climbs_out_of_the_wires_directory() {
+    // what this catches: a room name that escapes `wires/` (`..`, `../etc/passwd`), now that a
+    // name may be a path whose segments are joined by `.` in its directory.
+    assert_eq!(sanitise_name("../etc/passwd"), "--.etc.passwd");
+    assert_eq!(sanitise_name(".."), "--");
     assert_eq!(sanitise_name("normal-name_42"), "normal-name_42");
+    assert_eq!(sanitise_name("academy/benchmarks/run-1"), "academy.benchmarks.run-1");
+    for name in ["..", "../..", "a/../b", ".", "/"] {
+        let dir = sanitise_name(name);
+        assert!(dir != "." && dir != ".." && !dir.contains('/'), "{name:?} -> {dir:?} stays inside wires/");
+    }
 }
 
 #[test]

@@ -76,6 +76,8 @@ impl Room {
     /// or write disk.
     pub fn from_name(home: &Path, name: &str) -> Result<Self, RoomError> {
         let wire = home.join("wires").join(sanitise_name(name));
+        // A room's name may be a PATH (`academy/benchmarks/run-1`): its directory is the one
+        // `wire_dir_name` form, so this and a subscription's wire never disagree.
         let channel = RoomId::from_uuid(Uuid::new_v5(&ROOM_NAMESPACE, name.as_bytes()));
         Ok(Self {
             version: ROOM_VERSION,
@@ -129,15 +131,21 @@ impl Room {
 /// Multiple names can collide post-sanitisation (`foo/bar` and
 /// `foo-bar` → same dir); avoid weird names.
 fn sanitise_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
+    // Each path segment is sanitised on its own (anything outside `a-z 0-9 - _` becomes `-`, an
+    // empty one is `-`, so no `.` or `..` survives), then joined the one way every wire directory is
+    // (`subscriptions::wire_dir_name`): a name can never climb out of `wires/`.
+    let segments: Vec<String> = name
+        .split(crate::subscriptions::PATH_SEPARATOR)
+        .map(|segment| match segment.is_empty() {
+            // an empty segment (`/`, `a//b`) is a `-`, so no join can make `.` or `..`
+            true => "-".to_string(),
+            false => segment
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                .collect(),
         })
-        .collect()
+        .collect();
+    crate::subscriptions::wire_dir_name(&segments.join(&crate::subscriptions::PATH_SEPARATOR.to_string()))
 }
 
 fn now_ms() -> Result<u64, std::time::SystemTimeError> {

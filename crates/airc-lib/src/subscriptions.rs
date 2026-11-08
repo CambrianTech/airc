@@ -105,8 +105,10 @@ impl ChannelName {
 
     /// Construct from any user-supplied string. Strips a leading `#`
     /// if present, trims whitespace, lower-cases ASCII, and rejects
-    /// anything that wouldn't be safe as both a path component and a
-    /// chat label.
+    /// anything that isn't a room PATH: one or more segments of `a-z 0-9 - _`
+    /// separated by `/` (`academy`, `academy/benchmarks/run-1`). Rooms nest
+    /// (continuum's ACTIVITY-ROOM-PATTERNS.md: every activity is a room at a path),
+    /// and the full path is the room's identity, so its channel is derived from it.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ChannelNameError> {
         let raw = value.as_ref().trim().trim_start_matches('#').trim();
         if raw.is_empty() {
@@ -116,12 +118,23 @@ impl ChannelName {
             .chars()
             .map(|c| c.to_ascii_lowercase())
             .collect::<String>();
-        for c in normalized.chars() {
-            if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Err(ChannelNameError::InvalidChar(c));
+        for segment in normalized.split(PATH_SEPARATOR) {
+            if segment.is_empty() {
+                return Err(ChannelNameError::EmptySegment);
+            }
+            for c in segment.chars() {
+                if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                    return Err(ChannelNameError::InvalidChar(c));
+                }
             }
         }
         Ok(Self(normalized))
+    }
+
+    /// The room's directory name: its path's segments joined by `.`, which no segment may
+    /// hold, so two different paths never share a directory (`a/b` is `a.b`, never `a-b`).
+    pub fn wire_dir_name(&self) -> String {
+        wire_dir_name(&self.0)
     }
 
     /// Underlying normalized name with no `#` prefix.
@@ -179,14 +192,27 @@ impl<'de> Deserialize<'de> for ChannelName {
     }
 }
 
+/// Separates the segments of a room's path (`academy/benchmarks/run-1`).
+pub const PATH_SEPARATOR: char = '/';
+/// Joins a path's segments in its directory name; never valid inside a segment.
+const WIRE_DIR_SEPARATOR: &str = ".";
+
+/// The directory name for a room `name` (a path): its segments joined by `.`, the one form
+/// every wire path is derived through ([`ChannelName::wire_dir_name`], `Room::from_name`).
+pub(crate) fn wire_dir_name(name: &str) -> String {
+    name.split(PATH_SEPARATOR).collect::<Vec<_>>().join(WIRE_DIR_SEPARATOR)
+}
+
 /// Why a [`ChannelName`] failed to parse. Closed set so callers can
 /// produce specific error messages.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChannelNameError {
     #[error("channel name cannot be empty")]
     Empty,
-    #[error("channel name contains invalid character '{0}' (allowed: a-z 0-9 - _)")]
+    #[error("channel name contains invalid character '{0}' (allowed: a-z 0-9 - _, and / between path segments)")]
     InvalidChar(char),
+    #[error("channel name has an empty path segment (`a//b`, or a leading or trailing `/`)")]
+    EmptySegment,
 }
 
 /// Opaque mesh-identity string. v1 callers may pass any stable token;
@@ -263,7 +289,7 @@ impl Subscription {
         identity: &MeshIdentity,
         name: ChannelName,
     ) -> Result<Self, SubscriptionError> {
-        let wire = home.join("wires").join(name.as_str());
+        let wire = home.join("wires").join(name.wire_dir_name());
         Self::with_wire(identity, name, wire)
     }
 
@@ -276,7 +302,7 @@ impl Subscription {
         identity: &MeshIdentity,
         name: ChannelName,
     ) -> Result<Self, SubscriptionError> {
-        let wire = wire_root.join("wires").join(name.as_str());
+        let wire = wire_root.join("wires").join(name.wire_dir_name());
         Self::with_wire(identity, name, wire)
     }
 
@@ -741,10 +767,27 @@ mod tests {
             ChannelName::new("foo bar").unwrap_err(),
             ChannelNameError::InvalidChar(' ')
         ));
+        assert_eq!(ChannelName::new("foo//bar").unwrap_err(), ChannelNameError::EmptySegment);
+        assert_eq!(ChannelName::new("foo/").unwrap_err(), ChannelNameError::EmptySegment);
         assert!(matches!(
-            ChannelName::new("foo/bar").unwrap_err(),
-            ChannelNameError::InvalidChar('/')
+            ChannelName::new("foo/b.r").unwrap_err(),
+            ChannelNameError::InvalidChar('.')
         ));
+    }
+
+    // what this catches: rooms that cannot nest (continuum's room tree: a benchmark run at
+    // `academy/benchmarks/<run>`), or two different paths sharing one wire directory.
+    #[test]
+    fn a_room_path_is_a_name_and_its_wire_directory_is_unambiguous() {
+        let run = ChannelName::new("#Academy/Benchmarks/run-1").unwrap();
+        assert_eq!(run.as_str(), "academy/benchmarks/run-1");
+        assert_eq!(run.wire_dir_name(), "academy.benchmarks.run-1");
+        assert_ne!(
+            ChannelName::new("a/b").unwrap().wire_dir_name(),
+            ChannelName::new("a-b").unwrap().wire_dir_name(),
+            "a path and a hyphenated name never share a directory"
+        );
+        assert_eq!(ChannelName::new("general").unwrap().wire_dir_name(), "general", "a flat name keeps its directory");
     }
 
     #[test]
