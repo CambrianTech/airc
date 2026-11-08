@@ -566,8 +566,7 @@ fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
 // recovery, so a resident sat on a weeks-old checkout that could never submit. One holding
 // nothing unpublished is moved aside whole and re-allocated at the current start point; one
 // holding an unpushed commit (on a branch or a detached HEAD), an untracked file or a stash is
-// kept byte-identical and the
-// refusal names what it holds.
+// kept byte-identical and the refusal names what it holds.
 #[test]
 fn an_unanchored_card_clone_is_reallocated_only_when_nothing_in_it_is_unpublished() {
     let tmp = tempfile::tempdir().unwrap();
