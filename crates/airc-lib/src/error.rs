@@ -240,19 +240,33 @@ pub enum AircError {
     },
 }
 
+/// How a daemon call failed to be answered. A daemon that is not there is gone; one that did not
+/// answer in time is only busy, and must be waited on, not replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonReach {
+    /// Not connected, or the connection dropped mid-call: a daemon between processes (an
+    /// update's handoff, a restart). Reattach.
+    Absent,
+    /// The call outlived the RPC deadline. The daemon is up and the same attachment is good:
+    /// wait and retry; reattaching only re-runs the attach scans that made it slow.
+    Slow,
+}
+
 impl AircError {
-    /// The daemon is not there to answer: not connected, the connection dropped mid-call, or
-    /// it did not answer in time. That is the shape of a daemon between processes (an
-    /// update's handoff, a restart). Every other error is about the request itself.
-    pub fn is_daemon_absent(&self) -> bool {
-        matches!(
-            self,
+    /// Why the daemon did not answer, or `None` when the error is about the request itself.
+    pub fn daemon_reach(&self) -> Option<DaemonReach> {
+        match self {
             AircError::DaemonClient(
-                airc_ipc::ClientError::NotConnected(_)
-                    | airc_ipc::ClientError::Io(_)
-                    | airc_ipc::ClientError::Timeout
-            )
-        )
+                airc_ipc::ClientError::NotConnected(_) | airc_ipc::ClientError::Io(_),
+            ) => Some(DaemonReach::Absent),
+            AircError::DaemonClient(airc_ipc::ClientError::Timeout) => Some(DaemonReach::Slow),
+            _ => None,
+        }
+    }
+
+    /// The daemon is not there to answer ([`DaemonReach::Absent`]). A timeout is not this.
+    pub fn is_daemon_absent(&self) -> bool {
+        self.daemon_reach() == Some(DaemonReach::Absent)
     }
 }
 

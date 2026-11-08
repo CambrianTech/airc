@@ -686,3 +686,57 @@ async fn addressee_scan_returns_only_candidates_through_an_ambient_flood() {
         );
     }
 }
+
+// what this catches (card 1b0e2b64): a one-connection reader pool, where every scan from every
+// client queued behind the slowest. Every reader connection is held at once, so N slow reads
+// proceed in parallel, while the writer stays exactly one.
+#[tokio::test]
+async fn readers_hold_the_hosts_parallelism_beside_one_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = SqliteDurableSink::open_path(&dir.path().join("pool.sqlite"))
+        .await
+        .unwrap();
+    let host = std::thread::available_parallelism().unwrap().get();
+    let pool = sink.readers.get_sqlite_connection_pool();
+    assert_eq!(pool.options().get_max_connections() as usize, host);
+    assert_eq!(
+        sink.db
+            .get_sqlite_connection_pool()
+            .options()
+            .get_max_connections(),
+        1
+    );
+    let mut held = Vec::new();
+    for _ in 0..host {
+        held.push(
+            tokio::time::timeout(std::time::Duration::from_secs(5), pool.acquire())
+                .await
+                .expect("every reader connection is available at once")
+                .unwrap(),
+        );
+    }
+    assert_eq!(held.len(), host);
+}
+
+// what this catches (card 1b0e2b64): the dead `delivery = 'durable'` predicate on every feed scan
+// and count (every row of `bus_events` is durable). The built statements name no delivery column
+// in their WHERE, and still carry the range and the caller's header scope.
+#[tokio::test]
+async fn a_feed_scan_has_no_delivery_predicate() {
+    let ch = RoomId::from_u128(0xfeed);
+    let origin = Cursor::new(Seq::new(0, 0), EventId::from_u128(0));
+    let through = Cursor::new(Seq::new(9, 9), EventId::from_u128(u128::MAX));
+    let scope = airc_core::HeaderFilter::Not(Box::new(airc_core::HeaderFilter::Has {
+        key: "airc.stream.id".into(),
+    }));
+    let rule = airc_core::HistoryMatch::headers(&scope);
+    let mut statements = page_rows(ch, origin, through, rule, 65, true);
+    statements.push(matching_rows(ch, origin, through, &scope));
+    for query in &statements {
+        let built = sea_orm::QueryTrait::build(query, sea_orm::DbBackend::Sqlite);
+        // The column list names `delivery`; only the predicate matters.
+        let (_, predicate) = built.sql.split_once(" WHERE ").expect("a filtered select");
+        assert!(!predicate.contains("delivery"), "{}", built.sql);
+        assert!(predicate.contains("room_id"), "{}", built.sql);
+    }
+}

@@ -150,7 +150,7 @@ pub use stream_chunk::{
 // `airc_lib::time_probe!`. The `probe` re-export carries both the
 // `probe!`/`time_probe!` macros and the `probe::class` constants.
 pub use airc_diagnostics::{probe, time_probe};
-pub use error::AircError;
+pub use error::{AircError, DaemonReach};
 pub use external_identity::{
     BridgedMessage, BridgedMessageFilter, ExternalIdentity, ExternalIdentitySource,
     HEADER_BRIDGE_HANDLE, HEADER_BRIDGE_SOURCE,

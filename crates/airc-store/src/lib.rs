@@ -55,6 +55,7 @@ pub mod memory;
 pub mod mesh_identity;
 pub mod migration;
 pub mod peer_trust;
+mod reader_pool;
 pub mod refresh_lock;
 pub mod retention;
 pub mod scoped_state;

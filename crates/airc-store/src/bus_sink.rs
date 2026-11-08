@@ -60,11 +60,11 @@ pub struct SqliteDurableSink {
 }
 
 impl SqliteDurableSink {
-    fn pool_options(db_url: &str) -> ConnectOptions {
+    fn pool_options(db_url: &str, connections: u32) -> ConnectOptions {
         let mut opts = ConnectOptions::new(db_url.to_owned());
         opts.connect_timeout(POOL_ACQUIRE_TIMEOUT)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .max_connections(1);
+            .max_connections(connections);
         opts
     }
 
@@ -86,7 +86,7 @@ impl SqliteDurableSink {
         gate: std::sync::Arc<crate::write_gate::FileGate>,
     ) -> Result<Self, BusError> {
         let custody = crate::custody::WriteGate::new(admission).map_err(BusError::sink_source)?;
-        let mut opts = Self::pool_options(db_url);
+        let mut opts = Self::pool_options(db_url, 1);
         // WAL + the busy timeout ride the connection options so the journal switch
         // never needs a separate exclusive statement racing another opener — see
         // `SqliteEventStore::open` (2026-09-14: "database is locked" at attach on
@@ -143,7 +143,11 @@ impl SqliteDurableSink {
             // write a read-only connection refuses. Only reads use this pool; migrations run once
             // above.
             let read_options = read_only_options(sqlite_options.get_filename());
-            let mut opts = Self::pool_options(db_url);
+            // One writer, N readers: WAL lets the readers run beside it ([`ReaderPool`]).
+            let mut opts = Self::pool_options(
+                db_url,
+                crate::reader_pool::ReaderPool::of_host()?.connections(),
+            );
             opts.map_sqlx_sqlite_opts(move |_| read_options.clone());
             Database::connect(opts)
                 .await
@@ -196,7 +200,10 @@ impl SqliteDurableSink {
     /// immutable snapshot. Missing files/schema and read failures stay errors.
     pub async fn open_read_only_path(path: &Path) -> Result<Self, BusError> {
         let path = path.to_owned();
-        let mut opts = Self::pool_options("sqlite::memory:");
+        let mut opts = Self::pool_options(
+            "sqlite::memory:",
+            crate::reader_pool::ReaderPool::of_host()?.connections(),
+        );
         opts.sqlx_logging(false);
         // Supply the native filename through the typed driver, not a URI: `?`
         // and `#` in a path must not become connection parameters.
@@ -631,14 +638,14 @@ fn from_model(m: bus_event::Model) -> Result<Envelope, BusError> {
 ///   OR (epoch == c.epoch AND counter < c.counter)
 ///   OR (epoch == c.epoch AND counter == c.counter
 ///       AND event_id < c.event_id).
-/// The durable rows of `channel` in `(after, through]`: one owner for the range `page_matching`
+/// The rows of `channel` in `(after, through]` (every row of `bus_events` is durable, so no delivery
+/// predicate): one owner for the range `page_matching`
 /// pages, `count_matching` counts and a derivation of either scopes to.
 fn in_range(channel: RoomId, after: Cursor, through: Cursor) -> sea_orm::Condition {
     sea_orm::Condition::all()
         .add(bus_event::Column::RoomId.eq(channel.as_uuid()))
         .add(strictly_after(after))
         .add(strictly_after(through).not())
-        .add(bus_event::Column::Delivery.eq("durable"))
 }
 
 /// Strictly after `c` in generational order:
