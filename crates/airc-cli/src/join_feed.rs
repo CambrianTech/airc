@@ -7,7 +7,7 @@
 //! of replaying the full transcript.
 
 use airc_core::{MentionTarget, PeerId, RoomId, TranscriptEvent, TranscriptKind};
-use airc_lib::{Airc, LiveLag};
+use airc_lib::{Airc, DaemonReach, LiveLag};
 use futures::stream::StreamExt;
 use std::io::Write;
 
@@ -48,13 +48,23 @@ pub async fn run(
         if let Err(error) = turn {
             // Decided by the error's type, never by probing afterwards: a replacement daemon
             // can answer a probe before the old one's failure is handled (Codex on #1603).
-            if !daemon_absent(error.as_ref()) {
-                return Err(error);
+            match after_failed_turn(error.as_ref()) {
+                FailedTurn::End => return Err(error),
+                FailedTurn::Reattach => {
+                    stream = reattach(airc, home).await?;
+                    continue;
+                }
+                // A slow daemon is a live one: the same attachment is good, and reattaching
+                // would only re-run the attach scans that made it slow. Wait out the
+                // interval below and take the turn again (`announce_history` is unchanged).
+                FailedTurn::Wait => eprintln!(
+                    "airc join [{}]: the daemon is slow to answer ({error}); waiting on the same attachment",
+                    utc_now()
+                ),
             }
-            stream = reattach(airc, home).await?;
-            continue;
+        } else {
+            announce_history = false;
         }
-        announce_history = false;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
@@ -67,12 +77,26 @@ pub async fn run(
     }
 }
 
-/// The daemon was not there to answer (`AircError::is_daemon_absent`): a daemon between
-/// processes. Output, store and protocol errors are not this, and end the feed.
-fn daemon_absent(error: &(dyn std::error::Error + 'static)) -> bool {
-    error
+/// What a failed delivery turn calls for, decided by the error's type ([`DaemonReach`]).
+#[derive(Debug, PartialEq, Eq)]
+enum FailedTurn {
+    /// The daemon is between processes: attach again.
+    Reattach,
+    /// The daemon is up but did not answer in time: wait and retry on the same attachment.
+    Wait,
+    /// Output, store and protocol errors end the feed.
+    End,
+}
+
+fn after_failed_turn(error: &(dyn std::error::Error + 'static)) -> FailedTurn {
+    match error
         .downcast_ref::<airc_lib::AircError>()
-        .is_some_and(airc_lib::AircError::is_daemon_absent)
+        .and_then(airc_lib::AircError::daemon_reach)
+    {
+        Some(DaemonReach::Absent) => FailedTurn::Reattach,
+        Some(DaemonReach::Slow) => FailedTurn::Wait,
+        None => FailedTurn::End,
+    }
 }
 
 /// Wait out the daemon's absence and subscribe again (card 201417d4). A supported update
@@ -138,7 +162,7 @@ async fn reattach(
                 );
                 return Ok(stream);
             }
-            Err(error) if error.is_daemon_absent() => {
+            Err(error) if error.daemon_reach().is_some() => {
                 let reason = error.to_string();
                 if reason != last_reason
                     || last_said.elapsed() >= std::time::Duration::from_secs(30)
@@ -559,7 +583,7 @@ mod tests {
 
     // what this catches (Codex on #1603): ending the feed on a daemon handoff because a fast
     // replacement answered a probe taken after the failure. The decision is the error's own
-    // type: a daemon that was not there (not connected, dropped mid-call, timed out) reattaches
+    // type: a daemon that was not there (not connected, dropped mid-call) reattaches
     // whatever answers later; a refused request, an output error or a store error ends the feed.
     #[test]
     fn a_daemon_absence_reattaches_and_every_other_error_ends_the_feed() {
@@ -569,9 +593,11 @@ mod tests {
         for absent in [
             AircError::DaemonClient(airc_ipc::ClientError::NotConnected(gone())),
             AircError::DaemonClient(airc_ipc::ClientError::Io(gone())),
-            AircError::DaemonClient(airc_ipc::ClientError::Timeout),
         ] {
-            assert!(daemon_absent(boxed(absent).as_ref()));
+            assert_eq!(
+                after_failed_turn(boxed(absent).as_ref()),
+                FailedTurn::Reattach
+            );
         }
         for real in [
             boxed(AircError::DaemonClient(airc_ipc::ClientError::Daemon(
@@ -583,8 +609,23 @@ mod tests {
             Box::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
                 as Box<dyn std::error::Error>,
         ] {
-            assert!(!daemon_absent(real.as_ref()), "{real}");
+            assert_eq!(after_failed_turn(real.as_ref()), FailedTurn::End, "{real}");
         }
+    }
+
+    // what this catches (card 1b0e2b64): a 5 s RPC timeout read as "the daemon went away", so
+    // every slow read reattached and re-ran the attach scans that made reads slow. A timeout
+    // waits on the same attachment; only absence reattaches.
+    #[test]
+    fn a_slow_daemon_is_waited_on_and_never_reattached() {
+        let slow: Box<dyn std::error::Error> =
+            airc_lib::AircError::DaemonClient(airc_ipc::ClientError::Timeout).into();
+        assert_eq!(after_failed_turn(slow.as_ref()), FailedTurn::Wait);
+        let gone: Box<dyn std::error::Error> = airc_lib::AircError::DaemonClient(
+            airc_ipc::ClientError::NotConnected(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .into();
+        assert_eq!(after_failed_turn(gone.as_ref()), FailedTurn::Reattach);
     }
 
     // what this catches (Codex on #1603): a reattach that loses what was published while the
