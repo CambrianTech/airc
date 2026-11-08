@@ -46,11 +46,13 @@ pub const CREATION_BASE_REF: &str = "refs/worktree/airc-creation-base";
 mod allocation;
 mod clone_staging;
 mod default_ref;
+mod history;
 mod unanchored;
 
 pub use allocation::{
     allocation_evidence, decode_allocation_evidence, AllocationEvidence, ALLOCATION_REF,
 };
+pub use history::complete_card_history;
 
 /// Read only the recorded creation base. Legacy worktrees have no anchor: callers
 /// must ask for an explicit base rather than infer one from HEAD or a remote.

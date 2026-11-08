@@ -700,3 +700,62 @@ fn an_unanchored_card_clone_is_reallocated_only_when_nothing_in_it_is_unpublishe
         assert!(!git(&stashed, &["stash", "list"]).is_empty());
     });
 }
+
+// what this catches (continuum card f76005e8, Kimi on the Windows node): a shallow card clone could
+// not prove whether its creation anchor was an ancestor of HEAD. Completing its history makes the
+// clone whole, so the question has a real answer; a complete clone is left as it is.
+#[test]
+fn a_shallow_card_clone_is_completed_and_a_complete_one_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = if cfg!(windows) {
+        tmp.path().to_path_buf()
+    } else {
+        tmp.path().canonicalize().unwrap()
+    };
+    let git = |dir: &Path, args: &[&str]| git_in(dir, args).unwrap_or_else(|e| panic!("{e}"));
+    let source = root.join("source");
+    git(
+        &root,
+        &[
+            "init",
+            "--quiet",
+            "--initial-branch=canary",
+            source.to_str().unwrap(),
+        ],
+    );
+    git(&source, &["config", "user.email", "t@t"]);
+    git(&source, &["config", "user.name", "t"]);
+    for n in 0..3 {
+        std::fs::write(source.join("lib.rs"), format!("fn f{n}() {{}}\n")).unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", &format!("c{n}")]);
+    }
+    let shallow = root.join("shallow");
+    let url = format!("file://{}", source.display());
+    git(
+        &root,
+        &[
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            &url,
+            shallow.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        git(&shallow, &["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+    complete_card_history(&shallow).unwrap();
+    assert_eq!(
+        git(&shallow, &["rev-parse", "--is-shallow-repository"]),
+        "false"
+    );
+    assert_eq!(
+        git(&shallow, &["rev-list", "--count", "HEAD"]),
+        "3",
+        "the whole history is here"
+    );
+    complete_card_history(&shallow).unwrap();
+}
