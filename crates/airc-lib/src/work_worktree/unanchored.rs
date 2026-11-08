@@ -21,7 +21,7 @@ pub(super) enum Unanchored {
 }
 
 /// Move `path` aside when nothing in it is unpublished: a clean tree (untracked files
-/// included), no stash, and every local branch tip present in `mirror` (the node's mirror of
+/// included), no stash, and HEAD and every local branch tip present in `mirror` (the node's mirror of
 /// the real remote). Anything else keeps it byte-identical and names why.
 pub(super) fn retire_if_nothing_hers(mirror: &Path, path: &Path) -> Result<Unanchored, String> {
     let changed = git_in(path, &["status", "--porcelain", "--untracked-files=all"])?;
@@ -42,7 +42,10 @@ pub(super) fn retire_if_nothing_hers(mirror: &Path, path: &Path) -> Result<Unanc
             "refs/heads",
         ],
     )?;
-    for (branch, tip) in tips.lines().filter_map(|line| line.split_once(' ')) {
+    // HEAD itself too: a detached HEAD's commits are on no branch (Codex on #1668).
+    let head = format!("HEAD {}", git_in(path, &["rev-parse", "HEAD"])?);
+    let tips = tips.lines().chain(std::iter::once(head.as_str()));
+    for (branch, tip) in tips.filter_map(|line| line.split_once(' ')) {
         // The mirror answers only for commits it has; a missing object is not on the remote.
         let on_remote = git_in(
             mirror,
@@ -58,7 +61,7 @@ pub(super) fn retire_if_nothing_hers(mirror: &Path, path: &Path) -> Result<Unanc
         .is_ok_and(|found| !found.is_empty());
         if !on_remote {
             return Ok(Unanchored::Kept(format!(
-                "branch {branch} at {tip}, which is not on the remote"
+                "{branch} at {tip}, which is not on the remote"
             )));
         }
     }

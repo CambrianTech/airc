@@ -565,7 +565,8 @@ fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
 // clone with no allocation evidence was refused forever ("preserved for recovery") with no
 // recovery, so a resident sat on a weeks-old checkout that could never submit. One holding
 // nothing unpublished is moved aside whole and re-allocated at the current start point; one
-// holding an unpushed commit, an untracked file or a stash is kept byte-identical and the
+// holding an unpushed commit (on a branch or a detached HEAD), an untracked file or a stash is
+// kept byte-identical and the
 // refusal names what it holds.
 #[test]
 fn an_unanchored_card_clone_is_reallocated_only_when_nothing_in_it_is_unpublished() {
@@ -638,6 +639,9 @@ fn an_unanchored_card_clone_is_reallocated_only_when_nothing_in_it_is_unpublishe
         commit(&unpushed, "fn hers() {}\n");
         let (untracked_card, untracked) = unanchored(3);
         std::fs::write(untracked.join("notes.txt"), "hers").unwrap();
+        let (detached_card, detached) = unanchored(5);
+        git(&detached, &["checkout", "--quiet", "--detach"]);
+        commit(&detached, "fn detached() {}\n");
         let (stashed_card, stashed) = unanchored(4);
         std::fs::write(stashed.join("lib.rs"), "fn wip() {}\n").unwrap();
         git(&stashed, &["stash", "--quiet"]);
@@ -671,6 +675,8 @@ fn an_unanchored_card_clone_is_reallocated_only_when_nothing_in_it_is_unpublishe
             (unpushed_card, &unpushed, "not on the remote"),
             (untracked_card, &untracked, "untracked"),
             (stashed_card, &stashed, "a stash"),
+            // Codex on #1668: a detached HEAD's commit is on no branch.
+            (detached_card, &detached, "HEAD at"),
         ] {
             let head = git(path, &["rev-parse", "HEAD"]);
             let Err(refusal) = stage(card) else {
