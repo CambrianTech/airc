@@ -120,6 +120,13 @@ async fn surviving_sdk_scopes_release_closed_inboxes_and_reacquire_after_daemon_
     let home = machine.home.clone();
     let socket_home = machine._socket_home.clone();
     let daemon_peer = machine.state.peer_id;
+    // Under custody (card 32f7dd97) attach never mints a citizen: each named scope is
+    // initialised first, exactly what `airc init --as` does, then attached.
+    for name in ["alice", "bob"] {
+        airc_lib::Airc::initialize_as(home.path(), name)
+            .await
+            .unwrap_or_else(|e| panic!("initialise {name}: {e:?}"));
+    }
     let alice = airc_lib::Airc::attach_as(home.path(), "alice", socket_home.path().join("a.sock"))
         .await
         .expect("attach Alice");
