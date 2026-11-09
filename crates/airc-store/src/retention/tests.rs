@@ -60,8 +60,8 @@ fn transcript_event_with(
 
 // regression for card 6781d7e9 (BigMama, 2026-09-26: 2.65 GB store, daemon
 // acquires > 2 s, node dark 7 h behind it).
-// what this catches: the drain removes exactly the two dead classes — a
-// heartbeat row and a paging frame go, a durable event and a message with a
+// what this catches: the drain removes exactly the dead classes — a heartbeat row,
+// a leftover live-stream chunk (card 67d8a6f7: 781,189 of them on the M5) and a paging frame go, a durable event and a message with a
 // body stay — and reports a footprint the file's length cannot lie about. The
 // paging frame is picked by its HEADER class (`request_response`, as the
 // backfill exchange stamps it), and a message stamped `durable` explicitly
@@ -91,6 +91,18 @@ async fn the_drain_removes_the_two_dead_classes_and_nothing_else() {
     sink.append(&bus_event(ch, 1, &[("h", "durable")]))
         .await
         .expect("test: durable row");
+    // A live-stream chunk an older writer persisted: a leftover the durable tier never keeps.
+    sink.append(&bus_event(
+        ch,
+        5,
+        &[
+            ("airc.stream.id", "s-1"),
+            ("airc.stream.kind", "text.token"),
+            ("airc.stream.seq", "0"),
+        ],
+    ))
+    .await
+    .expect("test: stream chunk row");
     store
         .append(transcript_event_with(
             ch,
@@ -131,8 +143,12 @@ async fn the_drain_removes_the_two_dead_classes_and_nothing_else() {
 
     let report = store.drain().await.expect("test: drain");
     assert_eq!(
-        (report.heartbeat_rows, report.non_durable_rows),
-        (1, 2),
+        (
+            report.heartbeat_rows,
+            report.stream_chunk_rows,
+            report.non_durable_rows
+        ),
+        (1, 1, 2),
         "exactly the dead classes"
     );
     assert!(
@@ -145,6 +161,10 @@ async fn the_drain_removes_the_two_dead_classes_and_nothing_else() {
     assert!(
         !bus_left[0].headers.contains_key("airc.heartbeat.kind"),
         "the heartbeat is gone"
+    );
+    assert!(
+        !bus_left[0].headers.contains_key("airc.stream.id"),
+        "the stream chunk is gone"
     );
     let events_left = store
         .page_recent(Some(ch), 100)
@@ -160,7 +180,14 @@ async fn the_drain_removes_the_two_dead_classes_and_nothing_else() {
 
     // A second pass finds nothing: the drain is idempotent.
     let again = store.drain().await.expect("test: drain again");
-    assert_eq!((again.heartbeat_rows, again.non_durable_rows), (0, 0));
+    assert_eq!(
+        (
+            again.heartbeat_rows,
+            again.stream_chunk_rows,
+            again.non_durable_rows
+        ),
+        (0, 0, 0)
+    );
 }
 
 // what this catches (2026-11-03, IntelMac: 2,205,371 of a resident store's rows were identity

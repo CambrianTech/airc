@@ -53,6 +53,17 @@ fn heartbeat_row() -> HeaderFilter {
     }
 }
 
+/// `bus_events` rows that are chunks of a live stream: the header every chunk carries. A chunk
+/// is [`airc_bus::DeliveryClass::StreamChunk`], which never reaches the durable tier, so any row
+/// holding one is a leftover of a writer that predated that rule. Measured on the M5 2026-11-09:
+/// 781,189 `text.token` chunks (61% of the bus rows, Jul 15 to Oct 21 2026, none after), drained
+/// by nothing, behind a store of 2.2 GB whose daemon answered no RPC (continuum card 67d8a6f7).
+fn stream_chunk_row() -> HeaderFilter {
+    HeaderFilter::Has {
+        key: "airc.stream.id".into(),
+    }
+}
+
 /// `events` rows of any NON-DURABLE class — decided by the header, never the body
 /// (the header rule: classify at ingress from headers, never decode payloads). After
 /// #1457 no non-durable frame is transcript history, so every such row is dead:
@@ -164,6 +175,8 @@ pub struct DrainReport {
     /// every other writer.
     pub declared_windows: WindowStats,
     pub heartbeat_rows: u64,
+    /// `bus_events` rows that were chunks of a live stream, which never belong in the durable tier.
+    pub stream_chunk_rows: u64,
     /// `events` rows of a non-durable class (backfill frames above all).
     pub non_durable_rows: u64,
     pub after: StoreFootprint,
@@ -349,6 +362,9 @@ impl SqliteEventStore {
         let heartbeat_rows = self
             .delete_in_windows::<bus_event::Entity>(&heartbeat_row(), window, &mut pace)
             .await?;
+        let stream_chunk_rows = self
+            .delete_in_windows::<bus_event::Entity>(&stream_chunk_row(), window, &mut pace)
+            .await?;
         let non_durable_rows = self
             .delete_in_windows::<event::Entity>(&non_durable_row(), window, &mut pace)
             .await?;
@@ -357,6 +373,7 @@ impl SqliteEventStore {
             declared_rows,
             declared_windows,
             heartbeat_rows,
+            stream_chunk_rows,
             non_durable_rows,
             after: self.footprint().await?,
         })
@@ -420,11 +437,30 @@ impl SqliteEventStore {
                 txn.commit().await?;
             }
             let held = started.elapsed();
+            let span = window.rows();
             window.after(worked);
-            if let Checkpointed::Pinned(_) = self.checkpoint_after_window(held).await? {
+            let checkpointed = self.checkpoint_after_window(held).await?;
+            // A pinned window ends the pass at once: no rest before the break (Cormac on #1671).
+            let pinned = matches!(checkpointed, Checkpointed::Pinned(_));
+            let rest = match pinned {
+                true => std::time::Duration::ZERO,
+                false => self.rest_at_pace(pace).await?.0,
+            };
+            tracing::debug!(
+                target: "airc_store::drain",
+                table = T::default().table_name(),
+                rowid_low = low,
+                span,
+                removed_now = removed,
+                worked_us = worked.as_micros() as u64,
+                held_us = held.as_micros() as u64,
+                rest_us = rest.as_micros() as u64,
+                pinned,
+                "drain window"
+            );
+            if pinned {
                 break;
             }
-            let _ = self.rest_at_pace(pace).await?;
             low = high;
             tokio::task::yield_now().await;
         }

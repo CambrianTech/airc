@@ -103,12 +103,18 @@ pub(crate) fn predicate<T: EventTable>(filter: &HeaderFilter) -> SimpleExpr {
     }
 }
 
-/// The ids of events holding header `key` (and matching `value`, if given).
+/// THIS event's header row for `key` (and matching `value`, if given): correlated to the outer
+/// row, so the database answers it with one probe on the header table's `(event_id, key)`
+/// primary key per candidate event.
 fn rows<T: EventTable>(key: &str, value: Option<SimpleExpr>) -> SelectStatement {
     let mut select = Query::select();
     select
-        .column((T::Headers::default(), T::HEADER_EVENT_ID))
+        .expr(Expr::value(1))
         .from(T::Headers::default())
+        .and_where(
+            Expr::col((T::Headers::default(), T::HEADER_EVENT_ID))
+                .equals((T::default(), T::EVENT_ID)),
+        )
         .and_where(Expr::col((T::Headers::default(), T::HEADER_KEY)).eq(key));
     if let Some(value) = value {
         select.and_where(value);
@@ -116,8 +122,14 @@ fn rows<T: EventTable>(key: &str, value: Option<SimpleExpr>) -> SelectStatement 
     select.to_owned()
 }
 
-fn holding<T: EventTable>(ids: SelectStatement) -> SimpleExpr {
-    Expr::col((T::default(), T::EVENT_ID)).in_subquery(ids)
+/// The event holds a matching header: `EXISTS` over its own header rows, never
+/// `event_id IN (every event holding the key)`. The `IN` form made a negated filter
+/// (`Not(Has { key })`, e.g. "not presence") collect the id of every event in the store
+/// holding a common key on every read: measured on the M5 2026-11-09, 1,357 slow reads
+/// of up to 10 s each, the daemon at ~130% CPU and every RPC timing out (continuum card
+/// 67d8a6f7). The cost now follows the rows the cursor window selects, not the store.
+fn holding<T: EventTable>(header: SelectStatement) -> SimpleExpr {
+    Expr::exists(header)
 }
 
 /// The least string greater than every string that starts with `prefix`:
@@ -146,6 +158,38 @@ mod tests {
     use crate::SqliteEventStore;
     use airc_core::{Body, ClientId, EventId, MentionTarget, PeerId, RoomId, TranscriptEvent};
     use sea_orm::{QueryFilter, QuerySelect};
+
+    // what this catches (continuum card 67d8a6f7): a header filter rendered as
+    // `event_id IN (SELECT event_id FROM headers WHERE key = ?)`, which made a negated
+    // filter collect every event in the store holding a common key on each read (1,357
+    // reads of up to 10 s on the M5, every daemon RPC timing out). Each filter is a
+    // correlated EXISTS on the event's own header rows, answered by the primary key.
+    #[test]
+    fn a_header_filter_probes_the_events_own_headers_never_every_event_holding_the_key() {
+        use sea_orm::sea_query::{Query, SqliteQueryBuilder};
+        let not_presence = HeaderFilter::Not(Box::new(HeaderFilter::Has {
+            key: "airc.kind".into(),
+        }));
+        let sql = Query::select()
+            .expr(Expr::value(1))
+            .from(crate::entities::bus_event::Entity)
+            .and_where(predicate::<crate::entities::bus_event::Entity>(
+                &not_presence,
+            ))
+            .to_string(SqliteQueryBuilder);
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "a negated filter is NOT EXISTS: {sql}"
+        );
+        assert!(
+            !sql.contains(" IN ("),
+            "never IN over every event holding the key: {sql}"
+        );
+        assert!(
+            sql.contains("\"bus_event_headers\".\"event_id\" = \"bus_events\".\"event_id\""),
+            "the header probe is correlated to the event being read: {sql}"
+        );
+    }
 
     // what this catches: the typed header subqueries agree with the Rust header
     // algebra for literal keys with SQL metacharacters, unicode values, exact
