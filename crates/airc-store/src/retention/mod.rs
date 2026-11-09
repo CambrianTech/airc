@@ -440,7 +440,12 @@ impl SqliteEventStore {
             let span = window.rows();
             window.after(worked);
             let checkpointed = self.checkpoint_after_window(held).await?;
-            let (rest, _) = self.rest_at_pace(pace).await?;
+            // A pinned window ends the pass at once: no rest before the break (Cormac on #1671).
+            let pinned = matches!(checkpointed, Checkpointed::Pinned(_));
+            let rest = match pinned {
+                true => std::time::Duration::ZERO,
+                false => self.rest_at_pace(pace).await?.0,
+            };
             tracing::debug!(
                 target: "airc_store::drain",
                 table = T::default().table_name(),
@@ -450,10 +455,10 @@ impl SqliteEventStore {
                 worked_us = worked.as_micros() as u64,
                 held_us = held.as_micros() as u64,
                 rest_us = rest.as_micros() as u64,
-                pinned = matches!(checkpointed, Checkpointed::Pinned(_)),
+                pinned,
                 "drain window"
             );
-            if let Checkpointed::Pinned(_) = checkpointed {
+            if pinned {
                 break;
             }
             low = high;
