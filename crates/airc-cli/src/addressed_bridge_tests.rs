@@ -120,6 +120,13 @@ async fn surviving_sdk_scopes_release_closed_inboxes_and_reacquire_after_daemon_
     let home = machine.home.clone();
     let socket_home = machine._socket_home.clone();
     let daemon_peer = machine.state.peer_id;
+    // Under custody (card 32f7dd97) attach never mints a citizen: each named scope is
+    // initialised first, exactly what `airc init --as` does, then attached.
+    for name in ["alice", "bob"] {
+        airc_lib::Airc::initialize_as(home.path(), name)
+            .await
+            .unwrap_or_else(|e| panic!("initialise {name}: {e:?}"));
+    }
     let alice = airc_lib::Airc::attach_as(home.path(), "alice", socket_home.path().join("a.sock"))
         .await
         .expect("attach Alice");
@@ -384,10 +391,21 @@ async fn attached_sdk_scopes_exchange_encrypted_command_and_result() {
         .connect_lan(addr, b.gateway.peer_id())
         .await
         .unwrap();
+    // Each `Machine::boot()` opened an empty home, so under custody (card
+    // 32f7dd97) it minted the default citizen — and open/attach never adds a
+    // second one beside existing ones. Initialise each named scope explicitly
+    // first, exactly what `airc init --as` does; the encrypted exchange below
+    // still exercises attach_as against an already-initialised home.
+    let _alice_scope = airc_lib::Airc::initialize_as(a.home.path(), "alice")
+        .await
+        .unwrap();
     let alice =
         airc_lib::Airc::attach_as(a.home.path(), "alice", a._socket_home.path().join("a.sock"))
             .await
             .unwrap();
+    let _bob_scope = airc_lib::Airc::initialize_as(b.home.path(), "bob")
+        .await
+        .unwrap();
     let bob = airc_lib::Airc::attach_as(b.home.path(), "bob", b._socket_home.path().join("a.sock"))
         .await
         .unwrap();
