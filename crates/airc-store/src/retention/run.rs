@@ -70,12 +70,13 @@ impl std::fmt::Display for PassReport {
             Ok(report) => write!(
                 f,
                 "drained {} declared rows in {} windows (gate held {} ms in all, {} ms at most), {} \
-                 heartbeat and {} non-durable rows; file {} MB before",
+                 heartbeat, {} stream-chunk and {} non-durable rows; file {} MB before",
                 report.declared_rows,
                 report.declared_windows.windows,
                 report.declared_windows.held.as_millis(),
                 report.declared_windows.max_held.as_millis(),
                 report.heartbeat_rows,
+                report.stream_chunk_rows,
                 report.non_durable_rows,
                 mb(report.before.file_bytes),
             )?,
