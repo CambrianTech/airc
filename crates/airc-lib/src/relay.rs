@@ -17,6 +17,24 @@ use crate::route::{
 };
 use crate::Airc;
 
+/// One relay session per handle: a live session answers only for its own relay.
+/// Saying Ok for another made discovery count a peer on that relay as dialed and stop
+/// trying its endpoints.
+fn live_relay_serves(
+    session: &RelayAdapter,
+    relay_addr: SocketAddr,
+    relay_peer: PeerId,
+) -> Result<(), AircError> {
+    if session.relay_addr() == relay_addr && session.relay_peer_id() == relay_peer {
+        return Ok(());
+    }
+    Err(AircError::Transport(format!(
+        "relay route is held by {} at {}; {relay_peer} at {relay_addr} is not connected",
+        session.relay_peer_id(),
+        session.relay_addr()
+    )))
+}
+
 impl Airc {
     /// Connect this handle to a pinned relay and make the relay route
     /// available for subsequent sends when route health selects it.
@@ -25,14 +43,17 @@ impl Airc {
         relay_addr: SocketAddr,
         relay_peer: PeerId,
     ) -> Result<(), AircError> {
-        {
-            let guard = self.inner.relay.lock().await;
-            if guard.is_some() {
-                drop(guard);
+        let installed = self.inner.relay.lock().await.clone();
+        if let Some(adapter) = installed {
+            if adapter.is_connected().await {
+                live_relay_serves(&adapter, relay_addr, relay_peer)?;
                 self.ensure_relay_subscriber().await?;
                 self.upsert_relay_health(relay_addr, relay_peer)?;
                 return Ok(());
             }
+            // A closed session is replaced, never reused. Before this, a dropped relay
+            // kept its dead adapter installed and every later call returned Ok, so
+            // relay-only peers stayed dark until the daemon restarted.
         }
 
         let adapter = RelayAdapter::new(RelayClientConfig {
@@ -42,14 +63,41 @@ impl Airc {
             relay_addr,
             registry: self.inner.registry.clone(),
         });
+        // A dropped relay wakes the same refresh a dropped LAN session does, so the
+        // redial happens on the event, not on the next tick.
+        let on_disconnect = self.inner.on_disconnect.clone();
+        adapter.set_disconnect_observer(std::sync::Arc::new(move |peer_id| {
+            let callback = on_disconnect.lock().ok().and_then(|slot| slot.clone());
+            if let Some(callback) = callback {
+                callback(peer_id);
+            }
+        }));
         adapter
             .connect()
             .await
             .map_err(|error| AircError::Transport(error.to_string()))?;
-        {
+        // Install ours unless a concurrent call already installed a live session. In
+        // that case ours is closed and the winner must be the requested relay, the same
+        // rule as the fast path: a session to another relay never answers for this one.
+        let winner = {
             let mut guard = self.inner.relay.lock().await;
-            if guard.is_none() {
+            let concurrent = match guard.as_ref() {
+                Some(current) if current.is_connected().await => Some(current.clone()),
+                _ => None,
+            };
+            if concurrent.is_none() {
                 *guard = Some(adapter.clone());
+            }
+            concurrent
+        };
+        match winner {
+            None => {
+                // The ingest task belonged to the closed adapter's stream; subscribe the new one.
+                *self.inner.relay_subscriber.lock().await = None;
+            }
+            Some(winner) => {
+                adapter.close().await;
+                live_relay_serves(&winner, relay_addr, relay_peer)?;
             }
         }
         self.ensure_relay_subscriber().await?;
