@@ -2,13 +2,16 @@
 name: airc:part
 description: Leave the current room without leaving the mesh. Host parts → room gist deleted, joiners reconnect into a new election. Joiner parts → host's gist stays open for others. Local identity preserved.
 user-invocable: true
-allowed-tools: Bash
 argument-hint: ""
 ---
 
 # /part — Leave the current airc room
 
 Run this yourself.
+
+For Codex, remove the owned `airc:codex-wake` heartbeat if this ends the chat's
+AIRC coordination. Keep it when coordinating in other subscribed rooms.
+See [Codex wake cleanup](../codex-wake/SKILL.md).
 
 ## Execute
 

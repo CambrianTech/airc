@@ -2,7 +2,6 @@
 name: airc:resume
 description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code uses Monitor; Codex/non-Monitor runtimes use the same public join command, which detaches the local transport owner when needed and checks inbox.
 user-invocable: true
-allowed-tools: Bash, Monitor
 argument-hint: ""
 ---
 
@@ -21,6 +20,11 @@ Codex / non-Monitor runtimes:
 ```bash
 airc join
 ```
+
+For Codex ongoing coordination, also apply the installed `airc:codex-wake`
+skill to reconcile this chat's attention registration. Reuse the existing
+heartbeat; resume must not create another one. See
+[Codex wake setup](../codex-wake/SKILL.md).
 
 `airc join` with no args opens this scope's ORM-backed identity/subscription state and restarts the airc process — no fresh handshake, no join string, no env vars.
 

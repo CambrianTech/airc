@@ -2,13 +2,16 @@
 name: airc:teardown
 description: Stop this scope's owning account daemon via `airc stop` and retain operator intent until explicit resume. State is preserved.
 user-invocable: true
-allowed-tools: Bash
 argument-hint: ""
 ---
 
 # airc teardown — stop the daemon
 
 Run this yourself when asked to stop AIRC. It's idempotent and preserves state.
+
+In Codex, apply `airc:codex-wake` disable to remove this chat/scope's owned
+heartbeat. If cleanup fails, report the remaining schedule ID; the daemon stop
+below still preserves operator intent. See [Codex wake cleanup](../codex-wake/SKILL.md).
 
 In the rust-rewrite there is no `airc teardown` verb. Graceful daemon shutdown for
 the current scope is `airc stop`.
