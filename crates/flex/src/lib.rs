@@ -17,6 +17,9 @@
 
 mod amount;
 mod claim;
+mod interval;
+mod joint;
+mod pool;
 mod provenance;
 mod solve;
 mod tier;
@@ -24,6 +27,12 @@ mod value;
 
 pub use amount::{Amount, Unit};
 pub use claim::{Claim, ClaimError, ClaimId, Floor, Increment, OwnerId};
+pub use interval::{IntervalClock, IntervalError, LaneCapacity, LaneDemand, LaneInterval, Lanes};
+pub use joint::{JointCapacity, JointDemand, JointError};
+pub use pool::{
+    PoolAmounts, PoolCapacity, PoolError, PoolFitError, PoolId, PoolTopology, PoolViewId,
+    TopologyRevision,
+};
 pub use provenance::{Provenance, SourceId};
 pub use tier::{
     Capacity, Clearing, Grant, GrantState, LeaseId, Outcome, Release, ReleaseError, Tier,
