@@ -163,7 +163,7 @@ pub fn project_transcript_work_events(
             Err(error) => return Err(error),
         };
         projection
-            .apply(&item.event)
+            .apply_at(item.cursor.event_id, &item.event)
             .map_err(|source| WorkReplayError::Projection {
                 event_id: transcript_event.event_id,
                 source,

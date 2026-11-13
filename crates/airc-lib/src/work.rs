@@ -312,6 +312,8 @@ pub struct WorkQueueStatus {
     pub claimable: Vec<ClaimableWorkItem>,
     pub agent_availability: Vec<AgentAvailabilityRecord>,
     pub active_claims_for_peer: Vec<WorkCard>,
+    /// Cards a second, different creation claimed: never offered as claimable, named here instead.
+    pub conflicts: Vec<airc_work::WorkCardConflict>,
 }
 
 impl WorkQueueStatus {
@@ -602,7 +604,9 @@ impl Airc {
         room: &Room,
         request: ReleaseWorkClaim,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_room(room, request.card_id).await?;
+        // giving a claim up is allowed on a conflicted card: it resolves, never acts
+        self.ensure_work_card_mutable_in_room(room, request.card_id, CardMutation::Resolve)
+            .await?;
         let event = WorkEvent::ClaimReleased(ClaimReleased {
             card_id: request.card_id,
             claim_id: request.claim_id,
@@ -680,7 +684,13 @@ impl Airc {
         room: &Room,
         request: ChangeWorkCardState,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_room(room, request.card_id).await?;
+        let mutation = if request.state == airc_work::CardState::Closed {
+            CardMutation::Resolve
+        } else {
+            CardMutation::Act
+        };
+        self.ensure_work_card_mutable_in_room(room, request.card_id, mutation)
+            .await?;
         let event = WorkEvent::CardStateChanged(CardStateChanged {
             card_id: request.card_id,
             state: request.state,
@@ -748,6 +758,7 @@ impl Airc {
                 room_id: room.channel,
             });
         };
+        refuse_conflicted(&board, request.card_id, CardMutation::Act)?;
         let old_pull_request = validate_relink_card_pull_request(card, &request.new_pull_request)?;
         let event = WorkEvent::PullRequestRelinked(airc_work::event::PullRequestRelinked {
             card_id: request.card_id,
@@ -780,7 +791,10 @@ impl Airc {
         room: &Room,
         request: MarkPullRequestMerged,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_room(room, request.card_id).await?;
+        // A merge on GitHub is an external fact, recorded like a close: a conflicted card a human
+        // merged must still reconcile to Merged instead of a refusal retried every tick (Fable on #1638).
+        self.ensure_work_card_mutable_in_room(room, request.card_id, CardMutation::Resolve)
+            .await?;
         let event = WorkEvent::PullRequestMerged(airc_work::event::PullRequestMerged {
             card_id: request.card_id,
             pull_request: request.pull_request,
@@ -1361,6 +1375,10 @@ impl Airc {
             if !open && !stale_claimable {
                 continue;
             }
+            // a conflicted card is never offered: no action is accepted on it until it is resolved
+            if !board.card_conflicts(card.card_id).is_empty() {
+                continue;
+            }
 
             items.push(ClaimableWorkItem { card, stale_claim });
         }
@@ -1413,6 +1431,7 @@ impl Airc {
             claimable: items,
             agent_availability,
             active_claims_for_peer,
+            conflicts: snapshot.card_conflicts,
         })
     }
 
@@ -1447,25 +1466,35 @@ impl Airc {
     }
 
     /// The one mutation guard, room-parameterized: a card may only be
-    /// mutated against a board it is actually on. `..._in_current_room`
-    /// is its current-room projection.
+    /// mutated against a board it is actually on, and a conflicted card
+    /// (a second, different creation of its id) only released or closed.
+    /// `..._in_current_room` is its current-room projection.
     async fn ensure_work_card_in_room(
         &self,
         room: &Room,
         card_id: WorkCardId,
     ) -> Result<(), AircError> {
+        self.ensure_work_card_mutable_in_room(room, card_id, CardMutation::Act)
+            .await
+    }
+
+    async fn ensure_work_card_mutable_in_room(
+        &self,
+        room: &Room,
+        card_id: WorkCardId,
+        mutation: CardMutation,
+    ) -> Result<(), AircError> {
         let board = self
             .project_room_work_board(room, WORK_MUTATION_PAGE_SIZE)
             .await?;
-        if board.card(card_id).is_some() {
-            return Ok(());
+        if board.card(card_id).is_none() {
+            return Err(AircError::WorkCardNotInCurrentRoom {
+                card_id,
+                room_name: room.name.clone(),
+                room_id: room.channel,
+            });
         }
-
-        Err(AircError::WorkCardNotInCurrentRoom {
-            card_id,
-            room_name: room.name.clone(),
-            room_id: room.channel,
-        })
+        refuse_conflicted(&board, card_id, mutation)
     }
 
     /// Whether a claim on `card_id` in `room` is a fresh claim or the owner resuming her own.
@@ -1591,6 +1620,30 @@ fn availability_state_rank(state: AgentAvailabilityState) -> u8 {
     }
 }
 
+/// What a mutation does to a card, for the conflict guard: a release or a
+/// close is how a conflicted card is resolved; anything else acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardMutation {
+    Act,
+    Resolve,
+}
+
+/// A conflicted card accepts no action but a release or a close (card a3fa88ae).
+fn refuse_conflicted(
+    board: &WorkBoardProjection,
+    card_id: WorkCardId,
+    mutation: CardMutation,
+) -> Result<(), AircError> {
+    match (board.card_conflicts(card_id).first(), mutation) {
+        (Some(c), CardMutation::Act) => Err(AircError::WorkCardConflicted {
+            card_id,
+            original_event: c.original_event,
+            conflicting_event: c.conflicting_event,
+        }),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,6 +1705,260 @@ mod tests {
             room_b.channel,
             "acting on A never moves the pointer off B"
         );
+    }
+
+    // what this catches (Codex on #1638): a card whose id a second, different creation
+    // claimed was offered and acted on as if the first creation won. It stays on the board,
+    // but no claim or update is accepted, the queue names it instead of offering it, and a
+    // close (the resolution) still is.
+    #[tokio::test]
+    async fn a_conflicted_card_accepts_only_a_close_and_is_never_offered() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room = airc.join("conflict-board").await.unwrap();
+        let card = airc
+            .create_work_card(CreateWorkCard::new(
+                RepoId::new("fixture/conflict").unwrap(),
+                "the first creation",
+                Priority::P1,
+            ))
+            .await
+            .unwrap();
+        airc.publish_work_event_in(
+            &room,
+            &WorkEvent::CardCreated(airc_work::CardCreated {
+                card_id: card,
+                repo: RepoId::new("fixture/conflict").unwrap(),
+                title: "a second creation of the same id".to_string(),
+                body: None,
+                priority: Priority::P1,
+                lane_id: None,
+                created_by: airc.peer_id(),
+                created_at_ms: now_ms().unwrap(),
+                reviews: None,
+                origin: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let claim = airc
+            .claim_work_card_with_provenance_in(
+                &room,
+                ClaimWorkCard {
+                    card_id: card,
+                    ttl_ms: 600_000,
+                },
+                airc_work::ClaimOrigin::Explicit,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(claim, Err(AircError::WorkCardConflicted { card_id, .. }) if card_id == card),
+            "{claim:?}"
+        );
+        let update = airc
+            .update_work_card_in(&room, UpdateWorkCard::amend(card).with_title("renamed"))
+            .await;
+        assert!(
+            matches!(update, Err(AircError::WorkCardConflicted { .. })),
+            "{update:?}"
+        );
+
+        let status = airc
+            .work_queue_status(WorkQueueStatusQuery::default())
+            .await
+            .unwrap();
+        assert!(status
+            .claimable
+            .iter()
+            .all(|item| item.card.card_id != card));
+        assert_eq!(status.conflicts.len(), 1);
+        assert_eq!(status.conflicts[0].card_id, card);
+
+        // A merge a human made on GitHub is an external fact recorded like a close: it reconciles
+        // the card instead of being refused every merger tick (Fable on #1638).
+        airc.mark_pull_request_merged_in(
+            &room,
+            MarkPullRequestMerged {
+                card_id: card,
+                pull_request: airc_work::model::PullRequestRef {
+                    repo: RepoId::new("fixture/conflict").unwrap(),
+                    number: 7,
+                    head: airc_work::model::BranchName::new("topic").unwrap(),
+                    base: airc_work::model::BranchName::new("canary").unwrap(),
+                },
+                merged_at_ms: now_ms().unwrap(),
+            },
+        )
+        .await
+        .expect("recording a merge resolves a conflicted card, never refused as an action");
+
+        airc.change_work_card_state_in(
+            &room,
+            ChangeWorkCardState {
+                card_id: card,
+                state: airc_work::CardState::Closed,
+            },
+        )
+        .await
+        .expect("closing a conflicted card resolves it");
+    }
+
+    // what this catches (Codex round 2 on #1638): review handoff and judgement skipped the
+    // conflict guard, so a submitted parent whose id a second creation claimed could still
+    // materialize a review, and a claimed review card in conflict could still take a fresh
+    // judgement. Both now refuse with the typed conflict and publish nothing; a retry that
+    // only reads (the recorded handoff) still answers.
+    #[tokio::test]
+    async fn review_handoff_and_judgement_refuse_a_conflicted_parent_or_review_card() {
+        let temp = tempfile::tempdir().unwrap();
+        let airc = Airc::open_with_wire_root_for_test(
+            &temp.path().join("home"),
+            &temp.path().join("wire"),
+        )
+        .await
+        .unwrap();
+        let room = airc.join("conflict-review").await.unwrap();
+        let repo = RepoId::new("fixture/conflict-review").unwrap();
+        let artifact: airc_work::SubmissionArtifact = serde_json::from_value(serde_json::json!({
+            "hash": "d".repeat(64), "size_bytes": 5, "mime": "text/x-diff"
+        }))
+        .unwrap();
+        let collide = |card_id: WorkCardId| {
+            WorkEvent::CardCreated(airc_work::CardCreated {
+                card_id,
+                repo: repo.clone(),
+                title: "a second creation of the same id".to_string(),
+                body: None,
+                priority: Priority::P1,
+                lane_id: None,
+                created_by: airc.peer_id(),
+                created_at_ms: now_ms().unwrap(),
+                reviews: None,
+                origin: None,
+            })
+        };
+        let submitted = |title: &'static str| {
+            let airc = &airc;
+            let room = &room;
+            let repo = repo.clone();
+            let artifact = artifact.clone();
+            async move {
+                let card = airc
+                    .create_work_card(CreateWorkCard::new(repo, title, Priority::P1))
+                    .await
+                    .unwrap();
+                let claim = airc
+                    .claim_work_card_with_provenance_in(
+                        room,
+                        ClaimWorkCard {
+                            card_id: card,
+                            ttl_ms: 600_000,
+                        },
+                        airc_work::ClaimOrigin::Explicit,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let submission = airc
+                    .submit_work_in(
+                        room,
+                        SubmitWork {
+                            submission_id: airc_work::SubmissionId::new(),
+                            card_id: card,
+                            claim_id: claim,
+                            instance: title.into(),
+                            base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+                            head: airc_work::GitObjectId::new("e".repeat(40)).unwrap(),
+                            artifact,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                (card, submission)
+            }
+        };
+
+        // A: the parent collides after its submission: no new review handoff
+        let (parent, submission) = submitted("parent that collides").await;
+        airc.publish_work_event_in(&room, &collide(parent))
+            .await
+            .unwrap();
+        let handoff = CreateWorkCard::new(repo.clone(), "review it", Priority::P1);
+        let refused = airc
+            .ensure_submission_review_in(&room, parent, submission.submission_id, handoff.clone())
+            .await;
+        assert!(
+            matches!(refused, Err(AircError::WorkCardConflicted { card_id, .. }) if card_id == parent),
+            "{refused:?}"
+        );
+        assert_eq!(
+            airc.work_board_in(&room)
+                .await
+                .unwrap()
+                .review_cards_for(parent)
+                .count(),
+            0
+        );
+
+        // B: a claimed review card collides: no fresh judgement
+        let (healthy, submission) = submitted("healthy parent").await;
+        let review_card = airc
+            .ensure_submission_review_in(&room, healthy, submission.submission_id, handoff.clone())
+            .await
+            .expect("a healthy parent hands off its review");
+        let review_claim = airc
+            .claim_work_card_with_provenance_in(
+                &room,
+                ClaimWorkCard {
+                    card_id: review_card,
+                    ttl_ms: 600_000,
+                },
+                airc_work::ClaimOrigin::Explicit,
+                None,
+            )
+            .await
+            .unwrap();
+        airc.publish_work_event_in(&room, &collide(review_card))
+            .await
+            .unwrap();
+        // the recorded handoff is a read: a retry still answers it
+        assert_eq!(
+            airc.ensure_submission_review_in(&room, healthy, submission.submission_id, handoff)
+                .await
+                .unwrap(),
+            review_card
+        );
+        let judgement = ReviewWorkSubmission {
+            review_id: airc_work::WorkReviewId::new(),
+            card_id: healthy,
+            submission_id: submission.submission_id,
+            artifact: artifact.clone(),
+            review_card_id: review_card,
+            review_claim_id: review_claim,
+            outcome: airc_work::WorkReviewOutcome::Unknown,
+            evidence: artifact,
+            evidence_text: None,
+        };
+        let refused = airc
+            .review_work_submission_in(&room, judgement.clone())
+            .await;
+        assert!(
+            matches!(refused, Err(AircError::WorkCardConflicted { card_id, .. }) if card_id == review_card),
+            "{refused:?}"
+        );
+        assert!(airc
+            .work_board_in(&room)
+            .await
+            .unwrap()
+            .submission_review(judgement.review_id)
+            .is_none());
     }
 
     // what this catches: card 4fee35cf. Kimi's lease on her own Review card lapsed and

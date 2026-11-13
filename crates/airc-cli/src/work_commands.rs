@@ -1942,6 +1942,13 @@ fn print_board(
     aliases: &std::collections::HashMap<airc_lib::PeerId, String>,
     limit: usize,
 ) {
+    for c in board.conflicts() {
+        println!(
+            "conflict: card {} was created again by event {} (by {}); its original creation is event {}. \
+             No action is accepted on it until it is closed; re-file the work under a new card.",
+            c.card_id, c.conflicting_event, c.conflicting_created_by, c.original_event
+        );
+    }
     let snapshot = board.snapshot();
     if snapshot.cards.is_empty() && snapshot.agent_availability.is_empty() {
         println!("(no work cards)");

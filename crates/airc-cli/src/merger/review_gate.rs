@@ -33,6 +33,12 @@ pub(crate) enum VerdictGap {
     },
     NoIndependentReview,
     LatestReview(WorkReviewOutcome),
+    /// A second, different creation claimed the card's id: it accepts no action but a release or a
+    /// close, so the merger never lands it (Fable on #1638).
+    Conflicted {
+        original_event: airc_core::EventId,
+        conflicting_event: airc_core::EventId,
+    },
 }
 
 impl std::fmt::Display for VerdictGap {
@@ -44,6 +50,7 @@ impl std::fmt::Display for VerdictGap {
             Self::HeadMoved { submitted, pr } => write!(f, "verdict at {submitted}, head {pr}: the PR moved past its submission; submit the new head for review"),
             Self::NoIndependentReview => f.write_str("no review by anyone but its author on the latest submission"),
             Self::LatestReview(outcome) => write!(f, "the latest independent review is {outcome:?}, not Passed"),
+            Self::Conflicted { original_event, conflicting_event } => write!(f, "the card's id was created twice (events {original_event} and {conflicting_event}): it accepts only a release or a close until resolved"),
         }
     }
 }
@@ -170,6 +177,15 @@ pub(crate) async fn check_card_gate(
     policy: super::GatePolicy,
 ) -> Result<CardGate, crate::gh_client::GhError> {
     // The board first: nothing below costs GitHub unless a reviewer already passed a recorded head.
+    if let Some(conflict) = board.card_conflicts(card.card_id).first() {
+        return Ok(CardGate::NotReady(
+            VerdictGap::Conflicted {
+                original_event: conflict.original_event,
+                conflicting_event: conflict.conflicting_event,
+            }
+            .to_string(),
+        ));
+    }
     let Some(submission) = card.latest_submission() else {
         return Ok(CardGate::NotReady(VerdictGap::NoSubmission.to_string()));
     };

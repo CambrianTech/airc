@@ -9,6 +9,7 @@ use crate::event::{
 };
 use crate::ids::{WorkCardId, WorkspaceId};
 use crate::model::{CardState, WorkCard, WorkspaceLease, WorkspaceStatus};
+use airc_core::EventId;
 
 /// From this instant on, a takeover is on the record: a BARE claim by anyone else
 /// while the holder's claim stands is dropped, lapsed lease or not. Anyone may take
@@ -46,7 +47,7 @@ fn renew_owner_lease(card: &mut WorkCard, actor: airc_core::PeerId, at_ms: u64) 
 use super::{
     pull_request_key, AgentAvailabilityRecord, BoardSnapshot, BranchTrackingRecord, LaneRecord,
     ManagerHat, ProjectionError, PullRequestRecord, RepoTrackingRecord, StaleClaim,
-    WorkBoardProjection, WorkspaceRecord,
+    WorkBoardProjection, WorkCardConflict, WorkspaceRecord,
 };
 
 impl WorkBoardProjection {
@@ -158,16 +159,45 @@ impl WorkBoardProjection {
         Ok(projection)
     }
 
-    /// Apply one event with bounded-window tolerance: an event whose
-    /// anchor entity is missing (its creation predates the window /
-    /// snapshot) is skipped, exactly as [`Self::replay_window`] skips
-    /// it; structural errors still fail. This is the single apply
-    /// rule shared by windowed replay AND incremental resume from a
-    /// cached projection (card 1291173d) — the two paths stay
-    /// semantically identical by construction.
-    pub fn apply_windowed(&mut self, event: &WorkEvent) -> Result<(), ProjectionError> {
+    /// Apply one transcript event, identified by its event id: the one rule
+    /// every board-building replay shares (windowed replay, incremental
+    /// resume from a cached projection, transcript projection), so they stay
+    /// semantically identical by construction (card 1291173d).
+    ///
+    /// An event whose anchor entity is missing (created before the window /
+    /// snapshot) is skipped. A creation of an existing card is a no-op when it
+    /// is that card's own creating event (a redelivery) and a recorded
+    /// [`WorkCardConflict`] when it is a different event: the original card
+    /// stands, unactionable until resolved, and every other card stays usable
+    /// (card a3fa88ae). Structural errors still fail. [`Self::apply`] stays
+    /// strict.
+    pub fn apply_at(&mut self, origin: EventId, event: &WorkEvent) -> Result<(), ProjectionError> {
+        if let WorkEvent::CardCreated(e) = event {
+            if let Some(original) = self.card_origins.get(&e.card_id).copied() {
+                if original != origin {
+                    let conflicts = self.card_conflicts.entry(e.card_id).or_default();
+                    if !conflicts.iter().any(|c| c.conflicting_event == origin) {
+                        conflicts.push(WorkCardConflict {
+                            card_id: e.card_id,
+                            original_event: original,
+                            conflicting_event: origin,
+                            conflicting_created_by: e.created_by,
+                            at_ms: e.created_at_ms,
+                        });
+                    }
+                }
+                return Ok(());
+            }
+        }
         match self.apply(event) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(card_id) = created_card(event) {
+                    if self.cards.contains_key(&card_id) {
+                        self.card_origins.entry(card_id).or_insert(origin);
+                    }
+                }
+                Ok(())
+            }
             Err(error) if error.is_missing_window_anchor() => Ok(()),
             Err(error) => Err(error),
         }
@@ -177,11 +207,11 @@ impl WorkBoardProjection {
     /// was created before the window are skipped; structural errors
     /// inside the window still fail.
     pub fn replay_window(
-        events: impl IntoIterator<Item = WorkEvent>,
+        items: impl IntoIterator<Item = crate::WorkReplayItem>,
     ) -> Result<Self, ProjectionError> {
         let mut projection = Self::new();
-        for event in events {
-            projection.apply_windowed(&event)?;
+        for item in items {
+            projection.apply_at(item.cursor.event_id, &item.event)?;
         }
         Ok(projection)
     }
@@ -197,6 +227,7 @@ impl WorkBoardProjection {
             manager_hats: self.manager_hats.values().cloned().collect(),
             agent_availability: self.agent_availability.values().cloned().collect(),
             hygiene_reports: self.hygiene_reports.clone(),
+            card_conflicts: self.conflicts().cloned().collect(),
         }
     }
 
@@ -750,5 +781,15 @@ impl WorkBoardProjection {
         self.repo_tracking
             .entry(repo.clone())
             .or_insert_with(|| RepoTrackingRecord::new(repo))
+    }
+}
+
+/// The card an event creates, when it creates one (a review request may
+/// materialize its review card).
+fn created_card(event: &WorkEvent) -> Option<WorkCardId> {
+    match event {
+        WorkEvent::CardCreated(e) => Some(e.card_id),
+        WorkEvent::SubmissionReviewRequested(e) => Some(e.card.card_id),
+        _ => None,
     }
 }

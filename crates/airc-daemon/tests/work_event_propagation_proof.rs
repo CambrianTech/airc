@@ -353,7 +353,7 @@ async fn card_state_transitions_propagate_to_all_attached_peers() {
     //     on the card's final state. This is the user-visible half of
     //     "the board you see matches the board everyone else sees".
     let project = |events: Vec<WorkEvent>| -> WorkBoardProjection {
-        WorkBoardProjection::replay_window(events).expect("replay projects")
+        WorkBoardProjection::replay(events).expect("replay projects")
     };
     let proj_a = project(decoded_a);
     let proj_b = project(decoded_b);

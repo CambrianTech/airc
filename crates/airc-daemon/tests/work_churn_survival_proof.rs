@@ -368,7 +368,7 @@ async fn dead_holder_lease_expires_and_a_different_peer_reclaims() {
     //     coordinator participating.
     let pre_reclaim: Vec<WorkEvent> = transcript[..2].to_vec();
     let project = |events: Vec<WorkEvent>| -> WorkBoardProjection {
-        WorkBoardProjection::replay_window(events).expect("replay projects")
+        WorkBoardProjection::replay(events).expect("replay projects")
     };
     for who in ["observer A", "observer B"] {
         let proj = project(pre_reclaim.clone());

@@ -260,7 +260,7 @@ async fn compose(
         .await?;
     let work = match resume {
         Some(text) => Some(text),
-        None => work_context(airc, &turn.live_events()[..live_end]).await?,
+        None => work_context(airc, &turn.live_events()[..live_end]).await,
     };
     let mut context = delivery_context(
         turn,
@@ -329,14 +329,16 @@ fn delivery_context(
     (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
-async fn work_context(
-    airc: &Airc,
-    events: &[TranscriptEvent],
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    if events.iter().any(is_work_queue_event) {
-        render_claimable_work(airc).await
-    } else {
-        Ok(None)
+/// The board is context beside her chat, never a gate on it: a board that cannot be read says
+/// so, by its error, in the turn that still delivers the chat (Codex on #1638: a projection
+/// error here aborted the whole hook, addressed chat included, before its delivery ACK).
+async fn work_context(airc: &Airc, events: &[TranscriptEvent]) -> Option<String> {
+    if !events.iter().any(is_work_queue_event) {
+        return None;
+    }
+    match render_claimable_work(airc).await {
+        Ok(text) => text,
+        Err(error) => Some(format!("AIRC: the work board could not be read: {error}")),
     }
 }
 

@@ -241,7 +241,8 @@ async fn resume_from_uses_store_cursor_contract() {
         .await
         .unwrap();
 
-    assert_eq!(page.events, vec![card_created(card_b)]);
+    let events: Vec<_> = page.events.iter().map(|item| item.event.clone()).collect();
+    assert_eq!(events, vec![card_created(card_b)]);
     assert_eq!(page.newest_cursor.unwrap().event_id, EventId::from_u128(2));
 }
 
@@ -314,7 +315,8 @@ async fn drain_sequence_through_store_replays_into_projection_state() {
         .unwrap();
     assert_eq!(page.events.len(), 3);
 
-    let projection = WorkBoardProjection::replay(page.events).unwrap();
+    let projection =
+        WorkBoardProjection::replay(page.events.into_iter().map(|item| item.event)).unwrap();
     assert_eq!(
         projection.workspace_pressure(&workspace_id).unwrap().level,
         PressureLevel::High,
@@ -1004,7 +1006,7 @@ fn apply_transcripts_advances_cursor_past_non_work_events() {
 }
 
 #[test]
-fn apply_transcripts_skips_missing_anchor_but_fails_structural_errors() {
+fn apply_transcripts_skips_missing_anchors_and_quarantines_duplicates() {
     let room = RoomId::from_u128(10);
     let card_a = WorkCardId::from_u128(20);
     let mut projection =
@@ -1020,12 +1022,19 @@ fn apply_transcripts_skips_missing_anchor_but_fails_structural_errors() {
     .unwrap();
     assert!(projection.card(unknown).is_none());
 
-    // Structural error (duplicate create): loud failure, not a skip.
-    let result = apply_transcripts(
+    // what this catches: a duplicate create failing every resume of the
+    // room's board (card a3fa88ae). Not a skip: the original stands and the
+    // conflict is recorded with both transcript events.
+    apply_transcripts(
         &mut projection,
         vec![work_transcript(3, room, 3, &card_created(card_a))],
-    );
-    assert!(matches!(result, Err(WorkStoreError::Projection(_))));
+    )
+    .unwrap();
+    assert!(projection.card(card_a).is_some());
+    let conflicts = projection.card_conflicts(card_a);
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].original_event, EventId::from_u128(1));
+    assert_eq!(conflicts[0].conflicting_event, EventId::from_u128(3));
 }
 
 #[test]
