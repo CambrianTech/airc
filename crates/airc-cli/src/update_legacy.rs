@@ -24,16 +24,9 @@ pub fn verified_endpoints(
         return Ok(Vec::new());
     }
     let canonical = canonical.to_path_buf();
-    let verified = std::thread::spawn(move || -> Result<Vec<PathBuf>, String> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?
-            .block_on(inspect(canonical, candidates))
-    })
-    .join()
-    .map_err(|_| "legacy endpoint inspection thread failed")?
-    .map_err(std::io::Error::other)?;
+    let verified = crate::runtime::block_on_fresh(inspect(canonical, candidates))
+        .map_err(|error| error.into_io("legacy endpoint inspection"))?
+        .map_err(std::io::Error::other)?;
     Ok(verified)
 }
 
