@@ -360,3 +360,101 @@ async fn tip_probe_surfaces_sink_error_instead_of_scanning() {
         "index failure is loud, not a scan fallback"
     );
 }
+
+/// Card 52aa43a8 — concurrent publishers on one channel. The owner seq
+/// must be stamped in the same critical section that appends to the ring
+/// and fans out, so ring order, live delivery order and total order are
+/// one order. When the seq was taken before the shard lock, a publisher
+/// that stamped `n` could push after the one that stamped `n + 1`: the
+/// ring's newest durable (the tip) then named `n` while every resume
+/// sorted `n + 1` last, so a work-board cache keyed on `n + 1` was told
+/// "not the tip — log rewound" and rebuilt from zero on every read; and a
+/// live subscriber whose high-watermark was `n + 1` silently dropped `n`.
+// what this catches: seq assigned outside the ring/fan-out critical section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_publishes_keep_one_order_for_tip_resume_and_live() {
+    use futures::StreamExt;
+
+    const PUBLISHERS: u128 = 8;
+    const PER_PUBLISHER: u128 = 500;
+    const TOTAL: usize = (PUBLISHERS * PER_PUBLISHER) as usize;
+
+    let router = EventRouter::new(
+        RouterConfig {
+            ring_capacity: TOTAL * 2,
+            subscriber_buffer: TOTAL * 2,
+            write_behind_buffer: TOTAL * 2,
+            ..RouterConfig::default()
+        },
+        Arc::new(ManualClock::new(1_700_000_000_000)),
+        Arc::new(SeqSource::start(&InMemoryEpochStore::new())),
+        Arc::new(InMemoryDurableSink::new()),
+    );
+    let channel = RoomId::from_u128(0x52aa);
+    let (live, _lag) = router.subscribe_live_with_lag(airc_bus::Filter::channel(channel));
+
+    let start = Arc::new(tokio::sync::Barrier::new(PUBLISHERS as usize));
+    let mut publishers = Vec::new();
+    for p in 0..PUBLISHERS {
+        let router = router.clone();
+        let start = Arc::clone(&start);
+        publishers.push(tokio::spawn(async move {
+            start.wait().await;
+            for n in 0..PER_PUBLISHER {
+                router
+                    .publish(event(
+                        channel,
+                        p * PER_PUBLISHER + n,
+                        DeliveryClass::Durable,
+                    ))
+                    .await
+                    .expect("publish");
+            }
+        }));
+    }
+    for publisher in publishers {
+        publisher.await.expect("publisher task");
+    }
+
+    // The publishers are done, so every live push is already buffered: a
+    // short read here is a dropped event, never a slow one.
+    futures::pin_mut!(live);
+    let mut delivered: Vec<Cursor> = Vec::with_capacity(TOTAL);
+    while delivered.len() < TOTAL {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), live.next()).await {
+            Ok(Some(env)) => delivered.push(env.cursor()),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert_eq!(delivered.len(), TOTAL, "no live event dropped");
+    assert!(
+        delivered.windows(2).all(|w| w[0].is_before(&w[1])),
+        "live delivery is in total order"
+    );
+
+    // Quiescent: the ring itself must hold total order. A from-zero replay
+    // walks the ring by position under the same high-watermark gate, so an
+    // inverted slot is a replayed event lost.
+    let replay = router.subscribe(airc_bus::Filter::channel(channel), None);
+    futures::pin_mut!(replay);
+    let mut replayed = 0usize;
+    while replayed < TOTAL {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), replay.next()).await {
+            Ok(Some(_)) => replayed += 1,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert_eq!(replayed, TOTAL, "a from-zero replay returns every event");
+
+    let resumed = router
+        .resume_from_cursor(channel, None, usize::MAX)
+        .await
+        .expect("resume");
+    assert_eq!(resumed.len(), TOTAL);
+    let tip = router.durable_tip(channel).await.expect("tip probe");
+    assert_eq!(
+        tip,
+        resumed.last().map(|env| env.cursor()),
+        "the tip IS the newest event a resume returns"
+    );
+}

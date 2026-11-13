@@ -454,10 +454,12 @@ impl EventRouter {
     ///
     /// Steps, all synchronous up to the write-behind enqueue:
     /// 0. Reserve durable queue capacity without waiting; reject before mutation.
-    /// 1. Stamp owner metadata: `seq` (generational) + `occurred_at_ms`.
-    /// 2. Under the shard lock: push to the ring (deliver-first), coalesce if
-    ///    `EphemeralLatest`, fan out to matching subscribers via `try_send`
-    ///    (lagging ones marked, never blocking). Release the lock.
+    /// 1. Under the shard lock: stamp owner metadata (`seq` + `occurred_at_ms`),
+    ///    push to the ring (deliver-first), coalesce if `EphemeralLatest`, fan
+    ///    out to matching subscribers via `try_send` (lagging ones marked, never
+    ///    blocking). Release the lock. Stamping inside the same critical section
+    ///    is what makes ring order, live delivery order and total order ONE
+    ///    order per channel (card 52aa43a8).
     /// 3. Off the lock: enqueue `Durable` envelopes to write-behind.
     ///
     /// [`Seq`]: crate::Seq
@@ -614,10 +616,6 @@ impl EventRouter {
         } else {
             None
         };
-        let seq = self.inner.seq.next();
-        env.seq = seq;
-        env.occurred_at_ms = self.inner.clock.now_ms();
-
         // Card 4132f48c: record the id so a later `publish_if_new` of the
         // same event (a transport echo of this publish) is a duplicate.
         // One short mutex hold; never crosses an await.
@@ -630,16 +628,24 @@ impl EventRouter {
             recent.insert(env.event_id);
         }
 
-        // Wrap ONCE: from here on every delivery (ring, ephemeral, fan-out,
-        // write-behind) is an `Arc::clone` — a refcount bump, never a deep copy
-        // of the envelope or its `headers` BTreeMap. This is the hot-path
-        // zero-copy keystone: per-subscriber CPU is one atomic increment.
-        let env = Arc::new(env);
-
         // --- synchronous hot path: NO await while the shard lock is held ---
-        {
+        let env = {
             let shard = self.shard_for(env.channel);
             let mut map = shard.channels.lock().unwrap_or_else(|p| p.into_inner());
+            // Card 52aa43a8: the seq is taken HERE, under the channel's shard
+            // lock, never before it. Taken before, two publishers on one channel
+            // could stamp `n` and `n + 1` and push `n + 1` first: the ring then
+            // held `n` after `n + 1`, its newest durable (the room tip) named
+            // `n` while every resume sorted `n + 1` last, and a live subscriber
+            // past `n + 1` dropped `n` at its high-watermark gate.
+            env.seq = self.inner.seq.next();
+            env.occurred_at_ms = self.inner.clock.now_ms();
+            // Wrap ONCE: from here on every delivery (ring, ephemeral, fan-out,
+            // write-behind) is an `Arc::clone` — a refcount bump, never a deep
+            // copy of the envelope or its `headers` BTreeMap. This is the
+            // hot-path zero-copy keystone: per-subscriber CPU is one atomic
+            // increment.
+            let env = Arc::new(env);
             let key = env.channel.0.as_u128();
             let is_new = !map.contains_key(&key);
             let state = map
@@ -710,7 +716,8 @@ impl EventRouter {
                 sent_closed,
                 "airc-bus publish: fan-out summary"
             );
-        } // shard lock released here, before any await
+            env
+        }; // shard lock released here, before any await
 
         // Fill the reserved slot only after live fan-out, off the shard lock.
         if let Some(permit) = durable_permit {
@@ -737,7 +744,7 @@ impl EventRouter {
             self.offer_to_forward_sink(&env, origin);
         }
 
-        Ok(seq)
+        Ok(env.seq)
     }
 
     /// Idempotent publish keyed on `env.event_id` (card 4132f48c).
