@@ -19,6 +19,55 @@ pub struct WorkSubmission {
     pub artifact: airc_blobs::MediaRef,
     pub publisher: PeerId,
     pub submitted_at_ms: u64,
+    /// What the author offers as proof beside the patch (a capture, a measurement, a test run),
+    /// signed with it. `Absent` is not written, so a submission without evidence re-encodes to the
+    /// bytes it was signed as (the `head` rule).
+    #[serde(default, skip_serializing_if = "AuthorEvidence::is_absent")]
+    pub evidence: AuthorEvidence,
+}
+
+/// The author's receipts for a submission, content-addressed like a review's evidence: the
+/// reviewer reads them beside the diff instead of reproducing them or failing for their absence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorEvidence {
+    Attached {
+        evidence: airc_blobs::MediaRef,
+        /// Signed, bounded author words; the evidence ref alone names a blob fetched by hash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    #[default]
+    Absent,
+}
+
+impl AuthorEvidence {
+    pub fn is_absent(&self) -> bool {
+        matches!(self, AuthorEvidence::Absent)
+    }
+
+    /// The author's words, when she wrote any.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            AuthorEvidence::Attached { text, .. } => text.as_deref(),
+            AuthorEvidence::Absent => None,
+        }
+    }
+}
+
+/// One rule for any signed evidence (a review's or an author's): a non-empty ref with a bounded
+/// MIME hint, and inline text, when present, non-blank, at most 32 KiB, and exactly the bytes its
+/// hash and size name.
+pub(crate) fn evidence_is_valid(evidence: &airc_blobs::MediaRef, text: Option<&str>) -> bool {
+    if evidence.size_bytes == 0 || evidence.mime.as_ref().is_some_and(|mime| mime.len() > 128) {
+        return false;
+    }
+    text.is_none_or(|text| {
+        !text.trim().is_empty()
+            && text.len() <= 32 * 1024
+            && text.len() as u64 == evidence.size_bytes
+            && airc_blobs::ContentHash::from_bytes(text.as_bytes()) == evidence.hash
+    })
 }
 
 /// The commit a submission's patch ends at.
@@ -130,23 +179,8 @@ impl WorkSubmissionReview {
     }
 
     pub fn validate(&self) -> Result<(), WorkReviewRejectionReason> {
-        if self.evidence.size_bytes == 0
-            || self
-                .evidence
-                .mime
-                .as_ref()
-                .is_some_and(|mime| mime.len() > 128)
-        {
+        if !evidence_is_valid(&self.evidence, self.evidence_text.as_deref()) {
             return Err(WorkReviewRejectionReason::InvalidEvidence);
-        }
-        if let Some(text) = &self.evidence_text {
-            if text.trim().is_empty()
-                || text.len() > 32 * 1024
-                || text.len() as u64 != self.evidence.size_bytes
-                || airc_blobs::ContentHash::from_bytes(text.as_bytes()) != self.evidence.hash
-            {
-                return Err(WorkReviewRejectionReason::InvalidEvidence);
-            }
         }
         Ok(())
     }
@@ -235,6 +269,8 @@ pub enum SubmissionRejectionReason {
     SettledCard,
     #[error("submission id was already used for different immutable content")]
     ConflictingId,
+    #[error("author evidence is empty, has an oversized MIME hint, or inline text exceeds 32 KiB or differs from its hash/size")]
+    InvalidEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +294,7 @@ impl WorkSubmission {
             && self.head == other.head
             && self.artifact == other.artifact
             && self.publisher == other.publisher
+            && self.evidence == other.evidence
     }
 
     /// Admission is also replayed against historical claim state, never today's clock.
@@ -308,6 +345,11 @@ impl WorkSubmission {
         }
         if self.artifact.mime.as_ref().is_some_and(|m| m.len() > 128) {
             return Err(SubmissionRejectionReason::InvalidArtifact);
+        }
+        if let AuthorEvidence::Attached { evidence, text } = &self.evidence {
+            if !evidence_is_valid(evidence, text.as_deref()) {
+                return Err(SubmissionRejectionReason::InvalidEvidence);
+            }
         }
         Ok(())
     }

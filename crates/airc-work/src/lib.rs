@@ -34,10 +34,10 @@ pub use drain_policy::{
     PolicyInputs, PrStatus, PrTerminalState, ReportOnlyReason, DEFAULT_HEARTBEAT_STALE_MS,
 };
 pub use event::{
-    submission_review_card_id, AgentAvailabilityReported, CardCreated, CardStateChanged,
-    CardUpdated, ClaimHeartbeat, ClaimOrigin, ClaimReleased, GitBranchMoved, GitCommitObserved,
-    GitDirtyStateChanged, HygieneReportRecorded, LaneCreated, LaneStateChanged, ManagerHatClaimed,
-    ManagerHatReleased, PullRequestCheckSuiteChanged, PullRequestLinked,
+    submission_review_card_id, AgentAvailabilityReported, AuthorEvidence, CardCreated,
+    CardStateChanged, CardUpdated, ClaimHeartbeat, ClaimOrigin, ClaimReleased, GitBranchMoved,
+    GitCommitObserved, GitDirtyStateChanged, HygieneReportRecorded, LaneCreated, LaneStateChanged,
+    ManagerHatClaimed, ManagerHatReleased, PullRequestCheckSuiteChanged, PullRequestLinked,
     PullRequestMergeStateChanged, PullRequestMerged, PullRequestRelinked,
     PullRequestReviewSubmitted, RejectedSubmission, RejectedWorkReview, SubmissionHead,
     SubmissionRejectionReason, SubmissionReviewRequested, WorkCardClaimed, WorkEvent,

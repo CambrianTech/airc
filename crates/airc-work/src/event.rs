@@ -595,6 +595,10 @@ mod tests {
         let legacy = r#"{"submission_id":"00000000-0000-0000-0000-000000000004","card_id":"00000000-0000-0000-0000-000000000001","claim_id":"00000000-0000-0000-0000-000000000002","instance":"card","base_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifact":{"hash":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":1},"publisher":"00000000-0000-0000-0000-000000000003","submitted_at_ms":30}"#;
         let decoded: WorkSubmission = serde_json::from_str(legacy).unwrap();
         assert_eq!(decoded.head, crate::SubmissionHead::Unrecorded);
+        assert!(
+            decoded.evidence.is_absent(),
+            "a legacy submission carries no author evidence"
+        );
         let reencoded = serde_json::to_value(&decoded).unwrap();
         assert_eq!(
             reencoded,
@@ -608,6 +612,56 @@ mod tests {
         let back: WorkSubmission =
             serde_json::from_value(serde_json::to_value(&recorded).unwrap()).unwrap();
         assert_eq!(back.head, recorded.head);
+    }
+
+    // what this catches: an author's receipts that do not match what they claim, or a retry that
+    // swaps them under the same id. Evidence text must be exactly the bytes its ref names, bounded
+    // and non-blank (the review's rule, one owner), and changing it makes a different candidate.
+    #[test]
+    fn author_evidence_must_match_its_ref_and_is_part_of_the_candidate() {
+        let legacy = r#"{"submission_id":"00000000-0000-0000-0000-000000000004","card_id":"00000000-0000-0000-0000-000000000001","claim_id":"00000000-0000-0000-0000-000000000002","instance":"card","base_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifact":{"hash":"0000000000000000000000000000000000000000000000000000000000000000","size_bytes":1},"publisher":"00000000-0000-0000-0000-000000000003","submitted_at_ms":30}"#;
+        let base: WorkSubmission = serde_json::from_str(legacy).unwrap();
+        let attached = |text: &str, named: &str| crate::AuthorEvidence::Attached {
+            evidence: airc_blobs::MediaRef {
+                hash: airc_blobs::ContentHash::from_bytes(named.as_bytes()),
+                size_bytes: named.len() as u64,
+                mime: Some("text/plain".into()),
+            },
+            text: Some(text.into()),
+        };
+        let receipt = "capture at 1024x480: 17 tiles and controls on screen";
+        let with = WorkSubmission {
+            evidence: attached(receipt, receipt),
+            ..base.clone()
+        };
+        assert_eq!(with.validate(), Ok(()));
+        assert_eq!(with.evidence.text(), Some(receipt));
+        let back: WorkSubmission =
+            serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(
+            back.evidence, with.evidence,
+            "attached evidence round-trips as itself"
+        );
+        let forged = WorkSubmission {
+            evidence: attached(receipt, "something else"),
+            ..base.clone()
+        };
+        assert_eq!(
+            forged.validate(),
+            Err(SubmissionRejectionReason::InvalidEvidence)
+        );
+        let blank = WorkSubmission {
+            evidence: attached("  ", "  "),
+            ..base.clone()
+        };
+        assert_eq!(
+            blank.validate(),
+            Err(SubmissionRejectionReason::InvalidEvidence)
+        );
+        assert!(
+            !with.same_candidate(&base),
+            "evidence is part of the signed candidate"
+        );
     }
 
     #[test]
@@ -655,6 +709,7 @@ mod tests {
             },
             publisher: owner,
             submitted_at_ms: 30,
+            evidence: crate::AuthorEvidence::Absent,
         };
         board
             .apply(&WorkEvent::WorkSubmitted(original.clone()))
