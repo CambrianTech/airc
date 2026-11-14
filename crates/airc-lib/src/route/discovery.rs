@@ -446,12 +446,11 @@ impl Airc {
         let mut declared_hosts: std::collections::HashMap<PeerId, PeerId> =
             std::collections::HashMap::new();
         let mut ghost_peers_skipped = 0usize;
-        let proven = super::proven_reach::ProvenReach::from_evidence(
+        let proven = super::proven_reach::ProvenReach::from_ledger(
             &self
                 .delivery_ledger()
                 .map(|ledger| ledger.snapshot())
                 .unwrap_or_default(),
-            &stored,
         );
         for peer in stored {
             if peer.peer_id == self.inner.identity.peer_id
