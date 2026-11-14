@@ -1,13 +1,80 @@
 use super::*;
 
 impl SqliteEventStore {
+    /// One public key names ONE peer. Before a row for `peer_id` is written with
+    /// `pubkey_b64`, every OTHER row holding that key is removed and logged.
+    ///
+    /// The twins this clears were minted by #402 (fixed in #1360, 2026-08-13): a
+    /// second agent in one home reused `identity.key` under a random peer id.
+    /// BigMama's key was enrolled as e85a5bb3 (its live id) and as 4731e245 (an
+    /// 08-10 twin nobody answers to). `PeerKeyRegistry::find_peer` then bound the
+    /// live TLS session to whichever twin it met first, the catch-up asked the dead
+    /// id for 44 hours and got no session, and the messages sent during the outage
+    /// never arrived. The writer of the current row is the key holder's current
+    /// claim (a registry import of its own beacon, or an operator's `peer add`), so
+    /// it supersedes the older ids. Each removal is a `warn` naming both ids.
+    async fn supersede_key_twins(
+        &self,
+        peer_id: PeerId,
+        pubkey_b64: &str,
+    ) -> Result<Vec<PeerId>, StoreError> {
+        let twins = peer_trust::Entity::find()
+            .filter(peer_trust::Column::PubkeyB64.eq(pubkey_b64))
+            .filter(peer_trust::Column::PeerId.ne(peer_id.as_uuid()))
+            .all(&self.db)
+            .await?;
+        let mut superseded = Vec::with_capacity(twins.len());
+        for twin in twins {
+            peer_trust::Entity::delete_by_id(twin.peer_id)
+                .exec(&self.db)
+                .await?;
+            let twin_id = PeerId::from_uuid(twin.peer_id);
+            tracing::warn!(
+                target: "airc::trust",
+                superseded = %twin_id,
+                current = %peer_id,
+                "peer id superseded: its public key now belongs to the current id; \
+                 one key names one peer"
+            );
+            superseded.push(twin_id);
+        }
+        Ok(superseded)
+    }
+    /// Every enrolled peer, one row per public key.
+    ///
+    /// Rows that share a key with another row (#402 twins: see
+    /// [`Self::supersede_key_twins`]) are collapsed here, once, before any
+    /// reader sees them: the twin with the freshest evidence of use (last
+    /// contact, then endpoint advertisement, then enrolment) is kept, the rest
+    /// are deleted, and each deletion is a `warn` naming both ids. The M5 held
+    /// 14 such pairs on 2026-11-14, every one minted between 06-15 and 09-04.
     pub async fn load_peers(&self) -> Result<Vec<StoredPeer>, StoreError> {
         let rows = peer_trust::Entity::find()
             .order_by_asc(peer_trust::Column::AddedAtMs)
             .order_by_asc(peer_trust::Column::PeerId)
             .all(&self.db)
             .await?;
-        rows.into_iter().map(stored_peer).collect()
+        let peers = rows
+            .into_iter()
+            .map(stored_peer)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (survivors, superseded) = one_peer_per_key(peers);
+        if !superseded.is_empty() {
+            let _write = self.admit_write().await?;
+            for (twin, survivor) in &superseded {
+                peer_trust::Entity::delete_by_id(twin.as_uuid())
+                    .exec(&self.db)
+                    .await?;
+                tracing::warn!(
+                    target: "airc::trust",
+                    superseded = %twin,
+                    current = %survivor,
+                    "peer id superseded: it shared its public key with a fresher id; \
+                     one key names one peer"
+                );
+            }
+        }
+        Ok(survivors)
     }
 
     /// One peer's trust row by its id (the primary key): an index seek, not a load of every
@@ -55,6 +122,7 @@ impl SqliteEventStore {
         tier: TrustTier,
     ) -> Result<StoredPeer, StoreError> {
         let _write = self.admit_write().await?;
+        self.supersede_key_twins(peer_id, &pubkey_b64).await?;
         let active = peer_trust::ActiveModel {
             peer_id: Set(peer_id.as_uuid()),
             pubkey_b64: Set(pubkey_b64.clone()),
@@ -127,6 +195,7 @@ impl SqliteEventStore {
         added_at_ms: u64,
     ) -> Result<StoredPeer, StoreError> {
         let _write = self.admit_write().await?;
+        self.supersede_key_twins(peer_id, &pubkey_b64).await?;
         // Card 34942ec1 Sub-A: replace preserves the existing tier
         // (a rotation is a key-material event; trust gradient is
         // orthogonal — losing it on rotate would silently demote a
@@ -498,4 +567,40 @@ fn stored_peer(row: peer_trust::Model) -> Result<StoredPeer, StoreError> {
         endpoints_peer_id: row.endpoints_peer_id.map(PeerId::from_uuid),
         endpoints_advertised_at_ms: stored_endpoints_stamp_ms(row.endpoints_advertised_at_ms)?,
     })
+}
+
+/// Split `peers` (in load order) into one survivor per public key and the
+/// `(superseded, survivor)` pairs. The survivor is the row with the freshest
+/// evidence of use: `last_seen_ms`, then `endpoints_advertised_at_ms`, then
+/// `added_at_ms`. Load order is kept for the survivors.
+pub(super) fn one_peer_per_key(peers: Vec<StoredPeer>) -> (Vec<StoredPeer>, Vec<(PeerId, PeerId)>) {
+    let freshness = |peer: &StoredPeer| {
+        (
+            peer.last_seen_ms,
+            peer.endpoints_advertised_at_ms,
+            peer.added_at_ms,
+        )
+    };
+    let mut best: std::collections::HashMap<&str, &StoredPeer> = std::collections::HashMap::new();
+    for peer in &peers {
+        let slot = best.entry(peer.pubkey_b64.as_str()).or_insert(peer);
+        if freshness(peer) > freshness(slot) {
+            *slot = peer;
+        }
+    }
+    let survivor_of: std::collections::HashMap<String, PeerId> = best
+        .into_iter()
+        .map(|(key, peer)| (key.to_string(), peer.peer_id))
+        .collect();
+    let mut superseded = Vec::new();
+    let mut survivors = Vec::with_capacity(survivor_of.len());
+    for peer in peers {
+        let survivor = survivor_of[&peer.pubkey_b64];
+        if survivor == peer.peer_id {
+            survivors.push(peer);
+        } else {
+            superseded.push((peer.peer_id, survivor));
+        }
+    }
+    (survivors, superseded)
 }

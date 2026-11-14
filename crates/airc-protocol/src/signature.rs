@@ -116,9 +116,17 @@ impl PeerKeyRegistry {
     /// Returns `KeyError::InvalidPublicKey` if the bytes don't
     /// decode as a valid Ed25519 point — substrate refuses garbage
     /// at enrolment rather than at verify time.
+    ///
+    /// One key names one peer: enrolling `pubkey` for `peer` removes any
+    /// binding of the same key to a DIFFERENT peer, so [`Self::find_peer`]
+    /// has exactly one answer. Two ids for one key (#402 twins) let the TLS
+    /// layer bind BigMama's live session to a dead twin id for 44 hours.
     pub fn enrol(&self, peer: PeerId, key_id: u32, pubkey: [u8; 32]) -> Result<(), KeyError> {
         let verifying_key =
             VerifyingKey::from_bytes(&pubkey).map_err(KeyError::InvalidPublicKey)?;
+        self.keys.retain(|(enrolled_peer, _key_id), key| {
+            *enrolled_peer == peer || key.as_bytes() != &pubkey
+        });
         self.keys.insert((peer, key_id), verifying_key);
         Ok(())
     }
@@ -164,11 +172,9 @@ impl PeerKeyRegistry {
     /// `find_peer`, and either binds the connection to the resulting
     /// peer or rejects on miss.
     ///
-    /// Returns the first match (each pubkey should be unique per
-    /// `(peer, key_id)`, but if a duplicate is enrolled, the first
-    /// hit wins). Iteration order is non-deterministic — fine for
-    /// reverse-lookup correctness because we only need to know
-    /// whether ANY match exists.
+    /// The answer is unique: [`Self::enrol`] keeps one peer per key. The
+    /// returned peer becomes the session's identity, so a duplicate here
+    /// would not be harmless (it was not: see `enrol`).
     pub fn find_peer(&self, pubkey: &[u8; 32]) -> Option<(PeerId, u32)> {
         self.keys.iter().find_map(|entry| {
             let ((peer, key_id), key) = entry.pair();

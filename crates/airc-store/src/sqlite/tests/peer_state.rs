@@ -780,3 +780,69 @@ async fn advance_scoped_state_never_moves_back_across_independent_stores() {
         "\"00000063\""
     );
 }
+
+/// what this catches: one public key enrolled under two peer ids. The #402
+/// twin (BigMama's key as both e85a5bb3 and 4731e245) let the TLS layer bind
+/// a live session to the dead id, and catch-up asked that id for 44 hours.
+/// Writing the key's current id removes the older twin, through either
+/// writer, and the surviving row is the one just written.
+#[tokio::test]
+async fn one_public_key_names_one_peer() {
+    let store = SqliteEventStore::in_memory().await.unwrap();
+    let key = "WAxK".repeat(11);
+    let twin = PeerId::from_u128(0x4731);
+    let current = PeerId::from_u128(0xe85a);
+    let other = PeerId::from_u128(0x5159);
+    store.add_peer_trust(twin, key.clone(), 100).await.unwrap();
+    store
+        .add_peer_trust(other, "BzhJ".repeat(11), 100)
+        .await
+        .unwrap();
+    store
+        .add_peer_trust(current, key.clone(), 200)
+        .await
+        .unwrap();
+    let ids: Vec<PeerId> = store
+        .load_peers()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|peer| peer.peer_id)
+        .collect();
+    assert_eq!(ids, vec![other, current]);
+
+    store.replace_peer_trust(twin, key, 300).await.unwrap();
+    let ids: Vec<PeerId> = store
+        .load_peers()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|peer| peer.peer_id)
+        .collect();
+    assert_eq!(ids, vec![other, twin]);
+}
+
+/// what this catches: twins already in a store before supersede-on-write
+/// existed (the M5 held 14 pairs). The reader never sees two ids for one key:
+/// the twin with the freshest evidence of use survives, whatever the load
+/// order, and a key with one row is untouched.
+#[test]
+fn a_loaded_store_keeps_the_freshest_id_for_each_key() {
+    let row = |peer: u128, key: &str, added: u64, seen: u64| StoredPeer {
+        peer_id: PeerId::from_u128(peer),
+        pubkey_b64: key.to_string(),
+        added_at_ms: added,
+        tier: TrustTier::OwnAccount,
+        endpoints_json: None,
+        last_seen_ms: seen,
+        endpoints_peer_id: None,
+        endpoints_advertised_at_ms: 0,
+    };
+    let live = row(0xe85a, "machine", 100, 9_000);
+    let twin = row(0x4731, "machine", 500, 600);
+    let alone = row(0x5159, "other", 50, 50);
+    let (survivors, superseded) =
+        crate::sqlite::trust_ops::one_peer_per_key(vec![alone.clone(), live.clone(), twin.clone()]);
+    assert_eq!(survivors, vec![alone, live.clone()]);
+    assert_eq!(superseded, vec![(twin.peer_id, live.peer_id)]);
+}
