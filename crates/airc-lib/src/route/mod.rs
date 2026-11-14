@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod health;
 pub mod invite;
 pub mod policy;
+pub(crate) mod proven_reach;
 pub mod resolver;
 
 pub(crate) mod execution;
