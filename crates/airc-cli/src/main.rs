@@ -82,6 +82,7 @@ mod route_commands;
 mod route_proof_commands;
 mod runtime_context;
 mod runtime_dir;
+mod send_commands;
 mod sos_commands;
 mod staleness;
 mod state_cli;
@@ -411,7 +412,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
 
         Command::Send { room, text } => {
-            commands::run_send(&home, parsed.peers, room.named(), &text).await
+            send_commands::run_send(&home, parsed.peers, room.named(), &text).await
         }
 
         Command::Listen { replay } => commands::run_listen(&home, parsed.peers, replay).await,
@@ -517,7 +518,7 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .into())
                 }
             };
-            commands::run_msg(
+            send_commands::run_msg(
                 &home,
                 default_or(socket, &home),
                 room.named(),
