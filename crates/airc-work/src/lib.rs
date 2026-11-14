@@ -43,7 +43,7 @@ pub use event::{
     SubmissionRejectionReason, SubmissionReviewRequested, WorkCardClaimed, WorkEvent,
     WorkReviewOutcome, WorkReviewRejectionReason, WorkSubmission, WorkSubmissionReview,
     WorkspaceAllocated, WorkspaceDrainCompleted, WorkspaceDrainRequested, WorkspaceHeartbeat,
-    WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested,
+    WorkspacePressureReported, WorkspaceReleased, WorkspaceRequested, EVIDENCE_TEXT_MAX_BYTES,
 };
 pub use goal::{ExitCondition, Goal, GoalState};
 pub use goal_event::{

@@ -55,6 +55,10 @@ impl AuthorEvidence {
     }
 }
 
+/// The most inline evidence text a signed review or submission carries; a longer receipt names a
+/// blob instead (its ref is the evidence, fetched by hash).
+pub const EVIDENCE_TEXT_MAX_BYTES: usize = 32 * 1024;
+
 /// One rule for any signed evidence (a review's or an author's): a non-empty ref with a bounded
 /// MIME hint, and inline text, when present, non-blank, at most 32 KiB, and exactly the bytes its
 /// hash and size name.
@@ -64,7 +68,7 @@ pub(crate) fn evidence_is_valid(evidence: &airc_blobs::MediaRef, text: Option<&s
     }
     text.is_none_or(|text| {
         !text.trim().is_empty()
-            && text.len() <= 32 * 1024
+            && text.len() <= EVIDENCE_TEXT_MAX_BYTES
             && text.len() as u64 == evidence.size_bytes
             && airc_blobs::ContentHash::from_bytes(text.as_bytes()) == evidence.hash
     })
