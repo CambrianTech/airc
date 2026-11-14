@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use airc_core::{RoomId, TranscriptCursor, TranscriptEvent};
+use airc_core::{ClientId, PeerId, RoomId, TranscriptCursor, TranscriptEvent};
 
 use crate::beacon::StoredBeacon;
 use crate::error::StoreError;
@@ -60,6 +60,25 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// is a new identity, not an update. Multiple rows with
     /// distinct `agent_name`s are legal post-Sub-B (8384cc18).
     async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError>;
+
+    /// Delete a local-identity row **only if** it is still the very
+    /// row the caller inserted — custody cleanup for a losing mint
+    /// (card 0f3b3126).
+    ///
+    /// The WHERE predicate matches the full identity of the inserted
+    /// row: `agent_name` + `peer_id` + `client_id` +
+    /// `expected_public_key`. If any field differs — the row was
+    /// replaced by another mint, or is already gone — zero rows are
+    /// affected and `Ok(false)` is returned. Nothing may be deleted on
+    /// mismatch: a winner's row or a replacement row must never be
+    /// removed by name alone.
+    async fn delete_local_identity_if_matching(
+        &self,
+        agent_name: &str,
+        peer_id: PeerId,
+        client_id: ClientId,
+        expected_public_key: Option<Vec<u8>>,
+    ) -> Result<bool, StoreError>;
 
     /// Replace only the user-facing identity card fields on the
     /// singleton row. Peer/client ids are immutable.

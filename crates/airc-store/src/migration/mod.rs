@@ -37,6 +37,7 @@ mod m20260723_000019_add_peer_trust_endpoints_stamp;
 mod m20260723_000020_add_peer_trust_endpoints_peer;
 mod m20261029_000021_add_event_addressing;
 mod m20261029_000022_create_event_headers;
+mod m20261105_000023_add_local_identity_expected_public_key;
 
 pub struct Migrator;
 
@@ -66,6 +67,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260723_000020_add_peer_trust_endpoints_peer::Migration),
             Box::new(m20261029_000021_add_event_addressing::Migration),
             Box::new(m20261029_000022_create_event_headers::Migration),
+            Box::new(m20261105_000023_add_local_identity_expected_public_key::Migration),
         ]
     }
 }

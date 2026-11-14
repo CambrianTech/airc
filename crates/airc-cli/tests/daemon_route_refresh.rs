@@ -169,6 +169,10 @@ async fn scenario(restart_addressed: bool) {
     }
     if restart_addressed {
         use airc_lib::addressed::InboxError;
+        // Under custody (card 32f7dd97) attach never mints: the named scope is initialised first.
+        Airc::initialize_as(&bob_home, "restart-bob")
+            .await
+            .expect("initialise the surviving Bob scope");
         let bob = Airc::attach_as(&bob_home, "restart-bob", socket.clone())
             .await
             .expect("attach surviving Bob scope");

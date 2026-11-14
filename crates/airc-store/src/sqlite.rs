@@ -332,6 +332,7 @@ impl SqliteEventStore {
                 created_at_ms: i64_to_u64("local_identity.created_at_ms", m.created_at_ms)?,
                 identity: identity_from_row(&m),
                 agent_name: m.agent_name,
+                expected_public_key: m.expected_public_key,
             })
         })
         .transpose()
@@ -379,11 +380,46 @@ impl SqliteEventStore {
             fingerprint: Set(identity.identity.fingerprint),
             integrations_json: Set(serde_json::to_value(identity.identity.integrations)?),
             agent_name: Set(identity.agent_name),
+            expected_public_key: Set(identity.expected_public_key),
         };
         local_identity::Entity::insert(active)
             .exec(&self.db)
             .await?;
         Ok(())
+    }
+    /// Delete a local-identity row **only if** it is still the very row the
+    /// caller inserted — custody cleanup for a losing mint (card 0f3b3126).
+    ///
+    /// A concurrent mint that wins a case-insensitive key-path race leaves
+    /// the loser with its own just-inserted row and no key file. The loser
+    /// must remove exactly that row — never a winner's or replacement row.
+    /// The WHERE clause therefore matches the full identity of the inserted
+    /// row (agent_name + peer_id + client_id + expected_public_key); if any
+    /// field differs (row replaced, or already gone) zero rows are affected
+    /// and `false` is returned — nothing is deleted on mismatch.
+    pub async fn delete_local_identity_if_matching(
+        &self,
+        agent_name: &str,
+        peer_id: PeerId,
+        client_id: ClientId,
+        expected_public_key: Option<Vec<u8>>,
+    ) -> Result<bool, StoreError> {
+        let _write = self.admit_write().await?;
+        // Repository delete_many().filter(...) pattern (same shape as the
+        // beacon_channel deletion in sqlite/event_store.rs): one statement,
+        // exact-row predicate, no model round-trip.
+        let mut query = local_identity::Entity::delete_many()
+            .filter(local_identity::Column::AgentName.eq(agent_name.to_string()))
+            .filter(local_identity::Column::PeerId.eq(peer_id.as_uuid()))
+            .filter(local_identity::Column::ClientId.eq(client_id.as_uuid()));
+        match expected_public_key {
+            Some(bytes) => {
+                query = query.filter(local_identity::Column::ExpectedPublicKey.eq(bytes))
+            }
+            None => query = query.filter(local_identity::Column::ExpectedPublicKey.is_null()),
+        }
+        let res = query.exec(&self.db).await?;
+        Ok(res.rows_affected == 1)
     }
 
     /// Replace the user-facing identity card on the singleton row.

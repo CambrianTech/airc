@@ -17,6 +17,23 @@ impl EventStore for SqliteEventStore {
         SqliteEventStore::insert_local_identity(self, identity).await
     }
 
+    async fn delete_local_identity_if_matching(
+        &self,
+        agent_name: &str,
+        peer_id: PeerId,
+        client_id: ClientId,
+        expected_public_key: Option<Vec<u8>>,
+    ) -> Result<bool, StoreError> {
+        SqliteEventStore::delete_local_identity_if_matching(
+            self,
+            agent_name,
+            peer_id,
+            client_id,
+            expected_public_key,
+        )
+        .await
+    }
+
     async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {
         SqliteEventStore::save_local_identity_card(self, identity).await
     }

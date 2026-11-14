@@ -17,4 +17,8 @@ pub struct StoredLocalIdentity {
     /// [`DEFAULT_AGENT_NAME`]; Sub-D's CLI surface creates distinct
     /// names.
     pub agent_name: String,
+    /// Custody binding (card 0f3b3126): the public key this row's secret must
+    /// derive at load time. Set by mint and legacy-json migration; `None` on
+    /// pre-binding rows, where load has nothing to check against.
+    pub expected_public_key: Option<Vec<u8>>,
 }
