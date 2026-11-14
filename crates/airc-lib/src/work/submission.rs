@@ -119,6 +119,18 @@ impl Airc {
         room: &Room,
         request: SubmitWork,
     ) -> Result<airc_work::WorkSubmission, AircError> {
+        self.submit_work_with_evidence_in(room, request, airc_work::AuthorEvidence::Absent)
+            .await
+    }
+
+    /// [`Self::submit_work_in`] with the author's receipts signed into the submission (a capture,
+    /// a measurement, a test run): the reviewer reads them beside the diff.
+    pub async fn submit_work_with_evidence_in(
+        &self,
+        room: &Room,
+        request: SubmitWork,
+        evidence: airc_work::AuthorEvidence,
+    ) -> Result<airc_work::WorkSubmission, AircError> {
         let board = self.work_board_in(room).await?;
         let card = board
             .card(request.card_id)
@@ -133,6 +145,7 @@ impl Airc {
             artifact: request.artifact,
             publisher: self.peer_id(),
             submitted_at_ms: now_ms()?,
+            evidence,
         };
         if let Some(prior) = card
             .submissions

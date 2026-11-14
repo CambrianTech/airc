@@ -23,6 +23,7 @@ fn submission(head: airc_work::SubmissionHead) -> WorkSubmission {
         },
         publisher: peer(10),
         submitted_at_ms: 1,
+        evidence: airc_work::AuthorEvidence::Absent,
     }
 }
 
