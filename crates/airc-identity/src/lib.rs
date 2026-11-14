@@ -300,7 +300,10 @@ impl LocalIdentity {
     /// The identity named `agent_name` in `home`, read only: `None` when it has not been created
     /// yet, and nothing is written either way. For a reader that must know who a citizen is
     /// without starting her (a desktop learning its viewer while her runtime is still booting).
-    pub async fn load_as(home: &Path, agent_name: impl AsRef<str>) -> Result<Option<Self>, IdentityError> {
+    pub async fn load_as(
+        home: &Path,
+        agent_name: impl AsRef<str>,
+    ) -> Result<Option<Self>, IdentityError> {
         let agent_name = normalise_agent_name(agent_name.as_ref())?;
         if !Self::key_path(home).exists() {
             return Ok(None);
@@ -648,12 +651,27 @@ mod tests {
     #[tokio::test]
     async fn load_as_reads_without_writing() {
         let home = TempDir::new().unwrap();
-        assert!(LocalIdentity::load_as(home.path(), "joel").await.unwrap().is_none());
-        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "a read writes nothing");
-        let made = LocalIdentity::load_or_generate_as(home.path(), "joel").await.unwrap();
-        let read = LocalIdentity::load_as(home.path(), "joel").await.unwrap().unwrap();
+        assert!(LocalIdentity::load_as(home.path(), "joel")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::read_dir(home.path()).unwrap().count(),
+            0,
+            "a read writes nothing"
+        );
+        let made = LocalIdentity::load_or_generate_as(home.path(), "joel")
+            .await
+            .unwrap();
+        let read = LocalIdentity::load_as(home.path(), "joel")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(read.peer_id, made.peer_id);
-        assert!(LocalIdentity::load_as(home.path(), "someone-else").await.unwrap().is_none());
+        assert!(LocalIdentity::load_as(home.path(), "someone-else")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
