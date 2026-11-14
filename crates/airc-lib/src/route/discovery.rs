@@ -446,6 +446,13 @@ impl Airc {
         let mut declared_hosts: std::collections::HashMap<PeerId, PeerId> =
             std::collections::HashMap::new();
         let mut ghost_peers_skipped = 0usize;
+        let proven = super::proven_reach::ProvenReach::from_evidence(
+            &self
+                .delivery_ledger()
+                .map(|ledger| ledger.snapshot())
+                .unwrap_or_default(),
+            &stored,
+        );
         for peer in stored {
             if peer.peer_id == self.inner.identity.peer_id
                 || connected.contains(&peer.peer_id)
@@ -465,8 +472,11 @@ impl Airc {
             // connected peer is already skipped above; a freshly-enrolled peer
             // has `last_seen_ms` floored to `added_at_ms`, so fresh adds dial
             // normally. Same TTL as the registry's liveness definition (one
-            // source of truth).
-            if is_ghost_peer(now_ms, peer.last_seen_ms) {
+            // source of truth). An identity that ACKNOWLEDGED frames in this
+            // daemon's life is never a ghost, whatever its beacon says: the
+            // dial quarantine bounds the cost of re-dialing it
+            // (`proven_reach` has the 44-hour partition this prevents).
+            if is_ghost_peer(now_ms, peer.last_seen_ms) && !proven.proves(&peer) {
                 ghost_peers_skipped += 1;
                 continue;
             }

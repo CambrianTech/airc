@@ -399,7 +399,10 @@ pub(crate) async fn poll_fallback_once(home: &Path) -> Result<usize, Box<dyn Err
         return Ok(0);
     };
     let cursor_path = join_cursor_path(home);
-    let printed = poll_once(&gist_id, &label, &cursor_path)?;
+    let comments = fetch_comments(&gist_id)?;
+    let printed = deliver_comments(&comments, &label, &cursor_path, |body| {
+        println!("{}", fallback_line(body))
+    })?;
     if printed > 0 {
         eprintln!(
             "airc: {printed} message(s) above arrived over the SOS fallback, NOT the live wire \
@@ -407,6 +410,16 @@ pub(crate) async fn poll_fallback_once(home: &Path) -> Result<usize, Box<dyn Err
         );
     }
     Ok(printed)
+}
+
+/// Marker on every SOS line the join stream prints. The line must say which
+/// channel carried it: the stream mixes it with live-wire events, and an SOS
+/// post is not a mesh event, so `airc inbox` can never find it (the M5 read
+/// Codex's posts as room messages on 2026-11-14 and searched every room).
+const FALLBACK_MARKER: &str = "[via SOS gist, not the mesh; `airc sos status`]";
+
+fn fallback_line(body: &str) -> String {
+    format!("{FALLBACK_MARKER} {body}")
 }
 
 fn poll_once(gist_id: &str, my_label: &str, cursor_path: &Path) -> Result<usize, Box<dyn Error>> {
@@ -733,6 +746,16 @@ mod tests {
                 0
             );
         }
+    }
+
+    // what this catches: SOS posts printed into the join stream looking like
+    // room messages. The reader then searches `airc inbox` for them, where
+    // they can never be, because the mesh never carried them.
+    #[test]
+    fn a_join_fallback_line_names_the_channel_that_carried_it() {
+        let line = fallback_line("[BIGMAMA] Codex to Fable: ping");
+        assert!(line.starts_with(FALLBACK_MARKER));
+        assert!(line.ends_with("[BIGMAMA] Codex to Fable: ping"));
     }
 
     #[test]
