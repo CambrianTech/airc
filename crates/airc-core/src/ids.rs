@@ -1,9 +1,12 @@
 //! Newtype-wrapped identifier types.
 //!
-//! Every internal id in airc-rust is a UUIDv4 — the right primitive for
-//! a P2P mesh substrate where peers generate ids locally without a
-//! central coordinator. See the substrate design doc, section
-//! "Identifiers — UUIDv4 everywhere," for the full rationale.
+//! Every internal id is a UUIDv7: generated locally with no central coordinator (what a P2P mesh
+//! needs) and time-ordered, so ordering by id is creation order. An id index then appends instead
+//! of scattering, and a page cursor over ids pages newest-first without a second timestamp column.
+//! Ids minted earlier as v4 stay valid: an id's value is opaque, only new ids carry the order.
+//!
+//! [`uuid_newtype!`] is exported so every crate declares its ids the same way (Copy, serde as the
+//! bare canonical string, `.shown()` for the short form [`crate::shown_id`] parses back).
 //!
 //! Wire shape: serde encodes `Uuid` as the canonical hyphenated string
 //! (`"550e8400-e29b-41d4-a716-446655440000"`), so JSON envelopes stay
@@ -12,7 +15,7 @@
 //! `{"value": ...}` wrapper.
 //!
 //! Generation: `EventId::new()`, `RoomId::new()`, etc. all delegate to
-//! `Uuid::new_v4()`. Tests that need deterministic ids use
+//! `Uuid::now_v7()`. Tests that need deterministic ids use
 //! `EventId::from_u128(N)` (also exposed below).
 //!
 //! Exception: `ContentHash` is NOT a UUID — it carries a content-
@@ -23,41 +26,43 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[macro_export]
 macro_rules! uuid_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(
-            Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+            ::serde::Serialize, ::serde::Deserialize,
         )]
         #[serde(transparent)]
-        pub struct $name(pub Uuid);
+        pub struct $name(pub ::uuid::Uuid);
 
         impl $name {
-            /// Generate a fresh random UUIDv4.
+            /// Mint a fresh id: a UUIDv7, time-ordered.
             pub fn new() -> Self {
-                Self(Uuid::new_v4())
+                Self(::uuid::Uuid::now_v7())
             }
 
             /// Construct from a known u128 — for deterministic test ids.
             /// Production code should use `new()`.
             pub fn from_u128(value: u128) -> Self {
-                Self(Uuid::from_u128(value))
+                Self(::uuid::Uuid::from_u128(value))
             }
 
             /// Construct from an existing Uuid (e.g. one parsed from
             /// the wire).
-            pub fn from_uuid(uuid: Uuid) -> Self {
+            pub fn from_uuid(uuid: ::uuid::Uuid) -> Self {
                 Self(uuid)
             }
 
             /// Access the underlying Uuid.
-            pub fn as_uuid(&self) -> Uuid {
+            pub fn as_uuid(&self) -> ::uuid::Uuid {
                 self.0
             }
 
             /// The short form every surface displays and a caller types back.
             pub fn shown(&self) -> String {
-                crate::shown_id::shown_form(self.0)
+                $crate::shown_id::shown_form(self.0)
             }
         }
 
