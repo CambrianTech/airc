@@ -89,10 +89,12 @@ mod tests {
             other_daemon.verify(&proof, &registry),
             Err(AttachAuthError::InvalidSignature)
         );
+        // Another peer, with its own key: one public key names one peer, so
+        // `key` cannot also be enrolled for it (#1674).
         let mut other_peer = challenge.clone();
         other_peer.peer = PeerId::new();
         registry
-            .enrol(other_peer.peer, 7, key.public_bytes())
+            .enrol(other_peer.peer, 7, PeerKeypair::generate().public_bytes())
             .unwrap();
         assert_eq!(
             other_peer.verify(&proof, &registry),
