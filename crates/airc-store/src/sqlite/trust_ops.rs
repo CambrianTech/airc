@@ -18,13 +18,15 @@ impl SqliteEventStore {
         peer_id: PeerId,
         pubkey_b64: &str,
     ) -> Result<Vec<PeerId>, StoreError> {
-        let twins = peer_trust::Entity::find()
+        // One row at a time: after load_peers' collapse a key has at most one
+        // other row, so this reads one row and stops.
+        let mut superseded = Vec::new();
+        while let Some(twin) = peer_trust::Entity::find()
             .filter(peer_trust::Column::PubkeyB64.eq(pubkey_b64))
             .filter(peer_trust::Column::PeerId.ne(peer_id.as_uuid()))
-            .all(&self.db)
-            .await?;
-        let mut superseded = Vec::with_capacity(twins.len());
-        for twin in twins {
+            .one(&self.db)
+            .await?
+        {
             peer_trust::Entity::delete_by_id(twin.peer_id)
                 .exec(&self.db)
                 .await?;
@@ -40,6 +42,7 @@ impl SqliteEventStore {
         }
         Ok(superseded)
     }
+
     /// Every enrolled peer, one row per public key.
     ///
     /// Rows that share a key with another row (#402 twins: see
