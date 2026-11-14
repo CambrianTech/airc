@@ -297,6 +297,21 @@ impl LocalIdentity {
     /// Load an existing identity (both halves must exist). Public
     /// for the cases that already know they have a populated
     /// install and want to fail loudly if either half is missing.
+    /// The identity named `agent_name` in `home`, read only: `None` when it has not been created
+    /// yet, and nothing is written either way. For a reader that must know who a citizen is
+    /// without starting her (a desktop learning its viewer while her runtime is still booting).
+    pub async fn load_as(home: &Path, agent_name: impl AsRef<str>) -> Result<Option<Self>, IdentityError> {
+        let agent_name = normalise_agent_name(agent_name.as_ref())?;
+        if !Self::key_path(home).exists() {
+            return Ok(None);
+        }
+        let store = open_store(home).await?;
+        match store.load_local_identity_by_agent_name(&agent_name).await? {
+            Some(stored) => Self::load_with_metadata_for_agent(home, stored, &agent_name).map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub async fn load(home: &Path) -> Result<Self, IdentityError> {
         let agent_name = requested_agent_name(None)?;
         let store = open_store(home).await?;
@@ -625,6 +640,20 @@ mod tests {
         assert_eq!(first.peer_id, second.peer_id);
         assert_eq!(first.client_id, second.client_id);
         assert_eq!(first.agent_name, airc_store::DEFAULT_AGENT_NAME);
+    }
+
+    // what this catches: a reader that must learn who a citizen is minting her identity (a race
+    // with her runtime's first boot), or failing while it exists. Absent = None and nothing written;
+    // present = the same peer her runtime loads.
+    #[tokio::test]
+    async fn load_as_reads_without_writing() {
+        let home = TempDir::new().unwrap();
+        assert!(LocalIdentity::load_as(home.path(), "joel").await.unwrap().is_none());
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "a read writes nothing");
+        let made = LocalIdentity::load_or_generate_as(home.path(), "joel").await.unwrap();
+        let read = LocalIdentity::load_as(home.path(), "joel").await.unwrap().unwrap();
+        assert_eq!(read.peer_id, made.peer_id);
+        assert!(LocalIdentity::load_as(home.path(), "someone-else").await.unwrap().is_none());
     }
 
     #[tokio::test]
