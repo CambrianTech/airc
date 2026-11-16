@@ -6,7 +6,7 @@
 //! `airc-store` so each attach starts at "new since last seen" instead
 //! of replaying the full transcript.
 
-use airc_core::{MentionTarget, PeerId, RoomId, TranscriptEvent, TranscriptKind};
+use airc_core::{RoomId, TranscriptEvent, TranscriptKind};
 use airc_lib::{Airc, DaemonReach, LiveLag};
 use futures::stream::StreamExt;
 use std::io::Write;
@@ -227,10 +227,12 @@ async fn print_delivery_turn(
         }
     };
     let live_end = turn.live_events().len().min(turn.budget);
+    // The one "is this for me" rule (addressing.rs): a typed target, or a leading @name / shown id
+    let me = airc.addressee().await?;
     let mut ambient = 0usize;
     let mut ambient_rooms = std::collections::HashSet::new();
     for event in &turn.live_events()[..live_end] {
-        if room.is_none_or(|focus| foreground(event, focus, airc.peer_id())) {
+        if room.is_none_or(|focus| foreground(event, focus, &me)) {
             print_event(event, self_filter, output, attached_at_ms)?;
         } else {
             ambient += 1;
@@ -244,7 +246,6 @@ async fn print_delivery_turn(
     // it is counted once per attachment, with its original times, and settled
     // (card ba22c72c). It stays durable for `airc inbox`.
     let history = if announce_history {
-        let me = airc.addressee().await?;
         let window = airc_lib::AddressedWindow {
             candidates: CATCH_UP_LIMIT,
             page: turn.budget,
@@ -286,8 +287,12 @@ async fn print_delivery_turn(
     Ok(pending)
 }
 
-fn foreground(event: &TranscriptEvent, focus: RoomId, peer: PeerId) -> bool {
-    event.room_id == focus || matches!(event.target, MentionTarget::Peer(target) if target == peer)
+/// Printed in full: the focused room's traffic, and anything addressed to me in any room. An
+/// addressed request is never reduced to an ambient count (addressing.rs's contract); before this,
+/// only a typed peer target counted, so `@Fable ...` in a sibling room read as "1 events in 1 other
+/// rooms" and Codex's replies went unseen for an afternoon (2026-11-16).
+fn foreground(event: &TranscriptEvent, focus: RoomId, me: &airc_lib::Addressee) -> bool {
+    event.room_id == focus || me.is_addressed(event)
 }
 
 fn consumer_id(runtime_client: Option<&str>) -> String {
@@ -359,6 +364,12 @@ mod tests {
         airc.append_event(event(&airc, other, 1, "claude:peer", "ambient-body"))
             .await
             .unwrap();
+        // regression (2026-11-16): a leading @name in a sibling room is addressed to me, so it prints;
+        // the feed used to honour only a typed peer target and counted this as ambient
+        let named = format!("@{} named-request", airc.agent_name());
+        airc.append_event(event(&airc, other, 2, "claude:peer", &named))
+            .await
+            .unwrap();
         // Exercise the public publish path, not a hand-crafted transcript target.
         // A different runtime represents a peer session on this shared account.
         airc.publish(
@@ -378,6 +389,10 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("direct-challenge"));
+        assert!(
+            text.contains("named-request"),
+            "an @name request in another room is shown in full: {text}"
+        );
         assert!(text.contains("room-message"));
         assert!(!text.contains("ambient-body"));
         assert!(text.contains("Ambient activity: 1 events in 1 other rooms"));
