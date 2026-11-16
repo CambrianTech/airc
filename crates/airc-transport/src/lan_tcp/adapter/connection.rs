@@ -23,7 +23,7 @@ use crate::lan_tcp::adapter::error::LanTcpError;
 use crate::lan_tcp::adapter::inner::{
     Inner, Outbound, Session, MAX_FRAME_BYTES, OUTBOUND_CHANNEL_DEPTH,
 };
-use crate::lan_tcp::cert::extract_ed25519_pubkey;
+use crate::lan_tcp::cert::{extract_ed25519_pubkey, extract_peer_id};
 
 /// Post-handshake server-side connection handler: bind the peer
 /// identity from the cert, install the outbound channel
@@ -74,10 +74,11 @@ fn resolve_peer_from_server_stream(
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
+    let peer = extract_peer_id(cert).ok()?;
     inner
         .registry
-        .find_peer(&pubkey)
-        .map(|(peer, _key_id)| (peer, pubkey))
+        .has_key(peer, &pubkey)
+        .then_some((peer, pubkey))
 }
 
 fn resolve_peer_from_client_stream(
@@ -87,10 +88,11 @@ fn resolve_peer_from_client_stream(
     let certs = tls_stream.get_ref().1.peer_certificates()?;
     let cert = certs.first()?;
     let pubkey = extract_ed25519_pubkey(cert).ok()?;
+    let peer = extract_peer_id(cert).ok()?;
     inner
         .registry
-        .find_peer(&pubkey)
-        .map(|(peer, _key_id)| (peer, pubkey))
+        .has_key(peer, &pubkey)
+        .then_some((peer, pubkey))
 }
 
 /// Install the outbound channel into `inner` **before** spawning the

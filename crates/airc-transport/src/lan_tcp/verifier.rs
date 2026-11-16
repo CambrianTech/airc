@@ -7,17 +7,15 @@
 //!
 //! - **`PinnedServerVerifier`** — client-side. The caller knows which
 //!   peer they're dialing (passed at construction). The verifier
-//!   accepts the server cert iff its subject pubkey matches one of
+//!   accepts the server cert iff its UUID CN names that peer and its pubkey matches one of
 //!   the expected peer's enrolled keys. Wrong peer / wrong key →
 //!   reject. Cert isn't Ed25519 → reject. Pubkey not enrolled →
 //!   reject. There is no path that accepts an unknown server.
 //!
 //! - **`PinnedClientVerifier`** — server-side. The server can't know
 //!   in advance which peer is connecting, so the verifier accepts any
-//!   client whose cert pubkey is enrolled in the registry for ANY
-//!   peer. Caller looks up the peer post-handshake via
-//!   `PeerKeyRegistry::find_peer` for connection binding. Cert not in
-//!   registry → reject.
+//!   client whose UUID CN and subject key are enrolled together. The
+//!   connection binds that exact certificate identity after the handshake.
 //!
 //! Both verifiers reject:
 //!   - Malformed cert DER
@@ -26,7 +24,7 @@
 //!
 //! There is no "fall back to standard PKI" path. There is no
 //! "allow self-signed" toggle. The only acceptance criterion is
-//! "this pubkey is in the registry."
+//! "this certificate identity and key are enrolled together."
 
 use std::sync::Arc;
 
@@ -38,7 +36,7 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use airc_core::PeerId;
 use airc_protocol::PeerKeyRegistry;
 
-use crate::lan_tcp::cert::extract_ed25519_pubkey;
+use crate::lan_tcp::cert::{extract_ed25519_pubkey, extract_peer_id};
 
 /// Schemes we tell rustls we can verify for. Just Ed25519 — substrate
 /// identity is exclusively Ed25519, no fall-back ciphers.
@@ -112,24 +110,20 @@ impl ServerCertVerifier for PinnedServerVerifier {
         let pubkey = extract_ed25519_pubkey(end_entity)
             .map_err(|error| RustlsError::General(error.to_string()))?;
 
-        // Pin to the requested identity's key, not an arbitrary reverse-lookup alias.
-        if self.registry.has_key(self.expected_peer, &pubkey) {
-            return Ok(ServerCertVerified::assertion());
+        let claimed =
+            extract_peer_id(end_entity).map_err(|error| RustlsError::General(error.to_string()))?;
+        if !self.registry.has_key(claimed, &pubkey) {
+            return Err(RustlsError::General(format!(
+                "server cert key is not enrolled for peer {claimed}"
+            )));
         }
-        match self.registry.find_peer(&pubkey) {
-            Some((peer, _)) => Err(RustlsError::General(peer_identity_mismatch_error(
-                peer,
+        if claimed != self.expected_peer {
+            return Err(RustlsError::General(peer_identity_mismatch_error(
+                claimed,
                 self.expected_peer,
-            ))),
-            None => Err(RustlsError::General(format!(
-                "server cert pubkey is not enrolled (expected peer {}) — either the \
-                 server runs an identity you never enrolled (compare `airc init` \
-                 output there), or this client consulted a different trust store \
-                 than the one you enrolled into (stores are per-scope; see the \
-                 lan-send preflight error for the store path)",
-                self.expected_peer
-            ))),
+            )));
         }
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -196,14 +190,13 @@ impl ClientCertVerifier for PinnedClientVerifier {
         let pubkey = extract_ed25519_pubkey(end_entity)
             .map_err(|error| RustlsError::General(error.to_string()))?;
 
-        // Any enrolled peer is acceptable; the adapter will read the
-        // cert pubkey post-handshake and bind the connection to the
-        // resolved PeerId. Pubkey not in registry → reject.
-        if self.registry.find_peer(&pubkey).is_some() {
+        let claimed =
+            extract_peer_id(end_entity).map_err(|error| RustlsError::General(error.to_string()))?;
+        if self.registry.has_key(claimed, &pubkey) {
             Ok(ClientCertVerified::assertion())
         } else {
             Err(RustlsError::General(
-                "client cert pubkey is not enrolled in the peer key registry".to_string(),
+                "client cert key is not enrolled for its claimed peer".to_string(),
             ))
         }
     }
@@ -291,6 +284,29 @@ mod tests {
     }
 
     #[test]
+    fn another_enrolled_key_cannot_claim_a_peers_identity() {
+        let owner = PeerId::from_u128(0xa1);
+        let other = PeerId::from_u128(0xb2);
+        let owner_key = PeerKeypair::generate();
+        let other_key = PeerKeypair::generate();
+        let registry = make_registry_with(owner, &owner_key);
+        registry.enrol(other, 0, other_key.public_bytes()).unwrap();
+        let (forged, _) = generate_self_signed_cert(&other_key, owner).unwrap();
+        let client = PinnedClientVerifier::new(registry.clone());
+        assert!(client.verify_client_cert(&forged, &[], unix_now()).is_err());
+        let server = PinnedServerVerifier::new(other, registry);
+        let error = server
+            .verify_server_cert(
+                &forged,
+                &[],
+                &ServerName::try_from("localhost").unwrap(),
+                &[],
+                unix_now(),
+            )
+            .unwrap_err();
+        assert_eq!(presented_peer_from_mismatch_error(&error.to_string()), None);
+    }
+    #[test]
     fn server_verifier_accepts_expected_peer_cert() {
         // The base secure case: dialing peer A, A's cert presents
         // their enrolled key → verify_server_cert returns Ok.
@@ -306,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn server_verifier_checks_each_alias_pin_independently() {
+    fn server_verifier_requires_certificate_identity_even_for_same_key() {
         let primary = PeerId::from_u128(0xa1);
         let alias = PeerId::from_u128(0xa2);
         let keypair = PeerKeypair::generate();
@@ -316,9 +332,12 @@ mod tests {
         let server_name = ServerName::try_from("localhost").unwrap();
         for peer in [primary, alias] {
             let verifier = PinnedServerVerifier::new(peer, registry.clone());
-            assert!(verifier
-                .verify_server_cert(&cert, &[], &server_name, &[], unix_now())
-                .is_ok());
+            assert_eq!(
+                verifier
+                    .verify_server_cert(&cert, &[], &server_name, &[], unix_now())
+                    .is_ok(),
+                peer == primary
+            );
         }
         registry.remove_peer(alias);
         let verifier = PinnedServerVerifier::new(alias, registry);
