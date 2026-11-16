@@ -319,12 +319,43 @@ pub fn legacy_socket_paths_in(home: &std::path::Path, canonical: &std::path::Pat
     let Some(user_home) = read_user_home_from_env() else {
         return Vec::new();
     };
-    legacy_socket_paths_for(&crate::machine_account_home(home), &user_home)
+    legacy_candidates_for(&crate::machine_account_home(home), &user_home, canonical)
+}
+
+fn legacy_candidates_for(
+    machine_home: &std::path::Path,
+    user_home: &std::path::Path,
+    canonical: &std::path::Path,
+) -> Vec<PathBuf> {
+    let mut candidates = legacy_socket_paths_for(machine_home, user_home);
+    if candidates.is_empty() {
+        return candidates;
+    }
+    candidates.extend(previous_versioned_endpoints(canonical));
+    candidates
         .into_iter()
         .filter(|candidate| normalized_path(candidate) != normalized_path(canonical))
         .collect()
 }
 
+// A protocol bump changes the canonical socket name but does not stop its old
+// owner. Only derive bounded historical names for this exact account endpoint;
+// the updater still proves live identity/protocol before requesting shutdown.
+fn previous_versioned_endpoints(canonical: &std::path::Path) -> Vec<PathBuf> {
+    let Some(name) = canonical.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let suffix = format!("-v{}.sock", airc_ipc::IPC_PROTOCOL_VERSION);
+    let Some(stem) = name
+        .strip_suffix(&suffix)
+        .filter(|stem| stem.starts_with("airc-machine-"))
+    else {
+        return Vec::new();
+    };
+    (1..airc_ipc::IPC_PROTOCOL_VERSION)
+        .map(|version| canonical.with_file_name(format!("{stem}-v{version}.sock")))
+        .collect()
+}
 fn legacy_socket_paths_for(
     machine_home: &std::path::Path,
     user_home: &std::path::Path,
@@ -363,6 +394,30 @@ fn machine_account_key(path: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn adoption_finds_previous_version_owner_in_the_same_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().join(format!(
+            "airc-machine-account-v{}.sock",
+            airc_ipc::IPC_PROTOCOL_VERSION
+        ));
+        let old = root.path().join("airc-machine-account-v5.sock");
+        let account = root.path().join(".airc");
+        std::fs::create_dir_all(&account).unwrap();
+        let candidates = legacy_candidates_for(&account, root.path(), &canonical);
+        assert!(
+            legacy_candidates_for(&root.path().join("foreign"), root.path(), &canonical).is_empty()
+        );
+        assert!(
+            candidates.contains(&old),
+            "the live v5 owner must not survive v6 adoption"
+        );
+        assert!(!candidates.contains(&canonical));
+        assert!(previous_versioned_endpoints(&canonical)
+            .iter()
+            .all(|path| path.parent() == canonical.parent()));
+        assert!(previous_versioned_endpoints(&root.path().join("custom.sock")).is_empty());
+    }
     #[test]
     fn account_aliases_share_canonical_socket_and_bounded_legacy_candidates() {
         let root = tempfile::tempdir().unwrap();
