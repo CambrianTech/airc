@@ -61,10 +61,12 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// distinct `agent_name`s are legal post-Sub-B (8384cc18).
     async fn insert_local_identity(&self, identity: StoredLocalIdentity) -> Result<(), StoreError>;
 
-    /// Replace only the user-facing identity card fields on the
-    /// singleton row. Peer/client ids are immutable.
+    /// Replace only the user-facing card for the required agent discriminator.
+    /// A missing agent is an error; never fall back to another identity row.
+    /// Peer/client ids, creation metadata and the agent discriminator are immutable.
     async fn save_local_identity_card(
         &self,
+        agent_name: &str,
         identity: airc_core::identity::Identity,
     ) -> Result<(), StoreError>;
 

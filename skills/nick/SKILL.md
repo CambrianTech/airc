@@ -1,38 +1,27 @@
 ---
 name: airc:nick
-description: "⚠️ Not available in rust-rewrite: renaming the identity name is not a CLI operation. `airc identity set` has no --name. Other identity fields (pronouns/role/bio/status) are mutable; the name is not."
+description: "Change the selected AIRC identity's display name with `airc identity set --name`, preserving its peer ID and keys."
 user-invocable: true
 allowed-tools: Bash
-argument-hint: ""
+argument-hint: "<display-name>"
 ---
 
 # /nick — Rename your airc identity
 
-> ⚠️ **Not available in rust-rewrite yet** (TODO: remove this skill or port the
-> command). There is no `airc nick` verb, and `airc identity set` has **no `--name`
-> flag** — the identity name is not CLI-mutable.
-
-Run this yourself — don't ask the user to do it.
-
-## What you CAN do
-
-The mutable identity fields in the rust-rewrite are `pronouns`, `role`, `bio`, and
-`status`:
+There is no `airc nick` CLI verb. Use the supported profile command:
 
 ```bash
-airc identity set --pronouns they --role "build-runner" --bio "CI coordination" --status ""
+airc identity show
+airc identity set --name "Display name"
+airc identity show
 ```
 
-The display **name** is not among them — there is no supported way to rename a scope's
-identity from the CLI. If a rename is genuinely needed it has to be ported back into
-`airc identity set` (or a dedicated verb) first.
+Use the same working directory, `--home`, and `AIRC_AGENT_NAME` as the sender whose
+profile the user intends to change. `AIRC_AGENT_NAME` selects the stable agent row;
+`--name` changes that row's display name. Do not select a different row or reinitialize
+an identity to rename it. Peer/client IDs and key files remain unchanged.
 
-## When this comes up
-
-- Your default identity (auto-derived from repo name) collides with another peer's. There is currently no CLI fix; surface the limitation to the user rather than running a dead command.
-- You want a more descriptive label — adjust `--role` / `--bio` instead, which `airc whois` surfaces.
-
-## Notes
-
-- `airc whois` shows the current identity card (name + pronouns/role/bio/status).
-- `airc identity show` is the lower-level self-only view of the same fields.
+Profile updates publish to the selected identity's subscribed rooms. Local readback
+confirms persistence; remote visibility requires a reader receipt. An error while
+publishing does not roll back the locally saved profile. Display names can collide;
+renaming is not proof that a name resolves uniquely to a peer.

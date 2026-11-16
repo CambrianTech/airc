@@ -226,6 +226,20 @@ pub struct PeerIdentityCard {
     pub emitted_at_ms: u64,
 }
 
+/// Decode a card published by the envelope's own sender. Transport verification
+/// remains upstream; a routed envelope may be signed by its forwarding daemon.
+/// Unrelated bodies are rejected by tag before any identity deserialization.
+pub fn decode_peer_identity_card(sender: PeerId, body: &crate::Body) -> Option<PeerIdentityCard> {
+    let crate::Body::Json(value) = body else {
+        return None;
+    };
+    if value.get("kind").and_then(serde_json::Value::as_str) != Some("peer_identity_card") {
+        return None;
+    }
+    let IdentityEvent::PeerIdentityCard(card) = IdentityEvent::deserialize(value).ok()?;
+    (card.peer_id == sender).then_some(card)
+}
+
 #[cfg(test)]
 mod wire_event_tests {
     use super::*;
@@ -255,6 +269,45 @@ mod wire_event_tests {
         match decoded {
             IdentityEvent::PeerIdentityCard(got) => assert_eq!(got, card),
         }
+
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let body = crate::Body::Json(value.clone());
+        assert_eq!(
+            decode_peer_identity_card(card.peer_id, &body),
+            Some(card.clone())
+        );
+        assert_eq!(
+            decode_peer_identity_card(PeerId::from_u128(43), &body),
+            None
+        );
+        for field in ["peer_id", "identity", "emitted_at_ms"] {
+            let mut malformed = value.clone();
+            malformed.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                decode_peer_identity_card(card.peer_id, &crate::Body::Json(malformed)),
+                None
+            );
+        }
+        let mut malformed = value.clone();
+        malformed["identity"]["name"] = serde_json::json!(42);
+        assert_eq!(
+            decode_peer_identity_card(card.peer_id, &crate::Body::Json(malformed)),
+            None
+        );
+        let mut unrelated = value;
+        unrelated["kind"] = serde_json::json!("unrelated_event");
+        assert_eq!(
+            decode_peer_identity_card(card.peer_id, &crate::Body::Json(unrelated)),
+            None
+        );
+        assert_eq!(
+            decode_peer_identity_card(card.peer_id, &crate::Body::text("hello")),
+            None
+        );
+        assert_eq!(
+            decode_peer_identity_card(card.peer_id, &crate::Body::Binary(vec![1, 2])),
+            None
+        );
     }
 
     #[test]

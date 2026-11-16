@@ -15,8 +15,8 @@
 //!      once in machine B's subscribed scope transcript — and the
 //!      reverse direction too.
 //!   2. Loop prevention: B never forwards A's frame back to A (origin
-//!      link check — observed on B's forwarded-frame counter, which
-//!      counts wire flushes, not deliveries).
+//!      link check — observed before A's owner deduplicates wire arrivals,
+//!      with a later B publication as an ordered forwarding barrier).
 //!   3. Transitive mesh forwarding terminates: A—B—C line topology
 //!      delivers A's message to C exactly once, with no echo storm.
 //!   4. The ring-marked-but-unpersisted retry edge: the remote
@@ -241,6 +241,86 @@ async fn routed_room_send_traverses_lan_both_directions() {
     assert_eq!(copies_in(&recent_a, id_ab), 1);
     let recent_b = op_b.page_recent(64).await.expect("page op-b");
     assert_eq!(copies_in(&recent_b, id_ba), 1);
+
+    // Profile updates use this SAME routed room path, preserving the scope
+    // sender instead of the transport gateway's machine identity.
+    let mut profile = airc_core::identity::Identity::new("Scope A reviewer");
+    profile.status = "reviewing".into();
+    op_a.set_local_identity_card(profile.clone())
+        .await
+        .expect("update profile");
+    let published = op_a
+        .page_recent(64)
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|event| {
+            event.kind == airc_core::TranscriptKind::IdentityPublished
+                && event.peer_id == op_a.peer_id()
+                && event
+                    .body
+                    .as_ref()
+                    .and_then(|body| {
+                        airc_core::identity::decode_peer_identity_card(event.peer_id, body)
+                    })
+                    .is_some_and(|card| card.identity == profile)
+        })
+        .expect("profile is in the publishing daemon transcript");
+    assert_eq!(wait_for_copies(&op_b, published.event_id).await, 1);
+
+    let victim_before = op_b.peer_identity_card(op_b.peer_id()).await.unwrap();
+    let spoof = airc_core::identity::IdentityEvent::PeerIdentityCard(
+        airc_core::identity::PeerIdentityCard {
+            peer_id: op_b.peer_id(),
+            identity: airc_core::identity::Identity::new("forged victim name"),
+            emitted_at_ms: published.occurred_at_ms.saturating_add(1_000),
+        },
+    );
+    let rejected = op_a
+        .publish(
+            airc_lib::PublishTarget::CurrentRoom,
+            airc_protocol::FrameKind::Event,
+            Body::Json(serde_json::to_value(spoof).unwrap()),
+            airc_core::Headers::new(),
+        )
+        .await
+        .unwrap();
+    // The existing ordered link's following message is a processing barrier:
+    // the remote identity observer has finished both preceding Event frames.
+    let barrier = op_a.say("profile projection barrier").await.unwrap();
+    assert_eq!(wait_for_copies(&op_b, barrier).await, 1);
+    let remote = op_b.page_recent(64).await.unwrap();
+    let card_event = remote
+        .iter()
+        .find(|event| event.event_id == published.event_id)
+        .expect("remote retained updated profile");
+    assert_eq!(
+        card_event.kind,
+        airc_core::TranscriptKind::IdentityPublished
+    );
+    assert_eq!(card_event.peer_id, op_a.peer_id());
+    assert_eq!(
+        op_b.peer_identity_card(op_a.peer_id())
+            .await
+            .unwrap()
+            .expect("remote durable identity index")
+            .identity,
+        profile
+    );
+    assert_eq!(
+        op_b.peer_identity_card(op_b.peer_id()).await.unwrap(),
+        victim_before,
+        "a peer cannot update another sender's identity card"
+    );
+    assert_eq!(
+        remote
+            .iter()
+            .find(|event| event.event_id == rejected.event_id)
+            .expect("spoof remains an auditable system event")
+            .kind,
+        airc_core::TranscriptKind::System
+    );
 }
 
 /// The daemon's gateway is NOT IPC-attached and does not subscribe to the
@@ -998,17 +1078,59 @@ async fn owner_backfill_read_failure_and_legacy_request_are_explicit_errors() {
     .expect("malformed backfill labels never silence unknown-channel diagnostics");
 }
 
-/// Loop prevention: a frame B received FROM A must never be forwarded
-/// back to A. B's `forwarded_count` counts frames flushed to the wire
-/// — with A as B's only link and B originating nothing after the
-/// snapshot, it must not move. (Removing the origin check makes B echo
-/// the frame to A and this counter increments — the mutation this test
-/// exists to catch; A would dedup the echo, so transcript counts alone
-/// cannot see it.)
+/// Observe actual wire arrivals, including frames the owner deduplicates.
+/// A receipt follows owner delivery, so its forwarding offer has been queued.
+struct ObservedInbound {
+    inner: Arc<RouterInboundBridge>,
+    received: tokio::sync::mpsc::UnboundedSender<EventId>,
+}
+
+#[async_trait]
+impl InboundFrameSink for ObservedInbound {
+    async fn deliver(&self, frame: &Frame) -> InboundDeliveryVerdict {
+        let verdict = self.inner.deliver(frame).await;
+        let _ = self.received.send(frame.envelope.event_id);
+        verdict
+    }
+
+    async fn backfill_channels(&self) -> Result<Vec<airc_core::RoomId>, String> {
+        self.inner.backfill_channels().await
+    }
+
+    async fn backfill_page(
+        &self,
+        channel: airc_core::RoomId,
+        before: Option<airc_bus::Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Arc<airc_bus::Envelope>>, String> {
+        self.inner.backfill_page(channel, before, limit).await
+    }
+}
+
+async fn observe_inbound(machine: &LinkedMachine) -> tokio::sync::mpsc::UnboundedReceiver<EventId> {
+    let (received, rx) = tokio::sync::mpsc::unbounded_channel();
+    machine
+        .gateway
+        .set_inbound_frame_sink(Arc::new(ObservedInbound {
+            inner: Arc::new(RouterInboundBridge::new(
+                machine.machine.daemon.router(),
+                coordinator_store(&machine.machine).await,
+            )),
+            received,
+        }));
+    rx
+}
+
+/// Loop prevention: a frame B received FROM A must never return on the wire.
+/// Observe the exact event before A's dedup can conceal an echo. A later B→A
+/// publication drains the same ordered worker; no sleep or unrelated profile
+/// traffic can decide the result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frame_received_from_a_peer_is_not_forwarded_back_to_it() {
     let a = boot_linked(RoutedForwarderConfig::default()).await;
     let b = boot_linked(RoutedForwarderConfig::default()).await;
+    let mut received_a = observe_inbound(&a).await;
+    let mut received_b = observe_inbound(&b).await;
     link(&a.gateway, &b.gateway).await;
 
     let op_a = a.machine.attach("op-a").await;
@@ -1016,23 +1138,42 @@ async fn frame_received_from_a_peer_is_not_forwarded_back_to_it() {
     let op_b = b.machine.attach("op-b").await;
     op_b.join(ROOM).await.expect("op-b joins");
 
-    // Quiesce, then snapshot B's wire-flush counter.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let b_forwarded_before = b.forwarder.forwarded_count();
-
     let event_id = op_a.say("must not boomerang").await.expect("op-a says");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while received_b
+            .recv()
+            .await
+            .expect("B's wire observer stays open")
+            != event_id
+        {}
+    })
+    .await
+    .expect("B completed owner delivery and offered the target for forwarding");
     assert_eq!(wait_for_copies(&op_b, event_id).await, 1);
 
-    // Give a hypothetical echo ample time to be flushed, then assert
-    // B forwarded nothing: its only connected peer is the frame's
-    // origin link.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        b.forwarder.forwarded_count(),
-        b_forwarded_before,
-        "B's only link is the origin of the frame — forwarding anything \
-         means the origin check is gone (echo back to A)"
-    );
+    // B's forwarding tap and per-peer worker are FIFO. If the origin guard
+    // were removed, the target's echo must precede this local publication.
+    let barrier = op_b
+        .say("origin check barrier")
+        .await
+        .expect("B publishes barrier");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let received = received_a
+                .recv()
+                .await
+                .expect("A's wire observer stays open");
+            assert_ne!(
+                received, event_id,
+                "B echoed A's exact event before owner dedup"
+            );
+            if received == barrier {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("B's ordered forward worker reached the barrier");
 
     // Belt: A's transcript still holds exactly one copy.
     let recent_a = op_a.page_recent(64).await.expect("page op-a");

@@ -27,9 +27,8 @@ impl Frame {
     ///     `channel → room_id`, `target`, `lamport`, `occurred_at_ms`,
     ///     `headers`, `body` are 1:1.
     ///   - `FrameKind::Message → TranscriptKind::Message`.
-    ///   - `FrameKind::Event → TranscriptKind::System` (no direct
-    ///     transcript equivalent; system-kind preserves it as an
-    ///     auditable record without claiming it's a chat message).
+    ///   - `FrameKind::Event → TranscriptKind::IdentityPublished` for a valid
+    ///     typed card describing its sender; otherwise `TranscriptKind::System`.
     ///   - `FrameKind::Control → TranscriptKind::SessionControl`.
     ///   - `signature` is dropped — verified before persistence; the
     ///     store doesn't need it again.
@@ -50,7 +49,20 @@ impl Frame {
         let kind = match kind {
             FrameKind::Addressed => return Err(NotTranscribable),
             FrameKind::Message => TranscriptKind::Message,
-            FrameKind::Event => TranscriptKind::System,
+            FrameKind::Event => {
+                if envelope
+                    .body
+                    .as_ref()
+                    .and_then(|body| {
+                        airc_core::identity::decode_peer_identity_card(envelope.sender, body)
+                    })
+                    .is_some()
+                {
+                    TranscriptKind::IdentityPublished
+                } else {
+                    TranscriptKind::System
+                }
+            }
             FrameKind::Control => TranscriptKind::SessionControl,
             FrameKind::Command => TranscriptKind::Command,
             FrameKind::CommandResult => TranscriptKind::CommandResult,
@@ -175,6 +187,51 @@ mod tests {
             frame.into_transcript_event().unwrap().kind,
             TranscriptKind::SessionControl
         );
+
+        // The typed card's subject must agree with its envelope, and only an
+        // Event publication may acquire identity semantics.
+        let sender = message_frame().envelope.sender;
+        let card = airc_core::identity::IdentityEvent::PeerIdentityCard(
+            airc_core::identity::PeerIdentityCard {
+                peer_id: sender,
+                identity: airc_core::identity::Identity::new("alice"),
+                emitted_at_ms: 7,
+            },
+        );
+        let value = serde_json::to_value(card).unwrap();
+        let mut malformed = value.clone();
+        malformed.as_object_mut().unwrap().remove("emitted_at_ms");
+        for (wire_kind, publisher, body, expected) in [
+            (
+                FrameKind::Event,
+                sender,
+                value.clone(),
+                TranscriptKind::IdentityPublished,
+            ),
+            (
+                FrameKind::Message,
+                sender,
+                value.clone(),
+                TranscriptKind::Message,
+            ),
+            (
+                FrameKind::Event,
+                PeerId::new(),
+                value,
+                TranscriptKind::System,
+            ),
+            (FrameKind::Event, sender, malformed, TranscriptKind::System),
+        ] {
+            let mut frame = message_frame();
+            frame.kind = wire_kind;
+            frame.envelope.sender = publisher;
+            frame.envelope.body = Some(Body::Json(body));
+            let original_body = frame.envelope.body.clone();
+            let event = frame.into_transcript_event().unwrap();
+            assert_eq!(event.kind, expected);
+            assert_eq!(event.body, original_body);
+            assert_eq!(event.peer_id, publisher);
+        }
     }
 
     #[test]
