@@ -190,53 +190,7 @@ async fn append_then_page_recent_round_trips() {
 #[tokio::test]
 async fn local_identity_card_round_trips_through_store_trait() {
     let store = SqliteEventStore::in_memory().await.unwrap();
-    let store_api: &dyn EventStore = &store;
-    let mut identity = Identity::new("alice");
-    identity.pronouns = "they".into();
-    identity.role = "substrate".into();
-    identity
-        .integrations
-        .insert("continuum".into(), "clio".into());
-
-    store_api
-        .insert_local_identity(StoredLocalIdentity {
-            peer_id: PeerId::from_u128(0xa1),
-            client_id: ClientId::from_u128(0xc1),
-            version: 1,
-            created_at_ms: 42,
-            identity,
-            agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
-        })
-        .await
-        .unwrap();
-
-    let mut updated = Identity::new("alice");
-    updated.status = "working".into();
-    updated
-        .integrations
-        .insert("openclaw".into(), "alice-ui".into());
-    store_api
-        .save_local_identity_card(updated.clone())
-        .await
-        .unwrap();
-
-    let stored = store_api
-        .load_local_identity()
-        .await
-        .unwrap()
-        .expect("local identity row");
-    assert_eq!(stored.peer_id, PeerId::from_u128(0xa1));
-    assert_eq!(stored.client_id, ClientId::from_u128(0xc1));
-    assert_eq!(stored.identity, updated);
-    // Card 8384cc18 Sub-A: every row carries an agent_name; the
-    // 2026-05-28+ default for pre-multi-agent installs is
-    // "default", set by the column default. The DTO surfaces it.
-    assert_eq!(
-        stored.agent_name,
-        crate::DEFAULT_AGENT_NAME,
-        "Sub-A: row inserted without an explicit agent_name still surfaces \
-         the documented default through the DTO"
-    );
+    crate::local_identity::assert_profile_update_selects_agent(&store).await;
 }
 
 /// Card 8384cc18 Sub-A — explicit `agent_name` round-trips

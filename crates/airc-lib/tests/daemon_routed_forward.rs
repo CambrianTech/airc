@@ -241,6 +241,86 @@ async fn routed_room_send_traverses_lan_both_directions() {
     assert_eq!(copies_in(&recent_a, id_ab), 1);
     let recent_b = op_b.page_recent(64).await.expect("page op-b");
     assert_eq!(copies_in(&recent_b, id_ba), 1);
+
+    // Profile updates use this SAME routed room path, preserving the scope
+    // sender instead of the transport gateway's machine identity.
+    let mut profile = airc_core::identity::Identity::new("Scope A reviewer");
+    profile.status = "reviewing".into();
+    op_a.set_local_identity_card(profile.clone())
+        .await
+        .expect("update profile");
+    let published = op_a
+        .page_recent(64)
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|event| {
+            event.kind == airc_core::TranscriptKind::IdentityPublished
+                && event.peer_id == op_a.peer_id()
+                && event
+                    .body
+                    .as_ref()
+                    .and_then(|body| {
+                        airc_core::identity::decode_peer_identity_card(event.peer_id, body)
+                    })
+                    .is_some_and(|card| card.identity == profile)
+        })
+        .expect("profile is in the publishing daemon transcript");
+    assert_eq!(wait_for_copies(&op_b, published.event_id).await, 1);
+
+    let victim_before = op_b.peer_identity_card(op_b.peer_id()).await.unwrap();
+    let spoof = airc_core::identity::IdentityEvent::PeerIdentityCard(
+        airc_core::identity::PeerIdentityCard {
+            peer_id: op_b.peer_id(),
+            identity: airc_core::identity::Identity::new("forged victim name"),
+            emitted_at_ms: published.occurred_at_ms.saturating_add(1_000),
+        },
+    );
+    let rejected = op_a
+        .publish(
+            airc_lib::PublishTarget::CurrentRoom,
+            airc_protocol::FrameKind::Event,
+            Body::Json(serde_json::to_value(spoof).unwrap()),
+            airc_core::Headers::new(),
+        )
+        .await
+        .unwrap();
+    // The existing ordered link's following message is a processing barrier:
+    // the remote identity observer has finished both preceding Event frames.
+    let barrier = op_a.say("profile projection barrier").await.unwrap();
+    assert_eq!(wait_for_copies(&op_b, barrier).await, 1);
+    let remote = op_b.page_recent(64).await.unwrap();
+    let card_event = remote
+        .iter()
+        .find(|event| event.event_id == published.event_id)
+        .expect("remote retained updated profile");
+    assert_eq!(
+        card_event.kind,
+        airc_core::TranscriptKind::IdentityPublished
+    );
+    assert_eq!(card_event.peer_id, op_a.peer_id());
+    assert_eq!(
+        op_b.peer_identity_card(op_a.peer_id())
+            .await
+            .unwrap()
+            .expect("remote durable identity index")
+            .identity,
+        profile
+    );
+    assert_eq!(
+        op_b.peer_identity_card(op_b.peer_id()).await.unwrap(),
+        victim_before,
+        "a peer cannot update another sender's identity card"
+    );
+    assert_eq!(
+        remote
+            .iter()
+            .find(|event| event.event_id == rejected.event_id)
+            .expect("spoof remains an auditable system event")
+            .kind,
+        airc_core::TranscriptKind::System
+    );
 }
 
 /// The daemon's gateway is NOT IPC-attached and does not subscribe to the

@@ -17,8 +17,12 @@ impl EventStore for SqliteEventStore {
         SqliteEventStore::insert_local_identity(self, identity).await
     }
 
-    async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {
-        SqliteEventStore::save_local_identity_card(self, identity).await
+    async fn save_local_identity_card(
+        &self,
+        agent_name: &str,
+        identity: Identity,
+    ) -> Result<(), StoreError> {
+        SqliteEventStore::save_local_identity_card(self, agent_name, identity).await
     }
 
     async fn append(&self, ev: TranscriptEvent) -> Result<(), StoreError> {

@@ -386,11 +386,15 @@ impl SqliteEventStore {
         Ok(())
     }
 
-    /// Replace the user-facing identity card on the singleton row.
-    /// Peer/client ids are not touched.
-    pub async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {
+    /// Replace the card on the selected agent row, without changing its identity.
+    pub async fn save_local_identity_card(
+        &self,
+        agent_name: &str,
+        identity: Identity,
+    ) -> Result<(), StoreError> {
         let _write = self.admit_write().await?;
-        let row = local_identity::Entity::find_by_id(local_identity::SINGLETON_ID)
+        let row = local_identity::Entity::find()
+            .filter(local_identity::Column::AgentName.eq(agent_name))
             .one(&self.db)
             .await?
             .ok_or(StoreError::NotFound("local_identity"))?;

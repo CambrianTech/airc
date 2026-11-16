@@ -105,13 +105,14 @@ impl EventStore for InMemoryEventStore {
 
     async fn save_local_identity_card(
         &self,
+        agent_name: &str,
         identity: airc_core::identity::Identity,
     ) -> Result<(), StoreError> {
         let mut stored = self
             .local_identities
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
-        let Some(row) = stored.get_mut(crate::DEFAULT_AGENT_NAME) else {
+        let Some(row) = stored.get_mut(agent_name) else {
             return Err(StoreError::NotFound("local_identity"));
         };
         row.identity = identity;
@@ -467,31 +468,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_local_identity_card_matches_store_trait() {
         let store = InMemoryEventStore::new();
-        let store_api: &dyn EventStore = &store;
-        let mut identity = airc_core::identity::Identity::new("alice");
-        identity.role = "tester".into();
-
-        store_api
-            .insert_local_identity(StoredLocalIdentity {
-                peer_id: PeerId::from_u128(0xa1),
-                client_id: ClientId::from_u128(0xc1),
-                version: 1,
-                created_at_ms: 42,
-                identity,
-                agent_name: crate::DEFAULT_AGENT_NAME.to_string(),
-            })
-            .await
-            .unwrap();
-
-        let mut updated = airc_core::identity::Identity::new("alice");
-        updated.status = "green".into();
-        store_api
-            .save_local_identity_card(updated.clone())
-            .await
-            .unwrap();
-
-        let stored = store_api.load_local_identity().await.unwrap().unwrap();
-        assert_eq!(stored.identity, updated);
+        crate::local_identity::assert_profile_update_selects_agent(&store).await;
     }
 
     #[tokio::test]

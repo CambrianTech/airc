@@ -916,16 +916,15 @@ impl Airc {
     /// updated profile without rejoining (card da586598 — last
     /// identity-roster slice).
     ///
-    /// Replaces the old direct-store save in the CLI's nick / identity
-    /// edit path: storage + emission are now atomic from the caller's
-    /// view (one fails, neither effect is visible to peers). Per-room
-    /// emission iterates the SubscriptionSet's `subscribed` map.
+    /// The profile belongs to this handle's selected home and agent name,
+    /// and is emitted under its existing peer id. Persistence precedes
+    /// per-room emission; an emission error does not roll back the saved card.
     pub async fn set_local_identity_card(
         &self,
         identity: airc_core::identity::Identity,
     ) -> Result<(), AircError> {
         self.event_store()
-            .save_local_identity_card(identity)
+            .save_local_identity_card(self.agent_name(), identity)
             .await
             .map_err(AircError::from)?;
         let set = subscriptions::load_or_init(self.event_store()).await?;
@@ -1480,9 +1479,9 @@ impl Airc {
 
     /// Persist an observed peer identity card into the durable per-peer
     /// identity index (`scoped_state`, [`ScopeRef::User`]), last-writer-wins
-    /// by `emitted_at_ms`. Called from the ingest chokepoints
-    /// (`append_received_frame` for peers, `append_sent_frame` for self) so
-    /// a name survives its `IdentityPublished` card scrolling out of the
+    /// by `emitted_at_ms`. Called from received-frame ingestion; authored
+    /// cards use the same index owner after publication. This lets a name
+    /// survive its `IdentityPublished` card scrolling out of the
     /// recent-transcript window. A non-`IdentityPublished` event, an
     /// empty/undecodable body, or a stale (older) card is a no-op. Failures
     /// to record are surfaced as diagnostics, never panicked — a missed
@@ -1491,11 +1490,10 @@ impl Airc {
         if event.kind != airc_core::TranscriptKind::IdentityPublished {
             return;
         }
-        let Some(airc_core::Body::Json(value)) = &event.body else {
-            return;
-        };
-        let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
-            serde_json::from_value::<airc_core::identity::IdentityEvent>(value.clone())
+        let Some(card) = event
+            .body
+            .as_ref()
+            .and_then(|body| airc_core::identity::decode_peer_identity_card(event.peer_id, body))
         else {
             return;
         };
@@ -2102,12 +2100,29 @@ impl Airc {
             identity: stored.identity,
             emitted_at_ms: time::now_ms()?,
         };
-        let event = airc_core::identity::IdentityEvent::PeerIdentityCard(card);
+        let event = airc_core::identity::IdentityEvent::PeerIdentityCard(card.clone());
         let body_json = serde_json::to_value(&event)
             .map_err(|e| AircError::Crypto(format!("identity event serialize: {e}")))?;
         let body = airc_core::Body::Json(body_json);
-        self.emit_lifecycle(airc_core::TranscriptKind::IdentityPublished, room_id, body)
-            .await
+        let room = self.room_by_channel(room_id).await?.ok_or_else(|| {
+            AircError::Route(format!(
+                "cannot publish identity to unsubscribed room {room_id}"
+            ))
+        })?;
+        // A profile is a room publication, not a scope-local lifecycle note.
+        // Reuse the same signed/daemon route as every structured room send.
+        self.send_frame_to_room(
+            airc_protocol::FrameKind::Event,
+            airc_core::MentionTarget::All,
+            body,
+            airc_core::Headers::new(),
+            &room,
+        )
+        .await?;
+        // Neither attached publication nor append_sent_frame owns this index;
+        // record the exact authored card through the shared identity owner.
+        // Remote receivers use observe_identity_event after normal ingress.
+        self.record_peer_identity_card(&card).await
     }
 
     /// Publish this scope's identity card to EVERY subscribed room, so
@@ -3130,9 +3145,46 @@ mod publish_identity_tests {
     #[tokio::test]
     async fn publish_identity_grounds_named_citizen_from_agent_name() {
         let dir = tempdir().unwrap();
-        let home = dir.path().join("ivar/.airc");
-        let airc = Airc::open_as(&home, "Ivar").await.expect("open as Ivar");
-        airc.join("general").await.expect("join a channel");
+        let home = dir.path().join("agents");
+        let wire = dir.path().join("wire");
+        let names = [airc_store::DEFAULT_AGENT_NAME, "Ivar", "Solveig"];
+        let mut agents = Vec::new();
+        let mut rows = Vec::new();
+        let mut keys = Vec::new();
+        for name in names {
+            let airc = Airc::open_inner(
+                home.clone(),
+                wire.clone(),
+                VerificationPolicy::Strict,
+                Some(name.into()),
+                None,
+            )
+            .await
+            .expect("open selected agent");
+            rows.push(
+                airc.event_store()
+                    .load_local_identity_by_agent_name(name)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            keys.push(std::fs::read(LocalIdentity::agent_key_path(&home, name)).unwrap());
+            agents.push(airc);
+        }
+        let airc = &agents[1];
+        mesh_identity::save(
+            airc.coordinator_store(),
+            &mesh_identity::CachedIdentity {
+                version: 1,
+                identity: "named-profile-regression".into(),
+                source: mesh_identity::Source::Operator,
+                resolved_at_ms: time::now_ms().unwrap(),
+                ttl_ms: mesh_identity::DEFAULT_TTL_MS,
+            },
+        )
+        .await
+        .unwrap();
+        let room = airc.join("general").await.expect("join a channel");
 
         airc.publish_identity()
             .await
@@ -3148,6 +3200,65 @@ mod publish_identity_tests {
             stored.identity.name, "Ivar",
             "the grounded citizen is named by its agent_name, not anonymous"
         );
+
+        // A named agent is not necessarily the first SQLite row. A profile
+        // update must select the same agent on persistence, emission and reopen.
+        let mut updated = stored.identity.clone();
+        updated.name = "Ivar the reviewer".into();
+        updated.status = "reviewing".into();
+        updated
+            .integrations
+            .insert("continuum".into(), "ivar-citizen".into());
+        airc.set_local_identity_card(updated.clone()).await.unwrap();
+        rows[1].identity = updated.clone();
+        let events = airc
+            .event_store()
+            .page_recent(Some(room.channel), 32)
+            .await
+            .unwrap();
+        let published = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.kind == airc_core::TranscriptKind::IdentityPublished
+                    && event.peer_id == airc.peer_id()
+            })
+            .expect("updated identity was emitted");
+        let Some(airc_core::Body::Json(body)) = &published.body else {
+            panic!("identity publication must carry its typed card");
+        };
+        let airc_core::identity::IdentityEvent::PeerIdentityCard(card) =
+            serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(card.peer_id, rows[1].peer_id);
+        assert_eq!(card.identity, updated);
+        drop(agents);
+
+        for ((name, expected), key) in names.into_iter().zip(rows).zip(keys) {
+            let reopened = Airc::open_inner(
+                home.clone(),
+                wire.clone(),
+                VerificationPolicy::Strict,
+                Some(name.into()),
+                None,
+            )
+            .await
+            .expect("reopen same selected agent");
+            assert_eq!(reopened.peer_id(), expected.peer_id);
+            assert_eq!(reopened.client_id(), expected.client_id);
+            assert_eq!(
+                reopened
+                    .event_store()
+                    .load_local_identity_by_agent_name(name)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            assert!(
+                std::fs::read(LocalIdentity::agent_key_path(&home, name)).unwrap() == key,
+                "profile update must not change any agent key"
+            );
+        }
     }
 
     // what this catches: the agent-name floor grounding a scope that never claimed a

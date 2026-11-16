@@ -124,12 +124,25 @@ fn target_to_mention(target: &Target) -> MentionTarget {
 
 /// Project a decoded owner-core envelope to the SDK transcript shape.
 pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
+    // Decode opaque payload once. Only Event publications with a valid typed
+    // self-card refine the coarse projection; routing remains payload-agnostic.
+    let body = Body::from_payload(&env.payload).ok();
+    let kind = if env.kind == Kind::Event
+        && body
+            .as_ref()
+            .and_then(|body| airc_core::identity::decode_peer_identity_card(env.from.0, body))
+            .is_some()
+    {
+        TranscriptKind::IdentityPublished
+    } else {
+        kind_to_transcript(env.kind)
+    };
     TranscriptEvent {
         event_id: env.event_id,
         room_id: env.channel,
         peer_id: env.from.0,
         client_id: env.from.1,
-        kind: kind_to_transcript(env.kind),
+        kind,
         occurred_at_ms: env.occurred_at_ms,
         lamport: pack_seq(env.seq.epoch, env.seq.counter),
         target: target_to_mention(&env.target),
@@ -143,7 +156,7 @@ pub(crate) fn project(env: &Envelope) -> TranscriptEvent {
         },
         // Durable chat payloads are `Body`-encoded; a non-`Body` payload
         // (raw stream chunk) has no transcript body.
-        body: Body::from_payload(&env.payload).ok(),
+        body,
         attachment: None,
         receipt: None,
         metadata: serde_json::Value::Null,
@@ -1086,6 +1099,57 @@ mod tests {
             transcript_kinds_to_ipc(&std::collections::BTreeSet::from([TranscriptKind::System]));
         assert!(!system.contains(&IpcKind::Command));
         assert!(!system.contains(&IpcKind::CommandResult));
+
+        let sender = PeerId::new();
+        let value = serde_json::to_value(airc_core::identity::IdentityEvent::PeerIdentityCard(
+            airc_core::identity::PeerIdentityCard {
+                peer_id: sender,
+                identity: airc_core::identity::Identity::new("alice"),
+                emitted_at_ms: 7,
+            },
+        ))
+        .unwrap();
+        let mut malformed = value.clone();
+        malformed.as_object_mut().unwrap().remove("emitted_at_ms");
+        for (bus, publisher, body, expected) in [
+            (
+                Kind::Event,
+                sender,
+                value.clone(),
+                TranscriptKind::IdentityPublished,
+            ),
+            (
+                Kind::Message,
+                sender,
+                value.clone(),
+                TranscriptKind::Message,
+            ),
+            (Kind::Event, PeerId::new(), value, TranscriptKind::System),
+            (Kind::Event, sender, malformed, TranscriptKind::System),
+            (
+                Kind::Event,
+                sender,
+                serde_json::json!({"text":"ordinary event"}),
+                TranscriptKind::System,
+            ),
+        ] {
+            let body = Body::Json(body);
+            let env = Envelope::new(
+                RoomId::new(),
+                (publisher, airc_core::ClientId::new()),
+                bus,
+                airc_bus::DeliveryClass::Durable,
+                body.to_payload().into(),
+            );
+            let event = project(&env);
+            assert_eq!(event.kind, expected);
+            assert_eq!(event.peer_id, publisher);
+            assert_eq!(event.body, Some(body));
+        }
+        let identity = transcript_kinds_to_ipc(&std::collections::BTreeSet::from([
+            TranscriptKind::IdentityPublished,
+        ]));
+        assert!(identity.contains(&IpcKind::Event));
     }
 
     // what this catches (Codex on #1603): a replacement daemon that closes the attach before

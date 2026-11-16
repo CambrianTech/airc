@@ -84,7 +84,7 @@ fn init_uses_airc_agent_name_env_when_as_is_absent() {
 
 #[test]
 fn identity_set_link_and_show_round_trip_through_store() {
-    let workspace = common::daemon_tempdir();
+    let workspace = common::daemon_tempdir().preserve_on_panic();
     let home = workspace.path();
 
     run_ok(
@@ -127,6 +127,199 @@ fn identity_set_link_and_show_round_trip_through_store() {
         run_ok(home, &["identity", "continuum-handle"], ""),
         "clio\n"
     );
+
+    // Regression: the selected named profile must be both the read and write
+    // target. A partial update must not copy the default card into that row.
+    run_ok_as(
+        home,
+        "alpha",
+        &[
+            "identity",
+            "set",
+            "--name",
+            "Alpha display",
+            "--pronouns",
+            "she/her",
+            "--role",
+            "builder",
+            "--bio",
+            "alpha profile",
+            "--status",
+            "alpha-ready",
+        ],
+        "",
+    );
+    run_ok_as(
+        home,
+        "alpha",
+        &[
+            "identity",
+            "link",
+            "--platform",
+            "continuum",
+            "--handle",
+            "alpha-c",
+        ],
+        "",
+    );
+    let alpha = run_ok_as(home, "alpha", &["identity", "show"], "");
+    assert!(alpha.contains("  name:       Alpha display\n"), "{alpha}");
+    assert!(alpha.contains("  pronouns:   she/her\n"));
+    assert!(alpha.contains("  role:       builder\n"));
+    assert!(alpha.contains("  bio:        alpha profile\n"));
+    assert!(alpha.contains("  status:     alpha-ready\n"));
+    assert!(alpha.contains("    continuum: alpha-c\n"));
+
+    run_ok_as(
+        home,
+        "beta",
+        &[
+            "identity",
+            "set",
+            "--role",
+            "reviewer",
+            "--status",
+            "beta-ready",
+        ],
+        "",
+    );
+    let beta = run_ok_as(home, "beta", &["identity", "show"], "");
+    assert!(beta.contains("  name:       beta\n"), "{beta}");
+    assert!(beta.contains("  pronouns:   (unset)\n"));
+    assert!(beta.contains("  role:       reviewer\n"));
+    assert!(beta.contains("  bio:        (unset)\n"));
+    assert!(beta.contains("  status:     beta-ready\n"));
+    assert!(beta.contains("  integrations: (none)\n"));
+
+    run_ok_as(
+        home,
+        "alpha",
+        &["identity", "set", "--status", "alpha-busy"],
+        "",
+    );
+    let updated_alpha = run_ok_as(home, "alpha", &["identity", "show"], "");
+    assert_eq!(updated_alpha, alpha.replace("alpha-ready", "alpha-busy"));
+    assert_eq!(run_ok_as(home, "alpha", &["whois"], ""), updated_alpha);
+    assert_eq!(
+        run_ok_as(home, "alpha", &["identity", "continuum-handle"], ""),
+        "alpha-c\n"
+    );
+    assert_eq!(run_ok_as(home, "beta", &["identity", "show"], ""), beta);
+    assert_eq!(run_ok(home, &["identity", "show"], ""), shown);
+
+    // Replace the old redirect-only unit test with actual sender evidence:
+    // project and machine identities share transport, but own separate cards.
+    let account = workspace.path().join("account");
+    let machine = account.join(".airc");
+    let project = account.join("project").join(".airc");
+    let run_in_account = |scope: &std::path::Path, args: &[&str]| {
+        run_ok_as_in_account(
+            scope,
+            airc_store::DEFAULT_AGENT_NAME,
+            Some(&account),
+            args,
+            "",
+        )
+    };
+    let machine_init = run_in_account(&machine, &["init"]);
+    let project_init = run_in_account(&project, &["init"]);
+    let peer_id = |output: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("peer_id:"))
+            .expect("init peer_id")
+            .trim()
+            .parse::<uuid::Uuid>()
+            .expect("peer UUID")
+    };
+    let machine_peer = peer_id(&machine_init);
+    let project_peer = peer_id(&project_init);
+    assert_ne!(machine_peer, project_peer);
+    let machine_key = std::fs::read(machine.join("identity.key")).unwrap();
+    let project_key = std::fs::read(project.join("identity.key")).unwrap();
+    run_in_account(
+        &machine,
+        &[
+            "identity",
+            "set",
+            "--name",
+            "Machine profile",
+            "--status",
+            "machine-ready",
+        ],
+    );
+    let machine_card = run_in_account(&machine, &["identity", "show"]);
+    run_in_account(
+        &project,
+        &[
+            "identity",
+            "set",
+            "--name",
+            "Project profile",
+            "--status",
+            "project-ready",
+        ],
+    );
+    run_in_account(&project, &["identity", "set", "--status", "project-busy"]);
+    let project_card = run_in_account(&project, &["identity", "show"]);
+    assert!(
+        project_card.contains("  name:       Project profile\n"),
+        "{project_card}"
+    );
+    assert!(project_card.contains("  status:     project-busy\n"));
+    assert_eq!(run_in_account(&project, &["whois"]), project_card);
+    assert_eq!(
+        run_in_account(&machine, &["identity", "show"]),
+        machine_card
+    );
+
+    run_in_account(&project, &["msg", "profile-scope-proof"]);
+    let inbox: serde_json::Value = serde_json::from_str(&run_in_account(
+        &project,
+        &["inbox", "--json", "--limit", "32"],
+    ))
+    .unwrap();
+    let events: Vec<airc_core::TranscriptEvent> =
+        serde_json::from_value(inbox["events"].clone()).unwrap();
+    let messages: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.body.as_ref().and_then(airc_core::Body::as_text) == Some("profile-scope-proof")
+        })
+        .collect();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].peer_id.as_uuid(), project_peer);
+    assert!(
+        events.iter().any(|event| {
+            let Some(airc_core::Body::Json(body)) = &event.body else {
+                return false;
+            };
+            let Ok(airc_core::identity::IdentityEvent::PeerIdentityCard(card)) =
+                serde_json::from_value(body.clone())
+            else {
+                return false;
+            };
+            event.peer_id.as_uuid() == project_peer
+                && card.peer_id.as_uuid() == project_peer
+                && card.identity.name == "Project profile"
+                && card.identity.status == "project-busy"
+        }),
+        "the project sender must publish its own updated card"
+    );
+    for (scope, before, key) in [
+        (&machine, &machine_init, &machine_key),
+        (&project, &project_init, &project_key),
+    ] {
+        let after = run_in_account(scope, &["init"]);
+        for field in ["peer_id:", "client_id:", "peer_spec:"] {
+            assert_eq!(
+                after.lines().find(|line| line.starts_with(field)),
+                before.lines().find(|line| line.starts_with(field)),
+                "profile edits must preserve {field}",
+            );
+        }
+        assert_eq!(&std::fs::read(scope.join("identity.key")).unwrap(), key);
+    }
 }
 
 #[test]
@@ -278,16 +471,34 @@ fn legacy_envelope_wrap_encrypts_message_field() {
 }
 
 fn run_ok(home: &std::path::Path, args: &[&str], stdin: &str) -> String {
+    run_ok_as(home, airc_store::DEFAULT_AGENT_NAME, args, stdin)
+}
+
+fn run_ok_as(home: &std::path::Path, agent_name: &str, args: &[&str], stdin: &str) -> String {
+    run_ok_as_in_account(home, agent_name, None, args, stdin)
+}
+
+fn run_ok_as_in_account(
+    home: &std::path::Path,
+    agent_name: &str,
+    account: Option<&std::path::Path>,
+    args: &[&str],
+    stdin: &str,
+) -> String {
     use std::io::Write;
-    let mut child = Command::new(airc_core())
+    let mut command = Command::new(airc_core());
+    command
         .arg("--home")
         .arg(home)
         .args(args)
+        .env("AIRC_AGENT_NAME", agent_name)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("airc-core must spawn");
+        .stderr(std::process::Stdio::piped());
+    if let Some(account) = account {
+        command.env("HOME", account).env("USERPROFILE", account);
+    }
+    let mut child = command.spawn().expect("airc-core must spawn");
     child
         .stdin
         .as_mut()
@@ -295,6 +506,9 @@ fn run_ok(home: &std::path::Path, args: &[&str], stdin: &str) -> String {
         .write_all(stdin.as_bytes())
         .unwrap();
     let output = child.wait_with_output().expect("airc-core must exit");
-    common::assert_success(&output, "airc-core");
+    common::assert_success(
+        &output,
+        &format!("airc-core {args:?} as {agent_name} in {}", home.display()),
+    );
     String::from_utf8(output.stdout).unwrap()
 }
