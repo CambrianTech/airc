@@ -178,15 +178,9 @@ impl LanTcpAdapter {
             .get(&peer)
             .filter(|session| authorized(session))
             .map(|session| (peer, session))
-            .or_else(|| {
-                connections
-                    .iter()
-                    .find(|(_, session)| authorized(session))
-                    .map(|(id, session)| (*id, session))
-            })
     }
 
-    /// Whether an enrolled identity has an authenticated session, including key aliases.
+    /// Whether this exact enrolled identity has an authenticated session.
     /// Unlike connected_peers this does not expand one physical connection into many IDs.
     pub async fn is_connected(&self, peer: PeerId) -> bool {
         self.session_for(&*self.inner.connections.lock().await, peer)
@@ -523,107 +517,99 @@ mod tests {
         );
     }
 
-    // Regression: a daemon ACK names the signer, while TLS may index its same-key alias.
+    // Historical duplicate key rows must not change either endpoint's identity.
     #[tokio::test]
-    async fn unicast_uses_authenticated_session_for_enrolled_alias_only() {
-        let (alice_id, alice, _bob_id, bob) = make_paired_adapters();
-        let bound = alice
-            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .unwrap();
-        let mut received = alice
-            .subscribe(Subscription {
-                channel: None,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        bob.connect(bound, alice_id).await.unwrap();
-        // Enrol AFTER handshake, making the stored connection's original ID deterministic.
-        let alias = PeerId::from_u128(0xa2);
-        bob.inner
-            .registry
-            .enrol(alias, 0, alice.inner.keypair.public_bytes())
-            .unwrap();
-        assert!(bob.is_connected(alias).await);
-        assert!(
-            matches!(bob.connect(bound, alias).await, Err(LanTcpError::AlreadyConnectedTo(id)) if id == alias)
-        );
-        assert_eq!(bob.connected_peers().await.len(), 1);
-        let stranger = PeerId::from_u128(0xa3);
-        bob.inner
-            .registry
-            .enrol(stranger, 0, PeerKeypair::generate().public_bytes())
-            .unwrap();
-        let channel = RoomId::from_u128(0xc0ffee);
-        for refused in [stranger, PeerId::from_u128(0xa4)] {
+    async fn certificate_identity_survives_twins_and_reconnects() {
+        for reverse in [false, true] {
+            let (alice_id, alice, bob_id, bob) = make_paired_adapters();
+            let alias = PeerId::from_u128(0xa2);
+            let bob_alias = PeerId::from_u128(0xb2);
+            for (registry, actual, twin, key) in [
+                (
+                    &bob.inner.registry,
+                    alice_id,
+                    alias,
+                    alice.inner.keypair.public_bytes(),
+                ),
+                (
+                    &alice.inner.registry,
+                    bob_id,
+                    bob_alias,
+                    bob.inner.keypair.public_bytes(),
+                ),
+            ] {
+                registry.remove_peer(actual);
+                let ids = if reverse {
+                    [twin, actual]
+                } else {
+                    [actual, twin]
+                };
+                for id in ids {
+                    registry.enrol(id, 0, key).unwrap();
+                }
+            }
+            let bound = alice
+                .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let mut received = alice
+                .subscribe(Subscription {
+                    channel: None,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = fired.clone();
+            bob.set_disconnect_observer(Arc::new(move |peer| sink.lock().unwrap().push(peer)));
+            for round in 0..2 {
+                bob.connect(bound, alice_id).await.unwrap();
+                assert_eq!(bob.connected_peers().await, vec![alice_id]);
+                assert!(!bob.is_connected(alias).await);
+                assert!(bob.connect(bound, alias).await.is_err());
+                assert!(!bob.drop_connection(alias).await);
+                let channel = RoomId::from_u128(0xc0ffee);
+                assert!(bob
+                    .send_to(alias, frame_at(80, channel, "wrong identity"))
+                    .await
+                    .is_err());
+                bob.send_to(alice_id, frame_at(81 + round, channel, "actual identity"))
+                    .await
+                    .unwrap();
+                let frame = tokio::time::timeout(Duration::from_secs(3), received.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(frame.envelope.lamport, 81 + round);
+                assert_eq!(alice.connected_peers().await, vec![bob_id]);
+                assert!(bob.drop_connection(alice_id).await);
+                assert!(!bob.drop_connection(alice_id).await);
+            }
+            assert_eq!(*fired.lock().unwrap(), vec![alice_id, alice_id]);
+            bob.connect(bound, alice_id).await.unwrap();
+            bob.inner
+                .registry
+                .enrol(alice_id, 0, PeerKeypair::generate().public_bytes())
+                .unwrap();
+            assert!(!bob.is_connected(alice_id).await);
             assert!(bob
-                .send_to(refused, frame_at(80, channel, "must not send"))
+                .send_to(alice_id, frame_at(89, RoomId::new(), "rotated key"))
+                .await
+                .is_err());
+            bob.inner
+                .registry
+                .enrol(alice_id, 0, alice.inner.keypair.public_bytes())
+                .unwrap();
+            assert!(bob.is_connected(alice_id).await);
+            bob.inner.registry.remove_peer(alice_id);
+            assert!(!bob.is_connected(alice_id).await);
+            assert!(bob
+                .send_to(alice_id, frame_at(90, RoomId::new(), "revoked"))
                 .await
                 .is_err());
         }
-        bob.send_to(alias, frame_at(81, channel, "alias ack"))
-            .await
-            .expect("same authenticated key must use the live session");
-        let frame = tokio::time::timeout(Duration::from_secs(3), received.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(frame.envelope.lamport, 81);
-        assert!(!bob.drop_connection(stranger).await);
-        assert!(bob.is_connected(alias).await);
-        // Replacing trust must not retroactively change the key a session proved.
-        bob.inner
-            .registry
-            .enrol(alias, 0, PeerKeypair::generate().public_bytes())
-            .unwrap();
-        assert!(bob
-            .send_to(alias, frame_at(82, channel, "rotated alias"))
-            .await
-            .is_err());
-        bob.inner
-            .registry
-            .enrol(alice_id, 0, PeerKeypair::generate().public_bytes())
-            .unwrap();
-        assert!(bob
-            .send_to(alice_id, frame_at(83, channel, "rotated primary"))
-            .await
-            .is_err());
-        assert!(!bob.drop_connection(alias).await);
-        bob.inner.registry.remove_peer(alias);
-        assert!(bob
-            .send_to(alias, frame_at(82, channel, "revoked"))
-            .await
-            .is_err());
     }
-    #[tokio::test]
-    async fn dropping_alias_retires_physical_session_and_notifies_once() {
-        let (alice_id, alice, _, bob) = make_paired_adapters();
-        let bound = alice
-            .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .unwrap();
-        bob.connect(bound, alice_id).await.unwrap();
-        let alias = PeerId::from_u128(0xa2);
-        bob.inner
-            .registry
-            .enrol(alias, 0, alice.inner.keypair.public_bytes())
-            .unwrap();
-        let fired = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = fired.clone();
-        bob.set_disconnect_observer(Arc::new(move |peer| sink.lock().unwrap().push(peer)));
-        assert!(bob.drop_connection(alias).await);
-        assert!(bob.connected_peers().await.is_empty());
-        assert!(!bob.is_connected(alias).await);
-        assert!(!bob.drop_connection(alias).await);
-        assert_eq!(*fired.lock().unwrap(), vec![alice_id]);
-        bob.connect(bound, alice_id)
-            .await
-            .expect("physical session can reconnect");
-        assert!(bob.is_connected(alias).await);
-    }
-
     // #240 event-driven heal: a terminated session must (1) drop the peer from
     // `connections` and (2) fire the registered disconnect observer with that
     // peer_id — the signal the daemon turns into a route-refresh wake nudge.
