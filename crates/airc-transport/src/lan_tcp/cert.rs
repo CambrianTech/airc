@@ -3,8 +3,8 @@
 //! - `generate_self_signed_cert(keypair, peer_id)` — turns the
 //!   substrate's `PeerKeypair` (Ed25519) into a self-signed X.509 cert
 //!   suitable for rustls. The cert's subject CN carries the peer's
-//!   UUID string for diagnostics; the cryptographic identity is the
-//!   subject public key (the Ed25519 pubkey itself).
+//!   UUID string. TLS proves possession of the key; the verifier checks
+//!   that exact UUID/key pair against enrollment before binding a session.
 //!
 //! - `extract_ed25519_pubkey(cert_der)` — reverse direction, used by
 //!   the pinning verifiers: take a received cert and return its
@@ -94,9 +94,7 @@ pub fn generate_self_signed_cert(
     let rcgen_key = KeyPair::try_from(pkcs8_bytes.as_slice())
         .map_err(|error| CertGenError::Rcgen(error.to_string()))?;
 
-    // Subject Common Name = peer UUID string. Substrate doesn't read
-    // this back; it's purely for diagnostics ("openssl x509 -text -in
-    // peer.der" shows the PeerId).
+    // Subject Common Name = durable peer UUID, authenticated by TLS CertificateVerify.
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, peer_id.to_string());
 
@@ -143,11 +141,49 @@ pub fn extract_ed25519_pubkey(cert_der: &CertificateDer<'_>) -> Result<[u8; 32],
     Ok(out)
 }
 
+/// The peer claimed by this certificate. TLS CertificateVerify proves possession
+/// of its key; callers must additionally check this exact ID/key pair is enrolled.
+/// Never reverse-map a key: historical duplicate enrollments are not identity authority.
+pub fn extract_peer_id(cert_der: &CertificateDer<'_>) -> Result<PeerId, CertParseError> {
+    let (_, parsed) = X509Certificate::from_der(cert_der.as_ref())
+        .map_err(|error| CertParseError::InvalidCert(error.to_string()))?;
+    let mut names = parsed.subject().iter_common_name();
+    let name = names
+        .next()
+        .ok_or_else(|| CertParseError::InvalidCert("missing peer UUID CN".into()))?;
+    if names.next().is_some() {
+        return Err(CertParseError::InvalidCert("multiple peer UUID CNs".into()));
+    }
+    let name = name
+        .as_str()
+        .map_err(|error| CertParseError::InvalidCert(error.to_string()))?;
+    name.parse::<uuid::Uuid>()
+        .map(PeerId::from_uuid)
+        .map_err(|error| CertParseError::InvalidCert(format!("invalid peer UUID CN: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use airc_protocol::PeerKeypair;
 
+    #[test]
+    fn multiple_identity_names_are_rejected_even_when_equal() {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        let peer = PeerId::from_u128(0xa1).to_string();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, peer.clone());
+        params
+            .distinguished_name
+            .push(DnType::CustomDnType(vec![2, 5, 4, 3]), peer);
+        let cert = params.self_signed(&key).unwrap();
+        assert!(
+            matches!(extract_peer_id(cert.der()), Err(CertParseError::InvalidCert(reason)) if reason == "multiple peer UUID CNs")
+        );
+    }
     #[test]
     fn generated_cert_carries_the_keypair_pubkey() {
         // The core invariant: the substrate's Ed25519 identity and the
@@ -159,6 +195,7 @@ mod tests {
         let (cert_der, _key_der) = generate_self_signed_cert(&keypair, peer_id).unwrap();
         let extracted = extract_ed25519_pubkey(&cert_der).unwrap();
         assert_eq!(extracted, keypair.public_bytes());
+        assert_eq!(extract_peer_id(&cert_der).unwrap(), peer_id);
     }
 
     #[test]
@@ -184,6 +221,21 @@ mod tests {
         let garbage = CertificateDer::from(vec![0u8; 16]);
         let result = extract_ed25519_pubkey(&garbage);
         assert!(matches!(result, Err(CertParseError::InvalidCert(_))));
+        assert!(extract_peer_id(&garbage).is_err());
+    }
+
+    #[test]
+    fn absent_or_malformed_identity_is_not_inferred_from_the_key() {
+        for name in [None, Some("Fable"), Some("")] {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.distinguished_name = DistinguishedName::new();
+            if let Some(name) = name {
+                params.distinguished_name.push(DnType::CommonName, name);
+            }
+            let cert = params.self_signed(&key).unwrap();
+            assert!(extract_peer_id(cert.der()).is_err());
+        }
     }
 
     #[test]

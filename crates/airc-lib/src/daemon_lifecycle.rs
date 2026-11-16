@@ -258,6 +258,11 @@ fn require_running(owner: &crate::MachineAccountHome) -> io::Result<()> {
 impl Drop for DaemonLifecycleGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.active);
+        // A duplicated or fork-inherited description can outlive this owner.
+        // Open admission only after releasing lifecycle exclusivity.
+        if let Some(intent) = &self._maintenance_intent {
+            let _ = FileExt::unlock(intent);
+        }
     }
 }
 
@@ -379,6 +384,28 @@ mod tests {
         assert!(!automatic.operator_stopped().unwrap());
         assert!(automatic.record_operator_stop().is_err());
         assert!(automatic.clear_operator_stop().is_err());
+    }
+
+    // An inherited/duplicated file description must not extend maintenance
+    // after its owner finishes. This holds the overlap without timing a fork.
+    #[test]
+    fn maintenance_release_unlocks_a_retained_intent_handle() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let maintenance = DaemonLifecycleGuard::maintenance(dir.path())?;
+        let retained = maintenance
+            ._maintenance_intent
+            .as_ref()
+            .ok_or_else(|| io::Error::other("maintenance did not acquire intent"))?
+            .try_clone()?;
+        let refused = DaemonLifecycleGuard::autostart(dir.path()).err();
+        assert!(refused
+            .as_ref()
+            .is_some_and(|error| is_maintenance_in_progress(error)));
+        drop(maintenance);
+        let automatic = DaemonLifecycleGuard::autostart(dir.path())?;
+        assert!(!automatic.operator_stopped()?);
+        drop((automatic, retained));
+        Ok(())
     }
 
     // A busy node drains its existing reader rather than abandoning an update;
