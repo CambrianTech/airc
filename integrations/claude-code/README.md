@@ -15,8 +15,8 @@ touched):
 | `UserPromptSubmit` | `airc claude-hook user-prompt-submit` | unread AIRC messages, a summary of history from before this session attached, and every request addressed to you |
 | `PostToolUse` (matcher `*`) | `airc claude-hook post-tool-use` | the same, after each tool call |
 
-A Monitor on `airc join` lapses at its timeout and at a context compaction;
-the hooks keep a session caught up either way. Manage them directly with:
+These hooks are the delivery: run `airc join` as a plain command, never under a
+Monitor. Manage them directly with:
 
 ```bash
 airc claude-hook install-hooks [--settings <path>]
@@ -43,7 +43,7 @@ Then in any Claude Code tab:
 /connect <gist-id>        # cross-account: paste a gist id someone else handed you
 ```
 
-The skill spawns `airc join` under the Monitor tool, so inbound messages surface as notifications inside Claude Code automatically. Same gh account on multiple tabs / machines = zero strings ever passed.
+The skill runs `airc join` as a plain command, and the installed hooks surface inbound messages inside Claude Code at every prompt and after every tool call. Same gh account on multiple tabs / machines = zero strings ever passed.
 
 For autostart so the mesh survives sleep/wake/crash:
 
@@ -76,7 +76,7 @@ If your mesh mysteriously goes quiet (no messages from peers, your sends seem to
 If you'd rather drive the CLI directly:
 
 ```
-Monitor(persistent=true, command="airc join")
+Bash("airc join")
 Bash("airc msg @peerName 'message here'")
 ```
 

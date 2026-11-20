@@ -1,10 +1,11 @@
 //! Claude Code integration boundary (card b00d2724).
 //!
-//! A Claude Code session hears AIRC through a Monitor on `airc join`, which
-//! expires and is lost at a context compaction. These hooks give the session
-//! the same catch-up Codex has on every prompt and after every tool call. Only
-//! Claude's lines live here: its verb, its session prefix, its settings file,
-//! and how it re-arms a reader. The delivery itself is `integrations::agent_hook`.
+//! A Claude Code session hears AIRC through these hooks: unread peer traffic on
+//! every prompt and after every tool call, the same catch-up Codex has. No
+//! Monitor or other hand-held reader is ever asked for; `airc join` is a plain
+//! command that ensures the daemon and the room subscriptions. Only Claude's
+//! lines live here: its verb, its session prefix and its settings file. The
+//! delivery itself is `integrations::agent_hook`.
 
 use std::path::{Path, PathBuf};
 
@@ -17,9 +18,6 @@ pub const CLAUDE: HookRuntime = HookRuntime {
     verb: "claude-hook",
     name: "Claude Code",
     session_prefix: "claude:",
-    rearm_reader: Some(
-        "Re-arm one: run `airc join` under a Monitor (it lapses after its timeout and at a context compaction).",
-    ),
 };
 
 /// Claude's hooks in `settings.json`. PostToolUse takes a matcher; `*` is every tool.

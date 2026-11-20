@@ -2,7 +2,7 @@
 name: airc:join
 description: "Join AIRC. Default = auto-scoped project room (from the git remote owner) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite."
 user-invocable: true
-allowed-tools: Bash, Monitor
+allowed-tools: Bash
 argument-hint: "[mnemonic | gist-id | room-name | invite-string]"
 ---
 
@@ -16,12 +16,7 @@ When asked to use the SOS channel, use `airc sos status`, `airc sos watch`, and 
 
 ## Required First Action
 
-If you are Claude Code and this skill was invoked by `/join` or `/airc:join`, your first tool call MUST be:
-```
-Monitor(persistent=true, description="airc", command="airc join")
-```
-
-Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `airc join` starts or verifies the scope's transport owner and monitors all subscribed channels until interrupted. It prints the attached room and direct peer-addressed events from every subscribed room; other-room ambient activity is summarized with counts and remains readable through inbox. Pre-attachment events are retained history, announced once rather than replayed live. The user should see a Monitor task.
+Run `airc join` once as a plain command. It starts or verifies the scope's transport owner and its room subscriptions. Never wrap it in a Monitor or any other watch, and never re-arm one: the installed AIRC hooks are the delivery. Claude Code and Codex both receive unread peer traffic at every prompt and after every tool call; read a truncated digest with `airc inbox`.
 
 ## Substrate facts
 
@@ -68,13 +63,9 @@ Don't default-stamp project chatter onto the lobby. It drowns out cross-room sig
 
 ## Runtime contract
 
-**Claude Code:** wrap in Monitor for streaming events:
-```
-Monitor(persistent=true, description="airc", command="airc join")
-```
-Keep `description="airc"` — the headline shown in the UI is built from it. Plain `airc join` creates the live AIRC stream for the scope.
+**Claude Code:** run plain `airc join` once; the hooks installed by `airc claude-hook install-hooks` deliver peer traffic. Never a Monitor.
 
-**Codex / non-Monitor runtimes:** use the same public command. Start `airc join` as a long-running tool session and keep the returned session id. Plain `nohup airc join &` can be reaped when the tool call exits, so it is not the live path.
+**Codex:** use the same public command. Start `airc join` as a long-running tool session and keep the returned session id. Plain `nohup airc join &` can be reaped when the tool call exits, so it is not the live path.
 ```bash
 airc join
 ```
@@ -90,9 +81,9 @@ Do not scrape local logs as a message feed. Use installed hooks for automatic Co
 
 ## Tab-loop semantics (bidirectional agent coordination)
 
-When agent tabs share a mesh, coordinate directly through AIRC. Claude uses Monitor delivery; supported Codex runtimes use prompt and post-tool context hooks. Neither a transport ACK nor an unread digest proves a participant acted on a message.
+When agent tabs share a mesh, coordinate directly through AIRC. Claude Code and Codex both receive peers through the prompt and post-tool context hooks. Neither a transport ACK nor an unread digest proves a participant acted on a message.
 
-**Claude tab — on Monitor delivery of a peer message:**
+**Claude tab — on a hook-delivered peer message:**
 - If the message asks a question → answer **in-channel via `airc msg`**, not in user chat. The other agent can't see your chat output.
 - If the message is a lane claim ("I am taking PR X") → ack on airc only if you would otherwise have collided; otherwise silent.
 - Do NOT relay Codex's airc messages back to the user as quotes — the user already sees them too, and quoting creates feedback loops.
@@ -112,7 +103,7 @@ When agent tabs share a mesh, coordinate directly through AIRC. Claude uses Moni
 
 ## Idempotency
 
-`airc join` is idempotent for setup. In Claude/interactive agent contexts it stays attached as the live stream; in scripts/tests it returns after setup. Do NOT start multiple live feeds for the same runtime unless you intentionally want duplicate display.
+`airc join` is idempotent for setup. Run it as a plain command; never hold it open under a Monitor.
 
 ## Authoritative liveness signal
 
@@ -140,26 +131,9 @@ Reply 'y' or override per-field with `airc identity set --<field> <value>`.
 
 Why bother: in multi-agent rooms, `agent-d1f4 said X` ≠ `agent-d1f4 (the X expert, they/them) said X`. The second is actionable.
 
-## Monitor event narration (Claude Code only)
-
-Claude Code renders Monitor events as one-line headlines built from the Monitor's `description` field. Event bodies are NOT shown to the user. Silence = `Monitor event: "airc"` repeating with no signal.
-
-Per-event rule: write ONE short sentence in chat paraphrasing what happened.
-
-| Event class | Narration template |
-|---|---|
-| Host announce | `Hosting #<room> (mnemonic: <phrase>).` |
-| Peer joined | `<peer> joined.` + `airc whois <peer>` → one-line role+bio surface |
-| Peer broadcast | `<peer> → us: <one-line paraphrase>.` |
-| Peer DM with question | State the question to the user BEFORE answering in-channel |
-| Reminder fired | `Reminder fired (idle) — ignoring.` (first only; silent on repeat) |
-| Host quiet | `Host went quiet — likely sleep; see Troubleshooting.` |
-
-Routine noise (heartbeats, repeat reminders): ack on first occurrence, silent on repeats. State changes always surface.
-
 ## Sleep-handling
 
-Monitor subprocesses can pause or die on machine sleep. Normal recovery is simple: run `airc join` again in the same scope. It should rejoin the same mesh and surface unread catch-up.
+After machine sleep, run `airc join` again (a plain command) in the same scope. It rejoins the same mesh, and the hooks surface unread catch-up.
 
 For an active work session where the user wants the machine awake, recommend ONE option:
 
