@@ -1,8 +1,8 @@
 ---
 name: airc:resume
-description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code uses Monitor; Codex/non-Monitor runtimes use the same public join command, which detaches the local transport owner when needed and checks inbox.
+description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code and Codex run the same plain join command (never under a Monitor), which detaches the local transport owner when needed and checks inbox.
 user-invocable: true
-allowed-tools: Bash, Monitor
+allowed-tools: Bash
 argument-hint: ""
 ---
 
@@ -12,12 +12,7 @@ Run this yourself — don't ask the user.
 
 ## Execute
 
-Claude Code:
-```
-Monitor(persistent=true, description="airc", command="airc join")
-```
-
-Codex / non-Monitor runtimes:
+Claude Code and Codex, as a plain command (never under a Monitor; the installed hooks deliver peer traffic):
 ```bash
 airc join
 ```
@@ -27,7 +22,7 @@ airc join
 ## When to use
 
 - User re-opens a Claude Code tab in a project dir that has a prior `.airc/` scope.
-- Monitor died or you need to bounce it after pulling new airc code.
+- The daemon needs to pick up new airc code.
 - Any time the state is on disk but no airc process is running.
 
 ## Failure modes

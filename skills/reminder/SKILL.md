@@ -1,6 +1,6 @@
 ---
 name: airc:reminder
-description: "Save a compact per-agent resume brief and deliver due work reminders through existing hooks, Claude Monitor, or an explicitly scheduled poll."
+description: "Save a compact per-agent resume brief and deliver due work reminders through existing hooks or an explicitly scheduled poll."
 user-invocable: true
 allowed-tools: Bash
 argument-hint: "brief and manual reference"
@@ -20,7 +20,7 @@ airc agent-resume clear
 Write the brief from the user's actual task. The brief plus manual reference must
 fit 1024 characters. Derived board and local maintenance issues are separate.
 Do not claim that saving a brief creates a wake-up task: Codex hooks only deliver
-at runtime boundaries, Claude uses its already-running Monitor, and idle Codex
+at runtime boundaries (Claude Code's hooks likewise), and an idle session
 requires the runtime's supported scheduler. Only configure a schedule when the
 user requests it. See `docs/agent-resume-context.md` for adapter details.
 

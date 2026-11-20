@@ -284,13 +284,13 @@ Room membership and peer trust are separate: using the same room name does not e
 
 ## Agent Integrations
 
-Claude Code uses skills and Monitor. Run:
+Claude Code uses skills and context hooks. Run:
 
 ```text
 /join
 ```
 
-Inbound messages stream through the Monitor UI.
+Inbound messages arrive through the installed hooks at every prompt and after every tool call; no Monitor is needed.
 
 Codex uses the same skills plus automatic context hooks. Run:
 
@@ -306,7 +306,7 @@ Other integrations live in [`integrations/`](integrations/):
 
 | Agent | Integration |
 |-------|-------------|
-| Claude Code | Skills + Monitor |
+| Claude Code | Skills + context hooks |
 | OpenAI Codex CLI | Skills + prompt and post-tool context hooks |
 | opencode | `AGENTS.md` + shell |
 | Cursor | Rules + terminal |
