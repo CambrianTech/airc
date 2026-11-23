@@ -23,8 +23,8 @@
 # with the live models for CPU and memory) records that ONCE, durably:
 #   git config --global airc.cargoGate fmt-only
 # The gate then runs only `cargo fmt --check` (a formatter, no compile) and says that
-# clippy and the compile are left to CI. Whatever installs or operates the machine sets it;
-# the hook never guesses whether a machine serves.
+# clippy and the compile are left to CI. Auto-detects serving state automatically;
+# manual override (airc.cargoGate=fmt-only) available for edge cases.
 #
 # Env knobs (all optional, per push):
 #   AIRC_HOOK_SKIP=1           disable ALL airc hooks (shared escape hatch)
@@ -63,6 +63,10 @@ fi
 
 # Why clippy (the compile) would not run here, if it would not; empty means it runs.
 DEFERRED_BY=""
+# Auto-detect serving node: if continuum-core-server is running, defer compile to CI.
+if pgrep -f "continuum-core-server" >/dev/null 2>&1; then
+  DEFERRED_BY="serving-node detected (continuum-core-server running)"
+fi
 if [ "$(git config --get airc.cargoGate 2>/dev/null || true)" = "fmt-only" ]; then
   DEFERRED_BY="airc.cargoGate=fmt-only (this machine does not compile)"
 elif [ "${AIRC_CARGO_GATE_CLIPPY:-1}" != "1" ]; then
