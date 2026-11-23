@@ -320,8 +320,8 @@ impl std::fmt::Display for IdentityError {
                               either the evidence is wrong or the local secret was swapped; no binding was established, and load keeps refusing this home until the two agree"
                         ),
                     }
-                }
-            }
+    }
+}
 
 impl std::error::Error for IdentityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -646,7 +646,9 @@ impl LocalIdentity {
         }
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&key_bytes);
-        let derived = PeerKeypair::from_secret_bytes(&secret).public_bytes().to_vec();
+        let derived = PeerKeypair::from_secret_bytes(&secret)
+            .public_bytes()
+            .to_vec();
         if derived != public_key_evidence {
             return Err(IdentityError::EvidenceMismatch {
                 agent_name: stored.agent_name.clone(),
@@ -1720,14 +1722,17 @@ mod tests {
 
         // The defect this card names: the unbound row makes load refuse.
         let refused = LocalIdentity::load_or_generate_as(home.path(), "codex").await;
-        assert!(matches!(refused, Err(IdentityError::KeyBindingMissing { .. })));
+        assert!(matches!(
+            refused,
+            Err(IdentityError::KeyBindingMissing { .. })
+        ));
 
         // The operator's independently verified evidence: the public key this
         // citizen is known to hold (from a peer-trust record / old backup).
         let bound = LocalIdentity::bind(
             home.path(),
             "codex",
-            &identity.keypair.public_bytes().to_vec(),
+            identity.keypair.public_bytes().as_ref(),
         )
         .await
         .unwrap();
@@ -1742,7 +1747,10 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.peer_id, identity.peer_id);
         assert_eq!(reopened.client_id, identity.client_id);
-        assert_eq!(reopened.keypair.public_bytes(), identity.keypair.public_bytes());
+        assert_eq!(
+            reopened.keypair.public_bytes(),
+            identity.keypair.public_bytes()
+        );
 
         // And the binding persisted to disk.
         let stored = store
@@ -1750,7 +1758,10 @@ mod tests {
             .await
             .unwrap()
             .expect("the row must survive the bind");
-        assert_eq!(stored.expected_public_key, Some(identity.keypair.public_bytes().to_vec()));
+        assert_eq!(
+            stored.expected_public_key,
+            Some(identity.keypair.public_bytes().to_vec())
+        );
     }
 
     // what this catches: an established binding is never overwritten — even by
@@ -1767,15 +1778,24 @@ mod tests {
         let result = LocalIdentity::bind(
             home.path(),
             "codex",
-            &identity.keypair.public_bytes().to_vec(),
+            identity.keypair.public_bytes().as_ref(),
         )
         .await;
-        assert!(matches!(result, Err(IdentityError::AlreadyBound { ref agent_name }) if agent_name == "codex"));
+        assert!(
+            matches!(result, Err(IdentityError::AlreadyBound { ref agent_name }) if agent_name == "codex")
+        );
 
         // The existing binding is untouched.
         let store = open_store(home.path()).await.unwrap();
-        let stored = store.load_local_identity_by_agent_name("codex").await.unwrap().unwrap();
-        assert_eq!(stored.expected_public_key, Some(identity.keypair.public_bytes().to_vec()));
+        let stored = store
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.expected_public_key,
+            Some(identity.keypair.public_bytes().to_vec())
+        );
     }
 
     // what this catches: evidence that is not a 32-byte ed25519 public key is
@@ -1817,10 +1837,16 @@ mod tests {
 
         // Independent evidence of a DIFFERENT key than this home holds.
         let result = LocalIdentity::bind(home.path(), "codex", &[9u8; 32]).await;
-        assert!(matches!(result, Err(IdentityError::EvidenceMismatch { ref agent_name }) if agent_name == "codex"));
+        assert!(
+            matches!(result, Err(IdentityError::EvidenceMismatch { ref agent_name }) if agent_name == "codex")
+        );
 
         // The row is still unbound — nothing was recorded.
-        let stored = store.load_local_identity_by_agent_name("codex").await.unwrap().unwrap();
+        let stored = store
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stored.expected_public_key.is_none());
     }
 
@@ -1831,6 +1857,8 @@ mod tests {
         let home = TempDir::new().unwrap();
 
         let result = LocalIdentity::bind(home.path(), "nobody", &[1u8; 32]).await;
-        assert!(matches!(result, Err(IdentityError::IdentityNotInitialised { ref agent_name }) if agent_name == "nobody"));
+        assert!(
+            matches!(result, Err(IdentityError::IdentityNotInitialised { ref agent_name }) if agent_name == "nobody")
+        );
     }
 }
