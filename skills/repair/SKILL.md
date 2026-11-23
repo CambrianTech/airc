@@ -2,7 +2,7 @@
 name: airc:repair
 description: Recover a stale airc mesh by stopping this scope's daemon and re-joining. Most routine recovery should just use `airc join`.
 user-invocable: true
-allowed-tools: Bash, Monitor
+allowed-tools: Bash
 argument-hint: "[join-string | room | gist-id]"
 ---
 
@@ -29,12 +29,7 @@ subscriptions, messages) is preserved on disk.
 
 ### Step 2 — join
 
-Claude Code:
-```
-Monitor(persistent=true, description="airc", command="airc join ${ARGUMENTS}")
-```
-
-Codex / non-Monitor runtimes:
+Claude Code and Codex, as a plain command (never under a Monitor; the installed hooks deliver peer traffic):
 ```bash
 airc join ${ARGUMENTS:+"$ARGUMENTS"}
 ```

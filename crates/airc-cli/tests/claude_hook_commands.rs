@@ -18,8 +18,9 @@ fn claude_stdin(session: &str, event: &str) -> String {
 }
 
 // what this catches: the Claude adapter emits the exact JSON Claude Code reads for
-// both events, keyed by the stdin session, and says in one line that no `airc join`
-// reader is beating for that session (the 9 h deaf session of 2026-10-26).
+// both events, keyed by the stdin session, and never tells the session to arm a
+// reader: the hooks are the delivery (a "re-arm under a Monitor" line kept agents
+// flooding themselves with Monitor watches, 2026-11-20).
 #[test]
 fn claude_hook_emits_claude_valid_json_for_both_events() {
     let workspace = common::daemon_tempdir();
@@ -39,10 +40,8 @@ fn claude_hook_emits_claude_valid_json_for_both_events() {
     assert_eq!(specific["hookEventName"], "UserPromptSubmit");
     let context = specific["additionalContext"].as_str().unwrap();
     assert!(context.contains("review requested"));
-    assert!(
-        context.contains("no live `airc join` reader for claude:s-1"),
-        "{context}"
-    );
+    assert!(!context.contains("Monitor"), "{context}");
+    assert!(!context.contains("airc join` reader"), "{context}");
     run_ok_with_client(&home, "codex:peer", &["send", "arrived during a tool"]);
     let tool = claude_stdin("s-1", "PostToolUse");
     let output = run_hook_with_client(&home, "", &["claude-hook", "post-tool-use"], &tool);

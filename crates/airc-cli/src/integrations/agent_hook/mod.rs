@@ -37,10 +37,6 @@ pub struct HookRuntime {
     pub name: &'static str,
     /// Prefix that turns the hook's stdin `session_id` into a runtime client id.
     pub session_prefix: &'static str,
-    /// How this runtime re-arms a live `airc join` reader. `Some` makes every digest
-    /// say in one line when no reader for this session is beating; `None` keeps the
-    /// digest silent about readers.
-    pub rearm_reader: Option<&'static str>,
 }
 
 /// The hook events both runtimes deliver context on.
@@ -262,7 +258,7 @@ async fn compose(
         Some(text) => Some(text),
         None => work_context(airc, &turn.live_events()[..live_end]).await?,
     };
-    let mut context = delivery_context(
+    let context = delivery_context(
         turn,
         live_end,
         options.raw,
@@ -271,11 +267,6 @@ async fn compose(
         runtime.verb,
         shows,
     );
-    if context.is_some() {
-        if let Some(line) = reader_line(runtime, airc, runtime_client).await {
-            context = context.map(|text| format!("{text}\n{line}"));
-        }
-    }
     let context = continuation(runtime, context, turn.has_pending(live_end), runtime_client);
     Ok((context, live_end))
 }
@@ -337,40 +328,6 @@ async fn work_context(
         render_claimable_work(airc).await
     } else {
         Ok(None)
-    }
-}
-
-/// One line when this session has no live `airc join` reader, judged from presence
-/// beats (a join beats as its runtime client). Says when it cannot tell.
-async fn reader_line(
-    runtime: &HookRuntime,
-    airc: &Airc,
-    runtime_client: Option<&str>,
-) -> Option<String> {
-    let rearm = runtime.rearm_reader?;
-    let Some(client) = runtime_client else {
-        return Some(format!(
-            "AIRC: cannot tell whether a live `airc join` reader is attached: this hook has no session identity. {rearm}"
-        ));
-    };
-    match airc
-        .active_agents(airc_lib::agent_heartbeat::PRESENCE_TTL, 0)
-        .await
-    {
-        Ok(agents) => {
-            let attached = agents.iter().any(|agent| {
-                agent.peer == airc.peer_id() && agent.client_id.as_deref() == Some(client)
-            });
-            (!attached).then(|| {
-                format!(
-                    "AIRC: no live `airc join` reader for {client} (no presence beat in {} s); between hook calls this session hears nothing. {rearm}",
-                    airc_lib::agent_heartbeat::PRESENCE_TTL.as_secs()
-                )
-            })
-        }
-        Err(error) => Some(format!(
-            "AIRC: cannot tell whether a live `airc join` reader is attached ({error}). {rearm}"
-        )),
     }
 }
 

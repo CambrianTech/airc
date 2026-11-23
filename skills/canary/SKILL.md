@@ -40,12 +40,7 @@ airc update
 
 Then restart this scope so the running daemon picks up the new binary:
 
-Claude Code:
-```
-Monitor(persistent=true, description="airc", command="airc join")
-```
-
-Codex / non-Monitor runtimes:
+Claude Code and Codex, as a plain command (never under a Monitor):
 ```bash
 airc join
 ```
