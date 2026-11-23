@@ -74,11 +74,29 @@ pub(super) fn route_finding(
         }
     };
     match snapshot.connected_lan_peers {
-        Some(0) => Finding::warn(
-            "route health",
-            format!("daemon snapshot {}s old: no connected LAN peers", age / 1000),
-            "check the intended peer's route; this count does not measure other transports or prove delivery failure",
-        ),
+        Some(0) => {
+            // When zero LAN connections but the same daemon snapshot shows
+            // confirmed deliveries (acked > 0), traffic arrived on an
+            // unmeasured rail. Report the meter gap — not a dead channel.
+            // This is #1306: "nothing here shows a frame has ever crossed"
+            // while 940/940 were acked on another transport.
+            let confirmed = snapshot.peers.iter().filter(|p| p.acked > 0).count();
+            if confirmed > 0 {
+                Finding::info(
+                    "route health",
+                    format!(
+                        "lan-tcp measured zero connections; delivery ledger confirms {} peer(s) — traffic on an unmeasured rail (see delivery truth)",
+                        confirmed
+                    ),
+                )
+            } else {
+                Finding::warn(
+                    "route health",
+                    format!("daemon snapshot {}s old: no connected LAN peers", age / 1000),
+                    "check the intended peer's route; this count does not measure other transports or prove delivery failure",
+                )
+            }
+        },
         Some(count) => Finding::info(
             "route health",
             format!(
