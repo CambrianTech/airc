@@ -63,14 +63,14 @@ fi
 
 # Why clippy (the compile) would not run here, if it would not; empty means it runs.
 DEFERRED_BY=""
-# Auto-detect serving node: if continuum-core-server is running, defer compile to CI.
-if pgrep -f "continuum-core-server" >/dev/null 2>&1; then
-  DEFERRED_BY="serving-node detected (continuum-core-server running)"
-fi
+# Manual overrides take precedence — they always win over auto-detection.
 if [ "$(git config --get airc.cargoGate 2>/dev/null || true)" = "fmt-only" ]; then
   DEFERRED_BY="airc.cargoGate=fmt-only (this machine does not compile)"
 elif [ "${AIRC_CARGO_GATE_CLIPPY:-1}" != "1" ]; then
   DEFERRED_BY="AIRC_CARGO_GATE_CLIPPY=0"
+# Auto-detect serving node: if continuum-core-server is running, defer to CI.
+elif pgrep -f "continuum-core-server" >/dev/null 2>&1; then
+  DEFERRED_BY="serving-node detected (continuum-core-server running)"
 fi
 
 if [ -n "$DEFERRED_BY" ]; then
