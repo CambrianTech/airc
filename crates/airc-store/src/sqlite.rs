@@ -422,6 +422,32 @@ impl SqliteEventStore {
         Ok(res.rows_affected == 1)
     }
 
+    /// Establish the custody binding on a still-unbound row (trait docs).
+    ///
+    /// One statement with the IS NULL predicate in the WHERE clause — the
+    /// same `update_many().col_expr(...).filter(...)` shape as the refresh-lock
+    /// acquisition above: a bound row can never match, so overwriting an
+    /// existing binding from current file contents is structurally impossible,
+    /// and two concurrent binds race on one atomic statement rather than a
+    /// read-then-write pair.
+    pub async fn bind_local_identity_public_key(
+        &self,
+        agent_name: &str,
+        expected_public_key: Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let _write = self.admit_write().await?;
+        let res = local_identity::Entity::update_many()
+            .col_expr(
+                local_identity::Column::ExpectedPublicKey,
+                Expr::value(expected_public_key),
+            )
+            .filter(local_identity::Column::AgentName.eq(agent_name.to_string()))
+            .filter(local_identity::Column::ExpectedPublicKey.is_null())
+            .exec(&self.db)
+            .await?;
+        Ok(res.rows_affected == 1)
+    }
+
     /// Replace the user-facing identity card on the singleton row.
     /// Peer/client ids are not touched.
     pub async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {

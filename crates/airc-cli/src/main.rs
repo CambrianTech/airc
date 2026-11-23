@@ -381,6 +381,9 @@ async fn dispatch(parsed: Cli) -> Result<(), Box<dyn std::error::Error>> {
             IdentityAction::PushContinuum { handle } => {
                 identity_commands::run_push_continuum(&home, &handle).await
             }
+            IdentityAction::Bind { as_agent, evidence } => {
+                identity_commands::run_bind(&home, as_agent.as_deref(), &evidence).await
+            }
         },
 
         Command::State(args) => match args.action {

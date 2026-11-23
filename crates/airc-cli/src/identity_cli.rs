@@ -162,4 +162,16 @@ pub enum IdentityAction {
         #[arg(long)]
         handle: String,
     },
+
+    /// Establish the custody binding on an unbound local-identity row from
+    /// independently verified public-key evidence — the one-shot migration for
+    /// rows that predate verified custody (expected_public_key is NULL).
+    Bind {
+        /// Agent whose row is bound; defaults to AIRC_AGENT_NAME or the default agent.
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+        /// Independently verified public key, URL-safe base64 without padding (32 bytes decoded).
+        #[arg(long)]
+        evidence: String,
+    },
 }

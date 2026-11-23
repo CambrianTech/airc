@@ -127,6 +127,25 @@ impl EventStore for InMemoryEventStore {
         }
     }
 
+    /// Establish the custody binding on a still-unbound row (trait docs).
+    async fn bind_local_identity_public_key(
+        &self,
+        agent_name: &str,
+        expected_public_key: Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        let mut stored = self
+            .local_identities
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        match stored.get_mut(agent_name) {
+            Some(row) if row.expected_public_key.is_none() => {
+                row.expected_public_key = Some(expected_public_key);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn save_local_identity_card(
         &self,
         identity: airc_core::identity::Identity,
