@@ -3,9 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use airc_core::identity::Identity;
-use airc_identity::LocalIdentity;
+use airc_identity::{requested_agent_name, LocalIdentity};
 use airc_lib::MachineAccountHome;
 use airc_store::{EventStore, SqliteEventStore};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Value};
 
@@ -15,6 +17,30 @@ const PRONOUNS_MAX: usize = 64;
 const ROLE_MAX: usize = 128;
 const BIO_MAX: usize = 512;
 const STATUS_MAX: usize = 256;
+
+/// Establish the custody binding on an unbound local-identity row from
+/// independently verified public-key evidence (the #1636 upgrade gap): rows
+/// that predate verified custody carry `expected_public_key = NULL` and refuse
+/// to open with KeyBindingMissing. This records the key, cross-checked against
+/// what the agent's own secret derives; an established binding is never
+/// overwritten.
+pub async fn run_bind(
+    home: &Path,
+    as_agent: Option<&str>,
+    evidence_b64: &str,
+) -> Result<(), Box<dyn Error>> {
+    let agent = requested_agent_name(as_agent)?;
+    let evidence = URL_SAFE_NO_PAD
+        .decode(evidence_b64.trim())
+        .map_err(|err| format!("--evidence is not valid base64 (URL-safe, no padding): {err}"))?;
+    let bound = LocalIdentity::bind(home, &agent, &evidence).await?;
+    println!(
+        "custody binding established for agent {:?} — public key {} recorded from independently verified evidence",
+        bound.agent_name,
+        URL_SAFE_NO_PAD.encode(&bound.public_key)
+    );
+    Ok(())
+}
 
 pub fn run_pretty(name: &str, identity_json: &str, host: &str) -> Result<(), Box<dyn Error>> {
     let identity: Value =

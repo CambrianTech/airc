@@ -80,6 +80,17 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
         expected_public_key: Option<Vec<u8>>,
     ) -> Result<bool, StoreError>;
 
+    /// Establish the custody binding on an existing local-identity row **only if it is still unbound** (`expected_public_key IS NULL`).
+    ///
+    /// Card e17a082b — the explicit upgrade path migration 000023 demands: pre-existing ORM rows carry `expected_public_key = NULL`, and the mandatory load check refuses to open them until a binding exists. This is the store-side half of that verb; it never creates a row (that is the mint APIs' job) and never overwrites an existing binding — re-binding from current file contents would launder whatever secret now sits at the key path into the record.
+    ///
+    /// Returns `Ok(true)` when exactly one row was bound, `Ok(false)` when no row matched: the agent is absent, or already carries a binding. Callers that must distinguish the two cases should read first with [`Self::load_local_identity_by_agent_name`].
+    async fn bind_local_identity_public_key(
+        &self,
+        agent_name: &str,
+        expected_public_key: Vec<u8>,
+    ) -> Result<bool, StoreError>;
+
     /// Replace only the user-facing identity card fields on the
     /// singleton row. Peer/client ids are immutable.
     async fn save_local_identity_card(

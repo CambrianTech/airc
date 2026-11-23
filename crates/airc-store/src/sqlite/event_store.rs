@@ -34,6 +34,15 @@ impl EventStore for SqliteEventStore {
         .await
     }
 
+    async fn bind_local_identity_public_key(
+        &self,
+        agent_name: &str,
+        expected_public_key: Vec<u8>,
+    ) -> Result<bool, StoreError> {
+        SqliteEventStore::bind_local_identity_public_key(self, agent_name, expected_public_key)
+            .await
+    }
+
     async fn save_local_identity_card(&self, identity: Identity) -> Result<(), StoreError> {
         SqliteEventStore::save_local_identity_card(self, identity).await
     }

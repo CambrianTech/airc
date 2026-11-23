@@ -59,6 +59,19 @@ pub struct LocalIdentity {
     pub agent_name: String,
 }
 
+/// The outcome of a successful [`LocalIdentity::bind`]: the identity that became openable, with the public key now bound to its row (for operator confirmation against their evidence).
+#[derive(Debug, Clone)]
+pub struct BoundIdentity {
+    /// The agent whose row was bound.
+    pub agent_name: String,
+    /// Peer id carried by the pre-existing row — unchanged by the bind.
+    pub peer_id: PeerId,
+    /// Client id carried by the pre-existing row — unchanged by the bind.
+    pub client_id: ClientId,
+    /// The public key the row is now bound to; equal to the verified evidence.
+    pub public_key: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub enum IdentityError {
     Io(std::io::Error),
@@ -179,6 +192,24 @@ pub enum IdentityError {
     KeyBindingMismatch {
         agent_name: String,
     },
+    /// An explicit custody bind was asked for a row that ALREADY carries an
+    /// `expected_public_key`. Bind is the one-shot migration from an unbound
+    /// (NULL) row; overwriting an established binding would let a later
+    /// operator silently rewrite history, so repairing an existing binding is
+    /// deliberate row-level repair with full evidence — never this verb.
+    AlreadyBound {
+        agent_name: String,
+    },
+    /// The public-key evidence supplied for an explicit custody bind is not 32
+    /// bytes — the length of the Ed25519 public key a binding verifies against.
+    BadEvidenceLength(usize),
+    /// Independently verified evidence does not match the public key derived
+    /// from this home's own key file for that agent: either the evidence is
+    /// wrong or the local secret was swapped — neither case may establish a
+    /// binding, since writing one would leave a row refusing every open.
+    EvidenceMismatch {
+        agent_name: String,
+    },
 }
 
 impl std::fmt::Display for IdentityError {
@@ -268,13 +299,27 @@ impl std::fmt::Display for IdentityError {
                  migration required: establish a binding from independently verified evidence before this home can open as that agent; \
                  the row and key file are preserved, and load refuses to sign with an unbound secret"
             ),
-            IdentityError::KeyBindingMismatch { agent_name } => write!(
-                f,
-                "the secret at identity-{agent_name}.key does not derive the public key bound by the row for agent {agent_name:?} — \
-                 restore the correct key or repair the binding from independently verified evidence before this home can open; \
-                 load refuses to serve a swapped or drifted signing identity"
-            ),
-        }
+                        IdentityError::KeyBindingMismatch { agent_name } => write!(
+                            f,
+                            "the secret at identity-{agent_name}.key does not derive the public key bound by the row for agent {agent_name:?} — \
+                              restore the correct key or repair the binding from independently verified evidence before this home can open; \
+                              load refuses to serve a swapped or drifted signing identity"
+                        ),
+                        IdentityError::AlreadyBound { agent_name } => write!(
+                            f,
+                            "the identity row for agent {agent_name:?} already carries a custody binding (expected_public_key is not NULL) — \
+                              bind is the one-shot migration from an unbound row and never overwrites; repair of an established binding is deliberate row-level work with full evidence"
+                        ),
+                        IdentityError::BadEvidenceLength(got) => write!(
+                            f,
+                            "public-key evidence for the custody bind is {got} bytes, expected 32 (raw Ed25519 public key)"
+                        ),
+                        IdentityError::EvidenceMismatch { agent_name } => write!(
+                            f,
+                            "the independently verified evidence does not match the public key derived from identity-{agent_name}.key for agent {agent_name:?} — \
+                              either the evidence is wrong or the local secret was swapped; no binding was established, and load keeps refusing this home until the two agree"
+                        ),
+                    }
     }
 }
 
@@ -295,7 +340,10 @@ impl std::error::Error for IdentityError {
             | IdentityError::IdentityAlreadyInitialised { .. }
             | IdentityError::KeyMaterialWithoutState { .. }
             | IdentityError::KeyBindingMissing { .. }
-            | IdentityError::KeyBindingMismatch { .. } => None,
+            | IdentityError::KeyBindingMismatch { .. }
+            | IdentityError::AlreadyBound { .. }
+            | IdentityError::BadEvidenceLength(_)
+            | IdentityError::EvidenceMismatch { .. } => None,
             IdentityError::KeyWriteFailedAfterRowInserted { source, .. }
             | IdentityError::KeyPathContended { source, .. } => Some(source),
             // The distinguishing failure of this variant is the failed custody
@@ -544,6 +592,85 @@ impl LocalIdentity {
                 state_exists: false,
             })?;
         Self::load_with_metadata(home, stored)
+    }
+
+    /// Establish the custody binding on an existing row whose
+    /// `expected_public_key` is still NULL — the explicit migration path for
+    /// rows that predate verified custody (card 0f3b3126; the residue
+    /// migration000023 leaves behind).
+    ///
+    /// The evidence must come from a source INDEPENDENT of this home (a peer-
+    /// trust store record, an old backup): bind cross-checks it against the
+    /// public key derived from the agent's own key file and refuses unless
+    /// they agree exactly. That is what keeps this verb from laundering drift —
+    /// recording only what the local file currently derives would bless a
+    /// swapped secret, and writing unverified evidence would leave a home that
+    /// can never open (card 0f3b3126).
+    ///
+    /// Only unbound rows are eligible (`expected_public_key IS NULL`); an
+    /// established binding is never overwritten. On success the agent opens
+    /// immediately: its key exists and matches what was just recorded.
+    pub async fn bind(
+        home: &Path,
+        agent_name: impl AsRef<str>,
+        public_key_evidence: &[u8],
+    ) -> Result<BoundIdentity, IdentityError> {
+        let agent_name = agent_name.as_ref();
+        if public_key_evidence.len() != 32 {
+            return Err(IdentityError::BadEvidenceLength(public_key_evidence.len()));
+        }
+        let store = open_store(home).await?;
+        let stored = store
+            .load_local_identity_by_agent_name(agent_name)
+            .await?
+            .ok_or(IdentityError::IdentityNotInitialised {
+                agent_name: agent_name.to_string(),
+            })?;
+        if stored.expected_public_key.is_some() {
+            return Err(IdentityError::AlreadyBound {
+                agent_name: agent_name.to_string(),
+            });
+        }
+        // Derive EXACTLY as load_with_metadata does — same key path, length
+        // check and derivation — so a successful bind guarantees the agent
+        // opens right afterwards.
+        let key_path = Self::agent_key_path(home, &stored.agent_name);
+        if !key_path.exists() {
+            return Err(IdentityError::KeyMissingForAgent {
+                agent_name: stored.agent_name.clone(),
+            });
+        }
+        let key_bytes = std::fs::read(&key_path)?;
+        if key_bytes.len() != 32 {
+            return Err(IdentityError::BadKeyLength(key_bytes.len()));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&key_bytes);
+        let derived = PeerKeypair::from_secret_bytes(&secret)
+            .public_bytes()
+            .to_vec();
+        if derived != public_key_evidence {
+            return Err(IdentityError::EvidenceMismatch {
+                agent_name: stored.agent_name.clone(),
+            });
+        }
+        // The store's statement is atomic and carries the IS NULL predicate
+        // itself, so a concurrent bind loses with zero affected rows instead of
+        // corrupting anything.
+        let bound = store
+            .bind_local_identity_public_key(agent_name, public_key_evidence.to_vec())
+            .await?;
+        if !bound {
+            return Err(IdentityError::AlreadyBound {
+                agent_name: stored.agent_name.clone(),
+            });
+        }
+        Ok(BoundIdentity {
+            agent_name: stored.agent_name,
+            peer_id: stored.peer_id,
+            client_id: stored.client_id,
+            public_key: derived,
+        })
     }
 
     fn load_with_metadata_for_agent(
@@ -1550,5 +1677,188 @@ mod tests {
         assert!(!LocalIdentity::key_path(home.path()).exists());
         let store = open_store(home.path()).await.unwrap();
         assert!(!store.has_local_identity_rows().await.unwrap());
+    }
+
+    // what this catches (card e17a082b): migration000023 leaves existing rows
+    // with expected_public_key=NULL, and load rejects NULL with
+    // KeyBindingMissing — an old home that predates verified custody can never
+    // open again. bind is the explicit migration step: independently verified
+    // evidence, cross-checked against the agent's own key file, recorded on a
+    // still-unbound row only. This test exercises the full path and then
+    // REOPENS the home — the restart regression this card requires.
+    #[tokio::test]
+    async fn bind_migrates_an_unbound_old_home_and_it_reopens() {
+        let home = TempDir::new().unwrap();
+
+        // A healthy citizen first: mint gives her a key file and a BOUND row.
+        let identity = LocalIdentity::load_or_generate_as(home.path(), "codex")
+            .await
+            .unwrap();
+        let store = open_store(home.path()).await.unwrap();
+
+        // Simulate the pre-migration state migration000023 leaves behind: her
+        // row survives, but its custody binding is NULL.
+        assert!(store
+            .delete_local_identity_if_matching(
+                "codex",
+                identity.peer_id,
+                identity.client_id,
+                Some(identity.keypair.public_bytes().to_vec()),
+            )
+            .await
+            .unwrap());
+        store
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: identity.peer_id,
+                client_id: identity.client_id,
+                version: IDENTITY_STATE_VERSION,
+                created_at_ms: 1,
+                identity: Identity::default(),
+                agent_name: "codex".to_string(),
+                expected_public_key: None,
+            })
+            .await
+            .unwrap();
+
+        // The defect this card names: the unbound row makes load refuse.
+        let refused = LocalIdentity::load_or_generate_as(home.path(), "codex").await;
+        assert!(matches!(
+            refused,
+            Err(IdentityError::KeyBindingMissing { .. })
+        ));
+
+        // The operator's independently verified evidence: the public key this
+        // citizen is known to hold (from a peer-trust record / old backup).
+        let bound = LocalIdentity::bind(
+            home.path(),
+            "codex",
+            identity.keypair.public_bytes().as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bound.agent_name, "codex");
+        assert_eq!(bound.peer_id, identity.peer_id);
+        assert_eq!(bound.public_key, identity.keypair.public_bytes().to_vec());
+
+        // The regression the card requires: reopen (restart) now succeeds —
+        // same citizen, same secret, binding intact.
+        let reopened = LocalIdentity::load_or_generate_as(home.path(), "codex")
+            .await
+            .unwrap();
+        assert_eq!(reopened.peer_id, identity.peer_id);
+        assert_eq!(reopened.client_id, identity.client_id);
+        assert_eq!(
+            reopened.keypair.public_bytes(),
+            identity.keypair.public_bytes()
+        );
+
+        // And the binding persisted to disk.
+        let stored = store
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .expect("the row must survive the bind");
+        assert_eq!(
+            stored.expected_public_key,
+            Some(identity.keypair.public_bytes().to_vec())
+        );
+    }
+
+    // what this catches: an established binding is never overwritten — even by
+    // "correct" evidence. Rebinding from current file contents would bless a
+    // swapped secret; repair of a live binding is operator surgery (delete +
+    // re-establish), not a verb.
+    #[tokio::test]
+    async fn bind_refuses_an_already_bound_row() {
+        let home = TempDir::new().unwrap();
+        let identity = LocalIdentity::load_or_generate_as(home.path(), "codex")
+            .await
+            .unwrap();
+
+        let result = LocalIdentity::bind(
+            home.path(),
+            "codex",
+            identity.keypair.public_bytes().as_ref(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(IdentityError::AlreadyBound { ref agent_name }) if agent_name == "codex")
+        );
+
+        // The existing binding is untouched.
+        let store = open_store(home.path()).await.unwrap();
+        let stored = store
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.expected_public_key,
+            Some(identity.keypair.public_bytes().to_vec())
+        );
+    }
+
+    // what this catches: evidence that is not a 32-byte ed25519 public key is
+    // rejected before anything is read or written.
+    #[tokio::test]
+    async fn bind_refuses_bad_evidence_length() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path()).unwrap();
+
+        let result = LocalIdentity::bind(home.path(), "codex", b"not-a-key").await;
+        assert!(matches!(result, Err(IdentityError::BadEvidenceLength(len)) if len == 9));
+    }
+
+    // what this catches: evidence that does not match the agent's own key file
+    // is refused — recording it would leave a home that can never open (or,
+    // worse, bless a swapped secret). The row stays unbound for honest repair.
+    #[tokio::test]
+    async fn bind_refuses_evidence_that_does_not_match_the_local_key() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path()).unwrap();
+        std::fs::write(
+            LocalIdentity::agent_key_path(home.path(), "codex"),
+            [7u8; 32],
+        )
+        .unwrap();
+        let store = open_store(home.path()).await.unwrap();
+        store
+            .insert_local_identity(StoredLocalIdentity {
+                peer_id: PeerId::new(),
+                client_id: ClientId::new(),
+                version: IDENTITY_STATE_VERSION,
+                created_at_ms: 1,
+                identity: Identity::default(),
+                agent_name: "codex".to_string(),
+                expected_public_key: None,
+            })
+            .await
+            .unwrap();
+
+        // Independent evidence of a DIFFERENT key than this home holds.
+        let result = LocalIdentity::bind(home.path(), "codex", &[9u8; 32]).await;
+        assert!(
+            matches!(result, Err(IdentityError::EvidenceMismatch { ref agent_name }) if agent_name == "codex")
+        );
+
+        // The row is still unbound — nothing was recorded.
+        let stored = store
+            .load_local_identity_by_agent_name("codex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.expected_public_key.is_none());
+    }
+
+    // what this catches: bind repairs an EXISTING row; a name with no row has
+    // nothing to migrate and gets the same "initialise first" answer load does.
+    #[tokio::test]
+    async fn bind_refuses_a_name_without_a_row() {
+        let home = TempDir::new().unwrap();
+
+        let result = LocalIdentity::bind(home.path(), "nobody", &[1u8; 32]).await;
+        assert!(
+            matches!(result, Err(IdentityError::IdentityNotInitialised { ref agent_name }) if agent_name == "nobody")
+        );
     }
 }
