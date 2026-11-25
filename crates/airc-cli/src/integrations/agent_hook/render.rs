@@ -2,7 +2,7 @@
 //! history summary. Runtime-neutral; the only runtime fact a line names is the
 //! verb a reader continues with.
 
-use airc_core::{Body, TranscriptEvent};
+use airc_core::{Body, MentionTarget, TranscriptEvent};
 use airc_lib::HistorySummary;
 
 use crate::work_suggestions::is_work_queue_event;
@@ -85,7 +85,7 @@ pub(super) fn history_section(summary: &HistorySummary) -> Option<String> {
     lines.extend(
         digest_messages(&summary.recent)
             .iter()
-            .map(|m| format!("- {} [{}]: {}", m.peer, m.at, m.body)),
+            .map(|m| format!("- {}{} [{}]: {}", m.peer, m.target, m.at, m.body)),
     );
     let addressed = digest_messages(&summary.addressed);
     if !addressed.is_empty() {
@@ -94,11 +94,19 @@ pub(super) fn history_section(summary: &HistorySummary) -> Option<String> {
         lines.extend(
             addressed
                 .iter()
-                .map(|m| format!("- {} [{}]: {}", m.peer, m.at, m.body)),
+                .map(|m| format!("- {}{} [{}]: {}", m.peer, m.target, m.at, m.body)),
         );
     }
     lines.extend(more_addressed_line(summary));
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn target_label(target: &MentionTarget) -> String {
+    match target {
+        MentionTarget::All => String::new(),
+        MentionTarget::Peer(id) => format!(" (to peer {id})"),
+        MentionTarget::Room(id) => format!(" (to room {id})"),
+    }
 }
 
 pub(super) fn render_raw<'a>(events: impl IntoIterator<Item = &'a TranscriptEvent>) -> String {
@@ -106,9 +114,10 @@ pub(super) fn render_raw<'a>(events: impl IntoIterator<Item = &'a TranscriptEven
         .into_iter()
         .map(|event| {
             format!(
-                "[{}] {}: {}",
+                "[{}] {}{}: {}",
                 event.occurred_at_ms,
                 event.peer_id,
+                target_label(&event.target),
                 summarize_body(event)
             )
         })
@@ -155,8 +164,8 @@ pub(super) fn render_digest<'a>(
     }
     for message in shown {
         lines.push(format!(
-            "- {} [{}]: {}",
-            message.peer, message.at, message.body
+            "- {}{} [{}]: {}",
+            message.peer, message.target, message.at, message.body
         ));
     }
     if hidden > 0 {
@@ -166,6 +175,7 @@ pub(super) fn render_digest<'a>(
 }
 
 struct DigestMessage {
+    target: String,
     peer: String,
     at: String,
     body: String,
@@ -191,6 +201,7 @@ fn digest_messages<'a>(
             )
         };
         messages.push(DigestMessage {
+            target: target_label(&event.target),
             peer,
             at: original_time(event.occurred_at_ms),
             body,
