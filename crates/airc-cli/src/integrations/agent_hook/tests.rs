@@ -63,6 +63,17 @@ fn consumer_id_uses_the_runtime_verb_and_client() {
 }
 
 #[test]
+fn hook_lines_show_the_wire_recipient_even_without_a_name_in_the_text() {
+    let mut line = event(Body::text("Please confirm receipt"));
+    let recipient = PeerId::from_u128(73);
+    line.target = MentionTarget::Peer(recipient);
+    let lines = [line];
+    let label = format!("(to peer {recipient})");
+    assert!(render_digest(&lines, 8, "claude-hook").contains(&label));
+    assert!(render_raw(&lines).contains(&label));
+}
+
+#[test]
 fn digest_suppresses_runtime_alive_events_and_carries_original_times() {
     let mut real = event(Body::text("real update"));
     real.occurred_at_ms = 1_760_000_000_000;
