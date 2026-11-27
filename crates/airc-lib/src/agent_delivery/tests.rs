@@ -1211,3 +1211,60 @@ async fn a_legacy_session_gets_one_page_then_the_present() {
         "the backlog is never walked"
     );
 }
+
+// what this catches (airc#1689, the continuum scope 2026-11-27): a read marker in the form written
+// before #1640 (the cursor's own JSON) made every `airc join` exit 1, and the forward-only advance
+// could never replace it; it migrates once to the current form, and anything else stays a refusal.
+#[tokio::test]
+async fn an_older_read_marker_migrates_once_and_a_stranger_is_refused() {
+    let (_dir, airc, _room) = fresh_agent().await;
+    let older = TranscriptCursor {
+        lamport: 663_005_511_549_344,
+        event_id: EventId::from_u128(0x67af_ea96_54b9_43a8_b9e9_8724_d1b7_0193),
+    };
+    let write = |value_json: String| StoredScopedState {
+        scope_key: SCOPE.into(),
+        key: READ_MARKER.into(),
+        value_json,
+        version: 1,
+        updated_at_ms: 0,
+        updated_by: None,
+    };
+    airc.inner
+        .store
+        .set_scoped_state(write(serde_json::to_string(&older).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_marker(&airc).await.unwrap(),
+        Some(older.clone()),
+        "the older form is read as the cursor it names"
+    );
+    let stored = airc
+        .inner
+        .store
+        .get_scoped_state(SCOPE, READ_MARKER)
+        .await
+        .unwrap()
+        .unwrap()
+        .value_json;
+    assert_eq!(
+        stored,
+        encode_marker(&older),
+        "and rewritten once in the current form"
+    );
+    assert_eq!(
+        read_marker(&airc).await.unwrap(),
+        Some(older),
+        "the migrated marker reads as itself"
+    );
+    airc.inner
+        .store
+        .set_scoped_state(write("{\"stranger\":1}".into()))
+        .await
+        .unwrap();
+    assert!(
+        read_marker(&airc).await.is_err(),
+        "a marker of neither form is refused, never guessed"
+    );
+}

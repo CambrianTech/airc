@@ -122,15 +122,43 @@ fn decode_marker(stored: &str) -> Result<TranscriptCursor, AircError> {
 }
 
 async fn read_marker(airc: &Airc) -> Result<Option<TranscriptCursor>, AircError> {
-    match airc
+    let Some(row) = airc
         .inner
         .store
         .get_scoped_state(SCOPE, READ_MARKER)
         .await?
-    {
-        Some(row) => Ok(Some(decode_marker(&row.value_json)?)),
-        None => Ok(None),
+    else {
+        return Ok(None);
+    };
+    match decode_marker(&row.value_json) {
+        Ok(cursor) => Ok(Some(cursor)),
+        Err(not_current) => match older_marker(&row.value_json) {
+            // the one-shot migration of the form written before #1640: replaced, not advanced, since
+            // the advance compares stored text and `{` sorts after `"`, so it could never move past it
+            // (the continuum scope, 2026-11-27: every `airc join` exited 1 on this marker, airc#1689)
+            Some(cursor) => {
+                airc.inner
+                    .store
+                    .set_scoped_state(StoredScopedState {
+                        scope_key: SCOPE.into(),
+                        key: READ_MARKER.into(),
+                        value_json: encode_marker(&cursor),
+                        version: 1,
+                        updated_at_ms: 0,
+                        updated_by: None,
+                    })
+                    .await?;
+                Ok(Some(cursor))
+            }
+            None => Err(not_current),
+        },
     }
+}
+
+/// The marker as written before #1640: the cursor's own JSON (`{"lamport":..,"event_id":".."}`).
+/// Only this recognized form migrates; anything else stays a refusal.
+fn older_marker(stored: &str) -> Option<TranscriptCursor> {
+    serde_json::from_str::<TranscriptCursor>(stored).ok()
 }
 
 /// Moves only forward, atomically in the store: whatever order sessions write in, the marker
