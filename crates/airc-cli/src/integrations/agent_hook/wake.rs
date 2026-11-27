@@ -41,13 +41,18 @@ impl Wake {
     }
 
     /// The line a turn shows when the consumer has no wake, naming the one command that arms it.
-    pub(super) fn line(self, runtime: &HookRuntime) -> Option<String> {
+    /// `client` is the session's identity as the hook knows it: the wake must read the same
+    /// consumer the hooks and the stop gate deliver to, so the command binds it explicitly.
+    pub(super) fn line(self, runtime: &HookRuntime, client: Option<&str>) -> Option<String> {
+        let bind = client.map_or_else(String::new, |client| {
+            format!("AIRC_CLIENT_ID={} ", serde_json::json!(client))
+        });
         match self {
             Self::Armed => None,
             Self::NotArmed => Some(format!(
                 "AIRC wake is not armed for this session, so a message addressed to you waits until \
-                 your next turn. Arm it: run `airc {} wake` as a background command. It exits on the \
-                 next message addressed to you, which wakes you; arm it again after.",
+                 your next turn. Arm it: run `{bind}airc {} wake` as a background command. It exits \
+                 on the next message addressed to you, which wakes you; arm it again after.",
                 runtime.verb
             )),
         }
@@ -113,30 +118,39 @@ pub async fn run_wake(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = current_client_id()?;
     let consumer = consumer_id(runtime, client.as_deref());
+    // The order closes every gap (Codex on 4768de58): subscribed first, so nothing published from
+    // here on is missed; armed (the lock) only once subscribed, so a stop hook that sees the wake
+    // armed can trust it hears; then the backlog, so a message that arrived before the
+    // subscription, after a stop hook looked, still wakes the session.
+    let airc = crate::commands::attached_airc(home).await?;
+    let mut addressed = airc.addressed_feed(client.as_deref()).await?;
     let lock = open_lock(home, &consumer)?;
     let end = match lock.try_lock_exclusive() {
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => WakeEnd::AlreadyArmed,
         Err(error) => return Err(error.into()),
-        Ok(()) => {
-            let airc = crate::commands::attached_airc(home).await?;
-            // Subscribed before anything else is awaited, so nothing addressed is missed.
-            let mut addressed = airc.addressed_feed(client.as_deref()).await?;
-            // While armed the session is present, as a joined session is (the join's own beat).
-            let presence = airc
-                .start_agent_heartbeat_with_metadata(
-                    runtime.presence,
-                    client.clone(),
-                    std::env::current_dir()
-                        .ok()
-                        .map(|dir| dir.display().to_string()),
-                    None,
-                    airc_lib::agent_heartbeat::DEFAULT_HEARTBEAT_INTERVAL,
-                )
-                .await?;
-            let woke = addressed.next().await;
-            presence.stop().await;
-            WakeEnd::Woke(woke)
-        }
+        Ok(()) => match airc
+            .addressed_undelivered(&consumer, client.as_deref(), super::args::UNREAD_SCAN)
+            .await?
+        {
+            Some(already) => WakeEnd::Woke(already),
+            None => {
+                // While armed the session is present, as a joined session is (the join's own beat).
+                let presence = airc
+                    .start_agent_heartbeat_with_metadata(
+                        runtime.presence,
+                        client.clone(),
+                        std::env::current_dir()
+                            .ok()
+                            .map(|dir| dir.display().to_string()),
+                        None,
+                        airc_lib::agent_heartbeat::DEFAULT_HEARTBEAT_INTERVAL,
+                    )
+                    .await?;
+                let woke = addressed.next().await;
+                presence.stop().await;
+                WakeEnd::Woke(woke)
+            }
+        },
     };
     let mut output = std::io::stdout().lock();
     writeln!(output, "{}", end.line())?;
@@ -175,7 +189,7 @@ pub async fn run_stop(
     } else if input.stop_hook_active {
         None
     } else {
-        Wake::of(home, &consumer)?.line(runtime)
+        Wake::of(home, &consumer)?.line(runtime, client.as_deref())
     };
     turn.acknowledge(0, false).await?;
     if let Some(reason) = reason {

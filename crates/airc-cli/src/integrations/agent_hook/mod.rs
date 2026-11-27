@@ -174,7 +174,9 @@ pub async fn run_hook(
     .await?;
     // At a prompt, a runtime that needs a wake is told when it has none (the stop gate asks too).
     let unarmed = match (runtime.wakes, event) {
-        (true, HookEvent::UserPromptSubmit) => wake::Wake::of(home, &consumer)?.line(runtime),
+        (true, HookEvent::UserPromptSubmit) => {
+            wake::Wake::of(home, &consumer)?.line(runtime, runtime_client.as_deref())
+        }
         _ => None,
     };
     let context = match (context, unarmed) {

@@ -274,3 +274,31 @@ impl Airc {
         })
     }
 }
+
+impl Airc {
+    /// The first event addressed to this reader that `consumer` has not yet been delivered, if any:
+    /// the same delivery cursor a hook advances, read without delivering anything. A wake checks it
+    /// after its feed is subscribed and its lock is held, so a message that arrived between a stop
+    /// hook's look and the wake's subscription still wakes the session.
+    pub async fn addressed_undelivered(
+        &self,
+        consumer: &str,
+        runtime_client: Option<&str>,
+        scan_limit: usize,
+    ) -> Result<Option<AddressedWake>, AircError> {
+        let turn = self.prepare_agent_delivery(consumer, scan_limit, 1).await?;
+        let me = self.addressee().await?;
+        let own = airc_core::RuntimeSelf::new(self.client_id(), runtime_client);
+        let found = turn
+            .live_events()
+            .iter()
+            .find(|event| !own.is_self_event(event) && me.is_addressed(event))
+            .map(|event| AddressedWake::Addressed {
+                from: event.peer_id,
+                event: event.event_id,
+            });
+        // Nothing was shown: ownership is released and the cursor stays where it was.
+        turn.acknowledge(0, false).await?;
+        Ok(found)
+    }
+}
