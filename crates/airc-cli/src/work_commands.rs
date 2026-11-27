@@ -743,7 +743,13 @@ async fn retire_under_lifecycle(
             format!("{card_id} is no longer Merged or Closed on the board; retained").into(),
         );
     }
-    Ok(crate::worktree_retirement::retire(path, root)?)
+    // Blocking git and directory removal run on the blocking pool, never the daemon's runtime
+    // (Cormac on #1694); the lifecycle lock above is held until it returns.
+    let (path, root) = (path.to_path_buf(), root.to_path_buf());
+    Ok(
+        tokio::task::spawn_blocking(move || crate::worktree_retirement::retire(&path, &root))
+            .await??,
+    )
 }
 
 /// Spawn a sibling review card for `parent_id` if one doesn't already

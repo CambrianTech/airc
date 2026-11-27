@@ -25,6 +25,7 @@ mod agent_resume;
 mod build_info;
 mod channel_gist_cli;
 mod channel_gist_commands;
+mod checkout_steward;
 mod cli;
 mod client_id;
 mod collaboration_cli;

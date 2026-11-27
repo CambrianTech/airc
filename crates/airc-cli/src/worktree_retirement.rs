@@ -50,28 +50,118 @@ pub(crate) fn attached_branch(path: &Path) -> Result<Option<String>, String> {
 pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<Retirement, String> {
     let root = managed_root.canonicalize().map_err(|e| e.to_string())?;
     let path = path.canonicalize().map_err(|e| e.to_string())?;
-    if path == root || !path.starts_with(&root) || !path.join(".git").is_file() {
+    if path == root || !path.starts_with(&root) {
         return Err("refusing non-managed or primary checkout".into());
     }
-    let branch = attached_branch(&path)?.ok_or("detached HEAD; checkout retained")?;
+    let mirrors = root.parent().map(|airc| airc.join("mirrors"));
+    match Checkout::of(&path, mirrors.as_deref())? {
+        Checkout::Worktree => retire_worktree(&path),
+        Checkout::CardClone { mirror } => retire_card_clone(&path, &mirror),
+    }
+}
+
+/// The two shapes airc gives a card (`airc_lib::work_worktree`): a worktree of the operator's
+/// checkout, or a citizen's card clone whose objects come from airc's mirror. One retirement
+/// serves both; before, a clone was "non-managed" and every one stayed (the M5: 254 of 438
+/// checkouts, 2026-11-27).
+#[derive(Debug, PartialEq, Eq)]
+enum Checkout {
+    Worktree,
+    CardClone { mirror: std::path::PathBuf },
+}
+
+impl Checkout {
+    /// `mirrors` is airc's mirror directory beside the managed root (`~/.airc/mirrors`).
+    fn of(path: &Path, mirrors: Option<&Path>) -> Result<Self, String> {
+        let dot_git = path.join(".git");
+        if dot_git.is_file() {
+            return Ok(Self::Worktree);
+        }
+        let alternates = dot_git.join("objects").join("info").join("alternates");
+        let objects = std::fs::read_to_string(&alternates).map_err(|_| {
+            "refusing a checkout that is neither a worktree nor a card clone".to_string()
+        })?;
+        let mut sources = objects
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let (Some(source), None) = (sources.next(), sources.next()) else {
+            return Err(
+                "refusing a card clone whose objects come from other than one mirror".into(),
+            );
+        };
+        let mirror = Path::new(source)
+            .parent()
+            .ok_or("card clone's alternates name no repository")?
+            .canonicalize()
+            .map_err(|e| format!("card clone's mirror: {e}"))?;
+        let mirrors = mirrors
+            .ok_or("the managed root has no parent, so no mirror directory")?
+            .canonicalize()
+            .map_err(|e| format!("airc mirrors: {e}"))?;
+        if !mirror.starts_with(&mirrors) {
+            return Err("refusing a card clone whose objects are not airc's mirror".into());
+        }
+        Ok(Self::CardClone { mirror })
+    }
+}
+
+/// The proofs every shape keeps before anything is removed: a card branch, nothing uncommitted
+/// or unpushed, no ignored files. Returns the branch and the HEAD they were proven at.
+fn proven_terminal(path: &Path) -> Result<(String, String), String> {
+    let branch = attached_branch(path)?.ok_or("detached HEAD; checkout retained")?;
     if matches!(branch.as_str(), "main" | "master" | "canary") {
         return Err(format!("refusing integration branch {branch}"));
     }
-    if crate::work_commands::probe_dirty_status_at(&path)
-        != crate::work_commands::DirtyStatus::Clean
+    if crate::work_commands::probe_dirty_status_at(path) != crate::work_commands::DirtyStatus::Clean
     {
         return Err("worktree has uncommitted, unpushed, or unclassified work".into());
     }
     // Ignored files can contain valuable local artifacts too. Keep them rather
-    // than relying on worktree remove's willingness to discard ignored files.
+    // than relying on removal's willingness to discard ignored files.
     if !git(
-        &path,
+        path,
         &["ls-files", "--others", "--ignored", "--exclude-standard"],
     )?
     .is_empty()
     {
         return Err("worktree contains ignored files; retain until reviewed".into());
     }
+    let head = git(path, &["rev-parse", "HEAD"])?;
+    Ok((branch, head))
+}
+
+/// A card clone: its recovery ref is written into the mirror its objects come from, then the
+/// clone (a directory that is only this card's) is removed. Proven again just before removal.
+fn retire_card_clone(path: &Path, mirror: &Path) -> Result<Retirement, String> {
+    let (branch, head) = proven_terminal(path)?;
+    let recovery = format!("refs/airc/retired/{branch}/{head}");
+    git(
+        path,
+        &[
+            "push",
+            "--quiet",
+            mirror.to_str().ok_or("non-UTF8 mirror path")?,
+            &format!("{head}:{recovery}"),
+        ],
+    )?;
+    release_submodules(path)?;
+    if proven_terminal(path)? != (branch.clone(), head) {
+        return Err("branch or HEAD changed during retirement; checkout retained".into());
+    }
+    std::fs::remove_dir_all(path).map_err(|e| format!("card clone removal: {e}"))?;
+    println!(
+        "retired: {branch}; recovery: {recovery} in {}",
+        mirror.display()
+    );
+    Ok(Retirement {
+        retained_branch: None,
+    })
+}
+
+fn retire_worktree(path: &Path) -> Result<Retirement, String> {
+    let path = path.to_path_buf();
+    let (branch, head) = proven_terminal(&path)?;
     let common = git(
         &path,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -88,7 +178,6 @@ pub(crate) fn retire(path: &Path, managed_root: &Path) -> Result<Retirement, Str
             "branch {branch} is shared or its worktree registration is ambiguous"
         ));
     }
-    let head = git(&path, &["rev-parse", "HEAD"])?;
     let recovery = format!("refs/airc/retired/{branch}/{head}");
     git(&path, &["update-ref", &recovery, &head])?;
     if attached_branch(&path)?.as_deref() != Some(branch.as_str())
@@ -426,6 +515,89 @@ mod tests {
                 tree,
             }
         }
+    }
+
+    /// A citizen's card clone, shaped as `airc_lib::work_worktree::ensure_card_clone` makes it: a
+    /// shared clone of airc's mirror (`<airc>/mirrors/...`) under the managed root, on its card
+    /// branch, pushed to the mirror it tracks.
+    fn card_clone() -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
+        let f = Fixture::new();
+        let airc = f.root.parent().unwrap().to_path_buf();
+        let mirror = airc.join("mirrors").join("acme").join("widgets.git");
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        git(
+            &airc,
+            &[
+                "clone",
+                "--quiet",
+                "--mirror",
+                f.repo.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let clone = f.root.join("eeff0011");
+        git(
+            &airc,
+            &[
+                "clone",
+                "--quiet",
+                "--shared",
+                mirror.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git(&clone, &["config", "user.email", "fixture@example.test"]).unwrap();
+        git(&clone, &["config", "user.name", "Fixture"]).unwrap();
+        git(&clone, &["checkout", "-q", "-b", "eeff0011/fix"]).unwrap();
+        git(
+            &clone,
+            &["commit", "--allow-empty", "-q", "-m", "card work"],
+        )
+        .unwrap();
+        git(&clone, &["push", "-q", "-u", "origin", "eeff0011/fix"]).unwrap();
+        (f, clone, mirror)
+    }
+
+    // what this catches (the M5, 2026-11-27: 254 of 438 managed checkouts were card clones and
+    // every one was refused as "non-managed", so they filled the disk): a terminal card clone
+    // retires like a worktree, and its exact history survives as a recovery ref in the mirror its
+    // objects came from.
+    #[test]
+    fn retires_a_pushed_card_clone_and_keeps_its_recovery_ref_in_the_mirror() {
+        let (f, clone, mirror) = card_clone();
+        let head = git(&clone, &["rev-parse", "HEAD"]).unwrap();
+        retire(&clone, &f.root).unwrap();
+        assert!(!clone.exists());
+        // The mirror's next refresh keeps it (Cormac: a plain --prune deleted every one).
+        airc_lib::work_worktree::refresh_mirror(&mirror).unwrap();
+        assert_eq!(
+            git(
+                &mirror,
+                &[
+                    "rev-parse",
+                    &format!("refs/airc/retired/eeff0011/fix/{head}")
+                ]
+            )
+            .unwrap(),
+            head
+        );
+    }
+
+    // what this catches: retiring a card clone that holds a commit pushed nowhere (her work lost
+    // with the directory). An unpushed commit keeps the clone, untouched.
+    #[test]
+    fn keeps_a_card_clone_with_an_unpushed_commit() {
+        let (f, clone, _mirror) = card_clone();
+        git(
+            &clone,
+            &["commit", "--allow-empty", "-q", "-m", "not pushed"],
+        )
+        .unwrap();
+        let refused = retire(&clone, &f.root).unwrap_err();
+        assert!(refused.contains("unpushed"), "{refused}");
+        assert!(clone.exists());
     }
     #[test]
     fn retires_branch_and_preserves_exact_recovery_commit() {

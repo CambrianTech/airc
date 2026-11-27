@@ -2053,8 +2053,21 @@ pub async fn run_daemon(
         .await;
     });
 
-    let server_result =
-        run_with_startup_check(state.clone(), socket, move || startup.bound()).await;
+    // The daemon keeps its card checkouts healthy for its whole life (checkout_steward.rs): it
+    // attaches as its own client once the socket is bound.
+    let bound = Arc::new(tokio::sync::Notify::new());
+    let steward_task = tokio::spawn(crate::checkout_steward::run(
+        home.to_path_buf(),
+        socket.clone(),
+        bound.clone(),
+        state.shutdown.clone(),
+    ));
+    let server_result = run_with_startup_check(state.clone(), socket, move || {
+        let bound_now = startup.bound();
+        bound.notify_one();
+        bound_now
+    })
+    .await;
     if server_result.is_err() {
         state.shutdown.notify_waiters();
         registry_handle.abort();
@@ -2068,6 +2081,7 @@ pub async fn run_daemon(
     // abort is the same listener-error backstop. (The detached updater it may
     // have spawned is independent and intentionally outlives this process.)
     auto_update_task.abort();
+    steward_task.abort();
     // Server returned ⇒ shutdown fired ⇒ the registry loop's shutdown
     // waiter was woken by the same `notify_waiters()`. Await its clean
     // exit so the process doesn't drop an in-flight gist write
