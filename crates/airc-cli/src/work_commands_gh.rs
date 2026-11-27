@@ -37,9 +37,10 @@ pub(crate) async fn open_pr_and_link(
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
-    if card.reviews.is_some() || card.pull_request.is_some() || !card.submissions.is_empty() {
-        // Review-only verdicts, already-linked PRs and submitted cards are reviewable as they stand
-        // (the owner's guard accepts each): no worktree or gh call is needed to move them.
+    if !opens_pull_request(card) {
+        // A review-only card and a card with a linked PR are reviewable as they stand. A card
+        // with only a submission still needs its PR: CI and the merger act on the PR, so the
+        // submission alone left code cards in Review with nothing to merge (Cormac, 432002f2).
         return Ok(());
     }
 
@@ -204,6 +205,8 @@ pub(crate) async fn open_pr_and_link(
             Ok((base, head, patch))
         });
     match submitted {
+        // A submission already at this head is the PR's: never a second copy of the same patch.
+        Ok((_, head, _)) if submitted_at(card, &head) => {}
         Ok((base, head, patch)) => {
             if let Err(error) = crate::work_commands::submit_patch(
                 airc,
@@ -540,9 +543,94 @@ pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::e
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
+/// Whether moving `card` to Review opens (or finds) its pull request. A review-only card and a
+/// card whose PR is linked are reviewable as they stand; every other card is code whose PR CI
+/// and the merger act on, so a submission alone never stands in for it.
+fn opens_pull_request(card: &airc_work::WorkCard) -> bool {
+    card.reviews.is_none() && card.pull_request.is_none()
+}
+
+/// Whether `card` already holds a submission ending at `head`: the PR's own patch, never sent twice.
+fn submitted_at(card: &airc_work::WorkCard, head: &airc_work::GitObjectId) -> bool {
+    card.submissions
+        .iter()
+        .any(|submitted| submitted.head.commit() == Some(head))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn code_card() -> airc_work::WorkCard {
+        airc_work::WorkCard {
+            submissions: Vec::new(),
+            last_submission_rejection: None,
+            card_id: airc_work::WorkCardId::from_uuid(uuid::Uuid::from_u128(2)),
+            repo: airc_work::RepoId::new("CambrianTech/continuum").expect("test repo"),
+            title: "step 0a".to_string(),
+            body: None,
+            priority: airc_work::Priority::P1,
+            lane_id: None,
+            state: airc_work::CardState::Claimed,
+            owner: None,
+            claim_id: None,
+            claim_provenance: None,
+            claim_expires_at_ms: None,
+            last_heartbeat_at_ms: None,
+            pull_request: None,
+            created_by: airc_core::PeerId::from_uuid(uuid::Uuid::from_u128(10)),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            reviews: None,
+        }
+    }
+
+    fn submission_at(head: &airc_work::GitObjectId) -> airc_work::WorkSubmission {
+        airc_work::WorkSubmission {
+            submission_id: airc_work::SubmissionId::from_u128(1),
+            card_id: airc_work::WorkCardId::from_uuid(uuid::Uuid::from_u128(2)),
+            claim_id: airc_work::ClaimId::from_uuid(uuid::Uuid::from_u128(3)),
+            instance: "CambrianTech/continuum".into(),
+            base_sha: airc_work::GitObjectId::new("a".repeat(40)).expect("test sha"),
+            head: airc_work::SubmissionHead::At(head.clone()),
+            artifact: airc_blobs::MediaRef {
+                hash: airc_blobs::ContentHash::from_bytes(b"patch"),
+                size_bytes: 5,
+                mime: None,
+            },
+            publisher: airc_core::PeerId::from_uuid(uuid::Uuid::from_u128(10)),
+            submitted_at_ms: 1,
+        }
+    }
+
+    // what this catches (Cormac, card 432002f2): a code card submitted before `state review` moved
+    // to Review with no PR, so CI and the merger had nothing to act on. A submission never stands in
+    // for the PR; only a linked PR or a review-only card skips opening one, and the PR's patch is not
+    // submitted a second time when a submission already ends at its head.
+    #[test]
+    fn a_submitted_code_card_still_opens_its_pull_request_without_a_second_submission() {
+        let head = airc_work::GitObjectId::new("b".repeat(40)).expect("test sha");
+        let mut card = code_card();
+        card.submissions.push(submission_at(&head));
+        assert!(opens_pull_request(&card), "a submission is not a PR");
+        assert!(
+            submitted_at(&card, &head),
+            "the PR's patch is already its submission"
+        );
+        let later = airc_work::GitObjectId::new("c".repeat(40)).expect("test sha");
+        assert!(!submitted_at(&card, &later), "a newer head is submitted");
+
+        card.pull_request = Some(airc_work::model::PullRequestRef {
+            repo: airc_work::RepoId::new("CambrianTech/continuum").expect("test repo"),
+            number: 6297,
+            head: airc_work::model::BranchName::new("432002f2/schema").expect("test head"),
+            base: airc_work::model::BranchName::new("canary").expect("test base"),
+        });
+        assert!(
+            !opens_pull_request(&card),
+            "a linked PR is reviewable as it stands"
+        );
+    }
 
     // what this catches (continuum card 4a9fda3f, Codex): a retry after a PR was opened but never
     // linked opening a second (GitHub refuses it, and the card never got its link), or picking one
