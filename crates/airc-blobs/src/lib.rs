@@ -38,6 +38,27 @@ pub use gc::{run as gc_run, GcReport, RetentionPolicy};
 pub use hash::ContentHash;
 
 // ─── Errors ───────────────────────────────────────────────────────────
+/// Which read found a blob's bytes hashing to something else: a typed answer to "where", so a
+/// corruption report names the path that caught it (card 18a9dfe3, Aiko).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobRead {
+    /// `MediaRef::verify`: checking bytes the caller holds against their reference.
+    Verify,
+    /// `FsStore::read_verified_into`: a verified read into the caller's buffer.
+    GetVerified,
+    /// `ContentAddressedStore::get`: a store read.
+    Get,
+}
+
+impl std::fmt::Display for BlobRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Verify => "verify",
+            Self::GetVerified => "get_verified",
+            Self::Get => "get",
+        })
+    }
+}
 
 /// All blob-store failures are typed. Callers distinguish "not here, ask
 /// a peer" (NotFound) from "we have it but it's corrupted" (HashMismatch)
@@ -53,10 +74,13 @@ pub enum BlobError {
     /// store is corrupted at this address; caller should treat the
     /// content as missing AND escalate (delete the bad copy, re-request,
     /// log the corruption event).
-    #[error("blob hash mismatch at {expected}: stored bytes hash to {actual}")]
+    #[error(
+        "blob hash mismatch at {expected}: stored bytes hash to {actual} (operation: {operation})"
+    )]
     HashMismatch {
         expected: ContentHash,
         actual: ContentHash,
+        operation: BlobRead,
     },
 
     /// Storage capacity exceeded. Backend-specific (filesystem free-space,
@@ -125,6 +149,7 @@ impl MediaRef {
             return Err(BlobError::HashMismatch {
                 expected: self.hash.clone(),
                 actual,
+                operation: BlobRead::Verify,
             });
         }
         Ok(())
@@ -308,8 +333,13 @@ mod tests {
         let mismatch = BlobError::HashMismatch {
             expected: hash.clone(),
             actual: ContentHash::from_bytes(b"y"),
+            operation: BlobRead::Get,
         };
         let display = format!("{mismatch}");
         assert!(display.contains(&hash.to_string()));
+        assert!(
+            display.contains("(operation: get)"),
+            "the mismatch names the read that caught it: {display}"
+        );
     }
 }

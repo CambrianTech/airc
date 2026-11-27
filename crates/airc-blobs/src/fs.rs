@@ -146,6 +146,7 @@ impl FsStore {
             return Err(BlobError::HashMismatch {
                 expected: reference.hash.clone(),
                 actual,
+                operation: crate::BlobRead::GetVerified,
             });
         }
         Ok(())
@@ -234,6 +235,7 @@ impl ContentAddressedStore for FsStore {
             return Err(BlobError::HashMismatch {
                 expected: hash.clone(),
                 actual,
+                operation: crate::BlobRead::Get,
             });
         }
         Ok(bytes)
