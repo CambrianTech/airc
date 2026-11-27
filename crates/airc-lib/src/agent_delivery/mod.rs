@@ -241,6 +241,75 @@ impl AgentDeliveryTurn {
     pub fn has_history(&self) -> bool {
         key(&self.state.summarized) < key(&self.state.boundary)
     }
+    /// The first event addressed to `me` that this consumer is still owed, read without delivering
+    /// anything (Codex on #1692): the history stretches whose addressed requests are not all shown
+    /// yet (`unsearched`, each shrinking from its top as requests are shown, so a shown one is never
+    /// found again), then the live range to the tip this turn captured. The store selects only the
+    /// events that could be addressed to `me`, page by page, so ambient traffic costs nothing and no
+    /// addressed event hides behind a page of others.
+    pub async fn first_addressed(
+        &self,
+        me: &crate::Addressee,
+        own: &airc_core::RuntimeSelf,
+    ) -> Result<Option<crate::AddressedWake>, AircError> {
+        let history = self.state.unsearched.iter().map(|stretch| {
+            (
+                stretch.after.clone(),
+                stretch.top.clone(),
+                stretch.top_exclusive,
+            )
+        });
+        let live = std::iter::once((self.state.scan_from().clone(), self.through.clone(), false));
+        for (after, top, top_exclusive) in history.chain(live) {
+            if let Some(found) = self
+                .first_addressed_in(me, own, after, &top, top_exclusive)
+                .await?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn first_addressed_in(
+        &self,
+        me: &crate::Addressee,
+        own: &airc_core::RuntimeSelf,
+        mut after: TranscriptCursor,
+        top: &TranscriptCursor,
+        top_exclusive: bool,
+    ) -> Result<Option<crate::AddressedWake>, AircError> {
+        while key(&after) < key(top) {
+            let page = self
+                .airc
+                .scan_agent_feed_in_channels(
+                    Some(&after),
+                    top,
+                    crate::agent_feed::AGENT_SCAN_LIMIT,
+                    &self.channels,
+                    Some(me.filter()),
+                )
+                .await?;
+            // A page sets `top_exclusive` once it has shown its top: that event is not owed again.
+            let shown_top = |event: &TranscriptEvent| {
+                top_exclusive && event.lamport == top.lamport && event.event_id == top.event_id
+            };
+            let owed = |event: &&TranscriptEvent| {
+                me.is_addressed(event) && !(own.is_self_event(event) || shown_top(event))
+            };
+            if let Some(event) = page.events.iter().find(owed) {
+                return Ok(Some(crate::AddressedWake::Addressed {
+                    from: event.peer_id,
+                    event: event.event_id,
+                }));
+            }
+            match page.scanned_through {
+                Some(next) if key(&next) > key(&after) => after = next,
+                _ => break,
+            }
+        }
+        Ok(None)
+    }
     /// Consumes the guard. `settle_history` records that the caller has shown what
     /// `history_summary` returned (or that it returned nothing): the count is
     /// marked shown, the addressed checkpoint moves to what was emitted, and the
@@ -368,7 +437,7 @@ impl Airc {
         budget: usize,
         attaching: bool,
     ) -> Result<AgentDeliveryTurn, AircError> {
-        if !(1..=4096).contains(&scan_limit) || budget == 0 {
+        if !(1..=crate::agent_feed::AGENT_SCAN_LIMIT).contains(&scan_limit) || budget == 0 {
             return Err(fail("invalid scan/output budget"));
         }
         let guard = lock(self.home(), &consumer)?;

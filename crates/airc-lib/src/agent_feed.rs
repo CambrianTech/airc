@@ -19,6 +19,9 @@ fn cursor(c: IpcCursor) -> TranscriptCursor {
         event_id: c.event_id,
     }
 }
+/// The most events one agent-feed scan reads: the store's page bound for every scan here.
+pub(crate) const AGENT_SCAN_LIMIT: usize = 4096;
+
 fn headers() -> HeaderFilter {
     HeaderFilter::Not(Box::new(HeaderFilter::Has {
         key: crate::HEADER_STREAM_ID.into(),
@@ -82,7 +85,7 @@ impl Airc {
         channels: &[airc_core::RoomId],
         addressed_to: Option<airc_core::AddresseeFilter>,
     ) -> Result<EventScan, AircError> {
-        if limit == 0 || limit > 4096 {
+        if limit == 0 || limit > AGENT_SCAN_LIMIT {
             return Err(AircError::Route("agent scan limit must be 1..4096".into()));
         }
         let zero = TranscriptCursor {
@@ -277,26 +280,19 @@ impl Airc {
 
 impl Airc {
     /// The first event addressed to this reader that `consumer` has not yet been delivered, if any:
-    /// the same delivery cursor a hook advances, read without delivering anything. A wake checks it
+    /// the consumer's whole undelivered range, read without delivering anything. A wake checks it
     /// after its feed is subscribed and its lock is held, so a message that arrived between a stop
-    /// hook's look and the wake's subscription still wakes the session.
+    /// hook's look and the wake's subscription still wakes the session, however much other traffic
+    /// came with it.
     pub async fn addressed_undelivered(
         &self,
         consumer: &str,
         runtime_client: Option<&str>,
-        scan_limit: usize,
     ) -> Result<Option<AddressedWake>, AircError> {
-        let turn = self.prepare_agent_delivery(consumer, scan_limit, 1).await?;
+        let turn = self.prepare_agent_delivery(consumer, 1, 1).await?;
         let me = self.addressee().await?;
         let own = airc_core::RuntimeSelf::new(self.client_id(), runtime_client);
-        let found = turn
-            .live_events()
-            .iter()
-            .find(|event| !own.is_self_event(event) && me.is_addressed(event))
-            .map(|event| AddressedWake::Addressed {
-                from: event.peer_id,
-                event: event.event_id,
-            });
+        let found = turn.first_addressed(&me, &own).await?;
         // Nothing was shown: ownership is released and the cursor stays where it was.
         turn.acknowledge(0, false).await?;
         Ok(found)
