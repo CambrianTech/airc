@@ -303,9 +303,18 @@ impl AgentDeliveryTurn {
                     event: event.event_id,
                 }));
             }
+            // A page below `top` that does not advance would end the search with an addressed event
+            // still stored past it, and the wake would wait forever: it is an error, never "none"
+            // (Cormac on #1695).
             match page.scanned_through {
                 Some(next) if key(&next) > key(&after) => after = next,
-                _ => break,
+                stalled => {
+                    return Err(fail(format!(
+                    "the addressed scan stopped below its top (after {:?}, scanned through {:?})",
+                    key(&after),
+                    stalled.as_ref().map(key)
+                )))
+                }
             }
         }
         Ok(None)
