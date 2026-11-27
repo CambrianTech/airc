@@ -372,6 +372,7 @@ dependencies = [
 name = "airc-lib"
 version = "0.1.0"
 dependencies = [
+ "airc-blobs",
  "airc-bus",
  "airc-core",
  "airc-daemon",

@@ -107,32 +107,64 @@ pub(crate) async fn open_pr_and_link(
         Some(base) => base,
         None => gh_default_branch(&worktree_str)?,
     };
-    let create_out = airc_core::process::background(airc_core::gh_executable::resolve())
+    // A retry after the PR was opened but never linked (the link failed, or the process ended
+    // between them) finds that PR by its exact head and base and links it; opening a second is
+    // refused by GitHub, and before card 4a9fda3f the bare state change that followed parked the
+    // card in Review with nothing linked, where nothing could ever resolve it.
+    let list_out = airc_core::process::background(airc_core::gh_executable::resolve())
         .current_dir(&worktree_str)
         .args([
             "pr",
-            "create",
-            "--title",
-            subject.trim(),
-            "--body",
-            body.trim(),
-            "--base",
-            base_branch.as_str(),
+            "list",
+            "--state",
+            "open",
             "--head",
             head_branch.as_str(),
+            "--base",
+            base_branch.as_str(),
+            "--json",
+            "number,url",
         ])
         .output()?;
-    if !create_out.status.success() {
+    if !list_out.status.success() {
         return Err(format!(
-            "gh pr create failed: {}",
-            String::from_utf8_lossy(&create_out.stderr).trim()
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&list_out.stderr).trim()
         )
         .into());
     }
-    let stdout = String::from_utf8(create_out.stdout)?;
-    let pr_url = stdout.trim().lines().last().unwrap_or("").trim();
-    let pr_number = extract_pr_number(pr_url)
-        .ok_or_else(|| format!("could not parse PR number from gh output: {pr_url}"))?;
+    let (pr_number, pr_url) = match the_open_pull_request(&String::from_utf8(list_out.stdout)?)? {
+        Some(open) => open,
+        None => {
+            let create_out = airc_core::process::background(airc_core::gh_executable::resolve())
+                .current_dir(&worktree_str)
+                .args([
+                    "pr",
+                    "create",
+                    "--title",
+                    subject.trim(),
+                    "--body",
+                    body.trim(),
+                    "--base",
+                    base_branch.as_str(),
+                    "--head",
+                    head_branch.as_str(),
+                ])
+                .output()?;
+            if !create_out.status.success() {
+                return Err(format!(
+                    "gh pr create failed: {}",
+                    String::from_utf8_lossy(&create_out.stderr).trim()
+                )
+                .into());
+            }
+            let stdout = String::from_utf8(create_out.stdout)?;
+            let pr_url = stdout.trim().lines().last().unwrap_or("").trim().to_owned();
+            let pr_number = extract_pr_number(&pr_url)
+                .ok_or_else(|| format!("could not parse PR number from gh output: {pr_url}"))?;
+            (pr_number, pr_url)
+        }
+    };
 
     // Resolve head from the worktree's git state. Base is the same
     // pinned value we passed to gh — the projection must record what
@@ -194,7 +226,7 @@ pub(crate) async fn open_pr_and_link(
     // re-running `state review` on a card whose review card already
     // exists is a no-op.
     if let Err(error) =
-        crate::work_commands::auto_spawn_review_card(airc, room, card_id, pr_url).await
+        crate::work_commands::auto_spawn_review_card(airc, room, card_id, &pr_url).await
     {
         eprintln!("airc: review card auto-spawn skipped — {error}");
     }
@@ -209,6 +241,31 @@ pub(crate) fn extract_pr_number(url: &str) -> Option<u64> {
     let tail = trimmed.rsplit('/').next()?;
     tail.parse::<u64>().ok()
 }
+
+/// One open pull request as `gh pr list --json number,url` reports it.
+#[derive(serde::Deserialize)]
+struct OpenPullRequest {
+    number: u64,
+    url: String,
+}
+
+/// The open pull request for a card's exact head and base, from `gh pr list` output: none (open
+/// one), exactly one (a retry links it), or several (refused: which one carries the card's work is
+/// not ours to guess).
+pub(crate) fn the_open_pull_request(listed: &str) -> Result<Option<(u64, String)>, String> {
+    let open: Vec<OpenPullRequest> =
+        serde_json::from_str(listed).map_err(|e| format!("gh pr list output: {e}"))?;
+    match open.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((one.number, one.url.clone()))),
+        many => Err(format!(
+            "{} open pull requests share this head and base ({}); link the one that carries this card with `airc work link`",
+            many.len(),
+            many.iter().map(|pr| format!("#{}", pr.number)).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 /// Card 70e87d33 (part b) — retroactively link an ALREADY-OPEN PR to a
 /// card by emitting `PullRequestLinked`. The auto-link in
 /// `open_pr_and_link` only fires when `airc work state review` itself
@@ -430,4 +487,32 @@ pub(crate) fn gh_default_branch(worktree: &str) -> Result<String, Box<dyn std::e
         .into());
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // what this catches (continuum card 4a9fda3f, Codex): a retry after a PR was opened but never
+    // linked opening a second (GitHub refuses it, and the card never got its link), or picking one
+    // of several at random. None opens, one is linked, several are refused by number.
+    #[test]
+    fn a_retry_links_the_one_open_pull_request_and_refuses_to_guess_among_several() {
+        assert_eq!(the_open_pull_request("[]"), Ok(None));
+        assert_eq!(
+            the_open_pull_request(
+                r#"[{"number":5292,"url":"https://github.com/CambrianTech/continuum/pull/5292"}]"#
+            ),
+            Ok(Some((
+                5292,
+                "https://github.com/CambrianTech/continuum/pull/5292".to_owned()
+            )))
+        );
+        let several = the_open_pull_request(r#"[{"number":1,"url":"u1"},{"number":2,"url":"u2"}]"#);
+        assert!(
+            several.as_ref().is_err_and(|why| why.contains("#1, #2")),
+            "{several:?}"
+        );
+        assert!(the_open_pull_request("not json").is_err());
+    }
 }
