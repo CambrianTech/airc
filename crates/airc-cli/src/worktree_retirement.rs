@@ -570,6 +570,8 @@ mod tests {
         let head = git(&clone, &["rev-parse", "HEAD"]).unwrap();
         retire(&clone, &f.root).unwrap();
         assert!(!clone.exists());
+        // The mirror's next refresh keeps it (Cormac: a plain --prune deleted every one).
+        airc_lib::work_worktree::refresh_mirror(&mirror).unwrap();
         assert_eq!(
             git(
                 &mirror,

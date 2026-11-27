@@ -363,6 +363,24 @@ pub fn ensure_mirror(repo: &RepoId, source: &Path) -> Result<PathBuf, String> {
 
 /// [`ensure_mirror`]'s one implementation: a new mirror is cloned from `clone_from` (a local
 /// clone, or for a submodule its URL) and pointed at `origin()`; an existing one refreshes.
+/// Refresh a mirror's refs from its origin. Refs follow the real remote, except airc's own
+/// (`refs/airc/*`): a retired card's recovery ref lives in its mirror, and a plain `--prune` deleted
+/// it on the next refresh (Cormac on #1694). Objects are never pruned (`preciousObjects`).
+pub fn refresh_mirror(mirror: &Path) -> Result<(), String> {
+    git_in(
+        mirror,
+        &[
+            "fetch",
+            "--quiet",
+            "--prune",
+            "origin",
+            "+refs/*:refs/*",
+            "^refs/airc/*",
+        ],
+    )
+    .map(|_| ())
+}
+
 fn ensure_mirror_from(
     repo: &RepoId,
     clone_from: &str,
@@ -424,7 +442,7 @@ fn ensure_mirror_from(
             git_in(&staging, &["config", "gc.auto", "0"])?;
             // A new mirror still holds the SOURCE's local branches until this prune-fetch
             // succeeds; none of them may become a card base, so it must succeed before publish.
-            git_in(&staging, &["fetch", "--quiet", "--prune", "origin"])?;
+            refresh_mirror(&staging)?;
             std::fs::rename(&staging, &path)
                 .map_err(|e| format!("publish mirror {}: {e}", path.display()))
         })();
@@ -434,7 +452,7 @@ fn ensure_mirror_from(
         return made.map(|()| path);
     }
     // Refs follow the real remote; objects are never pruned (preciousObjects).
-    if let Err(error) = git_in(&path, &["fetch", "--quiet", "--prune", "origin"]) {
+    if let Err(error) = refresh_mirror(&path) {
         // An existing mirror stages from the refs it already has; the base is still resolved
         // against them, and the staleness is said, not hidden.
         tracing::warn!(mirror = %path.display(), %error, "repo mirror refresh failed; staging from its existing refs");
