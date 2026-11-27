@@ -61,7 +61,18 @@ impl Drop for DeliveryLock {
         }
     }
 }
-fn lock(home: &Path, consumer: &str) -> Result<DeliveryLock, AircError> {
+/// How a turn takes the consumer's delivery lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockWait {
+    /// A hook turn: one delivery at a time, so a second refuses while the first holds it.
+    Try,
+    /// The wake's backlog look: a hook holds the lock for one turn, and the wake must still see
+    /// what arrived before it subscribed, so it waits for the release (an OS lock, freed at the
+    /// holder's exit at the latest) rather than ending at once (the M5, 2026-11-27: a wake armed
+    /// while a prompt hook delivered exited "consumer busy" and the session went deaf).
+    Wait,
+}
+fn lock(home: &Path, consumer: &str, wait: LockWait) -> Result<DeliveryLock, AircError> {
     // Resolve the actual database file, including directory/file symlinks and
     // relative aliases. A scope sharing this file therefore shares this lock.
     let db = home.join("events.sqlite").canonicalize().map_err(fail)?;
@@ -77,8 +88,11 @@ fn lock(home: &Path, consumer: &str) -> Result<DeliveryLock, AircError> {
         .truncate(false)
         .open(db.with_file_name(format!("{name}.agent-delivery-{id}.lock")))
         .map_err(fail)?;
-    fs2::FileExt::try_lock_exclusive(&file)
-        .map_err(|e| fail(format!("consumer busy or lock unavailable: {e}")))?;
+    match wait {
+        LockWait::Try => fs2::FileExt::try_lock_exclusive(&file),
+        LockWait::Wait => fs2::FileExt::lock_exclusive(&file),
+    }
+    .map_err(|e| fail(format!("consumer busy or lock unavailable: {e}")))?;
     Ok(DeliveryLock(file)) // never unlink: process-held OS ownership, no TTL takeover
 }
 async fn rooms(airc: &Airc) -> Result<Vec<RoomId>, AircError> {
@@ -414,7 +428,24 @@ impl Airc {
         let airc = self.clone();
         let consumer = consumer.to_owned();
         tokio::spawn(async move {
-            airc.prepare_delivery_owned(consumer, scan_limit, budget, false)
+            airc.prepare_delivery_owned(consumer, scan_limit, budget, false, LockWait::Try)
+                .await
+        })
+        .await
+        .map_err(fail)?
+    }
+    /// [`Self::prepare_agent_delivery`], waiting for a hook turn that holds the consumer's lock
+    /// to release it instead of refusing: the wake's look at what arrived before it subscribed.
+    pub async fn prepare_agent_delivery_waiting(
+        &self,
+        consumer: &str,
+        scan_limit: usize,
+        budget: usize,
+    ) -> Result<AgentDeliveryTurn, AircError> {
+        let airc = self.clone();
+        let consumer = consumer.to_owned();
+        tokio::spawn(async move {
+            airc.prepare_delivery_owned(consumer, scan_limit, budget, false, LockWait::Wait)
                 .await
         })
         .await
@@ -433,7 +464,7 @@ impl Airc {
         let airc = self.clone();
         let consumer = consumer.to_owned();
         tokio::spawn(async move {
-            airc.prepare_delivery_owned(consumer, scan_limit, budget, attaching)
+            airc.prepare_delivery_owned(consumer, scan_limit, budget, attaching, LockWait::Try)
                 .await
         })
         .await
@@ -445,11 +476,21 @@ impl Airc {
         scan_limit: usize,
         budget: usize,
         attaching: bool,
+        wait: LockWait,
     ) -> Result<AgentDeliveryTurn, AircError> {
         if !(1..=crate::agent_feed::AGENT_SCAN_LIMIT).contains(&scan_limit) || budget == 0 {
             return Err(fail("invalid scan/output budget"));
         }
-        let guard = lock(self.home(), &consumer)?;
+        let guard = match wait {
+            LockWait::Try => lock(self.home(), &consumer, wait)?,
+            // a blocking wait on an OS lock, off the async workers
+            LockWait::Wait => {
+                let (home, held) = (self.home().to_path_buf(), consumer.clone());
+                tokio::task::spawn_blocking(move || lock(&home, &held, wait))
+                    .await
+                    .map_err(fail)??
+            }
+        };
         // an older read marker becomes the current form once, before any read or advance (airc#1689)
         migrate_read_marker(self).await?;
         let channels = rooms(self).await?;

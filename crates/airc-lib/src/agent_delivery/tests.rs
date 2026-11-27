@@ -741,14 +741,14 @@ async fn aliases_and_concurrent_prepares_share_ownership_and_new_scope_refuses()
     let (dir, airc, room) = fixture().await;
     append(&airc, room, 1).await;
     let turn = airc.prepare_agent_delivery("same", 8, 8).await.unwrap();
-    assert!(lock(&dir.path().join("."), "same").is_err());
+    assert!(lock(&dir.path().join("."), "same", LockWait::Try).is_err());
     assert!(airc.prepare_agent_delivery("same", 8, 8).await.is_err());
-    assert!(lock(dir.path(), "different").is_ok());
+    assert!(lock(dir.path(), "different", LockWait::Try).is_ok());
     #[cfg(unix)]
     {
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
-        assert!(lock(&alias, "same").is_err());
+        assert!(lock(&alias, "same", LockWait::Try).is_err());
     }
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -761,7 +761,7 @@ async fn aliases_and_concurrent_prepares_share_ownership_and_new_scope_refuses()
         .unwrap();
     assert!(status.success());
     drop(turn);
-    assert!(lock(dir.path(), "same").is_ok());
+    assert!(lock(dir.path(), "same", LockWait::Try).is_ok());
     let mut set = airc.subscription_set().await.unwrap();
     set.subscribe_with_wire_root(
         dir.path(),
@@ -783,19 +783,19 @@ async fn dropping_turn_releases_lock_even_with_a_duplicated_descriptor() {
         .await
         .unwrap();
     let duplicate = turn._guard.0.try_clone().unwrap();
-    assert!(lock(dir.path(), "duplicated").is_err());
+    assert!(lock(dir.path(), "duplicated", LockWait::Try).is_err());
     drop(turn);
     // The duplicate remains open: close-only ownership fails this assertion.
-    let next = lock(dir.path(), "duplicated").unwrap();
+    let next = lock(dir.path(), "duplicated", LockWait::Try).unwrap();
     drop(duplicate);
-    assert!(lock(dir.path(), "duplicated").is_err());
+    assert!(lock(dir.path(), "duplicated", LockWait::Try).is_err());
     drop(next);
-    assert!(lock(dir.path(), "duplicated").is_ok());
+    assert!(lock(dir.path(), "duplicated", LockWait::Try).is_ok());
 }
 #[test]
 fn lock_child() {
     if let Some(home) = std::env::var_os("AIRC_DELIVERY_LOCK_TEST_HOME") {
-        assert!(lock(Path::new(&home), "same").is_err());
+        assert!(lock(Path::new(&home), "same", LockWait::Try).is_err());
     }
 }
 #[tokio::test]
