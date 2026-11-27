@@ -113,29 +113,55 @@ fn default_home_dir_for_with(
         .unwrap_or_else(|| cwd.join(".airc"))
 }
 
+/// The main working tree of the project `cwd` is in. A submodule belongs to its superproject's
+/// scope: its common dir is `<super>/.git/modules/<path>`, whose parent is no working tree, so
+/// reading it as one minted a phantom scope inside `.git/modules` (its own event store, and a
+/// wake lock no session in the project holds: the M5, 2026-11-27).
 fn git_main_working_tree(cwd: &Path) -> Option<PathBuf> {
     let output = airc_core::process::background("git")
-        .args(["rev-parse", "--git-common-dir"])
+        .args([
+            "rev-parse",
+            "--git-common-dir",
+            "--show-superproject-working-tree",
+        ])
         .current_dir(cwd)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let common_dir = text.trim();
-    if common_dir.is_empty() {
-        return None;
+    match project_of(&String::from_utf8(output.stdout).ok()?)? {
+        Project::InSuperproject(root) => git_main_working_tree(&root),
+        Project::CommonDir(common) => {
+            let abs = if common.is_absolute() {
+                common
+            } else {
+                cwd.join(common).canonicalize().ok()?
+            };
+            // common dir is `<main-working-tree>/.git`; parent is the main working tree.
+            abs.parent().map(Path::to_path_buf)
+        }
     }
-    let common_path = PathBuf::from(common_dir);
-    let abs = if common_path.is_absolute() {
-        common_path
-    } else {
-        cwd.join(common_path).canonicalize().ok()?
-    };
-    // common dir is `<main-working-tree>/.git`; parent is the main
-    // working tree.
-    abs.parent().map(|p| p.to_path_buf())
+}
+
+/// What `git rev-parse --git-common-dir --show-superproject-working-tree` says: one line (the
+/// common dir) outside a submodule, a second (the superproject's working tree) inside one.
+#[derive(Debug, PartialEq, Eq)]
+enum Project {
+    CommonDir(PathBuf),
+    InSuperproject(PathBuf),
+}
+
+fn project_of(stdout: &str) -> Option<Project> {
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let common = lines.next()?;
+    Some(match lines.next() {
+        Some(superproject) => Project::InSuperproject(PathBuf::from(superproject)),
+        None => Project::CommonDir(PathBuf::from(common)),
+    })
 }
 
 fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
@@ -160,6 +186,34 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 mod tests {
     use super::{default_home_dir_for, explicit_home_override};
     use std::path::{Path, PathBuf};
+
+    /// what this catches (the M5, 2026-11-27): a session whose cwd is inside a submodule resolved
+    /// its scope to `<super>/.git/modules/<path>/..`, a phantom scope with its own event store,
+    /// where the wake the session armed in the project is not seen. A submodule is its
+    /// superproject's; a plain checkout or worktree is its common dir's parent.
+    #[test]
+    fn a_submodule_belongs_to_its_superprojects_scope() {
+        use super::{project_of, Project};
+        assert_eq!(
+            project_of(
+                "/Users/op/continuum/.git/modules/core/vendor/llama.cpp\n/Users/op/continuum\n"
+            ),
+            Some(Project::InSuperproject(PathBuf::from(
+                "/Users/op/continuum"
+            )))
+        );
+        assert_eq!(
+            project_of("/Users/op/continuum/.git\n"),
+            Some(Project::CommonDir(PathBuf::from(
+                "/Users/op/continuum/.git"
+            )))
+        );
+        assert_eq!(
+            project_of(".git\n"),
+            Some(Project::CommonDir(PathBuf::from(".git")))
+        );
+        assert_eq!(project_of(""), None);
+    }
 
     /// what this catches (seam #1 `--here`): the override precedence.
     /// `--home` wins; `--here` resolves to the cwd-LOCAL `.airc` (the

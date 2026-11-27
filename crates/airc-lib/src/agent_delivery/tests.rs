@@ -737,18 +737,22 @@ async fn unacknowledged_output_replays() {
     assert_eq!(second.live_events()[0].lamport, 2);
 }
 #[tokio::test]
-async fn aliases_and_concurrent_prepares_share_ownership_and_new_scope_refuses() {
+async fn aliases_share_ownership_a_concurrent_prepare_waits_and_new_scope_refuses() {
     let (dir, airc, room) = fixture().await;
     append(&airc, room, 1).await;
     let turn = airc.prepare_agent_delivery("same", 8, 8).await.unwrap();
-    assert!(lock(&dir.path().join("."), "same").is_err());
-    assert!(airc.prepare_agent_delivery("same", 8, 8).await.is_err());
-    assert!(lock(dir.path(), "different").is_ok());
+    assert!(try_lock(&dir.path().join("."), "same").is_err());
+    // a second turn for the same consumer waits for the first, it neither fails nor proceeds
+    let waiting = {
+        let airc = airc.clone();
+        tokio::spawn(async move { airc.prepare_agent_delivery("same", 8, 8).await.map(drop) })
+    };
+    assert!(try_lock(dir.path(), "different").is_ok());
     #[cfg(unix)]
     {
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
-        assert!(lock(&alias, "same").is_err());
+        assert!(try_lock(&alias, "same").is_err());
     }
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -760,8 +764,16 @@ async fn aliases_and_concurrent_prepares_share_ownership_and_new_scope_refuses()
         .status()
         .unwrap();
     assert!(status.success());
+    assert!(
+        !waiting.is_finished(),
+        "a second turn proceeded while the first held the lock"
+    );
     drop(turn);
-    assert!(lock(dir.path(), "same").is_ok());
+    waiting
+        .await
+        .unwrap()
+        .expect("the waiting turn runs once the first ends");
+    assert!(try_lock(dir.path(), "same").is_ok());
     let mut set = airc.subscription_set().await.unwrap();
     set.subscribe_with_wire_root(
         dir.path(),
@@ -783,19 +795,19 @@ async fn dropping_turn_releases_lock_even_with_a_duplicated_descriptor() {
         .await
         .unwrap();
     let duplicate = turn._guard.0.try_clone().unwrap();
-    assert!(lock(dir.path(), "duplicated").is_err());
+    assert!(try_lock(dir.path(), "duplicated").is_err());
     drop(turn);
     // The duplicate remains open: close-only ownership fails this assertion.
-    let next = lock(dir.path(), "duplicated").unwrap();
+    let next = try_lock(dir.path(), "duplicated").unwrap();
     drop(duplicate);
-    assert!(lock(dir.path(), "duplicated").is_err());
+    assert!(try_lock(dir.path(), "duplicated").is_err());
     drop(next);
-    assert!(lock(dir.path(), "duplicated").is_ok());
+    assert!(try_lock(dir.path(), "duplicated").is_ok());
 }
 #[test]
 fn lock_child() {
     if let Some(home) = std::env::var_os("AIRC_DELIVERY_LOCK_TEST_HOME") {
-        assert!(lock(Path::new(&home), "same").is_err());
+        assert!(try_lock(Path::new(&home), "same").is_err());
     }
 }
 #[tokio::test]
@@ -1279,4 +1291,10 @@ async fn an_older_read_marker_migrates_once_and_a_stale_migrator_never_rewinds()
         read_marker(&airc).await.is_err(),
         "a stranger is refused, never guessed"
     );
+}
+/// The lock as a non-blocking probe: which scope spellings share one lock, proven without waiting.
+fn try_lock(home: &Path, consumer: &str) -> Result<DeliveryLock, AircError> {
+    let file = lock_file(home, consumer)?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(fail)?;
+    Ok(DeliveryLock(file))
 }
