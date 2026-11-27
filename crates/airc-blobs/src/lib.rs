@@ -53,10 +53,11 @@ pub enum BlobError {
     /// store is corrupted at this address; caller should treat the
     /// content as missing AND escalate (delete the bad copy, re-request,
     /// log the corruption event).
-    #[error("blob hash mismatch at {expected}: stored bytes hash to {actual}")]
+    #[error("blob hash mismatch at {expected}: stored bytes hash to {actual} (operation: {operation})")]
     HashMismatch {
         expected: ContentHash,
         actual: ContentHash,
+        operation: &'static str,
     },
 
     /// Storage capacity exceeded. Backend-specific (filesystem free-space,
@@ -125,6 +126,7 @@ impl MediaRef {
             return Err(BlobError::HashMismatch {
                 expected: self.hash.clone(),
                 actual,
+                operation: "verify",
             });
         }
         Ok(())
@@ -308,6 +310,7 @@ mod tests {
         let mismatch = BlobError::HashMismatch {
             expected: hash.clone(),
             actual: ContentHash::from_bytes(b"y"),
+            operation: "test",
         };
         let display = format!("{mismatch}");
         assert!(display.contains(&hash.to_string()));
