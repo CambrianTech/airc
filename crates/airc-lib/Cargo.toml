@@ -31,6 +31,8 @@ airc-ipc = { path = "../airc-ipc" }
 # socket_path: 16-char account key namespacing the machine-singular socket
 sha2 = "0.10"
 airc-protocol = { path = "../airc-protocol" }
+# A submission built whole in a unit test (its artifact is a blob reference).
+airc-blobs = { path = "../airc-blobs" }
 airc-wire = { path = "../airc-wire" }
 airc-store = { path = "../airc-store" }
 airc-trust = { path = "../airc-trust" }
@@ -71,6 +73,8 @@ mock = []
 airc-store = { path = "../airc-store", features = ["test-fixtures"] }
 airc-daemon = { path = "../airc-daemon" }
 airc-protocol = { path = "../airc-protocol" }
+# A submission built whole in a unit test (its artifact is a blob reference).
+airc-blobs = { path = "../airc-blobs" }
 # Stub AccountRegistryStore rendezvous in integration tests
 # (refresh-on-failure heal, self-healing join).
 async-trait = "0.1"

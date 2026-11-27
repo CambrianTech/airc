@@ -680,7 +680,17 @@ impl Airc {
         room: &Room,
         request: ChangeWorkCardState,
     ) -> Result<(), AircError> {
-        self.ensure_work_card_in_room(room, request.card_id).await?;
+        let board = self
+            .project_room_work_board(room, WORK_MUTATION_PAGE_SIZE)
+            .await?;
+        let Some(card) = board.card(request.card_id) else {
+            return Err(AircError::WorkCardNotInCurrentRoom {
+                card_id: request.card_id,
+                room_name: room.name.clone(),
+                room_id: room.channel,
+            });
+        };
+        validate_card_state_change(card, request.state)?;
         let event = WorkEvent::CardStateChanged(CardStateChanged {
             card_id: request.card_id,
             state: request.state,
@@ -1553,6 +1563,24 @@ fn owner_resumes(card: &WorkCard, me: airc_core::PeerId) -> Option<ClaimId> {
 /// lifecycle is over — reporting "no linked PR" on a Closed card would
 /// send the operator to `airc work link`, which is the wrong tool),
 /// then link presence, then same-PR.
+/// A state change the card can take as it stands. Review needs something to review: a
+/// submission or a linked pull request (each of which also moves a card there on its own). Without
+/// either, the card is settled with nothing a reviewer can judge and nothing anyone may claim.
+fn validate_card_state_change(
+    card: &airc_work::model::WorkCard,
+    requested: CardState,
+) -> Result<(), AircError> {
+    // a review card's own work is its verdict on its parent: it reaches Review with no PR or submission
+    let reviewable =
+        !card.submissions.is_empty() || card.pull_request.is_some() || card.reviews.is_some();
+    if requested == CardState::Review && !reviewable {
+        return Err(AircError::WorkCardNothingToReview {
+            card_id: card.card_id,
+        });
+    }
+    Ok(())
+}
+
 fn validate_relink_card_pull_request(
     card: &WorkCard,
     new_pull_request: &airc_work::model::PullRequestRef,
@@ -2136,6 +2164,63 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             reviews: None,
+        }
+    }
+
+    #[test]
+    fn review_needs_a_submission_or_a_linked_pull_request() {
+        // what this catches (continuum card 4a9fda3f, 2026-11-27): a bare state change parking a
+        // card in Review with nothing a reviewer can judge, where nobody may claim it either (six
+        // such cards on one board, a resident refused re-claiming her task). A linked PR or a
+        // submission each makes Review legitimate; every other state stays a plain move.
+        let bare = card_in(CardState::InProgress, None);
+        match validate_card_state_change(&bare, CardState::Review) {
+            Err(AircError::WorkCardNothingToReview { card_id }) => {
+                assert_eq!(card_id, bare.card_id)
+            }
+            other => panic!("expected WorkCardNothingToReview, got {other:?}"),
+        }
+        assert!(
+            validate_card_state_change(
+                &card_in(CardState::InProgress, Some(pr_ref(5292))),
+                CardState::Review
+            )
+            .is_ok(),
+            "a linked PR is reviewable"
+        );
+        let mut submitted = card_in(CardState::InProgress, None);
+        submitted.submissions = vec![airc_work::WorkSubmission {
+            submission_id: airc_work::SubmissionId::from_u128(4),
+            card_id: submitted.card_id,
+            claim_id: airc_work::ClaimId::from_u128(3),
+            instance: "card".into(),
+            base_sha: airc_work::GitObjectId::new("a".repeat(40)).unwrap(),
+            head: airc_work::SubmissionHead::At(
+                airc_work::GitObjectId::new("b".repeat(40)).unwrap(),
+            ),
+            artifact: airc_blobs::MediaRef {
+                hash: airc_blobs::ContentHash::from_bytes(b"review gate fixture"),
+                size_bytes: 1,
+                mime: Some("text/x-patch".into()),
+            },
+            publisher: airc_core::PeerId::from_u128(2),
+            submitted_at_ms: 1,
+        }];
+        assert!(
+            validate_card_state_change(&submitted, CardState::Review).is_ok(),
+            "a submission is reviewable"
+        );
+        let mut review_card = card_in(CardState::InProgress, None);
+        review_card.reviews = Some(WorkCardId::from_u128(9));
+        assert!(
+            validate_card_state_change(&review_card, CardState::Review).is_ok(),
+            "a review card's work is its verdict"
+        );
+        for state in [CardState::Open, CardState::Blocked, CardState::Closed] {
+            assert!(
+                validate_card_state_change(&bare, state).is_ok(),
+                "{state:?} needs nothing to review"
+            );
         }
     }
 

@@ -175,6 +175,15 @@ pub enum AircError {
         state: airc_work::CardState,
     },
 
+    /// Review is where a submission or a linked pull request waits for its verdict. A card moved
+    /// there with neither has nothing any reviewer can judge and, being settled, nothing anyone
+    /// may claim: it sits forever (continuum card 4a9fda3f: six such cards on one board,
+    /// 2026-11-27). `work submit` or `work link` moves a card to Review with what it carries.
+    #[error(
+        "work card {card_id} has nothing to review: submit the work (`airc work submit`) or link its pull request (`airc work link`); either moves it to Review"
+    )]
+    WorkCardNothingToReview { card_id: airc_work::WorkCardId },
+
     /// Card 09fddedd: `relink` supersedes an EXISTING link — a card
     /// with no linked PR has nothing to supersede. Use `airc work
     /// link` for the first link; refusing here keeps the audit
@@ -297,6 +306,7 @@ impl AircError {
             | AircError::WorkCardNotInCurrentRoom { .. }
             | AircError::WorkClaimNotCurrent { .. }
             | AircError::WorkCardNotClaimable { .. }
+            | AircError::WorkCardNothingToReview { .. }
             | AircError::WorkCardHasNoLinkedPullRequest { .. }
             | AircError::WorkCardRelinkSamePullRequest { .. }
             | AircError::WorkCardRelinkTerminalState { .. }
