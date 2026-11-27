@@ -426,6 +426,36 @@ impl EventStore for SqliteEventStore {
         Ok(advanced > 0)
     }
 
+    async fn replace_scoped_state_if(
+        &self,
+        entry: StoredScopedState,
+        expected: &str,
+    ) -> Result<bool, StoreError> {
+        use sea_orm::sea_query::Expr;
+        let _write = self.admit_write().await?;
+        // One statement: the row changes only while it still holds exactly `expected`.
+        let replaced = scoped_state::Entity::update_many()
+            .col_expr(
+                scoped_state::Column::ValueJson,
+                Expr::value(entry.value_json),
+            )
+            .col_expr(scoped_state::Column::Version, Expr::value(entry.version))
+            .col_expr(
+                scoped_state::Column::UpdatedAtMs,
+                Expr::value(entry.updated_at_ms),
+            )
+            .col_expr(
+                scoped_state::Column::UpdatedBy,
+                Expr::value(entry.updated_by),
+            )
+            .filter(scoped_state::Column::ScopeKey.eq(entry.scope_key))
+            .filter(scoped_state::Column::Key.eq(entry.key))
+            .filter(scoped_state::Column::ValueJson.eq(expected))
+            .exec(&self.db)
+            .await?;
+        Ok(replaced.rows_affected == 1)
+    }
+
     async fn list_scoped_state(
         &self,
         scope_key: &str,

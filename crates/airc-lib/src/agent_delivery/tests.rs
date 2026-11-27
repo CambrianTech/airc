@@ -1211,3 +1211,72 @@ async fn a_legacy_session_gets_one_page_then_the_present() {
         "the backlog is never walked"
     );
 }
+
+// what this catches (airc#1689; Codex on airc#1690): a read marker in the form written before #1640
+// made every `airc join` exit 1 and the forward-only advance could never replace it; it migrates once,
+// and a second migrator that read the old bytes before the first migrated can never rewind an advance
+// that landed in between (A and B read X; A migrates; the marker advances to Y; B's migration must not
+// write X back). Anything else stays a refusal and read_marker never writes.
+#[tokio::test]
+async fn an_older_read_marker_migrates_once_and_a_stale_migrator_never_rewinds() {
+    let (_dir, airc, _room) = fresh_agent().await;
+    let older = TranscriptCursor {
+        lamport: 663_005_511_549_344,
+        event_id: EventId::from_u128(0x67af_ea96_54b9_43a8_b9e9_8724_d1b7_0193),
+    };
+    let write = |value_json: String| StoredScopedState {
+        scope_key: SCOPE.into(),
+        key: READ_MARKER.into(),
+        value_json,
+        version: 1,
+        updated_at_ms: 0,
+        updated_by: None,
+    };
+    let old_bytes = serde_json::to_string(&older).unwrap();
+    airc.inner
+        .store
+        .set_scoped_state(write(old_bytes.clone()))
+        .await
+        .unwrap();
+    assert!(
+        read_marker(&airc).await.is_err(),
+        "read_marker never migrates: it only reads"
+    );
+    // A migrates
+    migrate_read_marker(&airc).await.unwrap();
+    assert_eq!(
+        read_marker(&airc).await.unwrap(),
+        Some(older.clone()),
+        "the older form now reads as the cursor it named"
+    );
+    // a delivery advances past it
+    let later = TranscriptCursor {
+        lamport: older.lamport + 10,
+        event_id: older.event_id,
+    };
+    advance_read_marker(&airc, &later).await.unwrap();
+    // B, holding the old bytes it read before A migrated, replaces only if they are still stored
+    let stale = airc
+        .inner
+        .store
+        .replace_scoped_state_if(write(encode_marker(&older)), &old_bytes)
+        .await
+        .unwrap();
+    assert!(!stale, "a stale migrator does not replace");
+    assert_eq!(
+        read_marker(&airc).await.unwrap(),
+        Some(later),
+        "the advance stands"
+    );
+    // a marker of neither form is left for read_marker to refuse
+    airc.inner
+        .store
+        .set_scoped_state(write("{\"stranger\":1}".into()))
+        .await
+        .unwrap();
+    migrate_read_marker(&airc).await.unwrap();
+    assert!(
+        read_marker(&airc).await.is_err(),
+        "a stranger is refused, never guessed"
+    );
+}

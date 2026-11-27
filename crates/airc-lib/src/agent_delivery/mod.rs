@@ -133,6 +133,44 @@ async fn read_marker(airc: &Airc) -> Result<Option<TranscriptCursor>, AircError>
     }
 }
 
+/// The one-shot migration of a read marker written before #1640 (the cursor's own JSON,
+/// `{"lamport":..,"event_id":".."}`), run when delivery opens, before any read or advance: replaced
+/// only while the row still holds exactly those bytes, so a concurrent migrator or a later advance is
+/// never rewound (Codex on airc#1690). The forward-only advance could never move past it (`{` sorts
+/// after `"`): every `airc join` exited 1 on it (airc#1689). Any other form is left for read_marker
+/// to refuse. Delete once no pre-#1640 scope remains.
+async fn migrate_read_marker(airc: &Airc) -> Result<(), AircError> {
+    let Some(row) = airc
+        .inner
+        .store
+        .get_scoped_state(SCOPE, READ_MARKER)
+        .await?
+    else {
+        return Ok(());
+    };
+    if decode_marker(&row.value_json).is_ok() {
+        return Ok(());
+    }
+    let Ok(cursor) = serde_json::from_str::<TranscriptCursor>(&row.value_json) else {
+        return Ok(());
+    };
+    airc.inner
+        .store
+        .replace_scoped_state_if(
+            StoredScopedState {
+                scope_key: SCOPE.into(),
+                key: READ_MARKER.into(),
+                value_json: encode_marker(&cursor),
+                version: 1,
+                updated_at_ms: 0,
+                updated_by: None,
+            },
+            &row.value_json,
+        )
+        .await?;
+    Ok(())
+}
+
 /// Moves only forward, atomically in the store: whatever order sessions write in, the marker
 /// is the furthest any of them delivered.
 async fn advance_read_marker(airc: &Airc, delivered: &TranscriptCursor) -> Result<(), AircError> {
@@ -334,6 +372,8 @@ impl Airc {
             return Err(fail("invalid scan/output budget"));
         }
         let guard = lock(self.home(), &consumer)?;
+        // an older read marker becomes the current form once, before any read or advance (airc#1689)
+        migrate_read_marker(self).await?;
         let channels = rooms(self).await?;
         let source = if let Some(client) = self.daemon_client() {
             // The owner's stable identity identifies the router sequence authority;
