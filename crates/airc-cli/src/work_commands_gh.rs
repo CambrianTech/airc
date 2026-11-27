@@ -136,7 +136,7 @@ pub(crate) async fn open_pr_and_link(
     }
     let (pr_number, pr_url) =
         match the_open_pull_request(&String::from_utf8(list_out.stdout)?, card.repo.as_str())? {
-            Some(open) => open,
+            Some(FoundPullRequest { number, url }) => (number, url),
             None => {
                 let create_out =
                     airc_core::process::background(airc_core::gh_executable::resolve())
@@ -279,6 +279,22 @@ impl OpenPullRequest {
     }
 }
 
+/// The pull request a retry links: the one open PR for the card's head and base in its own repo.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FoundPullRequest {
+    pub(crate) number: u64,
+    pub(crate) url: String,
+}
+
+/// Why the open PR for a card could not be named.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrLookupRefusal {
+    #[error("gh pr list output is not the JSON asked for: {0}")]
+    Unreadable(#[from] serde_json::Error),
+    #[error("{} open pull requests share this head and base ({}); link the one that carries this card with `airc work link`", numbers.len(), numbers.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", "))]
+    Ambiguous { numbers: Vec<u64> },
+}
+
 /// The open pull request for a card's exact head and base from the card's own repository, from
 /// `gh pr list` output: none (open one), exactly one (a retry links it), or several (refused:
 /// which one carries the card's work is not ours to guess). A PR from another fork with the same
@@ -286,18 +302,18 @@ impl OpenPullRequest {
 pub(crate) fn the_open_pull_request(
     listed: &str,
     repo: &str,
-) -> Result<Option<(u64, String)>, String> {
-    let open: Vec<OpenPullRequest> =
-        serde_json::from_str(listed).map_err(|e| format!("gh pr list output: {e}"))?;
+) -> Result<Option<FoundPullRequest>, PrLookupRefusal> {
+    let open: Vec<OpenPullRequest> = serde_json::from_str(listed)?;
     let ours: Vec<&OpenPullRequest> = open.iter().filter(|pr| pr.is_from(repo)).collect();
     match ours.as_slice() {
         [] => Ok(None),
-        [one] => Ok(Some((one.number, one.url.clone()))),
-        many => Err(format!(
-            "{} open pull requests share this head and base ({}); link the one that carries this card with `airc work link`",
-            many.len(),
-            many.iter().map(|pr| format!("#{}", pr.number)).collect::<Vec<_>>().join(", ")
-        )),
+        [one] => Ok(Some(FoundPullRequest {
+            number: one.number,
+            url: one.url.clone(),
+        })),
+        many => Err(PrLookupRefusal::Ambiguous {
+            numbers: many.iter().map(|pr| pr.number).collect(),
+        }),
     }
 }
 
@@ -539,28 +555,41 @@ mod tests {
                 r#"{{"number":{number},"url":"https://github.com/{REPO}/pull/{number}","headRepository":{{"name":"continuum"}},"headRepositoryOwner":{{"login":"{owner}"}}}}"#
             )
         };
-        assert_eq!(the_open_pull_request("[]", REPO), Ok(None));
-        let one = format!("[{}]", pr(5292, "CambrianTech"));
-        assert_eq!(
-            the_open_pull_request(&one, REPO),
-            Ok(Some((5292, format!("https://github.com/{REPO}/pull/5292"))))
+        let found = |listed: &str| {
+            the_open_pull_request(listed, REPO).map(|found| found.map(|pr| pr.number))
+        };
+        assert_eq!(found("[]").ok(), Some(None));
+        let one = the_open_pull_request(&format!("[{}]", pr(5292, "CambrianTech")), REPO);
+        assert!(
+            matches!(&one, Ok(Some(FoundPullRequest { number: 5292, url })) if url == &format!("https://github.com/{REPO}/pull/5292")),
+            "{one:?}"
         );
         // a fork's PR from a branch of the same name is not the card's (Codex on airc#1691)
-        let fork_only = format!("[{}]", pr(7, "someone-else"));
-        assert_eq!(the_open_pull_request(&fork_only, REPO), Ok(None));
-        let ours_and_fork = format!("[{},{}]", pr(7, "someone-else"), pr(5292, "CambrianTech"));
         assert_eq!(
-            the_open_pull_request(&ours_and_fork, REPO).map(|found| found.map(|(n, _)| n)),
-            Ok(Some(5292))
+            found(&format!("[{}]", pr(7, "someone-else"))).ok(),
+            Some(None)
         );
-        let several = the_open_pull_request(
-            &format!("[{},{}]", pr(1, "CambrianTech"), pr(2, "CambrianTech")),
-            REPO,
+        assert_eq!(
+            found(&format!(
+                "[{},{}]",
+                pr(7, "someone-else"),
+                pr(5292, "CambrianTech")
+            ))
+            .ok(),
+            Some(Some(5292))
         );
+        let several = found(&format!(
+            "[{},{}]",
+            pr(1, "CambrianTech"),
+            pr(2, "CambrianTech")
+        ));
         assert!(
-            several.as_ref().is_err_and(|why| why.contains("#1, #2")),
+            matches!(&several, Err(PrLookupRefusal::Ambiguous { numbers }) if numbers == &[1, 2]),
             "{several:?}"
         );
-        assert!(the_open_pull_request("not json", REPO).is_err());
+        assert!(matches!(
+            found("not json"),
+            Err(PrLookupRefusal::Unreadable(_))
+        ));
     }
 }
