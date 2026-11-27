@@ -37,8 +37,9 @@ pub(crate) async fn open_pr_and_link(
     let card = board
         .card(card_id)
         .ok_or_else(|| format!("card {card_id} not visible in board projection"))?;
-    if card.reviews.is_some() || card.pull_request.is_some() {
-        // Review-only verdicts and already-linked PRs keep their existing path.
+    if card.reviews.is_some() || card.pull_request.is_some() || !card.submissions.is_empty() {
+        // Review-only verdicts, already-linked PRs and submitted cards are reviewable as they stand
+        // (the owner's guard accepts each): no worktree or gh call is needed to move them.
         return Ok(());
     }
 
@@ -123,7 +124,7 @@ pub(crate) async fn open_pr_and_link(
             "--base",
             base_branch.as_str(),
             "--json",
-            "number,url",
+            "number,url,headRepository,headRepositoryOwner",
         ])
         .output()?;
     if !list_out.status.success() {
@@ -133,38 +134,40 @@ pub(crate) async fn open_pr_and_link(
         )
         .into());
     }
-    let (pr_number, pr_url) = match the_open_pull_request(&String::from_utf8(list_out.stdout)?)? {
-        Some(open) => open,
-        None => {
-            let create_out = airc_core::process::background(airc_core::gh_executable::resolve())
-                .current_dir(&worktree_str)
-                .args([
-                    "pr",
-                    "create",
-                    "--title",
-                    subject.trim(),
-                    "--body",
-                    body.trim(),
-                    "--base",
-                    base_branch.as_str(),
-                    "--head",
-                    head_branch.as_str(),
-                ])
-                .output()?;
-            if !create_out.status.success() {
-                return Err(format!(
-                    "gh pr create failed: {}",
-                    String::from_utf8_lossy(&create_out.stderr).trim()
-                )
-                .into());
+    let (pr_number, pr_url) =
+        match the_open_pull_request(&String::from_utf8(list_out.stdout)?, card.repo.as_str())? {
+            Some(open) => open,
+            None => {
+                let create_out =
+                    airc_core::process::background(airc_core::gh_executable::resolve())
+                        .current_dir(&worktree_str)
+                        .args([
+                            "pr",
+                            "create",
+                            "--title",
+                            subject.trim(),
+                            "--body",
+                            body.trim(),
+                            "--base",
+                            base_branch.as_str(),
+                            "--head",
+                            head_branch.as_str(),
+                        ])
+                        .output()?;
+                if !create_out.status.success() {
+                    return Err(format!(
+                        "gh pr create failed: {}",
+                        String::from_utf8_lossy(&create_out.stderr).trim()
+                    )
+                    .into());
+                }
+                let stdout = String::from_utf8(create_out.stdout)?;
+                let pr_url = stdout.trim().lines().last().unwrap_or("").trim().to_owned();
+                let pr_number = extract_pr_number(&pr_url)
+                    .ok_or_else(|| format!("could not parse PR number from gh output: {pr_url}"))?;
+                (pr_number, pr_url)
             }
-            let stdout = String::from_utf8(create_out.stdout)?;
-            let pr_url = stdout.trim().lines().last().unwrap_or("").trim().to_owned();
-            let pr_number = extract_pr_number(&pr_url)
-                .ok_or_else(|| format!("could not parse PR number from gh output: {pr_url}"))?;
-            (pr_number, pr_url)
-        }
-    };
+        };
 
     // Resolve head from the worktree's git state. Base is the same
     // pinned value we passed to gh — the projection must record what
@@ -242,20 +245,52 @@ pub(crate) fn extract_pr_number(url: &str) -> Option<u64> {
     tail.parse::<u64>().ok()
 }
 
-/// One open pull request as `gh pr list --json number,url` reports it.
+/// One open pull request as `gh pr list --json number,url,headRepository,headRepositoryOwner`
+/// reports it.
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OpenPullRequest {
     number: u64,
     url: String,
+    head_repository: Option<GhName>,
+    head_repository_owner: Option<GhLogin>,
 }
 
-/// The open pull request for a card's exact head and base, from `gh pr list` output: none (open
-/// one), exactly one (a retry links it), or several (refused: which one carries the card's work is
-/// not ours to guess).
-pub(crate) fn the_open_pull_request(listed: &str) -> Result<Option<(u64, String)>, String> {
+#[derive(serde::Deserialize)]
+struct GhName {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GhLogin {
+    login: String,
+}
+
+impl OpenPullRequest {
+    /// The repository its head branch lives in, `owner/name`: a fork's PR with the card's branch
+    /// name is not the card's.
+    fn is_from(&self, repo: &str) -> bool {
+        match (&self.head_repository_owner, &self.head_repository) {
+            (Some(owner), Some(name)) => {
+                format!("{}/{}", owner.login, name.name).eq_ignore_ascii_case(repo)
+            }
+            _ => false, // a head repository gh cannot name (deleted fork) is not provably the card's
+        }
+    }
+}
+
+/// The open pull request for a card's exact head and base from the card's own repository, from
+/// `gh pr list` output: none (open one), exactly one (a retry links it), or several (refused:
+/// which one carries the card's work is not ours to guess). A PR from another fork with the same
+/// branch name never matches (Codex on airc#1691).
+pub(crate) fn the_open_pull_request(
+    listed: &str,
+    repo: &str,
+) -> Result<Option<(u64, String)>, String> {
     let open: Vec<OpenPullRequest> =
         serde_json::from_str(listed).map_err(|e| format!("gh pr list output: {e}"))?;
-    match open.as_slice() {
+    let ours: Vec<&OpenPullRequest> = open.iter().filter(|pr| pr.is_from(repo)).collect();
+    match ours.as_slice() {
         [] => Ok(None),
         [one] => Ok(Some((one.number, one.url.clone()))),
         many => Err(format!(
@@ -498,21 +533,34 @@ mod tests {
     // of several at random. None opens, one is linked, several are refused by number.
     #[test]
     fn a_retry_links_the_one_open_pull_request_and_refuses_to_guess_among_several() {
-        assert_eq!(the_open_pull_request("[]"), Ok(None));
+        const REPO: &str = "CambrianTech/continuum";
+        let pr = |number: u64, owner: &str| {
+            format!(
+                r#"{{"number":{number},"url":"https://github.com/{REPO}/pull/{number}","headRepository":{{"name":"continuum"}},"headRepositoryOwner":{{"login":"{owner}"}}}}"#
+            )
+        };
+        assert_eq!(the_open_pull_request("[]", REPO), Ok(None));
+        let one = format!("[{}]", pr(5292, "CambrianTech"));
         assert_eq!(
-            the_open_pull_request(
-                r#"[{"number":5292,"url":"https://github.com/CambrianTech/continuum/pull/5292"}]"#
-            ),
-            Ok(Some((
-                5292,
-                "https://github.com/CambrianTech/continuum/pull/5292".to_owned()
-            )))
+            the_open_pull_request(&one, REPO),
+            Ok(Some((5292, format!("https://github.com/{REPO}/pull/5292"))))
         );
-        let several = the_open_pull_request(r#"[{"number":1,"url":"u1"},{"number":2,"url":"u2"}]"#);
+        // a fork's PR from a branch of the same name is not the card's (Codex on airc#1691)
+        let fork_only = format!("[{}]", pr(7, "someone-else"));
+        assert_eq!(the_open_pull_request(&fork_only, REPO), Ok(None));
+        let ours_and_fork = format!("[{},{}]", pr(7, "someone-else"), pr(5292, "CambrianTech"));
+        assert_eq!(
+            the_open_pull_request(&ours_and_fork, REPO).map(|found| found.map(|(n, _)| n)),
+            Ok(Some(5292))
+        );
+        let several = the_open_pull_request(
+            &format!("[{},{}]", pr(1, "CambrianTech"), pr(2, "CambrianTech")),
+            REPO,
+        );
         assert!(
             several.as_ref().is_err_and(|why| why.contains("#1, #2")),
             "{several:?}"
         );
-        assert!(the_open_pull_request("not json").is_err());
+        assert!(the_open_pull_request("not json", REPO).is_err());
     }
 }
