@@ -627,6 +627,15 @@ pub async fn ensure_daemon_running(
         if daemon_status_is_current(&status) {
             return Ok(socket);
         }
+        let this = std::env::current_exe()?;
+        if let crate::daemon_replacement::DaemonReplacement::Refused(refused) =
+            crate::daemon_replacement::daemon_replacement(
+                status.executable.as_deref().map(Path::new),
+                &this,
+            )
+        {
+            return Err(refused.into());
+        }
         let _ = client.stop().await;
         wait_for_daemon_exit(&client, Duration::from_secs(3)).await;
     }

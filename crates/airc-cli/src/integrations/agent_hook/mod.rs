@@ -152,7 +152,6 @@ pub async fn run_hook(
         None => agent_process_client_id()?,
     };
     let consumer = consumer_id(runtime, runtime_client.as_deref());
-    wake::announce(&airc, runtime, runtime_client.as_deref()).await;
     let mut turn = prepare(&airc, &consumer, options).await?;
     let resume =
         match crate::agent_resume::prepare(&airc, &consumer, event == HookEvent::PostToolUse).await
@@ -205,7 +204,6 @@ pub async fn run_poll(
     let airc = crate::commands::attached_airc(home).await?;
     let runtime_client = current_client_id()?;
     let consumer = consumer_id(runtime, runtime_client.as_deref());
-    wake::announce(&airc, runtime, runtime_client.as_deref()).await;
     let mut turn = prepare(&airc, &consumer, options).await?;
     if turn.is_empty() && !turn.has_pending(0) && !turn.has_history() && wait_ms > 0 {
         turn.acknowledge(0, false).await?; // release ownership before an idle wait

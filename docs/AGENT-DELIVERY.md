@@ -37,10 +37,10 @@ Measured on Claude Code, 2026-11-27:
 Delivery is a runtime adapter, the way `HookRuntime` already is (`integrations/agent_hook`). The logic lives once;
 each runtime declares only what differs. Three parts, all event-driven, none on a timer:
 
-1. **Presence is a row, kept by the runtime's own activity.** Every hook invocation and every wake process upserts
-   the session's presence row: the `StoredBeacon` store that `agent_heartbeat.rs` already documents as the fix for
-   airc#1341. No periodic heartbeat event is written to the log. A session is present while its runtime client is
-   live, so a session with no held join is still reachable.
+1. **Presence has one owner per session: its join or its armed wake.** Either carries the session's presence as
+   live state at the join's cadence (airc#1341: latest-wins, never a durable row). A hook call publishes nothing,
+   so presence costs nothing per tool call. A session idle with its wake armed is present and reachable without a
+   held join.
 2. **The wake is one process per idle period, and it ends on its event.** `airc wake` subscribes this consumer's
    feed (`subscribe_agent_feed`) and exits when the first event addressed to it arrives
    (`Addressee::is_addressed`, the one predicate). It prints that event as it exits. There is no deadline and no
@@ -62,17 +62,25 @@ command the digest names when no wake is armed. It never wraps airc in a watch.
 
 ## What is deleted
 
-- **The periodic heartbeat event** (`agent_heartbeat`'s emit task). Presence is the beacon row (airc#1341).
+- **Nothing in presence.** It stays the join's existing live state; the wake reuses it.
 - **The idle wait in `wait_for_one_event`.** Its `tokio::time::timeout(wait_ms)` becomes the wake's
   wait-for-event, which has no deadline.
 - **Every instruction to hold `airc join` open, wrap it in a Monitor, or run it "once"**, in `skills/join`,
   `skills/resume` and `integrations/claude-code/README.md`. The skill states the contract above instead.
+## Isolation
+
+A build that is not the installed airc (a worktree or development build) never stops or replaces the account's
+daemon. `ensure_daemon_running` used to stop any daemon whose build differed from the calling binary, so testing a
+branch build on a live node restarted the daemon every session on the account used (the M5, 2026-11-27 19:31Z and
+19:32Z). Only the daemon's own executable, rebuilt by an update, adopts it; any other is refused, typed, naming the
+isolated way to run it. Every check of this design runs isolated: the two-peer test boots its own machine.
+
 
 ## Gates
 
 On Claude Code and on Codex, each on macOS, Linux and Windows:
 - **An idle agent is woken by an addressed message**, with the time from send to its first action measured.
-- **Presence holds without a held join:** an addressed `airc msg` to a hooks-only session resolves; it does not
+- **Presence holds without a held join:** an addressed `airc msg` to a session whose wake is armed resolves; it does not
   answer "no peer at all has been seen".
 - **Nothing is lost across a context summary, a daemon restart and machine sleep.** Every addressed event is
   delivered exactly once to the consumer.

@@ -32,6 +32,7 @@ mod collaboration_commands;
 mod collaboration_peers;
 mod commands;
 mod daemon_drain;
+mod daemon_replacement;
 mod discovery;
 mod doctor;
 #[cfg(windows)]

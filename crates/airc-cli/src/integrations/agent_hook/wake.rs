@@ -1,13 +1,11 @@
 //! An idle agent hears what is addressed to it (docs/AGENT-DELIVERY.md).
 //!
-//! Three parts, none on a timer of its own:
-//! - **Presence** is published at every hook call, so a session that only has hooks is present
-//!   to its peers (an agent with no held `airc join` used to read as "no peer at all has been
-//!   seen").
-//! - **The wake** is one process per idle period. It holds this consumer's wake lock, keeps the
-//!   session present, and exits on the first event addressed to the consumer. A runtime whose
-//!   background task wakes the session when it exits (Claude Code) is then woken exactly when
-//!   someone addresses it; nothing expires.
+//! Two parts, one owner each:
+//! - **The wake** is one process per idle period. It holds this consumer's wake lock, carries the
+//!   session's presence at the join's own cadence (presence has one owner: a hook call costs no
+//!   message), and exits on the first event addressed to the consumer. A runtime whose background
+//!   task wakes the session when it exits (Claude Code) is woken exactly when someone addresses it;
+//!   nothing expires.
 //! - **The stop gate** runs when the agent is about to go idle. It hands over what is addressed
 //!   and undelivered, and asks once for a wake when none is armed.
 
@@ -15,32 +13,11 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use airc_lib::{AddressedWake, Airc, HeartbeatKind};
+use airc_lib::AddressedWake;
 use fs2::FileExt;
 
 use super::{compose, consumer_id, io, prepare, HookOptions, HookRuntime};
 use crate::client_id::current_client_id;
-
-/// Publish this session's presence: one live value per (peer, client), latest-wins, gone when it
-/// lapses (airc#1341). A failure is reported and never fails the hook it runs in.
-pub(super) async fn announce(airc: &Airc, runtime: &HookRuntime, client: Option<&str>) {
-    let scope = std::env::current_dir()
-        .ok()
-        .map(|dir| dir.display().to_string());
-    let build = (!crate::build_info::is_unknown()).then(|| crate::build_info::COMMIT_SHORT.into());
-    if let Err(error) = airc
-        .emit_agent_heartbeat_with_metadata(
-            HeartbeatKind::Alive,
-            runtime.presence,
-            client.map(ToString::to_string),
-            scope,
-            build,
-        )
-        .await
-    {
-        eprintln!("airc {}: presence not published: {error}", runtime.verb);
-    }
-}
 
 /// Whether a wake holds this consumer's lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,7 +156,6 @@ pub async fn run_stop(
     let airc = crate::commands::attached_airc(home).await?;
     let client = input.session.or(current_client_id()?);
     let consumer = consumer_id(runtime, client.as_deref());
-    announce(&airc, runtime, client.as_deref()).await;
     let mut turn = prepare(&airc, &consumer, options).await?;
     let me = airc.addressee().await?;
     let addressed = turn
