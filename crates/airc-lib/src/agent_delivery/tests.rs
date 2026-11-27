@@ -1212,11 +1212,13 @@ async fn a_legacy_session_gets_one_page_then_the_present() {
     );
 }
 
-// what this catches (airc#1689, the continuum scope 2026-11-27): a read marker in the form written
-// before #1640 (the cursor's own JSON) made every `airc join` exit 1, and the forward-only advance
-// could never replace it; it migrates once to the current form, and anything else stays a refusal.
+// what this catches (airc#1689; Codex on airc#1690): a read marker in the form written before #1640
+// made every `airc join` exit 1 and the forward-only advance could never replace it; it migrates once,
+// and a second migrator that read the old bytes before the first migrated can never rewind an advance
+// that landed in between (A and B read X; A migrates; the marker advances to Y; B's migration must not
+// write X back). Anything else stays a refusal and read_marker never writes.
 #[tokio::test]
-async fn an_older_read_marker_migrates_once_and_a_stranger_is_refused() {
+async fn an_older_read_marker_migrates_once_and_a_stale_migrator_never_rewinds() {
     let (_dir, airc, _room) = fresh_agent().await;
     let older = TranscriptCursor {
         lamport: 663_005_511_549_344,
@@ -1230,41 +1232,51 @@ async fn an_older_read_marker_migrates_once_and_a_stranger_is_refused() {
         updated_at_ms: 0,
         updated_by: None,
     };
+    let old_bytes = serde_json::to_string(&older).unwrap();
     airc.inner
         .store
-        .set_scoped_state(write(serde_json::to_string(&older).unwrap()))
+        .set_scoped_state(write(old_bytes.clone()))
         .await
         .unwrap();
+    assert!(
+        read_marker(&airc).await.is_err(),
+        "read_marker never migrates: it only reads"
+    );
+    // A migrates
+    migrate_read_marker(&airc).await.unwrap();
     assert_eq!(
         read_marker(&airc).await.unwrap(),
         Some(older.clone()),
-        "the older form is read as the cursor it names"
+        "the older form now reads as the cursor it named"
     );
-    let stored = airc
+    // a delivery advances past it
+    let later = TranscriptCursor {
+        lamport: older.lamport + 10,
+        event_id: older.event_id,
+    };
+    advance_read_marker(&airc, &later).await.unwrap();
+    // B, holding the old bytes it read before A migrated, replaces only if they are still stored
+    let stale = airc
         .inner
         .store
-        .get_scoped_state(SCOPE, READ_MARKER)
+        .replace_scoped_state_if(write(encode_marker(&older)), &old_bytes)
         .await
-        .unwrap()
-        .unwrap()
-        .value_json;
-    assert_eq!(
-        stored,
-        encode_marker(&older),
-        "and rewritten once in the current form"
-    );
+        .unwrap();
+    assert!(!stale, "a stale migrator does not replace");
     assert_eq!(
         read_marker(&airc).await.unwrap(),
-        Some(older),
-        "the migrated marker reads as itself"
+        Some(later),
+        "the advance stands"
     );
+    // a marker of neither form is left for read_marker to refuse
     airc.inner
         .store
         .set_scoped_state(write("{\"stranger\":1}".into()))
         .await
         .unwrap();
+    migrate_read_marker(&airc).await.unwrap();
     assert!(
         read_marker(&airc).await.is_err(),
-        "a marker of neither form is refused, never guessed"
+        "a stranger is refused, never guessed"
     );
 }

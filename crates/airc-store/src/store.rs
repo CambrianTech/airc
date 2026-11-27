@@ -185,6 +185,15 @@ pub trait EventStore: crate::history_count::CountHistory + Send + Sync {
     /// interleave. Returns whether this write advanced it.
     async fn advance_scoped_state(&self, entry: StoredScopedState) -> Result<bool, StoreError>;
 
+    /// Replace the row with `entry` only if its stored `value_json` is exactly `expected`, in one atomic
+    /// statement: a one-shot migration that a concurrent writer (or another migrator) can never
+    /// overwrite with stale bytes. Returns whether it replaced.
+    async fn replace_scoped_state_if(
+        &self,
+        entry: StoredScopedState,
+        expected: &str,
+    ) -> Result<bool, StoreError>;
+
     /// List every scoped-state row under `scope_key`, `key` ascending.
     /// Backs dashboard / RAG enumeration of a scope's walls.
     async fn list_scoped_state(
