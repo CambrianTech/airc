@@ -51,7 +51,7 @@ async fn a_message_sent_before_the_wake_subscribed_is_found_undelivered() {
     // The stop hook looks first and finds nothing addressed: the consumer's cursor now exists.
     assert_eq!(
         alice
-            .addressed_undelivered(consumer, None, 256)
+            .addressed_undelivered(consumer, None)
             .await
             .expect("stop hook's look"),
         None
@@ -68,17 +68,99 @@ async fn a_message_sent_before_the_wake_subscribed_is_found_undelivered() {
     };
     assert_eq!(
         alice
-            .addressed_undelivered(consumer, None, 256)
+            .addressed_undelivered(consumer, None)
             .await
             .expect("check"),
         Some(woke.clone())
     );
     assert_eq!(
         alice
-            .addressed_undelivered(consumer, None, 256)
+            .addressed_undelivered(consumer, None)
             .await
             .expect("check again"),
         Some(woke),
         "reading it delivered nothing"
+    );
+}
+
+// what this catches (Codex on #1692 at 7d371beb): the undelivered check read one unfiltered page, so
+// an addressed message behind a page of others was missed and the wake waited forever with it
+// already stored. After the stop hook's empty look, sixty unaddressed lines and then one addressed
+// line arrive before the wake subscribes, and nothing is sent after: the check still finds it.
+#[tokio::test]
+async fn an_addressed_message_behind_a_page_of_others_is_found_undelivered() {
+    let machine = Machine::boot().await;
+    machine.pin_identity("addressed-behind-a-page-test").await;
+    let (alice, bob) = machine.pair_in("general").await;
+    let alice_short: String = alice.peer_id().to_string().chars().take(8).collect();
+    let consumer = "claude-hook:claude:alice-busy-room";
+    assert_eq!(
+        alice
+            .addressed_undelivered(consumer, None)
+            .await
+            .expect("stop hook's look"),
+        None
+    );
+
+    for i in 0..60 {
+        bob.say(&format!("ambient line {i}"))
+            .await
+            .expect("ambient");
+    }
+    let addressed = bob
+        .say(&format!("@{alice_short} behind sixty others"))
+        .await
+        .expect("addressed");
+    let _feed = alice.addressed_feed(None).await.expect("alice's feed");
+    assert_eq!(
+        alice
+            .addressed_undelivered(consumer, None)
+            .await
+            .expect("check"),
+        Some(AddressedWake::Addressed {
+            from: bob.peer_id(),
+            event: addressed,
+        })
+    );
+}
+
+// what this catches: a wake that fires again for a message the session was already shown, so every
+// re-armed wake exits at once and the session loops. Once a hook delivers it, it is no longer owed.
+#[tokio::test]
+async fn a_delivered_addressed_message_is_no_longer_owed() {
+    let machine = Machine::boot().await;
+    machine.pin_identity("addressed-delivered-test").await;
+    let (alice, bob) = machine.pair_in("general").await;
+    let alice_short: String = alice.peer_id().to_string().chars().take(8).collect();
+    let consumer = "claude-hook:claude:alice-delivered";
+    assert_eq!(
+        alice
+            .addressed_undelivered(consumer, None)
+            .await
+            .expect("first look"),
+        None
+    );
+
+    bob.say(&format!("@{alice_short} read me once"))
+        .await
+        .expect("addressed");
+    assert!(alice
+        .addressed_undelivered(consumer, None)
+        .await
+        .expect("owed")
+        .is_some());
+
+    let turn = alice
+        .prepare_agent_delivery(consumer, 50, 10)
+        .await
+        .expect("a hook's turn");
+    let shown = turn.live_events().len();
+    turn.acknowledge(shown, false).await.expect("delivered");
+    assert_eq!(
+        alice
+            .addressed_undelivered(consumer, None)
+            .await
+            .expect("after delivery"),
+        None
     );
 }

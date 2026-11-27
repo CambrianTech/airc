@@ -74,7 +74,12 @@ pub enum ClaudeHookAction {
     Stop(#[command(flatten)] HookReadArgs),
     /// Wait for the next event addressed to this session, then exit: run as a background command,
     /// its exit wakes an idle session.
-    Wake,
+    Wake {
+        /// The session's client id, as the hook printed it; it binds the wake to the consumer the
+        /// hooks and the stop gate deliver to.
+        #[arg(long)]
+        client: Option<String>,
+    },
     /// Print unread AIRC context for this Claude Code session.
     Poll {
         #[command(flatten)]
@@ -118,7 +123,7 @@ impl ClaudeHookArgs {
             ClaudeHookAction::Stop(read) => {
                 agent_hook::run_stop(&CLAUDE, home, &read.options()).await
             }
-            ClaudeHookAction::Wake => agent_hook::run_wake(&CLAUDE, home).await,
+            ClaudeHookAction::Wake { client } => agent_hook::run_wake(&CLAUDE, home, client).await,
             ClaudeHookAction::Poll { read, wait_ms } => {
                 agent_hook::run_poll(&CLAUDE, home, &read.options(), wait_ms).await
             }

@@ -45,13 +45,13 @@ impl Wake {
     /// consumer the hooks and the stop gate deliver to, so the command binds it explicitly.
     pub(super) fn line(self, runtime: &HookRuntime, client: Option<&str>) -> Option<String> {
         let bind = client.map_or_else(String::new, |client| {
-            format!("AIRC_CLIENT_ID={} ", serde_json::json!(client))
+            format!(" --client {}", serde_json::json!(client))
         });
         match self {
             Self::Armed => None,
             Self::NotArmed => Some(format!(
                 "AIRC wake is not armed for this session, so a message addressed to you waits until \
-                 your next turn. Arm it: run `{bind}airc {} wake` as a background command. It exits \
+                 your next turn. Arm it: run `airc {} wake{bind}` as a background command. It exits \
                  on the next message addressed to you, which wakes you; arm it again after.",
                 runtime.verb
             )),
@@ -112,11 +112,16 @@ impl WakeEnd {
 }
 
 /// `airc <runtime>-hook wake`: wait for the first event addressed to this consumer, then exit.
+/// `client` is the session the hook named (`--client`), else this process's own identity.
 pub async fn run_wake(
     runtime: &HookRuntime,
     home: &Path,
+    named: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = current_client_id()?;
+    let client = match named {
+        Some(client) => Some(client),
+        None => current_client_id()?,
+    };
     let consumer = consumer_id(runtime, client.as_deref());
     // The order closes every gap (Codex on 4768de58): subscribed first, so nothing published from
     // here on is missed; armed (the lock) only once subscribed, so a stop hook that sees the wake
@@ -129,7 +134,7 @@ pub async fn run_wake(
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => WakeEnd::AlreadyArmed,
         Err(error) => return Err(error.into()),
         Ok(()) => match airc
-            .addressed_undelivered(&consumer, client.as_deref(), super::args::UNREAD_SCAN)
+            .addressed_undelivered(&consumer, client.as_deref())
             .await?
         {
             Some(already) => WakeEnd::Woke(already),
