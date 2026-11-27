@@ -289,7 +289,7 @@ impl Airc {
         consumer: &str,
         runtime_client: Option<&str>,
     ) -> Result<Option<AddressedWake>, AircError> {
-        let turn = self.prepare_agent_delivery_waiting(consumer, 1, 1).await?;
+        let turn = self.prepare_agent_delivery(consumer, 1, 1).await?;
         let me = self.addressee().await?;
         let own = airc_core::RuntimeSelf::new(self.client_id(), runtime_client);
         let found = turn.first_addressed(&me, &own).await?;
