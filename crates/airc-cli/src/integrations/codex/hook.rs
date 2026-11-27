@@ -7,4 +7,6 @@ pub const CODEX: HookRuntime = HookRuntime {
     verb: "codex-hook",
     name: "Codex",
     session_prefix: "codex:",
+    presence: "codex",
+    wakes: false,
 };

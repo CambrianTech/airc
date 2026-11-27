@@ -4,10 +4,13 @@ use clap::Args;
 
 use super::{DeliverySelection, HookOptions};
 
+/// How many unread events a hook reads by default; the wake's backlog check reads the same window.
+pub(super) const UNREAD_SCAN: usize = 50;
+
 #[derive(Debug, Args)]
 pub struct HookReadArgs {
     /// Maximum unread events to fetch from the transcript store.
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = UNREAD_SCAN)]
     pub count: usize,
     /// Maximum events to show in digest mode.
     #[arg(long, default_value_t = super::render::DIGEST_PAGE)]

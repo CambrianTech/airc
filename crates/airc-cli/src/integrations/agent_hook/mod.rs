@@ -13,6 +13,7 @@ mod render;
 pub mod settings;
 #[cfg(test)]
 mod tests;
+mod wake;
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -28,6 +29,7 @@ use crate::work_suggestions::{is_work_queue_event, render_claimable_work};
 
 pub use args::HookReadArgs;
 pub(crate) use render::{history_line, more_addressed_line, original_time};
+pub use wake::{run_stop, run_wake};
 
 /// What differs between runtimes. Everything else is this module's.
 pub struct HookRuntime {
@@ -37,6 +39,11 @@ pub struct HookRuntime {
     pub name: &'static str,
     /// Prefix that turns the hook's stdin `session_id` into a runtime client id.
     pub session_prefix: &'static str,
+    /// The runtime label its presence is published under (`claude`, `codex`).
+    pub presence: &'static str,
+    /// Whether the runtime needs a wake to hear an idle session: its hooks run only inside a
+    /// turn, and its background task wakes the session when it exits (Claude Code).
+    pub wakes: bool,
 }
 
 /// The hook events both runtimes deliver context on.
@@ -134,7 +141,7 @@ pub async fn run_hook(
     options: &HookOptions,
     event: HookEvent,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let hook_session = io::drain_stdin(runtime)?;
+    let hook_session = io::drain_stdin(runtime)?.session;
     let airc = crate::commands::attached_airc(home).await?;
     // An identity the runtime states outright wins; then the hook's own session, which
     // names this exact task; only then the ancestor-process guess. The guess ranked
@@ -165,6 +172,17 @@ pub async fn run_hook(
         resume_text,
     )
     .await?;
+    // At a prompt, a runtime that needs a wake is told when it has none (the stop gate asks too).
+    let unarmed = match (runtime.wakes, event) {
+        (true, HookEvent::UserPromptSubmit) => {
+            wake::Wake::of(home, &consumer)?.line(runtime, runtime_client.as_deref())
+        }
+        _ => None,
+    };
+    let context = match (context, unarmed) {
+        (Some(context), Some(line)) => Some(format!("{context}\n\n{line}")),
+        (context, line) => context.or(line),
+    };
     if let Some(context) = context {
         io::print_hook_payload(&context, event.name())?;
         std::io::stdout().flush()?;

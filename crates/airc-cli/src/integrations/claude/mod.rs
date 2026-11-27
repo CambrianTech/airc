@@ -1,7 +1,7 @@
 //! Claude Code integration boundary (card b00d2724).
 //!
-//! A Claude Code session hears AIRC through these hooks: unread peer traffic on
-//! every prompt and after every tool call, the same catch-up Codex has. No
+//! A Claude Code session hears AIRC through these hooks and its wake (docs/AGENT-DELIVERY.md): unread peer traffic on
+//! every prompt and after every tool call, presence, a Stop hook that hands over what is addressed before the session idles, and `wake`, whose exit wakes an idle session. No
 //! Monitor or other hand-held reader is ever asked for; `airc join` is a plain
 //! command that ensures the daemon and the room subscriptions. Only Claude's
 //! lines live here: its verb, its session prefix and its settings file. The
@@ -18,6 +18,8 @@ pub const CLAUDE: HookRuntime = HookRuntime {
     verb: "claude-hook",
     name: "Claude Code",
     session_prefix: "claude:",
+    presence: "claude",
+    wakes: true,
 };
 
 /// Claude's hooks in `settings.json`. PostToolUse takes a matcher; `*` is every tool.
@@ -32,6 +34,11 @@ const CLAUDE_HOOKS: ManagedHooks = ManagedHooks {
             event: "PostToolUse",
             args: "claude-hook post-tool-use",
             matcher: Some("*"),
+        },
+        ManagedHook {
+            event: "Stop",
+            args: "claude-hook stop",
+            matcher: None,
         },
     ],
     status_message: None,
@@ -62,6 +69,12 @@ pub enum ClaudeHookAction {
     UserPromptSubmit(#[command(flatten)] HookReadArgs),
     /// Emit Claude Code PostToolUse JSON with unread AIRC context.
     PostToolUse(#[command(flatten)] HookReadArgs),
+    /// Emit Claude Code Stop JSON: hold the stop while messages addressed to this session are
+    /// undelivered, and ask once for a wake when none is armed.
+    Stop(#[command(flatten)] HookReadArgs),
+    /// Wait for the next event addressed to this session, then exit: run as a background command,
+    /// its exit wakes an idle session.
+    Wake,
     /// Print unread AIRC context for this Claude Code session.
     Poll {
         #[command(flatten)]
@@ -79,7 +92,7 @@ impl ClaudeHookArgs {
                 let path = path.map_or_else(default_settings, Ok)?;
                 if settings::install(&path, &CLAUDE_HOOKS)? {
                     println!(
-                        "installed AIRC UserPromptSubmit and PostToolUse hooks in {}",
+                        "installed AIRC UserPromptSubmit, PostToolUse and Stop hooks in {}",
                         path.display()
                     );
                 }
@@ -89,7 +102,7 @@ impl ClaudeHookArgs {
                 let path = path.map_or_else(default_settings, Ok)?;
                 if settings::uninstall(&path, &CLAUDE_HOOKS)? {
                     println!(
-                        "removed AIRC UserPromptSubmit and PostToolUse hooks from {}",
+                        "removed AIRC UserPromptSubmit, PostToolUse and Stop hooks from {}",
                         path.display()
                     );
                 }
@@ -102,6 +115,10 @@ impl ClaudeHookArgs {
             ClaudeHookAction::PostToolUse(read) => {
                 agent_hook::run_hook(&CLAUDE, home, &read.options(), HookEvent::PostToolUse).await
             }
+            ClaudeHookAction::Stop(read) => {
+                agent_hook::run_stop(&CLAUDE, home, &read.options()).await
+            }
+            ClaudeHookAction::Wake => agent_hook::run_wake(&CLAUDE, home).await,
             ClaudeHookAction::Poll { read, wait_ms } => {
                 agent_hook::run_poll(&CLAUDE, home, &read.options(), wait_ms).await
             }

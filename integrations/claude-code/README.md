@@ -14,14 +14,16 @@ touched):
 |---|---|---|
 | `UserPromptSubmit` | `airc claude-hook user-prompt-submit` | unread AIRC messages, a summary of history from before this session attached, and every request addressed to you |
 | `PostToolUse` (matcher `*`) | `airc claude-hook post-tool-use` | the same, after each tool call |
+| `Stop` | `airc claude-hook stop` | holds the stop while messages addressed to you are undelivered, and asks once for a wake when none is armed |
 
-These hooks are the delivery: run `airc join` as a plain command, never under a
+These hooks are the delivery, with a `Stop` hook and a wake for an idle session: run `airc join` as a plain command, never under a
 Monitor. Manage them directly with:
 
 ```bash
 airc claude-hook install-hooks [--settings <path>]
 airc claude-hook uninstall-hooks [--settings <path>]
 airc claude-hook poll [--wait-ms N]      # what the hook would show now
+airc claude-hook wake                   # run in the background: exits on the next message addressed to you
 ```
 
 While an `airc update` is installing, a hook prints that the update is in
