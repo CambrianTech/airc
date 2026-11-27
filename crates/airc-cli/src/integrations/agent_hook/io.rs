@@ -63,9 +63,7 @@ use super::HookRuntime;
 /// `drain_stdin_timeout_proceeds_when_eof_never_arrives` in
 /// `tests/codex_hook_commands.rs` — see the regression test for the
 /// exact failure shape if a future refactor reverts the deadline.
-pub(super) fn drain_stdin(
-    runtime: &HookRuntime,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+pub(super) fn drain_stdin(runtime: &HookRuntime) -> Result<HookInput, Box<dyn std::error::Error>> {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -91,27 +89,60 @@ pub(super) fn drain_stdin(
                  proceeding with empty payload (see airc#1097)",
                 runtime.verb
             );
-            return Ok(None);
+            return Ok(HookInput::default());
         }
     };
 
     if raw.trim().is_empty() {
-        return Ok(None);
+        return Ok(HookInput::default());
     }
     // PostToolUse may include a large tool response. Validate the JSON while
     // skipping unknown fields instead of building a DOM for the entire payload.
     #[derive(Deserialize)]
-    struct HookInput {
+    struct RawInput {
         session_id: Option<String>,
+        #[serde(default)]
+        stop_hook_active: bool,
     }
     if !raw.trim_start().starts_with('{') {
         return Err(format!("{} hook stdin must be a JSON object", runtime.name).into());
     }
-    let input: HookInput = serde_json::from_str(&raw)?;
-    Ok(input
-        .session_id
-        .filter(|session| !session.trim().is_empty())
-        .map(|session| format!("{}{session}", runtime.session_prefix)))
+    let input: RawInput = serde_json::from_str(&raw)?;
+    Ok(HookInput {
+        session: input
+            .session_id
+            .filter(|session| !session.trim().is_empty())
+            .map(|session| format!("{}{session}", runtime.session_prefix)),
+        stop_hook_active: input.stop_hook_active,
+    })
+}
+
+/// What a runtime's hook stdin names: the session's client id, and (on a `Stop`) whether this
+/// stop already follows one the hook held.
+#[derive(Debug, Default)]
+pub(super) struct HookInput {
+    pub(super) session: Option<String>,
+    pub(super) stop_hook_active: bool,
+}
+
+/// A `Stop` hook's answer that keeps the agent working, with why (Claude Code's `decision: block`).
+pub(super) fn print_stop_block(reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(Serialize)]
+    struct StopBlock<'a> {
+        decision: &'static str,
+        reason: &'a str,
+    }
+    let mut output = std::io::stdout().lock();
+    serde_json::to_writer(
+        &mut output,
+        &StopBlock {
+            decision: "block",
+            reason,
+        },
+    )?;
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
 }
 
 /// The hook payload both Codex and Claude Code read for UserPromptSubmit and

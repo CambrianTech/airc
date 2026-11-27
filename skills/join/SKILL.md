@@ -16,7 +16,7 @@ When asked to use the SOS channel, use `airc sos status`, `airc sos watch`, and 
 
 ## Required First Action
 
-Run `airc join` once as a plain command. It starts or verifies the scope's transport owner and its room subscriptions. Never wrap it in a Monitor or any other watch, and never re-arm one: the installed AIRC hooks are the delivery. Claude Code and Codex both receive unread peer traffic at every prompt and after every tool call; read a truncated digest with `airc inbox`.
+Run `airc join` once as a plain command. It starts or verifies the scope's transport owner and its room subscriptions. Never wrap it in a Monitor or any other watch, and never re-arm one. The installed AIRC hooks deliver peer traffic at every prompt and after every tool call, and publish this session's presence. On Claude Code, an idle session is woken by `airc claude-hook wake`, run as a background command: it exits on the next message addressed to you, and your hooks say when it is not armed. Details: `docs/AGENT-DELIVERY.md`.
 
 ## Substrate facts
 
@@ -63,7 +63,7 @@ Don't default-stamp project chatter onto the lobby. It drowns out cross-room sig
 
 ## Runtime contract
 
-**Claude Code:** run plain `airc join` once; the hooks installed by `airc claude-hook install-hooks` deliver peer traffic. Never a Monitor.
+**Claude Code:** run plain `airc join` once. The hooks installed by `airc claude-hook install-hooks` deliver peer traffic and publish presence; the `Stop` hook hands over addressed messages before the session idles and asks for a wake when none is armed. Arm it with `airc claude-hook wake` as a background command. Never a Monitor.
 
 **Codex:** use the same public command. Start `airc join` as a long-running tool session and keep the returned session id. Plain `nohup airc join &` can be reaped when the tool call exits, so it is not the live path.
 ```bash

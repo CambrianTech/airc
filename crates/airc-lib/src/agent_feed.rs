@@ -215,3 +215,62 @@ impl Airc {
             .await?)
     }
 }
+
+/// Why waiting for the next event addressed to a reader ended. Every ending is a reason for the
+/// reader to read its delivery now; none is a timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressedWake {
+    /// An event addressed to the reader arrived from another runtime.
+    Addressed {
+        from: airc_core::PeerId,
+        event: EventId,
+    },
+    /// The live feed lagged: something may have been missed, so the delivery reads it.
+    Lagged,
+    /// The feed closed (the daemon went away).
+    FeedClosed,
+}
+
+/// A reader's live feed, narrowed to what is addressed to it. Subscribed when it is made, so an
+/// event published after [`Airc::addressed_feed`] returns is never missed.
+pub struct AddressedFeed {
+    feed: FilteredEventStream,
+    me: crate::Addressee,
+    own: airc_core::RuntimeSelf,
+}
+
+impl AddressedFeed {
+    /// The next event addressed to the reader that is not its own runtime's send. No deadline: it
+    /// ends on an event, a lag or the feed closing.
+    pub async fn next(&mut self) -> AddressedWake {
+        use futures::StreamExt;
+        while let Some(next) = self.feed.next().await {
+            match next {
+                Ok(event) if !self.own.is_self_event(&event) && self.me.is_addressed(&event) => {
+                    return AddressedWake::Addressed {
+                        from: event.peer_id,
+                        event: event.event_id,
+                    }
+                }
+                Ok(_) => {}
+                Err(_lag) => return AddressedWake::Lagged,
+            }
+        }
+        AddressedWake::FeedClosed
+    }
+}
+
+impl Airc {
+    /// This reader's feed of what is addressed to it ([`crate::Addressee::is_addressed`]), with
+    /// `runtime_client`'s own sends left out.
+    pub async fn addressed_feed(
+        &self,
+        runtime_client: Option<&str>,
+    ) -> Result<AddressedFeed, AircError> {
+        Ok(AddressedFeed {
+            feed: self.subscribe_agent_feed().await?,
+            me: self.addressee().await?,
+            own: airc_core::RuntimeSelf::new(self.client_id(), runtime_client),
+        })
+    }
+}
