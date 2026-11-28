@@ -57,12 +57,10 @@ pub fn default_home_dir_for(cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| cwd.join(".airc"))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{default_home_dir_for, explicit_home_override};
     use std::path::{Path, PathBuf};
-
 
     /// what this catches (seam #1 `--here`): the override precedence.
     /// `--home` wins; `--here` resolves to the cwd-LOCAL `.airc` (the
