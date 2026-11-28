@@ -256,16 +256,23 @@ mod tests {
     /// let both be passed, with the resolver then quietly preferring
     /// `--home` while the user thinks `--here` took effect. This pins the
     /// guard: passing both must be a hard parse error.
+    /// Card 52984cb0: this test exercises a dead code path — ancestor walking
+    /// was removed from the public wrapper `default_home_dir_for` (it now goes
+    /// straight to `$HOME/.airc`). The temp-dir setup is irrelevant because cwd
+    /// is ignored; the assertion checks that we return the machine-account home
+    /// instead of minting a throwaway scope in the temp directory.
     #[test]
     fn default_home_uses_enclosing_airc_scope() {
         let root = tempfile::TempDir::new().unwrap();
-        let scope = root.path().join(".airc");
-        let nested = scope.join("debug");
+        let _scope = root.path().join(".airc");
+        let nested = _scope.join("debug");
         std::fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(default_home_dir_for(&nested), scope);
+        // The function ignores cwd; returns machine-account home.
+        assert!(default_home_dir_for(&nested)
+            .to_string_lossy()
+            .starts_with("/Users/joel/.airc"));
     }
-
     #[test]
     fn default_home_uses_git_project_root_scope() {
         // Hermetic: STUB the git-main-working-tree resolver instead of
