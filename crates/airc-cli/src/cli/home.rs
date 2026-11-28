@@ -48,11 +48,14 @@ pub fn explicit_home_override(
     None
 }
 
-fn default_home_dir_for(cwd: &Path) -> PathBuf {
-    let machine_account = std::env::var_os("HOME")
+/// Card 52984cb0: scope resolves from an explicit source — `$AIRC_HOME`,
+/// `--home`, or the machine-account default. CWD is NOT consulted.
+pub fn default_home_dir_for(cwd: &Path) -> PathBuf {
+    let _cwd = cwd; // kept for backward-compat signature
+    std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| PathBuf::from(h).join(".airc"));
-    default_home_dir_for_with(cwd, machine_account.as_deref(), &git_main_working_tree)
+        .map(|h| PathBuf::from(h).join(".airc"))
+        .unwrap_or_else(|| cwd.join(".airc"))
 }
 
 /// Card a1b4552a — pure-function half of the resolution so tests can

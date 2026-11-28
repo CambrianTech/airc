@@ -221,19 +221,8 @@ pub(crate) fn machine_account_home_for(
         return scope_home.to_path_buf();
     }
 
-    if let Some(home) = home {
-        let normalized_home = normalized_path(home);
-        if normalized_scope.starts_with(&normalized_home) {
-            return normalized_home.join(".airc");
-        }
-    }
-    #[cfg(windows)]
-    if let Some(userprofile) = profile {
-        let normalized_userprofile = normalized_path(userprofile);
-        if normalized_scope.starts_with(&normalized_userprofile) {
-            return normalized_userprofile.join(".airc");
-        }
-    }
+    // Card 52984cb0: removed HOME-based wire promotion. Each scope keeps
+    // its own wire root; mesh sharing happens via daemon cross-scope routing.
     scope_home.to_path_buf()
 }
 
