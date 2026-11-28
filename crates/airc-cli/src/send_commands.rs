@@ -356,7 +356,8 @@ pub async fn run_msg(
         // Publishing has already succeeded locally. A name lookup cannot undo it.
         let recipient = match airc.peer_alias(peer).await {
             Ok(Some(name)) => format!("{name} ({peer})"),
-            _ => peer.to_string(),
+            Ok(None) => peer.to_string(),
+            Err(error) => format!("{peer} (name lookup failed: {error})"),
         };
         println!(
             "Queued for {recipient} in {channel_name}. Event {}. Recipient delivery is unconfirmed.",
