@@ -113,17 +113,22 @@ fn send_receipt_distinguishes_zero_enrolled_peers_without_lying_about_delivery()
     // cross-process broadcast fix). The receipt must be HONEST: it must
     // not imply confirmed remote delivery, and it must not claim
     // non-delivery either (local tailers still receive it). This mirrors
-    // the canonical `format_send_receipt` invariants unit-tested in
-    // `commands.rs` — the verb is "queued to" (not the old delivery-
-    // implying "sent to"), the count is framed as "enrolled" (not
-    // "paired"), and the local-tailer fan-out is surfaced.
+    // the `format_send_receipt` invariants unit-tested in
+    // `send_commands.rs`: the verb is "queued" (not the old delivery-
+    // implying "sent to"), the address book is framed as "enrolled" (not
+    // "paired"), no reader is claimed, and the local-tailer fan-out is
+    // surfaced.
     assert!(
-        output.contains("queued to"),
-        "receipt must use the honest verb 'queued to' — not the old delivery-implying 'sent to', got: {output}"
+        output.contains("queued"),
+        "receipt must use the honest verb 'queued' — not the old delivery-implying 'sent to', got: {output}"
     );
     assert!(
-        output.contains("0 enrolled remote peer(s)"),
+        output.contains("0 peer(s) are enrolled"),
         "receipt must surface zero enrolled remote peers without claiming non-delivery, got: {output}"
+    );
+    assert!(
+        output.contains("0 readers reachable") || output.contains("reach UNKNOWN"),
+        "with no remote peer, no reader may be claimed, got: {output}"
     );
     assert!(
         !output.contains("sent to"),

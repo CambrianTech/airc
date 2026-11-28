@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use airc_lib::{
     coordinator_snapshot_store, machine_account_home, resolve_mesh_identity, Airc,
-    CoordinatorConfig, PresenceBeacon, DEFAULT_PEER_FRESHNESS_TTL_MS,
+    CoordinatorConfig, CoordinatorSnapshot, PresenceBeacon, DEFAULT_PEER_FRESHNESS_TTL_MS,
 };
 
 pub fn run_lan_ip() -> Result<(), Box<dyn Error>> {
@@ -196,9 +196,7 @@ pub(crate) fn convergence_status(
     my_room: &str,
     other_live_peer_channels: &[Vec<String>],
 ) -> ConvergenceStatus {
-    let reachable = other_live_peer_channels
-        .iter()
-        .any(|channels| channels.iter().any(|channel| channel == my_room));
+    let reachable = room_reader_count(my_room, other_live_peer_channels) > 0;
     let other_rooms: BTreeSet<String> =
         other_live_peer_channels.iter().flatten().cloned().collect();
     ConvergenceStatus {
@@ -206,6 +204,58 @@ pub(crate) fn convergence_status(
         other_peer_count: other_live_peer_channels.len(),
         other_rooms: other_rooms.into_iter().collect(),
     }
+}
+
+/// How many OTHER live peers' presence lists `room`. The one owner of "who
+/// reads this room": `airc network`'s convergence verdict and the send
+/// receipt both count with it.
+pub(crate) fn room_reader_count(room: &str, other_live_peer_channels: &[Vec<String>]) -> usize {
+    other_live_peer_channels
+        .iter()
+        .filter(|channels| channels.iter().any(|channel| channel == room))
+        .count()
+}
+
+/// The machine-account beacon snapshot, judged by the registry freshness
+/// window. ONE machine-account store (§3.3), the same events.sqlite the
+/// daemon's coordinator writes beacons into: it shows what THIS daemon knows
+/// about the mesh, with no gh round-trip.
+///
+/// Liveness lens: the 10-min registry FRESHNESS window, NOT the 60s
+/// coordinator heartbeat TTL. Cross-machine beacons publish on a ~120s
+/// cadence, so a 60s window flaps a healthy remote peer stale/live every
+/// cycle and misreports the grid.
+pub(crate) async fn mesh_snapshot(
+    home: &Path,
+    now: u64,
+) -> Result<(airc_lib::MeshIdentity, CoordinatorSnapshot), Box<dyn Error>> {
+    let db_path = machine_account_home(home).join("events.sqlite");
+    let store = Arc::new(airc_store::SqliteEventStore::open_path(&db_path).await?);
+    let identity = resolve_mesh_identity(store.as_ref())
+        .await?
+        .as_mesh_identity();
+    let config = CoordinatorConfig {
+        heartbeat_ttl_ms: DEFAULT_PEER_FRESHNESS_TTL_MS,
+        ..CoordinatorConfig::default()
+    };
+    let snapshot = coordinator_snapshot_store(store.as_ref(), &identity, &config, now).await?;
+    Ok((identity, snapshot))
+}
+
+/// Readers of `room` among the live peers other than `me`.
+pub(crate) async fn live_room_readers(
+    home: &Path,
+    me: airc_lib::PeerId,
+    room: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let (_, snapshot) = mesh_snapshot(home, now_ms()).await?;
+    let others: Vec<Vec<String>> = snapshot
+        .live
+        .iter()
+        .filter(|beacon| beacon.peer_id != me)
+        .map(beacon_channels)
+        .collect();
+    Ok(room_reader_count(room, &others))
 }
 
 /// Best-effort OS/role hint from a beacon's `scope_home` path shape.
@@ -295,27 +345,8 @@ pub async fn run_network(home: &Path, show_all_stale: bool) -> Result<(), Box<dy
     // (#1217 cross-review, M5.)
     let current = airc.peek_default_room().await?;
 
-    // ONE machine-account store (§3.3) — the same events.sqlite the
-    // daemon's coordinator writes beacons into. Reading it shows what
-    // THIS daemon knows about the mesh, with no gh round-trip.
-    let db_path = machine_account_home(home).join("events.sqlite");
-    let store = Arc::new(airc_store::SqliteEventStore::open_path(&db_path).await?);
-    let identity = resolve_mesh_identity(store.as_ref())
-        .await?
-        .as_mesh_identity();
-
     let now = now_ms();
-    // Liveness lens: the 10-min registry FRESHNESS window, NOT the 60s
-    // coordinator heartbeat TTL. Cross-machine beacons publish on a
-    // ~120s cadence, so a 60s window flaps a healthy remote peer
-    // stale/live every cycle and misreports the grid. The registry's own
-    // freshness TTL is the right "is this peer alive on the grid" lens —
-    // the same window its stale-beacon prune uses.
-    let config = CoordinatorConfig {
-        heartbeat_ttl_ms: DEFAULT_PEER_FRESHNESS_TTL_MS,
-        ..CoordinatorConfig::default()
-    };
-    let snapshot = coordinator_snapshot_store(store.as_ref(), &identity, &config, now).await?;
+    let (identity, snapshot) = mesh_snapshot(home, now).await?;
 
     // Endpoints live on the trust store, keyed by peer_id; index them so
     // each live peer line can show what route discovery would dial.

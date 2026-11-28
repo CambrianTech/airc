@@ -117,6 +117,25 @@ pub async fn run_publish(
         // without re-deriving the rule. TRUE in both failing shapes:
         //   - daemon answered, peers enrolled, none connected → fan-out reached nobody
         //   - daemon did not answer → mid-swap or down; reach cannot be claimed
+        // Who can read it on this room, typed (`crate::send_commands::RoomReach`):
+        // the same observation `airc msg` prints, so a shell consumer branches on
+        // `room_reach.state` instead of reading a connection count as an audience.
+        let readers = crate::network_commands::live_room_readers(
+            home,
+            airc.peer_id(),
+            receipt.channel_name.as_str(),
+        )
+        .await
+        .ok();
+        let reach = crate::send_commands::room_reach(
+            daemon_answered.then_some(connected_lan_peers),
+            readers,
+        );
+        obj.insert(
+            "room_reach".into(),
+            serde_json::to_value(reach)
+                .map_err(|error| format!("serialize room reach: {error}"))?,
+        );
         obj.insert(
             "reached_no_remote_peer".into(),
             (!daemon_answered || (enrolled_peers > 0 && connected_lan_peers == 0)).into(),

@@ -1,8 +1,8 @@
 //! `airc send` / `airc msg`: publish one text message to a subscribed room
 //! and print the sender's receipt, with the @mention audience check.
 //!
-//! Moved out of `commands.rs` unchanged (a pure move: same code, same
-//! tests). The receipt's reach rule changes in a follow-up, in this file.
+//! The receipt names the room's reachable readers (see [`RoomReach`]),
+//! never a bare connection count.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -51,60 +51,74 @@ fn format_send_receipt(
     channel_name: &str,
     channel_id: &str,
     enrolled_peers: usize,
-    connected_lan_peers: usize,
+    reach: RoomReach,
 ) -> String {
-    if enrolled_peers == 0 {
-        format!(
-            "queued to {channel_name} ({channel_id}) — 0 enrolled remote peer(s); \
-             any scope tailing this channel on this machine will receive it."
-        )
-    } else if connected_lan_peers == 0 {
-        // LOUD: enrolled peers exist but the daemon holds no live LAN
-        // connection, so room broadcast forwarded to nobody. This is the
-        // signal whose absence let a broken fan-out read as success.
-        format!(
-            "queued to {channel_name} ({channel_id}) — ⚠ reached 0 of {enrolled_peers} \
-             enrolled remote peer(s): NONE are currently connected, so no remote machine \
-             received this (run `airc doctor --health` to see why the routes are down). \
-             Any scope tailing this channel on this machine still has it."
-        )
-    } else {
-        // Report REACH, not the address book. `enrolled_peers` is every peer this
-        // scope has ever enrolled — across every room, for all time — so printing
-        // it beside a live count invites the reader to divide, and that ratio is
-        // meaningless: the enrolled set is not this room's audience, and
-        // `connected_lan_peers` counts LAN links only.
-        //
-        // Live 2026-08-07 that arithmetic manufactured a false alarm. "addressed 52
-        // enrolled remote peer(s), 1 currently connected" reads as 2% reach; the
-        // ack ledger for the same period showed 767 of 771 delivered — 99.5%. A
-        // card was filed on the strength of the receipt (#340) and the receipt was
-        // the only thing wrong. An instrument that reads as a catastrophe during
-        // healthy operation is worse than no instrument: it burns the operator's
-        // trust in every future alarm.
-        //
-        // So: state the live count as a plain fact with no denominator to divide
-        // by, and point at `airc doctor --health`, which reads the ACK ledger
-        // (#280 — delivery is a returned ack, never a connection's existence).
-        let peers = if connected_lan_peers == 1 {
-            "1 peer"
-        } else {
-            "peers"
-        };
-        let count = if connected_lan_peers == 1 {
-            String::new()
-        } else {
-            format!("{connected_lan_peers} ")
-        };
-        format!(
-            "queued to {channel_name} ({channel_id}) — live to {count}{peers} now; \
-             delivery is asynchronous and confirmed by ACK, not by this line \
-             (run `airc doctor --health` for the delivery ledger). \
-             {enrolled_peers} peer(s) are enrolled in this scope's address book, \
-             which is not this room's audience — do not read it as a reach ratio. \
-             Any scope tailing this channel on this machine also receives it."
-        )
+    let tail = format!(
+        "Delivery is asynchronous and confirmed by ACK, not by this line \
+         (`airc doctor --health` reads the delivery ledger). {enrolled_peers} peer(s) are \
+         enrolled in this scope's address book, which is not this room's audience. Any \
+         scope tailing this channel on this machine also receives it."
+    );
+    match reach {
+        RoomReach::Unknown => format!(
+            "queued to {channel_name} ({channel_id}); reach UNKNOWN: the daemon did not \
+             answer, so no reader can be claimed. {tail}"
+        ),
+        RoomReach::NoLiveRoute => format!(
+            "\u{26a0} 0 readers reachable on #{channel_name}; queued ({channel_id}). The daemon \
+             holds NO live connection, so no remote machine received this (`airc doctor \
+             --health` says why the routes are down). {tail}"
+        ),
+        RoomReach::NoReader { connected } => format!(
+            "\u{26a0} 0 readers reachable on #{channel_name}; queued ({channel_id}). {connected} \
+             live connection(s), but no live peer's presence lists #{channel_name} \
+             (`airc network` shows where they are). {tail}"
+        ),
+        RoomReach::Readers { readers, connected } => format!(
+            "queued to {channel_name} ({channel_id}); {readers} live peer(s) present on \
+             #{channel_name}, {connected} live connection(s). {tail}"
+        ),
     }
+}
+
+/// Who can read a send on its room right now, from two observations: the
+/// daemon's live connections (`None`: the daemon did not answer) and how many
+/// OTHER live peers' presence lists the room (`None`: presence unreadable).
+/// Serialized into `airc publish`'s JSON receipt as `room_reach`.
+///
+/// 2026-11-12 to 11-14 the M5 printed "live to 2 peers" for every send to
+/// #continuum-dev for 44 hours while neither connected peer read that room
+/// and Codex on BigMama received nothing. A connection count says nothing
+/// about a room's readers; this type keeps the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum RoomReach {
+    Unknown,
+    NoLiveRoute,
+    NoReader { connected: usize },
+    Readers { readers: usize, connected: usize },
+}
+
+pub(crate) fn room_reach(connected: Option<usize>, readers: Option<usize>) -> RoomReach {
+    match (connected, readers) {
+        (None, _) | (_, None) => RoomReach::Unknown,
+        (Some(0), Some(_)) => RoomReach::NoLiveRoute,
+        (Some(connected), Some(0)) => RoomReach::NoReader { connected },
+        (Some(connected), Some(readers)) => RoomReach::Readers { readers, connected },
+    }
+}
+
+/// Observe [`RoomReach`] for a send just published on `channel_name`.
+pub(crate) async fn observe_room_reach(home: &Path, airc: &Airc, channel_name: &str) -> RoomReach {
+    let connected = DaemonClient::new(crate::cli::default_socket_path_in(home))
+        .status()
+        .await
+        .ok()
+        .map(|status| status.connected_lan_peers);
+    let readers = crate::network_commands::live_room_readers(home, airc.peer_id(), channel_name)
+        .await
+        .ok();
+    room_reach(connected, readers)
 }
 
 /// Presence horizon for the @mention audience check. Generous on
@@ -301,19 +315,10 @@ pub async fn run_send(
     // delivery count — see `format_send_receipt` for why the receipt
     // says "queued/addressed" rather than "sent to N peers".
     let peer_count = airc.peers().await?.len();
-    // Ask the daemon how many of those peers it currently holds a LIVE
-    // LAN connection to — the set room broadcast can actually reach.
-    // A cheap Status round-trip; on any failure we fall back to 0,
-    // which the receipt frames as "none currently connected" rather
-    // than inventing reach the daemon can't confirm.
-    let connected_lan_peers = DaemonClient::new(crate::cli::default_socket_path_in(home))
-        .status()
-        .await
-        .map(|status| status.connected_lan_peers)
-        .unwrap_or(0);
+    let reach = observe_room_reach(home, &airc, &channel_name).await;
     println!(
         "{}",
-        format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
+        format_send_receipt(&channel_name, &channel_id, peer_count, reach)
     );
     if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
         println!("{warning}");
@@ -357,14 +362,10 @@ pub async fn run_msg(
     // delivery receipt; the daemon's live-connection count (Status) is
     // the set room broadcast can actually reach.
     let peer_count = airc.peers().await?.len();
-    let connected_lan_peers = DaemonClient::new(crate::cli::default_socket_path_in(home))
-        .status()
-        .await
-        .map(|status| status.connected_lan_peers)
-        .unwrap_or(0);
+    let reach = observe_room_reach(home, &airc, &channel_name).await;
     println!(
         "{}",
-        format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
+        format_send_receipt(&channel_name, &channel_id, peer_count, reach)
     );
     if let Some(peer) = to {
         println!("addressed to peer {peer}; recipient presence and agent-visible delivery are unconfirmed until the peer replies");
@@ -530,164 +531,81 @@ mod tests {
     }
 
     /// what this catches: the send receipt must NOT report the enrolled
-    /// peer count as confirmed delivery. The old line was
-    /// "sent to X — N paired peer(s) + any local scope tailing …",
-    /// which made a send look successful even when zero peers actually
-    /// received anything (the false "it works" bug). The receipt is
-    /// honest: the verb is "queued"/"addressed" (not "sent to N peers"),
-    /// it never claims "paired peer(s)" delivered, and it tells the
-    /// operator delivery is asynchronous + how to confirm it.
+    /// peer count as confirmed delivery, nor lead with "sent to". It states
+    /// that delivery is asynchronous and how to confirm it, and it keeps the
+    /// address book out of any reach ratio (#351: "52 enrolled, 1 connected"
+    /// read as 2% while the ack ledger said 99.5%).
     #[test]
     fn send_receipt_does_not_imply_confirmed_delivery() {
-        // 41 enrolled, all currently connected → the healthy branch.
-        let line = format_send_receipt("general", "cb2e21a1", 41, 41);
-
-        // The exact misleading phrasing is gone.
-        assert!(
-            !line.contains("41 paired peer(s)"),
-            "must not report enrolled count as delivery: {line}"
+        let line = format_send_receipt(
+            "general",
+            "cb2e21a1",
+            41,
+            RoomReach::Readers {
+                readers: 3,
+                connected: 2,
+            },
         );
-        assert!(
-            !line.contains("paired peer"),
-            "the enrolled-peer count must not masquerade as delivery: {line}"
-        );
-        // It must not lead with the delivery-implying verb "sent to".
-        assert!(
-            !line.starts_with("sent to"),
-            "verb must not imply confirmed delivery: {line}"
-        );
-        // It IS honest about what happened and what is unconfirmed.
-        assert!(line.contains("queued to general"), "honest verb: {line}");
-        assert!(
-            line.contains("enrolled"),
-            "the address-book count is still disclosed, just not as reach: {line}"
-        );
-        assert!(
-            line.contains("asynchronous"),
-            "must state delivery is unconfirmed: {line}"
-        );
-        assert!(
-            line.contains("airc doctor --health"),
-            "must tell operator how to confirm delivery: {line}"
-        );
-    }
-
-    /// what this catches (#351): the receipt inviting the reader to compute a
-    /// REACH RATIO out of two incommensurable numbers.
-    ///
-    /// It used to print "addressed 52 enrolled remote peer(s), 1 currently
-    /// connected". Enrolled is every peer this scope ever met, across every room,
-    /// for all time — not this room's audience — and the live count is LAN links
-    /// only. Read as a fraction it says 2%. The ack ledger for the same period
-    /// said 767 of 771 delivered: 99.5%. A card (#340) was filed on the strength
-    /// of that line, and the line was the only thing wrong.
-    ///
-    /// An instrument that reads as catastrophe during healthy operation is worse
-    /// than no instrument — it spends the trust that a REAL alarm will need.
-    #[test]
-    fn the_receipt_never_reads_as_a_reach_ratio() {
-        // The shape that caused the false alarm: a big address book, one live link.
-        let line = format_send_receipt("cambriantech", "cb2e21a1", 52, 1);
-
-        // The adjacency itself was the bug — "N enrolled …, M currently connected"
-        // sitting together is what the eye divides. Neither the old phrasing nor
-        // the old ordering may come back.
-        assert!(
-            !line.contains("currently connected"),
-            "a live-link count must not sit where it reads as the numerator: {line}"
-        );
-        assert!(
-            !line.contains("addressed 52"),
-            "the address book is not an audience and must not be 'addressed': {line}"
-        );
-        // It must say so outright, because a reader who has been burned once will
-        // keep dividing unless told the denominator is not a denominator.
-        assert!(
-            line.contains("not this room's audience"),
-            "must disclaim the address book explicitly: {line}"
-        );
-        // And it must point at the ACK ledger, which is what delivery actually
-        // means (#280: delivery is a returned ack, never a connection's existence).
-        assert!(
-            line.contains("ACK") || line.contains("ack"),
-            "delivery truth is the ack ledger, not this line: {line}"
-        );
-    }
-
-    /// what this catches: the zero-enrolled-peer case stays honest —
-    /// no false "delivered" claim, but it correctly preserves the
-    /// load-bearing truth that same-machine tailers still receive the
-    /// frame (the lone-node / two-scopes-one-home topology). Count is
-    /// reported as enrolled, never as a delivery confirmation.
-    #[test]
-    fn send_receipt_zero_peers_is_honest_about_local_tailers() {
-        let line = format_send_receipt("general", "cb2e21a1", 0, 0);
         assert!(!line.starts_with("sent to"), "no delivery verb: {line}");
         assert!(
             !line.contains("paired peer"),
             "no paired-peer claim: {line}"
         );
         assert!(line.contains("queued to general"), "honest verb: {line}");
-        assert!(
-            line.contains("0 enrolled remote peer(s)"),
-            "honest about zero enrolled peers: {line}"
-        );
-        assert!(
-            line.contains("tailing this channel on this machine"),
-            "must preserve the same-machine-delivery truth: {line}"
-        );
-    }
-
-    /// what this catches (issue #1243 — the legibility trap): enrolled
-    /// peers exist but the daemon holds ZERO live LAN connections, so
-    /// room broadcast forwarded to nobody. The receipt must say so
-    /// LOUDLY (not report the enrolled "address book" count as if it
-    /// were reach) — the silent-success of this exact case let a fully
-    /// broken fan-out masquerade as a healthy channel for an hour.
-    #[test]
-    fn send_receipt_warns_loudly_when_no_peer_is_connected() {
-        let line = format_send_receipt("general", "cb2e21a1", 42, 0);
-        assert!(line.contains("queued to general"), "honest verb: {line}");
-        // It must NOT frame 42 enrolled as if 42 received it.
-        assert!(
-            line.contains("reached 0 of 42"),
-            "must surface that 0 of 42 enrolled peers were reached: {line}"
-        );
-        assert!(
-            line.contains("NONE are currently connected"),
-            "must name the broken-route cause, not imply delivery: {line}"
-        );
+        assert!(line.contains("asynchronous"), "unconfirmed: {line}");
+        assert!(line.contains("ACK"), "delivery is the ack ledger: {line}");
         assert!(
             line.contains("airc doctor --health"),
-            "must point the operator at the route diagnostic: {line}"
+            "how to confirm: {line}"
         );
-        // The same-machine truth is preserved even when remotes are dark.
+        assert!(
+            line.contains("not this room's audience"),
+            "the address book is disclaimed: {line}"
+        );
         assert!(
             line.contains("tailing this channel on this machine"),
             "local tailers still receive it: {line}"
         );
     }
 
-    /// what this catches: the healthy branch reports BOTH counts —
-    /// enrolled (address book) and the live-connected subset — without
-    /// claiming confirmed delivery. Distinguishes "addressed N, M
-    /// connected" from the loud zero-connected case above.
+    /// what this catches: THE 44-HOUR LIE. The M5 printed "live to 2 peers"
+    /// for every send to #continuum-dev while neither connected peer read the
+    /// room and Codex received nothing. Live connections with no reader on
+    /// the room must say "0 readers reachable", never a live count.
     #[test]
-    fn send_receipt_reports_connected_subset_when_routes_are_up() {
-        let line = format_send_receipt("general", "cb2e21a1", 42, 3);
-        // Both facts are still disclosed — the fix was never about hiding a
-        // number, it was about not pairing them as numerator and denominator.
-        assert!(
-            line.contains("3 peers"),
-            "the live-link count is still reported: {line}"
+    fn connections_without_a_reader_say_zero_readers() {
+        let line = format_send_receipt(
+            "continuum-dev",
+            "0faa2dae",
+            130,
+            room_reach(Some(2), Some(0)),
         );
         assert!(
-            line.contains("42 peer(s) are enrolled"),
-            "the address-book size is still reported, as its own fact: {line}"
+            line.contains("0 readers reachable on #continuum-dev; queued"),
+            "{line}"
         );
-        assert!(
-            line.contains("asynchronous"),
-            "still does not claim confirmed delivery: {line}"
+        assert!(!line.contains("live to"), "{line}");
+        let line = format_send_receipt("general", "cb2e21a1", 42, room_reach(Some(0), Some(3)));
+        assert!(line.contains("0 readers reachable on #general"), "{line}");
+        assert!(line.contains("NO live connection"), "{line}");
+    }
+
+    /// what this catches: an unanswered daemon or unreadable presence read as
+    /// zero (a guess wearing a number) or as reach. Either missing observation
+    /// is UNKNOWN, and the JSON form carries the typed state.
+    #[test]
+    fn a_missing_observation_is_unknown_reach_and_serializes_typed() {
+        assert_eq!(room_reach(None, Some(3)), RoomReach::Unknown);
+        assert_eq!(room_reach(Some(2), None), RoomReach::Unknown);
+        let line = format_send_receipt("general", "cb2e21a1", 42, RoomReach::Unknown);
+        assert!(line.contains("reach UNKNOWN"), "{line}");
+        assert_eq!(
+            serde_json::to_value(room_reach(Some(2), Some(0))).unwrap(),
+            serde_json::json!({"state": "no_reader", "connected": 2})
+        );
+        assert_eq!(
+            serde_json::to_value(room_reach(Some(2), Some(1))).unwrap(),
+            serde_json::json!({"state": "readers", "readers": 1, "connected": 2})
         );
     }
 }
