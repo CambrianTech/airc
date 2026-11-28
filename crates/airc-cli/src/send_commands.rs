@@ -352,6 +352,19 @@ pub async fn run_msg(
         .await?;
     let (channel_name, channel) = (receipt.channel_name, receipt.channel_id);
     let channel_id = channel.to_string();
+    if let Some(peer) = to {
+        // Publishing has already succeeded locally. A name lookup cannot undo it.
+        let recipient = match airc.peer_alias(peer).await {
+            Ok(Some(name)) => format!("{name} ({peer})"),
+            Ok(None) => peer.to_string(),
+            Err(error) => format!("{peer} (name lookup failed: {error})"),
+        };
+        println!(
+            "Queued for {recipient} in {channel_name}. Event {}. Recipient delivery is unconfirmed.",
+            receipt.event_id
+        );
+        return Ok(());
+    }
     // Same enrolled-vs-delivered honesty fix as run_send, for the
     // daemon-attached send path. `peers()` is the address book, not a
     // delivery receipt; the daemon's live-connection count (Status) is
@@ -366,9 +379,6 @@ pub async fn run_msg(
         "{}",
         format_send_receipt(&channel_name, &channel_id, peer_count, connected_lan_peers)
     );
-    if let Some(peer) = to {
-        println!("addressed to peer {peer}; recipient presence and agent-visible delivery are unconfirmed until the peer replies");
-    }
     if let Some(warning) = mention_audience_warning(&airc, text, channel, &channel_name).await {
         println!("{warning}");
     }
