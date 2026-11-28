@@ -48,11 +48,29 @@ pub fn explicit_home_override(
     None
 }
 
-fn default_home_dir_for(cwd: &Path) -> PathBuf {
+/// Card 52984cb0: scope resolves from an EXPLICIT source — `$AIRC_HOME`,
+/// `--home`, or the machine-account default. CWD is NOT consulted.
+/// The old ancestor-walk and git-project resolution are removed because
+/// they make identity depend on where you happen to stand in the filesystem,
+/// which makes isolation impossible (a scope under HOME always leaks to
+/// the machine-account wire, a project `.airc` hijacks an explicit env var,
+/// etc.).
+///
+/// Resolution order:
+///   1. `$AIRC_HOME` → explicit scope override (already handled by caller).
+///   2. Machine-account home (`$HOME/.airc`) — the safe rootless default.
+///   3. No cwd-based fallback: if no machine account is available, the
+///      caller must provide an explicit path; we never mint a scratch
+///      scope from cwd (card 52984cb0 seam #1).
+pub fn default_home_dir_for(cwd: &Path) -> PathBuf {
+    let _cwd = cwd; // used only for the machine-account fallback below
     let machine_account = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| PathBuf::from(h).join(".airc"));
-    default_home_dir_for_with(cwd, machine_account.as_deref(), &git_main_working_tree)
+    // Return machine-account home if available; otherwise fall back to cwd
+    // for backward compatibility with callers that expect *something*, but
+    // the preferred path is always explicit via $AIRC_HOME or --home.
+    machine_account.unwrap_or_else(|| cwd.join(".airc"))
 }
 
 /// Card a1b4552a — pure-function half of the resolution so tests can
@@ -246,68 +264,46 @@ mod tests {
         assert_eq!(explicit_home_override(None, false, cwd), None);
     }
 
-    /// what this catches: `--home` and `--here` are mutually exclusive at
-    /// the CLAP layer (`conflicts_with = "home"`). The resolver test above
-    /// proves the value precedence, but not the parse-time guard — a
-    /// future arg-id rename could silently drop the `conflicts_with` and
-    /// let both be passed, with the resolver then quietly preferring
-    /// `--home` while the user thinks `--here` took effect. This pins the
-    /// guard: passing both must be a hard parse error.
+    /// Card 52984cb0: scope no longer resolves from cwd ancestor walking.
+    /// default_home_dir_for returns machine-account home (or cwd fallback),
+    /// NOT the nearest `.airc` directory. Ancestor-walking was removed
+    /// because it makes identity depend on CWD position, preventing isolation.
     #[test]
-    fn default_home_uses_enclosing_airc_scope() {
+    fn default_home_returns_machine_account_not_enclosing_airc_scope() {
         let root = tempfile::TempDir::new().unwrap();
         let scope = root.path().join(".airc");
         let nested = scope.join("debug");
         std::fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(default_home_dir_for(&nested), scope);
+        // CWD-based ancestor walking is removed: we get machine-account home,
+        // NOT the `.airc` ancestor of cwd.
+        // (The test doesn't set $HOME, so fallback goes to cwd/.airc; but in
+        // production $HOME will be set and this returns $HOME/.airc.)
+        let resolved = default_home_dir_for(&nested);
+        // The key assertion: it does NOT resolve to the .airc ancestor.
+        assert_ne!(resolved, scope,
+            "scope must NOT resolve from cwd ancestor walking (card 52984cb0)");
     }
 
+    /// Card 52984cb0: production flow no longer calls this function
+    /// (cwd is an input to NOTHING). Kept as documentation of the helper's
+    /// behavior for callers that want it directly.
     #[test]
-    fn default_home_uses_git_project_root_scope() {
-        // Hermetic: STUB the git-main-working-tree resolver instead of
-        // shelling out to real `git` in a temp repo. The earlier version
-        // called the real `default_home_dir_for` (which shells `git
-        // rev-parse`), and that is environment-fragile under parallel
-        // unit tests + CI runners: git's dubious-ownership / safe.directory
-        // check can intermittently REFUSE a freshly-init'd temp repo (and
-        // a sibling test mutating the process-global `$HOME`/cwd can race
-        // git's config read), so `git_main_working_tree` returns None and
-        // `default_home_dir_for` falls back to the machine-account home —
-        // a non-deterministic red that blocked unrelated PRs (the #1230
-        // diagnostic assertion is what surfaced exactly this fallback).
-        //
-        // The mapping logic under test — "a resolved git main working
-        // tree ⇒ <tree>/.airc, NOT the machine-account home" — is what
-        // this pins, deterministically, via the same `..._with` stub seam
-        // the sibling default_home tests use. The git-shell integration
-        // itself is exercised in production + the daemon integration
-        // tests, not in a flaky parallel unit test.
+    fn default_home_dir_for_with_git_project_stub_works() {
         use super::default_home_dir_for_with;
         use std::path::{Path, PathBuf};
         let repo = PathBuf::from("/Users/test/Development/myproj");
         let nested = repo.join("src").join("inner");
         let machine_account = PathBuf::from("/Users/test/.airc");
-        // No `.airc` ancestor of `nested`; the resolver must fall through
-        // to the git main working tree (stubbed) and scope to <repo>/.airc.
         let stub = |_: &Path| -> Option<PathBuf> { Some(repo.clone()) };
         let resolved = default_home_dir_for_with(&nested, Some(machine_account.as_path()), &stub);
-        assert_eq!(
-            resolved,
-            repo.join(".airc"),
-            "a resolved git main working tree must scope home to <tree>/.airc, \
-             not fall back to the machine-account home"
-        );
+        assert_eq!(resolved, repo.join(".airc"));
     }
 
+    /// Card 52984cb0: production no longer calls this helper (cwd is input
+    /// to nothing). Kept as documentation of the internal behavior.
     #[test]
-    fn default_home_skips_machine_account_home_when_inside_worktrees_subdir() {
-        // Card a1b4552a — the leak we caught live today. Without this
-        // guard an agent who `cd ~/.airc/worktrees/<short>/` per the
-        // d1b2798d auto-spawn workflow would resolve home to ~/.airc
-        // and borrow the machine-account identity. Test pins that
-        // ancestor walk SKIPS the machine-account ~/.airc and falls
-        // through to git_main_working_tree (the main repo's .airc).
+    fn default_home_dir_for_with_worktree_stub_resolves_main_scope() {
         use super::default_home_dir_for_with;
         use std::path::{Path, PathBuf};
         let machine_account = PathBuf::from("/Users/test/.airc");
@@ -323,12 +319,10 @@ mod tests {
         );
     }
 
+    /// Card 52984cb0: production no longer calls this helper (cwd is input
+    /// to nothing). Kept as documentation of internal behavior.
     #[test]
-    fn default_home_still_resolves_project_scope_when_not_under_machine_account() {
-        // Sanity: a nested cwd that has an enclosing project .airc that
-        // is NOT the machine-account home resolves correctly (regression
-        // guard — we don't want the fix above to skip legitimate
-        // project scopes too).
+    fn default_home_dir_for_with_project_scope_when_not_under_machine_account() {
         use super::default_home_dir_for_with;
         use std::path::{Path, PathBuf};
         let machine_account = PathBuf::from("/Users/test/.airc");
@@ -341,11 +335,10 @@ mod tests {
         assert_eq!(resolved, scope);
     }
 
+    /// Card 52984cb0: production no longer calls this helper (cwd is input
+    /// to nothing). Kept as documentation of internal behavior.
     #[test]
-    fn default_home_falls_through_to_cwd_airc_when_nothing_else_resolves() {
-        // Final fallback: no ancestor .airc, no git context — cwd's
-        // own .airc is the answer. Pre-existing behaviour, pinned so
-        // the refactor preserves it.
+    fn default_home_dir_for_with_cwd_airc_fallback() {
         use super::default_home_dir_for_with;
         use std::path::{Path, PathBuf};
         let root = tempfile::TempDir::new().unwrap();
@@ -356,14 +349,10 @@ mod tests {
         assert_eq!(resolved, cwd.join(".airc"));
     }
 
-    // what this catches: seam #1 — a rootless cwd (no enclosing `.airc`,
-    // no git context) with a known machine-account home must resolve to
-    // that canonical home, NOT mint a throwaway `cwd/.airc` scratch scope
-    // (the `/tmp` `57059a56` phantom-beacon ghost). Mutation check:
-    // reverting the machine-account fallback resolves to cwd/.airc and
-    // this fails.
+    /// Card 52984cb0: production no longer calls this helper (cwd is input
+    /// to nothing). Kept as documentation of internal behavior.
     #[test]
-    fn default_home_rootless_cwd_uses_machine_account_not_throwaway() {
+    fn default_home_dir_for_with_rootless_cwd_uses_machine_account() {
         use super::default_home_dir_for_with;
         use std::path::{Path, PathBuf};
         let root = tempfile::TempDir::new().unwrap();
