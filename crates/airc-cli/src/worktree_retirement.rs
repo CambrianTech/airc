@@ -141,7 +141,8 @@ fn retire_card_clone(path: &Path, mirror: &Path) -> Result<Retirement, String> {
         &[
             "push",
             "--quiet",
-            mirror.to_str().ok_or("non-UTF8 mirror path")?,
+            // Git emits a local push destination it can parse on this platform.
+            &git(mirror, &["--git-dir=.", "rev-parse", "--absolute-git-dir"])?,
             &format!("{head}:{recovery}"),
         ],
     )?;
